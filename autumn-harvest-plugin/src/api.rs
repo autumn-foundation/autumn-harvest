@@ -1442,6 +1442,8 @@ pub(crate) struct WorkflowFilters {
     pub(crate) started_before: Option<chrono::DateTime<chrono::Utc>>,
     /// Prefix match on the execution UUID cast to text (e.g. "abc123").
     pub(crate) exec_id_prefix: Option<String>,
+    pub(crate) owner: Option<String>,
+    pub(crate) severity: Option<String>,
 }
 
 impl WorkflowFilters {
@@ -1597,6 +1599,7 @@ struct WorkflowChildResponse {
 #[derive(Debug, Deserialize)]
 struct DeadLetterListQuery {
     limit: Option<i64>,
+    owner: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3167,6 +3170,18 @@ pub(crate) fn parse_workflow_filters(
                     filters.workflow_name = Some(trimmed.to_string());
                 }
             }
+            "owner" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.owner = Some(trimmed.to_string());
+                }
+            }
+            "severity" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.severity = Some(trimmed.to_string());
+                }
+            }
             "search_attr" => {
                 let (raw_key, raw_val) = value.split_once(':').ok_or_else(|| {
                     AutumnError::bad_request_msg(format!(
@@ -4690,6 +4705,14 @@ async fn start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
+    let (owner, runbook_url, severity) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .map_or((None, None, None), |info| {
+            (info.owner, info.runbook_url, info.severity)
+        });
+
     let result = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
@@ -4716,6 +4739,9 @@ async fn start_workflow(
             start_at: request.start_at,
             delay,
             max_workflow_start_delay: max_delay_chrono,
+            owner,
+            runbook_url,
+            severity,
         },
     )
     .await;
@@ -5101,6 +5127,14 @@ async fn batch_start_workflows(
             )
             .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
+            let (owner, runbook_url, severity) = runtime
+                .registry
+                .workflows
+                .get(&item.workflow_name)
+                .map_or((None, None, None), |info| {
+                    (info.owner, info.runbook_url, info.severity)
+                });
+
             let start_result = start_or_load_workflow_execution(
                 &mut conn,
                 StartWorkflowParams {
@@ -5123,6 +5157,9 @@ async fn batch_start_workflows(
                     start_at: None,
                     delay: None,
                     max_workflow_start_delay: None,
+                    owner,
+                    runbook_url,
+                    severity,
                 },
             )
             .await;
@@ -5589,6 +5626,14 @@ async fn signal_with_start_workflow(
             (key, Some(policy.limit))
         });
 
+    let (owner, runbook_url, severity) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .map_or((None, None, None), |info| {
+            (info.owner, info.runbook_url, info.severity)
+        });
+
     let result = signal_with_start_workflow_execution(
         &mut conn,
         SignalWithStartParams {
@@ -5615,6 +5660,9 @@ async fn signal_with_start_workflow(
             idempotency_key: request.idempotency_key.clone(),
             max_workflow_input_bytes: effective_wf_cap,
             max_signal_payload_bytes: runtime.registry.max_signal_payload_bytes,
+            owner,
+            runbook_url,
+            severity,
         },
     )
     .await;
@@ -6764,6 +6812,9 @@ async fn trigger_dag_run(
         request.conf,
         shard,
         &default_queue,
+        dag.owner.as_deref(),
+        dag.runbook_url.as_deref(),
+        dag.severity.as_deref(),
     )
     .await;
 
@@ -8119,6 +8170,31 @@ async fn trigger_schedule_now(
     // deployments; multi-shard schedule pinning is a follow-up to issue #171).
     let exec_id = ExecutionId::new();
 
+    let (owner, runbook_url, severity) = {
+        let wf_meta = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .map(|info| (info.owner, info.runbook_url, info.severity));
+        let dag_meta = runtime.dags().get(&workflow_name).map(|dag| {
+            (
+                dag.owner.as_deref(),
+                dag.runbook_url.as_deref(),
+                dag.severity.as_deref(),
+            )
+        });
+        match (wf_meta, dag_meta) {
+            (Some((o, r, s)), Some((dag_owner, dag_runbook, dag_severity))) => {
+                (o.or(dag_owner), r.or(dag_runbook), s.or(dag_severity))
+            }
+            (Some((o, r, s)), None) => (o, r, s),
+            (None, Some((dag_owner, dag_runbook, dag_severity))) => {
+                (dag_owner, dag_runbook, dag_severity)
+            }
+            (None, None) => (None, None, None),
+        }
+    };
+
     let result = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
@@ -8141,6 +8217,9 @@ async fn trigger_schedule_now(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner,
+            runbook_url,
+            severity,
         },
     )
     .await;
@@ -8637,6 +8716,14 @@ async fn schedule_backfill(
                     }
                 }
 
+                let (owner, runbook_url, severity) = runtime
+                    .registry
+                    .workflows
+                    .get(&wf_name)
+                    .map_or((None, None, None), |info| {
+                        (info.owner, info.runbook_url, info.severity)
+                    });
+
                 let result = start_or_load_workflow_execution(
                     &mut conn,
                     StartWorkflowParams {
@@ -8659,6 +8746,9 @@ async fn schedule_backfill(
                         start_at: None,
                         delay: None,
                         max_workflow_start_delay: None,
+                        owner,
+                        runbook_url,
+                        severity,
                     },
                 )
                 .await;
@@ -8763,6 +8853,18 @@ async fn schedule_backfill(
                     }
                 }
 
+                let (owner, runbook_url, severity) =
+                    runtime
+                        .dags()
+                        .get(&dag_name)
+                        .map_or((None, None, None), |dag| {
+                            (
+                                dag.owner.as_deref(),
+                                dag.runbook_url.as_deref(),
+                                dag.severity.as_deref(),
+                            )
+                        });
+
                 let start_result = start_or_load_workflow_execution(
                     &mut conn,
                     StartWorkflowParams {
@@ -8785,6 +8887,9 @@ async fn schedule_backfill(
                         start_at: None,
                         delay: None,
                         max_workflow_start_delay: None,
+                        owner,
+                        runbook_url,
+                        severity,
                     },
                 )
                 .await;
@@ -9175,13 +9280,70 @@ fn parse_schedule_expr_with_tz(
     Ok(schedule)
 }
 
+#[derive(Debug, serde::Serialize)]
+struct DeadLetterResponse {
+    #[serde(flatten)]
+    dead_letter: DeadLetter,
+    runbook_url: Option<String>,
+}
+
 async fn list_dead_letters(
     Extension(api_state): Extension<HarvestApiState>,
     Query(query): Query<DeadLetterListQuery>,
-) -> Result<Json<Vec<DeadLetter>>, AutumnError> {
+) -> Result<Json<Vec<DeadLetterResponse>>, AutumnError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let dead_letters = load_dead_letters_from_shards(&api_state, limit).await?;
-    Ok(Json(dead_letters))
+    let dead_letters =
+        load_dead_letters_from_shards(&api_state, limit, query.owner.as_deref()).await?;
+
+    let mut runbooks = std::collections::HashMap::new();
+    let exec_ids: Vec<uuid::Uuid> = dead_letters
+        .iter()
+        .filter_map(|dl| dl.workflow_exec_id)
+        .collect();
+
+    if !exec_ids.is_empty() {
+        let pool = api_state.storage_pool().map_err(map_error)?;
+        let mut by_shard: std::collections::HashMap<_, Vec<uuid::Uuid>> =
+            std::collections::HashMap::new();
+        for id in exec_ids {
+            let exec_id = ExecutionId::from_uuid(id);
+            let shard = exec_id.shard();
+            by_shard.entry(shard).or_default().push(id);
+        }
+
+        for (shard, ids) in by_shard {
+            use autumn_harvest::schema::harvest_workflow_executions::dsl as wf_dsl;
+            let shard_pool = pool.pool_for(shard);
+            let mut conn = acquire_conn(shard_pool).await?;
+            let rows: Vec<(uuid::Uuid, Option<String>)> = wf_dsl::harvest_workflow_executions
+                .filter(wf_dsl::id.eq_any(&ids))
+                .select((wf_dsl::id, wf_dsl::runbook_url))
+                .load::<(uuid::Uuid, Option<String>)>(&mut conn)
+                .await
+                .map_err(HarvestError::from)
+                .map_err(map_error)?;
+            for (id, url) in rows {
+                if let Some(u) = url {
+                    runbooks.insert(id, u);
+                }
+            }
+        }
+    }
+
+    let responses: Vec<DeadLetterResponse> = dead_letters
+        .into_iter()
+        .map(|dl| {
+            let runbook_url = dl
+                .workflow_exec_id
+                .and_then(|id| runbooks.get(&id).cloned());
+            DeadLetterResponse {
+                dead_letter: dl,
+                runbook_url,
+            }
+        })
+        .collect();
+
+    Ok(Json(responses))
 }
 
 async fn replay_dead_letter(
@@ -10848,6 +11010,12 @@ pub(crate) async fn load_workflows(
         let pattern = format!("{}%", prefix.to_lowercase());
         query = query.filter(sql::<Bool>("CAST(id AS TEXT) ILIKE ").bind::<Text, _>(pattern));
     }
+    if let Some(owner) = &filters.owner {
+        query = query.filter(harvest_workflow_executions::owner.eq(owner.clone()));
+    }
+    if let Some(severity) = &filters.severity {
+        query = query.filter(harvest_workflow_executions::severity.eq(severity.clone()));
+    }
     // Each search_attr filter contributes its own `search_attrs @> {...}` predicate.
     // The `@>` operator hits the existing `idx_harvest_we_search` GIN index on
     // `search_attrs`; ANDing predicates means repeated keys narrow the result set.
@@ -11183,13 +11351,14 @@ async fn load_schedules_from_shards(
 async fn load_dead_letters_from_shards(
     api_state: &HarvestApiState,
     limit: i64,
+    owner: Option<&str>,
 ) -> Result<Vec<DeadLetter>, AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut dead_letters = Vec::new();
 
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = dlq::list_dead_letters(&mut conn, limit)
+        let mut rows = dlq::list_dead_letters(&mut conn, limit, owner)
             .await
             .map_err(map_error)?;
         dead_letters.append(&mut rows);
@@ -14232,6 +14401,10 @@ mod tests {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -14758,6 +14931,9 @@ mod tests {
                 start_at: None,
                 delay: None,
                 max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         )
         .await
@@ -15438,6 +15614,9 @@ mod tests {
                     execution_timeout: None,
                     concurrency: None,
                     max_input_bytes: None,
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
                     description: Some("A workflow with an input schema"),
                     input_schema: Some(my_input_schema),
                     output_schema: None,
@@ -15450,6 +15629,9 @@ mod tests {
                     execution_timeout: None,
                     concurrency: None,
                     max_input_bytes: None,
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
                     description: None,
                     input_schema: None,
                     output_schema: None,

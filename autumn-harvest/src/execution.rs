@@ -85,6 +85,9 @@ pub struct StartWorkflowParams<'a> {
     pub delay: Option<chrono::Duration>,
     /// Server-side ceiling on start delay (issue #322).
     pub max_workflow_start_delay: Option<chrono::Duration>,
+    pub owner: Option<&'a str>,
+    pub runbook_url: Option<&'a str>,
+    pub severity: Option<&'a str>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -295,6 +298,9 @@ pub async fn start_or_load_workflow_execution(
         search_attrs: request.search_attrs.clone(),
         assigned_build_id: assigned_build.clone(),
         parent_close_policy: None, // root or awaited child; detached uses worker path
+        owner: request.owner,
+        runbook_url: request.runbook_url,
+        severity: request.severity,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -956,6 +962,9 @@ pub struct SignalWithStartParams<'a> {
     pub max_workflow_input_bytes: u64,
     /// Payload cap for `signal_payload` (bytes). Zero means no cap.
     pub max_signal_payload_bytes: u64,
+    pub owner: Option<&'a str>,
+    pub runbook_url: Option<&'a str>,
+    pub severity: Option<&'a str>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -1123,6 +1132,9 @@ pub async fn signal_with_start_workflow_execution(
                     start_at: None,
                     delay: None,
                     max_workflow_start_delay: None,
+                    owner: request.owner,
+                    runbook_url: request.runbook_url,
+                    severity: request.severity,
                 };
 
             let started = start_or_load_workflow_execution(

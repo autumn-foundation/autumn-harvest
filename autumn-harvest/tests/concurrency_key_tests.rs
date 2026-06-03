@@ -18,6 +18,10 @@ fn workflow_info_has_concurrency_fields() {
         execution_timeout: None,
         concurrency: None,
         max_input_bytes: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
         description: None,
         input_schema: None,
         output_schema: None,
@@ -38,6 +42,10 @@ fn workflow_info_with_concurrency_policy() {
             limit: 10,
         }),
         max_input_bytes: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
         description: None,
         input_schema: None,
         output_schema: None,

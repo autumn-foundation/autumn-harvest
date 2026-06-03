@@ -91,3 +91,22 @@ fn dags_macro_collects_and_builds_definitions() {
     assert_eq!(definition.tasks()[0].queue.as_deref(), Some("etl-workers"));
     assert_eq!(definition.tasks()[1].trigger_rule, TriggerRule::AllDone);
 }
+
+#[dag(
+    schedule = "0 2 * * *",
+    catchup = false,
+    owner = "etl-team",
+    runbook = "https://wiki.acme.com/etl-runbook",
+    severity = "sev3"
+)]
+fn metadata_dag(dag: &mut DagBuilder) {
+    let _ = dag.activity(extract_users);
+}
+
+#[test]
+fn dag_metadata_attributes() {
+    let info = __autumn_dag_info_metadata_dag();
+    assert_eq!(info.owner, Some("etl-team"));
+    assert_eq!(info.runbook_url, Some("https://wiki.acme.com/etl-runbook"));
+    assert_eq!(info.severity, Some("sev3"));
+}

@@ -75,6 +75,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
     "\n",
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -219,6 +221,10 @@ async fn test_same_shard_not_found_retry() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -231,6 +237,10 @@ async fn test_same_shard_not_found_retry() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -276,6 +286,10 @@ async fn test_same_shard_not_found_retry() {
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -309,6 +323,10 @@ async fn test_same_shard_not_found_retry() {
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -362,6 +380,10 @@ async fn test_cross_shard_outbox_delivery() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -374,6 +396,10 @@ async fn test_cross_shard_outbox_delivery() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -420,6 +446,10 @@ async fn test_cross_shard_outbox_delivery() {
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -446,6 +476,10 @@ async fn test_cross_shard_outbox_delivery() {
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -494,6 +528,10 @@ async fn test_grace_window_expiration() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -539,6 +577,10 @@ async fn test_grace_window_expiration() {
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -604,6 +646,10 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -616,6 +662,10 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -661,6 +711,10 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -694,6 +748,10 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await

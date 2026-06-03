@@ -132,6 +132,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
     ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
+    ),
 );
 type HarvestApiApp = axum::Router;
 
@@ -353,6 +357,10 @@ fn approval_registry() -> Arc<HandlerRegistry> {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -372,6 +380,10 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -384,6 +396,10 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -500,6 +516,10 @@ async fn insert_workflow_on_url(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -573,6 +593,10 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -617,6 +641,9 @@ async fn insert_dead_letter_on_url(
             input: json!({ "queue": queue_name }),
             error: format!("{activity_name} failed"),
             attempts: 3,
+
+            owner: None,
+            severity: None,
         },
     )
     .await
@@ -640,6 +667,9 @@ fn manual_pipeline_info_named(name: &'static str) -> DagInfo {
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100,
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }
 }
 
@@ -719,6 +749,10 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             search_attrs: None,
             assigned_build_id: None,
             parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         })
         .execute(&mut conn)
         .await
@@ -1038,6 +1072,10 @@ async fn seed_scheduled_activity_task_from_url(
             search_attrs: None,
             assigned_build_id: None,
             parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         })
         .execute(&mut conn)
         .await
@@ -1785,6 +1823,9 @@ fn manual_pipeline_info() -> DagInfo {
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100,
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }
 }
 
@@ -1801,6 +1842,9 @@ fn interval_pipeline_info() -> DagInfo {
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100,
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }
 }
 
@@ -1817,6 +1861,9 @@ fn classic_interval_pipeline_info() -> DagInfo {
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100,
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }
 }
 
@@ -1828,6 +1875,9 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
         execution_timeout: None,
         concurrency: None,
         max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
         description: None,
         input_schema: None,
         output_schema: None,
@@ -1845,10 +1895,12 @@ fn unified_manual_dag_info_named(name: &'static str, default_queue: &'static str
         default_queue: Some(default_queue),
         builder: build_interval_pipeline_dag,
         workflow_handler: Some(approval_workflow),
-
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }
 }
 
@@ -1862,10 +1914,12 @@ fn manual_interval_pipeline_info() -> DagInfo {
         default_queue: Some("default"),
         builder: build_interval_pipeline_dag,
         workflow_handler: None,
-
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }
 }
 
@@ -2723,6 +2777,10 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -2753,6 +2811,10 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -2826,6 +2888,10 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -2876,6 +2942,10 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -2935,6 +3005,10 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -2981,6 +3055,10 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -3036,6 +3114,10 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -3509,6 +3591,9 @@ async fn harvest_api_lists_and_replays_dead_letters() {
                 input: json!({ "order_id": 42 }),
                 error: "smtp is in the coffin".to_string(),
                 attempts: 3,
+
+                owner: None,
+                severity: None,
             },
         )
         .await
@@ -3651,6 +3736,10 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -3902,6 +3991,10 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: autumn_harvest::OverlapPolicy::Skip,
             buffer_all_max: 100u32,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }])
         .expect("manual unified DAG should compile"),
     );
@@ -4197,6 +4290,10 @@ async fn harvest_api_rejects_non_dry_run_backfill_for_paused_dag_schedule() {
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     let workflow_schedule = dag_info
         .as_workflow_schedule()
@@ -4284,6 +4381,10 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -4351,6 +4452,7 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -4368,6 +4470,10 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -4548,6 +4654,10 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -4650,6 +4760,10 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -5005,6 +5119,10 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: autumn_harvest::OverlapPolicy::Skip,
             buffer_all_max: 100u32,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }])
         .expect("unified DAG should compile"),
     );
@@ -5067,6 +5185,10 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -5139,6 +5261,10 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -5236,6 +5362,10 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         jitter: ::std::time::Duration::ZERO,
         overlap_policy: autumn_harvest::OverlapPolicy::Skip,
         buffer_all_max: 100u32,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -5316,6 +5446,7 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
     let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
     let router = two_shard_router();
@@ -5334,6 +5465,10 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: autumn_harvest::OverlapPolicy::Skip,
             buffer_all_max: 100u32,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5443,6 +5578,10 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: autumn_harvest::OverlapPolicy::Skip,
             buffer_all_max: 100u32,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5539,6 +5678,10 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: autumn_harvest::OverlapPolicy::Skip,
             buffer_all_max: 100u32,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5650,6 +5793,10 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: autumn_harvest::OverlapPolicy::Skip,
             buffer_all_max: 100u32,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5691,6 +5838,10 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: autumn_harvest::OverlapPolicy::Skip,
             buffer_all_max: 100u32,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }])
         .expect("classic DAG schedule should compile");
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
@@ -6200,4 +6351,159 @@ async fn get_schedule_decisions_api_endpoints() {
     assert_eq!(list2[0]["schedule_id"], id.to_string());
     assert_eq!(list2[0]["decision"], "fired");
     assert_eq!(list2[0]["reason_code"], "fired_ok");
+}
+
+#[tokio::test]
+async fn scheduler_tick_preserves_dag_metadata() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "metadata_dag";
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+    };
+
+    let dag_info = DagInfo {
+        name: dag_name,
+        module: "tests",
+        schedule: Some(Schedule::Interval(Duration::from_secs(60))),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("dag-workers"),
+        builder: build_interval_pipeline_dag,
+        workflow_handler: Some(approval_workflow),
+        jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        owner: Some("ops-team"),
+        runbook_url: Some("http://ops-runbook"),
+        severity: Some("sev2"),
+    };
+    let dag_catalog = Arc::new(compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
+
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for DAG schedule seed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("failed to seed DAG-backed workflow schedule");
+        let schedule = load_schedule_from_url(&database_url, dag_name).await;
+        diesel::update(harvest_schedules::table.find(schedule.id))
+            .set(
+                harvest_schedules::next_run_at
+                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("failed to force DAG schedule due");
+    }
+
+    tick_once(
+        pool.clone(),
+        Arc::new(HandlerRegistry::new(
+            vec![workflow_info_named(dag_name)],
+            vec![],
+        )),
+        dag_catalog,
+        Arc::new(vec![workflow_schedule]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("scheduler tick should dispatch DAG schedule");
+
+    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, dag_name)
+        .await
+        .expect("scheduled execution should exist");
+    assert_eq!(execution.owner.as_deref(), Some("ops-team"));
+    assert_eq!(execution.runbook_url.as_deref(), Some("http://ops-runbook"));
+    assert_eq!(execution.severity.as_deref(), Some("sev2"));
+}
+
+#[tokio::test]
+async fn api_trigger_preserves_dag_metadata() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "api_metadata_dag";
+
+    let dag_info = DagInfo {
+        name: dag_name,
+        module: "tests",
+        schedule: Some(Schedule::Manual),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("dag-workers"),
+        builder: build_interval_pipeline_dag,
+        workflow_handler: Some(approval_workflow),
+        jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        owner: Some("dev-team"),
+        runbook_url: Some("http://dev-runbook"),
+        severity: Some("sev1"),
+    };
+    let dag_catalog = Arc::new(compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(dag_name)],
+        vec![],
+    ));
+
+    let schedule_id = seed_workflow_schedule_and_get_id(&database_url, dag_name).await;
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("connect");
+        diesel::update(harvest_schedules::table.find(schedule_id))
+            .set((
+                harvest_schedules::dag_name.eq(Some(dag_name.to_string())),
+                harvest_schedules::workflow_name.eq(None::<String>),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("update schedule");
+    }
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, ack) = post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{schedule_id}/trigger"),
+        json!({}),
+        "ops-team",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ack["outcome"], "fired");
+
+    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, dag_name)
+        .await
+        .expect("triggered execution should exist");
+    assert_eq!(execution.owner.as_deref(), Some("dev-team"));
+    assert_eq!(execution.runbook_url.as_deref(), Some("http://dev-runbook"));
+    assert_eq!(execution.severity.as_deref(), Some("sev1"));
 }

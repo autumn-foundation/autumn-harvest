@@ -81,6 +81,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
     "\n",
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
 );
 
 // ── Recording metrics ──────────────────────────────────────────────────────
@@ -142,6 +144,10 @@ fn make_registry(workflow_name: &'static str) -> Arc<HandlerRegistry> {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,

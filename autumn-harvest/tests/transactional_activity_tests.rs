@@ -90,6 +90,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
     "\n",
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
 );
 
 const CREATE_USER_RECORDS: &str = "
@@ -329,6 +331,10 @@ async fn transactional_activity_happy_path_atomic_commit() {
                 start_at: None,
                 delay: None,
                 max_workflow_start_delay: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         )
         .await
@@ -402,6 +408,10 @@ async fn transactional_activity_err_rolls_back_user_writes() {
                 start_at: None,
                 delay: None,
                 max_workflow_start_delay: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         )
         .await

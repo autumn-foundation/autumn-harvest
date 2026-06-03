@@ -8,7 +8,11 @@ pub fn workflows() -> Vec<WorkflowInfo> {
     workflows![standalone_order, standalone_shipping]
 }
 
-#[workflow]
+#[workflow(
+    owner = "fulfillment",
+    runbook = "https://wiki.acme.com/fulfillment-runbook",
+    severity = "sev2"
+)]
 pub async fn standalone_order(
     ctx: &WorkflowContext,
     order: StandaloneOrder,
@@ -47,7 +51,11 @@ pub async fn standalone_order(
     }))
 }
 
-#[workflow]
+#[workflow(
+    owner = "shipping",
+    runbook = "https://wiki.acme.com/shipping-runbook",
+    severity = "sev3"
+)]
 pub async fn standalone_shipping(ctx: &WorkflowContext, input: Value) -> HarvestResult<Value> {
     ctx.execute_activity(&buy_shipping_label_info(), input)
         .await

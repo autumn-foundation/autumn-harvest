@@ -96,6 +96,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
     ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -239,6 +243,9 @@ async fn insert_dlq_row(database_url: &str, activity_name: &str, task_type: &str
             input: json!({ "test": true }),
             error: format!("{activity_name} failed"),
             attempts: 3,
+
+            owner: None,
+            severity: None,
         },
     )
     .await

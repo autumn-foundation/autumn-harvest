@@ -64,6 +64,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
     "\n",
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -141,6 +143,10 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -225,6 +231,10 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -499,6 +509,10 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -585,6 +599,10 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -684,6 +702,10 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -814,6 +836,10 @@ async fn activity_exits_early_on_workflow_cancellation() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -940,6 +966,10 @@ async fn activity_without_cancellation_check_completes_normally() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await

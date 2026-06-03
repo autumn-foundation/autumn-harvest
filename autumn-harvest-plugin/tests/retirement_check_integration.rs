@@ -172,6 +172,10 @@ async fn insert_versioned_execution(
         search_attrs: None,
         assigned_build_id: None,
         parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -238,6 +242,10 @@ async fn insert_execution_without_marker(
         search_attrs: None,
         assigned_build_id: None,
         parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)

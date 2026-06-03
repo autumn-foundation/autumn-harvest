@@ -158,6 +158,8 @@ fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult
 ///     input: serde_json::json!({"to": "user@example.com"}),
 ///     error: "connection refused".to_string(),
 ///     attempts: 3,
+///     owner: None,
+///     severity: None,
 /// };
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -170,6 +172,8 @@ pub struct NewDeadLetterEntry {
     pub input: serde_json::Value,
     pub error: String,
     pub attempts: i32,
+    pub owner: Option<String>,
+    pub severity: Option<String>,
 }
 
 /// Insert a task into the dead-letter queue and return the generated DLQ entry ID.
@@ -192,6 +196,8 @@ pub async fn dead_letter(
         input: entry.input.clone(),
         error: &entry.error,
         attempts: entry.attempts,
+        owner: entry.owner.as_deref(),
+        severity: entry.severity.as_deref(),
     };
 
     let inserted: Vec<Uuid> = diesel::insert_into(harvest_dead_letters::table)
@@ -232,12 +238,20 @@ pub async fn dead_letter_count(conn: &mut AsyncPgConnection) -> HarvestResult<i6
 pub async fn list_dead_letters(
     conn: &mut AsyncPgConnection,
     limit: i64,
+    owner: Option<&str>,
 ) -> HarvestResult<Vec<DeadLetter>> {
     use crate::schema::harvest_dead_letters::dsl;
 
-    dsl::harvest_dead_letters
+    let mut query = dsl::harvest_dead_letters
+        .into_boxed()
         .order(dsl::failed_at.desc())
-        .limit(limit)
+        .limit(limit);
+
+    if let Some(o) = owner {
+        query = query.filter(dsl::owner.eq(o.to_string()));
+    }
+
+    query
         .select(DeadLetter::as_select())
         .load(conn)
         .await
@@ -590,6 +604,8 @@ mod tests {
             input: serde_json::json!({"to": "alice@example.com"}),
             error: "SMTP connection refused after 3 attempts".into(),
             attempts: 3,
+            owner: None,
+            severity: None,
         };
 
         assert_eq!(entry.queue_name, "email-queue");
@@ -611,6 +627,8 @@ mod tests {
             input: serde_json::Value::Null,
             error: "unknown failure".into(),
             attempts: 1,
+            owner: None,
+            severity: None,
         };
 
         assert!(entry.workflow_exec_id.is_none());
@@ -773,6 +791,8 @@ mod tests {
             input: serde_json::json!({"amount": 99.99}),
             error: "payment declined".into(),
             attempts: 5,
+            owner: None,
+            severity: None,
         };
 
         let json = serde_json::to_string(&entry).expect("should serialize");

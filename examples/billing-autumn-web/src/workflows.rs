@@ -19,7 +19,11 @@ pub fn workflows() -> Vec<WorkflowInfo> {
     ]
 }
 
-#[workflow]
+#[workflow(
+    owner = "billing-team",
+    runbook = "https://wiki.acme.com/billing-runbook",
+    severity = "sev1"
+)]
 #[allow(clippy::too_many_lines)]
 pub async fn billing_checkout(
     ctx: &WorkflowContext,
@@ -198,7 +202,11 @@ pub async fn billing_checkout(
     })
 }
 
-#[workflow]
+#[workflow(
+    owner = "billing-team",
+    runbook = "https://wiki.acme.com/invoice-runbook",
+    severity = "sev2"
+)]
 pub async fn issue_initial_invoice(
     ctx: &WorkflowContext,
     request: InvoiceRequest,
@@ -211,7 +219,11 @@ pub async fn issue_initial_invoice(
     Ok(invoice)
 }
 
-#[workflow]
+#[workflow(
+    owner = "billing-team",
+    runbook = "https://wiki.acme.com/cycle-runbook",
+    severity = "sev3"
+)]
 pub async fn monthly_billing_cycle(ctx: &WorkflowContext, input: Value) -> HarvestResult<Value> {
     let cycle = input.get("cycle").and_then(Value::as_u64).unwrap_or(1);
     let stop_after = input

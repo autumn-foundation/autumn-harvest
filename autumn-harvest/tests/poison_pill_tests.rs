@@ -79,6 +79,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     // Poison-pill crash_strikes column (issue #367)
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
 );
 
 #[derive(Debug, Default)]
@@ -416,6 +418,9 @@ async fn replay_into_terminal_workflow_is_rejected() {
             input: serde_json::json!({}),
             error: "poison".to_string(),
             attempts: 3,
+
+            owner: None,
+            severity: None,
         },
     )
     .await

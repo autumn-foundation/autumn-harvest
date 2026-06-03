@@ -165,6 +165,12 @@ pub struct WorkflowInfo {
     ///
     /// `None` means the global cap applies.
     pub max_input_bytes: Option<u64>,
+    /// Team owner metadata (issue #372).
+    pub owner: Option<&'static str>,
+    /// Linked runbook URL metadata (issue #372).
+    pub runbook_url: Option<&'static str>,
+    /// Severity level metadata (issue #372).
+    pub severity: Option<&'static str>,
     /// Optional human-readable description of this workflow's purpose.
     ///
     /// Set via `#[workflow(description = "…")]` or the [`with_description`](Self::with_description)
@@ -676,6 +682,12 @@ pub struct DagInfo {
     pub overlap_policy: crate::policy::OverlapPolicy,
     /// Maximum buffered slots under [`OverlapPolicy::BufferAll`]. Default 100.
     pub buffer_all_max: u32,
+    /// Team owner metadata (issue #372).
+    pub owner: Option<&'static str>,
+    /// Linked runbook URL metadata (issue #372).
+    pub runbook_url: Option<&'static str>,
+    /// Severity level metadata (issue #372).
+    pub severity: Option<&'static str>,
 }
 
 impl DagInfo {
@@ -735,6 +747,9 @@ impl DagInfo {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: self.owner,
+            runbook_url: self.runbook_url,
+            severity: self.severity,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -752,6 +767,9 @@ impl std::fmt::Debug for WorkflowInfo {
             .field("execution_timeout", &self.execution_timeout)
             .field("concurrency", &self.concurrency)
             .field("max_input_bytes", &self.max_input_bytes)
+            .field("owner", &self.owner)
+            .field("runbook_url", &self.runbook_url)
+            .field("severity", &self.severity)
             .field("description", &self.description)
             .field("input_schema", &self.input_schema.map(|_| "<fn>"))
             .field("output_schema", &self.output_schema.map(|_| "<fn>"))
@@ -798,6 +816,9 @@ impl std::fmt::Debug for DagInfo {
             .field("jitter", &self.jitter)
             .field("overlap_policy", &self.overlap_policy)
             .field("buffer_all_max", &self.buffer_all_max)
+            .field("owner", &self.owner)
+            .field("runbook_url", &self.runbook_url)
+            .field("severity", &self.severity)
             .finish()
     }
 }
@@ -844,6 +865,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -863,6 +887,9 @@ mod tests {
             execution_timeout: Some(std::time::Duration::from_secs(86_400)),
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -885,6 +912,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: Some("Handles user onboarding from signup to first action"),
             input_schema: None,
             output_schema: None,
@@ -905,6 +935,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -942,6 +975,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -971,6 +1007,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -997,6 +1036,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: Some("A workflow with a schema"),
             input_schema: Some(my_schema),
             output_schema: None,
@@ -1031,6 +1073,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: Some(schema_fn),
             output_schema: None,
@@ -1058,6 +1103,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: Some(schema_fn),
             output_schema: None,
@@ -1080,6 +1128,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -1201,6 +1252,9 @@ mod tests {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: crate::policy::OverlapPolicy::Skip,
             buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         };
 
         let definition = info.build_definition().expect("dag should compile");
@@ -1223,6 +1277,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -1267,6 +1324,9 @@ mod tests {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: crate::policy::OverlapPolicy::Skip,
             buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         };
         let debug_str = format!("{dag_info:?}");
         assert!(debug_str.contains("DagInfo"));

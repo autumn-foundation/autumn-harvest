@@ -21,7 +21,11 @@ use autumn_web::reexports::axum::extract::State;
 /// The 30-second pause is intentional: kill the process and restart while the
 /// timer is counting down. The engine replays the welcome step from Postgres
 /// history and resumes exactly at the timer — without re-running the activity.
-#[workflow]
+#[workflow(
+    owner = "support",
+    runbook = "https://wiki.acme.com/greeting-runbook",
+    severity = "sev4"
+)]
 async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> {
     let welcome: serde_json::Value = ctx
         .execute_activity(
@@ -50,7 +54,11 @@ async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> 
 }
 
 /// Fast request/response variant used by `POST /greet`.
-#[workflow]
+#[workflow(
+    owner = "support",
+    runbook = "https://wiki.acme.com/instant-greeting-runbook",
+    severity = "sev4"
+)]
 async fn instant_greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> {
     let greeting: serde_json::Value = ctx
         .execute_activity(
@@ -126,6 +134,10 @@ async fn greet(
                 start_at: None,
                 delay: None,
                 max_workflow_start_delay: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         )
         .await

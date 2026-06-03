@@ -81,6 +81,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
     "\n",
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -117,6 +119,10 @@ async fn insert_execution(conn: &mut AsyncPgConnection, name: &str) -> Execution
         search_attrs: None,
         assigned_build_id: None,
         parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
