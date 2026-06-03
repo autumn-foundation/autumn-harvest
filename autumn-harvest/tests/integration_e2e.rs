@@ -1332,6 +1332,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_marks_workflow_failed_when_handler_errors() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -3683,6 +3684,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)

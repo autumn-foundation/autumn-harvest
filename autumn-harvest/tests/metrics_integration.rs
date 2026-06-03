@@ -771,6 +771,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn continue_as_new_records_history_size_and_rotation_metrics() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = AsyncPgConnection::establish(&database_url)
@@ -1017,6 +1018,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = AsyncPgConnection::establish(&database_url)
