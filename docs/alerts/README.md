@@ -96,3 +96,41 @@ Recommended check cadence:
 
 No rule in this pack requires a new `WorkflowEvent` variant, event-history
 rewrite, migration, replay-rule change, or macro path change.
+
+## Alert Routing & Metadata Integration (Issue #372)
+
+With first-class support for `owner`, `runbook`, and `severity` declared directly on workflows and DAGs (e.g. `#[workflow(owner = "billing-team", runbook = "https://wiki.acme.com/billing-runbook", severity = "sev1")]`), you can route and customize alert payloads dynamically.
+
+### Dynamic Alert Placeholders
+
+The following placeholders are supported in downstream alert templating (such as Slack webhook templates, PagerDuty integration payloads, and custom outbound email hooks):
+
+*   `{{ workflow.owner }}`: The team/service responsible for the workflow (e.g., `"billing-team"`).
+*   `{{ workflow.runbook_url }}`: Direct URL to the mitigation/triage runbook (e.g., `"https://wiki.acme.com/billing-runbook"`).
+*   `{{ workflow.severity }}`: The compile-time validated severity level of the workflow (one of `sev1`, `sev2`, `sev3`, `sev4`).
+
+### Starter Slack/PagerDuty Alert Template Example
+
+```json
+{
+  "title": "[{{ workflow.severity | uppercase }}] Harvest DLQ Quarantine Alert",
+  "text": "Workflow *{{ workflow.name }}* (ID: `{{ workflow.id }}`) has been quarantined in the DLQ.",
+  "fields": [
+    {
+      "title": "Owner",
+      "value": "{{ workflow.owner }}",
+      "short": true
+    },
+    {
+      "title": "Severity",
+      "value": "{{ workflow.severity }}",
+      "short": true
+    },
+    {
+      "title": "Action Required",
+      "value": "<{{ workflow.runbook_url }}|Open Triage Runbook>",
+      "short": false
+    }
+  ]
+}
+```

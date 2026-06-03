@@ -116,6 +116,10 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!(
+        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
+    ),
+    "\n",
+    include_str!(
         "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
     )
 );
@@ -240,6 +244,10 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -342,6 +350,10 @@ async fn insert_workflow_on_url(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -400,6 +412,8 @@ async fn insert_dead_letter_on_url(
             input: json!({ "ordinal": ordinal, "workflow": workflow_name }),
             error: format!("{workflow_name} failed at attempt {ordinal}: downstream timeout with enough text to truncate"),
             attempts: i32::try_from(ordinal + 1).expect("ordinal fits i32"),
+            owner: None,
+            severity: None,
         },
     )
     .await
@@ -1936,6 +1950,10 @@ async fn insert_child_workflow_on_url(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -2475,6 +2493,10 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
                 description: None,
                 input_schema: None,
                 output_schema: None,
@@ -2567,4 +2589,107 @@ async fn ui_schedules_displays_recent_decisions() {
         html.contains("fired_ok"),
         "reason code 'fired_ok' missing from page: {html}"
     );
+}
+
+#[tokio::test]
+async fn ui_trigger_preserves_dag_metadata() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "ui_metadata_dag";
+
+    let dag_info = autumn_harvest::info::DagInfo {
+        name: dag_name,
+        module: "tests",
+        schedule: Some(autumn_harvest::policy::Schedule::Manual),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("dag-workers"),
+        builder: |_dag| {},
+        workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+        jitter: std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        owner: Some("ui-team"),
+        runbook_url: Some("http://ui-runbook"),
+        severity: Some("sev3"),
+    };
+
+    let dag_catalog =
+        Arc::new(autumn_harvest::compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: dag_name,
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            concurrency: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![],
+    ));
+
+    let schedule_id = insert_test_schedule(&database_url, "Dag", dag_name, false).await;
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    // Mount the UI router
+    let app = harvest_ui_router(api_state).with_state(test_app_state_without_database());
+
+    // POST /schedules/{id}/trigger-now
+    let (status, _headers, _body) = post_form(
+        &app,
+        &format!("/schedules/{schedule_id}/trigger-now"),
+        String::new(),
+    )
+    .await;
+    assert!(
+        status.is_redirection(),
+        "UI trigger must redirect; got {status}"
+    );
+
+    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, dag_name)
+        .await
+        .expect("triggered execution should exist");
+    assert_eq!(execution.owner.as_deref(), Some("ui-team"));
+    assert_eq!(execution.runbook_url.as_deref(), Some("http://ui-runbook"));
+    assert_eq!(execution.severity.as_deref(), Some("sev3"));
+}
+
+async fn load_latest_workflow_execution_by_name_from_url(
+    database_url: &str,
+    workflow_name: &str,
+) -> Option<autumn_harvest::models::WorkflowExecution> {
+    use diesel::OptionalExtension;
+    use diesel::SelectableHelper;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for workflow lookup");
+    autumn_harvest::schema::harvest_workflow_executions::table
+        .filter(
+            autumn_harvest::schema::harvest_workflow_executions::workflow_name.eq(workflow_name),
+        )
+        .order(autumn_harvest::schema::harvest_workflow_executions::created_at.desc())
+        .select(autumn_harvest::models::WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .optional()
+        .expect("failed to load workflow rows by workflow name")
 }

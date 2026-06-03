@@ -74,6 +74,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
     "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    "\n",
     include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql")
 );
 
@@ -161,6 +163,9 @@ async fn start_workflow(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -235,6 +240,9 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
         execution_timeout: None,
         concurrency: None,
         max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
         description: None,
         input_schema: None,
         output_schema: None,
@@ -254,6 +262,9 @@ fn wf_info_with_concurrency(
         execution_timeout: None,
         concurrency: Some(concurrency),
         max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
         description: None,
         input_schema: None,
         output_schema: None,
@@ -337,6 +348,10 @@ async fn insert_detached_child_execution(
             search_attrs: None,
             assigned_build_id: None,
             parent_close_policy: Some(policy.as_str().to_string()),
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         })
         .execute(conn)
         .await
@@ -916,6 +931,10 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             search_attrs: None,
             assigned_build_id: None,
             parent_close_policy: Some(ParentClosePolicy::Abandon.as_str().to_string()),
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         })
         .execute(&mut conn)
         .await

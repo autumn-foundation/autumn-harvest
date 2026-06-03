@@ -12,7 +12,10 @@ pub fn dags() -> Vec<DagInfo> {
     schedule = "0 6 * * *",
     catchup = false,
     max_active_runs = 1,
-    default_queue = "ops"
+    default_queue = "ops",
+    owner = "billing-team",
+    runbook = "https://wiki.acme.com/reconciliation-runbook",
+    severity = "sev2"
 )]
 pub fn billing_reconciliation(dag: &mut DagBuilder) {
     let export = dag.activity(export_billing_events);

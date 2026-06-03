@@ -323,6 +323,9 @@ impl DeferredTriggerStart {
                     start_at: None,
                     delay: None,
                     max_workflow_start_delay: None,
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
                 },
             )
             .await;
@@ -502,6 +505,9 @@ pub fn evaluate_triggers_for_execution<'a>(
                         start_at: None,
                         delay: None,
                         max_workflow_start_delay: None,
+                        owner: None,
+                        runbook_url: None,
+                        severity: None,
                     },
                 )
                 .await?;
@@ -656,6 +662,9 @@ pub async fn enforce_completion_triggers_outbox(
                 start_at: None,
                 delay: None,
                 max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         )
         .await;

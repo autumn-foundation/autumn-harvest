@@ -56,6 +56,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
     "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    "\n",
     include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql")
 );
 
@@ -105,6 +107,10 @@ fn params<'a>(
         idempotency_key: None,
         max_workflow_input_bytes: 0,
         max_signal_payload_bytes: 0,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }
 }
 

@@ -59,6 +59,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
     "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    "\n",
     include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql")
 );
 
@@ -110,6 +112,10 @@ fn delay_registry() -> Arc<HandlerRegistry> {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,
@@ -171,6 +177,10 @@ async fn test_delayed_start_validation() {
             start_at: Some(chrono::Utc::now() + chrono::Duration::seconds(10)),
             delay: Some(chrono::Duration::seconds(10)),
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -210,6 +220,10 @@ async fn test_delayed_start_validation() {
             start_at: Some(chrono::Utc::now() - chrono::Duration::seconds(10)),
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -301,6 +315,10 @@ async fn test_delayed_start_no_premature_dispatch() {
             start_at: None,
             delay: Some(delay_duration),
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -371,6 +389,10 @@ async fn test_delayed_start_cancel_before_firing() {
             start_at: None,
             delay: Some(chrono::Duration::seconds(10)),
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -443,6 +465,10 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             start_at: Some(target_future),
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -488,6 +514,10 @@ async fn test_immediate_start_skew_tolerance() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await

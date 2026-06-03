@@ -307,6 +307,8 @@ mod db_tests {
         "\n",
         include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
         "\n",
+        include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+        "\n",
         include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql")
     );
 
@@ -466,6 +468,10 @@ mod db_tests {
                 search_attrs: None,
                 assigned_build_id: required_build_id.map(str::to_string),
                 parent_close_policy: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
             })
             .execute(conn)
             .await

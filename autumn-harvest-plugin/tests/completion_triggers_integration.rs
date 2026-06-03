@@ -206,6 +206,9 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
             WorkflowInfo {
                 name: "target_wf",
@@ -218,6 +221,9 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
             },
         ],
         vec![],
@@ -391,6 +397,9 @@ async fn test_trigger_evaluations_same_shard() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -481,6 +490,9 @@ async fn test_trigger_input_mapping_static_and_projection() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -549,6 +561,9 @@ async fn test_trigger_input_mapping_static_and_projection() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -639,6 +654,9 @@ async fn test_trigger_state_matching_and_deduplication() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -806,6 +824,9 @@ async fn test_trigger_cross_shard() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -901,6 +922,9 @@ async fn test_completion_trigger_via_worker_run() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -1010,6 +1034,9 @@ async fn test_trigger_with_custom_queue() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -1187,6 +1214,9 @@ async fn test_trigger_outbox_retry_and_sweep() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await
@@ -1389,6 +1419,9 @@ async fn test_trigger_cross_shard_queue_preservation() {
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         },
     )
     .await

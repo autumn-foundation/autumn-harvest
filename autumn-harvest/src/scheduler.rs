@@ -145,6 +145,12 @@ pub struct RegisteredDag {
     pub overlap_policy: OverlapPolicy,
     /// Maximum buffered slots under `BufferAll` (issue #241).
     pub buffer_all_max: u32,
+    /// Team owner metadata (issue #372).
+    pub owner: Option<String>,
+    /// Linked runbook URL metadata (issue #372).
+    pub runbook_url: Option<String>,
+    /// Severity level metadata (issue #372).
+    pub severity: Option<String>,
 }
 
 impl RegisteredDag {
@@ -383,6 +389,9 @@ pub fn compile_dag_catalog(dags: Vec<DagInfo>) -> HarvestResult<DagCatalog> {
                 jitter: dag.jitter,
                 overlap_policy: dag.overlap_policy,
                 buffer_all_max: dag.buffer_all_max,
+                owner: dag.owner.map(ToString::to_string),
+                runbook_url: dag.runbook_url.map(ToString::to_string),
+                severity: dag.severity.map(ToString::to_string),
             },
         );
     }
@@ -632,12 +641,16 @@ pub async fn tick_once_sharded(
 ///
 /// Returns [`HarvestError`] if the DB pool is exhausted or the workflow start
 /// transaction fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn trigger_unified_dag(
     pool: DbPool,
     dag_name: &str,
     run_conf: Option<Value>,
     shard: crate::types::ShardId,
     default_queue: &str,
+    owner: Option<&str>,
+    runbook_url: Option<&str>,
+    severity: Option<&str>,
 ) -> HarvestResult<StartedWorkflowExecution> {
     let mut db = pool
         .get()
@@ -724,6 +737,9 @@ pub async fn trigger_unified_dag(
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
+            owner,
+            runbook_url,
+            severity,
         },
     )
     .await
@@ -1439,6 +1455,7 @@ async fn tick_workflow_schedules(
             now,
             current_shard,
             my_claim_token,
+            registered_dags,
             registry,
             metrics,
         )
@@ -1564,6 +1581,7 @@ async fn tick_one_workflow_schedule(
     now: DateTime<Utc>,
     current_shard: ShardId,
     claim_token: uuid::Uuid,
+    registered_dags: &DagCatalog,
     registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
@@ -2013,14 +2031,33 @@ async fn tick_one_workflow_schedule(
             .workflow_input
             .clone()
             .unwrap_or(serde_json::Value::Null);
-        let (concurrency_key, concurrency_limit) = registry
-            .workflows
-            .get(wf_name)
+        let wf_info = registry.workflows.get(wf_name);
+        let (concurrency_key, concurrency_limit) = wf_info
             .and_then(|info| info.concurrency.as_ref())
             .map_or((None, None), |policy| {
                 let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
                 (key, Some(policy.limit))
             });
+        let (owner, runbook_url, severity) = {
+            let wf_meta = wf_info.map(|info| (info.owner, info.runbook_url, info.severity));
+            let dag_meta = registered_dags.get(wf_name).map(|dag| {
+                (
+                    dag.owner.as_deref(),
+                    dag.runbook_url.as_deref(),
+                    dag.severity.as_deref(),
+                )
+            });
+            match (wf_meta, dag_meta) {
+                (Some((o, r, s)), Some((dag_owner, dag_runbook, dag_severity))) => {
+                    (o.or(dag_owner), r.or(dag_runbook), s.or(dag_severity))
+                }
+                (Some((o, r, s)), None) => (o, r, s),
+                (None, Some((dag_owner, dag_runbook, dag_severity))) => {
+                    (dag_owner, dag_runbook, dag_severity)
+                }
+                (None, None) => (None, None, None),
+            }
+        };
         tracing::info!(
             workflow_name = %wf_name, workflow_id = %workflow_id,
             scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
@@ -2047,6 +2084,9 @@ async fn tick_one_workflow_schedule(
                 start_at: None,
                 delay: None,
                 max_workflow_start_delay: None,
+                owner,
+                runbook_url,
+                severity,
             },
         )
         .await;
@@ -2428,14 +2468,33 @@ async fn drain_buffered_schedule_runs(
                 .workflow_input
                 .clone()
                 .unwrap_or(serde_json::Value::Null);
-            let (concurrency_key, concurrency_limit) = registry
-                .workflows
-                .get(wf_name)
+            let wf_info = registry.workflows.get(wf_name);
+            let (concurrency_key, concurrency_limit) = wf_info
                 .and_then(|info| info.concurrency.as_ref())
                 .map_or((None, None), |policy| {
                     let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
                     (key, Some(policy.limit))
                 });
+            let (owner, runbook_url, severity) = {
+                let wf_meta = wf_info.map(|info| (info.owner, info.runbook_url, info.severity));
+                let dag_meta = registered_dags.get(wf_name).map(|dag| {
+                    (
+                        dag.owner.as_deref(),
+                        dag.runbook_url.as_deref(),
+                        dag.severity.as_deref(),
+                    )
+                });
+                match (wf_meta, dag_meta) {
+                    (Some((o, r, s)), Some((dag_owner, dag_runbook, dag_severity))) => {
+                        (o.or(dag_owner), r.or(dag_runbook), s.or(dag_severity))
+                    }
+                    (Some((o, r, s)), None) => (o, r, s),
+                    (None, Some((dag_owner, dag_runbook, dag_severity))) => {
+                        (dag_owner, dag_runbook, dag_severity)
+                    }
+                    (None, None) => (None, None, None),
+                }
+            };
 
             tracing::info!(
                 workflow_name = %wf_name,
@@ -2466,6 +2525,9 @@ async fn drain_buffered_schedule_runs(
                     start_at: None,
                     delay: None,
                     max_workflow_start_delay: None,
+                    owner,
+                    runbook_url,
+                    severity,
                 },
             )
             .await;

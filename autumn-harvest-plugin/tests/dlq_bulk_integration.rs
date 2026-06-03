@@ -98,6 +98,10 @@ const INIT_SQL: &str = concat!(
     ),
     "\n",
     include_str!(
+        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
+    ),
+    "\n",
+    include_str!(
         "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
     )
 );
@@ -243,6 +247,9 @@ async fn insert_dlq_row(database_url: &str, activity_name: &str, task_type: &str
             input: json!({ "test": true }),
             error: format!("{activity_name} failed"),
             attempts: 3,
+
+            owner: None,
+            severity: None,
         },
     )
     .await

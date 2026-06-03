@@ -36,6 +36,9 @@ diesel::table! {
         assigned_build_id -> Nullable<Text>,
         /// Parent-close policy for detached children (issue #347). NULL for awaited children.
         parent_close_policy -> Nullable<Text>,
+        owner -> Nullable<Text>,
+        runbook_url -> Nullable<Text>,
+        severity -> Nullable<Text>,
     }
 }
 
@@ -216,6 +219,8 @@ diesel::table! {
         error -> Text,
         attempts -> Int4,
         failed_at -> Timestamptz,
+        owner -> Nullable<Text>,
+        severity -> Nullable<Text>,
     }
 }
 

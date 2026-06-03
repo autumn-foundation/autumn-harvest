@@ -101,6 +101,9 @@ pub struct WorkflowExecution {
     pub assigned_build_id: Option<String>,
     /// Parent-close policy for detached children (issue #347). `None` = awaited.
     pub parent_close_policy: Option<String>,
+    pub owner: Option<String>,
+    pub runbook_url: Option<String>,
+    pub severity: Option<String>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -125,6 +128,9 @@ pub struct NewWorkflowExecution<'a> {
     pub assigned_build_id: Option<String>,
     /// Parent-close policy for detached children (issue #347). `None` = awaited.
     pub parent_close_policy: Option<String>,
+    pub owner: Option<&'a str>,
+    pub runbook_url: Option<&'a str>,
+    pub severity: Option<&'a str>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -449,6 +455,8 @@ pub struct DeadLetter {
     pub error: String,
     pub attempts: i32,
     pub failed_at: DateTime<Utc>,
+    pub owner: Option<String>,
+    pub severity: Option<String>,
 }
 
 /// Insert struct for moving a failed task to the dead-letter queue.
@@ -463,6 +471,8 @@ pub struct NewDeadLetter<'a> {
     pub input: serde_json::Value,
     pub error: &'a str,
     pub attempts: i32,
+    pub owner: Option<&'a str>,
+    pub severity: Option<&'a str>,
 }
 
 // ── ExternalTask ──────────────────────────────────────────────────────────────

@@ -2628,6 +2628,10 @@ async fn persist_all_started_child_workflows(
             // Insert rows and enqueue tasks for new children.
             for child in &new_children {
                 let child_workflow_id = child.child_id.to_string();
+                let (owner, runbook_url, severity) = registry
+                    .workflows
+                    .get(child.workflow_name.as_str())
+                    .map_or((None, None, None), |w| (w.owner, w.runbook_url, w.severity));
                 let child_row = NewWorkflowExecution {
                     id: child.child_id.as_uuid(),
                     workflow_name: &child.workflow_name,
@@ -2643,6 +2647,9 @@ async fn persist_all_started_child_workflows(
                     search_attrs: None,
                     assigned_build_id: parent_execution.assigned_build_id.clone(),
                     parent_close_policy: None, // awaited child
+                    owner,
+                    runbook_url,
+                    severity,
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
@@ -3132,6 +3139,10 @@ async fn create_detached_child_executions(
         }
 
         let child_workflow_id = child_id.to_string();
+        let (owner, runbook_url, severity) = registry
+            .workflows
+            .get(workflow_name.as_str())
+            .map_or((None, None, None), |w| (w.owner, w.runbook_url, w.severity));
         let child_row = NewWorkflowExecution {
             id: child_id.as_uuid(),
             workflow_name: workflow_name.as_str(),
@@ -3147,6 +3158,9 @@ async fn create_detached_child_executions(
             search_attrs: None,
             assigned_build_id: parent_execution.assigned_build_id.clone(),
             parent_close_policy: Some(parent_close_policy.as_str().to_string()),
+            owner,
+            runbook_url,
+            severity,
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -4236,6 +4250,9 @@ async fn persist_workflow_continue_as_new(
         search_attrs: execution.search_attrs.clone(),
         assigned_build_id: execution.assigned_build_id.clone(),
         parent_close_policy: None, // root workflow
+        owner: execution.owner.as_deref(),
+        runbook_url: execution.runbook_url.as_deref(),
+        severity: execution.severity.as_deref(),
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
@@ -4676,6 +4693,15 @@ async fn move_workflow_to_dlq_for_history_cap(
     conn.transaction::<(), HarvestError, _>(|conn| {
         let reason = reason.clone();
         async move {
+            use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+            let (owner, severity) = exec_dsl::harvest_workflow_executions
+                .find(exec_id.as_uuid())
+                .select((exec_dsl::owner, exec_dsl::severity))
+                .first::<(Option<String>, Option<String>)>(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+                .unwrap_or((None, None));
             dlq::dead_letter(
                 conn,
                 &NewDeadLetterEntry {
@@ -4687,6 +4713,8 @@ async fn move_workflow_to_dlq_for_history_cap(
                     input: task.input.clone(),
                     error: reason.clone(),
                     attempts: task.attempt,
+                    owner,
+                    severity,
                 },
             )
             .await?;
@@ -6584,6 +6612,9 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
             description: None,
             input_schema: None,
             output_schema: None,

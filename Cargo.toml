@@ -56,3 +56,12 @@ nursery = { level = "warn", priority = -1 }
 
 [patch.crates-io]
 autumn-web = { git = "https://github.com/madmax983/autumn", branch = "feature/outbound-webhooks" }
+
+[profile.dev.package.bollard-stubs]
+opt-level = 2
+debug = false
+
+[profile.dev.package.bollard]
+opt-level = 2
+debug = false
+
