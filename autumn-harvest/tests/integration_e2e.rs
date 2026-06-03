@@ -5711,6 +5711,9 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
