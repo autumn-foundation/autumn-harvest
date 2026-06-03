@@ -32,15 +32,15 @@ use serde_json::Value;
 use autumn_harvest::audit::OP_BATCH_START;
 use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
-    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_DAG_PATCH,
-    OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
-    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_RETENTION_RUN_NOW,
-    OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
-    OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
-    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_DAG,
-    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER,
-    TARGET_WORKFLOW,
+    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_CIRCUIT_FORCE_CLOSE,
+    OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK,
+    OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL,
+    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKER_DRAIN,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
+    OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH,
+    TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY,
+    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -1705,6 +1705,16 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/admin/rate-limits/{key}",
             post(set_rate_limit).route_layer(require_admin.clone()),
         )
+        .route("/admin/circuits", get(list_circuits))
+        .route("/admin/circuits/{activity_name}", get(get_circuit))
+        .route(
+            "/admin/circuits/{activity_name}/force-open",
+            post(force_open_circuit).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/circuits/{activity_name}/force-close",
+            post(force_close_circuit).route_layer(require_admin.clone()),
+        )
         .route("/admin/queues/scaling", get(queues_scaling_signal))
         .route("/admin/metrics", get(prometheus_metrics))
         .route("/admin/history/exports", get(export_workflow_histories))
@@ -1920,6 +1930,10 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/concurrency"),
         ("GET", "/admin/rate-limits"),
         ("POST", "/admin/rate-limits/{key}"),
+        ("GET", "/admin/circuits"),
+        ("GET", "/admin/circuits/{activity_name}"),
+        ("POST", "/admin/circuits/{activity_name}/force-open"),
+        ("POST", "/admin/circuits/{activity_name}/force-close"),
         ("GET", "/admin/queues/scaling"),
         ("GET", "/admin/metrics"),
         ("GET", "/admin/history/exports"),
@@ -2423,6 +2437,52 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/concurrency", None), // Vec<ConcurrencyKeyStats> (external model)
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
+        ("GET", "/admin/circuits", None), // Vec<CircuitSnapshot> (external model)
+        (
+            "GET",
+            "/admin/circuits/{activity_name}",
+            Some(&[
+                "activity_name",
+                "state",
+                "forced_open",
+                "last_trip",
+                "rolling_failure_count",
+                "time_until_probe_secs",
+                "failure_threshold",
+                "window_secs",
+                "cooldown_secs",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/circuits/{activity_name}/force-open",
+            Some(&[
+                "activity_name",
+                "state",
+                "forced_open",
+                "last_trip",
+                "rolling_failure_count",
+                "time_until_probe_secs",
+                "failure_threshold",
+                "window_secs",
+                "cooldown_secs",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/circuits/{activity_name}/force-close",
+            Some(&[
+                "activity_name",
+                "state",
+                "forced_open",
+                "last_trip",
+                "rolling_failure_count",
+                "time_until_probe_secs",
+                "failure_threshold",
+                "window_secs",
+                "cooldown_secs",
+            ]),
+        ),
         ("GET", "/admin/queues/scaling", None),
         ("GET", "/admin/metrics", None),
         (
@@ -10299,6 +10359,127 @@ async fn set_rate_limit(
         let _ = audit::insert_audit(&mut conn, &ar).await;
         Ok(Json(BasicAck { ok: true }))
     }
+}
+
+// ── Circuit Breaker Management (issue #369) ─────────────────────────────────
+
+/// `GET /admin/circuits` — current state of every activity circuit breaker.
+///
+/// Reflects the in-process, per-shard breaker state observed by this runtime's
+/// worker (closed/open/half-open, last-trip timestamp, rolling failure count,
+/// and time-until-probe). Activities without a declared
+/// [`CircuitBreakerPolicy`](autumn_harvest::policy::CircuitBreakerPolicy) are
+/// omitted.
+async fn list_circuits(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<autumn_harvest::circuit_breaker::CircuitSnapshot>>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let breakers = runtime.registry().circuit_breakers();
+    Ok(Json(breakers.list(std::time::Instant::now())))
+}
+
+/// `GET /admin/circuits/{activity_name}` — state of a single breaker.
+///
+/// Returns `404` when the activity has no circuit-breaker policy.
+async fn get_circuit(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(activity_name): Path<String>,
+) -> Result<Json<autumn_harvest::circuit_breaker::CircuitSnapshot>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let breakers = runtime.registry().circuit_breakers();
+    breakers
+        .snapshot(&activity_name, std::time::Instant::now())
+        .map(Json)
+        .ok_or_else(|| {
+            AutumnError::not_found_msg(format!(
+                "no circuit breaker configured for activity '{activity_name}'"
+            ))
+        })
+}
+
+/// `POST /admin/circuits/{activity_name}/force-open` — operator pins the breaker
+/// open for manual incident response. Returns `404` when the activity has no
+/// circuit-breaker policy.
+async fn force_open_circuit(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path(activity_name): Path<String>,
+) -> Result<Json<autumn_harvest::circuit_breaker::CircuitSnapshot>, AutumnError> {
+    force_circuit(&api_state, &headers, &activity_name, true).await
+}
+
+/// `POST /admin/circuits/{activity_name}/force-close` — operator clears any pin
+/// and resets the breaker to closed so normal tracking resumes. Returns `404`
+/// when the activity has no circuit-breaker policy.
+async fn force_close_circuit(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path(activity_name): Path<String>,
+) -> Result<Json<autumn_harvest::circuit_breaker::CircuitSnapshot>, AutumnError> {
+    force_circuit(&api_state, &headers, &activity_name, false).await
+}
+
+async fn force_circuit(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    activity_name: &str,
+    open: bool,
+) -> Result<Json<autumn_harvest::circuit_breaker::CircuitSnapshot>, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let breakers = runtime.registry().circuit_breakers();
+    if !breakers.has_policy(activity_name) {
+        return Err(AutumnError::not_found_msg(format!(
+            "no circuit breaker configured for activity '{activity_name}'"
+        )));
+    }
+    let now = std::time::Instant::now();
+    if open {
+        breakers.force_open(activity_name, now);
+    } else {
+        breakers.force_close(activity_name);
+    }
+
+    // Audit the manual action (best-effort): circuit state itself is in-process,
+    // but the operator decision belongs in the audit trail (#158).
+    let (actor, source, request_id) = audit_context(headers, api_state);
+    let (operation, route) = if open {
+        (
+            OP_CIRCUIT_FORCE_OPEN,
+            "POST /admin/circuits/{activity_name}/force-open",
+        )
+    } else {
+        (
+            OP_CIRCUIT_FORCE_CLOSE,
+            "POST /admin/circuits/{activity_name}/force-close",
+        )
+    };
+    if let Ok(pool) = api_state.storage_pool()
+        && let Ok(mut conn) = pool.default_pool().get().await
+    {
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation,
+            target_type: TARGET_CIRCUIT,
+            target_id: Some(activity_name),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+    }
+
+    breakers
+        .snapshot(activity_name, now)
+        .map(Json)
+        .ok_or_else(|| {
+            AutumnError::not_found_msg(format!(
+                "no circuit breaker configured for activity '{activity_name}'"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------

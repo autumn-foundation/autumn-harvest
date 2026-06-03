@@ -1324,9 +1324,16 @@ impl WorkflowContext {
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
 
-            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+            HistoryMatch::Failed {
+                error,
+                attempt,
+                error_type,
+                details,
+            } => Err(HarvestError::ActivityFailed {
                 name: name.to_string(),
                 attempt,
+                error_type,
+                details,
                 source: error.into(),
             }),
 
@@ -1347,11 +1354,7 @@ impl WorkflowContext {
                 });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
-                        name: name.to_string(),
-                        attempt: 1,
-                        source: error.into(),
-                    }),
+                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "activity '{name}' cancelled: result channel dropped"
                     ))),
@@ -1412,11 +1415,7 @@ impl WorkflowContext {
                 // Suspend the coroutine until the worker resolves this activity.
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
-                        name: name.to_string(),
-                        attempt: 1,
-                        source: error.into(),
-                    }),
+                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "activity '{name}' cancelled: result channel dropped"
                     ))),
@@ -1446,9 +1445,16 @@ impl WorkflowContext {
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
-            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+            HistoryMatch::Failed {
+                error,
+                attempt,
+                error_type,
+                details,
+            } => Err(HarvestError::ActivityFailed {
                 name: name.to_string(),
                 attempt,
+                error_type,
+                details,
                 source: error.into(),
             }),
             HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
@@ -1466,11 +1472,7 @@ impl WorkflowContext {
                 });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
-                        name: name.to_string(),
-                        attempt: 1,
-                        source: error.into(),
-                    }),
+                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "activity '{name}' cancelled: result channel dropped"
                     ))),
@@ -1522,11 +1524,7 @@ impl WorkflowContext {
                 });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
-                        name: name.to_string(),
-                        attempt: 1,
-                        source: error.into(),
-                    }),
+                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "activity '{name}' cancelled: result channel dropped"
                     ))),
@@ -1577,9 +1575,16 @@ impl WorkflowContext {
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
 
-            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+            HistoryMatch::Failed {
+                error,
+                attempt,
+                error_type,
+                details,
+            } => Err(HarvestError::ActivityFailed {
                 name: name.to_string(),
                 attempt,
+                error_type,
+                details,
                 source: error.into(),
             }),
 
@@ -1627,11 +1632,7 @@ impl WorkflowContext {
                     let error = last_error.unwrap_or_else(|| {
                         format!("local activity '{name}' failed after {failed_attempts} attempts")
                     });
-                    return Err(HarvestError::ActivityFailed {
-                        name: name.to_string(),
-                        attempt: failed_attempts,
-                        source: error.into(),
-                    });
+                    return Err(HarvestError::activity_failed(name, failed_attempts, &error));
                 }
 
                 // Some retry attempts remain — push the command so the worker
@@ -1650,11 +1651,11 @@ impl WorkflowContext {
                 });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
-                        name: name.to_string(),
-                        attempt: failed_attempts.max(1),
-                        source: error.into(),
-                    }),
+                    Ok(Err(error)) => Err(HarvestError::activity_failed(
+                        name,
+                        failed_attempts.max(1),
+                        &error,
+                    )),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "local activity '{name}' cancelled: result channel dropped"
                     ))),
@@ -1700,11 +1701,7 @@ impl WorkflowContext {
 
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
-                        name: name.to_string(),
-                        attempt: 1,
-                        source: error.into(),
-                    }),
+                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "local activity '{name}' cancelled: result channel dropped"
                     ))),
@@ -1796,9 +1793,16 @@ impl WorkflowContext {
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
-            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+            HistoryMatch::Failed {
+                error,
+                attempt,
+                error_type,
+                details,
+            } => Err(HarvestError::ActivityFailed {
                 name: format!("child-workflow:{workflow_name}"),
                 attempt,
+                error_type,
+                details,
                 source: error.into(),
             }),
             HistoryMatch::TimedOut { .. }
@@ -1838,11 +1842,11 @@ impl WorkflowContext {
                 });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
-                        name: format!("child-workflow:{workflow_name}"),
-                        attempt: 1,
-                        source: error.into(),
-                    }),
+                    Ok(Err(error)) => Err(HarvestError::activity_failed(
+                        format!("child-workflow:{workflow_name}"),
+                        1,
+                        &error,
+                    )),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "child workflow '{workflow_name}' cancelled: result channel dropped"
                     ))),
@@ -1876,11 +1880,11 @@ impl WorkflowContext {
 
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
-                        name: format!("child-workflow:{workflow_name}"),
-                        attempt: 1,
-                        source: error.into(),
-                    }),
+                    Ok(Err(error)) => Err(HarvestError::activity_failed(
+                        format!("child-workflow:{workflow_name}"),
+                        1,
+                        &error,
+                    )),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "child workflow '{workflow_name}' cancelled: result channel dropped"
                     ))),
@@ -2750,9 +2754,16 @@ impl WorkflowContext {
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
 
-            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+            HistoryMatch::Failed {
+                error,
+                attempt,
+                error_type,
+                details,
+            } => Err(HarvestError::ActivityFailed {
                 name: name.to_string(),
                 attempt,
+                error_type,
+                details,
                 source: error.into(),
             }),
 
@@ -2781,11 +2792,7 @@ impl WorkflowContext {
                 });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
-                        name: name.to_string(),
-                        attempt: 1,
-                        source: error.into(),
-                    }),
+                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "external activity '{name}' cancelled: result channel dropped"
                     ))),
@@ -2810,11 +2817,7 @@ impl WorkflowContext {
                 });
                 match rx.await {
                     Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
-                        name: name.to_string(),
-                        attempt: 1,
-                        source: error.into(),
-                    }),
+                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
                     Err(_) => Err(HarvestError::Cancelled(format!(
                         "external activity '{name}' cancelled: result channel dropped"
                     ))),
@@ -4689,6 +4692,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_replays_circuit_open_failure_with_typed_metadata() {
+        // Consumability (issue #369): a replayed CircuitOpen ActivityFailed must
+        // surface its typed error_type and details to workflow code, not just a
+        // human message — so workflows can branch on `is_circuit_open()` and read
+        // `retry_after_secs` deterministically on replay.
+        let activity_id = ActivityExecId::new();
+        let failure = crate::failure::ActivityFailure::circuit_open(
+            "charge_card",
+            None,
+            Some(std::time::Duration::from_secs(45)),
+        );
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge_card".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: failure.message.clone(),
+                attempt: 1,
+                error_type: failure.error_type.clone(),
+                non_retryable: true,
+                details: failure.details.clone(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let err = ctx
+            .execute_activity_raw("charge_card", Value::Null, "default")
+            .await
+            .expect_err("replay must reproduce the CircuitOpen failure");
+
+        assert_eq!(err.activity_error_type(), Some("CircuitOpen"));
+        assert!(err.is_circuit_open());
+        let details = err
+            .activity_details()
+            .expect("CircuitOpen failure carries structured details on replay");
+        assert!((details["retry_after_secs"].as_f64().unwrap() - 45.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
     async fn context_replays_timed_out_activity() {
         let activity_id = ActivityExecId::new();
 
@@ -6301,6 +6351,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }

@@ -174,6 +174,18 @@ pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 /// (`"poison_pill"`). `execution.id` stays span-only per ADR-0001 §7.
 pub const METRIC_TASK_QUARANTINED: &str = "harvest.task.quarantined";
 
+/// Counter: incremented each time an activity's circuit breaker trips open
+/// (closed → open) or re-opens after a failed half-open probe (issue #369).
+///
+/// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
+pub const METRIC_CIRCUIT_TRIPPED: &str = "harvest.activity.circuit.tripped";
+
+/// Counter: incremented each time an activity's circuit breaker recovers to the
+/// closed state after a successful half-open probe (issue #369).
+///
+/// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
+pub const METRIC_CIRCUIT_CLOSED: &str = "harvest.activity.circuit.closed";
+
 /// Histogram: observed payload size in bytes at each write boundary (issue #252).
 ///
 /// Emitted for every payload written to `harvest_events`, regardless of whether
@@ -243,6 +255,9 @@ pub const METRIC_LABEL_WORKFLOW: &str = "workflow";
 pub const METRIC_LABEL_WORKFLOW_TYPE: &str = "workflow.type";
 /// Metric label: the activity name.
 pub const METRIC_LABEL_ACTIVITY: &str = "activity";
+/// Metric label: the activity name, dotted form used by circuit-breaker
+/// counters (issue #369) to match the ADR-0001 `activity.name` attribute.
+pub const METRIC_LABEL_ACTIVITY_NAME: &str = "activity.name";
 /// Metric label: the task queue name.
 pub const METRIC_LABEL_QUEUE: &str = "queue";
 /// Metric label: terminal outcome status (e.g. `"completed"`, `"failed"`).
@@ -755,6 +770,22 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.task.quarantined{queue, reason}`.
     fn record_task_quarantined(&self, queue: &str, reason: &str) {
         let _ = (queue, reason);
+    }
+
+    /// An activity's circuit breaker tripped open or re-opened after a failed
+    /// half-open probe (issue #369).
+    ///
+    /// Maps to the counter `harvest.activity.circuit.tripped{activity.name}`.
+    fn record_circuit_tripped(&self, activity_name: &str) {
+        let _ = activity_name;
+    }
+
+    /// An activity's circuit breaker recovered to closed after a successful
+    /// half-open probe (issue #369).
+    ///
+    /// Maps to the counter `harvest.activity.circuit.closed{activity.name}`.
+    fn record_circuit_closed(&self, activity_name: &str) {
+        let _ = activity_name;
     }
 
     /// A payload was observed at a write boundary (issue #252).

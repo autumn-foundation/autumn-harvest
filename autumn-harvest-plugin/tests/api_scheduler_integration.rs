@@ -415,6 +415,7 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        circuit_breaker: None,
         handler: record_activity,
     }
 }
@@ -436,6 +437,7 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        circuit_breaker: None,
         handler: wait_on_barrier_activity,
     }
 }
@@ -3162,6 +3164,7 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -3227,6 +3230,7 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
             std::time::Duration::from_secs(5),
             &None,
             &[],
+            None,
         )
         .await
     });
@@ -4623,6 +4627,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: record_activity,
         }],
         Arc::new(state),

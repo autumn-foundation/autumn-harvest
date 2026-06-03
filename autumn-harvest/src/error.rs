@@ -108,6 +108,15 @@ pub enum HarvestError {
         name: String,
         /// The attempt number that failed.
         attempt: u32,
+        /// The stable, low-cardinality error-type class carried by the failure
+        /// (issue #227 / #369), e.g. `"CircuitOpen"`, `"InvalidInput"`, or the
+        /// `"Error"` fallback for legacy `Err(String)` failures. Lets workflow
+        /// code branch on the failure class without parsing the human message.
+        error_type: String,
+        /// Optional structured details carried by a typed `ActivityFailure`
+        /// (e.g. `retry_after_secs` / `forced` for a `CircuitOpen` failure).
+        /// `None` for legacy or detail-less failures.
+        details: Option<serde_json::Value>,
         /// The underlying error source.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -333,6 +342,62 @@ pub enum HarvestError {
     },
 }
 
+impl HarvestError {
+    /// Build an [`ActivityFailed`](HarvestError::ActivityFailed) from a recorded
+    /// failure payload, decoding the typed `error_type` / `details` (issue #227
+    /// / #369) so workflow code can branch on the failure class without parsing
+    /// the human message.
+    ///
+    /// `payload` is the engine-internal failure string (a typed `ActivityFailure`
+    /// wire envelope, or a legacy `Err(String)` which maps to `error_type =
+    /// "Error"`). The `source` is the human-readable message.
+    #[must_use]
+    pub fn activity_failed(name: impl Into<String>, attempt: u32, payload: &str) -> Self {
+        let failure = crate::failure::parse_error_payload_full(payload);
+        Self::ActivityFailed {
+            name: name.into(),
+            attempt,
+            error_type: failure.error_type,
+            details: failure.details,
+            source: failure.message.into(),
+        }
+    }
+
+    /// If this is an [`ActivityFailed`](HarvestError::ActivityFailed), return its
+    /// stable error-type class (e.g. `"CircuitOpen"`). `None` for other variants.
+    ///
+    /// Lets workflow code branch on the failure class:
+    /// ```rust,ignore
+    /// if err.activity_error_type() == Some("CircuitOpen") { /* compensate */ }
+    /// ```
+    #[must_use]
+    pub const fn activity_error_type(&self) -> Option<&str> {
+        match self {
+            Self::ActivityFailed { error_type, .. } => Some(error_type.as_str()),
+            _ => None,
+        }
+    }
+
+    /// If this is an [`ActivityFailed`](HarvestError::ActivityFailed), return the
+    /// structured `details` carried by a typed failure (e.g. `retry_after_secs`
+    /// / `forced` for a `CircuitOpen`). `None` for other variants or detail-less
+    /// failures.
+    #[must_use]
+    pub const fn activity_details(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::ActivityFailed { details, .. } => details.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// `true` if this is an activity failure synthesised because the activity's
+    /// circuit breaker was open (issue #369).
+    #[must_use]
+    pub fn is_circuit_open(&self) -> bool {
+        self.activity_error_type() == Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN)
+    }
+}
+
 /// Standard result type for internal harvest engine operations.
 pub type HarvestResult<T> = Result<T, HarvestError>;
 
@@ -474,12 +539,40 @@ mod tests {
         let e = HarvestError::ActivityFailed {
             name: "test_activity".into(),
             attempt: 3,
+            error_type: "Error".into(),
+            details: None,
             source: Box::new(std::io::Error::other("io error")),
         };
         let msg = e.to_string();
         assert!(msg.contains("test_activity"));
         assert!(msg.contains("attempt 3"));
         assert!(msg.contains("io error"));
+    }
+
+    #[test]
+    fn activity_failed_decodes_typed_circuit_open_payload() {
+        use crate::failure::{ActivityFailure, IntoActivityErrorString};
+        let payload = ActivityFailure::circuit_open(
+            "charge_card",
+            None,
+            Some(std::time::Duration::from_secs(30)),
+        )
+        .into_error_payload();
+        let e = HarvestError::activity_failed("charge_card", 1, &payload);
+        assert_eq!(e.activity_error_type(), Some("CircuitOpen"));
+        assert!(e.is_circuit_open());
+        let details = e.activity_details().expect("CircuitOpen carries details");
+        assert!((details["retry_after_secs"].as_f64().unwrap() - 30.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn activity_failed_legacy_string_is_error_type_error() {
+        let e = HarvestError::activity_failed("send_email", 2, "connection refused");
+        assert_eq!(e.activity_error_type(), Some("Error"));
+        assert!(!e.is_circuit_open());
+        assert!(e.activity_details().is_none());
+        // The human message is preserved as the source.
+        assert!(e.to_string().contains("connection refused"));
     }
 
     #[test]

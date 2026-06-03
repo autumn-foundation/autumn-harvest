@@ -187,6 +187,12 @@ pub struct ActivityInfo {
     /// Rate limit bucket key. Multiple activities sharing a key share the
     /// rate limit. Defaults to the activity's own name when rate limits are set.
     pub rate_limit_key: Option<&'static str>,
+    /// Optional circuit-breaker policy (issue #369). When set, the worker
+    /// fast-fails dispatches of this activity with a non-retryable
+    /// `"CircuitOpen"` failure while the breaker is open. `None` retains
+    /// today's behaviour (no breaker; the full retry policy applies). Declared
+    /// via `#[activity(circuit_breaker = CircuitBreakerPolicy::new(...))]`.
+    pub circuit_breaker: Option<crate::policy::CircuitBreakerPolicy>,
     /// Type-erased dispatch function.
     pub handler: ActivityHandlerFn,
 }
@@ -328,6 +334,7 @@ impl std::fmt::Debug for ActivityInfo {
             .field("rate_limit_rps", &self.rate_limit_rps)
             .field("rate_limit_burst", &self.rate_limit_burst)
             .field("rate_limit_key", &self.rate_limit_key)
+            .field("circuit_breaker", &self.circuit_breaker)
             .field("handler", &"<fn>")
             .finish()
     }
@@ -442,6 +449,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert!(info.default_retry_policy.is_none());
@@ -469,6 +477,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert!(info.is_local);
@@ -504,6 +513,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert_eq!(info.max_concurrent, Some(5));
@@ -581,6 +591,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         let debug_str = format!("{activity_info:?}");

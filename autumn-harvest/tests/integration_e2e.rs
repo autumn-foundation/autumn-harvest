@@ -1120,7 +1120,7 @@ async fn full_workflow_lifecycle() {
 
     // 4. Claim the task
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "worker-e2e-1", "", None)
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-e2e-1", "", None, &[])
         .await
         .expect("claim_task failed");
     let claimed = claimed.expect("no task claimed");
@@ -1194,7 +1194,7 @@ async fn claim_task_returns_none_on_empty_queue() {
     let (mut conn, _container) = setup_test_db().await;
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1", "", None)
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1", "", None, &[])
         .await
         .expect("claim_task failed");
     assert!(
@@ -1485,6 +1485,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -1624,6 +1625,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -1729,6 +1731,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     rate_limit_rps: None,
                     rate_limit_burst: None,
                     rate_limit_key: None,
+                    circuit_breaker: None,
                     is_local: false,
                     max_input_bytes: None,
                     max_result_bytes: None,
@@ -1828,10 +1831,11 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .expect("enqueue parked workflow task failed");
 
     let default_queues = vec!["default".to_string()];
-    let claimed_workflow = queue::claim_task(&mut conn, &default_queues, "parked-worker", "", None)
-        .await
-        .expect("claim parked workflow task failed")
-        .expect("workflow task should be claimable");
+    let claimed_workflow =
+        queue::claim_task(&mut conn, &default_queues, "parked-worker", "", None, &[])
+            .await
+            .expect("claim parked workflow task failed")
+            .expect("workflow task should be claimable");
     assert_eq!(claimed_workflow.id, workflow_task_id);
     assert_eq!(claimed_workflow.state, "RUNNING");
     queue::park_workflow_task(&mut conn, workflow_task_id, None)
@@ -1857,6 +1861,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         std::time::Duration::from_secs(5),
         &None,
         &[],
+        None,
     )
     .await
     .expect("timeout enforcement should succeed");
@@ -1967,6 +1972,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     rate_limit_rps: None,
                     rate_limit_burst: None,
                     rate_limit_key: None,
+                    circuit_breaker: None,
                     is_local: false,
                     max_input_bytes: None,
                     max_result_bytes: None,
@@ -2512,6 +2518,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -2653,7 +2660,7 @@ async fn wake_workflow_task_emits_notification() {
         .expect("enqueue should succeed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "wake-test-worker", "", None)
+    let claimed = queue::claim_task(&mut conn, &queues, "wake-test-worker", "", None, &[])
         .await
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
@@ -2699,7 +2706,7 @@ async fn wake_workflow_task_does_not_requeue_active_running_task() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "active-worker", "", None)
+    let claimed = queue::claim_task(&mut conn, &queues, "active-worker", "", None, &[])
         .await
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
@@ -2739,7 +2746,7 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker", "", None)
+    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker", "", None, &[])
         .await
         .expect("claim should succeed")
         .expect("activity task should be claimable");
@@ -3124,6 +3131,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -3270,7 +3278,7 @@ async fn claim_task_prefers_sticky_worker_within_window() {
         .expect("enqueue pinned task failed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker", "", None)
+    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker", "", None, &[])
         .await
         .expect("claim should succeed")
         .expect("sticky worker should get its pinned task");
@@ -3279,7 +3287,7 @@ async fn claim_task_prefers_sticky_worker_within_window() {
         "sticky worker should claim its pinned task ahead of the higher-priority free task",
     );
 
-    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker", "", None)
+    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker", "", None, &[])
         .await
         .expect("second claim should succeed")
         .expect("other worker should pick up the free task");
@@ -3304,7 +3312,7 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
 
     let queues = vec!["default".to_string()];
     // Different worker must not steal a fresh sticky pin.
-    let claimed = queue::claim_task(&mut conn, &queues, "interloper", "", None)
+    let claimed = queue::claim_task(&mut conn, &queues, "interloper", "", None, &[])
         .await
         .expect("claim should succeed");
     assert!(
@@ -3313,7 +3321,7 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
     );
 
     // The owner can still claim it.
-    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker", "", None)
+    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker", "", None, &[])
         .await
         .expect("owner claim should succeed")
         .expect("owner should be able to claim its pinned task");
@@ -3342,7 +3350,7 @@ async fn claim_task_falls_back_to_any_worker_after_sticky_expires() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "", None)
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "", None, &[])
         .await
         .expect("claim should succeed")
         .expect("any worker may claim after sticky_until expires");
@@ -3385,7 +3393,7 @@ async fn claim_task_treats_expired_sticky_rows_like_unpinned_rows() {
         .expect("enqueue free task failed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "", None)
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "", None, &[])
         .await
         .expect("claim should succeed")
         .expect("one of the eligible tasks should be claimed");
@@ -3407,7 +3415,7 @@ async fn park_workflow_task_with_sticky_hint_pins_to_worker() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker", "", None)
+    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker", "", None, &[])
         .await
         .expect("claim should succeed")
         .expect("row should be claimable");
@@ -3450,7 +3458,7 @@ async fn wake_workflow_task_refreshes_sticky_until() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker", "", None)
+    let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker", "", None, &[])
         .await
         .expect("claim should succeed");
     // Use a 5s window so both the park's sticky_until and the wake's refreshed
@@ -4220,17 +4228,17 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
             .expect("enqueue failed");
     }
 
-    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None)
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[])
         .await
         .expect("claim 1 query failed");
-    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None)
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[])
         .await
         .expect("claim 2 query failed");
     assert!(t1.is_some(), "first claim should succeed");
     assert!(t2.is_some(), "second claim should succeed");
 
     // Cap is now saturated — third claim must be deferred.
-    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None)
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[])
         .await
         .expect("claim 3 query failed");
     assert!(
@@ -4244,7 +4252,7 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
         .expect("complete_task failed");
 
     // Now a slot is free; one more task should be claimable.
-    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None)
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[])
         .await
         .expect("claim after complete query failed");
     assert!(
@@ -4296,7 +4304,7 @@ async fn concurrency_cap_shared_key_budget_is_not_doubled() {
     // Attempt to claim all 6; the shared budget of 3 should cap the total.
     let mut claimed = 0usize;
     for _ in 0..6 {
-        if queue::claim_task(&mut conn, &queues, "worker-sk-1", "", None)
+        if queue::claim_task(&mut conn, &queues, "worker-sk-1", "", None, &[])
             .await
             .expect("claim query failed")
             .is_some()
@@ -4331,17 +4339,17 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
     }
 
     // Claim 2 (saturating the cap).
-    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None)
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[])
         .await
         .expect("claim 1 query failed")
         .expect("first task should be claimable");
-    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None)
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[])
         .await
         .expect("claim 2 query failed")
         .expect("second task should be claimable");
 
     // Cap is now saturated.
-    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None)
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[])
         .await
         .expect("claim 3 query failed");
     assert!(t3.is_none(), "cap must be saturated after 2 claims");
@@ -4355,10 +4363,10 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
         .expect("fail t2 failed");
 
     // The queue must not be wedged; the remaining pending tasks must be claimable.
-    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None)
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[])
         .await
         .expect("claim after fail query failed");
-    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None)
+    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[])
         .await
         .expect("claim 5 query failed");
     assert!(
@@ -4391,13 +4399,13 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
             .await
             .expect("enqueue capped task failed");
         // Immediately claim each to put it in RUNNING state.
-        queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None)
+        queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[])
             .await
             .expect("claim capped task failed");
     }
 
     // Verify the key is saturated (third claim returns None).
-    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None)
+    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[])
         .await
         .expect("saturation check query failed");
     assert!(
@@ -4421,7 +4429,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
     // is at its cap — the NULL check-path must not be constrained by other keys.
     let mut claimed = 0usize;
     for _ in 0..3 {
-        if queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None)
+        if queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[])
             .await
             .expect("uncapped claim query failed")
             .is_some()
@@ -5506,6 +5514,16 @@ fn always_legacy_string_failure_activity<'a>(
     Box::pin(async move { Err("foo".to_string()) })
 }
 
+/// Activity handler that always fails with a *retryable* error, simulating a
+/// downstream outage (issue #369). The circuit breaker should observe these
+/// failures and trip, after which the worker short-circuits dispatch.
+fn always_retryable_failure_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Err("downstream is down".to_string()) })
+}
+
 /// End-to-end fail-fast for a typed `ActivityFailure` flagged `non_retryable`:
 /// the activity must fail on attempt 1 (skipping the retry policy entirely),
 /// the `ActivityFailed` event in history must carry the structured
@@ -5576,6 +5594,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -5647,6 +5666,128 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
     assert_eq!(execution.state, "FAILED");
 }
 
+/// End-to-end circuit breaker (issue #369): an activity configured with a
+/// `CircuitBreakerPolicy` (threshold 1) against a downstream that is hard-down.
+///
+/// Attempt 1 dispatches normally (breaker closed) and fails with a retryable
+/// error, which trips the breaker. Attempt 2 (the retry) is short-circuited by
+/// the open breaker and recorded as a non-retryable `ActivityFailed` with
+/// `error_type = "CircuitOpen"`, terminating the workflow without burning the
+/// rest of the retry curve. The `CircuitOpen` failure lives in the workflow's
+/// own event history exactly like any other activity failure, so replay
+/// reproduces the same outcome regardless of breaker state at replay time
+/// (no new `WorkflowEvent` variant is introduced).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn circuit_breaker_short_circuits_after_tripping() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"to": "alice@example.com"});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_activity,
+            execution_timeout: None,
+            concurrency: None,
+            max_input_bytes: None,
+        }],
+        vec![ActivityInfo {
+            name: "send_email",
+            module: "integration_e2e",
+            // Allow up to 5 retries — but the breaker (threshold 1) trips on the
+            // first failure and short-circuits the retry as a CircuitOpen.
+            default_retry_policy: Some(autumn_harvest::RetryPolicy::exponential(
+                5,
+                Duration::from_millis(10),
+            )),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            // Trip after a single failure; long cooldown so it stays open.
+            circuit_breaker: Some(autumn_harvest::policy::CircuitBreakerPolicy::new(
+                1,
+                Duration::from_secs(60),
+                Duration::from_secs(300),
+            )),
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            handler: always_retryable_failure_activity,
+        }],
+    ));
+
+    let worker = build_runtime_worker("worker-circuit-breaker", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+
+    // The breaker short-circuited a dispatch: history carries a non-retryable
+    // ActivityFailed with error_type "CircuitOpen".
+    let circuit_open = history
+        .events
+        .iter()
+        .find_map(|ev| match ev {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                ..
+            } if error_type == "CircuitOpen" => Some(*non_retryable),
+            _ => None,
+        })
+        .expect("history must contain a CircuitOpen ActivityFailed once the breaker trips");
+    assert!(
+        circuit_open,
+        "CircuitOpen failures must be non-retryable terminal for the in-flight attempt"
+    );
+
+    // The breaker prevented the full retry curve from running: far fewer than
+    // the 5 configured attempts were dispatched (attempt 1 ran, the rest were
+    // short-circuited terminally).
+    let activity_started = history
+        .events
+        .iter()
+        .filter(|ev| matches!(ev, WorkflowEvent::ActivityStarted { .. }))
+        .count();
+    assert!(
+        activity_started <= 2,
+        "breaker must curb retries; saw {activity_started} ActivityStarted events"
+    );
+
+    assert_eq!(execution.state, "FAILED");
+}
+
 /// Back-compat mirror: an activity returning a legacy `Err("foo")` short-
 /// circuits retries when `RetryPolicy::non_retryable_errors` contains `"foo"`,
 /// exactly as before #227. Confirms the legacy resolution path is still
@@ -5707,6 +5848,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -6375,6 +6517,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         "test-worker-timeout",
         "",
         None,
+        &[],
     )
     .await
     .expect("claim task failed")
@@ -6498,9 +6641,16 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
 
     loop {
         // Try to claim one more task.
-        let claimed = queue::claim_task(&mut conn, &queues, "test-worker-concurrency-a", "", None)
-            .await
-            .expect("claim query failed");
+        let claimed = queue::claim_task(
+            &mut conn,
+            &queues,
+            "test-worker-concurrency-a",
+            "",
+            None,
+            &[],
+        )
+        .await
+        .expect("claim query failed");
 
         if let Some(task) = claimed {
             held.push(task.id);
@@ -6526,13 +6676,20 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
 
         // Drain any tasks that can still be claimed immediately.
         if held.len() < LIMIT as usize
-            && queue::claim_task(&mut conn, &queues, "test-worker-concurrency-a", "", None)
-                .await
-                .expect("claim query failed")
-                .is_some_and(|t| {
-                    held.push(t.id);
-                    true
-                })
+            && queue::claim_task(
+                &mut conn,
+                &queues,
+                "test-worker-concurrency-a",
+                "",
+                None,
+                &[],
+            )
+            .await
+            .expect("claim query failed")
+            .is_some_and(|t| {
+                held.push(t.id);
+                true
+            })
         {
             // extra claim consumed above
         }
@@ -6602,7 +6759,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
     }
 
     // Saturate the loud key: claim 1 loud task (cap=1 → saturated).
-    let loud_task = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None)
+    let loud_task = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[])
         .await
         .expect("claim 1 query failed")
         .expect("first loud task should be claimable");
@@ -6619,7 +6776,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
     let mut quiet_claimed = 0u32;
     let mut attempts = 0u32;
     while quiet_claimed < 2 && attempts < 10 {
-        if let Some(task) = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None)
+        if let Some(task) = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[])
             .await
             .expect("claim query failed")
         {
@@ -6651,7 +6808,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
         .await
         .expect("complete loud task failed");
 
-    let next_loud = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None)
+    let next_loud = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[])
         .await
         .expect("claim after complete query failed");
     assert!(
