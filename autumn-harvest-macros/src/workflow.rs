@@ -24,6 +24,9 @@ struct WorkflowAttrs {
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
     max_input_bytes: Option<u64>,
+    /// Human-readable description for operator/UI discovery (issue #373).
+    /// Parsed from `#[workflow(description = "...")]`.
+    description: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
@@ -31,6 +34,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         execution_timeout: None,
         concurrency: None,
         max_input_bytes: None,
+        description: None,
     };
 
     syn::meta::parser(|meta| {
@@ -82,9 +86,13 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             })?;
             result.max_input_bytes = Some(bytes);
             Ok(())
+        } else if meta.path.is_ident("description") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.description = Some(value.value());
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `concurrency`, or `max_input_bytes`",
+                "unsupported attribute: expected `execution_timeout`, `concurrency`, `max_input_bytes`, or `description`",
             ))
         }
     })
@@ -201,6 +209,11 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .max_input_bytes
         .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
 
+    let description_expr = attrs.description.as_deref().map_or_else(
+        || quote! { ::std::option::Option::None },
+        |s| quote! { ::std::option::Option::Some(#s) },
+    );
+
     let camel_name = to_pascal_case(&fn_name_str);
     let stub_name = format_ident!("{}Stub", camel_name);
     let ok_type = extract_ok_type(&input_fn.sig.output);
@@ -230,6 +243,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 execution_timeout: #execution_timeout_expr,
                 concurrency: #concurrency_expr,
                 max_input_bytes: #max_input_bytes_expr,
+                description: #description_expr,
+                input_schema: ::std::option::Option::None,
+                output_schema: ::std::option::Option::None,
+                error_schema: ::std::option::Option::None,
             }
         }
 

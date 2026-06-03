@@ -24,6 +24,9 @@ db = [
 ]
 testing = []
 metrics-rs = ["dep:metrics"]
+# Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
+# generation from types that derive `schemars::JsonSchema` (issue #373).
+schema = ["dep:schemars"]
 
 [dependencies]
 autumn-harvest-macros = { version = "0.3.0", path = "../autumn-harvest-macros" }
@@ -48,6 +51,7 @@ diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 metrics = { version = "0.24", optional = true }
+schemars = { version = "0.8", optional = true }
 
 [[test]]
 name = "macros_query_handlers"
@@ -126,6 +130,10 @@ name = "collect_approvals"
 [[example]]
 name = "fanout_batch"
 
+[[example]]
+name = "schema_workflow"
+required-features = ["schema"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
@@ -136,6 +144,7 @@ criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
+schemars = { version = "0.8" }
 
 [[test]]
 name = "replay_verifier_tests"

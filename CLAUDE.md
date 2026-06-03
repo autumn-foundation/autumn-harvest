@@ -73,6 +73,7 @@ Two crates in the workspace. `autumn-harvest` is the public library. `autumn-har
 - **Phase 3.16** (implemented): DAG retry-from-failed-node operator surface — see issue #366. New management route `POST /api/harvest/dags/{dag_name}/runs/{run_exec_id}/retry` (handler `retry_dag_run` in `api.rs`) and pure resolver `autumn-harvest-plugin/src/dag_retry.rs` (`resolve_retry_plan`, `downstream_closure`, `node_outcome`). The endpoint resolves `(dag_name, run_exec_id, from_nodes)` → `reset_to_event_id = earliest_reexecute_schedule - 1` by walking the registered `DagDefinition` (node name == activity name) and the recorded history, then delegates to the existing #148 reset internals. **No new core primitive, no new `WorkflowEvent` variant, no migration.** The only core change is an opt-in `WorkflowResetRequest.allow_terminal_source` flag (`#[serde(default)]` false) so a terminal *failed* DAG run can be forked; `validate_source_execution` accepts `FAILED`/`CANCELLED`/`TIMED_OUT` only when set. Reset `reason` is augmented with `dag_retry: nodes=[...]` for the audit trail (#158); audit op `OP_DAG_RETRY = "dag.retry"`. Semantics are level-granular (operator choice): retrying any node auto-widens to its full execution level + downstream closure, so the cut lands on the clean boundary before the level and the failed node's same-level siblings re-run with it (no "name the succeeded sibling to widen" dead-end). A `409` is returned only when the fork point lands inside an unresolved *upstream* side effect (the #148 validator rejects it). Ambiguous requests (a node name that maps to >1 task because the DAG reuses the activity) are rejected `400`. `WorkflowResetRequest.allow_terminal_source` is `#[serde(skip)]` so it cannot be enabled from the public reset endpoint body. Source-state gating: `COMPLETED` → `409`, `RUNNING`/`SUSPENDED` → `409`, classic DAGs → `400`. CLI `dag retry` subcommand. Runbook `docs/runbooks/dag-retry-from-failed-node.md`. Tests: resolver unit tests in `dag_retry.rs`, HTTP+worker integration tests in `autumn-harvest-plugin/tests/dag_retry_integration.rs`, CLI mapping/coverage tests.
 - **Phase 3.17** (implemented): Poison-pill task quarantine — see issue #367. A poison-pill task crashes the worker *process* (panic, OOM, segfault, hard exit) rather than returning a clean `Err`, leaving its row stuck in `RUNNING`; SKIP LOCKED re-claim then cascades the crash across the fleet. New `poison_pill.rs` module: pure `quarantine_decision(strikes_after_increment, threshold) -> ReclaimAction` (no DB dependency, unit-tested without `db`); `orphaned_running_tasks_query()` selects `RUNNING` rows whose `worker_id` has no live `harvest_workers` heartbeat (authoritative liveness signal — reclaim does **not** depend on per-task `start_to_close`/`heartbeat_timeout`, so an un-timed orphan is recovered rather than stuck forever); `reclaim_orphaned_tasks` increments `crash_strikes` and either re-queues (under threshold) or quarantines to the DLQ (at/over threshold); `spawn_poison_pill_reclaimer` runs the sweep on the worker's `poll_interval`, wired into `WorkerMonitoringHandles` alongside the timeout checker. Quarantine moves the task to `harvest_dead_letters` with a typed `DeadLetterReason::PoisonPill { crash_strikes, last_worker_id }` (the reason discriminator distinguishes it from clean retry exhaustion), marks the queue row `FAILED`, and fails the owning workflow terminally via the existing `WorkflowFailed` event path (**no new `WorkflowEvent` variant**), waking any blocked parent. `WorkerConfig::poison_pill_threshold` (default **3**; `with_poison_pill_threshold`; `0` disables quarantine = legacy requeue-forever loop). New metric `harvest.task.quarantined{queue, reason}` (`METRIC_TASK_QUARANTINED`, `record_task_quarantined` on `MetricsRecorder`, bridged in `metrics_rs_adapter`). Migration `20260601000001_harvest_poison_pill_strikes` adds `crash_strikes INT NOT NULL DEFAULT 0` to `harvest_task_queue` plus a partial index on `(worker_id) WHERE state = 'RUNNING' AND worker_id IS NOT NULL`. Shard-local: detection and quarantine run against the connection's own database. Integration tests in `tests/poison_pill_tests.rs`.
 - **Phase 3.18** (implemented): Per-activity circuit breaker for fast-fail dispatch during downstream outages — see issue #369. Opt-in `CircuitBreakerPolicy { failure_threshold, window, cooldown }` (in `policy.rs`) attached to `ActivityInfo.circuit_breaker` via the `#[activity(circuit_breaker = ...)]` attribute. New `circuit_breaker.rs` module: pure `CircuitBreakerRegistry` (closed/open/half-open state machine, rolling-window failure counting, single half-open probe, `force_open`/`force_close`, `snapshot`/`list`) — unit-tested without `db`. `on_result` takes an `AttemptOutcome` (`Success`/`RetryableFailure`/`NonRetryableFailure`): only `RetryableFailure` trips the breaker (classification mirrors the retry decision via the shared `failure_is_non_retryable` helper, honouring both the typed `non_retryable` flag and the retry policy's `non_retryable_errors`, incl. legacy `Err(String)`), so a burst of permanent per-request errors can't open the circuit. It also takes a `DispatchToken` carrying a monotonic **generation** (bumped on every state-resetting transition — trip/close/force-open/force-close); `on_result` fences any result whose token predates the current generation, which subsumes both the half-open straggler case and the "pre-force-close failure re-trips the operator's reset" case. Cancellation-driven results (workflow/task cancelled mid-flight) are excluded from breaker accounting entirely. Activity **timeouts** (start-to-close/heartbeat) feed the breaker out-of-band via `on_external_failure` wired into `timeout::enforce_activity_timeout` (token-less, since the dispatching worker may be gone), so a hanging downstream trips the breaker too. Circuit breakers are rejected on local activities (macro compile error + defensive registry filter) since local activities bypass the dispatch path. The worker consults the breaker in `process_activity_task` before running the handler: when open it short-circuits with a non-retryable `ActivityFailure::circuit_open` (error type `"CircuitOpen"`, `ERROR_TYPE_CIRCUIT_OPEN` in `failure.rs`) recorded as an ordinary `ActivityFailed` event — **no new `WorkflowEvent` variant, no migration** — so the append-only contract and deterministic replay are unchanged. `DispatchDecision::ShortCircuit.retry_after` is `Option<Duration>` (`None` = operator-forced open / in-flight probe, so callers don't busy-loop on a stale hint). The typed failure is **consumable from workflow code**: `error_type`/`details` are threaded through `HistoryMatch::Failed` and `HarvestError::ActivityFailed` (which now carries `error_type` + `details`), with accessors `HarvestError::activity_error_type()`/`activity_details()`/`is_circuit_open()` and the `HarvestError::activity_failed(name, attempt, payload)` decoding constructor — deterministic on replay. **Rate-limit interaction:** for an activity with both `rate_limit_*` and `circuit_breaker`, rate limiting is enforced at **dispatch** rather than at claim. `queue::claim_task` skips the rate-limit gate **and** token debit for every activity with a breaker (the static set `CircuitBreakerRegistry::tracked_activity_names()` passed into the claim query), so a `CircuitOpen` short-circuit is always claimable and propagates at full speed during an outage without burning tokens. A genuine call — admitted by the authoritative `on_dispatch` in `process_activity_task` — atomically reserves one token via `queue::try_consume_rate_limit_token`; if the bucket is empty the task is rescheduled (one refill interval ahead, clamped) instead of running, so a real call can never run below zero tokens. Enforcing at dispatch (gated on the real breaker decision) avoids the claim-vs-dispatch staleness window since the breaker state is in-process and can change between the two. Plain rate-limited activities without a breaker are unchanged (gate + debit at claim). State is in-process and per-shard, shared (`HandlerRegistry::circuit_breakers()`) between the worker and the management API. Management routes `GET /admin/circuits`, `GET /admin/circuits/{activity_name}`, `POST /admin/circuits/{activity_name}/force-{open,close}` (audit ops `OP_CIRCUIT_FORCE_OPEN`/`OP_CIRCUIT_FORCE_CLOSE`). New metrics `harvest.activity.circuit.tripped` / `harvest.activity.circuit.closed` (`activity.name` label; `record_circuit_tripped`/`record_circuit_closed` on `MetricsRecorder`, bridged in `metrics_rs_adapter`). Runbook `docs/runbooks/activity-circuit-breaker.md` with the breaker-vs-retry/jitter/rate-limit decision matrix. Tests: `circuit_breaker.rs` unit tests, `tests/circuit_breaker_wiring_tests.rs`, `context::tests::context_replays_circuit_open_failure_with_typed_metadata`, and the `circuit_breaker_short_circuits_after_tripping` e2e in `tests/integration_e2e.rs`.
+- **Phase 3.19** (implemented): Published workflow input/output JSON Schema for self-service triggering — see issue #373. `WorkflowInfo` gains four new optional fields: `description: Option<&'static str>`, `input_schema: Option<fn() -> serde_json::Value>`, `output_schema: Option<fn() -> serde_json::Value>`, `error_schema: Option<fn() -> serde_json::Value>`. Three fluent builder methods: `with_description`, `with_input_schema_fn`, `with_output_schema_fn`, `with_error_schema_fn` (all `#[must_use]`). Under the new `schema` Cargo feature, `with_schemas::<I, O, E>()` derives all three schemas automatically from types that implement `schemars::JsonSchema`. Two new management API routes: `GET /workflows/registered` (sorted list of all registered workflow types with optional schemas) and `GET /workflows/registered/{name}/schema` (404 for unknown names). `POST /workflows/{name}/start` validates input against the published schema when one is set; on failure returns `400` with a structured JSON body `{"error": "input validation failed", "violations": [{"message": "…", "field_path": "…"}]}` where `field_path` is a JSON Pointer (RFC 6901). `WorkflowInfo::validate_input` is the pure validation method — returns `Ok(())` or `Err(Vec<SchemaViolation>)`. `validate_against_schema` is the standalone recursive validator. `#[workflow(description = "…")]` attribute wires description through the companion function. Opt-in: workflows without a schema compile and run identically to today — no breakage. **No new `WorkflowEvent` variants, no migrations, no shard-routing changes, no replay-determinism impact.** `RegisteredWorkflowRecord` is the serialisable discovery record. Example: `autumn-harvest/examples/schema_workflow.rs` (requires `--features schema`). New types in `info.rs`: `SchemaViolation`, `RegisteredWorkflowRecord`, `validate_against_schema`.
 - **Phase 4** (next): production hardening -- sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`). Note: the cancellation primitive and `Saga` both ship; their interaction semantics, idempotency contract, and replay-determinism contract are documented in `docs/saga.md` and locked in by three integration tests in `tests/saga_tests.rs` (issue #238).
 
 ---
@@ -485,6 +486,111 @@ async fn compute_checksum(ctx: &ActivityContext, data: Vec<u8>) -> Result<String
 - You need the activity to run on a different worker pool or machine
 - The operation might take more than 60 s or needs heartbeating to signal liveness
 - You want `schedule_to_start` timeout enforcement
+
+### Workflow Input/Output JSON Schema (issue #373)
+
+Operators and non-Rust callers can discover the expected JSON shape of each workflow's input and output through the management API without reading Rust source. Schema publishing is **opt-in** — workflows that don't attach a schema continue to work exactly as today.
+
+#### Opt-in via manual schema function
+
+```rust
+fn onboard_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "integer"},
+            "email":   {"type": "string"}
+        },
+        "required": ["user_id", "email"]
+    })
+}
+
+// In the builder — chain after the companion function:
+.workflows(vec![
+    onboarding_info()
+        .with_description("Handles new-user onboarding from signup to first action")
+        .with_input_schema_fn(onboard_input_schema),
+])
+```
+
+#### Opt-in via `schema` feature + `schemars`
+
+Enable the `schema` Cargo feature and derive `JsonSchema` on your types:
+
+```toml
+# In your Cargo.toml:
+autumn-harvest = { version = "0.3", features = ["schema"] }
+schemars = "0.8"
+```
+
+```rust
+#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+pub struct OnboardInput { pub user_id: i64, pub email: String }
+
+// In the builder:
+.workflows(vec![
+    onboarding_info().with_schemas::<OnboardInput, (), String>(),
+])
+```
+
+#### `#[workflow(description = "…")]`
+
+Attach a one-paragraph description directly in the macro attribute:
+
+```rust
+#[workflow(description = "Handles new-user onboarding from signup to first action")]
+async fn onboarding(ctx: &WorkflowContext, input: OnboardInput) -> Result<(), String> { … }
+```
+
+#### Discovery endpoints
+
+```
+GET /api/harvest/workflows/registered
+```
+Returns a sorted JSON array of all registered workflow types:
+```json
+[
+  { "name": "onboarding", "description": "Handles new-user onboarding…",
+    "input_schema": { "type": "object", … }, "output_schema": null, "error_schema": null },
+  { "name": "no_schema_wf", "input_schema": null, "output_schema": null, "error_schema": null }
+]
+```
+
+```
+GET /api/harvest/workflows/registered/{name}/schema
+```
+Returns the record for a single workflow type, or `404` if the name is unknown.
+
+#### Server-side input validation
+
+When a workflow has a published `input_schema`, `POST /api/harvest/workflows/{name}/start` validates the input **before** the workflow enters the task queue. A bad input returns:
+```json
+HTTP 400
+{
+  "error": "input validation failed",
+  "violations": [
+    { "message": "missing required field 'email'", "field_path": "/email" },
+    { "message": "expected type 'integer', got 'string'", "field_path": "/user_id" }
+  ]
+}
+```
+`field_path` is a JSON Pointer (RFC 6901). Workflows without a schema accept any input, unchanged.
+
+#### curl examples
+
+```bash
+# Correctly shaped input — starts the workflow:
+curl -X POST /api/harvest/workflows/onboarding/start \
+  -H 'Content-Type: application/json' \
+  -d '{"input": {"user_id": 1, "email": "alice@example.com"}}'
+
+# Deliberately wrong shape — rejected at the API boundary (400):
+curl -X POST /api/harvest/workflows/onboarding/start \
+  -H 'Content-Type: application/json' \
+  -d '{"input": {"user_id": "not_an_int"}}'
+```
+
+See `autumn-harvest/examples/schema_workflow.rs` for a full working demonstration.
 
 ---
 

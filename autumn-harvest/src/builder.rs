@@ -1699,6 +1699,10 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }
     }
 
@@ -2116,6 +2120,10 @@ mod tests {
                     limit: 0,
                 }),
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }])
             .try_build();
         let err = result.unwrap_err();
@@ -2144,6 +2152,10 @@ mod tests {
                     limit: 5,
                 }),
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }])
             .try_build();
         assert!(result.is_ok());
