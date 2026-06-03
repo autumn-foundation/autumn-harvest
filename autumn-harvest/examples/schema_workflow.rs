@@ -3,7 +3,7 @@
 //! Demonstrates:
 //! 1. Attaching a JSON Schema to a workflow via `with_input_schema_fn` (no
 //!    extra dependencies — manual schema as `serde_json::Value`).
-//! 2. Attaching a schema via `with_schemas::<I, O, E>()` using the `schema`
+//! 2. Attaching a schema via `with_schemas::<I, O>()` using the `schema`
 //!    feature, which derives the schema automatically from types that implement
 //!    `schemars::JsonSchema`.
 //! 3. The `RegisteredWorkflowRecord` response that `GET /workflows/registered`
@@ -129,8 +129,7 @@ fn main() {
     {
         println!("\n--- Option B: automatic schema via `schema` feature ---");
 
-        let onboarding_info_auto =
-            onboarding_info().with_schemas::<OnboardInput, OnboardOutput, String>();
+        let onboarding_info_auto = onboarding_info().with_schemas::<OnboardInput, OnboardOutput>();
 
         let record_auto = RegisteredWorkflowRecord::from_info(&onboarding_info_auto);
         println!(
