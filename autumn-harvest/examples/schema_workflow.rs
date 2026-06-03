@@ -155,8 +155,7 @@ fn main() {
     // ── Input validation ──────────────────────────────────────────────────────
     println!("\n--- Server-side input validation ---");
 
-    let schema_info = onboarding_info()
-        .with_input_schema_fn(onboard_input_schema);
+    let schema_info = onboarding_info().with_input_schema_fn(onboard_input_schema);
 
     // Valid input: passes
     let valid = serde_json::json!({"user_id": 42, "email": "alice@example.com"});

@@ -1623,10 +1623,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         // issue #373: static /workflows/registered must be registered before any
         // /workflows/{param} routes so axum does not capture "registered" as a path param.
-        .route(
-            "/workflows/registered",
-            get(list_registered_workflows),
-        )
+        .route("/workflows/registered", get(list_registered_workflows))
         .route(
             "/workflows/registered/{name}/schema",
             get(get_registered_workflow_schema),
@@ -3119,7 +3116,10 @@ async fn get_registered_workflow_schema(
                 .into_response()
         },
         |info| {
-            Json(autumn_harvest::info::RegisteredWorkflowRecord::from_info(info)).into_response()
+            Json(autumn_harvest::info::RegisteredWorkflowRecord::from_info(
+                info,
+            ))
+            .into_response()
         },
     )
 }
@@ -4894,9 +4894,10 @@ async fn batch_start_workflows(
     };
 
     // ── Pre-validate all items in-memory (issue #357) ───────────────────────
-    // Check: workflow name registered, no DAG collision.  Payload size and
-    // duplicate-id checks happen inside start_or_load_workflow_execution and
-    // are surfaced as per-item errors (or a batch-level 409 for atomic mode).
+    // Check: workflow name registered, no DAG collision, JSON Schema (issue #373).
+    // Payload size and duplicate-id checks happen inside
+    // start_or_load_workflow_execution and are surfaced as per-item errors (or
+    // a batch-level 409 for atomic mode).
     let mut pre_rejected: Vec<BatchStartItemResult> = Vec::new();
     for (idx, item) in request.items.iter().enumerate() {
         let err = if !runtime.registry.workflows.contains_key(&item.workflow_name) {
@@ -4909,6 +4910,25 @@ async fn batch_start_workflows(
                 "workflow '{}' is a registered DAG; use POST /dags/{{name}}/trigger",
                 item.workflow_name
             ))
+        } else if let Some(info) = runtime.registry.workflows.get(&item.workflow_name) {
+            // issue #373: validate against published JSON Schema when present.
+            let null = serde_json::Value::Null;
+            let input = item.input.as_ref().unwrap_or(&null);
+            match info.validate_input(input) {
+                Ok(()) => None,
+                Err(violations) => {
+                    let msgs: Vec<String> = violations
+                        .iter()
+                        .map(|v| {
+                            v.field_path.as_ref().map_or_else(
+                                || v.message.clone(),
+                                |p| format!("{p}: {}", v.message),
+                            )
+                        })
+                        .collect();
+                    Some(format!("input validation failed: {}", msgs.join("; ")))
+                }
+            }
         } else {
             None
         };
@@ -5425,6 +5445,21 @@ async fn signal_with_start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
+
+    // issue #373: validate start_input against the workflow's published JSON Schema (if any).
+    // Done before the shard scan so invalid inputs fail fast without any DB work.
+    if let Some(info) = runtime.registry.workflows.get(&workflow_name)
+        && let Err(violations) = info.validate_input(&start_input)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "input validation failed",
+                "violations": violations,
+            })),
+        )
+            .into_response();
+    }
 
     // Issue #252: resolve cap values. Both caps are enforced inside
     // signal_with_start_workflow_execution — after idempotency dedupe and
@@ -15427,7 +15462,10 @@ mod tests {
             record.description.as_deref(),
             Some("A workflow with an input schema")
         );
-        assert!(record.input_schema.is_some(), "input_schema must be present");
+        assert!(
+            record.input_schema.is_some(),
+            "input_schema must be present"
+        );
         assert_eq!(
             record.input_schema.as_ref().unwrap()["type"],
             "object",
@@ -15467,9 +15505,11 @@ mod tests {
         let bad_input = serde_json::json!({"user_id": 42});
         let err = info.validate_input(&bad_input).unwrap_err();
         assert!(!err.is_empty(), "should have at least one violation");
-        let found = err
-            .iter()
-            .any(|v| v.field_path.as_deref().map_or(false, |p| p.contains("email")));
+        let found = err.iter().any(|v| {
+            v.field_path
+                .as_deref()
+                .map_or(false, |p| p.contains("email"))
+        });
         assert!(found, "violation must reference the 'email' field path");
     }
 

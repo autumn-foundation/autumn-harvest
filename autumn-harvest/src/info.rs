@@ -237,10 +237,7 @@ impl WorkflowInfo {
     /// # Errors
     ///
     /// Returns `Err(Vec<SchemaViolation>)` when the input fails schema validation.
-    pub fn validate_input(
-        &self,
-        input: &serde_json::Value,
-    ) -> Result<(), Vec<SchemaViolation>> {
+    pub fn validate_input(&self, input: &serde_json::Value) -> Result<(), Vec<SchemaViolation>> {
         let Some(schema_fn) = self.input_schema else {
             return Ok(());
         };
@@ -300,7 +297,7 @@ pub fn validate_against_schema(
     input: &serde_json::Value,
 ) -> Result<(), Vec<SchemaViolation>> {
     let mut violations: Vec<SchemaViolation> = Vec::new();
-    validate_node(schema, input, "", &mut violations);
+    validate_node(schema, schema, input, "", &mut violations);
     if violations.is_empty() {
         Ok(())
     } else {
@@ -309,12 +306,34 @@ pub fn validate_against_schema(
 }
 
 /// Recursive schema walker — validates `value` against `schema` at path `ptr`.
+///
+/// `root` is the top-level schema document, used to resolve `$ref` pointers.
+#[allow(clippy::too_many_lines)]
 fn validate_node(
+    root: &serde_json::Value,
     schema: &serde_json::Value,
     value: &serde_json::Value,
     ptr: &str,
     out: &mut Vec<SchemaViolation>,
 ) {
+    // Resolve $ref (local JSON Pointer only, e.g. "#/definitions/Foo").
+    let mut schema = schema;
+    let mut visited = std::collections::HashSet::new();
+    while let Some(ref_str) = schema.get("$ref").and_then(|v| v.as_str()) {
+        if !visited.insert(ref_str) {
+            break; // cycle guard
+        }
+        if let Some(stripped) = ref_str.strip_prefix('#') {
+            if let Some(resolved) = root.pointer(stripped) {
+                schema = resolved;
+            } else {
+                break;
+            }
+        } else {
+            break; // external refs not supported — skip
+        }
+    }
+
     let Some(schema_obj) = schema.as_object() else {
         return;
     };
@@ -334,7 +353,13 @@ fn validate_node(
             "object" => value.is_object(),
             "array" => value.is_array(),
             "string" => value.is_string(),
-            "number" | "integer" => value.is_number(),
+            "number" => value.is_number(),
+            // JSON Schema "integer": must be a number with no fractional part.
+            "integer" => {
+                value.as_i64().is_some()
+                    || value.as_u64().is_some()
+                    || value.as_f64().is_some_and(|f| f.fract() == 0.0)
+            }
             "boolean" => value.is_boolean(),
             "null" => value.is_null(),
             _ => true,
@@ -360,9 +385,11 @@ fn validate_node(
             if let Some(field) = req.as_str()
                 && !obj.contains_key(field)
             {
+                // Escape field name per RFC 6901: ~ → ~0, / → ~1.
+                let escaped = field.replace('~', "~0").replace('/', "~1");
                 out.push(SchemaViolation {
                     message: format!("missing required field '{field}'"),
-                    field_path: Some(format!("{ptr}/{field}")),
+                    field_path: Some(format!("{ptr}/{escaped}")),
                 });
             }
         }
@@ -375,8 +402,10 @@ fn validate_node(
     ) {
         for (prop_name, prop_schema) in properties {
             if let Some(prop_value) = obj.get(prop_name) {
-                let child_ptr = format!("{ptr}/{prop_name}");
-                validate_node(prop_schema, prop_value, &child_ptr, out);
+                // Escape property name per RFC 6901: ~ → ~0, / → ~1.
+                let escaped_name = prop_name.replace('~', "~0").replace('/', "~1");
+                let child_ptr = format!("{ptr}/{escaped_name}");
+                validate_node(root, prop_schema, prop_value, &child_ptr, out);
             }
         }
     }
@@ -394,7 +423,9 @@ fn validate_node(
     // minLength / maxLength for strings
     if let Some(s) = value.as_str() {
         let char_count = s.chars().count() as u64;
-        if let Some(min) = schema_obj.get("minLength").and_then(serde_json::Value::as_u64)
+        if let Some(min) = schema_obj
+            .get("minLength")
+            .and_then(serde_json::Value::as_u64)
             && char_count < min
         {
             out.push(SchemaViolation {
@@ -402,7 +433,9 @@ fn validate_node(
                 field_path: path(),
             });
         }
-        if let Some(max) = schema_obj.get("maxLength").and_then(serde_json::Value::as_u64)
+        if let Some(max) = schema_obj
+            .get("maxLength")
+            .and_then(serde_json::Value::as_u64)
             && char_count > max
         {
             out.push(SchemaViolation {
@@ -844,7 +877,10 @@ mod tests {
         };
         let record = RegisteredWorkflowRecord::from_info(&info);
         assert_eq!(record.name, "schema_wf");
-        assert_eq!(record.description.as_deref(), Some("A workflow with a schema"));
+        assert_eq!(
+            record.description.as_deref(),
+            Some("A workflow with a schema")
+        );
         assert!(record.input_schema.is_some());
         assert_eq!(record.input_schema.unwrap()["type"], "object");
         assert!(record.output_schema.is_none());
