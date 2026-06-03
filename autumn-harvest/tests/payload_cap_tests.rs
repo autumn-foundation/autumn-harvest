@@ -50,6 +50,10 @@ fn fake_workflow_info(name: &'static str) -> WorkflowInfo {
         execution_timeout: None,
         concurrency: None,
         max_input_bytes: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
     }
 }
 
@@ -222,6 +226,10 @@ fn workflow_info_has_max_input_bytes_field() {
         execution_timeout: None,
         concurrency: None,
         max_input_bytes: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
     };
     assert!(info.max_input_bytes.is_none());
 
@@ -232,6 +240,10 @@ fn workflow_info_has_max_input_bytes_field() {
         execution_timeout: None,
         concurrency: None,
         max_input_bytes: Some(8 * 1024 * 1024),
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
     };
     assert_eq!(info_with_cap.max_input_bytes, Some(8 * 1024 * 1024));
 }

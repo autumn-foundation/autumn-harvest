@@ -5446,21 +5446,6 @@ async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
-    // issue #373: validate start_input against the workflow's published JSON Schema (if any).
-    // Done before the shard scan so invalid inputs fail fast without any DB work.
-    if let Some(info) = runtime.registry.workflows.get(&workflow_name)
-        && let Err(violations) = info.validate_input(&start_input)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({
-                "error": "input validation failed",
-                "violations": violations,
-            })),
-        )
-            .into_response();
-    }
-
     // Issue #252: resolve cap values. Both caps are enforced inside
     // signal_with_start_workflow_execution — after idempotency dedupe and
     // only on the fresh-start path for start_input — to avoid spurious 413s
@@ -5499,7 +5484,10 @@ async fn signal_with_start_workflow(
         Ok(p) => p,
         Err(e) => return map_error(e).into_response(),
     };
-    let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+    // The 4th element records whether this is a pure attach (existing RUNNING/SUSPENDED +
+    // AllowDuplicate*). Used below to skip start_input schema validation on attach requests
+    // where start_input is never written (mirrors the payload-cap deferral from issue #252).
+    let mut found_shard: Option<(ShardId, PoolConn, ExecutionId, bool)> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
         let mut shard_conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
@@ -5541,12 +5529,12 @@ async fn signal_with_start_workflow(
             } else {
                 ExecutionId::new_for_shard(candidate_shard)
             };
-            found_shard = Some((candidate_shard, shard_conn, exec_id));
+            found_shard = Some((candidate_shard, shard_conn, exec_id, will_attach));
             break;
         }
     }
 
-    let (shard, mut conn, exec_id) = if let Some(tuple) = found_shard {
+    let (shard, mut conn, exec_id, will_attach) = if let Some(tuple) = found_shard {
         tuple
     } else {
         let shard = runtime
@@ -5556,8 +5544,26 @@ async fn signal_with_start_workflow(
             Ok(c) => c,
             Err(e) => return e.into_response(),
         };
-        (shard, conn, ExecutionId::new_for_shard(shard))
+        (shard, conn, ExecutionId::new_for_shard(shard), false)
     };
+
+    // issue #373: validate start_input against the workflow's published JSON Schema (if any).
+    // Only runs when this request will write a new execution; attach requests (existing
+    // RUNNING/SUSPENDED + AllowDuplicate*) never use start_input, so we skip validation to
+    // avoid spurious 400s — matching the payload-cap deferral from issue #252.
+    if !will_attach
+        && let Some(info) = runtime.registry.workflows.get(&workflow_name)
+        && let Err(violations) = info.validate_input(&start_input)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "input validation failed",
+                "violations": violations,
+            })),
+        )
+            .into_response();
+    }
 
     let trace_ctx = tracing::info_span!(
         "harvest.workflow.schedule",

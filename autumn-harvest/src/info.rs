@@ -268,6 +268,7 @@ impl WorkflowInfo {
     /// ])
     /// ```
     #[cfg(feature = "schema")]
+    #[must_use]
     pub fn with_schemas<I, O, E>(self) -> Self
     where
         I: schemars::JsonSchema,
@@ -418,6 +419,14 @@ fn validate_node(
             message: "value is not one of the allowed enum values".to_string(),
             field_path: path(),
         });
+    }
+
+    // array items — recurse into each element
+    if let (Some(items_schema), Some(arr)) = (schema_obj.get("items"), value.as_array()) {
+        for (i, elem) in arr.iter().enumerate() {
+            let child_ptr = format!("{ptr}/{i}");
+            validate_node(root, items_schema, elem, &child_ptr, out);
+        }
     }
 
     // minLength / maxLength for strings

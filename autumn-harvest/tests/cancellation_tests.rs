@@ -225,6 +225,10 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![autumn_harvest::info::ActivityInfo {
             name: "heartbeat_activity",
@@ -581,6 +585,10 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![autumn_harvest::info::ActivityInfo {
             name: "uncooperative_activity",
