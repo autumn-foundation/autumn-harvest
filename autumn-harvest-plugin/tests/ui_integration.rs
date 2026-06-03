@@ -244,6 +244,10 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ))
@@ -2489,6 +2493,10 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }],
             vec![],
         )

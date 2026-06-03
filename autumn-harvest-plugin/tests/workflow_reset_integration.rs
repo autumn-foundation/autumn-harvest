@@ -476,6 +476,10 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));

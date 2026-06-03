@@ -241,6 +241,10 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
         owner: None,
         runbook_url: None,
         severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
     }
 }
 
@@ -259,6 +263,10 @@ fn wf_info_with_concurrency(
         owner: None,
         runbook_url: None,
         severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
     }
 }
 

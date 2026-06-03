@@ -435,6 +435,10 @@ pub mod flows {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }
         }
     }
@@ -483,6 +487,10 @@ pub mod relative_test_self {
                     owner: None,
                     runbook_url: None,
                     severity: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
                 }
             }
         }
@@ -519,6 +527,10 @@ pub mod relative_test_super {
                     owner: None,
                     runbook_url: None,
                     severity: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
                 }
             }
         }
@@ -559,6 +571,10 @@ pub mod relative_test_plain {
                     owner: None,
                     runbook_url: None,
                     severity: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
                 }
             }
         }

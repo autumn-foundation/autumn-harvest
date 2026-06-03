@@ -27,6 +27,9 @@ struct WorkflowAttrs {
     owner: Option<String>,
     runbook: Option<String>,
     severity: Option<String>,
+    /// Human-readable description for operator/UI discovery (issue #373).
+    /// Parsed from `#[workflow(description = "...")]`.
+    description: Option<String>,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
@@ -37,6 +40,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         owner: None,
         runbook: None,
         severity: None,
+        description: None,
     };
 
     syn::meta::parser(|meta| {
@@ -106,9 +110,13 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             }
             result.severity = Some(s);
             Ok(())
+        } else if meta.path.is_ident("description") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.description = Some(value.value());
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `concurrency`, `max_input_bytes`, `owner`, `runbook`, or `severity`",
+                "unsupported attribute: expected `execution_timeout`, `concurrency`, `max_input_bytes`, `owner`, `runbook`, `severity`, or `description`",
             ))
         }
     })
@@ -225,6 +233,11 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .max_input_bytes
         .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
 
+    let description_expr = attrs.description.as_deref().map_or_else(
+        || quote! { ::std::option::Option::None },
+        |s| quote! { ::std::option::Option::Some(#s) },
+    );
+
     let camel_name = to_pascal_case(&fn_name_str);
     let stub_name = format_ident!("{}Stub", camel_name);
     let ok_type = extract_ok_type(&input_fn.sig.output);
@@ -270,6 +283,10 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,
                 severity: #severity_expr,
+                description: #description_expr,
+                input_schema: ::std::option::Option::None,
+                output_schema: ::std::option::Option::None,
+                error_schema: ::std::option::Option::None,
             }
         }
 

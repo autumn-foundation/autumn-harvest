@@ -1859,6 +1859,48 @@
       ]
     },
     {
+      "method": "GET",
+      "path": "/workflows/registered",
+      "category": "discovery",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "List all registered workflow types with their optional JSON Schema, description, and schema fields. Returns a sorted JSON array of RegisteredWorkflowRecord objects. Workflows without a published schema have null input_schema/output_schema/error_schema fields (issue #373).",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": []
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/registered/{name}/schema",
+      "category": "discovery",
+      "read_only": true,
+      "idempotency": "Safe",
+      "description": "Fetch the RegisteredWorkflowRecord for a single registered workflow type by name. Returns 404 when the name is unknown (issue #373).",
+      "params": [
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "description": "Registered workflow type name."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Workflow type not registered."
+        }
+      ]
+    },
+    {
       "method": "POST",
       "path": "/workflows/batch_start",
       "category": "batch",

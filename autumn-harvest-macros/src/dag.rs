@@ -488,6 +488,10 @@ fn emit_workflow_companion(
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,
                 severity: #severity_expr,
+                description: ::std::option::Option::None,
+                input_schema: ::std::option::Option::None,
+                output_schema: ::std::option::Option::None,
+                error_schema: ::std::option::Option::None,
             }
         }
     }

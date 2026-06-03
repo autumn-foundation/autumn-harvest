@@ -1624,6 +1624,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
                     usize::try_from(BATCH_START_BODY_HARD_LIMIT).unwrap_or(usize::MAX),
                 )),
         )
+        // issue #373: static /workflows/registered must be registered before any
+        // /workflows/{param} routes so axum does not capture "registered" as a path param.
+        .route("/workflows/registered", get(list_registered_workflows))
+        .route(
+            "/workflows/registered/{name}/schema",
+            get(get_registered_workflow_schema),
+        )
         .route(
             "/workflows/{id}/history/export",
             get(export_workflow_history),
@@ -1876,6 +1883,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
     &[
         // ── workflows ────────────────────────────────────────────────────────
         ("GET", "/workflows"),
+        ("GET", "/workflows/registered"),
+        ("GET", "/workflows/registered/{name}/schema"),
         ("GET", "/workflows/{id}"),
         ("GET", "/workflows/{id}/result"),
         ("GET", "/workflows/{id}/history/export"),
@@ -3068,6 +3077,54 @@ async fn list_workflows(
     let filters = parse_workflow_filters(&pairs)?;
     let workflows = load_workflows_from_shards(&api_state, &filters).await?;
     Ok(Json(workflows))
+}
+
+/// `GET /workflows/registered` — list all registered workflow types with
+/// their optional JSON Schema, description, and type information (issue #373).
+///
+/// Returns an array of [`RegisteredWorkflowRecord`] objects sorted by name.
+/// Workflows that have not opted into schema publishing return `null` for
+/// `input_schema`, `output_schema`, and `error_schema`.
+async fn list_registered_workflows(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<autumn_harvest::info::RegisteredWorkflowRecord>>, AutumnError> {
+    let runtime = api_state.runtime()?;
+    let mut records: Vec<_> = runtime
+        .registry
+        .workflows
+        .values()
+        .map(autumn_harvest::info::RegisteredWorkflowRecord::from_info)
+        .collect();
+    records.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(records))
+}
+
+/// `GET /workflows/registered/{name}/schema` — return the schema record for a
+/// single registered workflow type (issue #373).
+///
+/// Returns `200` with the [`RegisteredWorkflowRecord`] when the workflow is
+/// known, or `404` when the name is not registered.
+async fn get_registered_workflow_schema(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(name): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+    runtime.registry.workflows.get(&name).map_or_else(
+        || {
+            AutumnError::not_found_msg(format!("workflow '{name}' is not registered"))
+                .into_response()
+        },
+        |info| {
+            Json(autumn_harvest::info::RegisteredWorkflowRecord::from_info(
+                info,
+            ))
+            .into_response()
+        },
+    )
 }
 
 /// Parse the management-API query string into a `WorkflowFilters`.
@@ -4452,6 +4509,43 @@ async fn start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let input = request.input.unwrap_or(Value::Null);
 
+    // issue #373: validate input against the workflow's published JSON Schema (if any).
+    // Runs before the delayed-start checks so bad inputs fail fast and never
+    // reach the DB or appear in harvest_dead_letters.
+    if let Some(info) = runtime.registry.workflows.get(&workflow_name)
+        && let Err(violations) = info.validate_input(&input)
+    {
+        use serde_json::json;
+        #[derive(serde::Serialize)]
+        struct ValidationFailure {
+            error: &'static str,
+            violations: Vec<autumn_harvest::info::SchemaViolation>,
+        }
+        let body = json!(ValidationFailure {
+            error: "input validation failed",
+            violations,
+        });
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("input schema validation failed"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return (axum::http::StatusCode::BAD_REQUEST, Json(body)).into_response();
+    }
+
     // Validate delayed start parameters (issue #322)
     if request.start_at.is_some() && request.delay.is_some() {
         if let Ok(pool) = api_state.storage_pool()
@@ -4826,9 +4920,14 @@ async fn batch_start_workflows(
     };
 
     // ── Pre-validate all items in-memory (issue #357) ───────────────────────
-    // Check: workflow name registered, no DAG collision.  Payload size and
-    // duplicate-id checks happen inside start_or_load_workflow_execution and
-    // are surfaced as per-item errors (or a batch-level 409 for atomic mode).
+    // Check: workflow name registered, no DAG collision.
+    // Schema validation (issue #373) is intentionally deferred to the per-shard
+    // execution loop rather than done here. batch_start always uses AllowDuplicate,
+    // so any item whose (workflow_name, workflow_id) already exists is returned as-is
+    // without storing or deserializing the submitted input; rejecting those items in
+    // pre-validation would cause spurious 400s on idempotent retries that carry stale
+    // or omitted input — the same reason payload-size checks are deferred to
+    // start_or_load_workflow_execution.
     let mut pre_rejected: Vec<BatchStartItemResult> = Vec::new();
     for (idx, item) in request.items.iter().enumerate() {
         let err = if !runtime.registry.workflows.contains_key(&item.workflow_name) {
@@ -5407,7 +5506,10 @@ async fn signal_with_start_workflow(
         Ok(p) => p,
         Err(e) => return map_error(e).into_response(),
     };
-    let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+    // The 4th element records whether this is a pure attach (existing RUNNING/SUSPENDED +
+    // AllowDuplicate*). Used below to skip start_input schema validation on attach requests
+    // where start_input is never written (mirrors the payload-cap deferral from issue #252).
+    let mut found_shard: Option<(ShardId, PoolConn, ExecutionId, bool)> = None;
     for (candidate_shard, shard_pool) in pool.iter_shards() {
         let mut shard_conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
@@ -5438,7 +5540,11 @@ async fn signal_with_start_workflow(
             // Attach (reuse UUID) only when the prior is live AND the policy
             // expects to attach. Every other path goes through replace_execution
             // and needs a fresh exec_id keyed for the same shard.
-            let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
+            // Only a RUNNING execution under a non-rejecting policy is a true
+            // attach (signal delivered, start_input ignored). SUSPENDED is
+            // upgraded to TerminateIfRunning by resolve_effective_signal_with_start_policy,
+            // which writes a fresh execution using start_input — so validation must run.
+            let will_attach = existing_state == "RUNNING"
                 && matches!(
                     reuse_policy,
                     WorkflowIdReusePolicy::AllowDuplicate
@@ -5449,12 +5555,12 @@ async fn signal_with_start_workflow(
             } else {
                 ExecutionId::new_for_shard(candidate_shard)
             };
-            found_shard = Some((candidate_shard, shard_conn, exec_id));
+            found_shard = Some((candidate_shard, shard_conn, exec_id, will_attach));
             break;
         }
     }
 
-    let (shard, mut conn, exec_id) = if let Some(tuple) = found_shard {
+    let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
         tuple
     } else {
         let shard = runtime
@@ -5464,8 +5570,40 @@ async fn signal_with_start_workflow(
             Ok(c) => c,
             Err(e) => return e.into_response(),
         };
-        (shard, conn, ExecutionId::new_for_shard(shard))
+        (shard, conn, ExecutionId::new_for_shard(shard), false)
     };
+
+    // issue #373: validate start_input against the workflow's published JSON Schema (if any).
+    // Always runs regardless of will_attach: the pre-scan that sets will_attach is unlocked, so
+    // if the observed RUNNING execution completes before the core resolver takes its FOR UPDATE
+    // lock, the core path can escalate AllowDuplicate to a fresh start and write start_input
+    // without validation. Validating unconditionally closes this TOCTOU window.
+    if let Some(info) = runtime.registry.workflows.get(&workflow_name)
+        && let Err(violations) = info.validate_input(&start_input)
+    {
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_SIGNAL_WITH_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: None,
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: request.idempotency_key.as_deref(),
+            status: STATUS_FAILED,
+            error_summary: Some("input validation failed"),
+            shard_id: Some(shard.as_i32()),
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "input validation failed",
+                "violations": violations,
+            })),
+        )
+            .into_response();
+    }
 
     let trace_ctx = tracing::info_span!(
         "harvest.workflow.schedule",
@@ -14267,6 +14405,10 @@ mod tests {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }],
             vec![],
         ));
@@ -15447,5 +15589,148 @@ mod tests {
             field, "schedule_expr",
             "cron parse error must be attributed to 'schedule_expr': {err}"
         );
+    }
+
+    // ── issue #373: registered workflow schema endpoint tests ─────────────────
+
+    fn make_schema_registry() -> Arc<HandlerRegistry> {
+        fn my_input_schema() -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "integer"},
+                    "email": {"type": "string"}
+                },
+                "required": ["user_id", "email"]
+            })
+        }
+
+        Arc::new(HandlerRegistry::new(
+            vec![
+                autumn_harvest::WorkflowInfo {
+                    name: "schema_wf",
+                    module: "tests",
+                    handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                    execution_timeout: None,
+                    concurrency: None,
+                    max_input_bytes: None,
+                    description: Some("A workflow with an input schema"),
+                    input_schema: Some(my_input_schema),
+                    output_schema: None,
+                    error_schema: None,
+                },
+                autumn_harvest::WorkflowInfo {
+                    name: "no_schema_wf",
+                    module: "tests",
+                    handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                    execution_timeout: None,
+                    concurrency: None,
+                    max_input_bytes: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
+                },
+            ],
+            vec![],
+        ))
+    }
+
+    #[test]
+    fn registered_workflow_record_from_info_includes_schema() {
+        let registry = make_schema_registry();
+        let info = registry.workflows.get("schema_wf").unwrap();
+        let record = autumn_harvest::info::RegisteredWorkflowRecord::from_info(info);
+
+        assert_eq!(record.name, "schema_wf");
+        assert_eq!(
+            record.description.as_deref(),
+            Some("A workflow with an input schema")
+        );
+        assert!(
+            record.input_schema.is_some(),
+            "input_schema must be present"
+        );
+        assert_eq!(
+            record.input_schema.as_ref().unwrap()["type"],
+            "object",
+            "schema type must be 'object'"
+        );
+        assert!(record.output_schema.is_none());
+        assert!(record.error_schema.is_none());
+    }
+
+    #[test]
+    fn registered_workflow_record_from_info_nulls_for_no_schema() {
+        let registry = make_schema_registry();
+        let info = registry.workflows.get("no_schema_wf").unwrap();
+        let record = autumn_harvest::info::RegisteredWorkflowRecord::from_info(info);
+
+        assert_eq!(record.name, "no_schema_wf");
+        assert!(record.description.is_none());
+        assert!(record.input_schema.is_none());
+        assert!(record.output_schema.is_none());
+        assert!(record.error_schema.is_none());
+
+        // Serialized JSON: input_schema / output_schema / error_schema are `null`
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json["input_schema"].is_null());
+        assert!(json["output_schema"].is_null());
+        assert!(json["error_schema"].is_null());
+        // description is omitted (skip_serializing_if)
+        assert!(
+            json.get("description")
+                .is_none_or(serde_json::Value::is_null)
+        );
+    }
+
+    #[test]
+    fn validate_input_rejects_missing_required_field() {
+        let registry = make_schema_registry();
+        let info = registry.workflows.get("schema_wf").unwrap();
+
+        // Missing "email"
+        let bad_input = serde_json::json!({"user_id": 42});
+        let err = info.validate_input(&bad_input).unwrap_err();
+        assert!(!err.is_empty(), "should have at least one violation");
+        let found = err
+            .iter()
+            .any(|v| v.field_path.as_deref().is_some_and(|p| p.contains("email")));
+        assert!(found, "violation must reference the 'email' field path");
+    }
+
+    #[test]
+    fn validate_input_accepts_valid_input() {
+        let registry = make_schema_registry();
+        let info = registry.workflows.get("schema_wf").unwrap();
+
+        let good = serde_json::json!({"user_id": 1, "email": "a@b.com"});
+        assert!(
+            info.validate_input(&good).is_ok(),
+            "valid input must pass schema validation"
+        );
+    }
+
+    #[test]
+    fn validate_input_passes_through_when_no_schema() {
+        let registry = make_schema_registry();
+        let info = registry.workflows.get("no_schema_wf").unwrap();
+
+        let any = serde_json::json!({"totally": "arbitrary"});
+        assert!(
+            info.validate_input(&any).is_ok(),
+            "no-schema workflow must accept any input"
+        );
+    }
+
+    #[test]
+    fn schema_violation_serialises_with_field_path() {
+        let v = autumn_harvest::info::SchemaViolation {
+            message: "missing required field 'name'".to_string(),
+            field_path: Some("/name".to_string()),
+        };
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["message"], "missing required field 'name'");
+        assert_eq!(json["field_path"], "/name");
     }
 }

@@ -235,6 +235,10 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![autumn_harvest::info::ActivityInfo {
             name: "heartbeat_activity",
@@ -599,6 +603,10 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![autumn_harvest::info::ActivityInfo {
             name: "uncooperative_activity",

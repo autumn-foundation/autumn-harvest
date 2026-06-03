@@ -730,6 +730,10 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "child_echo_workflow",
@@ -742,6 +746,10 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![],
@@ -762,6 +770,10 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "child_continue_as_new_workflow",
@@ -774,6 +786,10 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![],
@@ -1241,6 +1257,10 @@ async fn worker_completes_workflow_task_and_persists_result() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -1349,6 +1369,10 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -1471,6 +1495,10 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -1608,6 +1636,10 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "checkpointed_import",
@@ -1958,6 +1990,10 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     owner: None,
                     runbook_url: None,
                     severity: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
                 }],
                 vec![ActivityInfo {
                     name: "slow_activity",
@@ -2034,6 +2070,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_completes_workflow_with_timer_round_trip() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -2098,6 +2135,10 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                     owner: None,
                     runbook_url: None,
                     severity: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
                 }],
                 vec![],
             )),
@@ -2358,6 +2399,10 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "child_alpha",
@@ -2370,6 +2415,10 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "child_beta",
@@ -2382,6 +2431,10 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![],
@@ -2504,6 +2557,10 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }])
         .activities(vec![ActivityInfo {
             name: "stateful_activity",
@@ -3002,6 +3059,10 @@ async fn worker_completes_workflow_after_signal_delivery() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -3117,6 +3178,10 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -3533,6 +3598,10 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -3636,6 +3705,10 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -4516,6 +4589,10 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -4624,6 +4701,10 @@ async fn workflow_schedule_max_active_runs_enforced() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -4700,6 +4781,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
 
 /// (c) Pause / resume: no dispatches after pause; dispatches resume after unpause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn workflow_schedule_pause_and_resume() {
     use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
 
@@ -4718,6 +4800,10 @@ async fn workflow_schedule_pause_and_resume() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -4987,6 +5073,10 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -5136,6 +5226,10 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }],
             vec![],
         ))
@@ -5230,6 +5324,10 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }])
         .workflow_schedule(ws)
         .worker(WorkerConfig::default())
@@ -5575,6 +5673,10 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5714,6 +5816,10 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5837,6 +5943,10 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -5978,6 +6088,10 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -6044,6 +6158,10 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -6119,6 +6237,10 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -6198,6 +6320,10 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -6272,6 +6398,10 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -6349,6 +6479,10 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));

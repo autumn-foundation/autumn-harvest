@@ -225,6 +225,10 @@ async fn test_same_shard_not_found_retry() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "target_workflow",
@@ -237,6 +241,10 @@ async fn test_same_shard_not_found_retry() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ])
         .worker(WorkerConfig::default())
@@ -376,6 +384,10 @@ async fn test_cross_shard_outbox_delivery() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "target_workflow",
@@ -388,6 +400,10 @@ async fn test_cross_shard_outbox_delivery() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ])
         .worker(WorkerConfig::default())
@@ -516,6 +532,10 @@ async fn test_grace_window_expiration() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }])
         .worker(WorkerConfig::default().with_unknown_target_grace_window(Duration::from_secs(1)))
         .build();
@@ -630,6 +650,10 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "target_workflow",
@@ -642,6 +666,10 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ])
         .worker(WorkerConfig::default())

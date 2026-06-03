@@ -210,6 +210,10 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "telem_child_wf",
@@ -222,6 +226,10 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![

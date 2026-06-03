@@ -6367,6 +6367,10 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }
     }
 
