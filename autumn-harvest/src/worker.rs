@@ -5050,7 +5050,8 @@ async fn process_workflow_task(
                             .await;
                     }
                 };
-                history_events.extend(new_events.clone());
+                // Use `.iter().cloned()` to prevent an unnecessary intermediate heap allocation of the entire Vec
+                history_events.extend(new_events.iter().cloned());
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                 if let Some(cap) = registry.history_policy().event_hard_cap()
