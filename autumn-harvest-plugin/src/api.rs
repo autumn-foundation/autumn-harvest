@@ -7598,6 +7598,7 @@ pub struct CreateCompletionTriggerRequest {
     pub terminal_states: Option<Vec<TerminalState>>,
     pub target_workflow_name: String,
     pub input_mapping: Option<InputMapping>,
+    pub queue_name: Option<String>,
 }
 
 async fn list_completion_triggers(
@@ -7646,6 +7647,7 @@ async fn create_completion_trigger(
         terminal_states: states_val,
         target_workflow_name: request.target_workflow_name.clone(),
         input_mapping: mapping_val,
+        queue_name: request.queue_name.clone(),
     };
 
     let pool = api_state.storage_pool().map_err(map_error)?;
@@ -7664,6 +7666,7 @@ async fn create_completion_trigger(
                 triggers_dsl::terminal_states.eq(&new_row.terminal_states),
                 triggers_dsl::target_workflow_name.eq(&new_row.target_workflow_name),
                 triggers_dsl::input_mapping.eq(&new_row.input_mapping),
+                triggers_dsl::queue_name.eq(&new_row.queue_name),
                 triggers_dsl::updated_at.eq(Utc::now()),
             ))
             .get_result::<CompletionTriggerDb>(&mut conn)

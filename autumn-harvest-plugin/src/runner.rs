@@ -208,11 +208,13 @@ impl HarvestRunner {
     ///
     /// Returns an error if the workflow/activity registrations are invalid or
     /// the worker configuration cannot be materialized.
+    #[allow(clippy::too_many_lines)]
     pub fn start(
         built: BuiltHarvest,
         config: &HarvestRuntimeConfig,
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
+        let completion_triggers = built.completion_triggers().to_vec();
         let prepared = PreparedHarvestRuntime::build(built, resources)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
@@ -227,6 +229,39 @@ impl HarvestRunner {
                 "harvest runtime started without local worker or scheduler ownership"
             );
         }
+
+        // Sync static triggers before starting workers (issue #517)
+        let sync_trigger_task = if completion_triggers.is_empty() {
+            None
+        } else {
+            let pool = prepared.storage_pool.clone();
+            let triggers = completion_triggers;
+            Some(tokio::spawn(async move {
+                for (_shard_id, shard_pool) in pool.iter_shards() {
+                    match shard_pool.get().await {
+                        Ok(mut conn) => {
+                            if let Err(e) =
+                                autumn_harvest::completion_trigger::sync_completion_triggers(
+                                    &mut conn, &triggers,
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to sync completion triggers on startup: {:?}",
+                                    e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Failed to get DB connection to sync completion triggers: {:?}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }))
+        };
 
         let worker = if config.worker_enabled {
             Some(Arc::new(
@@ -246,6 +281,9 @@ impl HarvestRunner {
             let worker = Arc::clone(worker);
             let pool = harvest_pool.clone();
             tokio::spawn(async move {
+                if let Some(task) = sync_trigger_task {
+                    let _ = task.await;
+                }
                 worker.run(&pool).await;
             })
         });

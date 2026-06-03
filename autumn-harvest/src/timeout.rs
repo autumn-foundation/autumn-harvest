@@ -416,8 +416,8 @@ async fn commit_workflow_execution_timeout(
     timeout_event: &WorkflowEvent,
     error_msg: &str,
     metrics: Option<&(dyn MetricsRecorder + Send + Sync)>,
-) -> HarvestResult<bool> {
-    conn.transaction::<bool, HarvestError, _>(|conn| {
+) -> HarvestResult<(bool, Vec<crate::completion_trigger::DeferredTriggerStart>)> {
+    conn.transaction::<(bool, Vec<crate::completion_trigger::DeferredTriggerStart>), HarvestError, _>(|conn| {
         let timeout_event = timeout_event.clone();
         let error_msg = error_msg.to_owned();
         async move {
@@ -433,7 +433,7 @@ async fn commit_workflow_execution_timeout(
 
             match current_state.as_deref() {
                 Some("RUNNING") => {}
-                _ => return Ok(false),
+                _ => return Ok((false, Vec::new())),
             }
 
             store::append_single_event(conn, exec_id, timeout_event).await?;
@@ -467,15 +467,16 @@ async fn commit_workflow_execution_timeout(
                 .await?;
             }
 
-            apply_parent_close_cascade(conn, exec_id).await?;
-            crate::completion_trigger::evaluate_triggers_for_execution(
+            let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+            let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                 conn,
                 exec_id,
                 crate::completion_trigger::TerminalState::TimedOut,
                 metrics,
             )
             .await?;
-            Ok(true)
+            deferred.extend(triggers);
+            Ok((true, deferred))
         }
         .scope_boxed()
     })
@@ -561,36 +562,45 @@ async fn enforce_workflow_timeout(
         error: error.clone(),
     };
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        let error = error.clone();
-        async move {
-            store::append_events(conn, exec_id, &[workflow_event], history.next_event_id).await?;
-            update_workflow_execution_timed_out(conn, exec_id, &error).await?;
-            queue::fail_task(conn, task.id, &error).await?;
-            apply_parent_close_cascade(conn, exec_id).await?;
-            crate::completion_trigger::evaluate_triggers_for_execution(
-                conn,
-                exec_id,
-                crate::completion_trigger::TerminalState::TimedOut,
-                Some(metrics),
-            )
-            .await?;
-            if execution.parent_close_policy.is_none()
-                && let Some(parent_uuid) = execution.parent_id
-            {
-                wake_parent_for_child_timeout(
-                    conn,
-                    execution_id_from_uuid(parent_uuid),
-                    exec_id,
-                    &error,
-                )
-                .await?;
-            }
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await?;
+    let deferred_starts = conn
+        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
+            |conn| {
+                let error = error.clone();
+                async move {
+                    store::append_events(conn, exec_id, &[workflow_event], history.next_event_id)
+                        .await?;
+                    update_workflow_execution_timed_out(conn, exec_id, &error).await?;
+                    queue::fail_task(conn, task.id, &error).await?;
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::TimedOut,
+                        Some(metrics),
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+                    if execution.parent_close_policy.is_none()
+                        && let Some(parent_uuid) = execution.parent_id
+                    {
+                        wake_parent_for_child_timeout(
+                            conn,
+                            execution_id_from_uuid(parent_uuid),
+                            exec_id,
+                            &error,
+                        )
+                        .await?;
+                    }
+                    Ok(deferred)
+                }
+                .scope_boxed()
+            },
+        )
+        .await?;
+
+    for start in deferred_starts {
+        start.spawn();
+    }
 
     // Best-effort: count task-level timeouts toward the schedule auto-pause threshold.
     // Called AFTER the transaction commits to avoid aborting the transition on a
@@ -756,8 +766,8 @@ pub async fn enforce_workflow_execution_timeouts(
         )
         .await;
 
-        let timed_out_applied = match result {
-            Ok(applied) => applied,
+        let (timed_out_applied, deferred_starts) = match result {
+            Ok((applied, deferred)) => (applied, deferred),
             Err(error) => {
                 tracing::error!(
                     exec_id = %exec_id,
@@ -772,6 +782,10 @@ pub async fn enforce_workflow_execution_timeouts(
         if !timed_out_applied {
             // Row was already non-RUNNING; nothing to do.
             continue;
+        }
+
+        for start in deferred_starts {
+            start.spawn();
         }
 
         tracing::warn!(

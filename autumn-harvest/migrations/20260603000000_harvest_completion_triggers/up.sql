@@ -4,6 +4,7 @@ CREATE TABLE harvest_completion_triggers (
     terminal_states JSONB NOT NULL,
     target_workflow_name VARCHAR(255) NOT NULL,
     input_mapping JSONB NOT NULL,
+    queue_name VARCHAR(255),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

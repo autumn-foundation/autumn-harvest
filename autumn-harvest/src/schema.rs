@@ -389,6 +389,7 @@ diesel::table! {
         terminal_states -> Jsonb,
         target_workflow_name -> Text,
         input_mapping -> Jsonb,
+        queue_name -> Nullable<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }

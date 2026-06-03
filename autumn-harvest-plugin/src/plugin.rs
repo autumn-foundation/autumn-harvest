@@ -228,7 +228,7 @@ impl Plugin for HarvestPlugin {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::unused_async)]
 async fn start_harvest_runtime(
     state: &AppState,
     slot: &Arc<Mutex<HarvestRuntimeSlot>>,
@@ -334,7 +334,6 @@ async fn start_harvest_runtime(
     let max_workflow_start_delay = built.max_workflow_start_delay;
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
     let query_timeout = built.worker_config().query_timeout;
-    let completion_triggers = built.completion_triggers().to_vec();
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources)?;
     let harvest_db_pool = runner.storage_pool();
     let workflow_handle_client = WorkflowHandleClient::new(
@@ -442,26 +441,6 @@ async fn start_harvest_runtime(
         }
     });
     api_state.install(runner.api_runtime());
-
-    if !completion_triggers.is_empty() {
-        for (_shard_id, shard_pool) in runner.storage_pool().iter_shards() {
-            let mut conn = shard_pool.get().await.map_err(|error| {
-                AutumnError::service_unavailable_msg(format!(
-                    "Failed to get DB connection to sync completion triggers: {error}"
-                ))
-            })?;
-            autumn_harvest::completion_trigger::sync_completion_triggers(
-                &mut conn,
-                &completion_triggers,
-            )
-            .await
-            .map_err(|error| {
-                AutumnError::service_unavailable_msg(format!(
-                    "Failed to sync completion triggers to database: {error}"
-                ))
-            })?;
-        }
-    }
 
     {
         let mut guard = slot.lock().expect("harvest lock poisoned");

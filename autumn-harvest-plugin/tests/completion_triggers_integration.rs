@@ -302,7 +302,9 @@ async fn post_json(app: &HarvestApiApp, uri: &str, body: Value) -> (StatusCode, 
 
 #[tokio::test]
 async fn test_completion_triggers_crud_api() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
@@ -343,7 +345,9 @@ async fn test_completion_triggers_crud_api() {
 
 #[tokio::test]
 async fn test_trigger_evaluations_same_shard() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
@@ -431,7 +435,9 @@ async fn test_trigger_evaluations_same_shard() {
 
 #[tokio::test]
 async fn test_trigger_input_mapping_static_and_projection() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
@@ -587,7 +593,9 @@ async fn test_trigger_input_mapping_static_and_projection() {
 
 #[tokio::test]
 async fn test_trigger_state_matching_and_deduplication() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
@@ -700,7 +708,9 @@ async fn test_trigger_state_matching_and_deduplication() {
 
 #[tokio::test]
 async fn test_trigger_cross_shard() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
     let pool0 = build_pool(&shard0_url);
     let pool1 = build_pool(&shard1_url);
@@ -812,9 +822,13 @@ async fn test_trigger_cross_shard() {
         .await
         .unwrap();
 
-    evaluate_triggers_for_execution(&mut conn0, source_exec_id, TerminalState::Completed, None)
-        .await
-        .unwrap();
+    let deferred =
+        evaluate_triggers_for_execution(&mut conn0, source_exec_id, TerminalState::Completed, None)
+            .await
+            .unwrap();
+    for start in deferred {
+        start.spawn();
+    }
 
     // Since cross-shard triggers run asynchronously via tokio::spawn, wait briefly
     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -834,7 +848,9 @@ async fn test_trigger_cross_shard() {
 
 #[tokio::test]
 async fn test_completion_trigger_via_worker_run() {
-    let _lock = TEST_MUTEX.lock().unwrap();
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (url, _container) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool);
@@ -943,4 +959,88 @@ async fn test_completion_trigger_via_worker_run() {
         "State was {}",
         target_exec.state
     );
+}
+
+#[tokio::test]
+async fn test_trigger_with_custom_queue() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"},
+            "queue_name": "custom-queue"
+        }),
+    )
+    .await;
+
+    // Start source workflow
+    let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-queue-test",
+            exec_id: source_exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Transition source to COMPLETED
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    // Evaluate trigger
+    let deferred =
+        evaluate_triggers_for_execution(&mut conn, source_exec_id, TerminalState::Completed, None)
+            .await
+            .unwrap();
+    for start in deferred {
+        start.spawn();
+    }
+
+    // Verify target workflow has been started on queue "custom-queue"
+    let target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+    let target_exec: WorkflowExecution = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .first(&mut conn)
+        .await
+        .unwrap();
+
+    assert_eq!(target_exec.queue_name, "custom-queue");
 }

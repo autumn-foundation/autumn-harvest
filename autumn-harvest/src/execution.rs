@@ -15,6 +15,7 @@ use scoped_futures::ScopedFutureExt;
 use uuid::Uuid;
 
 use crate::build_routing;
+use crate::completion_trigger::DeferredTriggerStart;
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
 use crate::models::{NewHarvestSignal, NewWorkflowExecution, WorkflowExecution};
@@ -312,110 +313,135 @@ pub async fn start_or_load_workflow_execution(
         enqueue.scheduled_at = target_start_time;
     }
 
-    conn.transaction::<StartedWorkflowExecution, HarvestError, _>(|conn| {
-        let row = row;
-        let enqueue = enqueue.clone();
-        let request = request.clone();
-        async move {
-            // `on_conflict_do_nothing()` (no explicit target) lets Postgres
-            // arbitrate against the partial unique index installed by the
-            // continue-as-new migration, which only enforces uniqueness on
-            // rows whose state is not sealed (`CONTINUED_AS_NEW` or
-            // `TERMINATED`). A previously sealed continue-as-new chain or reset
-            // source therefore does not block reusing the same
-            // (workflow_name, workflow_id).
-            let inserted = diesel::insert_into(harvest_workflow_executions::table)
-                .values(&row)
-                .on_conflict_do_nothing()
-                .returning(WorkflowExecution::as_returning())
-                .get_result(conn)
-                .await
-                .optional()
-                .map_err(database_error)?;
+    let (cancel_result, deferred_starts) = conn
+        .transaction::<(StartedWorkflowExecution, Vec<DeferredTriggerStart>), HarvestError, _>(
+            |conn| {
+                let row = row;
+                let enqueue = enqueue.clone();
+                let request = request.clone();
+                async move {
+                    // `on_conflict_do_nothing()` (no explicit target) lets Postgres
+                    // arbitrate against the partial unique index installed by the
+                    // continue-as-new migration, which only enforces uniqueness on
+                    // rows whose state is not sealed (`CONTINUED_AS_NEW` or
+                    // `TERMINATED`). A previously sealed continue-as-new chain or reset
+                    // source therefore does not block reusing the same
+                    // (workflow_name, workflow_id).
+                    let inserted = diesel::insert_into(harvest_workflow_executions::table)
+                        .values(&row)
+                        .on_conflict_do_nothing()
+                        .returning(WorkflowExecution::as_returning())
+                        .get_result(conn)
+                        .await
+                        .optional()
+                        .map_err(database_error)?;
 
-            if let Some(execution) = inserted {
-                if request.start_at.is_some_and(|sa| sa < now) {
-                    return Err(HarvestError::Config(
-                        "Requested start_at is in the past".to_string(),
-                    ));
-                }
-                // Enforce the input cap only on the fresh-insert path. Duplicates
-                // never reach here so the reuse-policy outcome is unaffected.
-                if request.max_workflow_input_bytes > 0 {
-                    let observed =
-                        serde_json::to_string(&request.input).map_or(0, |s| s.len() as u64);
-                    if observed > request.max_workflow_input_bytes {
-                        return Err(crate::error::HarvestError::PayloadTooLarge {
-                            kind: crate::error::PayloadKind::WorkflowInput,
-                            observed_bytes: observed,
-                            cap_bytes: request.max_workflow_input_bytes,
-                            workflow_type: request.workflow_name.to_string(),
-                            activity_name: None,
-                        });
+                    if let Some(execution) = inserted {
+                        if request.start_at.is_some_and(|sa| sa < now) {
+                            return Err(HarvestError::Config(
+                                "Requested start_at is in the past".to_string(),
+                            ));
+                        }
+                        // Enforce the input cap only on the fresh-insert path. Duplicates
+                        // never reach here so the reuse-policy outcome is unaffected.
+                        if request.max_workflow_input_bytes > 0 {
+                            let observed =
+                                serde_json::to_string(&request.input).map_or(0, |s| s.len() as u64);
+                            if observed > request.max_workflow_input_bytes {
+                                return Err(crate::error::HarvestError::PayloadTooLarge {
+                                    kind: crate::error::PayloadKind::WorkflowInput,
+                                    observed_bytes: observed,
+                                    cap_bytes: request.max_workflow_input_bytes,
+                                    workflow_type: request.workflow_name.to_string(),
+                                    activity_name: None,
+                                });
+                            }
+                        }
+                        let started_event = WorkflowEvent::WorkflowStarted {
+                            input: request.input.clone(),
+                            timestamp: target_start_time,
+                        };
+                        store::append_events(conn, exec_id, &[started_event], 0).await?;
+                        queue::enqueue(conn, &enqueue).await?;
+                        return Ok((
+                            StartedWorkflowExecution::from_row(execution, true),
+                            Vec::new(),
+                        ));
                     }
-                }
-                let started_event = WorkflowEvent::WorkflowStarted {
-                    input: request.input.clone(),
-                    timestamp: target_start_time,
-                };
-                store::append_events(conn, exec_id, &[started_event], 0).await?;
-                queue::enqueue(conn, &enqueue).await?;
-                return Ok(StartedWorkflowExecution::from_row(execution, true));
-            }
 
-            // INSERT was a no-op: a prior execution exists. Lock the row to
-            // prevent concurrent state changes while we decide what to do.
-            let existing = load_workflow_execution_by_key_for_update(
-                conn,
-                request.workflow_name,
-                request.workflow_id,
-            )
-            .await?;
+                    // INSERT was a no-op: a prior execution exists. Lock the row to
+                    // prevent concurrent state changes while we decide what to do.
+                    let existing = load_workflow_execution_by_key_for_update(
+                        conn,
+                        request.workflow_name,
+                        request.workflow_id,
+                    )
+                    .await?;
 
-            match request.reuse_policy {
-                WorkflowIdReusePolicy::AllowDuplicate => {
-                    Ok(StartedWorkflowExecution::from_row(existing, false))
-                }
+                    match request.reuse_policy {
+                        WorkflowIdReusePolicy::AllowDuplicate => Ok((
+                            StartedWorkflowExecution::from_row(existing, false),
+                            Vec::new(),
+                        )),
 
-                WorkflowIdReusePolicy::RejectDuplicate => Err(HarvestError::AlreadyExists {
-                    existing_exec_id: ExecutionId::from_uuid(existing.id),
-                    existing_state: existing.state,
-                }),
+                        WorkflowIdReusePolicy::RejectDuplicate => {
+                            Err(HarvestError::AlreadyExists {
+                                existing_exec_id: ExecutionId::from_uuid(existing.id),
+                                existing_state: existing.state,
+                            })
+                        }
 
-                WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
-                    match existing.state.as_str() {
-                        "FAILED" | "CANCELLED" => {
-                            // Only these two explicitly abnormal states start fresh.
-                            replace_execution(
+                        WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
+                            match existing.state.as_str() {
+                                "FAILED" | "CANCELLED" => {
+                                    // Only these two explicitly abnormal states start fresh.
+                                    replace_execution(
+                                        conn, existing, &row, &enqueue, exec_id, &request, now,
+                                    )
+                                    .await
+                                }
+                                _ => {
+                                    // RUNNING, COMPLETED, TIMED_OUT, or any other state:
+                                    // return the existing execution unchanged.
+                                    Ok((
+                                        StartedWorkflowExecution::from_row(existing, false),
+                                        Vec::new(),
+                                    ))
+                                }
+                            }
+                        }
+
+                        WorkflowIdReusePolicy::TerminateIfRunning => {
+                            // The pre-check above cancelled any RUNNING prior execution
+                            // (Transaction 1). By the time we reach this point the prior
+                            // execution's state is CANCELLED, FAILED, COMPLETED, or —
+                            // under extreme concurrency — still RUNNING. All cases start
+                            // fresh; for the still-RUNNING race we inline the cancel here
+                            // so the new start is not silently blocked.
+                            let mut deferred = if existing.state == "RUNNING" {
+                                inline_cancel(conn, ExecutionId::from_uuid(existing.id)).await?
+                            } else {
+                                Vec::new()
+                            };
+                            let (started_wf, mut extra_deferred) = replace_execution(
                                 conn, existing, &row, &enqueue, exec_id, &request, now,
                             )
-                            .await
-                        }
-                        _ => {
-                            // RUNNING, COMPLETED, TIMED_OUT, or any other state:
-                            // return the existing execution unchanged.
-                            Ok(StartedWorkflowExecution::from_row(existing, false))
+                            .await?;
+                            deferred.append(&mut extra_deferred);
+                            Ok((started_wf, deferred))
                         }
                     }
                 }
+                .scope_boxed()
+            },
+        )
+        .await?;
 
-                WorkflowIdReusePolicy::TerminateIfRunning => {
-                    // The pre-check above cancelled any RUNNING prior execution
-                    // (Transaction 1). By the time we reach this point the prior
-                    // execution's state is CANCELLED, FAILED, COMPLETED, or —
-                    // under extreme concurrency — still RUNNING. All cases start
-                    // fresh; for the still-RUNNING race we inline the cancel here
-                    // so the new start is not silently blocked.
-                    if existing.state == "RUNNING" {
-                        inline_cancel(conn, ExecutionId::from_uuid(existing.id)).await?;
-                    }
-                    replace_execution(conn, existing, &row, &enqueue, exec_id, &request, now).await
-                }
-            }
-        }
-        .scope_boxed()
-    })
-    .await
+    for start in deferred_starts {
+        start.spawn();
+    }
+
+    Ok(cancel_result)
 }
 
 /// Transition `existing` to `CONTINUED_AS_NEW` (releasing the partial unique
@@ -429,7 +455,7 @@ async fn replace_execution(
     new_exec_id: ExecutionId,
     request: &StartWorkflowParams<'_>,
     now: chrono::DateTime<Utc>,
-) -> HarvestResult<StartedWorkflowExecution> {
+) -> HarvestResult<(StartedWorkflowExecution, Vec<DeferredTriggerStart>)> {
     if request.start_at.is_some_and(|sa| sa < now) {
         return Err(HarvestError::Config(
             "Requested start_at is in the past".to_string(),
@@ -481,14 +507,20 @@ async fn replace_execution(
     store::append_events(conn, new_exec_id, &[started_event], 0).await?;
     queue::enqueue(conn, enqueue).await?;
 
-    Ok(StartedWorkflowExecution::from_row(new_execution, true))
+    Ok((
+        StartedWorkflowExecution::from_row(new_execution, true),
+        Vec::new(),
+    ))
 }
 
 /// Inline cancellation for the `TerminateIfRunning` race condition where a
 /// RUNNING row appears inside the start transaction despite the pre-check.
 /// Appends a `WorkflowCancelled` event, transitions to CANCELLED, and fails
 /// open tasks — all within the caller's transaction.
-async fn inline_cancel(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> HarvestResult<()> {
+async fn inline_cancel(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Vec<DeferredTriggerStart>> {
     let reason = "terminated to start new execution";
     let history = store::load_history(conn, exec_id).await?;
     store::append_events(
@@ -512,15 +544,16 @@ async fn inline_cancel(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Ha
         .map_err(database_error)?;
     queue::fail_open_tasks_for_execution(conn, exec_id, &format!("workflow cancelled: {reason}"))
         .await?;
-    Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
-    crate::completion_trigger::evaluate_triggers_for_execution(
+    let mut deferred = Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
         conn,
         exec_id,
         crate::completion_trigger::TerminalState::Cancelled,
         None,
     )
     .await?;
-    Ok(())
+    deferred.extend(triggers);
+    Ok(deferred)
 }
 
 /// Cancel a running workflow execution.
@@ -536,6 +569,7 @@ async fn inline_cancel(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Ha
 /// Returns [`HarvestError::NotFound`] when the execution does not exist,
 /// [`HarvestError::Config`] when the execution is already terminal for another
 /// reason, and [`HarvestError::Database`] for persistence failures.
+#[allow(clippy::too_many_lines)]
 pub async fn cancel_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -548,103 +582,116 @@ pub async fn cancel_workflow_execution(
         reason.to_string()
     };
 
-    let cancel_result = conn
-        .transaction::<CancelledWorkflowExecution, HarvestError, _>(|conn| {
-            async move {
-                let execution = harvest_workflow_executions::table
-                    .find(exec_id.as_uuid())
-                    .select(WorkflowExecution::as_select())
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(database_error)?
-                    .ok_or_else(|| {
-                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                    })?;
+    let (cancel_result, deferred_starts) = conn
+        .transaction::<(CancelledWorkflowExecution, Vec<DeferredTriggerStart>), HarvestError, _>(
+            |conn| {
+                async move {
+                    let execution = harvest_workflow_executions::table
+                        .find(exec_id.as_uuid())
+                        .select(WorkflowExecution::as_select())
+                        .for_update()
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(database_error)?
+                        .ok_or_else(|| {
+                            HarvestError::NotFound(format!("workflow execution {exec_id}"))
+                        })?;
 
-                match execution.state.as_str() {
-                    "RUNNING" => {}
-                    "CANCELLED" => {
-                        return Ok(CancelledWorkflowExecution::idempotent(exec_id, execution));
+                    match execution.state.as_str() {
+                        "RUNNING" => {}
+                        "CANCELLED" => {
+                            return Ok((
+                                CancelledWorkflowExecution::idempotent(exec_id, execution),
+                                Vec::new(),
+                            ));
+                        }
+                        state => {
+                            return Err(HarvestError::Config(format!(
+                                "workflow execution {exec_id} is already terminal ({state})"
+                            )));
+                        }
                     }
-                    state => {
+
+                    let deleted_pending = diesel::delete(
+                        crate::schema::harvest_task_queue::table
+                            .filter(
+                                crate::schema::harvest_task_queue::workflow_exec_id
+                                    .eq(Some(exec_id.as_uuid())),
+                            )
+                            .filter(crate::schema::harvest_task_queue::task_type.eq("workflow"))
+                            .filter(crate::schema::harvest_task_queue::state.eq("PENDING"))
+                            .filter(crate::schema::harvest_task_queue::scheduled_at.gt(Utc::now())),
+                    )
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+
+                    let history = store::load_history(conn, exec_id).await?;
+                    store::append_events(
+                        conn,
+                        exec_id,
+                        &[WorkflowEvent::WorkflowCancelled {
+                            reason: reason.clone(),
+                        }],
+                        history.next_event_id,
+                    )
+                    .await?;
+
+                    let updated =
+                        diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                            .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                            .set((
+                                harvest_workflow_executions::state.eq("CANCELLED"),
+                                harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                                harvest_workflow_executions::error.eq(Some(reason.clone())),
+                                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                            ))
+                            .execute(conn)
+                            .await
+                            .map_err(database_error)?;
+
+                    if updated == 0 {
                         return Err(HarvestError::Config(format!(
-                            "workflow execution {exec_id} is already terminal ({state})"
+                            "workflow execution {exec_id} is no longer running"
                         )));
                     }
+
+                    let failed_task_count = queue::fail_open_tasks_for_execution(
+                        conn,
+                        exec_id,
+                        &format!("workflow cancelled: {reason}"),
+                    )
+                    .await?;
+
+                    let total_failed_or_deleted = deleted_pending + failed_task_count;
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Cancelled,
+                        None,
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+
+                    Ok((
+                        CancelledWorkflowExecution::newly_cancelled(
+                            exec_id,
+                            reason,
+                            total_failed_or_deleted,
+                        ),
+                        deferred,
+                    ))
                 }
-
-                let deleted_pending = diesel::delete(
-                    crate::schema::harvest_task_queue::table
-                        .filter(
-                            crate::schema::harvest_task_queue::workflow_exec_id
-                                .eq(Some(exec_id.as_uuid())),
-                        )
-                        .filter(crate::schema::harvest_task_queue::task_type.eq("workflow"))
-                        .filter(crate::schema::harvest_task_queue::state.eq("PENDING"))
-                        .filter(crate::schema::harvest_task_queue::scheduled_at.gt(Utc::now())),
-                )
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-
-                let history = store::load_history(conn, exec_id).await?;
-                store::append_events(
-                    conn,
-                    exec_id,
-                    &[WorkflowEvent::WorkflowCancelled {
-                        reason: reason.clone(),
-                    }],
-                    history.next_event_id,
-                )
-                .await?;
-
-                let updated =
-                    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                        .filter(harvest_workflow_executions::state.eq("RUNNING"))
-                        .set((
-                            harvest_workflow_executions::state.eq("CANCELLED"),
-                            harvest_workflow_executions::output.eq(None::<serde_json::Value>),
-                            harvest_workflow_executions::error.eq(Some(reason.clone())),
-                            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(database_error)?;
-
-                if updated == 0 {
-                    return Err(HarvestError::Config(format!(
-                        "workflow execution {exec_id} is no longer running"
-                    )));
-                }
-
-                let failed_task_count = queue::fail_open_tasks_for_execution(
-                    conn,
-                    exec_id,
-                    &format!("workflow cancelled: {reason}"),
-                )
-                .await?;
-
-                let total_failed_or_deleted = deleted_pending + failed_task_count;
-                apply_parent_close_cascade(conn, exec_id).await?;
-                crate::completion_trigger::evaluate_triggers_for_execution(
-                    conn,
-                    exec_id,
-                    crate::completion_trigger::TerminalState::Cancelled,
-                    None,
-                )
-                .await?;
-
-                Ok(CancelledWorkflowExecution::newly_cancelled(
-                    exec_id,
-                    reason,
-                    total_failed_or_deleted,
-                ))
-            }
-            .scope_boxed()
-        })
+                .scope_boxed()
+            },
+        )
         .await?;
+
+    for start in deferred_starts {
+        start.spawn();
+    }
 
     Ok(cancel_result)
 }
@@ -684,7 +731,7 @@ pub(crate) async fn parent_close_cascade_event_count(
 pub(crate) async fn apply_parent_close_cascade(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
-) -> HarvestResult<()> {
+) -> HarvestResult<Vec<DeferredTriggerStart>> {
     use crate::store;
 
     let running_children: Vec<(Uuid, Option<String>)> = harvest_workflow_executions::table
@@ -699,6 +746,8 @@ pub(crate) async fn apply_parent_close_cascade(
         .await
         .map_err(database_error)?;
 
+    let mut deferred = Vec::new();
+
     for (child_uuid, policy_opt) in running_children {
         let child_exec_id = ExecutionId::from_uuid(child_uuid);
         let policy_str = policy_opt.expect("filtered by is_not_null");
@@ -706,22 +755,25 @@ pub(crate) async fn apply_parent_close_cascade(
             .parse::<ParentClosePolicy>()
             .map_err(HarvestError::Config)?;
 
-        let action = match policy {
-            ParentClosePolicy::Abandon => None,
+        let (action, mut child_deferred) = match policy {
+            ParentClosePolicy::Abandon => (None, Vec::new()),
             ParentClosePolicy::RequestCancel => {
-                cascade_cancel_detached_child(conn, child_exec_id, "parent closed")
-                    .await?
-                    .then_some("request_cancel")
+                let (success, d) =
+                    cascade_cancel_detached_child(conn, child_exec_id, "parent closed").await?;
+                (success.then_some("request_cancel"), d)
             }
             ParentClosePolicy::Terminate => {
-                cascade_terminate_detached_child(conn, child_exec_id, "ParentClosed")
-                    .await?
-                    .then_some("terminate")
+                let (success, d) =
+                    cascade_terminate_detached_child(conn, child_exec_id, "ParentClosed").await?;
+                (success.then_some("terminate"), d)
             }
         };
-        let Some(action) = action else {
+
+        let Some(action_str) = action else {
             continue;
         };
+
+        deferred.append(&mut child_deferred);
 
         store::append_single_event(
             conn,
@@ -729,20 +781,20 @@ pub(crate) async fn apply_parent_close_cascade(
             crate::event::WorkflowEvent::ChildWorkflowCascadeApplied {
                 child_id: child_exec_id,
                 policy,
-                action: action.to_string(),
+                action: action_str.to_string(),
             },
         )
         .await?;
     }
 
-    Ok(())
+    Ok(deferred)
 }
 
 async fn cascade_cancel_detached_child(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
-) -> HarvestResult<bool> {
+) -> HarvestResult<(bool, Vec<DeferredTriggerStart>)> {
     let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq("RUNNING"))
         .set((
@@ -754,7 +806,7 @@ async fn cascade_cancel_detached_child(
         .await
         .map_err(database_error)?;
     if updated == 0 {
-        return Ok(false);
+        return Ok((false, Vec::new()));
     }
     store::append_single_event(
         conn,
@@ -770,22 +822,23 @@ async fn cascade_cancel_detached_child(
         &format!("workflow cancelled by parent close: {reason}"),
     )
     .await?;
-    Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
-    crate::completion_trigger::evaluate_triggers_for_execution(
+    let mut deferred = Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
         conn,
         exec_id,
         crate::completion_trigger::TerminalState::Cancelled,
         None,
     )
     .await?;
-    Ok(true)
+    deferred.extend(triggers);
+    Ok((true, deferred))
 }
 
 async fn cascade_terminate_detached_child(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
-) -> HarvestResult<bool> {
+) -> HarvestResult<(bool, Vec<DeferredTriggerStart>)> {
     let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq("RUNNING"))
         .set((
@@ -797,7 +850,7 @@ async fn cascade_terminate_detached_child(
         .await
         .map_err(database_error)?;
     if updated == 0 {
-        return Ok(false);
+        return Ok((false, Vec::new()));
     }
     store::append_single_event(
         conn,
@@ -813,15 +866,16 @@ async fn cascade_terminate_detached_child(
         &format!("workflow terminated by parent close: {reason}"),
     )
     .await?;
-    Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
-    crate::completion_trigger::evaluate_triggers_for_execution(
+    let mut deferred = Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
         conn,
         exec_id,
         crate::completion_trigger::TerminalState::Failed,
         None,
     )
     .await?;
-    Ok(true)
+    deferred.extend(triggers);
+    Ok((true, deferred))
 }
 
 /// Hard-finalize a workflow execution to `CANCELLED` regardless of its
@@ -859,72 +913,85 @@ pub async fn terminate_workflow_execution(
         reason.to_string()
     };
 
-    let cancel_result = conn
-        .transaction::<CancelledWorkflowExecution, HarvestError, _>(|conn| {
-            async move {
-                let execution = harvest_workflow_executions::table
-                    .find(exec_id.as_uuid())
-                    .select(WorkflowExecution::as_select())
-                    .for_update()
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(database_error)?
-                    .ok_or_else(|| {
-                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                    })?;
+    let (cancel_result, deferred_starts) = conn
+        .transaction::<(CancelledWorkflowExecution, Vec<DeferredTriggerStart>), HarvestError, _>(
+            |conn| {
+                async move {
+                    let execution = harvest_workflow_executions::table
+                        .find(exec_id.as_uuid())
+                        .select(WorkflowExecution::as_select())
+                        .for_update()
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(database_error)?
+                        .ok_or_else(|| {
+                            HarvestError::NotFound(format!("workflow execution {exec_id}"))
+                        })?;
 
-                if execution.state == "CANCELLED" {
-                    return Ok(CancelledWorkflowExecution::idempotent(exec_id, execution));
-                }
+                    if execution.state == "CANCELLED" {
+                        return Ok((
+                            CancelledWorkflowExecution::idempotent(exec_id, execution),
+                            Vec::new(),
+                        ));
+                    }
 
-                let history = store::load_history(conn, exec_id).await?;
-                store::append_events(
-                    conn,
-                    exec_id,
-                    &[WorkflowEvent::WorkflowCancelled {
-                        reason: reason.clone(),
-                    }],
-                    history.next_event_id,
-                )
-                .await?;
+                    let history = store::load_history(conn, exec_id).await?;
+                    store::append_events(
+                        conn,
+                        exec_id,
+                        &[WorkflowEvent::WorkflowCancelled {
+                            reason: reason.clone(),
+                        }],
+                        history.next_event_id,
+                    )
+                    .await?;
 
-                // No state-precondition filter: operator override force-writes.
-                diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                    .set((
-                        harvest_workflow_executions::state.eq("CANCELLED"),
-                        harvest_workflow_executions::output.eq(None::<serde_json::Value>),
-                        harvest_workflow_executions::error.eq(Some(reason.clone())),
-                        harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                    // No state-precondition filter: operator override force-writes.
+                    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                        .set((
+                            harvest_workflow_executions::state.eq("CANCELLED"),
+                            harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                            harvest_workflow_executions::error.eq(Some(reason.clone())),
+                            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+
+                    let failed_task_count = queue::fail_open_tasks_for_execution(
+                        conn,
+                        exec_id,
+                        &format!("workflow terminated: {reason}"),
+                    )
+                    .await?;
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Cancelled,
+                        None,
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+
+                    Ok((
+                        CancelledWorkflowExecution::newly_cancelled(
+                            exec_id,
+                            reason,
+                            failed_task_count,
+                        ),
+                        deferred,
                     ))
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
-
-                let failed_task_count = queue::fail_open_tasks_for_execution(
-                    conn,
-                    exec_id,
-                    &format!("workflow terminated: {reason}"),
-                )
-                .await?;
-                apply_parent_close_cascade(conn, exec_id).await?;
-                crate::completion_trigger::evaluate_triggers_for_execution(
-                    conn,
-                    exec_id,
-                    crate::completion_trigger::TerminalState::Cancelled,
-                    None,
-                )
-                .await?;
-
-                Ok(CancelledWorkflowExecution::newly_cancelled(
-                    exec_id,
-                    reason,
-                    failed_task_count,
-                ))
-            }
-            .scope_boxed()
-        })
+                }
+                .scope_boxed()
+            },
+        )
         .await?;
+
+    for start in deferred_starts {
+        start.spawn();
+    }
 
     Ok(cancel_result)
 }

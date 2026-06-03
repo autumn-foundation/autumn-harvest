@@ -779,6 +779,7 @@ pub struct CompletionTriggerDb {
     pub terminal_states: serde_json::Value,
     pub target_workflow_name: String,
     pub input_mapping: serde_json::Value,
+    pub queue_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -792,6 +793,7 @@ pub struct NewCompletionTriggerDb {
     pub terminal_states: serde_json::Value,
     pub target_workflow_name: String,
     pub input_mapping: serde_json::Value,
+    pub queue_name: Option<String>,
 }
 
 /// Queryable model representing a fired completion trigger event instance.
