@@ -1164,36 +1164,39 @@ impl HistoryMatcher {
     /// - [`HistoryMatch::ExternalSignalInProgress`] when `ExternalSignalRequested`
     ///   exists but no terminal event yet (crash recovery path)
     /// - [`HistoryMatch::NoMatch`] when past end of history (first-time call)
+    fn try_match_stashed_external_signal(
+        &mut self,
+        target: ExecutionId,
+        signal_name: &str,
+    ) -> Option<HistoryMatch> {
+        let pos = self
+            .pending_external_signals
+            .iter()
+            .position(|p| p.target == target && p.signal_name == signal_name)?;
+        let stashed = self.pending_external_signals.remove(pos);
+        Some(match stashed.terminal {
+            Some(StashedSignalTerminal::Delivered) => HistoryMatch::Matched {
+                output: serde_json::Value::Null,
+            },
+            Some(StashedSignalTerminal::Failed(reason_code)) => {
+                HistoryMatch::ExternalSignalFailed {
+                    signal_id: stashed.signal_id,
+                    reason_code,
+                }
+            }
+            None => HistoryMatch::ExternalSignalInProgress {
+                signal_id: stashed.signal_id,
+                payload: stashed.payload,
+            },
+        })
+    }
+
     /// - [`HistoryMatch::Diverged`] when a different event is at this position
-    #[allow(clippy::too_many_lines)]
     pub fn match_external_signal(
         &mut self,
         target: ExecutionId,
         signal_name: &str,
     ) -> HistoryMatch {
-        // Helper: drain a matching entry from the stash and return its result.
-        let try_stash = |pending: &mut Vec<StashedExternalSignal>| {
-            let pos = pending
-                .iter()
-                .position(|p| p.target == target && p.signal_name == signal_name)?;
-            let stashed = pending.remove(pos);
-            Some(match stashed.terminal {
-                Some(StashedSignalTerminal::Delivered) => HistoryMatch::Matched {
-                    output: serde_json::Value::Null,
-                },
-                Some(StashedSignalTerminal::Failed(reason_code)) => {
-                    HistoryMatch::ExternalSignalFailed {
-                        signal_id: stashed.signal_id,
-                        reason_code,
-                    }
-                }
-                None => HistoryMatch::ExternalSignalInProgress {
-                    signal_id: stashed.signal_id,
-                    payload: stashed.payload,
-                },
-            })
-        };
-
         // prepare_match calls drain_early_signals which eagerly stashes any
         // ExternalSignal events sitting at the current cursor. This ensures
         // terminal events at the current cursor are paired with their start
@@ -1213,7 +1216,7 @@ impl HistoryMatcher {
         // accepted trade-off: concurrent signals have no authoritative ordering in
         // history; sequential calls (each in their own execution cycle) always reach
         // cursor-based matching below and DO detect reordering.
-        if let Some(result) = try_stash(&mut self.pending_external_signals) {
+        if let Some(result) = self.try_match_stashed_external_signal(target, signal_name) {
             return result;
         }
         if !has_history {
@@ -1282,6 +1285,14 @@ impl HistoryMatcher {
 
         // Advance past the ExternalSignalRequested event.
         self.cursor += 1;
+        self.scan_external_signal_terminal(signal_id, recorded_payload)
+    }
+
+    fn scan_external_signal_terminal(
+        &mut self,
+        signal_id: ExternalSignalId,
+        recorded_payload: Value,
+    ) -> HistoryMatch {
         let mut scan_cursor = self.cursor;
         let mut first_interleaved_command = None;
 
