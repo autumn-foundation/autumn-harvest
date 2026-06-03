@@ -1455,6 +1455,7 @@ async fn tick_workflow_schedules(
             now,
             current_shard,
             my_claim_token,
+            registered_dags,
             registry,
             metrics,
         )
@@ -1580,6 +1581,7 @@ async fn tick_one_workflow_schedule(
     now: DateTime<Utc>,
     current_shard: ShardId,
     claim_token: uuid::Uuid,
+    registered_dags: &DagCatalog,
     registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
 ) -> HarvestResult<()> {
@@ -2036,9 +2038,26 @@ async fn tick_one_workflow_schedule(
                 let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
                 (key, Some(policy.limit))
             });
-        let (owner, runbook_url, severity) = wf_info.map_or((None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity)
-        });
+        let (owner, runbook_url, severity) = {
+            let wf_meta = wf_info.map(|info| (info.owner, info.runbook_url, info.severity));
+            let dag_meta = registered_dags.get(wf_name).map(|dag| {
+                (
+                    dag.owner.as_deref(),
+                    dag.runbook_url.as_deref(),
+                    dag.severity.as_deref(),
+                )
+            });
+            match (wf_meta, dag_meta) {
+                (Some((o, r, s)), Some((dag_owner, dag_runbook, dag_severity))) => {
+                    (o.or(dag_owner), r.or(dag_runbook), s.or(dag_severity))
+                }
+                (Some((o, r, s)), None) => (o, r, s),
+                (None, Some((dag_owner, dag_runbook, dag_severity))) => {
+                    (dag_owner, dag_runbook, dag_severity)
+                }
+                (None, None) => (None, None, None),
+            }
+        };
         tracing::info!(
             workflow_name = %wf_name, workflow_id = %workflow_id,
             scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
@@ -2456,9 +2475,26 @@ async fn drain_buffered_schedule_runs(
                     let key = crate::concurrency::resolve_concurrency_key(policy.key_expr, &input);
                     (key, Some(policy.limit))
                 });
-            let (owner, runbook_url, severity) = wf_info.map_or((None, None, None), |info| {
-                (info.owner, info.runbook_url, info.severity)
-            });
+            let (owner, runbook_url, severity) = {
+                let wf_meta = wf_info.map(|info| (info.owner, info.runbook_url, info.severity));
+                let dag_meta = registered_dags.get(wf_name).map(|dag| {
+                    (
+                        dag.owner.as_deref(),
+                        dag.runbook_url.as_deref(),
+                        dag.severity.as_deref(),
+                    )
+                });
+                match (wf_meta, dag_meta) {
+                    (Some((o, r, s)), Some((dag_owner, dag_runbook, dag_severity))) => {
+                        (o.or(dag_owner), r.or(dag_runbook), s.or(dag_severity))
+                    }
+                    (Some((o, r, s)), None) => (o, r, s),
+                    (None, Some((dag_owner, dag_runbook, dag_severity))) => {
+                        (dag_owner, dag_runbook, dag_severity)
+                    }
+                    (None, None) => (None, None, None),
+                }
+            };
 
             tracing::info!(
                 workflow_name = %wf_name,

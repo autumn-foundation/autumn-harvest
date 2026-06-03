@@ -6291,3 +6291,158 @@ async fn get_schedule_decisions_api_endpoints() {
     assert_eq!(list2[0]["decision"], "fired");
     assert_eq!(list2[0]["reason_code"], "fired_ok");
 }
+
+#[tokio::test]
+async fn scheduler_tick_preserves_dag_metadata() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "metadata_dag";
+    let workflow_schedule = WorkflowSchedule {
+        workflow_name: dag_name.to_string(),
+        dag_name: Some(dag_name.to_string()),
+        schedule: Schedule::Interval(Duration::from_secs(60)),
+        input: Value::Null,
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "dag-workers".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+    };
+
+    let dag_info = DagInfo {
+        name: dag_name,
+        module: "tests",
+        schedule: Some(Schedule::Interval(Duration::from_secs(60))),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("dag-workers"),
+        builder: build_interval_pipeline_dag,
+        workflow_handler: Some(approval_workflow),
+        jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        owner: Some("ops-team"),
+        runbook_url: Some("http://ops-runbook"),
+        severity: Some("sev2"),
+    };
+    let dag_catalog = Arc::new(compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
+
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for DAG schedule seed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&workflow_schedule))
+            .await
+            .expect("failed to seed DAG-backed workflow schedule");
+        let schedule = load_schedule_from_url(&database_url, dag_name).await;
+        diesel::update(harvest_schedules::table.find(schedule.id))
+            .set(
+                harvest_schedules::next_run_at
+                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("failed to force DAG schedule due");
+    }
+
+    tick_once(
+        pool.clone(),
+        Arc::new(HandlerRegistry::new(
+            vec![workflow_info_named(dag_name)],
+            vec![],
+        )),
+        dag_catalog,
+        Arc::new(vec![workflow_schedule]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("scheduler tick should dispatch DAG schedule");
+
+    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, dag_name)
+        .await
+        .expect("scheduled execution should exist");
+    assert_eq!(execution.owner.as_deref(), Some("ops-team"));
+    assert_eq!(execution.runbook_url.as_deref(), Some("http://ops-runbook"));
+    assert_eq!(execution.severity.as_deref(), Some("sev2"));
+}
+
+#[tokio::test]
+async fn api_trigger_preserves_dag_metadata() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let dag_name = "api_metadata_dag";
+
+    let dag_info = DagInfo {
+        name: dag_name,
+        module: "tests",
+        schedule: Some(Schedule::Manual),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("dag-workers"),
+        builder: build_interval_pipeline_dag,
+        workflow_handler: Some(approval_workflow),
+        jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100u32,
+        owner: Some("dev-team"),
+        runbook_url: Some("http://dev-runbook"),
+        severity: Some("sev1"),
+    };
+    let dag_catalog = Arc::new(compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![workflow_info_named(dag_name)],
+        vec![],
+    ));
+
+    let schedule_id = seed_workflow_schedule_and_get_id(&database_url, dag_name).await;
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("connect");
+        diesel::update(harvest_schedules::table.find(schedule_id))
+            .set((
+                harvest_schedules::dag_name.eq(Some(dag_name.to_string())),
+                harvest_schedules::workflow_name.eq(None::<String>),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("update schedule");
+    }
+
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::clone(&dag_catalog),
+        Arc::new(Vec::new()),
+        Some("scheduler-only".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let (status, ack) = post_json_with_actor(
+        &app,
+        format!("/admin/schedules/{schedule_id}/trigger"),
+        json!({}),
+        "ops-team",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ack["outcome"], "fired");
+
+    let execution = load_latest_workflow_execution_by_name_from_url(&database_url, dag_name)
+        .await
+        .expect("triggered execution should exist");
+    assert_eq!(execution.owner.as_deref(), Some("dev-team"));
+    assert_eq!(execution.runbook_url.as_deref(), Some("http://dev-runbook"));
+    assert_eq!(execution.severity.as_deref(), Some("sev1"));
+}

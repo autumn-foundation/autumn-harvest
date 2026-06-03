@@ -7972,13 +7972,30 @@ async fn trigger_schedule_now(
     // deployments; multi-shard schedule pinning is a follow-up to issue #171).
     let exec_id = ExecutionId::new();
 
-    let (owner, runbook_url, severity) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .map_or((None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity)
+    let (owner, runbook_url, severity) = {
+        let wf_meta = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .map(|info| (info.owner, info.runbook_url, info.severity));
+        let dag_meta = runtime.dags().get(&workflow_name).map(|dag| {
+            (
+                dag.owner.as_deref(),
+                dag.runbook_url.as_deref(),
+                dag.severity.as_deref(),
+            )
         });
+        match (wf_meta, dag_meta) {
+            (Some((o, r, s)), Some((dag_owner, dag_runbook, dag_severity))) => {
+                (o.or(dag_owner), r.or(dag_runbook), s.or(dag_severity))
+            }
+            (Some((o, r, s)), None) => (o, r, s),
+            (None, Some((dag_owner, dag_runbook, dag_severity))) => {
+                (dag_owner, dag_runbook, dag_severity)
+            }
+            (None, None) => (None, None, None),
+        }
+    };
 
     let result = start_or_load_workflow_execution(
         &mut conn,
