@@ -353,6 +353,10 @@ fn approval_registry() -> Arc<HandlerRegistry> {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ))
@@ -368,6 +372,10 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "timer_then_signal_workflow",
@@ -376,6 +384,10 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![],
@@ -1816,6 +1828,10 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
         execution_timeout: None,
         concurrency: None,
         max_input_bytes: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
     }
 }
 
@@ -2707,6 +2723,10 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }])
             .build(),
         &HarvestRuntimeConfig {
@@ -2733,6 +2753,10 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }])
             .build(),
         &HarvestRuntimeConfig {
@@ -2802,6 +2826,10 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![
             recording_activity_info("parallel_a"),
@@ -2848,6 +2876,10 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![
             recording_activity_info("parallel_fast"),
@@ -2903,6 +2935,10 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![recording_activity_info("shared_parallel")],
         Arc::new(state),
@@ -2945,6 +2981,10 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![
             recording_activity_info("barrier_first"),
@@ -2973,6 +3013,7 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn worker_does_not_append_completion_after_activity_timeout() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -2995,6 +3036,10 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![blocking_activity_info(
             "timeout_completion_race",
@@ -3606,6 +3651,10 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -4499,6 +4548,10 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "interval_step",
@@ -4597,6 +4650,10 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![recording_activity_info("interval_step")],
         Arc::new(state),

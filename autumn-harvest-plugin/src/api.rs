@@ -5518,7 +5518,11 @@ async fn signal_with_start_workflow(
             // Attach (reuse UUID) only when the prior is live AND the policy
             // expects to attach. Every other path goes through replace_execution
             // and needs a fresh exec_id keyed for the same shard.
-            let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
+            // Only a RUNNING execution under a non-rejecting policy is a true
+            // attach (signal delivered, start_input ignored). SUSPENDED is
+            // upgraded to TerminateIfRunning by resolve_effective_signal_with_start_policy,
+            // which writes a fresh execution using start_input — so validation must run.
+            let will_attach = existing_state == "RUNNING"
                 && matches!(
                     reuse_policy,
                     WorkflowIdReusePolicy::AllowDuplicate
@@ -15499,7 +15503,10 @@ mod tests {
         assert!(json["output_schema"].is_null());
         assert!(json["error_schema"].is_null());
         // description is omitted (skip_serializing_if)
-        assert!(json.get("description").map_or(true, |v| v.is_null()));
+        assert!(
+            json.get("description")
+                .is_none_or(serde_json::Value::is_null)
+        );
     }
 
     #[test]
@@ -15511,11 +15518,9 @@ mod tests {
         let bad_input = serde_json::json!({"user_id": 42});
         let err = info.validate_input(&bad_input).unwrap_err();
         assert!(!err.is_empty(), "should have at least one violation");
-        let found = err.iter().any(|v| {
-            v.field_path
-                .as_deref()
-                .map_or(false, |p| p.contains("email"))
-        });
+        let found = err
+            .iter()
+            .any(|v| v.field_path.as_deref().is_some_and(|p| p.contains("email")));
         assert!(found, "violation must reference the 'email' field path");
     }
 

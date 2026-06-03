@@ -236,6 +236,10 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ))
@@ -2467,6 +2471,10 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }],
             vec![],
         )

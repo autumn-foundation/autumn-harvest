@@ -348,29 +348,22 @@ fn validate_node(
         }
     };
 
-    // type check
-    if let Some(expected_type) = schema_obj.get("type").and_then(|v| v.as_str()) {
-        let actual_ok = match expected_type {
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "string" => value.is_string(),
-            "number" => value.is_number(),
-            // JSON Schema "integer": must be a number with no fractional part.
-            "integer" => {
-                value.as_i64().is_some()
-                    || value.as_u64().is_some()
-                    || value.as_f64().is_some_and(|f| f.fract() == 0.0)
-            }
-            "boolean" => value.is_boolean(),
-            "null" => value.is_null(),
-            _ => true,
-        };
-        if !actual_ok {
+    // type check — handles both scalar "type": "string" and multi-type "type": ["string","null"]
+    if let Some(type_node) = schema_obj.get("type") {
+        let type_ok = type_node.as_str().map_or_else(
+            || {
+                type_node.as_array().is_none_or(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .any(|t| type_matches(t, value))
+                })
+            },
+            |single| type_matches(single, value),
+        );
+        if !type_ok {
+            let expected = type_node.to_string();
             out.push(SchemaViolation {
-                message: format!(
-                    "expected type '{expected_type}', got '{}'",
-                    json_type_name(value)
-                ),
+                message: format!("expected type {expected}, got '{}'", json_type_name(value)),
                 field_path: path(),
             });
             return;
@@ -452,6 +445,24 @@ fn validate_node(
                 field_path: path(),
             });
         }
+    }
+}
+
+fn type_matches(expected_type: &str, value: &serde_json::Value) -> bool {
+    match expected_type {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        // JSON Schema "integer": must be a number with no fractional part.
+        "integer" => {
+            value.as_i64().is_some()
+                || value.as_u64().is_some()
+                || value.as_f64().is_some_and(|f| f.fract() == 0.0)
+        }
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        _ => true,
     }
 }
 
