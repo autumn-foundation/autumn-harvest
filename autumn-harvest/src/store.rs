@@ -665,7 +665,11 @@ fn summarize_error(error: Option<String>) -> Option<String> {
         return None;
     }
 
-    Some(first_line.chars().take(MAX_ERROR_SUMMARY_CHARS).collect())
+    let end_idx = first_line
+        .char_indices()
+        .nth(MAX_ERROR_SUMMARY_CHARS)
+        .map_or(first_line.len(), |(idx, _)| idx);
+    Some(first_line[..end_idx].to_string())
 }
 
 #[cfg(test)]
