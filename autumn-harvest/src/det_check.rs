@@ -562,6 +562,9 @@ fn line_comment_start(line: &str) -> Option<usize> {
 }
 
 fn next_char(line: &str, pos: usize) -> Option<(char, usize)> {
+    if pos >= line.len() || !line.is_char_boundary(pos) {
+        return None;
+    }
     let ch = line[pos..].chars().next()?;
     Some((ch, pos + ch.len_utf8()))
 }
@@ -835,6 +838,17 @@ mod tests {
                 r#"let _ = SystemTime::now(); // harvest-suppress: DET001 "safe""#
             ),
             Some("safe".to_string())
+        );
+    }
+
+    #[test]
+    fn havoc_emoji_panic_trigger() {
+        let res = std::panic::catch_unwind(|| {
+            let _ = strip_unparseable_content("let s = \"a💀b\";");
+        });
+        assert!(
+            res.is_ok(),
+            "The system still crashes when slicing multi-byte chars!"
         );
     }
 
