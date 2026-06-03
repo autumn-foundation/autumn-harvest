@@ -4894,10 +4894,14 @@ async fn batch_start_workflows(
     };
 
     // ── Pre-validate all items in-memory (issue #357) ───────────────────────
-    // Check: workflow name registered, no DAG collision, JSON Schema (issue #373).
-    // Payload size and duplicate-id checks happen inside
-    // start_or_load_workflow_execution and are surfaced as per-item errors (or
-    // a batch-level 409 for atomic mode).
+    // Check: workflow name registered, no DAG collision.
+    // Schema validation (issue #373) is intentionally deferred to the per-shard
+    // execution loop rather than done here. batch_start always uses AllowDuplicate,
+    // so any item whose (workflow_name, workflow_id) already exists is returned as-is
+    // without storing or deserializing the submitted input; rejecting those items in
+    // pre-validation would cause spurious 400s on idempotent retries that carry stale
+    // or omitted input — the same reason payload-size checks are deferred to
+    // start_or_load_workflow_execution.
     let mut pre_rejected: Vec<BatchStartItemResult> = Vec::new();
     for (idx, item) in request.items.iter().enumerate() {
         let err = if !runtime.registry.workflows.contains_key(&item.workflow_name) {
@@ -4910,25 +4914,6 @@ async fn batch_start_workflows(
                 "workflow '{}' is a registered DAG; use POST /dags/{{name}}/trigger",
                 item.workflow_name
             ))
-        } else if let Some(info) = runtime.registry.workflows.get(&item.workflow_name) {
-            // issue #373: validate against published JSON Schema when present.
-            let null = serde_json::Value::Null;
-            let input = item.input.as_ref().unwrap_or(&null);
-            match info.validate_input(input) {
-                Ok(()) => None,
-                Err(violations) => {
-                    let msgs: Vec<String> = violations
-                        .iter()
-                        .map(|v| {
-                            v.field_path.as_ref().map_or_else(
-                                || v.message.clone(),
-                                |p| format!("{p}: {}", v.message),
-                            )
-                        })
-                        .collect();
-                    Some(format!("input validation failed: {}", msgs.join("; ")))
-                }
-            }
         } else {
             None
         };
