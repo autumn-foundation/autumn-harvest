@@ -413,6 +413,8 @@ mod db_tests {
         include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
         "\n",
         include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+        "\n",
+        include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql")
     );
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {

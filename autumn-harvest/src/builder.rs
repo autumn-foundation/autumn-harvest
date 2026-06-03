@@ -90,6 +90,8 @@ pub struct HarvestBuilder {
     unknown_target_grace_window: Option<Duration>,
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     batch_start_config: BatchStartConfig,
+    /// Declarative completion triggers (issue #517).
+    completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
 }
 
 impl Default for HarvestBuilder {
@@ -117,6 +119,7 @@ impl Default for HarvestBuilder {
             max_workflow_start_delay: None,
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
+            completion_triggers: Vec::new(),
         }
     }
 }
@@ -196,6 +199,8 @@ pub struct BuiltHarvest {
     pub unknown_target_grace_window: Duration,
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     pub batch_start_config: BatchStartConfig,
+    /// Declarative completion triggers (issue #517).
+    completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -424,6 +429,12 @@ pub enum HarvestBuilderError {
 }
 
 impl BuiltHarvest {
+    /// Declarative completion triggers registered on the builder.
+    #[must_use]
+    pub fn completion_triggers(&self) -> &[crate::completion_trigger::CompletionTrigger] {
+        &self.completion_triggers
+    }
+
     #[must_use]
     pub const fn payload_codecs(&self) -> &PayloadCodecs {
         &self.payload_codecs
@@ -624,6 +635,26 @@ impl HarvestBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register completion triggers.
+    #[must_use]
+    pub fn completion_triggers(
+        mut self,
+        triggers: Vec<crate::completion_trigger::CompletionTrigger>,
+    ) -> Self {
+        self.completion_triggers.extend(triggers);
+        self
+    }
+
+    /// Register a single completion trigger.
+    #[must_use]
+    pub fn completion_trigger(
+        mut self,
+        trigger: crate::completion_trigger::CompletionTrigger,
+    ) -> Self {
+        self.completion_triggers.push(trigger);
+        self
     }
 
     /// Register workflow definitions (output of `workflows![]` macro).
@@ -1020,6 +1051,7 @@ impl HarvestBuilder {
             max_workflow_start_delay,
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,
+            completion_triggers: self.completion_triggers,
         })
     }
 }

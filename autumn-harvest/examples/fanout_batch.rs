@@ -1,5 +1,6 @@
 //! Fan-out / parallel activity batch example (issue #359).
 //!
+#![allow(clippy::doc_markdown, clippy::missing_errors_doc, clippy::unused_async)]
 //! Demonstrates:
 //! 1. Fail-fast fan-out: N items processed in parallel; returns on first failure.
 //! 2. Collect-all fan-out: N items processed in parallel; per-slot success/failure.

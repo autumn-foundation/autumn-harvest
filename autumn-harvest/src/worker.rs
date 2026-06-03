@@ -1859,6 +1859,7 @@ async fn persist_workflow_completion(
     next_event_id: i32,
     worker_id: &str,
     output: serde_json::Value,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
@@ -1868,7 +1869,14 @@ async fn persist_workflow_completion(
             store::append_events(conn, exec_id, &[event], next_event_id).await?;
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output).await?;
-            apply_parent_close_cascade(conn, exec_id).await
+            apply_parent_close_cascade(conn, exec_id).await?;
+            crate::completion_trigger::evaluate_triggers_for_execution(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::Completed,
+                metrics,
+            )
+            .await
         }
         .scope_boxed()
     })
@@ -1882,6 +1890,7 @@ async fn persist_workflow_failure(
     next_event_id: i32,
     worker_id: &str,
     error: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
     let error = error.to_string();
     conn.transaction::<(), HarvestError, _>(|conn| {
@@ -1897,7 +1906,14 @@ async fn persist_workflow_failure(
             .await?;
             update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
             queue::fail_task(conn, task_id, &error).await?;
-            apply_parent_close_cascade(conn, exec_id).await
+            apply_parent_close_cascade(conn, exec_id).await?;
+            crate::completion_trigger::evaluate_triggers_for_execution(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::Failed,
+                metrics,
+            )
+            .await
         }
         .scope_boxed()
     })
@@ -2797,6 +2813,7 @@ async fn fail_task_and_execution(
         history.next_event_id,
         worker_id,
         error,
+        None,
     )
     .await
 }
@@ -2936,6 +2953,7 @@ async fn wake_parent_for_child_failure(
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_child_workflow_completion(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -2944,6 +2962,7 @@ async fn persist_child_workflow_completion(
     worker_id: &str,
     parent_exec_id: ExecutionId,
     output: serde_json::Value,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
@@ -2956,6 +2975,13 @@ async fn persist_child_workflow_completion(
             update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
             queue::complete_task(conn, task_id, output.clone()).await?;
             apply_parent_close_cascade(conn, exec_id).await?;
+            crate::completion_trigger::evaluate_triggers_for_execution(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::Completed,
+                metrics,
+            )
+            .await?;
             wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output).await
         }
         .scope_boxed()
@@ -2963,6 +2989,7 @@ async fn persist_child_workflow_completion(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_child_workflow_failure(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -2971,6 +2998,7 @@ async fn persist_child_workflow_failure(
     worker_id: &str,
     parent_exec_id: ExecutionId,
     error: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
     let workflow_failure = WorkflowEvent::WorkflowFailed {
         error: error.to_string(),
@@ -2983,6 +3011,13 @@ async fn persist_child_workflow_failure(
             update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
             queue::fail_task(conn, task_id, &error).await?;
             apply_parent_close_cascade(conn, exec_id).await?;
+            crate::completion_trigger::evaluate_triggers_for_execution(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::Failed,
+                metrics,
+            )
+            .await?;
             wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &error).await
         }
         .scope_boxed()
@@ -3878,6 +3913,7 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             context.persistence.worker_id,
             &error,
+            None,
         )
         .await
     };
@@ -4076,6 +4112,7 @@ async fn reject_child_continue_as_new(
             persistence.next_event_id,
             persistence.worker_id,
             error,
+            None,
         )
         .await?;
     } else {
@@ -4087,6 +4124,7 @@ async fn reject_child_continue_as_new(
             persistence.worker_id,
             parent_exec_id,
             error,
+            None,
         )
         .await?;
     }
@@ -4212,6 +4250,7 @@ async fn persist_workflow_continue_as_new(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn persist_workflow_outcome(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -4240,6 +4279,7 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 parent_id,
                 output,
+                Some(registry.telemetry().metrics.as_ref()),
             )
             .await
         }
@@ -4252,6 +4292,7 @@ async fn persist_workflow_outcome(
                 persistence.next_event_id,
                 persistence.worker_id,
                 output,
+                Some(registry.telemetry().metrics.as_ref()),
             )
             .await;
             if result.is_ok() && update_schedule_counter {
@@ -4273,6 +4314,7 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 parent_id,
                 &error,
+                Some(registry.telemetry().metrics.as_ref()),
             )
             .await;
             if result.is_ok() && update_schedule_counter {
@@ -4295,6 +4337,7 @@ async fn persist_workflow_outcome(
                 persistence.next_event_id,
                 persistence.worker_id,
                 &error,
+                Some(registry.telemetry().metrics.as_ref()),
             )
             .await;
             if result.is_ok() && update_schedule_counter {

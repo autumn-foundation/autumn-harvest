@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use crate::schema::{
     harvest_audit_log, harvest_backfill_log, harvest_batch_jobs, harvest_build_compat,
-    harvest_build_policies, harvest_calendar_exclusions, harvest_calendars, harvest_dead_letters,
+    harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
+    harvest_completion_trigger_fires, harvest_completion_triggers, harvest_dead_letters,
     harvest_events, harvest_external_tasks, harvest_rate_limit_buckets, harvest_schedule_decisions,
     harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
     harvest_workflow_executions,
@@ -762,4 +763,51 @@ pub struct NewScheduleDecision {
     pub occurred_at: DateTime<Utc>,
     pub next_fire_at: DateTime<Utc>,
     pub shard_id: i16,
+}
+
+// ── Completion Triggers ────────────────────────────────────────────────────────
+
+/// Queryable model representing a completion trigger.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_completion_triggers)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CompletionTriggerDb {
+    pub id: Uuid,
+    pub source_workflow_name: String,
+    pub terminal_states: serde_json::Value,
+    pub target_workflow_name: String,
+    pub input_mapping: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insertable model for registering/creating a completion trigger.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_triggers)]
+pub struct NewCompletionTriggerDb {
+    pub id: Uuid,
+    pub source_workflow_name: String,
+    pub terminal_states: serde_json::Value,
+    pub target_workflow_name: String,
+    pub input_mapping: serde_json::Value,
+}
+
+/// Queryable model representing a fired completion trigger event instance.
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_trigger_fires)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CompletionTriggerFireDb {
+    pub source_exec_id: Uuid,
+    pub trigger_id: Uuid,
+    pub fired_at: DateTime<Utc>,
+}
+
+/// Insertable model for registering a fired completion trigger.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_trigger_fires)]
+pub struct NewCompletionTriggerFireDb {
+    pub source_exec_id: Uuid,
+    pub trigger_id: Uuid,
 }

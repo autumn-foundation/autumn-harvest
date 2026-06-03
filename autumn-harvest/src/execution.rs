@@ -513,6 +513,13 @@ async fn inline_cancel(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Ha
     queue::fail_open_tasks_for_execution(conn, exec_id, &format!("workflow cancelled: {reason}"))
         .await?;
     Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    crate::completion_trigger::evaluate_triggers_for_execution(
+        conn,
+        exec_id,
+        crate::completion_trigger::TerminalState::Cancelled,
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -621,6 +628,13 @@ pub async fn cancel_workflow_execution(
 
                 let total_failed_or_deleted = deleted_pending + failed_task_count;
                 apply_parent_close_cascade(conn, exec_id).await?;
+                crate::completion_trigger::evaluate_triggers_for_execution(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Cancelled,
+                    None,
+                )
+                .await?;
 
                 Ok(CancelledWorkflowExecution::newly_cancelled(
                     exec_id,
@@ -757,6 +771,13 @@ async fn cascade_cancel_detached_child(
     )
     .await?;
     Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    crate::completion_trigger::evaluate_triggers_for_execution(
+        conn,
+        exec_id,
+        crate::completion_trigger::TerminalState::Cancelled,
+        None,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -793,6 +814,13 @@ async fn cascade_terminate_detached_child(
     )
     .await?;
     Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    crate::completion_trigger::evaluate_triggers_for_execution(
+        conn,
+        exec_id,
+        crate::completion_trigger::TerminalState::Failed,
+        None,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -880,6 +908,13 @@ pub async fn terminate_workflow_execution(
                 )
                 .await?;
                 apply_parent_close_cascade(conn, exec_id).await?;
+                crate::completion_trigger::evaluate_triggers_for_execution(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Cancelled,
+                    None,
+                )
+                .await?;
 
                 Ok(CancelledWorkflowExecution::newly_cancelled(
                     exec_id,

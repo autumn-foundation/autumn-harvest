@@ -415,6 +415,7 @@ async fn commit_workflow_execution_timeout(
     parent_uuid: Option<uuid::Uuid>,
     timeout_event: &WorkflowEvent,
     error_msg: &str,
+    metrics: Option<&(dyn MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<bool> {
     conn.transaction::<bool, HarvestError, _>(|conn| {
         let timeout_event = timeout_event.clone();
@@ -467,6 +468,13 @@ async fn commit_workflow_execution_timeout(
             }
 
             apply_parent_close_cascade(conn, exec_id).await?;
+            crate::completion_trigger::evaluate_triggers_for_execution(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::TimedOut,
+                metrics,
+            )
+            .await?;
             Ok(true)
         }
         .scope_boxed()
@@ -480,7 +488,7 @@ async fn enforce_activity_timeout(
     exec_id: crate::types::ExecutionId,
     reason: &TimeoutReason,
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
-    metrics: &dyn MetricsRecorder,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> HarvestResult<()> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return queue::fail_task(conn, task.id, &timeout_error("activity", reason)).await;
@@ -544,7 +552,7 @@ async fn enforce_workflow_timeout(
     task: &TaskQueueItem,
     exec_id: crate::types::ExecutionId,
     reason: &TimeoutReason,
-    metrics: &dyn MetricsRecorder,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> HarvestResult<()> {
     let execution = load_workflow_execution(conn, exec_id).await?;
     let error = timeout_error(&execution.workflow_name, reason);
@@ -560,6 +568,13 @@ async fn enforce_workflow_timeout(
             update_workflow_execution_timed_out(conn, exec_id, &error).await?;
             queue::fail_task(conn, task.id, &error).await?;
             apply_parent_close_cascade(conn, exec_id).await?;
+            crate::completion_trigger::evaluate_triggers_for_execution(
+                conn,
+                exec_id,
+                crate::completion_trigger::TerminalState::TimedOut,
+                Some(metrics),
+            )
+            .await?;
             if execution.parent_close_policy.is_none()
                 && let Some(parent_uuid) = execution.parent_id
             {
@@ -691,7 +706,7 @@ pub async fn enforce_external_task_timeouts(conn: &mut AsyncPgConnection) -> Har
 /// Returns the first database or persistence error encountered.
 pub async fn enforce_workflow_execution_timeouts(
     conn: &mut AsyncPgConnection,
-    metrics: &dyn MetricsRecorder,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
 ) -> HarvestResult<usize> {
     let now = Utc::now();
     let expired: Vec<WorkflowExecution> = harvest_workflow_executions::table
@@ -737,6 +752,7 @@ pub async fn enforce_workflow_execution_timeouts(
             parent_uuid,
             &timeout_event,
             &error_msg,
+            Some(metrics),
         )
         .await;
 
@@ -797,7 +813,7 @@ pub async fn enforce_workflow_execution_timeouts(
 #[allow(clippy::too_many_lines)]
 pub async fn enforce_external_signals_outbox(
     conn: &mut AsyncPgConnection,
-    metrics: &dyn MetricsRecorder,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
@@ -1044,7 +1060,7 @@ pub async fn enforce_external_signals_outbox(
 /// Returns the first database or persistence error encountered.
 pub async fn enforce_timeouts_once(
     conn: &mut AsyncPgConnection,
-    metrics: &dyn MetricsRecorder,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
     unknown_target_grace_window: Duration,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],

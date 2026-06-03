@@ -55,6 +55,7 @@ use autumn_harvest::calendar::{
     list_calendars, load_exclusions_for_calendar, plan_backfill_with_calendar,
     preview_schedule_firings, replace_calendar_exclusions,
 };
+use autumn_harvest::completion_trigger::{InputMapping, TerminalState};
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::dlq;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
@@ -64,8 +65,9 @@ use autumn_harvest::history_export::{
     HistoryExportRequest, HistoryPayloadPolicy, export_history,
 };
 use autumn_harvest::models::{
-    AuditRecord, BackfillLogRow, DeadLetter, HarvestCalendar, HarvestSchedule, NewAuditRecord,
-    NewBackfillLogRow, RateLimitBucket, ScheduleDecision, WorkflowExecution,
+    AuditRecord, BackfillLogRow, CompletionTriggerDb, DeadLetter, HarvestCalendar, HarvestSchedule,
+    NewAuditRecord, NewBackfillLogRow, NewCompletionTriggerDb, RateLimitBucket, ScheduleDecision,
+    WorkflowExecution,
 };
 use autumn_harvest::policy::{
     Schedule, SkipPolicy, WorkflowSchedule, compute_jitter_offset, validate_jitter,
@@ -1727,6 +1729,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/admin/external-handoffs/{token}",
             get(get_external_handoff),
         )
+        // Completion triggers management (issue #517): list & create completion triggers.
+        .route("/admin/completion-triggers", get(list_completion_triggers))
+        .route(
+            "/admin/completion-triggers",
+            post(create_completion_trigger).route_layer(require_admin.clone()),
+        )
         // Schedule management (issue #91): unified list + workflow-schedule CRUD.
         // Schedule backfill (issue #177): bounded missed-run recovery.
         .route("/admin/schedules", get(list_schedules))
@@ -1945,6 +1953,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/history/exports"),
         ("GET", "/admin/external-handoffs"),
         ("GET", "/admin/external-handoffs/{token}"),
+        // ── completion triggers (issue #517) ──────────────────────────────────
+        ("GET", "/admin/completion-triggers"),
+        ("POST", "/admin/completion-triggers"),
         // ── schedules (issues #91, #177, #229) ───────────────────────────────
         ("GET", "/admin/schedules"),
         ("GET", "/admin/schedules/{id}"),
@@ -2112,6 +2123,17 @@ pub const fn management_api_request_fields()
             ]),
         ),
         // ── admin ─────────────────────────────────────────────────────────────
+        (
+            "POST",
+            "/admin/completion-triggers",
+            Some(&[
+                "id",
+                "source_workflow_name",
+                "terminal_states",
+                "target_workflow_name",
+                "input_mapping",
+            ]),
+        ),
         ("POST", "/admin/retention/run-now", Some(&[])),
         (
             "POST",
@@ -2513,6 +2535,21 @@ pub const fn management_api_response_fields()
             "GET",
             "/admin/external-handoffs/{token}",
             Some(&["status", "item", "shard_coverage"]),
+        ),
+        // ── completion triggers ───────────────────────────────────────────────
+        ("GET", "/admin/completion-triggers", None),
+        (
+            "POST",
+            "/admin/completion-triggers",
+            Some(&[
+                "id",
+                "source_workflow_name",
+                "terminal_states",
+                "target_workflow_name",
+                "input_mapping",
+                "created_at",
+                "updated_at",
+            ]),
         ),
         // ── schedules ─────────────────────────────────────────────────────────
         ("GET", "/admin/schedules", None), // Vec<ScheduleEntry>
@@ -7552,6 +7589,95 @@ async fn resume_schedule(
 ) -> Result<Json<BasicAck>, AutumnError> {
     let reason = body.and_then(|Json(r)| r.reason);
     set_schedule_paused(&api_state, &id, false, reason.as_deref(), &headers).await
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CreateCompletionTriggerRequest {
+    pub id: Option<uuid::Uuid>,
+    pub source_workflow_name: String,
+    pub terminal_states: Option<Vec<TerminalState>>,
+    pub target_workflow_name: String,
+    pub input_mapping: Option<InputMapping>,
+}
+
+async fn list_completion_triggers(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<CompletionTriggerDb>>, AutumnError> {
+    use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.pool_for(runtime.router().default_shard())).await?;
+
+    let rows = triggers_dsl::harvest_completion_triggers
+        .order(triggers_dsl::created_at.asc())
+        .select(CompletionTriggerDb::as_select())
+        .load(&mut conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+
+    Ok(Json(rows))
+}
+
+async fn create_completion_trigger(
+    Extension(api_state): Extension<HarvestApiState>,
+    Json(request): Json<CreateCompletionTriggerRequest>,
+) -> Result<(StatusCode, Json<CompletionTriggerDb>), AutumnError> {
+    use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+    use chrono::Utc;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let trigger_id = request.id.unwrap_or_else(uuid::Uuid::new_v4);
+    let states = request
+        .terminal_states
+        .unwrap_or_else(|| vec![TerminalState::Completed]);
+    let mapping = request.input_mapping.unwrap_or(InputMapping::Passthrough);
+
+    let states_val = serde_json::to_value(&states)
+        .map_err(|e| AutumnError::bad_request_msg(format!("invalid terminal states: {e}")))?;
+    let mapping_val = serde_json::to_value(&mapping)
+        .map_err(|e| AutumnError::bad_request_msg(format!("invalid input mapping: {e}")))?;
+
+    let new_row = NewCompletionTriggerDb {
+        id: trigger_id,
+        source_workflow_name: request.source_workflow_name.clone(),
+        terminal_states: states_val,
+        target_workflow_name: request.target_workflow_name.clone(),
+        input_mapping: mapping_val,
+    };
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut inserted_row = None;
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+
+        let row = diesel::insert_into(autumn_harvest::schema::harvest_completion_triggers::table)
+            .values(&new_row)
+            .on_conflict(triggers_dsl::id)
+            .do_update()
+            .set((
+                triggers_dsl::source_workflow_name.eq(&new_row.source_workflow_name),
+                triggers_dsl::terminal_states.eq(&new_row.terminal_states),
+                triggers_dsl::target_workflow_name.eq(&new_row.target_workflow_name),
+                triggers_dsl::input_mapping.eq(&new_row.input_mapping),
+                triggers_dsl::updated_at.eq(Utc::now()),
+            ))
+            .get_result::<CompletionTriggerDb>(&mut conn)
+            .await
+            .map_err(database_error)
+            .map_err(map_error)?;
+
+        inserted_row = Some(row);
+    }
+
+    let inserted_row = inserted_row
+        .ok_or_else(|| AutumnError::internal_server_error_msg("no database shards configured"))?;
+
+    Ok((StatusCode::CREATED, Json(inserted_row)))
 }
 
 #[allow(clippy::too_many_lines)]

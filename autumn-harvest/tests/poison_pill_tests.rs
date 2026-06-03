@@ -79,6 +79,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     // Poison-pill crash_strikes column (issue #367)
     include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql")
 );
 
 #[derive(Debug, Default)]

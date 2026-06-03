@@ -80,11 +80,16 @@ impl ShardRouter {
                 "writable shard {writable} is not in the readable set"
             );
         }
-        Self {
+        let this = Self {
             readable_shards,
             writable_shards,
             default_shard,
+        };
+        #[cfg(feature = "db")]
+        if let Ok(mut lock) = GLOBAL_SHARD_ROUTER.write() {
+            *lock = Some(this.clone());
         }
+        this
     }
 
     /// Build a router for a single-shard deployment.
@@ -221,6 +226,10 @@ impl std::fmt::Debug for ShardedDbPool {
 
 #[cfg(feature = "db")]
 pub static GLOBAL_SHARDED_POOL: std::sync::RwLock<Option<ShardedDbPool>> =
+    std::sync::RwLock::new(None);
+
+#[cfg(feature = "db")]
+pub static GLOBAL_SHARD_ROUTER: std::sync::RwLock<Option<ShardRouter>> =
     std::sync::RwLock::new(None);
 
 #[cfg(feature = "db")]

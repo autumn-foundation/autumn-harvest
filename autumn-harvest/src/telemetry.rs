@@ -99,6 +99,11 @@ pub const METRIC_SCHEDULE_RUNS: &str = "harvest.schedule.runs";
 /// Counter: incremented each time a scheduled run is skipped.
 pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
 
+/// Counter: incremented when a completion trigger fires (issue #517).
+///
+/// Attributes: `trigger`, `outcome` (started | skipped | deduped).
+pub const METRIC_COMPLETION_TRIGGER_FIRED: &str = "harvest.completion_trigger.fires";
+
 /// Counter: incremented each time `POST /admin/schedules/{id}/trigger` fires a
 /// one-off run (issue #343).
 ///
@@ -282,6 +287,8 @@ pub const METRIC_LABEL_QUERY: &str = "query.name";
 pub const METRIC_LABEL_OUTCOME: &str = "outcome";
 /// Metric label: reason code for external signal failure.
 pub const METRIC_LABEL_REASON_CODE: &str = "reason_code";
+/// Metric label: the completion trigger ID (issue #517).
+pub const METRIC_LABEL_TRIGGER: &str = "trigger";
 
 // ---------------------------------------------------------------------------
 // TraceContextCarrier
@@ -504,6 +511,13 @@ impl ActivityStatus {
 /// metrics backend the application uses). All methods have default no-op
 /// bodies so implementers can opt in to only the metrics they care about.
 pub trait MetricsRecorder: Send + Sync {
+    /// A completion trigger was fired/evaluated (issue #517).
+    ///
+    /// `outcome` is one of: `"started"`, `"skipped"`, `"deduped"`.
+    fn record_completion_trigger_fired(&self, trigger_id: &str, outcome: &str) {
+        let _ = (trigger_id, outcome);
+    }
+
     /// A workflow task entered the executor on a worker.
     fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
