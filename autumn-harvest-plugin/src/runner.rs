@@ -209,7 +209,7 @@ impl HarvestRunner {
     /// Returns an error if the workflow/activity registrations are invalid or
     /// the worker configuration cannot be materialized.
     #[allow(clippy::too_many_lines)]
-    pub fn start(
+    pub async fn start(
         built: BuiltHarvest,
         config: &HarvestRuntimeConfig,
         resources: HarvestRunnerResources,
@@ -231,33 +231,23 @@ impl HarvestRunner {
         }
 
         // Sync static triggers before starting workers (issue #517)
-        let pool = prepared.storage_pool.clone();
-        let triggers = completion_triggers;
-        let sync_trigger_task = tokio::spawn(async move {
-            for (_shard_id, shard_pool) in pool.iter_shards() {
-                match shard_pool.get().await {
-                    Ok(mut conn) => {
-                        if let Err(e) =
-                            autumn_harvest::completion_trigger::sync_completion_triggers(
-                                &mut conn, &triggers,
-                            )
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to sync completion triggers on startup: {:?}",
-                                e
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to get DB connection to sync completion triggers: {:?}",
-                            e
-                        );
-                    }
-                }
-            }
-        });
+        for (shard_id, shard_pool) in prepared.storage_pool.iter_shards() {
+            let mut conn = shard_pool.get().await.map_err(|e| {
+                AutumnError::service_unavailable_msg(format!(
+                    "Failed to get DB connection to sync completion triggers for shard {shard_id}: {e}"
+                ))
+            })?;
+            autumn_harvest::completion_trigger::sync_completion_triggers(
+                &mut conn,
+                &completion_triggers,
+            )
+            .await
+            .map_err(|e| {
+                AutumnError::service_unavailable_msg(format!(
+                    "Failed to sync completion triggers on startup for shard {shard_id}: {e:?}"
+                ))
+            })?;
+        }
 
         let worker = if config.worker_enabled {
             Some(Arc::new(
@@ -277,7 +267,6 @@ impl HarvestRunner {
             let worker = Arc::clone(worker);
             let pool = harvest_pool.clone();
             tokio::spawn(async move {
-                let _ = sync_trigger_task.await;
                 worker.run(&pool).await;
             })
         });

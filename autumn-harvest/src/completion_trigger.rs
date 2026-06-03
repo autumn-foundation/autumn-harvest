@@ -271,7 +271,7 @@ impl DeferredTriggerStart {
             .read()
             .ok()
             .and_then(|p| p.clone())
-            .map(|sp| sp.pool_for(self.target_shard).clone())
+            .and_then(|sp| sp.exact_pool_for(self.target_shard).cloned())
         else {
             tracing::error!(
                 "[completion_trigger] GLOBAL_SHARDED_POOL is not initialized during spawn. Cannot start target cross-shard workflow."
@@ -333,7 +333,7 @@ impl DeferredTriggerStart {
                         .read()
                         .ok()
                         .and_then(|p| p.clone())
-                        .map(|sp| sp.pool_for(self.source_shard).clone())
+                        .and_then(|sp| sp.exact_pool_for(self.source_shard).cloned())
                         && let Ok(mut source_conn) = source_pool.get().await
                     {
                         use diesel::prelude::*;
@@ -517,7 +517,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                 // Verify cross-shard database pool is configured before proceeding
                 let _pool = {
                     let lock = crate::shard::GLOBAL_SHARDED_POOL.read();
-                    lock.ok().and_then(|p| p.clone()).map(|sp| sp.pool_for(target_shard).clone())
+                    lock.ok().and_then(|p| p.clone()).and_then(|sp| sp.exact_pool_for(target_shard).cloned())
                 }.ok_or_else(|| {
                     tracing::error!("[completion_trigger] GLOBAL_SHARDED_POOL is not initialized or does not have shard {}.", target_shard);
                     crate::error::database_error(diesel::result::Error::RollbackTransaction)
@@ -607,7 +607,7 @@ pub async fn enforce_completion_triggers_outbox(
         let target_shard = crate::types::ShardId::new(task.target_shard);
         let Some(target_pool) = sharded_pool
             .as_ref()
-            .map(|sp| sp.pool_for(target_shard).clone())
+            .and_then(|sp| sp.exact_pool_for(target_shard).cloned())
         else {
             continue;
         };

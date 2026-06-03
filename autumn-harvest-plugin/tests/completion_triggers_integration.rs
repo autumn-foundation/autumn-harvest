@@ -1493,3 +1493,269 @@ async fn test_trigger_compensating_rollback() {
         .is_some();
     assert!(!exists);
 }
+
+#[tokio::test]
+async fn test_trigger_compensating_rollback_restores_existing() {
+    use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
+    let pool0 = build_pool(&shard0_url);
+    let pool1 = build_pool(&shard1_url);
+
+    let trigger_id = uuid::Uuid::new_v4();
+
+    // 1. Pre-register trigger on both shard 0 and shard 1 with initial definition
+    for pool in [&pool0, &pool1] {
+        let mut conn = pool.get().await.unwrap();
+        diesel::insert_into(autumn_harvest::schema::harvest_completion_triggers::table)
+            .values(&autumn_harvest::models::NewCompletionTriggerDb {
+                id: trigger_id,
+                source_workflow_name: "initial_source_wf".to_string(),
+                terminal_states: json!(["Completed"]),
+                target_workflow_name: "initial_target_wf".to_string(),
+                input_mapping: json!({"type": "Passthrough"}),
+                queue_name: None,
+                is_static: false,
+            })
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // Now, setup bad pool1 for shard 1 to trigger connection/update failure on shard 1
+    let bad_pool1 = build_pool("postgres://postgres:postgres@localhost:12345/non_existent");
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool0.clone());
+    pools.insert(ShardId::new(1), bad_pool1.clone());
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(sharded_pool));
+    api_state.install(HarvestApiRuntime::new(
+        test_registry(),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("completion-trigger-test-rollback-restore".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        router.clone(),
+    ));
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+
+    // 2. Post to /admin/completion-triggers with updated values.
+    // Shard 0 will succeed to update, but Shard 1 will fail.
+    // This should trigger compensating rollback, updating Shard 0 back to "initial_source_wf"!
+    let (status, _err_res) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "updated_source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "updated_target_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Verify request failed
+    assert_ne!(status, StatusCode::CREATED);
+
+    // Verify Shard 0 trigger was restored to its pre-existing definition (initial_source_wf)
+    let mut conn0 = pool0.get().await.unwrap();
+    let trigger: autumn_harvest::models::CompletionTriggerDb =
+        triggers_dsl::harvest_completion_triggers
+            .find(trigger_id)
+            .first::<autumn_harvest::models::CompletionTriggerDb>(&mut conn0)
+            .await
+            .unwrap();
+
+    assert_eq!(trigger.source_workflow_name, "initial_source_wf");
+    assert_eq!(trigger.target_workflow_name, "initial_target_wf");
+}
+
+#[tokio::test]
+async fn test_exact_pool_routing_cross_shard() {
+    use autumn_harvest::completion_trigger::enforce_completion_triggers_outbox;
+    use autumn_harvest::completion_trigger::evaluate_triggers_for_execution;
+    use autumn_harvest::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
+    use autumn_harvest::schema::harvest_workflow_executions::dsl as execs_dsl;
+
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
+    let pool0 = build_pool(&shard0_url);
+    let pool1 = build_pool(&shard1_url);
+
+    // Setup sharded database pool and router
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool0.clone());
+    pools.insert(ShardId::new(1), pool1.clone());
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    // Install router
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    // Set globally
+    if let Ok(mut lock) = autumn_harvest::shard::GLOBAL_SHARDED_POOL.write() {
+        *lock = Some(sharded_pool.clone());
+    }
+    if let Ok(mut lock) = autumn_harvest::shard::GLOBAL_SHARD_ROUTER.write() {
+        *lock = Some(router.clone());
+    }
+
+    let mut trigger_id = uuid::Uuid::new_v4();
+    let mut source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+
+    // Find trigger_id and source_exec_id such that the target routes to shard 1
+    for _ in 0..10000 {
+        trigger_id = uuid::Uuid::new_v4();
+        source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+        target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+        if router
+            .pick_for_new_workflow("target_wf", &target_workflow_id)
+            .as_i32()
+            == 1
+        {
+            break;
+        }
+    }
+
+    // Insert trigger into Shard 0
+    let mut conn0 = pool0.get().await.unwrap();
+    diesel::insert_into(autumn_harvest::schema::harvest_completion_triggers::table)
+        .values(&autumn_harvest::models::NewCompletionTriggerDb {
+            id: trigger_id,
+            source_workflow_name: "source_wf".to_string(),
+            terminal_states: json!(["Completed"]),
+            target_workflow_name: "target_wf".to_string(),
+            input_mapping: json!({"type": "Passthrough"}),
+            queue_name: None,
+            is_static: false,
+        })
+        .execute(&mut conn0)
+        .await
+        .unwrap();
+
+    // Insert completed source execution
+    diesel::insert_into(execs_dsl::harvest_workflow_executions)
+        .values((
+            execs_dsl::id.eq(source_exec_id.as_uuid()),
+            execs_dsl::workflow_name.eq("source_wf"),
+            execs_dsl::workflow_id.eq("source-exec-1"),
+            execs_dsl::run_id.eq(uuid::Uuid::new_v4()),
+            execs_dsl::shard_id.eq(0),
+            execs_dsl::state.eq("COMPLETED"),
+            execs_dsl::input.eq(json!({})),
+            execs_dsl::queue_name.eq("default"),
+        ))
+        .execute(&mut conn0)
+        .await
+        .unwrap();
+
+    // Evaluate trigger - this should insert a row into outbox table since target routes to Shard 1
+    let deferred =
+        evaluate_triggers_for_execution(&mut conn0, source_exec_id, TerminalState::Completed, None)
+            .await
+            .unwrap();
+    assert_eq!(deferred.len(), 1);
+
+    // Verify outbox row exists in Shard 0
+    let outbox_rows = outbox_dsl::harvest_completion_trigger_outbox
+        .load::<autumn_harvest::models::CompletionTriggerOutboxDb>(&mut conn0)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows.len(), 1);
+    assert_eq!(outbox_rows[0].target_shard, 1);
+
+    // Now, run the outbox sweep, but we mock the sharded_pool to ONLY have Shard 0 (e.g. simulating a worker that does not configure Shard 1 pool)
+    let mut incomplete_pools = BTreeMap::new();
+    incomplete_pools.insert(ShardId::new(0), pool0.clone());
+    let incomplete_sharded_pool = Some(ShardedDbPool::from_map(incomplete_pools, ShardId::new(0)));
+
+    let sweep_count = enforce_completion_triggers_outbox(
+        &mut conn0,
+        &incomplete_sharded_pool,
+        &[ShardId::new(0), ShardId::new(1)],
+    )
+    .await
+    .unwrap();
+
+    // Verify it processed the row (returned count 1, or 1 task was loaded)
+    assert_eq!(sweep_count, 1);
+
+    // Verify outbox row STILL exists in Shard 0 (it was skipped because Shard 1 pool was unavailable!)
+    let outbox_rows_after = outbox_dsl::harvest_completion_trigger_outbox
+        .load::<autumn_harvest::models::CompletionTriggerOutboxDb>(&mut conn0)
+        .await
+        .unwrap();
+    assert_eq!(outbox_rows_after.len(), 1);
+}
+
+#[tokio::test]
+async fn test_runner_startup_fails_on_sync_failure() {
+    use autumn_harvest_plugin::{
+        HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
+    };
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Create a pool that will immediately fail when a connection is retrieved
+    let bad_pool = build_pool("postgres://postgres:postgres@localhost:12345/non_existent");
+
+    let built = autumn_harvest::HarvestBuilder::new()
+        .completion_triggers(vec![
+            autumn_harvest::completion_trigger::CompletionTrigger {
+                id: uuid::Uuid::new_v4(),
+                source_workflow_name: "source".to_string(),
+                terminal_states: vec![TerminalState::Completed],
+                target_workflow_name: "target".to_string(),
+                input_mapping: autumn_harvest::completion_trigger::InputMapping::Passthrough,
+                queue_name: None,
+            },
+        ])
+        .build();
+
+    let result = HarvestRunner::start(
+        built,
+        &HarvestRuntimeConfig {
+            mode: HarvestMode::External,
+            worker_enabled: false,
+            scheduler_enabled: false,
+            database: autumn_harvest_plugin::HarvestDatabaseConfig {
+                url: Some("postgres://postgres:postgres@localhost:12345/non_existent".to_string()),
+            },
+            outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
+            batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
+            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+        },
+        HarvestRunnerResources::new(bad_pool),
+    )
+    .await;
+
+    // Verify it failed to start
+    assert!(result.is_err());
+    let err_str = result.err().unwrap().to_string();
+    assert!(
+        err_str.contains("Failed to get DB connection")
+            || err_str.contains("sync completion triggers")
+    );
+}

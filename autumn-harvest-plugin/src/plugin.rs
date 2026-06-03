@@ -334,7 +334,7 @@ async fn start_harvest_runtime(
     let max_workflow_start_delay = built.max_workflow_start_delay;
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
     let query_timeout = built.worker_config().query_timeout;
-    let runner = HarvestRunner::start(built, &harvest_config, runner_resources)?;
+    let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
     let harvest_db_pool = runner.storage_pool();
     let workflow_handle_client = WorkflowHandleClient::new(
         harvest_db_pool.sharded_pool().clone(),
@@ -731,7 +731,8 @@ mod tests {
                 readiness: crate::config::HarvestReadinessConfig::default(),
             },
             HarvestRunnerResources::new(pool),
-        );
+        )
+        .await;
 
         let Err(err) = result else {
             panic!("classic DAG runtime should be rejected before startup");

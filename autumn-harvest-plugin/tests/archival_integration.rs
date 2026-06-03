@@ -280,6 +280,7 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
         },
         HarvestRunnerResources::new(pool.clone()),
     )
+    .await
     .expect("runner with retention and archiver should start");
 
     let successful_exec = uuid::Uuid::new_v4();
@@ -422,6 +423,7 @@ async fn archival_hook_times_out_and_preserves_execution() {
         },
         HarvestRunnerResources::new(pool.clone()),
     )
+    .await
     .expect("runner with retention and slow archiver should start");
 
     let slow_exec = uuid::Uuid::new_v4();
