@@ -390,6 +390,7 @@ diesel::table! {
         target_workflow_name -> Text,
         input_mapping -> Jsonb,
         queue_name -> Nullable<Text>,
+        is_static -> Bool,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
@@ -402,6 +403,26 @@ diesel::table! {
         source_exec_id -> Uuid,
         trigger_id -> Uuid,
         fired_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_completion_trigger_outbox (id) {
+        id -> Uuid,
+        source_exec_id -> Uuid,
+        trigger_id -> Uuid,
+        target_shard -> Integer,
+        target_workflow_name -> Text,
+        target_workflow_id -> Text,
+        target_input -> Jsonb,
+        queue_name -> Nullable<Text>,
+        concurrency_key -> Nullable<Text>,
+        concurrency_limit -> Nullable<Integer>,
+        priority -> Jsonb,
+        max_workflow_input_bytes -> BigInt,
+        created_at -> Timestamptz,
     }
 }
 
@@ -435,4 +456,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_rate_limit_buckets,
     harvest_completion_triggers,
     harvest_completion_trigger_fires,
+    harvest_completion_trigger_outbox,
 );

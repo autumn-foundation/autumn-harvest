@@ -1131,6 +1131,12 @@ pub async fn enforce_timeouts_once(
         shard_assignments,
     )
     .await?;
+    count += crate::completion_trigger::enforce_completion_triggers_outbox(
+        conn,
+        sharded_pool,
+        shard_assignments,
+    )
+    .await?;
     Ok(count)
 }
 

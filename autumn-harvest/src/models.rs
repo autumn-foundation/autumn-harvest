@@ -12,10 +12,10 @@ use uuid::Uuid;
 use crate::schema::{
     harvest_audit_log, harvest_backfill_log, harvest_batch_jobs, harvest_build_compat,
     harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
-    harvest_completion_trigger_fires, harvest_completion_triggers, harvest_dead_letters,
-    harvest_events, harvest_external_tasks, harvest_rate_limit_buckets, harvest_schedule_decisions,
-    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
-    harvest_workflow_executions,
+    harvest_completion_trigger_fires, harvest_completion_trigger_outbox,
+    harvest_completion_triggers, harvest_dead_letters, harvest_events, harvest_external_tasks,
+    harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_signals,
+    harvest_task_queue, harvest_timers, harvest_workers, harvest_workflow_executions,
 };
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
@@ -780,6 +780,7 @@ pub struct CompletionTriggerDb {
     pub target_workflow_name: String,
     pub input_mapping: serde_json::Value,
     pub queue_name: Option<String>,
+    pub is_static: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -794,6 +795,7 @@ pub struct NewCompletionTriggerDb {
     pub target_workflow_name: String,
     pub input_mapping: serde_json::Value,
     pub queue_name: Option<String>,
+    pub is_static: bool,
 }
 
 /// Queryable model representing a fired completion trigger event instance.
@@ -812,4 +814,41 @@ pub struct CompletionTriggerFireDb {
 pub struct NewCompletionTriggerFireDb {
     pub source_exec_id: Uuid,
     pub trigger_id: Uuid,
+}
+
+/// Queryable model representing a deferred completion trigger outbox task.
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_trigger_outbox)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CompletionTriggerOutboxDb {
+    pub id: Uuid,
+    pub source_exec_id: Uuid,
+    pub trigger_id: Uuid,
+    pub target_shard: i32,
+    pub target_workflow_name: String,
+    pub target_workflow_id: String,
+    pub target_input: serde_json::Value,
+    pub queue_name: Option<String>,
+    pub concurrency_key: Option<String>,
+    pub concurrency_limit: Option<i32>,
+    pub priority: serde_json::Value,
+    pub max_workflow_input_bytes: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insertable model for registering a deferred completion trigger outbox task.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_trigger_outbox)]
+pub struct NewCompletionTriggerOutboxDb {
+    pub source_exec_id: Uuid,
+    pub trigger_id: Uuid,
+    pub target_shard: i32,
+    pub target_workflow_name: String,
+    pub target_workflow_id: String,
+    pub target_input: serde_json::Value,
+    pub queue_name: Option<String>,
+    pub concurrency_key: Option<String>,
+    pub concurrency_limit: Option<i32>,
+    pub priority: serde_json::Value,
+    pub max_workflow_input_bytes: i64,
 }

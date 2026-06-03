@@ -7648,33 +7648,68 @@ async fn create_completion_trigger(
         target_workflow_name: request.target_workflow_name.clone(),
         input_mapping: mapping_val,
         queue_name: request.queue_name.clone(),
+        is_static: false,
     };
 
     let pool = api_state.storage_pool().map_err(map_error)?;
 
     let mut inserted_row = None;
+    let mut completed_shards = Vec::new();
 
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
+    for (shard, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                for rolled_shard in completed_shards {
+                    let rolled_pool = pool.pool_for(rolled_shard);
+                    if let Ok(mut rollback_conn) = acquire_conn(rolled_pool).await {
+                        let _ = diesel::delete(
+                            autumn_harvest::schema::harvest_completion_triggers::table
+                                .filter(triggers_dsl::id.eq(trigger_id)),
+                        )
+                        .execute(&mut rollback_conn)
+                        .await;
+                    }
+                }
+                return Err(e);
+            }
+        };
 
-        let row = diesel::insert_into(autumn_harvest::schema::harvest_completion_triggers::table)
-            .values(&new_row)
-            .on_conflict(triggers_dsl::id)
-            .do_update()
-            .set((
-                triggers_dsl::source_workflow_name.eq(&new_row.source_workflow_name),
-                triggers_dsl::terminal_states.eq(&new_row.terminal_states),
-                triggers_dsl::target_workflow_name.eq(&new_row.target_workflow_name),
-                triggers_dsl::input_mapping.eq(&new_row.input_mapping),
-                triggers_dsl::queue_name.eq(&new_row.queue_name),
-                triggers_dsl::updated_at.eq(Utc::now()),
-            ))
-            .get_result::<CompletionTriggerDb>(&mut conn)
-            .await
-            .map_err(database_error)
-            .map_err(map_error)?;
+        let row =
+            match diesel::insert_into(autumn_harvest::schema::harvest_completion_triggers::table)
+                .values(&new_row)
+                .on_conflict(triggers_dsl::id)
+                .do_update()
+                .set((
+                    triggers_dsl::source_workflow_name.eq(&new_row.source_workflow_name),
+                    triggers_dsl::terminal_states.eq(&new_row.terminal_states),
+                    triggers_dsl::target_workflow_name.eq(&new_row.target_workflow_name),
+                    triggers_dsl::input_mapping.eq(&new_row.input_mapping),
+                    triggers_dsl::queue_name.eq(&new_row.queue_name),
+                    triggers_dsl::updated_at.eq(Utc::now()),
+                ))
+                .get_result::<CompletionTriggerDb>(&mut conn)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    for rolled_shard in completed_shards {
+                        let rolled_pool = pool.pool_for(rolled_shard);
+                        if let Ok(mut rollback_conn) = acquire_conn(rolled_pool).await {
+                            let _ = diesel::delete(
+                                autumn_harvest::schema::harvest_completion_triggers::table
+                                    .filter(triggers_dsl::id.eq(trigger_id)),
+                            )
+                            .execute(&mut rollback_conn)
+                            .await;
+                        }
+                    }
+                    return Err(map_error(database_error(e)));
+                }
+            };
 
         inserted_row = Some(row);
+        completed_shards.push(shard);
     }
 
     let inserted_row = inserted_row

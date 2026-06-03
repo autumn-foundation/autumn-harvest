@@ -1044,3 +1044,452 @@ async fn test_trigger_with_custom_queue() {
 
     assert_eq!(target_exec.queue_name, "custom-queue");
 }
+
+#[tokio::test]
+async fn test_static_trigger_sync_and_cleanup() {
+    use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    let trigger = autumn_harvest::completion_trigger::CompletionTrigger {
+        id: trigger_id,
+        source_workflow_name: "source_wf".to_string(),
+        terminal_states: vec![TerminalState::Completed],
+        target_workflow_name: "target_wf".to_string(),
+        input_mapping: autumn_harvest::completion_trigger::InputMapping::Passthrough,
+        queue_name: None,
+    };
+
+    // 1. Sync one trigger
+    autumn_harvest::completion_trigger::sync_completion_triggers(&mut conn, &[trigger])
+        .await
+        .unwrap();
+
+    // Verify it is present and is_static = true
+    let row: autumn_harvest::models::CompletionTriggerDb =
+        triggers_dsl::harvest_completion_triggers
+            .find(trigger_id)
+            .first(&mut conn)
+            .await
+            .unwrap();
+    assert!(row.is_static);
+
+    // 2. Sync empty list
+    autumn_harvest::completion_trigger::sync_completion_triggers(&mut conn, &[])
+        .await
+        .unwrap();
+
+    // Verify it is gone
+    let exists = triggers_dsl::harvest_completion_triggers
+        .find(trigger_id)
+        .first::<autumn_harvest::models::CompletionTriggerDb>(&mut conn)
+        .await
+        .optional()
+        .unwrap()
+        .is_some();
+    assert!(!exists);
+}
+
+#[tokio::test]
+async fn test_trigger_outbox_retry_and_sweep() {
+    use autumn_harvest::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
+    let pool0 = build_pool(&shard0_url);
+    let pool1 = build_pool(&shard1_url);
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool0.clone());
+    pools.insert(ShardId::new(1), pool1.clone());
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(sharded_pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        test_registry(),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("completion-trigger-test-outbox".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        router.clone(),
+    ));
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+
+    let mut trigger_id = uuid::Uuid::new_v4();
+    let mut source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+
+    // Ensure routing routes target to shard 1
+    for _ in 0..10000 {
+        trigger_id = uuid::Uuid::new_v4();
+        source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+        target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+        if router
+            .pick_for_new_workflow("target_wf", &target_workflow_id)
+            .as_i32()
+            == 1
+        {
+            break;
+        }
+    }
+
+    // Register trigger
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Start source on Shard 0
+    let mut conn0 = pool0.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn0,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-outbox",
+            exec_id: source_exec_id,
+            input: json!({"key": "val"}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Complete source workflow
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(json!({"out": "yes"}))),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn0)
+        .await
+        .unwrap();
+
+    // Evaluate trigger - this inserts into outbox inside source transaction because target is cross-shard (Shard 1)
+    let deferred =
+        evaluate_triggers_for_execution(&mut conn0, source_exec_id, TerminalState::Completed, None)
+            .await
+            .unwrap();
+    assert_eq!(deferred.len(), 1);
+
+    // Verify outbox row exists in Shard 0
+    let outbox_exists = outbox_dsl::harvest_completion_trigger_outbox
+        .filter(outbox_dsl::source_exec_id.eq(source_exec_id.as_uuid()))
+        .first::<autumn_harvest::models::CompletionTriggerOutboxDb>(&mut conn0)
+        .await
+        .optional()
+        .unwrap()
+        .is_some();
+    assert!(outbox_exists);
+
+    // 1. Run outbox sweep with an incomplete/failing sharded pool mapping (mocking transient connection failure to Shard 1)
+    let mut bad_pools = BTreeMap::new();
+    bad_pools.insert(ShardId::new(0), pool0.clone());
+    // Shard 1 is missing, so sweep cannot start workflow on Shard 1
+    let bad_sharded_pool = ShardedDbPool::from_map(bad_pools, ShardId::new(0));
+
+    let sweep_res = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
+        &mut conn0,
+        &Some(bad_sharded_pool),
+        &[ShardId::new(1)], // sweep targets Shard 1
+    )
+    .await
+    .unwrap();
+    assert_eq!(sweep_res, 0); // nothing completed successfully
+
+    // Outbox row should still be there
+    let outbox_still_exists = outbox_dsl::harvest_completion_trigger_outbox
+        .filter(outbox_dsl::source_exec_id.eq(source_exec_id.as_uuid()))
+        .first::<autumn_harvest::models::CompletionTriggerOutboxDb>(&mut conn0)
+        .await
+        .optional()
+        .unwrap()
+        .is_some();
+    assert!(outbox_still_exists);
+
+    // 2. Now run outbox sweep with the correct/working sharded pool
+    let sweep_res_success = autumn_harvest::completion_trigger::enforce_completion_triggers_outbox(
+        &mut conn0,
+        &Some(sharded_pool),
+        &[ShardId::new(1)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(sweep_res_success, 1); // 1 task succeeded
+
+    // Outbox row should be deleted
+    let outbox_deleted = outbox_dsl::harvest_completion_trigger_outbox
+        .filter(outbox_dsl::source_exec_id.eq(source_exec_id.as_uuid()))
+        .first::<autumn_harvest::models::CompletionTriggerOutboxDb>(&mut conn0)
+        .await
+        .optional()
+        .unwrap()
+        .is_none();
+    assert!(outbox_deleted);
+
+    // Verify target workflow execution is started on Shard 1
+    let mut conn1 = pool1.get().await.unwrap();
+    let target_exec: WorkflowExecution = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .first(&mut conn1)
+        .await
+        .unwrap();
+    assert_eq!(target_exec.input, json!({"out": "yes"}));
+}
+
+#[tokio::test]
+async fn test_trigger_cross_shard_queue_preservation() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
+    let pool0 = build_pool(&shard0_url);
+    let pool1 = build_pool(&shard1_url);
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool0.clone());
+    pools.insert(ShardId::new(1), pool1.clone());
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(sharded_pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        test_registry(),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("completion-trigger-test-queue".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        router.clone(),
+    ));
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+
+    let mut trigger_id = uuid::Uuid::new_v4();
+    let mut source_exec_id = ExecutionId::new_for_shard(ShardId::new(1)); // Source runs on Shard 1
+    let mut target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+
+    // Target routes to Shard 1 as well
+    for _ in 0..10000 {
+        trigger_id = uuid::Uuid::new_v4();
+        source_exec_id = ExecutionId::new_for_shard(ShardId::new(1));
+        target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+        if router
+            .pick_for_new_workflow("target_wf", &target_workflow_id)
+            .as_i32()
+            == 1
+        {
+            break;
+        }
+    }
+
+    // Register trigger without explicit queue
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Create a target workflow schedule on Shard 0 (default shard) with a custom queue
+    let mut conn0 = pool0.get().await.unwrap();
+    let ws = autumn_harvest::policy::WorkflowSchedule {
+        workflow_name: "target_wf".to_string(),
+        dag_name: None,
+        schedule: autumn_harvest::policy::Schedule::Interval(Duration::from_secs(3600)),
+        input: json!({}),
+        catchup: false,
+        max_active_runs: 1,
+        paused: false,
+        queue_name: "target-custom-queue".to_string(),
+        jitter: Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 10,
+        execution_timeout: None,
+        calendar: None,
+        skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
+        consecutive_failure_limit: None,
+    };
+    autumn_harvest::register_workflow_schedules(&mut conn0, &[ws])
+        .await
+        .unwrap();
+
+    // Start source on Shard 1
+    let mut conn1 = pool1.get().await.unwrap();
+    start_or_load_workflow_execution(
+        &mut conn1,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-queue-lookup",
+            exec_id: source_exec_id,
+            input: json!({}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Complete source workflow on Shard 1
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn1)
+        .await
+        .unwrap();
+
+    // Evaluate trigger on Shard 1 (local execution)
+    let deferred =
+        evaluate_triggers_for_execution(&mut conn1, source_exec_id, TerminalState::Completed, None)
+            .await
+            .unwrap();
+    for start in deferred {
+        start.spawn();
+    }
+
+    // Since starts asynchronously, wait briefly
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Verify target execution was started on Shard 1, preserving schedule's "target-custom-queue" queue resolved from Shard 0!
+    let target_exec: WorkflowExecution = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .first(&mut conn1)
+        .await
+        .unwrap();
+    assert_eq!(target_exec.queue_name, "target-custom-queue");
+}
+
+#[tokio::test]
+async fn test_trigger_compensating_rollback() {
+    use autumn_harvest::schema::harvest_completion_triggers::dsl as triggers_dsl;
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ((shard0_url, _shard1_url), _container) = setup_sharded_databases().await;
+    let pool0 = build_pool(&shard0_url);
+    // shard 1 pool: we'll create a bad pool pointing to a non-existent port/host to trigger connection failure
+    let bad_pool1 = build_pool("postgres://postgres:postgres@localhost:12345/non_existent");
+
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), pool0.clone());
+    pools.insert(ShardId::new(1), bad_pool1.clone());
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    let router = ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    );
+
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(HarvestDbPool::sharded(sharded_pool));
+    api_state.install(HarvestApiRuntime::new(
+        test_registry(),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("completion-trigger-test-rollback".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        router.clone(),
+    ));
+    let app = harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"));
+
+    let trigger_id = uuid::Uuid::new_v4();
+
+    // Post to register trigger - shard 0 should succeed, but shard 1 should fail.
+    // This should trigger compensating rollback, deleting the row from shard 0.
+    let (status, _err_res) = post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Verify it failed
+    assert_ne!(status, StatusCode::CREATED);
+
+    // Verify trigger is NOT in Shard 0 (rolled back successfully!)
+    let mut conn0 = pool0.get().await.unwrap();
+    let exists = triggers_dsl::harvest_completion_triggers
+        .find(trigger_id)
+        .first::<autumn_harvest::models::CompletionTriggerDb>(&mut conn0)
+        .await
+        .optional()
+        .unwrap()
+        .is_some();
+    assert!(!exists);
+}

@@ -133,6 +133,23 @@ pub async fn sync_completion_triggers(
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
+    // First, delete any static triggers that are no longer present in the builder's triggers list.
+    let active_ids: Vec<Uuid> = triggers.iter().map(|t| t.id).collect();
+    if active_ids.is_empty() {
+        diesel::delete(dsl::harvest_completion_triggers)
+            .filter(dsl::is_static.eq(true))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    } else {
+        diesel::delete(dsl::harvest_completion_triggers)
+            .filter(dsl::is_static.eq(true))
+            .filter(dsl::id.ne_all(&active_ids))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
+
     for trigger in triggers {
         let db_row = NewCompletionTriggerDb {
             id: trigger.id,
@@ -141,6 +158,7 @@ pub async fn sync_completion_triggers(
             target_workflow_name: trigger.target_workflow_name.clone(),
             input_mapping: serde_json::to_value(&trigger.input_mapping)?,
             queue_name: trigger.queue_name.clone(),
+            is_static: true,
         };
 
         diesel::insert_into(dsl::harvest_completion_triggers)
@@ -153,6 +171,7 @@ pub async fn sync_completion_triggers(
                 dsl::target_workflow_name.eq(&db_row.target_workflow_name),
                 dsl::input_mapping.eq(&db_row.input_mapping),
                 dsl::queue_name.eq(&db_row.queue_name),
+                dsl::is_static.eq(true),
                 dsl::updated_at.eq(Utc::now()),
             ))
             .execute(conn)
@@ -179,8 +198,60 @@ pub static GLOBAL_MAX_WORKFLOW_INPUT_BYTES: std::sync::RwLock<u64> =
     std::sync::RwLock::new(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES);
 
 #[cfg(feature = "db")]
+pub async fn resolve_target_queue(
+    conn: &mut diesel_async::AsyncPgConnection,
+    target_workflow_name: &str,
+    target_shard: crate::types::ShardId,
+) -> String {
+    // If the target shard is 0 (the default shard), we can query it directly.
+    if target_shard.as_i32() == 0 || target_shard.is_unencoded() {
+        use crate::schema::harvest_schedules::dsl as sched_dsl;
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        if let Ok(Some(Some(q))) = sched_dsl::harvest_schedules
+            .filter(sched_dsl::workflow_name.eq(target_workflow_name))
+            .select(sched_dsl::queue_name)
+            .first::<Option<String>>(conn)
+            .await
+            .optional()
+        {
+            return q;
+        }
+        return "default".to_string();
+    }
+
+    // Otherwise, acquire a connection to Shard 0 to query the schedules.
+    let default_pool = crate::shard::GLOBAL_SHARDED_POOL
+        .read()
+        .ok()
+        .and_then(|p| p.clone())
+        .map(|sp| sp.pool_for(crate::types::ShardId::new(0)).clone());
+
+    if let Some(dp) = default_pool
+        && let Ok(mut default_conn) = dp.get().await
+    {
+        use crate::schema::harvest_schedules::dsl as sched_dsl;
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        if let Ok(Some(Some(q))) = sched_dsl::harvest_schedules
+            .filter(sched_dsl::workflow_name.eq(target_workflow_name))
+            .select(sched_dsl::queue_name)
+            .first::<Option<String>>(&mut default_conn)
+            .await
+            .optional()
+        {
+            return q;
+        }
+    }
+
+    "default".to_string()
+}
+
+#[cfg(feature = "db")]
 #[derive(Debug, Clone)]
 pub struct DeferredTriggerStart {
+    pub outbox_id: Uuid,
+    pub source_shard: crate::types::ShardId,
     pub target_shard: crate::types::ShardId,
     pub target_workflow_name: String,
     pub target_workflow_id: String,
@@ -223,19 +294,12 @@ impl DeferredTriggerStart {
             let queue_name = if let Some(ref q) = self.queue_name {
                 q.clone()
             } else {
-                use crate::schema::harvest_schedules::dsl as sched_dsl;
-                use diesel::prelude::*;
-                use diesel_async::RunQueryDsl;
-                sched_dsl::harvest_schedules
-                    .filter(sched_dsl::workflow_name.eq(&self.target_workflow_name))
-                    .select(sched_dsl::queue_name)
-                    .first::<Option<String>>(&mut target_conn)
-                    .await
-                    .optional()
-                    .ok()
-                    .flatten()
-                    .flatten()
-                    .unwrap_or_else(|| "default".to_string())
+                resolve_target_queue(
+                    &mut target_conn,
+                    &self.target_workflow_name,
+                    self.target_shard,
+                )
+                .await
             };
             let start_res = crate::execution::start_or_load_workflow_execution(
                 &mut target_conn,
@@ -262,11 +326,34 @@ impl DeferredTriggerStart {
                 },
             )
             .await;
-            if let Err(e) = start_res {
-                tracing::error!(
-                    "[completion_trigger] Failed to start workflow execution cross-shard: {:?}",
-                    e
-                );
+            match start_res {
+                Ok(_) => {
+                    // Delete task from outbox on successful start
+                    if let Some(source_pool) = crate::shard::GLOBAL_SHARDED_POOL
+                        .read()
+                        .ok()
+                        .and_then(|p| p.clone())
+                        .map(|sp| sp.pool_for(self.source_shard).clone())
+                        && let Ok(mut source_conn) = source_pool.get().await
+                    {
+                        use diesel::prelude::*;
+                        use diesel_async::RunQueryDsl;
+                        let _ =
+                            diesel::delete(crate::schema::harvest_completion_trigger_outbox::table)
+                                .filter(
+                                    crate::schema::harvest_completion_trigger_outbox::dsl::id
+                                        .eq(self.outbox_id),
+                                )
+                                .execute(&mut source_conn)
+                                .await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "[completion_trigger] Failed to start workflow execution cross-shard: {:?}",
+                        e
+                    );
+                }
             }
         });
     }
@@ -287,7 +374,7 @@ pub fn evaluate_triggers_for_execution<'a>(
         use crate::schema::harvest_completion_triggers::dsl as triggers_dsl;
         use crate::schema::harvest_completion_trigger_fires::dsl as fires_dsl;
         use crate::schema::harvest_workflow_executions::dsl as execs_dsl;
-        use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution};
+        use crate::models::{CompletionTriggerDb, NewCompletionTriggerFireDb, WorkflowExecution, NewCompletionTriggerOutboxDb};
         use crate::execution::{StartWorkflowParams, start_or_load_workflow_execution};
         use crate::types::WorkflowIdReusePolicy;
         use crate::types::Priority;
@@ -359,7 +446,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                     crate::error::database_error(diesel::result::Error::RollbackTransaction)
                 })?;
             let target_shard = router.pick_for_new_workflow(&trigger_db.target_workflow_name, &target_workflow_id);
-            let source_shard = exec_id.shard();
+            let source_shard = router.shard_for_execution(exec_id);
 
             // Resolve target concurrency parameters
             let (concurrency_key, concurrency_limit) = {
@@ -385,21 +472,11 @@ pub fn evaluate_triggers_for_execution<'a>(
                     .map_or(global_default, |per_wf| per_wf.max(global_default))
             };
 
-            if target_shard == source_shard || source_shard.is_unencoded() {
+            if target_shard == source_shard {
                 let queue_name = if let Some(ref q) = trigger_db.queue_name {
                     q.clone()
                 } else {
-                    use crate::schema::harvest_schedules::dsl as sched_dsl;
-                    sched_dsl::harvest_schedules
-                        .filter(sched_dsl::workflow_name.eq(&trigger_db.target_workflow_name))
-                        .select(sched_dsl::queue_name)
-                        .first::<Option<String>>(conn)
-                        .await
-                        .optional()
-                        .ok()
-                        .flatten()
-                        .flatten()
-                        .unwrap_or_else(|| "default".to_string())
+                    resolve_target_queue(conn, &trigger_db.target_workflow_name, target_shard).await
                 };
 
                 let target_exec_id = crate::types::ExecutionId::new_for_shard(target_shard);
@@ -450,7 +527,27 @@ pub fn evaluate_triggers_for_execution<'a>(
                     m.record_completion_trigger_fired(&trigger_name, "started");
                 }
 
+                let outbox_row = diesel::insert_into(crate::schema::harvest_completion_trigger_outbox::table)
+                    .values(&NewCompletionTriggerOutboxDb {
+                        source_exec_id: exec_id.as_uuid(),
+                        trigger_id: trigger_db.id,
+                        target_shard: target_shard.as_i32(),
+                        target_workflow_name: trigger_db.target_workflow_name.clone(),
+                        target_workflow_id: target_workflow_id.clone(),
+                        target_input: target_input.clone(),
+                        queue_name: trigger_db.queue_name.clone(),
+                        concurrency_key: concurrency_key.clone(),
+                        concurrency_limit: concurrency_limit.map(|l| i32::try_from(l).unwrap_or(i32::MAX)),
+                        priority: serde_json::to_value(Priority::default()).unwrap_or(Value::Null),
+                        max_workflow_input_bytes: i64::try_from(max_workflow_input_bytes).unwrap_or(i64::MAX),
+                    })
+                    .get_result::<crate::models::CompletionTriggerOutboxDb>(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
                 deferred_starts.push(DeferredTriggerStart {
+                    outbox_id: outbox_row.id,
+                    source_shard,
                     target_shard,
                     target_workflow_name: trigger_db.target_workflow_name.clone(),
                     target_workflow_id,
@@ -468,6 +565,119 @@ pub fn evaluate_triggers_for_execution<'a>(
         Ok(deferred_starts)
     }
     .boxed()
+}
+
+/// Enforces pending completion triggers outbox tasks.
+///
+/// # Errors
+///
+/// Returns an error if any database operations fail.
+#[cfg(feature = "db")]
+pub async fn enforce_completion_triggers_outbox(
+    conn: &mut diesel_async::AsyncPgConnection,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+) -> crate::error::HarvestResult<usize> {
+    use crate::models::CompletionTriggerOutboxDb;
+    use crate::schema::harvest_completion_trigger_outbox::dsl as outbox_dsl;
+    use crate::types::Priority;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let shards: Vec<i32> = if shard_assignments.is_empty() {
+        vec![0]
+    } else {
+        shard_assignments.iter().map(|s| s.as_i32()).collect()
+    };
+
+    // Load up to 50 pending outbox tasks for shards assigned to this worker.
+    let pending_tasks = outbox_dsl::harvest_completion_trigger_outbox
+        .filter(outbox_dsl::target_shard.eq_any(&shards))
+        .limit(50)
+        .load::<CompletionTriggerOutboxDb>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let count = pending_tasks.len();
+    if count == 0 {
+        return Ok(0);
+    }
+
+    for task in pending_tasks {
+        let target_shard = crate::types::ShardId::new(task.target_shard);
+        let Some(target_pool) = sharded_pool
+            .as_ref()
+            .map(|sp| sp.pool_for(target_shard).clone())
+        else {
+            continue;
+        };
+
+        let mut target_conn = match target_pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    "[completion_trigger outbox] Failed to get connection to target shard {:?}: {:?}",
+                    target_shard,
+                    e
+                );
+                continue;
+            }
+        };
+
+        let queue_name = if let Some(ref q) = task.queue_name {
+            q.clone()
+        } else {
+            resolve_target_queue(&mut target_conn, &task.target_workflow_name, target_shard).await
+        };
+
+        let priority: Priority = serde_json::from_value(task.priority).unwrap_or_default();
+
+        let start_res = crate::execution::start_or_load_workflow_execution(
+            &mut target_conn,
+            crate::execution::StartWorkflowParams {
+                workflow_name: &task.target_workflow_name,
+                workflow_id: &task.target_workflow_id,
+                exec_id: crate::types::ExecutionId::new_for_shard(target_shard),
+                input: task.target_input,
+                parent_id: None,
+                queue_name: &queue_name,
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: task.concurrency_key,
+                concurrency_limit: task
+                    .concurrency_limit
+                    .map(|l| u32::try_from(l).unwrap_or(0)),
+                priority,
+                max_workflow_input_bytes: u64::try_from(task.max_workflow_input_bytes).unwrap_or(0),
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+            },
+        )
+        .await;
+
+        match start_res {
+            Ok(_) => {
+                // Delete task from outbox on successful start
+                let _ = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                    .filter(outbox_dsl::id.eq(task.id))
+                    .execute(conn)
+                    .await;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[completion_trigger outbox] Failed to start workflow execution cross-shard: {:?}",
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(count)
 }
 
 #[cfg(test)]
