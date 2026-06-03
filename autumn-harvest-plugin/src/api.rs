@@ -179,7 +179,7 @@ impl HarvestApiRuntime {
                 .filter_map(|schedule| schedule.dag_name.clone()),
         );
 
-        Self {
+        let this = Self {
             registry,
             dags,
             registered_dag_names: Arc::new(registered_dag_names),
@@ -188,8 +188,10 @@ impl HarvestApiRuntime {
             queues,
             scheduler,
             retention,
-            router,
-        }
+            router: router.clone(),
+        };
+        autumn_harvest::shard::install_global_router(router);
+        this
     }
 
     /// Shard router used to pick a destination for new workflows.

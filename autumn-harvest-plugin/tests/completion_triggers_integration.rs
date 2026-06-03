@@ -1649,9 +1649,7 @@ async fn test_exact_pool_routing_cross_shard() {
     if let Ok(mut lock) = autumn_harvest::shard::GLOBAL_SHARDED_POOL.write() {
         *lock = Some(sharded_pool.clone());
     }
-    if let Ok(mut lock) = autumn_harvest::shard::GLOBAL_SHARD_ROUTER.write() {
-        *lock = Some(router.clone());
-    }
+    autumn_harvest::shard::install_global_router(router.clone());
 
     let mut trigger_id = uuid::Uuid::new_v4();
     let mut source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));

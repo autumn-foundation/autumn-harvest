@@ -80,16 +80,11 @@ impl ShardRouter {
                 "writable shard {writable} is not in the readable set"
             );
         }
-        let this = Self {
+        Self {
             readable_shards,
             writable_shards,
             default_shard,
-        };
-        #[cfg(feature = "db")]
-        if let Ok(mut lock) = GLOBAL_SHARD_ROUTER.write() {
-            *lock = Some(this.clone());
         }
-        this
     }
 
     /// Build a router for a single-shard deployment.
@@ -231,6 +226,18 @@ pub static GLOBAL_SHARDED_POOL: std::sync::RwLock<Option<ShardedDbPool>> =
 #[cfg(feature = "db")]
 pub static GLOBAL_SHARD_ROUTER: std::sync::RwLock<Option<ShardRouter>> =
     std::sync::RwLock::new(None);
+
+/// Install a `ShardRouter` into the global registry.
+///
+/// This should only be called once during runtime initialization (e.g. by
+/// the `HarvestRunner` or `HarvestApiRuntime`) to avoid race conditions and
+/// overwrites from temporary constructors in tests.
+#[cfg(feature = "db")]
+pub fn install_global_router(router: ShardRouter) {
+    if let Ok(mut lock) = GLOBAL_SHARD_ROUTER.write() {
+        *lock = Some(router);
+    }
+}
 
 #[cfg(feature = "db")]
 impl ShardedDbPool {

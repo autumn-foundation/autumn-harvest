@@ -222,6 +222,7 @@ impl HarvestRunner {
         let queues = prepared.worker_runtime_config.queues.clone();
         let harvest_pool = prepared.storage_pool.clone_inner();
         let shard_router = prepared.shard_router.clone();
+        autumn_harvest::shard::install_global_router(shard_router.clone());
 
         if !config.worker_enabled && !config.scheduler_enabled {
             tracing::info!(

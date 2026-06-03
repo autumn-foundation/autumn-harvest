@@ -131,55 +131,62 @@ pub async fn sync_completion_triggers(
     use crate::schema::harvest_completion_triggers::dsl;
     use chrono::Utc;
     use diesel::prelude::*;
-    use diesel_async::RunQueryDsl;
+    use diesel_async::{AsyncConnection, RunQueryDsl};
 
-    // First, delete any static triggers that are no longer present in the builder's triggers list.
     let active_ids: Vec<Uuid> = triggers.iter().map(|t| t.id).collect();
-    if active_ids.is_empty() {
-        diesel::delete(dsl::harvest_completion_triggers)
-            .filter(dsl::is_static.eq(true))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-    } else {
-        diesel::delete(dsl::harvest_completion_triggers)
-            .filter(dsl::is_static.eq(true))
-            .filter(dsl::id.ne_all(&active_ids))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-    }
+    let triggers = triggers.to_vec();
 
-    for trigger in triggers {
-        let db_row = NewCompletionTriggerDb {
-            id: trigger.id,
-            source_workflow_name: trigger.source_workflow_name.clone(),
-            terminal_states: serde_json::to_value(&trigger.terminal_states)?,
-            target_workflow_name: trigger.target_workflow_name.clone(),
-            input_mapping: serde_json::to_value(&trigger.input_mapping)?,
-            queue_name: trigger.queue_name.clone(),
-            is_static: true,
-        };
+    conn.transaction(|tx| {
+        Box::pin(async move {
+            // First, delete any static triggers that are no longer present in the builder's triggers list.
+            if active_ids.is_empty() {
+                diesel::delete(dsl::harvest_completion_triggers)
+                    .filter(dsl::is_static.eq(true))
+                    .execute(tx)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            } else {
+                diesel::delete(dsl::harvest_completion_triggers)
+                    .filter(dsl::is_static.eq(true))
+                    .filter(dsl::id.ne_all(&active_ids))
+                    .execute(tx)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
 
-        diesel::insert_into(dsl::harvest_completion_triggers)
-            .values(&db_row)
-            .on_conflict(dsl::id)
-            .do_update()
-            .set((
-                dsl::source_workflow_name.eq(&db_row.source_workflow_name),
-                dsl::terminal_states.eq(&db_row.terminal_states),
-                dsl::target_workflow_name.eq(&db_row.target_workflow_name),
-                dsl::input_mapping.eq(&db_row.input_mapping),
-                dsl::queue_name.eq(&db_row.queue_name),
-                dsl::is_static.eq(true),
-                dsl::updated_at.eq(Utc::now()),
-            ))
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-    }
+            for trigger in &triggers {
+                let db_row = NewCompletionTriggerDb {
+                    id: trigger.id,
+                    source_workflow_name: trigger.source_workflow_name.clone(),
+                    terminal_states: serde_json::to_value(&trigger.terminal_states)?,
+                    target_workflow_name: trigger.target_workflow_name.clone(),
+                    input_mapping: serde_json::to_value(&trigger.input_mapping)?,
+                    queue_name: trigger.queue_name.clone(),
+                    is_static: true,
+                };
 
-    Ok(())
+                diesel::insert_into(dsl::harvest_completion_triggers)
+                    .values(&db_row)
+                    .on_conflict(dsl::id)
+                    .do_update()
+                    .set((
+                        dsl::source_workflow_name.eq(&db_row.source_workflow_name),
+                        dsl::terminal_states.eq(&db_row.terminal_states),
+                        dsl::target_workflow_name.eq(&db_row.target_workflow_name),
+                        dsl::input_mapping.eq(&db_row.input_mapping),
+                        dsl::queue_name.eq(&db_row.queue_name),
+                        dsl::is_static.eq(true),
+                        dsl::updated_at.eq(Utc::now()),
+                    ))
+                    .execute(tx)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+
+            Ok(())
+        })
+    })
+    .await
 }
 
 #[cfg(feature = "db")]
