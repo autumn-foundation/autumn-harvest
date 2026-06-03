@@ -1863,9 +1863,8 @@
       "path": "/workflows/batch_start",
       "category": "batch",
       "read_only": false,
-      "idempotency": "Idempotent per item: each item may carry an idempotency_key (issue #357); a retried batch carrying the same keys does not start duplicate executions. The batch envelope itself is not idempotent without per-item keys.",
       "description": "Start N workflow executions in one batched request. atomic=true validates all items first; if any are invalid the entire batch is rejected with 409 and zero rows are inserted. atomic=false returns per-item results.",
-      "idempotency": "Idempotent by workflow_id per item according to the individual reuse policy.",
+      "idempotency": "Idempotent by workflow_id per item according to the individual reuse policy. Additionally, each item may carry a specific idempotency_key (issue #357); a retried batch carrying the same keys does not start duplicate executions. The batch envelope itself is not idempotent without per-item keys.",
       "params": [],
       "request_body": {
         "required": true,
