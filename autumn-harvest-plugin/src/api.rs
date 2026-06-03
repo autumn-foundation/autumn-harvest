@@ -5523,7 +5523,7 @@ async fn signal_with_start_workflow(
         }
     }
 
-    let (shard, mut conn, exec_id, will_attach) = if let Some(tuple) = found_shard {
+    let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
         tuple
     } else {
         let shard = runtime
@@ -5537,13 +5537,27 @@ async fn signal_with_start_workflow(
     };
 
     // issue #373: validate start_input against the workflow's published JSON Schema (if any).
-    // Only runs when this request will write a new execution; attach requests (existing
-    // RUNNING/SUSPENDED + AllowDuplicate*) never use start_input, so we skip validation to
-    // avoid spurious 400s — matching the payload-cap deferral from issue #252.
-    if !will_attach
-        && let Some(info) = runtime.registry.workflows.get(&workflow_name)
+    // Always runs regardless of will_attach: the pre-scan that sets will_attach is unlocked, so
+    // if the observed RUNNING execution completes before the core resolver takes its FOR UPDATE
+    // lock, the core path can escalate AllowDuplicate to a fresh start and write start_input
+    // without validation. Validating unconditionally closes this TOCTOU window.
+    if let Some(info) = runtime.registry.workflows.get(&workflow_name)
         && let Err(violations) = info.validate_input(&start_input)
     {
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_SIGNAL_WITH_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: None,
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: request.idempotency_key.as_deref(),
+            status: STATUS_FAILED,
+            error_summary: Some("input validation failed"),
+            shard_id: Some(shard.as_i32()),
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({

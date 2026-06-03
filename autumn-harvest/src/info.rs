@@ -246,7 +246,12 @@ impl WorkflowInfo {
     }
 
     /// Convenience method (enabled with the `schema` feature) that attaches
-    /// JSON Schemas for `I`, `O`, and `E` using [`schemars`].
+    /// JSON Schemas for `I` and `O` using [`schemars`].
+    ///
+    /// The error schema is always published as `{"type": "string"}` because the
+    /// workflow runtime stringifies every `Err(e)` value before recording it in
+    /// `WorkflowFailed`. Publishing the structured schema of `E` would mislead
+    /// discovery clients into expecting a payload that can never be returned.
     ///
     /// # Example
     ///
@@ -264,23 +269,25 @@ impl WorkflowInfo {
     ///
     /// // In the builder:
     /// .workflows(vec![
-    ///     onboarding_info().with_schemas::<OnboardInput, (), String>(),
+    ///     onboarding_info().with_schemas::<OnboardInput, ()>(),
     /// ])
     /// ```
     #[cfg(feature = "schema")]
     #[must_use]
-    pub fn with_schemas<I, O, E>(self) -> Self
+    pub fn with_schemas<I, O>(self) -> Self
     where
         I: schemars::JsonSchema,
         O: schemars::JsonSchema,
-        E: schemars::JsonSchema,
     {
         fn schema_for<T: schemars::JsonSchema>() -> serde_json::Value {
             serde_json::to_value(schemars::schema_for!(T)).unwrap_or_default()
         }
+        fn string_schema() -> serde_json::Value {
+            serde_json::json!({"type": "string"})
+        }
         self.with_input_schema_fn(schema_for::<I>)
             .with_output_schema_fn(schema_for::<O>)
-            .with_error_schema_fn(schema_for::<E>)
+            .with_error_schema_fn(string_schema)
     }
 }
 
@@ -471,25 +478,34 @@ fn validate_node(
         }
     }
 
-    // additionalProperties: false — reject unknown object keys
-    if schema_obj
-        .get("additionalProperties")
-        .and_then(serde_json::Value::as_bool)
-        == Some(false)
-        && let Some(obj) = value.as_object()
+    // additionalProperties — reject unknown keys (false) or validate them against a sub-schema
+    if let (Some(add_props), Some(obj)) =
+        (schema_obj.get("additionalProperties"), value.as_object())
     {
-        let allowed: std::collections::HashSet<&str> = schema_obj
+        let known_keys: std::collections::HashSet<&str> = schema_obj
             .get("properties")
             .and_then(|v| v.as_object())
             .map(|props| props.keys().map(String::as_str).collect())
             .unwrap_or_default();
-        for key in obj.keys() {
-            if !allowed.contains(key.as_str()) {
-                let escaped = key.replace('~', "~0").replace('/', "~1");
-                out.push(SchemaViolation {
-                    message: format!("additional property '{key}' is not allowed"),
-                    field_path: Some(format!("{ptr}/{escaped}")),
-                });
+        if add_props.as_bool() == Some(false) {
+            // boolean false: any unknown key is forbidden
+            for key in obj.keys() {
+                if !known_keys.contains(key.as_str()) {
+                    let escaped = key.replace('~', "~0").replace('/', "~1");
+                    out.push(SchemaViolation {
+                        message: format!("additional property '{key}' is not allowed"),
+                        field_path: Some(format!("{ptr}/{escaped}")),
+                    });
+                }
+            }
+        } else if add_props.is_object() {
+            // schema object: validate each additional (non-properties) key against it
+            for (key, val) in obj {
+                if !known_keys.contains(key.as_str()) {
+                    let escaped = key.replace('~', "~0").replace('/', "~1");
+                    let child_ptr = format!("{ptr}/{escaped}");
+                    validate_node(root, add_props, val, &child_ptr, out);
+                }
             }
         }
     }
