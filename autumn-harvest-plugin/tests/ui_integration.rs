@@ -2624,6 +2624,10 @@ async fn ui_trigger_preserves_dag_metadata() {
             owner: None,
             runbook_url: None,
             severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
