@@ -464,6 +464,10 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));

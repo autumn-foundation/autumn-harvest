@@ -432,6 +432,10 @@ pub mod flows {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }
         }
     }
@@ -477,6 +481,10 @@ pub mod relative_test_self {
                     execution_timeout: None,
                     concurrency: None,
                     max_input_bytes: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
                 }
             }
         }
@@ -510,6 +518,10 @@ pub mod relative_test_super {
                     execution_timeout: None,
                     concurrency: None,
                     max_input_bytes: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
                 }
             }
         }
@@ -547,6 +559,10 @@ pub mod relative_test_plain {
                     execution_timeout: None,
                     concurrency: None,
                     max_input_bytes: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
                 }
             }
         }

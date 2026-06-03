@@ -219,6 +219,10 @@ async fn test_same_shard_not_found_retry() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "target_workflow",
@@ -227,6 +231,10 @@ async fn test_same_shard_not_found_retry() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ])
         .worker(WorkerConfig::default())
@@ -354,6 +362,10 @@ async fn test_cross_shard_outbox_delivery() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "target_workflow",
@@ -362,6 +374,10 @@ async fn test_cross_shard_outbox_delivery() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ])
         .worker(WorkerConfig::default())
@@ -478,6 +494,10 @@ async fn test_grace_window_expiration() {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }])
         .worker(WorkerConfig::default().with_unknown_target_grace_window(Duration::from_secs(1)))
         .build();
@@ -584,6 +604,10 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "target_workflow",
@@ -592,6 +616,10 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ])
         .worker(WorkerConfig::default())
