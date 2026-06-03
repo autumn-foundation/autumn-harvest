@@ -251,6 +251,61 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Per-activity circuit-breaker configuration (issue #369).
+///
+/// When attached to an activity (via the `#[activity(circuit_breaker = ...)]`
+/// attribute or builder registration), the worker tracks consecutive failures
+/// of that activity within a rolling window. Once `failure_threshold` failures
+/// accumulate inside `window`, the breaker **trips open** and subsequent
+/// dispatches fast-fail with a non-retryable
+/// [`ActivityFailure`](crate::failure::ActivityFailure) of error type
+/// `"CircuitOpen"` instead of being retried against a downstream that is known
+/// to be down. After `cooldown` elapses the breaker moves to half-open and
+/// admits a single probe; success re-closes it, failure re-opens it.
+///
+/// Circuit state is tracked in-process and per-shard — it never touches the
+/// workflow event log, so the append-only contract is unchanged and replay is
+/// unaffected (a short-circuited attempt records an ordinary `ActivityFailed`
+/// event).
+///
+/// ## Examples
+///
+/// ```rust
+/// use std::time::Duration;
+/// use autumn_harvest::policy::CircuitBreakerPolicy;
+///
+/// // Trip after 10 failures within 30s; re-probe after 60s.
+/// let policy = CircuitBreakerPolicy::new(10, Duration::from_secs(30), Duration::from_secs(60));
+/// assert_eq!(policy.failure_threshold, 10);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CircuitBreakerPolicy {
+    /// Number of failures within `window` that trips the breaker open.
+    /// Must be `>= 1`.
+    pub failure_threshold: u32,
+    /// Rolling time window over which failures are counted.
+    pub window: Duration,
+    /// Cooldown after the breaker opens before a single half-open probe is
+    /// admitted.
+    pub cooldown: Duration,
+}
+
+impl CircuitBreakerPolicy {
+    /// Construct a circuit-breaker policy.
+    ///
+    /// `failure_threshold` is clamped to a minimum of 1 — a threshold of 0
+    /// would trip on the very first dispatch before any failure is observed,
+    /// which is never the intended behaviour.
+    #[must_use]
+    pub fn new(failure_threshold: u32, window: Duration, cooldown: Duration) -> Self {
+        Self {
+            failure_threshold: failure_threshold.max(1),
+            window,
+            cooldown,
+        }
+    }
+}
+
 /// Status of a completed DAG task, used by trigger rules.
 ///
 /// ## Examples

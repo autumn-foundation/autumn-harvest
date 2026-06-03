@@ -271,6 +271,7 @@ fn local_activity_info(
         rate_limit_rps: None,
         rate_limit_burst: None,
         rate_limit_key: None,
+        circuit_breaker: None,
         handler,
     }
 }
@@ -1176,6 +1177,7 @@ async fn workflow_task_timeout_cascades_detached_children() {
         Duration::from_secs(5),
         &sharded_pool,
         &[ShardId::new(0)],
+        None,
     )
     .await
     .expect("timeout enforcement should succeed");

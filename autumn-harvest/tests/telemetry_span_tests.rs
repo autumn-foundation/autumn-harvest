@@ -231,6 +231,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                circuit_breaker: None,
                 handler: telem_activity,
             },
             ActivityInfo {
@@ -249,6 +250,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                circuit_breaker: None,
                 handler: telem_activity,
             },
         ],

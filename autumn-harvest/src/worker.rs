@@ -196,6 +196,11 @@ pub struct HandlerRegistry {
     pub max_activity_result_bytes: u64,
     /// Maximum allowed bytes for a signal payload (enforced at signal-send time).
     pub max_signal_payload_bytes: u64,
+    /// Per-activity circuit breakers (issue #369), shared with the management
+    /// API so both the worker dispatch path and operators observe the same
+    /// in-process state. Built from the registered activities' declared
+    /// [`CircuitBreakerPolicy`](crate::policy::CircuitBreakerPolicy)s.
+    circuit_breakers: Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
 }
 
 impl HandlerRegistry {
@@ -237,9 +242,20 @@ impl HandlerRegistry {
             .into_iter()
             .map(|w| (w.name.to_string(), w))
             .collect();
-        let activities = activities
+        let activities: HashMap<String, ActivityInfo> = activities
             .into_iter()
             .map(|a| (a.name.to_string(), a))
+            .collect();
+        // Circuit breakers are enforced on the task-dispatch path
+        // (`process_activity_task`), which local activities bypass by running
+        // inline. The `#[activity]` macro rejects `circuit_breaker` on local
+        // activities at compile time; this filter is the defensive equivalent
+        // for hand-built `ActivityInfo`s so a local activity never registers a
+        // breaker that can appear configured in the admin API yet never trips.
+        let circuit_policies: HashMap<String, crate::policy::CircuitBreakerPolicy> = activities
+            .iter()
+            .filter(|(_, info)| !info.is_local)
+            .filter_map(|(name, info)| info.circuit_breaker.map(|p| (name.clone(), p)))
             .collect();
         Self {
             workflows,
@@ -253,6 +269,9 @@ impl HandlerRegistry {
             max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             max_activity_result_bytes: crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            circuit_breakers: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
+                circuit_policies,
+            )),
         }
     }
 
@@ -322,6 +341,15 @@ impl HandlerRegistry {
         &self.telemetry
     }
 
+    /// Access the per-activity circuit-breaker registry (issue #369).
+    ///
+    /// Shared (behind an `Arc`) with the management API so operators observe
+    /// and force the same in-process breaker state the worker enforces.
+    #[must_use]
+    pub fn circuit_breakers(&self) -> Arc<crate::circuit_breaker::CircuitBreakerRegistry> {
+        Arc::clone(&self.circuit_breakers)
+    }
+
     /// History-size guardrails applied to workflow contexts run by this registry.
     #[must_use]
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
@@ -343,6 +371,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
+            .field("circuit_breakers", &self.circuit_breakers)
             .finish()
     }
 }
@@ -1239,11 +1268,11 @@ async fn run_local_activity_inline(
                 run.name, run.failed_attempts
             )
         });
-        return Err(HarvestError::ActivityFailed {
-            name: run.name.clone(),
-            attempt: run.failed_attempts,
-            source: error.into(),
-        });
+        return Err(HarvestError::activity_failed(
+            run.name.clone(),
+            run.failed_attempts,
+            &error,
+        ));
     }
 
     for attempt in start_attempt..=max_attempts {
@@ -1460,26 +1489,36 @@ pub(crate) fn chrono_duration_from_secs(
     })
 }
 
+/// Whether `error` is non-retryable under the same rules `next_retry_delay`
+/// applies: the typed-payload `non_retryable` flag *and* the retry policy's
+/// `non_retryable_errors` list (which also matches legacy `Err(String)` values
+/// the typed flag never sees). The circuit breaker reuses this so a burst of
+/// permanent failures — typed or legacy — never trips the circuit.
+fn failure_is_non_retryable(error: &str, retry_policy: Option<&RetryPolicy>) -> bool {
+    let typed = parse_typed_payload(error);
+    if typed.as_ref().is_some_and(|f| f.non_retryable) {
+        return true;
+    }
+    if let Some(policy) = retry_policy {
+        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
+        return policy.is_non_retryable(typed_error_type, error);
+    }
+    false
+}
+
 fn next_retry_delay(
     task: &TaskQueueItem,
     error: &str,
     retry_policy: Option<&RetryPolicy>,
 ) -> HarvestResult<Option<chrono::Duration>> {
-    // Only consult the structured `error_type` when the payload was actually
-    // the typed wire format — passing the synthetic "Error" fallback would
-    // make a pre-existing `non_retryable_errors = ["Error"]` policy halt
-    // retries on every legacy `Err(String)` failure.
-    let typed = parse_typed_payload(error);
-    if typed.as_ref().is_some_and(|f| f.non_retryable) {
+    // Non-retryable (typed flag or policy `non_retryable_errors`, incl. legacy
+    // `Err(String)`) short-circuits all remaining attempts. See
+    // `failure_is_non_retryable` for the shared rule.
+    if failure_is_non_retryable(error, retry_policy) {
         return Ok(None);
     }
 
     if let Some(policy) = retry_policy {
-        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
-        if policy.is_non_retryable(typed_error_type, error) {
-            return Ok(None);
-        }
-
         return policy
             .next_delay_with_seed(task_attempt(task), retry_stream_seed(task))
             .map(|delay| chrono_duration_from_std(delay, "retry delay"))
@@ -3187,6 +3226,16 @@ async fn execute_activity_future_with_cancellation(
     .await
 }
 
+/// Fallback defer delay when a rate-limited circuit-breaker activity has no
+/// configured `rate_limit_rps` to derive a one-token refill interval from.
+const RATE_LIMIT_DEFER_FALLBACK: Duration = Duration::from_millis(250);
+/// Lower clamp on the dispatch-time rate-limit defer delay, so a very high RPS
+/// can't spin the reschedule loop hot.
+const RATE_LIMIT_DEFER_MIN: Duration = Duration::from_millis(50);
+/// Upper clamp on the dispatch-time rate-limit defer delay, so a very low RPS
+/// still re-evaluates `on_dispatch` (the breaker may have changed) reasonably soon.
+const RATE_LIMIT_DEFER_MAX: Duration = Duration::from_secs(5);
+
 #[allow(clippy::too_many_lines)]
 async fn process_activity_task(
     pool: &DbPool,
@@ -3212,21 +3261,148 @@ async fn process_activity_task(
         return Err(HarvestError::Config(error));
     };
 
-    // Setup phase: acquire a connection, append ActivityStarted, then drop it
-    // so the pool slot is free before the handler runs.  This prevents a
-    // deadlock when `run_transactional` needs a second slot from the same pool
-    // while max_size connections are already claimed by concurrent activity tasks.
+    // Circuit breaker (issue #369): consult the breaker before doing anything
+    // durable. `on_dispatch` is a pure in-process decision (it may admit the
+    // half-open probe), so it is safe to run before we append ActivityStarted.
+    let circuit_breakers = registry.circuit_breakers();
+    let dispatch_decision = circuit_breakers.on_dispatch(activity_name, std::time::Instant::now());
+    // The dispatch token is threaded into `on_result` below so the breaker can
+    // fence stale stragglers by generation and gate the half-open probe.
+    let circuit_token = match dispatch_decision {
+        crate::circuit_breaker::DispatchDecision::Allow { token } => Some(token),
+        crate::circuit_breaker::DispatchDecision::ShortCircuit { .. } => None,
+    };
+
+    // Dispatch-time rate limiting (issue #369): a circuit-breaker activity skips
+    // the claim-time rate-limit gate/debit, so a genuine call (Allow) must reserve
+    // a token here, gated on the authoritative `on_dispatch` decision. This runs
+    // BEFORE appending ActivityStarted so a deferred (rate-limited) task leaves no
+    // event behind — otherwise every defer/reclaim cycle would append a *duplicate*
+    // ActivityStarted (an activity stays "pending" until a terminal event, so the
+    // start event does not make `append_activity_started_if_pending` idempotent).
+    // A short-circuit reserves nothing; only a real call consumes a token. The
+    // `circuit_token.is_some()` guard means "decision is Allow"; the breaker guard
+    // restricts this to activities whose claim-time rate limiting was skipped.
+    if circuit_token.is_some()
+        && activity.circuit_breaker.is_some()
+        && let Some(key) = task.rate_limit_key.as_deref()
+    {
+        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        if !queue::try_consume_rate_limit_token(&mut conn, key).await? {
+            // No token available (bucket empty, or fail-closed when the bucket
+            // row is missing): defer this real call instead of running it.
+            //
+            // Releasing any half-open probe slot this dispatch just admitted is
+            // essential — `on_dispatch` set `probe_in_flight = true`, and if we
+            // returned without resolving it the breaker would stay HalfOpen
+            // forever and short-circuit every later attempt. A rate-limit defer
+            // is not a downstream health signal, so `on_cancelled` re-arms the
+            // cooldown (rather than tripping or closing) and a fresh probe is
+            // admitted once the cooldown re-elapses.
+            if let Some(token) = circuit_token {
+                circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+            }
+            let refill_delay = activity
+                .rate_limit_rps
+                .filter(|rps| *rps > 0.0)
+                .map_or(RATE_LIMIT_DEFER_FALLBACK, |rps| {
+                    Duration::from_secs_f64(1.0 / rps)
+                })
+                .clamp(RATE_LIMIT_DEFER_MIN, RATE_LIMIT_DEFER_MAX);
+            registry
+                .telemetry()
+                .metrics
+                .record_rate_limit_throttled(key);
+            let scheduled_at = chrono::Utc::now()
+                + chrono::Duration::from_std(refill_delay)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(5));
+            queue::defer_rate_limited_task(&mut conn, task.id, scheduled_at).await?;
+            return Ok(());
+        }
+    }
+
+    // Setup phase: append ActivityStarted, then drop the connection so the pool
+    // slot is free before the handler runs (prevents a deadlock when
+    // `run_transactional` needs a second slot while max_size connections are held
+    // by concurrent activity tasks). Appended AFTER the rate-limit reservation so
+    // a deferred task never records a start it did not run; serves both the
+    // short-circuit path (start + CircuitOpen failure) and the real-call path.
     let activity_id = {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let started_result =
             append_activity_started_if_pending(&mut conn, task, exec_id, activity_name, worker_id)
                 .await;
-        match fail_execution_on_error(&mut conn, task, worker_id, started_result).await? {
-            Some(id) => id,
-            None => return Ok(()),
-        }
+        let Some(id) = fail_execution_on_error(&mut conn, task, worker_id, started_result).await?
+        else {
+            // The activity will not run: it already has a terminal event, or the
+            // task row stopped being RUNNING (cancelled / timed out concurrently).
+            // Undo the side effects of the dispatch decision for this no-op so the
+            // breaker and bucket aren't left skewed:
+            //   - release any half-open probe `on_dispatch` admitted, or the
+            //     breaker would stay HalfOpen with probe_in_flight forever and
+            //     short-circuit every later attempt (no-op for non-probe tokens);
+            //   - refund the token reserved above for the call that won't happen
+            //     (only reached when the reservation succeeded — see the guard).
+            if let Some(token) = circuit_token {
+                circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+            }
+            if circuit_token.is_some()
+                && activity.circuit_breaker.is_some()
+                && let Some(key) = task.rate_limit_key.as_deref()
+                && let Err(error) = queue::refund_rate_limit_token(&mut conn, key).await
+            {
+                tracing::warn!(
+                    rate_limit_key = %key,
+                    error = %error,
+                    "failed to refund rate-limit token after a no-op activity start"
+                );
+            }
+            return Ok(());
+        };
+        id
         // conn is dropped here, returning the slot to the pool
     };
+
+    if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
+        opened_at,
+        retry_after,
+    } = dispatch_decision
+    {
+        use crate::failure::IntoActivityErrorString as _;
+        let payload =
+            crate::failure::ActivityFailure::circuit_open(activity_name, opened_at, retry_after)
+                .into_error_payload();
+        let telemetry = registry.telemetry().clone();
+        telemetry.metrics.record_activity_completed_with_error_type(
+            activity_name,
+            &task.queue_name,
+            0.0,
+            ActivityStatus::Failed,
+            Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN),
+        );
+        telemetry.metrics.record_activity_failed(
+            activity_name,
+            "",
+            crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
+            true,
+        );
+        let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+        let retry_policy_result = configured_retry_policy(task);
+        let retry_policy =
+            fail_execution_on_error(&mut conn, task, worker_id, retry_policy_result).await?;
+        return handle_activity_result(
+            &mut conn,
+            task,
+            exec_id,
+            activity_id,
+            worker_id,
+            retry_policy.as_ref(),
+            Err(payload),
+            0,
+            activity_name,
+        )
+        .await;
+    }
 
     let cancel = CancellationToken::new();
     let heartbeat_tx =
@@ -3293,6 +3469,12 @@ async fn process_activity_task(
         span,
     )
     .await;
+    // Whether this attempt was driven by cancellation: the observer cancels the
+    // token when the workflow/task is cancelled mid-flight. A cancellation is
+    // not evidence the downstream is unhealthy, so it must not count toward the
+    // circuit breaker (issue #369 review). Captured before the unconditional
+    // `cancel.cancel()` below.
+    let was_cancelled = cancel.is_cancelled();
 
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting
     // metrics so that an Ok result above the cap is counted as Failed, not Completed.
@@ -3356,6 +3538,54 @@ async fn process_activity_task(
     let retry_policy_result = configured_retry_policy(task);
     let retry_policy =
         fail_execution_on_error(&mut conn, task, worker_id, retry_policy_result).await?;
+
+    // Circuit breaker (issue #369): record this attempt's outcome. A close →
+    // open trip (or half-open re-open) and a recovery to closed are surfaced as
+    // the `harvest.activity.circuit.{tripped,closed}` counters so existing
+    // alerting picks them up. Only retryable (downstream-style) failures trip
+    // the breaker — a non-retryable permanent error (bad input) proves the
+    // downstream answered and must not open the circuit for healthy callers.
+    // Classification mirrors the retry decision (`failure_is_non_retryable`),
+    // so it honours both the typed `non_retryable` flag and the retry policy's
+    // `non_retryable_errors` list, including legacy `Err(String)` failures.
+    // A cancellation-driven result is not evidence the downstream is unhealthy
+    // (the workflow/task was cancelled out from under the attempt), so it is
+    // excluded from breaker accounting entirely — neither a trip nor a probe
+    // resolution. But if the cancelled attempt held the single half-open probe,
+    // its slot must still be released via `on_cancelled`, or the breaker would
+    // stay HalfOpen with `probe_in_flight = true` forever and short-circuit every
+    // later dispatch. Only genuine handler outcomes feed the breaker as outcomes.
+    let circuit_outcome = if was_cancelled {
+        if let Some(token) = circuit_token {
+            circuit_breakers.on_cancelled(activity_name, token, std::time::Instant::now());
+        }
+        None
+    } else {
+        Some(match activity_result.as_ref() {
+            Ok(_) => crate::circuit_breaker::AttemptOutcome::Success,
+            Err(payload) if failure_is_non_retryable(payload, retry_policy.as_ref()) => {
+                crate::circuit_breaker::AttemptOutcome::NonRetryableFailure
+            }
+            Err(_) => crate::circuit_breaker::AttemptOutcome::RetryableFailure,
+        })
+    };
+    // `circuit_token` is always `Some` here: the short-circuit path returned
+    // early above, so reaching this point means the attempt was dispatched.
+    if let Some(transition) = circuit_token
+        .zip(circuit_outcome)
+        .and_then(|(token, outcome)| {
+            circuit_breakers.on_result(activity_name, outcome, token, std::time::Instant::now())
+        })
+    {
+        match transition {
+            crate::circuit_breaker::CircuitTransition::Tripped => {
+                telemetry.metrics.record_circuit_tripped(activity_name);
+            }
+            crate::circuit_breaker::CircuitTransition::Closed => {
+                telemetry.metrics.record_circuit_closed(activity_name);
+            }
+        }
+    }
 
     // activity_result is already cap-normalized (oversized Ok → non-retryable Err);
     // pass 0 so handle_activity_result skips the redundant cap check.
@@ -5620,6 +5850,7 @@ impl Worker {
             self.config.unknown_target_grace_window,
             self.config.sharded_pool.clone(),
             self.config.shard_assignments.clone(),
+            self.registry.circuit_breakers(),
         );
         // Worker-stale threshold mirrors the fleet-health classifier:
         // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
@@ -5924,12 +6155,22 @@ impl Worker {
             }
         };
 
+        // Activities with a circuit breaker skip the claim-time rate-limit gate
+        // and token debit entirely (issue #369): their rate limiting is enforced
+        // authoritatively at dispatch in `process_activity_task`, gated on the
+        // real `on_dispatch` decision, so a `CircuitOpen` short-circuit is claimed
+        // and fast-failed at full speed during an outage while a genuine call
+        // still atomically reserves a token. The set is static.
+        let circuit_breakers = self.registry.circuit_breakers();
+        let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
+
         match queue::claim_task(
             &mut conn,
             &self.config.queues,
             &self.config.worker_id,
             &self.config.build_id,
             self.config.priority_aging_secs,
+            circuit_breaker_activities,
         )
         .await
         {
@@ -6260,6 +6501,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
 

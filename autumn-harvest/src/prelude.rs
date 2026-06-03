@@ -8,6 +8,10 @@ pub use crate::builder::{HarvestBuilder, WorkerConfig};
 pub use crate::calendar::{
     Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
 };
+pub use crate::circuit_breaker::{
+    AttemptOutcome, CircuitBreakerRegistry, CircuitPhase, CircuitSnapshot, CircuitTransition,
+    DispatchDecision, DispatchToken,
+};
 pub use crate::context::{ActivityContext, WorkflowContext};
 pub use crate::dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
@@ -24,7 +28,8 @@ pub use crate::handle_typed::{
 };
 pub use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 pub use crate::policy::{
-    OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+    CircuitBreakerPolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus,
+    TriggerRule, WorkflowSchedule,
 };
 pub use crate::query::QueryRegistry;
 pub use crate::saga::Saga;

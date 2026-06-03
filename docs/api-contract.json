@@ -1863,6 +1863,7 @@
       "path": "/workflows/batch_start",
       "category": "batch",
       "read_only": false,
+      "idempotency": "Idempotent per item: each item may carry an idempotency_key (issue #357); a retried batch carrying the same keys does not start duplicate executions. The batch envelope itself is not idempotent without per-item keys.",
       "description": "Start N workflow executions in one batched request. atomic=true validates all items first; if any are invalid the entire batch is rejected with 409 and zero rows are inserted. atomic=false returns per-item results.",
       "params": [],
       "request_body": {
@@ -2010,6 +2011,141 @@
         {
           "status": 500,
           "description": "Database write error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/circuits",
+      "category": "admin",
+      "read_only": true,
+      "description": "List every activity circuit breaker and its current in-process state (issue #369): closed/open/half-open, last-trip timestamp, rolling failure count, and time-until-probe.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 503,
+          "description": "Harvest runtime not yet installed."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/circuits/{activity_name}",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return the current circuit-breaker state for a single activity (issue #369).",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of the activity whose circuit breaker to inspect."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "activity_name",
+          "state",
+          "forced_open",
+          "last_trip",
+          "rolling_failure_count",
+          "time_until_probe_secs",
+          "failure_threshold",
+          "window_secs",
+          "cooldown_secs"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No circuit breaker is configured for the named activity."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/circuits/{activity_name}/force-open",
+      "category": "admin",
+      "read_only": false,
+      "idempotency": "Idempotent; repeated calls leave the breaker pinned open with the same observable state.",
+      "description": "Operator action: pin an activity's circuit breaker open for manual incident response (issue #369). New dispatches fast-fail with a non-retryable CircuitOpen failure until force-close is called.",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of the activity whose circuit breaker to pin open."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": true
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "activity_name",
+          "state",
+          "forced_open",
+          "last_trip",
+          "rolling_failure_count",
+          "time_until_probe_secs",
+          "failure_threshold",
+          "window_secs",
+          "cooldown_secs"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No circuit breaker is configured for the named activity."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/circuits/{activity_name}/force-close",
+      "category": "admin",
+      "read_only": false,
+      "idempotency": "Idempotent; repeated calls leave the breaker closed with normal tracking resumed.",
+      "description": "Operator action: clear any pin and reset an activity's circuit breaker to closed so normal tracking resumes (issue #369).",
+      "params": [
+        {
+          "name": "activity_name",
+          "in": "path",
+          "required": true,
+          "description": "Name of the activity whose circuit breaker to reset."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": true
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "activity_name",
+          "state",
+          "forced_open",
+          "last_trip",
+          "rolling_failure_count",
+          "time_until_probe_secs",
+          "failure_threshold",
+          "window_secs",
+          "cooldown_secs"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "No circuit breaker is configured for the named activity."
         }
       ]
     },

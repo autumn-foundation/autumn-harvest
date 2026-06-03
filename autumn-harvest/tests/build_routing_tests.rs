@@ -489,6 +489,7 @@ mod db_tests {
             "worker-a",
             "v1.0",
             None,
+            &[],
         )
         .await
         .expect("claim_task");
@@ -509,6 +510,7 @@ mod db_tests {
             "worker-b",
             "v2.0",
             None,
+            &[],
         )
         .await
         .expect("claim_task");
@@ -533,6 +535,7 @@ mod db_tests {
             "worker-c",
             "v2.0",
             None,
+            &[],
         )
         .await
         .expect("claim_task");
@@ -556,6 +559,7 @@ mod db_tests {
             "worker-d",
             "v99.0",
             None,
+            &[],
         )
         .await
         .expect("claim_task");
@@ -579,6 +583,7 @@ mod db_tests {
             "worker-legacy",
             "",
             None,
+            &[],
         )
         .await
         .expect("claim_task");

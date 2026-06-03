@@ -533,6 +533,7 @@ mod db_tests {
             "worker-beta",
             "", // legacy build id — claims anything
             None,
+            &[],
         )
         .await
         .expect("claim_task");
@@ -572,6 +573,7 @@ mod db_tests {
             "worker-delta", // not the sticky worker
             "",
             None,
+            &[],
         )
         .await
         .expect("claim_task");
@@ -617,6 +619,7 @@ mod db_tests {
             "worker-zeta", // not the original sticky worker
             "",
             None,
+            &[],
         )
         .await
         .expect("claim_task");
@@ -650,10 +653,17 @@ mod db_tests {
         let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
 
         // Worker claims the task.
-        queue::claim_task(&mut conn, &["default".to_string()], "worker-eta", "", None)
-            .await
-            .expect("claim_task")
-            .expect("must claim");
+        queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-eta",
+            "",
+            None,
+            &[],
+        )
+        .await
+        .expect("claim_task")
+        .expect("must claim");
 
         // Worker parks the task, pinning itself as the sticky worker.
         let hint = StickyHint::new("worker-eta", Duration::from_secs(20));
@@ -702,6 +712,7 @@ mod db_tests {
             "worker-theta",
             "",
             None,
+            &[],
         )
         .await
         .expect("claim_task")
@@ -811,11 +822,17 @@ mod db_tests {
 
         // Worker-iota claims: must get the STICKY task (higher priority in ORDER BY)
         // even though the unpinned task was enqueued earlier.
-        let claimed =
-            queue::claim_task(&mut conn, &["default".to_string()], "worker-iota", "", None)
-                .await
-                .expect("claim_task")
-                .expect("must claim something");
+        let claimed = queue::claim_task(
+            &mut conn,
+            &["default".to_string()],
+            "worker-iota",
+            "",
+            None,
+            &[],
+        )
+        .await
+        .expect("claim_task")
+        .expect("must claim something");
 
         assert_eq!(
             claimed.id, task_sticky,
@@ -872,6 +889,7 @@ mod db_tests {
             "worker-lambda",
             "",
             None,
+            &[],
         )
         .await
         .expect("claim_task");

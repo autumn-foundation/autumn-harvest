@@ -1928,6 +1928,7 @@ mod tests {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                circuit_breaker: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .state(String::from("haunted"))
@@ -1972,6 +1973,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -1993,6 +1995,7 @@ mod tests {
             rate_limit_rps: None,
             rate_limit_burst: None,
             rate_limit_key: None,
+            circuit_breaker: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -2271,6 +2274,7 @@ mod tests {
                 rate_limit_rps: None,
                 rate_limit_burst: None,
                 rate_limit_key: None,
+                circuit_breaker: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .try_build();
@@ -2424,6 +2428,7 @@ mod tests {
             rate_limit_rps: Some(10.0),
             rate_limit_burst: Some(5.0),
             rate_limit_key: Some("stripe"),
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -2442,6 +2447,7 @@ mod tests {
             rate_limit_rps: Some(20.0), // mismatched rps!
             rate_limit_burst: Some(5.0),
             rate_limit_key: Some("stripe"),
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
@@ -2475,6 +2481,7 @@ mod tests {
             rate_limit_rps: None, // Missing RPS!
             rate_limit_burst: None,
             rate_limit_key: Some("stripe"),
+            circuit_breaker: None,
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
