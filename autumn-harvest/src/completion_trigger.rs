@@ -543,7 +543,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                 };
 
                 let target_exec_id = crate::types::ExecutionId::new_for_shard(target_shard);
-                let start_res = start_or_load_workflow_execution(
+                let start_res = match start_or_load_workflow_execution(
                     conn,
                     StartWorkflowParams {
                         workflow_name: &trigger_db.target_workflow_name,
@@ -570,7 +570,32 @@ pub fn evaluate_triggers_for_execution<'a>(
                         severity: target_severity.as_deref(),
                     },
                 )
-                .await?;
+                .await
+                {
+                    Ok(res) => res,
+                    Err(crate::error::HarvestError::PayloadTooLarge {
+                        kind,
+                        observed_bytes,
+                        cap_bytes,
+                        workflow_type,
+                        ..
+                    }) => {
+                        tracing::warn!(
+                            trigger_id = %trigger_db.id,
+                            target_workflow_name = %trigger_db.target_workflow_name,
+                            kind = %kind,
+                            observed_bytes = observed_bytes,
+                            cap_bytes = cap_bytes,
+                            workflow_type = %workflow_type,
+                            "Oversized trigger input payload; skipping trigger execution."
+                        );
+                        if let Some(m) = metrics {
+                            m.record_completion_trigger_fired(&trigger_name, "payload_too_large");
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
 
                 if let Some(m) = metrics {
                     if start_res.created {

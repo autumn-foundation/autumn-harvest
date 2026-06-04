@@ -426,6 +426,21 @@ pub enum HarvestBuilderError {
         /// The orphaned rate limit key.
         key: String,
     },
+
+    /// A completion trigger references an unknown workflow name as a source or target.
+    #[non_exhaustive]
+    #[error(
+        "completion_trigger references unknown workflow '{workflow_name}' as {role}; \
+         registered workflows: {registered:?}"
+    )]
+    UnknownCompletionTriggerWorkflow {
+        /// The unrecognised workflow name in the trigger.
+        workflow_name: String,
+        /// The role the workflow plays ("source" or "target").
+        role: &'static str,
+        /// All workflow names currently registered on the builder.
+        registered: Vec<String>,
+    },
 }
 
 impl BuiltHarvest {
@@ -1010,6 +1025,11 @@ impl HarvestBuilder {
             &self.workflows,
             &self.auto_registered_dag_workflows,
         )?;
+        validate_completion_triggers(
+            &self.completion_triggers,
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
         validate_local_activity_timeouts(
             &self.activities,
             self.worker_config.max_local_activity_start_to_close,
@@ -1124,6 +1144,38 @@ fn validate_dag_workflow_name_collisions(
 /// Verify that every [`WorkflowSchedule`] references a workflow name that is
 /// actually registered on the builder. Fails fast with
 /// [`HarvestBuilderError::UnknownWorkflowSchedule`] on the first mismatch.
+fn validate_completion_triggers(
+    triggers: &[crate::completion_trigger::CompletionTrigger],
+    workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
+) -> Result<(), HarvestBuilderError> {
+    if triggers.is_empty() {
+        return Ok(());
+    }
+    let registered: Vec<String> = workflows
+        .iter()
+        .map(|w| w.name.to_string())
+        .chain(auto_registered_dag_workflows.iter().cloned())
+        .collect();
+    for trigger in triggers {
+        if !registered.contains(&trigger.source_workflow_name) {
+            return Err(HarvestBuilderError::UnknownCompletionTriggerWorkflow {
+                workflow_name: trigger.source_workflow_name.clone(),
+                role: "source",
+                registered,
+            });
+        }
+        if !registered.contains(&trigger.target_workflow_name) {
+            return Err(HarvestBuilderError::UnknownCompletionTriggerWorkflow {
+                workflow_name: trigger.target_workflow_name.clone(),
+                role: "target",
+                registered,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_workflow_schedules(
     schedules: &[WorkflowSchedule],
     workflows: &[crate::info::WorkflowInfo],
@@ -2591,5 +2643,57 @@ mod tests {
             .batch_start_config(custom.clone())
             .build();
         assert_eq!(built.batch_start_config, custom);
+    }
+
+    #[test]
+    fn harvest_builder_validates_static_completion_triggers() {
+        use crate::completion_trigger::CompletionTrigger;
+
+        // Both source and target registered -> Ok
+        let trigger = CompletionTrigger::new("test", "test");
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_triggers(vec![trigger])
+            .try_build();
+        assert!(
+            result.is_ok(),
+            "Expected builder success with registered workflows, got: {result:?}"
+        );
+
+        // Unknown source -> Error
+        let trigger_bad_source = CompletionTrigger::new("unknown_source", "test");
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_triggers(vec![trigger_bad_source])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownCompletionTriggerWorkflow {
+                    ref workflow_name,
+                    role,
+                    ..
+                }) if workflow_name == "unknown_source" && role == "source"
+            ),
+            "Expected UnknownCompletionTriggerWorkflow error for source, got: {result:?}"
+        );
+
+        // Unknown target -> Error
+        let trigger_bad_target = CompletionTrigger::new("test", "unknown_target");
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_triggers(vec![trigger_bad_target])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownCompletionTriggerWorkflow {
+                    ref workflow_name,
+                    role,
+                    ..
+                }) if workflow_name == "unknown_target" && role == "target"
+            ),
+            "Expected UnknownCompletionTriggerWorkflow error for target, got: {result:?}"
+        );
     }
 }
