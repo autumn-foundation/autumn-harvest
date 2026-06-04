@@ -384,12 +384,14 @@ enum ClaimedTaskKind {
 
 impl ClaimedTaskKind {
     fn from_db(task_type: &str) -> HarvestResult<Self> {
-        match task_type {
-            task_type if task_type == TaskType::Workflow.as_str() => Ok(Self::Workflow),
-            task_type if task_type == TaskType::Activity.as_str() => Ok(Self::Activity),
-            other => Err(HarvestError::Config(format!(
-                "unsupported task type in queue row: {other}"
-            ))),
+        if task_type == TaskType::Workflow.as_str() {
+            Ok(Self::Workflow)
+        } else if task_type == TaskType::Activity.as_str() {
+            Ok(Self::Activity)
+        } else {
+            Err(HarvestError::Config(format!(
+                "unsupported task type in queue row: {task_type}"
+            )))
         }
     }
 }
