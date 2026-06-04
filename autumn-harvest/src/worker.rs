@@ -251,6 +251,9 @@ impl HandlerRegistry {
                         crate::completion_trigger::WorkflowMetadata {
                             concurrency: w.concurrency,
                             max_input_bytes: w.max_input_bytes,
+                            owner: w.owner.map(String::from),
+                            runbook_url: w.runbook_url.map(String::from),
+                            severity: w.severity.map(String::from),
                         },
                     )
                 })

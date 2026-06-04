@@ -7684,6 +7684,28 @@ async fn create_completion_trigger(
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
+    let runtime = api_state.runtime().map_err(map_error)?;
+    if !runtime
+        .registry
+        .workflows
+        .contains_key(&request.source_workflow_name)
+    {
+        return Err(AutumnError::not_found_msg(format!(
+            "source workflow '{}' is not registered",
+            request.source_workflow_name
+        )));
+    }
+    if !runtime
+        .registry
+        .workflows
+        .contains_key(&request.target_workflow_name)
+    {
+        return Err(AutumnError::not_found_msg(format!(
+            "target workflow '{}' is not registered",
+            request.target_workflow_name
+        )));
+    }
+
     let trigger_id = request.id.unwrap_or_else(uuid::Uuid::new_v4);
     let states = request
         .terminal_states

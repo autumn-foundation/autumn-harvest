@@ -2685,6 +2685,11 @@
             "name": "input_mapping",
             "required": false,
             "description": "Input projection mapping."
+          },
+          {
+            "name": "queue_name",
+            "required": false,
+            "description": "Target queue name override."
           }
         ]
       },
@@ -2696,6 +2701,7 @@
           "terminal_states",
           "target_workflow_name",
           "input_mapping",
+          "queue_name",
           "created_at",
           "updated_at"
         ]

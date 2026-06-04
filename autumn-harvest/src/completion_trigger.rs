@@ -193,6 +193,9 @@ pub async fn sync_completion_triggers(
 pub struct WorkflowMetadata {
     pub concurrency: Option<crate::concurrency::ConcurrencyPolicy>,
     pub max_input_bytes: Option<u64>,
+    pub owner: Option<String>,
+    pub runbook_url: Option<String>,
+    pub severity: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -269,6 +272,9 @@ pub struct DeferredTriggerStart {
     pub priority: crate::types::Priority,
     pub max_workflow_input_bytes: u64,
     pub trigger_name: String,
+    pub owner: Option<String>,
+    pub runbook_url: Option<String>,
+    pub severity: Option<String>,
 }
 
 #[cfg(feature = "db")]
@@ -330,9 +336,9 @@ impl DeferredTriggerStart {
                     start_at: None,
                     delay: None,
                     max_workflow_start_delay: None,
-                    owner: None,
-                    runbook_url: None,
-                    severity: None,
+                    owner: self.owner.as_deref(),
+                    runbook_url: self.runbook_url.as_deref(),
+                    severity: self.severity.as_deref(),
                 },
             )
             .await;
@@ -482,6 +488,17 @@ pub fn evaluate_triggers_for_execution<'a>(
                     .map_or(global_default, |per_wf| per_wf.max(global_default))
             };
 
+            // Resolve target metadata (owner, runbook_url, severity)
+            let (target_owner, target_runbook_url, target_severity) = {
+                let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
+                lock.as_ref()
+                    .and_then(|guard| guard.as_ref())
+                    .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
+                    .map_or((None, None, None), |meta| {
+                        (meta.owner.clone(), meta.runbook_url.clone(), meta.severity.clone())
+                    })
+            };
+
             if target_shard == source_shard {
                 let queue_name = if let Some(ref q) = trigger_db.queue_name {
                     q.clone()
@@ -512,9 +529,9 @@ pub fn evaluate_triggers_for_execution<'a>(
                         start_at: None,
                         delay: None,
                         max_workflow_start_delay: None,
-                        owner: None,
-                        runbook_url: None,
-                        severity: None,
+                        owner: target_owner.as_deref(),
+                        runbook_url: target_runbook_url.as_deref(),
+                        severity: target_severity.as_deref(),
                     },
                 )
                 .await?;
@@ -571,6 +588,9 @@ pub fn evaluate_triggers_for_execution<'a>(
                     priority: Priority::default(),
                     max_workflow_input_bytes,
                     trigger_name,
+                    owner: target_owner,
+                    runbook_url: target_runbook_url,
+                    severity: target_severity,
                 });
             }
         }
@@ -586,6 +606,7 @@ pub fn evaluate_triggers_for_execution<'a>(
 ///
 /// Returns an error if any database operations fail.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 pub async fn enforce_completion_triggers_outbox(
     conn: &mut diesel_async::AsyncPgConnection,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
@@ -645,6 +666,20 @@ pub async fn enforce_completion_triggers_outbox(
 
         let priority: Priority = serde_json::from_value(task.priority).unwrap_or_default();
 
+        let (target_owner, target_runbook_url, target_severity) = {
+            let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
+            lock.as_ref()
+                .and_then(|guard| guard.as_ref())
+                .and_then(|meta_map| meta_map.get(&task.target_workflow_name))
+                .map_or((None, None, None), |meta| {
+                    (
+                        meta.owner.clone(),
+                        meta.runbook_url.clone(),
+                        meta.severity.clone(),
+                    )
+                })
+        };
+
         let start_res = crate::execution::start_or_load_workflow_execution(
             &mut target_conn,
             crate::execution::StartWorkflowParams {
@@ -669,9 +704,9 @@ pub async fn enforce_completion_triggers_outbox(
                 start_at: None,
                 delay: None,
                 max_workflow_start_delay: None,
-                owner: None,
-                runbook_url: None,
-                severity: None,
+                owner: target_owner.as_deref(),
+                runbook_url: target_runbook_url.as_deref(),
+                severity: target_severity.as_deref(),
             },
         )
         .await;
