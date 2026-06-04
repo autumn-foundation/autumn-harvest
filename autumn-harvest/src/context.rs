@@ -636,6 +636,26 @@ pub struct WorkflowContext {
 impl WorkflowContext {
     // ── Internal Helpers ──────────────────────────────────────────────────
 
+    fn handle_task_result(
+        result: Result<Result<Value, String>, tokio::sync::oneshot::error::RecvError>,
+        task_type: &str,
+        task_name: &str,
+        error_name: String,
+        attempts: u32,
+    ) -> HarvestResult<Value> {
+        match result {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err(HarvestError::activity_failed(
+                error_name,
+                attempts.max(1),
+                &error,
+            )),
+            Err(_) => Err(HarvestError::Cancelled(format!(
+                "{task_type} '{task_name}' cancelled: result channel dropped"
+            ))),
+        }
+    }
+
     fn check_strict_replay_no_match(&self, actual_event: &str) -> HarvestResult<()> {
         if self.strict_replay {
             return Err(HarvestError::NonDeterministic(format!(
@@ -1352,13 +1372,7 @@ impl WorkflowContext {
                     activity_id,
                     result_tx: tx,
                 });
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
+                Self::handle_task_result(rx.await, "activity", name, name.to_string(), 1)
             }
 
             HistoryMatch::AwaitingExternalCompletion { .. }
@@ -1413,13 +1427,7 @@ impl WorkflowContext {
                 });
 
                 // Suspend the coroutine until the worker resolves this activity.
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
+                Self::handle_task_result(rx.await, "activity", name, name.to_string(), 1)
             }
         }
     }
@@ -1470,13 +1478,7 @@ impl WorkflowContext {
                     activity_id,
                     result_tx: tx,
                 });
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
+                Self::handle_task_result(rx.await, "activity", name, name.to_string(), 1)
             }
             HistoryMatch::AwaitingExternalCompletion { .. }
             | HistoryMatch::ChildInProgress { .. }
@@ -1522,13 +1524,7 @@ impl WorkflowContext {
                     start_to_close_override,
                     result_tx: tx,
                 });
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
+                Self::handle_task_result(rx.await, "activity", name, name.to_string(), 1)
             }
         }
     }
@@ -1649,17 +1645,13 @@ impl WorkflowContext {
                     failed_attempts,
                     last_error,
                 });
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(
-                        name,
-                        failed_attempts.max(1),
-                        &error,
-                    )),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "local activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
+                Self::handle_task_result(
+                    rx.await,
+                    "local activity",
+                    name,
+                    name.to_string(),
+                    failed_attempts,
+                )
             }
 
             HistoryMatch::NoMatch => {
@@ -1699,13 +1691,7 @@ impl WorkflowContext {
                     last_error: None,
                 });
 
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "local activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
+                Self::handle_task_result(rx.await, "local activity", name, name.to_string(), 1)
             }
         }
     }
@@ -1840,17 +1826,13 @@ impl WorkflowContext {
                     input,
                     result_tx: tx,
                 });
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(
-                        format!("child-workflow:{workflow_name}"),
-                        1,
-                        &error,
-                    )),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "child workflow '{workflow_name}' cancelled: result channel dropped"
-                    ))),
-                }
+                Self::handle_task_result(
+                    rx.await,
+                    "child workflow",
+                    workflow_name,
+                    format!("child-workflow:{workflow_name}"),
+                    1,
+                )
             }
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!(
@@ -1878,17 +1860,13 @@ impl WorkflowContext {
                     result_tx: tx,
                 });
 
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(
-                        format!("child-workflow:{workflow_name}"),
-                        1,
-                        &error,
-                    )),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "child workflow '{workflow_name}' cancelled: result channel dropped"
-                    ))),
-                }
+                Self::handle_task_result(
+                    rx.await,
+                    "child workflow",
+                    workflow_name,
+                    format!("child-workflow:{workflow_name}"),
+                    1,
+                )
             }
         }
     }
@@ -2790,13 +2768,7 @@ impl WorkflowContext {
                     schedule_to_close_secs,
                     result_tx: tx,
                 });
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "external activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
+                Self::handle_task_result(rx.await, "external activity", name, name.to_string(), 1)
             }
 
             HistoryMatch::NoMatch => {
@@ -2815,13 +2787,7 @@ impl WorkflowContext {
                     schedule_to_close_secs,
                     result_tx: tx,
                 });
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "external activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
+                Self::handle_task_result(rx.await, "external activity", name, name.to_string(), 1)
             }
 
             HistoryMatch::ActivityInProgress { .. }
