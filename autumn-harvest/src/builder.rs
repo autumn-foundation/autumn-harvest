@@ -68,7 +68,7 @@ pub struct HarvestBuilder {
     /// Server-side ceiling on `execution_timeout` (issue #243).
     ///
     /// When set, any `start_workflow` call that requests an `execution_timeout`
-    /// larger than this ceiling is rejected with [`BuildError::ExecutionTimeoutExceedsCeiling`].
+    /// larger than this ceiling is rejected with [`HarvestBuilderError::ExecutionTimeoutExceedsCeiling`].
     /// `None` means no ceiling is enforced.
     max_workflow_execution_timeout: Option<Duration>,
     /// Maximum allowed byte length for an activity input payload (issue #252).
@@ -420,6 +420,15 @@ pub enum HarvestBuilderError {
         activity: String,
         /// The orphaned rate limit key.
         key: String,
+    },
+
+    /// The client requested an `execution_timeout` larger than the server-side ceiling.
+    #[error("requested execution_timeout {requested:?} exceeds server ceiling of {ceiling:?}")]
+    ExecutionTimeoutExceedsCeiling {
+        /// The requested timeout.
+        requested: Duration,
+        /// The server-side ceiling.
+        ceiling: Duration,
     },
 }
 
