@@ -190,6 +190,13 @@ impl HarvestApiRuntime {
             retention,
             router: router.clone(),
         };
+        if let Some(first_queue) = this.queues.as_slice().first()
+            && let Ok(mut lock) =
+                autumn_harvest::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE.write()
+            && lock.is_none()
+        {
+            *lock = Some(first_queue.clone());
+        }
         autumn_harvest::shard::install_global_router(router);
         this
     }
@@ -2137,6 +2144,7 @@ pub const fn management_api_request_fields()
                 "terminal_states",
                 "target_workflow_name",
                 "input_mapping",
+                "queue_name",
             ]),
         ),
         ("POST", "/admin/retention/run-now", Some(&[])),
@@ -2552,6 +2560,7 @@ pub const fn management_api_response_fields()
                 "terminal_states",
                 "target_workflow_name",
                 "input_mapping",
+                "queue_name",
                 "created_at",
                 "updated_at",
             ]),

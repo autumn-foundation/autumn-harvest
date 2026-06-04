@@ -22,6 +22,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::WorkerConfig;
+use crate::completion_trigger::DeferredTriggerStart;
 #[cfg(feature = "db")]
 use crate::context::TransactionalState;
 use crate::context::{
@@ -139,6 +140,12 @@ impl WorkerRuntimeConfig {
 
 impl From<WorkerConfig> for WorkerRuntimeConfig {
     fn from(cfg: WorkerConfig) -> Self {
+        if let Some(first_queue) = cfg.queues.as_slice().first()
+            && let Ok(mut lock) = crate::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE.write()
+            && lock.is_none()
+        {
+            *lock = Some(first_queue.clone());
+        }
         Self {
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: cfg.queues,
@@ -4690,57 +4697,63 @@ async fn move_workflow_to_dlq_for_history_cap(
     worker_id: &str,
     parent_exec_id: Option<ExecutionId>,
     reason: DeadLetterReason,
-) -> HarvestResult<()> {
+) -> HarvestResult<Vec<DeferredTriggerStart>> {
     let reason = reason.to_string();
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        let reason = reason.clone();
-        async move {
-            use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-            let (owner, severity) = exec_dsl::harvest_workflow_executions
-                .find(exec_id.as_uuid())
-                .select((exec_dsl::owner, exec_dsl::severity))
-                .first::<(Option<String>, Option<String>)>(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?
-                .unwrap_or((None, None));
-            dlq::dead_letter(
-                conn,
-                &NewDeadLetterEntry {
-                    original_task_id: task.id,
-                    queue_name: task.queue_name.clone(),
-                    task_type: task.task_type.clone(),
-                    workflow_exec_id: task.workflow_exec_id,
-                    activity_name: task.activity_name.clone(),
-                    input: task.input.clone(),
-                    error: reason.clone(),
-                    attempts: task.attempt,
-                    owner,
-                    severity,
-                },
-            )
-            .await?;
-            store::append_events(
-                conn,
-                exec_id,
-                &[WorkflowEvent::WorkflowFailed {
-                    error: reason.clone(),
-                }],
-                next_event_id,
-            )
-            .await?;
-            update_workflow_execution_failed(conn, exec_id, worker_id, &reason).await?;
-            queue::fail_task(conn, task.id, &reason).await?;
-            apply_parent_close_cascade(conn, exec_id).await?;
-            if let Some(parent_exec_id) = parent_exec_id {
-                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason).await?;
-            }
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await
+    let deferred = conn
+        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
+            |conn| {
+                let reason = reason.clone();
+                async move {
+                    use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                    let (owner, severity) = exec_dsl::harvest_workflow_executions
+                        .find(exec_id.as_uuid())
+                        .select((exec_dsl::owner, exec_dsl::severity))
+                        .first::<(Option<String>, Option<String>)>(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?
+                        .unwrap_or((None, None));
+                    dlq::dead_letter(
+                        conn,
+                        &NewDeadLetterEntry {
+                            original_task_id: task.id,
+                            queue_name: task.queue_name.clone(),
+                            task_type: task.task_type.clone(),
+                            workflow_exec_id: task.workflow_exec_id,
+                            activity_name: task.activity_name.clone(),
+                            input: task.input.clone(),
+                            error: reason.clone(),
+                            attempts: task.attempt,
+                            owner,
+                            severity,
+                        },
+                    )
+                    .await?;
+                    store::append_events(
+                        conn,
+                        exec_id,
+                        &[WorkflowEvent::WorkflowFailed {
+                            error: reason.clone(),
+                        }],
+                        next_event_id,
+                    )
+                    .await?;
+                    update_workflow_execution_failed(conn, exec_id, worker_id, &reason).await?;
+                    queue::fail_task(conn, task.id, &reason).await?;
+                    let deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    if let Some(parent_exec_id) = parent_exec_id {
+                        wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason)
+                            .await?;
+                    }
+                    Ok(deferred)
+                }
+                .scope_boxed()
+            },
+        )
+        .await?;
+
+    Ok(deferred)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4755,7 +4768,7 @@ async fn fail_workflow_for_history_cap(
     started_at: std::time::Instant,
     event_count: u64,
     cap: u64,
-) -> HarvestResult<()> {
+) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
     let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
     telemetry.metrics.record_workflow_completed(
         &execution.workflow_name,
@@ -5009,7 +5022,7 @@ async fn process_workflow_task(
                         if let Some(cap) = registry.history_policy().event_hard_cap()
                             && current_history_event_count >= cap
                         {
-                            return fail_workflow_for_history_cap(
+                            let deferred = fail_workflow_for_history_cap(
                                 conn,
                                 &telemetry,
                                 task,
@@ -5021,7 +5034,11 @@ async fn process_workflow_task(
                                 current_history_event_count,
                                 cap,
                             )
-                            .await;
+                            .await?;
+                            for start in deferred {
+                                start.spawn();
+                            }
+                            return Ok(());
                         }
                     }
                     remaining
@@ -5058,7 +5075,7 @@ async fn process_workflow_task(
                         event_count,
                     } => {
                         history_events.extend(events);
-                        return fail_workflow_for_history_cap(
+                        let deferred = fail_workflow_for_history_cap(
                             conn,
                             &telemetry,
                             task,
@@ -5073,7 +5090,11 @@ async fn process_workflow_task(
                                 .event_hard_cap()
                                 .expect("HistoryCapReached requires a configured hard cap"),
                         )
-                        .await;
+                        .await?;
+                        for start in deferred {
+                            start.spawn();
+                        }
+                        return Ok(());
                     }
                 };
                 history_events.extend(new_events);
@@ -5082,7 +5103,7 @@ async fn process_workflow_task(
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
-                    return fail_workflow_for_history_cap(
+                    let deferred = fail_workflow_for_history_cap(
                         conn,
                         &telemetry,
                         task,
@@ -5094,7 +5115,11 @@ async fn process_workflow_task(
                         current_history_event_count,
                         cap,
                     )
-                    .await;
+                    .await?;
+                    for start in deferred {
+                        start.spawn();
+                    }
+                    return Ok(());
                 }
             }
             WorkflowOutcome::Suspended { commands }
@@ -5160,7 +5185,7 @@ async fn process_workflow_task(
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
-                    return fail_workflow_for_history_cap(
+                    let deferred = fail_workflow_for_history_cap(
                         conn,
                         &telemetry,
                         task,
@@ -5172,7 +5197,11 @@ async fn process_workflow_task(
                         current_history_event_count,
                         cap,
                     )
-                    .await;
+                    .await?;
+                    for start in deferred {
+                        start.spawn();
+                    }
+                    return Ok(());
                 }
 
                 // If any signal in the batch was not resolved inline (remains pending/suspended),
@@ -5282,7 +5311,7 @@ async fn process_workflow_task(
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
-                    return fail_workflow_for_history_cap(
+                    let deferred = fail_workflow_for_history_cap(
                         conn,
                         &telemetry,
                         task,
@@ -5294,7 +5323,11 @@ async fn process_workflow_task(
                         current_history_event_count,
                         cap,
                     )
-                    .await;
+                    .await?;
+                    for start in deferred {
+                        start.spawn();
+                    }
+                    return Ok(());
                 }
                 // Re-acquire a fresh execute_span so persist_workflow_outcome
                 // (via handle_suspended_workflow) gets a valid span reference.
@@ -5353,7 +5386,7 @@ async fn process_workflow_task(
         && current_history_event_count >= cap
         && !matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. })
     {
-        return fail_workflow_for_history_cap(
+        let deferred = fail_workflow_for_history_cap(
             conn,
             &telemetry,
             task,
@@ -5365,7 +5398,11 @@ async fn process_workflow_task(
             current_history_event_count,
             cap,
         )
-        .await;
+        .await?;
+        for start in deferred {
+            start.spawn();
+        }
+        return Ok(());
     }
 
     let status = match &outcome {

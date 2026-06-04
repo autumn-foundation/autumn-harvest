@@ -208,6 +208,10 @@ pub static GLOBAL_MAX_WORKFLOW_INPUT_BYTES: std::sync::RwLock<u64> =
     std::sync::RwLock::new(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES);
 
 #[cfg(feature = "db")]
+pub static GLOBAL_DEFAULT_WORKFLOW_QUEUE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+#[cfg(feature = "db")]
 pub async fn resolve_target_queue(
     conn: &mut diesel_async::AsyncPgConnection,
     target_workflow_name: &str,
@@ -227,7 +231,11 @@ pub async fn resolve_target_queue(
         {
             return q;
         }
-        return "default".to_string();
+        return GLOBAL_DEFAULT_WORKFLOW_QUEUE
+            .read()
+            .ok()
+            .and_then(|lock| lock.clone())
+            .unwrap_or_else(|| "default".to_string());
     }
 
     // Otherwise, acquire a connection to Shard 0 to query the schedules.
@@ -254,7 +262,11 @@ pub async fn resolve_target_queue(
         }
     }
 
-    "default".to_string()
+    GLOBAL_DEFAULT_WORKFLOW_QUEUE
+        .read()
+        .ok()
+        .and_then(|lock| lock.clone())
+        .unwrap_or_else(|| "default".to_string())
 }
 
 #[cfg(feature = "db")]

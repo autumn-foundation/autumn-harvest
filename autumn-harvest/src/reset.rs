@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::completion_trigger::DeferredTriggerStart;
 use crate::error::{HarvestError, database_error};
 use crate::event::WorkflowEvent;
 use crate::execution::apply_parent_close_cascade;
@@ -530,57 +531,76 @@ pub async fn reset_workflow_execution(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ResetResult, WorkflowResetError> {
     let request = request.normalized();
-    conn.transaction::<ResetResult, WorkflowResetError, _>(|conn| {
-        async move {
-            let source = load_source_execution(conn, exec_id, true).await?;
-            validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
+    let (res, deferred_starts) = conn
+        .transaction::<(ResetResult, Vec<DeferredTriggerStart>), WorkflowResetError, _>(|conn| {
+            async move {
+                let source = load_source_execution(conn, exec_id, true).await?;
+                validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
 
-            let rows = load_event_rows(conn, exec_id).await?;
-            let events = decode_events(&rows)?;
-            let plan = validate_reset_point(&events, request.reset_to_event_id)?;
+                let rows = load_event_rows(conn, exec_id).await?;
+                let events = decode_events(&rows)?;
+                let plan = validate_reset_point(&events, request.reset_to_event_id)?;
 
-            let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
-            let source_next_event_id = rows.last().map_or(0, |row| row.event_id.saturating_add(1));
+                let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
+                let source_next_event_id =
+                    rows.last().map_or(0, |row| row.event_id.saturating_add(1));
 
-            terminate_source_execution(conn, exec_id, new_exec_id, &request, source_next_event_id)
+                let deferred = terminate_source_execution(
+                    conn,
+                    exec_id,
+                    new_exec_id,
+                    &request,
+                    source_next_event_id,
+                )
                 .await?;
-            let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
-            copy_carried_events(conn, new_exec_id, &rows, request.reset_to_event_id).await?;
-            append_fork_marker(conn, new_exec_id, exec_id, &request, &plan).await?;
+                let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
+                copy_carried_events(conn, new_exec_id, &rows, request.reset_to_event_id).await?;
+                append_fork_marker(conn, new_exec_id, exec_id, &request, &plan).await?;
 
-            let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
-                conn,
-                exec_id,
-                &format!("workflow reset to {new_exec_id}: {}", request.reason),
-            )
-            .await?;
-            let source_timers_removed = remove_pending_timers(conn, exec_id).await?;
-            let source_external_cancelled = cancel_pending_external_tasks(conn, exec_id).await?;
-            let signals_buffered =
-                reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply).await?;
+                let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
+                    conn,
+                    exec_id,
+                    &format!("workflow reset to {new_exec_id}: {}", request.reason),
+                )
+                .await?;
+                let source_timers_removed = remove_pending_timers(conn, exec_id).await?;
+                let source_external_cancelled =
+                    cancel_pending_external_tasks(conn, exec_id).await?;
+                let signals_buffered =
+                    reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply)
+                        .await?;
 
-            enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
+                enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
 
-            Ok(ResetResult {
-                new_exec_id,
-                reset_from_exec_id: exec_id,
-                reset_to_event_id: request.reset_to_event_id,
-                events_carried_over: plan.events_carried_over,
-                source_tasks_cancelled: source_tasks_cancelled + source_external_cancelled,
-                source_timers_removed,
-                source_signals_dropped: match request.signal_reapply {
-                    ResetSignalReapplyPolicy::Drop => signals_buffered,
-                    ResetSignalReapplyPolicy::Buffer => 0,
-                },
-                source_signals_buffered: match request.signal_reapply {
-                    ResetSignalReapplyPolicy::Drop => 0,
-                    ResetSignalReapplyPolicy::Buffer => signals_buffered,
-                },
-            })
-        }
-        .scope_boxed()
-    })
-    .await
+                Ok((
+                    ResetResult {
+                        new_exec_id,
+                        reset_from_exec_id: exec_id,
+                        reset_to_event_id: request.reset_to_event_id,
+                        events_carried_over: plan.events_carried_over,
+                        source_tasks_cancelled: source_tasks_cancelled + source_external_cancelled,
+                        source_timers_removed,
+                        source_signals_dropped: match request.signal_reapply {
+                            ResetSignalReapplyPolicy::Drop => signals_buffered,
+                            ResetSignalReapplyPolicy::Buffer => 0,
+                        },
+                        source_signals_buffered: match request.signal_reapply {
+                            ResetSignalReapplyPolicy::Drop => 0,
+                            ResetSignalReapplyPolicy::Buffer => signals_buffered,
+                        },
+                    },
+                    deferred,
+                ))
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    for start in deferred_starts {
+        start.spawn();
+    }
+
+    Ok(res)
 }
 
 fn validate_source_execution(
@@ -731,7 +751,7 @@ async fn terminate_source_execution(
     new_exec_id: ExecutionId,
     request: &WorkflowResetRequest,
     source_next_event_id: i32,
-) -> Result<(), WorkflowResetError> {
+) -> Result<Vec<DeferredTriggerStart>, WorkflowResetError> {
     crate::store::append_events(
         conn,
         source_exec_id,
@@ -770,9 +790,9 @@ async fn terminate_source_execution(
         .execute(conn)
         .await
         .map_err(database_error)?;
-    apply_parent_close_cascade(conn, source_exec_id).await?;
+    let deferred = apply_parent_close_cascade(conn, source_exec_id).await?;
 
-    Ok(())
+    Ok(deferred)
 }
 
 async fn insert_fork_execution(
