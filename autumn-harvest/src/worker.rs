@@ -5050,7 +5050,26 @@ async fn process_workflow_task(
                             .await;
                     }
                 };
-                history_events.extend(new_events.clone());
+                // If any signal in the batch was not resolved inline (remains pending/suspended),
+                // we must break the loop and suspend the workflow task.
+                let mut all_resolved = true;
+                for item in &items_clone {
+                    if let SignalBatchItem::Signal(run) = item {
+                        let resolved = new_events.iter().any(|e| match e {
+                            WorkflowEvent::ExternalSignalDelivered { signal_id }
+                            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                                *signal_id == run.signal_id
+                            }
+                            _ => false,
+                        });
+                        if !resolved {
+                            all_resolved = false;
+                            break;
+                        }
+                    }
+                }
+
+                history_events.extend(new_events);
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                 if let Some(cap) = registry.history_policy().event_hard_cap()
@@ -5069,25 +5088,6 @@ async fn process_workflow_task(
                         cap,
                     )
                     .await;
-                }
-
-                // If any signal in the batch was not resolved inline (remains pending/suspended),
-                // we must break the loop and suspend the workflow task.
-                let mut all_resolved = true;
-                for item in &items_clone {
-                    if let SignalBatchItem::Signal(run) = item {
-                        let resolved = new_events.iter().any(|e| match e {
-                            WorkflowEvent::ExternalSignalDelivered { signal_id }
-                            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
-                                *signal_id == run.signal_id
-                            }
-                            _ => false,
-                        });
-                        if !resolved {
-                            all_resolved = false;
-                            break;
-                        }
-                    }
                 }
 
                 if !all_resolved {
