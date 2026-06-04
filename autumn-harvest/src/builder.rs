@@ -1785,6 +1785,93 @@ mod tests {
     }
 
     #[test]
+    fn validate_local_activity_timeouts_rejects_exceeding_cap() {
+        use crate::info::ActivityInfo;
+
+        let act = ActivityInfo {
+            name: "local_act",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: Some(Duration::from_secs(120)),
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: true,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            handler: |_ctx, _input| Box::pin(async { Ok(serde_json::Value::Null) }),
+        };
+
+        let result = validate_local_activity_timeouts(&[act], Duration::from_secs(60));
+        assert!(matches!(
+            result,
+            Err(HarvestBuilderError::LocalActivityStartToCloseExceedsCap { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_local_activity_timeouts_accepts_within_cap() {
+        use crate::info::ActivityInfo;
+
+        let act = ActivityInfo {
+            name: "local_act",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: Some(Duration::from_secs(30)),
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: true,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            handler: |_ctx, _input| Box::pin(async { Ok(serde_json::Value::Null) }),
+        };
+
+        let result = validate_local_activity_timeouts(&[act], Duration::from_secs(60));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_local_activity_timeouts_ignores_remote_activities() {
+        use crate::info::ActivityInfo;
+
+        let act = ActivityInfo {
+            name: "remote_act",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: Some(Duration::from_secs(120)),
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            handler: |_ctx, _input| Box::pin(async { Ok(serde_json::Value::Null) }),
+        };
+
+        let result = validate_local_activity_timeouts(&[act], Duration::from_secs(60));
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn worker_config_builder_adds_queues() {
         let config = WorkerConfig::default().with_queues(["email-workers", "etl"]);
         assert!(config.queues.contains(&"email-workers".to_string()));
