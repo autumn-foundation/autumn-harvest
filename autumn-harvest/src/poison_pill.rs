@@ -309,7 +309,15 @@ mod scanner {
             .map_err(crate::error::database_error)?;
         }
 
-        let deferred = apply_parent_close_cascade(conn, exec_id).await?;
+        let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+        let failed_triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            conn,
+            exec_id,
+            crate::completion_trigger::TerminalState::Failed,
+            None,
+        )
+        .await?;
+        deferred.extend(failed_triggers);
 
         // Wake a parent that is blocked on this child. When a parent-close
         // policy is set the cascade above owns the parent relationship, so we

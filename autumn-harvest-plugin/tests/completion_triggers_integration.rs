@@ -196,6 +196,16 @@ fn test_workflow<'a>(
     Box::pin(async move { Ok(input) })
 }
 
+fn target_schema_fn() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "email": { "type": "string" }
+        },
+        "required": ["email"]
+    })
+}
+
 fn test_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
@@ -223,6 +233,21 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
+            WorkflowInfo {
+                name: "target_with_schema_wf",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                concurrency: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: Some(target_schema_fn),
                 output_schema: None,
                 error_schema: None,
                 owner: None,
@@ -1793,4 +1818,158 @@ async fn test_runner_startup_fails_on_sync_failure() {
         err_str.contains("Failed to get DB connection")
             || err_str.contains("sync completion triggers")
     );
+}
+
+#[tokio::test]
+async fn test_trigger_evaluations_schema_validation() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_with_schema_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // 1. Valid Input Path: should start target workflow
+    let source_exec_id_valid = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-valid",
+            exec_id: source_exec_id_valid,
+            input: Value::Null,
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id_valid.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(json!({"email": "test@example.com"}))),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_exec_id_valid,
+        TerminalState::Completed,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let target_workflow_id_valid =
+        format!("completion-trigger-{}-{}", trigger_id, source_exec_id_valid);
+    let target_exec_valid: Option<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id_valid))
+        .first(&mut conn)
+        .await
+        .optional()
+        .unwrap();
+    assert!(target_exec_valid.is_some());
+    let target_exec_valid = target_exec_valid.unwrap();
+    assert_eq!(
+        target_exec_valid.input,
+        json!({"email": "test@example.com"})
+    );
+
+    // 2. Invalid Input Path: should skip starting target workflow
+    let source_exec_id_invalid = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-invalid",
+            exec_id: source_exec_id_invalid,
+            input: Value::Null,
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id_invalid.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(json!({"username": "not_an_email"}))),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_exec_id_invalid,
+        TerminalState::Completed,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let target_workflow_id_invalid = format!(
+        "completion-trigger-{}-{}",
+        trigger_id, source_exec_id_invalid
+    );
+    let target_exec_invalid: Option<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id_invalid))
+        .first(&mut conn)
+        .await
+        .optional()
+        .unwrap();
+    assert!(target_exec_invalid.is_none());
 }

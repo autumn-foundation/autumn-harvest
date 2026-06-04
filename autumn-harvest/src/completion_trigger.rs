@@ -196,6 +196,7 @@ pub struct WorkflowMetadata {
     pub owner: Option<String>,
     pub runbook_url: Option<String>,
     pub severity: Option<String>,
+    pub input_schema: Option<fn() -> serde_json::Value>,
 }
 
 #[cfg(feature = "db")]
@@ -445,6 +446,29 @@ pub fn evaluate_triggers_for_execution<'a>(
             };
 
             let target_workflow_id = format!("completion-trigger-{}-{}", trigger_db.id, exec_id);
+
+            // Validate mapped inputs against the target schema
+            if let Some(ref target_schema_fn) = {
+                let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
+                lock.as_ref()
+                    .and_then(|guard| guard.as_ref())
+                    .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
+                    .and_then(|meta| meta.input_schema)
+            } {
+                let schema = target_schema_fn();
+                if let Err(violations) = crate::info::validate_against_schema(&schema, &target_input) {
+                    tracing::warn!(
+                        trigger_id = %trigger_db.id,
+                        target_workflow_name = %trigger_db.target_workflow_name,
+                        violations = ?violations,
+                        "Completion trigger input validation failed; skipping trigger execution."
+                    );
+                    if let Some(m) = metrics {
+                        m.record_completion_trigger_fired(&trigger_db.id.to_string(), "validation_failed");
+                    }
+                    continue;
+                }
+            }
 
             let inserted = diesel::insert_into(fires_dsl::harvest_completion_trigger_fires)
                 .values(&NewCompletionTriggerFireDb {

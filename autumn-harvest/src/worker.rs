@@ -261,6 +261,7 @@ impl HandlerRegistry {
                             owner: w.owner.map(String::from),
                             runbook_url: w.runbook_url.map(String::from),
                             severity: w.severity.map(String::from),
+                            input_schema: w.input_schema,
                         },
                     )
                 })
@@ -4741,7 +4742,16 @@ async fn move_workflow_to_dlq_for_history_cap(
                     .await?;
                     update_workflow_execution_failed(conn, exec_id, worker_id, &reason).await?;
                     queue::fail_task(conn, task.id, &reason).await?;
-                    let deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let failed_triggers =
+                        crate::completion_trigger::evaluate_triggers_for_execution(
+                            conn,
+                            exec_id,
+                            crate::completion_trigger::TerminalState::Failed,
+                            None,
+                        )
+                        .await?;
+                    deferred.extend(failed_triggers);
                     if let Some(parent_exec_id) = parent_exec_id {
                         wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason)
                             .await?;
