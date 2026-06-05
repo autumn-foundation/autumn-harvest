@@ -136,6 +136,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
     ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
+    )
 );
 type HarvestApiApp = axum::Router;
 
@@ -2800,6 +2804,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
         },
         HarvestRunnerResources::new(pool.clone()),
     )
+    .await
     .expect("external web runtime should start without local ownership");
 
     let runner = HarvestRunner::start(
@@ -2834,6 +2839,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
         },
         HarvestRunnerResources::new(pool.clone()),
     )
+    .await
     .expect("external runner should start");
 
     api_state.install_storage_pool(web_runtime.storage_pool());
@@ -3422,7 +3428,8 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
         },
         HarvestRunnerResources::new(pool.clone()),
     )
-    .expect("runner with retention should start");
+    .await
+    .expect("retention janitor runner should start");
 
     let old_exec_a = uuid::Uuid::new_v4();
     let old_exec_b = uuid::Uuid::new_v4();

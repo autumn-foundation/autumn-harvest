@@ -2632,6 +2632,93 @@
     },
     {
       "method": "GET",
+      "path": "/admin/completion-triggers",
+      "category": "completion-trigger",
+      "read_only": true,
+      "description": "List all completion triggers.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/completion-triggers",
+      "category": "completion-trigger",
+      "read_only": false,
+      "description": "Register or create a completion trigger.",
+      "idempotency": "Idempotent on completion trigger ID (upserts the completion trigger).",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "id",
+            "required": false,
+            "description": "Optional completion trigger UUID."
+          },
+          {
+            "name": "source_workflow_name",
+            "required": true,
+            "description": "Registered source workflow name."
+          },
+          {
+            "name": "terminal_states",
+            "required": false,
+            "description": "Matching terminal states list."
+          },
+          {
+            "name": "target_workflow_name",
+            "required": true,
+            "description": "Registered target workflow name."
+          },
+          {
+            "name": "input_mapping",
+            "required": false,
+            "description": "Input projection mapping."
+          },
+          {
+            "name": "queue_name",
+            "required": false,
+            "description": "Target queue name override."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "fields": [
+          "id",
+          "source_workflow_name",
+          "terminal_states",
+          "target_workflow_name",
+          "input_mapping",
+          "queue_name",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid input layout."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/schedules",
       "category": "schedule",
       "read_only": true,

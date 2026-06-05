@@ -224,6 +224,22 @@ pub static GLOBAL_SHARDED_POOL: std::sync::RwLock<Option<ShardedDbPool>> =
     std::sync::RwLock::new(None);
 
 #[cfg(feature = "db")]
+pub static GLOBAL_SHARD_ROUTER: std::sync::RwLock<Option<ShardRouter>> =
+    std::sync::RwLock::new(None);
+
+/// Install a `ShardRouter` into the global registry.
+///
+/// This should only be called once during runtime initialization (e.g. by
+/// the `HarvestRunner` or `HarvestApiRuntime`) to avoid race conditions and
+/// overwrites from temporary constructors in tests.
+#[cfg(feature = "db")]
+pub fn install_global_router(router: ShardRouter) {
+    if let Ok(mut lock) = GLOBAL_SHARD_ROUTER.write() {
+        *lock = Some(router);
+    }
+}
+
+#[cfg(feature = "db")]
 impl ShardedDbPool {
     /// Wrap an existing single pool as a one-shard sharded pool at `ShardId(0)`.
     ///

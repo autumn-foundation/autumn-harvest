@@ -22,6 +22,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::WorkerConfig;
+use crate::completion_trigger::DeferredTriggerStart;
 #[cfg(feature = "db")]
 use crate::context::TransactionalState;
 use crate::context::{
@@ -139,6 +140,12 @@ impl WorkerRuntimeConfig {
 
 impl From<WorkerConfig> for WorkerRuntimeConfig {
     fn from(cfg: WorkerConfig) -> Self {
+        if let Some(first_queue) = cfg.queues.as_slice().first()
+            && let Ok(mut lock) = crate::completion_trigger::GLOBAL_DEFAULT_WORKFLOW_QUEUE.write()
+            && lock.is_none()
+        {
+            *lock = Some(first_queue.clone());
+        }
         Self {
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: cfg.queues,
@@ -238,10 +245,29 @@ impl HandlerRegistry {
         state: SharedState,
         telemetry: Arc<crate::telemetry::TelemetryConfig>,
     ) -> Self {
-        let workflows = workflows
+        let workflows: HashMap<String, WorkflowInfo> = workflows
             .into_iter()
             .map(|w| (w.name.to_string(), w))
             .collect();
+        if let Ok(mut lock) = crate::completion_trigger::GLOBAL_WORKFLOW_METADATA.write() {
+            let metadata = workflows
+                .iter()
+                .map(|(name, w)| {
+                    (
+                        name.clone(),
+                        crate::completion_trigger::WorkflowMetadata {
+                            concurrency: w.concurrency,
+                            max_input_bytes: w.max_input_bytes,
+                            owner: w.owner.map(String::from),
+                            runbook_url: w.runbook_url.map(String::from),
+                            severity: w.severity.map(String::from),
+                            input_schema: w.input_schema,
+                        },
+                    )
+                })
+                .collect();
+            *lock = Some(metadata);
+        }
         let activities: HashMap<String, ActivityInfo> = activities
             .into_iter()
             .map(|a| (a.name.to_string(), a))
@@ -309,7 +335,7 @@ impl HandlerRegistry {
 
     /// Set the payload size caps propagated from [`crate::builder::BuiltHarvest`].
     #[must_use]
-    pub const fn with_payload_caps(
+    pub fn with_payload_caps(
         mut self,
         max_activity_input_bytes: u64,
         max_workflow_input_bytes: u64,
@@ -320,6 +346,9 @@ impl HandlerRegistry {
         self.max_workflow_input_bytes = max_workflow_input_bytes;
         self.max_activity_result_bytes = max_activity_result_bytes;
         self.max_signal_payload_bytes = max_signal_payload_bytes;
+        if let Ok(mut lock) = crate::completion_trigger::GLOBAL_MAX_WORKFLOW_INPUT_BYTES.write() {
+            *lock = max_workflow_input_bytes;
+        }
         self
     }
 
@@ -1859,20 +1888,38 @@ async fn persist_workflow_completion(
     next_event_id: i32,
     worker_id: &str,
     output: serde_json::Value,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
     };
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            store::append_events(conn, exec_id, &[event], next_event_id).await?;
-            update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
-            queue::complete_task(conn, task_id, output).await?;
-            apply_parent_close_cascade(conn, exec_id).await
-        }
-        .scope_boxed()
-    })
-    .await
+    let deferred = conn
+        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
+            |conn| {
+                async move {
+                    store::append_events(conn, exec_id, &[event], next_event_id).await?;
+                    update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
+                    queue::complete_task(conn, task_id, output).await?;
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Completed,
+                        metrics,
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+                    Ok(deferred)
+                }
+                .scope_boxed()
+            },
+        )
+        .await?;
+
+    for start in deferred {
+        start.spawn();
+    }
+    Ok(())
 }
 
 async fn persist_workflow_failure(
@@ -1882,26 +1929,44 @@ async fn persist_workflow_failure(
     next_event_id: i32,
     worker_id: &str,
     error: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
     let error = error.to_string();
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            store::append_events(
-                conn,
-                exec_id,
-                &[WorkflowEvent::WorkflowFailed {
-                    error: error.clone(),
-                }],
-                next_event_id,
-            )
-            .await?;
-            update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
-            queue::fail_task(conn, task_id, &error).await?;
-            apply_parent_close_cascade(conn, exec_id).await
-        }
-        .scope_boxed()
-    })
-    .await
+    let deferred = conn
+        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
+            |conn| {
+                async move {
+                    store::append_events(
+                        conn,
+                        exec_id,
+                        &[WorkflowEvent::WorkflowFailed {
+                            error: error.clone(),
+                        }],
+                        next_event_id,
+                    )
+                    .await?;
+                    update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
+                    queue::fail_task(conn, task_id, &error).await?;
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Failed,
+                        metrics,
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+                    Ok(deferred)
+                }
+                .scope_boxed()
+            },
+        )
+        .await?;
+
+    for start in deferred {
+        start.spawn();
+    }
+    Ok(())
 }
 
 /// Append `UpdateCompleted` or `UpdateFailed` events for each
@@ -2804,6 +2869,7 @@ async fn fail_task_and_execution(
         history.next_event_id,
         worker_id,
         error,
+        None,
     )
     .await
 }
@@ -2943,6 +3009,7 @@ async fn wake_parent_for_child_failure(
     queue::wake_workflow_task(conn, parent_exec_id).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_child_workflow_completion(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -2951,25 +3018,44 @@ async fn persist_child_workflow_completion(
     worker_id: &str,
     parent_exec_id: ExecutionId,
     output: serde_json::Value,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
     };
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        let output = output.clone();
-        async move {
-            store::append_events(conn, exec_id, &[event], next_event_id).await?;
-            update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
-            queue::complete_task(conn, task_id, output.clone()).await?;
-            apply_parent_close_cascade(conn, exec_id).await?;
-            wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output).await
-        }
-        .scope_boxed()
-    })
-    .await
+    let deferred = conn
+        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
+            |conn| {
+                let output = output.clone();
+                async move {
+                    store::append_events(conn, exec_id, &[event], next_event_id).await?;
+                    update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
+                    queue::complete_task(conn, task_id, output.clone()).await?;
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Completed,
+                        metrics,
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+                    wake_parent_for_child_completion(conn, parent_exec_id, exec_id, output).await?;
+                    Ok(deferred)
+                }
+                .scope_boxed()
+            },
+        )
+        .await?;
+
+    for start in deferred {
+        start.spawn();
+    }
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_child_workflow_failure(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -2978,23 +3064,41 @@ async fn persist_child_workflow_failure(
     worker_id: &str,
     parent_exec_id: ExecutionId,
     error: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
     let workflow_failure = WorkflowEvent::WorkflowFailed {
         error: error.to_string(),
     };
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        let error = error.to_string();
-        async move {
-            store::append_events(conn, exec_id, &[workflow_failure], next_event_id).await?;
-            update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
-            queue::fail_task(conn, task_id, &error).await?;
-            apply_parent_close_cascade(conn, exec_id).await?;
-            wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &error).await
-        }
-        .scope_boxed()
-    })
-    .await
+    let deferred = conn
+        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
+            |conn| {
+                let error = error.to_string();
+                async move {
+                    store::append_events(conn, exec_id, &[workflow_failure], next_event_id).await?;
+                    update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
+                    queue::fail_task(conn, task_id, &error).await?;
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Failed,
+                        metrics,
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+                    wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &error).await?;
+                    Ok(deferred)
+                }
+                .scope_boxed()
+            },
+        )
+        .await?;
+
+    for start in deferred {
+        start.spawn();
+    }
+    Ok(())
 }
 
 /// Perform the DB side-effects for all `SpawnDetachedChildWorkflow` commands in
@@ -3892,6 +3996,7 @@ async fn handle_suspended_workflow(
             context.persistence.next_event_id,
             context.persistence.worker_id,
             &error,
+            None,
         )
         .await
     };
@@ -4090,6 +4195,7 @@ async fn reject_child_continue_as_new(
             persistence.next_event_id,
             persistence.worker_id,
             error,
+            None,
         )
         .await?;
     } else {
@@ -4101,6 +4207,7 @@ async fn reject_child_continue_as_new(
             persistence.worker_id,
             parent_exec_id,
             error,
+            None,
         )
         .await?;
     }
@@ -4229,6 +4336,7 @@ async fn persist_workflow_continue_as_new(
     .await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn persist_workflow_outcome(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -4257,6 +4365,7 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 parent_id,
                 output,
+                Some(registry.telemetry().metrics.as_ref()),
             )
             .await
         }
@@ -4269,6 +4378,7 @@ async fn persist_workflow_outcome(
                 persistence.next_event_id,
                 persistence.worker_id,
                 output,
+                Some(registry.telemetry().metrics.as_ref()),
             )
             .await;
             if result.is_ok() && update_schedule_counter {
@@ -4290,6 +4400,7 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 parent_id,
                 &error,
+                Some(registry.telemetry().metrics.as_ref()),
             )
             .await;
             if result.is_ok() && update_schedule_counter {
@@ -4312,6 +4423,7 @@ async fn persist_workflow_outcome(
                 persistence.next_event_id,
                 persistence.worker_id,
                 &error,
+                Some(registry.telemetry().metrics.as_ref()),
             )
             .await;
             if result.is_ok() && update_schedule_counter {
@@ -4586,57 +4698,72 @@ async fn move_workflow_to_dlq_for_history_cap(
     worker_id: &str,
     parent_exec_id: Option<ExecutionId>,
     reason: DeadLetterReason,
-) -> HarvestResult<()> {
+) -> HarvestResult<Vec<DeferredTriggerStart>> {
     let reason = reason.to_string();
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        let reason = reason.clone();
-        async move {
-            use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-            let (owner, severity) = exec_dsl::harvest_workflow_executions
-                .find(exec_id.as_uuid())
-                .select((exec_dsl::owner, exec_dsl::severity))
-                .first::<(Option<String>, Option<String>)>(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?
-                .unwrap_or((None, None));
-            dlq::dead_letter(
-                conn,
-                &NewDeadLetterEntry {
-                    original_task_id: task.id,
-                    queue_name: task.queue_name.clone(),
-                    task_type: task.task_type.clone(),
-                    workflow_exec_id: task.workflow_exec_id,
-                    activity_name: task.activity_name.clone(),
-                    input: task.input.clone(),
-                    error: reason.clone(),
-                    attempts: task.attempt,
-                    owner,
-                    severity,
-                },
-            )
-            .await?;
-            store::append_events(
-                conn,
-                exec_id,
-                &[WorkflowEvent::WorkflowFailed {
-                    error: reason.clone(),
-                }],
-                next_event_id,
-            )
-            .await?;
-            update_workflow_execution_failed(conn, exec_id, worker_id, &reason).await?;
-            queue::fail_task(conn, task.id, &reason).await?;
-            apply_parent_close_cascade(conn, exec_id).await?;
-            if let Some(parent_exec_id) = parent_exec_id {
-                wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason).await?;
-            }
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await
+    let deferred = conn
+        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
+            |conn| {
+                let reason = reason.clone();
+                async move {
+                    use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                    let (owner, severity) = exec_dsl::harvest_workflow_executions
+                        .find(exec_id.as_uuid())
+                        .select((exec_dsl::owner, exec_dsl::severity))
+                        .first::<(Option<String>, Option<String>)>(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?
+                        .unwrap_or((None, None));
+                    dlq::dead_letter(
+                        conn,
+                        &NewDeadLetterEntry {
+                            original_task_id: task.id,
+                            queue_name: task.queue_name.clone(),
+                            task_type: task.task_type.clone(),
+                            workflow_exec_id: task.workflow_exec_id,
+                            activity_name: task.activity_name.clone(),
+                            input: task.input.clone(),
+                            error: reason.clone(),
+                            attempts: task.attempt,
+                            owner,
+                            severity,
+                        },
+                    )
+                    .await?;
+                    store::append_events(
+                        conn,
+                        exec_id,
+                        &[WorkflowEvent::WorkflowFailed {
+                            error: reason.clone(),
+                        }],
+                        next_event_id,
+                    )
+                    .await?;
+                    update_workflow_execution_failed(conn, exec_id, worker_id, &reason).await?;
+                    queue::fail_task(conn, task.id, &reason).await?;
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let failed_triggers =
+                        crate::completion_trigger::evaluate_triggers_for_execution(
+                            conn,
+                            exec_id,
+                            crate::completion_trigger::TerminalState::Failed,
+                            None,
+                        )
+                        .await?;
+                    deferred.extend(failed_triggers);
+                    if let Some(parent_exec_id) = parent_exec_id {
+                        wake_parent_for_child_failure(conn, parent_exec_id, exec_id, &reason)
+                            .await?;
+                    }
+                    Ok(deferred)
+                }
+                .scope_boxed()
+            },
+        )
+        .await?;
+
+    Ok(deferred)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4651,7 +4778,7 @@ async fn fail_workflow_for_history_cap(
     started_at: std::time::Instant,
     event_count: u64,
     cap: u64,
-) -> HarvestResult<()> {
+) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
     let terminal_count = u64::try_from(next_event_id).unwrap_or(0).saturating_add(1);
     telemetry.metrics.record_workflow_completed(
         &execution.workflow_name,
@@ -4905,7 +5032,7 @@ async fn process_workflow_task(
                         if let Some(cap) = registry.history_policy().event_hard_cap()
                             && current_history_event_count >= cap
                         {
-                            return fail_workflow_for_history_cap(
+                            let deferred = fail_workflow_for_history_cap(
                                 conn,
                                 &telemetry,
                                 task,
@@ -4917,7 +5044,11 @@ async fn process_workflow_task(
                                 current_history_event_count,
                                 cap,
                             )
-                            .await;
+                            .await?;
+                            for start in deferred {
+                                start.spawn();
+                            }
+                            return Ok(());
                         }
                     }
                     remaining
@@ -4954,7 +5085,7 @@ async fn process_workflow_task(
                         event_count,
                     } => {
                         history_events.extend(events);
-                        return fail_workflow_for_history_cap(
+                        let deferred = fail_workflow_for_history_cap(
                             conn,
                             &telemetry,
                             task,
@@ -4969,7 +5100,11 @@ async fn process_workflow_task(
                                 .event_hard_cap()
                                 .expect("HistoryCapReached requires a configured hard cap"),
                         )
-                        .await;
+                        .await?;
+                        for start in deferred {
+                            start.spawn();
+                        }
+                        return Ok(());
                     }
                 };
                 history_events.extend(new_events);
@@ -4978,7 +5113,7 @@ async fn process_workflow_task(
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
-                    return fail_workflow_for_history_cap(
+                    let deferred = fail_workflow_for_history_cap(
                         conn,
                         &telemetry,
                         task,
@@ -4990,7 +5125,11 @@ async fn process_workflow_task(
                         current_history_event_count,
                         cap,
                     )
-                    .await;
+                    .await?;
+                    for start in deferred {
+                        start.spawn();
+                    }
+                    return Ok(());
                 }
             }
             WorkflowOutcome::Suspended { commands }
@@ -5056,7 +5195,7 @@ async fn process_workflow_task(
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
-                    return fail_workflow_for_history_cap(
+                    let deferred = fail_workflow_for_history_cap(
                         conn,
                         &telemetry,
                         task,
@@ -5068,7 +5207,11 @@ async fn process_workflow_task(
                         current_history_event_count,
                         cap,
                     )
-                    .await;
+                    .await?;
+                    for start in deferred {
+                        start.spawn();
+                    }
+                    return Ok(());
                 }
 
                 // If any signal in the batch was not resolved inline (remains pending/suspended),
@@ -5178,7 +5321,7 @@ async fn process_workflow_task(
                 if let Some(cap) = registry.history_policy().event_hard_cap()
                     && current_history_event_count >= cap
                 {
-                    return fail_workflow_for_history_cap(
+                    let deferred = fail_workflow_for_history_cap(
                         conn,
                         &telemetry,
                         task,
@@ -5190,7 +5333,11 @@ async fn process_workflow_task(
                         current_history_event_count,
                         cap,
                     )
-                    .await;
+                    .await?;
+                    for start in deferred {
+                        start.spawn();
+                    }
+                    return Ok(());
                 }
                 // Re-acquire a fresh execute_span so persist_workflow_outcome
                 // (via handle_suspended_workflow) gets a valid span reference.
@@ -5249,7 +5396,7 @@ async fn process_workflow_task(
         && current_history_event_count >= cap
         && !matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. })
     {
-        return fail_workflow_for_history_cap(
+        let deferred = fail_workflow_for_history_cap(
             conn,
             &telemetry,
             task,
@@ -5261,7 +5408,11 @@ async fn process_workflow_task(
             current_history_event_count,
             cap,
         )
-        .await;
+        .await?;
+        for start in deferred {
+            start.spawn();
+        }
+        return Ok(());
     }
 
     let status = match &outcome {

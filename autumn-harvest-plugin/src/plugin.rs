@@ -194,7 +194,7 @@ impl Plugin for HarvestPlugin {
                 let api_state = startup_api_state.clone();
                 async move {
                     tracing::info!("on_startup hook: executing start_harvest_runtime");
-                    let res = start_harvest_runtime(&state, &slot, &api_state);
+                    let res = start_harvest_runtime(&state, &slot, &api_state).await;
                     match &res {
                         Ok(()) => tracing::info!(
                             "on_startup hook: start_harvest_runtime completed successfully"
@@ -228,8 +228,8 @@ impl Plugin for HarvestPlugin {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn start_harvest_runtime(
+#[allow(clippy::too_many_lines, clippy::unused_async)]
+async fn start_harvest_runtime(
     state: &AppState,
     slot: &Arc<Mutex<HarvestRuntimeSlot>>,
     api_state: &HarvestApiState,
@@ -334,7 +334,7 @@ fn start_harvest_runtime(
     let max_workflow_start_delay = built.max_workflow_start_delay;
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
     let query_timeout = built.worker_config().query_timeout;
-    let runner = HarvestRunner::start(built, &harvest_config, runner_resources)?;
+    let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
     let harvest_db_pool = runner.storage_pool();
     let workflow_handle_client = WorkflowHandleClient::new(
         harvest_db_pool.sharded_pool().clone(),
@@ -461,6 +461,7 @@ fn start_harvest_runtime(
         let mut guard = slot.lock().expect("harvest lock poisoned");
         guard.runtime = Some(HarvestRuntime { runner, outbox });
     }
+
     Ok(())
 }
 
@@ -751,7 +752,8 @@ mod tests {
                 readiness: crate::config::HarvestReadinessConfig::default(),
             },
             HarvestRunnerResources::new(pool),
-        );
+        )
+        .await;
 
         let Err(err) = result else {
             panic!("classic DAG runtime should be rejected before startup");

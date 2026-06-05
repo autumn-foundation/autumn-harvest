@@ -112,6 +112,7 @@ mod scanner {
     use tokio_util::sync::CancellationToken;
 
     use super::{ReclaimAction, ReclaimSummary, orphaned_running_tasks_query, quarantine_decision};
+    use crate::completion_trigger::DeferredTriggerStart;
     use crate::error::{HarvestError, HarvestResult};
     use crate::event::WorkflowEvent;
     use crate::execution::apply_parent_close_cascade;
@@ -231,7 +232,7 @@ mod scanner {
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
         error: &str,
-    ) -> HarvestResult<Option<(String, String)>> {
+    ) -> HarvestResult<(Option<(String, String)>, Vec<DeferredTriggerStart>)> {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
 
         type ExecRow = (String, Option<uuid::Uuid>, Option<String>, String, String);
@@ -251,10 +252,10 @@ mod scanner {
             .map_err(crate::error::database_error)?;
         let Some((state, parent_id, parent_close_policy, workflow_id, workflow_name)) = current
         else {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         };
         if state != "RUNNING" {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         }
 
         let history = crate::store::load_history(conn, exec_id).await?;
@@ -308,7 +309,15 @@ mod scanner {
             .map_err(crate::error::database_error)?;
         }
 
-        apply_parent_close_cascade(conn, exec_id).await?;
+        let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+        let failed_triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+            conn,
+            exec_id,
+            crate::completion_trigger::TerminalState::Failed,
+            None,
+        )
+        .await?;
+        deferred.extend(failed_triggers);
 
         // Wake a parent that is blocked on this child. When a parent-close
         // policy is set the cascade above owns the parent relationship, so we
@@ -329,7 +338,7 @@ mod scanner {
             .await?;
             crate::queue::wake_workflow_task(conn, parent_exec_id).await?;
         }
-        Ok(Some((workflow_id, workflow_name)))
+        Ok((Some((workflow_id, workflow_name)), deferred))
     }
 
     /// Quarantine an orphaned poison-pill task: move it to the dead-letter
@@ -394,11 +403,15 @@ mod scanner {
         // The transaction returns whether the row was acted on, plus the owning
         // workflow's (id, name) when it was actually failed RUNNING → FAILED so
         // the schedule failure counter can be bumped after commit.
-        let (acted, failed_workflow): (bool, Option<(String, String)>) = conn
-            .transaction::<(bool, Option<(String, String)>), HarvestError, _>(|conn| {
+        let (acted, failed_workflow, deferred_starts) = conn
+            .transaction::< (
+                bool,
+                Option<(String, String)>,
+                Vec<DeferredTriggerStart>,
+            ), HarvestError, _>(|conn| {
                 async move {
                     let Some(worker_id) = worker else {
-                        return Ok((false, None));
+                        return Ok((false, None, Vec::new()));
                     };
                     let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
                         .find(task_id)
@@ -413,10 +426,10 @@ mod scanner {
                             if state == "RUNNING"
                                 && wid == worker_id
                                 && strikes == prior_strikes => {}
-                        _ => return Ok((false, None)),
+                        _ => return Ok((false, None, Vec::new())),
                     }
                     if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
-                        return Ok((false, None));
+                        return Ok((false, None, Vec::new()));
                     }
 
                     dead_letter(conn, &entry).await?;
@@ -433,14 +446,14 @@ mod scanner {
                         .await
                         .map_err(crate::error::database_error)?;
 
-                    let failed_workflow = match workflow_exec_id {
+                    let (failed_workflow, deferred) = match workflow_exec_id {
                         Some(exec_uuid) => {
                             fail_owning_workflow(conn, execution_id_from_uuid(exec_uuid), &error)
                                 .await?
                         }
-                        None => None,
+                        None => (None, Vec::new()),
                     };
-                    Ok((true, failed_workflow))
+                    Ok((true, failed_workflow, deferred))
                 }
                 .scope_boxed()
             })
@@ -460,6 +473,9 @@ mod scanner {
                     metrics,
                 )
                 .await;
+            }
+            for start in deferred_starts {
+                start.spawn();
             }
         }
         Ok(acted)

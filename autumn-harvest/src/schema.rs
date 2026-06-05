@@ -385,6 +385,52 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_completion_triggers (id) {
+        id -> Uuid,
+        source_workflow_name -> Text,
+        terminal_states -> Jsonb,
+        target_workflow_name -> Text,
+        input_mapping -> Jsonb,
+        queue_name -> Nullable<Text>,
+        is_static -> Bool,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_completion_trigger_fires (source_exec_id, trigger_id) {
+        source_exec_id -> Uuid,
+        trigger_id -> Uuid,
+        fired_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_completion_trigger_outbox (id) {
+        id -> Uuid,
+        source_exec_id -> Uuid,
+        trigger_id -> Uuid,
+        target_shard -> Integer,
+        target_workflow_name -> Text,
+        target_workflow_id -> Text,
+        target_input -> Jsonb,
+        queue_name -> Nullable<Text>,
+        concurrency_key -> Nullable<Text>,
+        concurrency_limit -> Nullable<Integer>,
+        priority -> Jsonb,
+        max_workflow_input_bytes -> BigInt,
+        created_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_signals -> harvest_workflow_executions (workflow_exec_id));
@@ -413,4 +459,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_calendar_exclusions,
     harvest_schedule_decisions,
     harvest_rate_limit_buckets,
+    harvest_completion_triggers,
+    harvest_completion_trigger_fires,
+    harvest_completion_trigger_outbox,
 );

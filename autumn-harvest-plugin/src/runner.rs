@@ -208,11 +208,13 @@ impl HarvestRunner {
     ///
     /// Returns an error if the workflow/activity registrations are invalid or
     /// the worker configuration cannot be materialized.
-    pub fn start(
+    #[allow(clippy::too_many_lines)]
+    pub async fn start(
         built: BuiltHarvest,
         config: &HarvestRuntimeConfig,
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
+        let completion_triggers = built.completion_triggers().to_vec();
         let prepared = PreparedHarvestRuntime::build(built, resources)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
@@ -220,12 +222,32 @@ impl HarvestRunner {
         let queues = prepared.worker_runtime_config.queues.clone();
         let harvest_pool = prepared.storage_pool.clone_inner();
         let shard_router = prepared.shard_router.clone();
+        autumn_harvest::shard::install_global_router(shard_router.clone());
 
         if !config.worker_enabled && !config.scheduler_enabled {
             tracing::info!(
                 mode = ?config.mode,
                 "harvest runtime started without local worker or scheduler ownership"
             );
+        }
+
+        // Sync static triggers before starting workers (issue #517)
+        for (shard_id, shard_pool) in prepared.storage_pool.iter_shards() {
+            let mut conn = shard_pool.get().await.map_err(|e| {
+                AutumnError::service_unavailable_msg(format!(
+                    "Failed to get DB connection to sync completion triggers for shard {shard_id}: {e}"
+                ))
+            })?;
+            autumn_harvest::completion_trigger::sync_completion_triggers(
+                &mut conn,
+                &completion_triggers,
+            )
+            .await
+            .map_err(|e| {
+                AutumnError::service_unavailable_msg(format!(
+                    "Failed to sync completion triggers on startup for shard {shard_id}: {e:?}"
+                ))
+            })?;
         }
 
         let worker = if config.worker_enabled {

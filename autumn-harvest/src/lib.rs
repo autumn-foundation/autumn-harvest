@@ -48,6 +48,7 @@ pub mod calendar;
 /// Per-activity circuit breaker that fast-fails dispatch during downstream
 /// outages (issue #369).
 pub mod circuit_breaker;
+pub mod completion_trigger;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;
 pub mod context;
@@ -172,6 +173,7 @@ pub use calendar::{
 pub use calendar::{
     Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
 };
+pub use completion_trigger::{CompletionTrigger, InputMapping, TerminalState};
 pub use context::{
     ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, WorkflowCommand, WorkflowContext,
     WorkflowHistoryPolicy,
