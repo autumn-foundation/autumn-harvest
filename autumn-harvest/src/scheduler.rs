@@ -1411,10 +1411,7 @@ async fn tick_workflow_schedules(
                     .and_then(parse_schedule_from_expr);
                 let next_run = next_run_after(parsed_schedule.as_ref(), now);
                 let _ = diesel::update(dsl::harvest_schedules.find(schedule.id))
-                    .set((
-                        dsl::next_run_at.eq(next_run),
-                        dsl::updated_at.eq(now),
-                    ))
+                    .set((dsl::next_run_at.eq(next_run), dsl::updated_at.eq(now)))
                     .execute(conn)
                     .await;
                 continue;

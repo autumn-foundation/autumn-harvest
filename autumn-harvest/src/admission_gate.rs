@@ -118,9 +118,7 @@ impl fmt::Display for GateScope {
 // ── AdmissionGateId ───────────────────────────────────────────────────────────
 
 /// Newtype wrapper for the admission gate UUID primary key.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AdmissionGateId(pub Uuid);
 
 impl fmt::Display for AdmissionGateId {
@@ -426,9 +424,7 @@ pub mod db {
             .map_err(database_error)?;
 
         row_to_gate(row).ok_or_else(|| {
-            crate::error::HarvestError::Config(
-                "created gate row could not be decoded".to_string(),
-            )
+            crate::error::HarvestError::Config("created gate row could not be decoded".to_string())
         })
     }
 
@@ -445,8 +441,8 @@ pub mod db {
         gate_id: Uuid,
         actor: &str,
     ) -> HarvestResult<Option<AdmissionGate>> {
-        use harvest_admission_gates::dsl as g;
         use diesel::OptionalExtension;
+        use harvest_admission_gates::dsl as g;
 
         let now = Utc::now();
 
@@ -455,10 +451,7 @@ pub mod db {
                 .find(gate_id)
                 .filter(g::lifted_at.is_null()),
         )
-        .set((
-            g::lifted_at.eq(Some(now)),
-            g::lifted_by.eq(Some(actor)),
-        ))
+        .set((g::lifted_at.eq(Some(now)), g::lifted_by.eq(Some(actor))))
         .get_result(conn)
         .await
         .optional()
@@ -522,8 +515,7 @@ impl From<AdmissionGate> for AdmissionGateView {
 impl From<&crate::models::AdmissionGateRow> for AdmissionGateView {
     fn from(row: &crate::models::AdmissionGateRow) -> Self {
         let now = Utc::now();
-        let is_active = row.lifted_at.is_none()
-            && row.expires_at.map_or(true, |exp| exp > now);
+        let is_active = row.lifted_at.is_none() && row.expires_at.map_or(true, |exp| exp > now);
         Self {
             id: row.id,
             scope_kind: row.scope_kind.clone(),
@@ -557,7 +549,10 @@ mod tests {
     #[test]
     fn gate_scope_kind_str_round_trips() {
         assert_eq!(GateScope::Fleet.kind_str(), "fleet");
-        assert_eq!(GateScope::WorkflowName("x".into()).kind_str(), "workflow_name");
+        assert_eq!(
+            GateScope::WorkflowName("x".into()).kind_str(),
+            "workflow_name"
+        );
         assert_eq!(GateScope::Queue("q".into()).kind_str(), "queue");
         assert_eq!(GateScope::ShardId(0).kind_str(), "shard_id");
         assert_eq!(GateScope::Owner("o".into()).kind_str(), "owner");
@@ -567,7 +562,11 @@ mod tests {
     fn gate_scope_from_db_round_trips() {
         let cases = [
             ("fleet", None, GateScope::Fleet),
-            ("workflow_name", Some("foo"), GateScope::WorkflowName("foo".into())),
+            (
+                "workflow_name",
+                Some("foo"),
+                GateScope::WorkflowName("foo".into()),
+            ),
             ("queue", Some("q1"), GateScope::Queue("q1".into())),
             ("shard_id", Some("3"), GateScope::ShardId(3)),
             ("owner", Some("team"), GateScope::Owner("team".into())),

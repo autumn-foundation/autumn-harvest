@@ -5939,7 +5939,9 @@ async fn lift_gate_ui(
     };
 
     let id_str = id.to_string();
-    if let Ok(Some(_gate)) = autumn_harvest::admission_gate::db::lift_gate(&mut conn, id, "ui").await {
+    if let Ok(Some(_gate)) =
+        autumn_harvest::admission_gate::db::lift_gate(&mut conn, id, "ui").await
+    {
         if let Ok(fresh) = autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await {
             api_state.gate_cache().refresh(fresh);
         }

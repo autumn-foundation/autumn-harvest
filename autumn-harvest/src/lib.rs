@@ -28,10 +28,10 @@ macro_rules! cfg_db {
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
 
-/// History analyzer and linter.
-pub mod analyzer;
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
+/// History analyzer and linter.
+pub mod analyzer;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;

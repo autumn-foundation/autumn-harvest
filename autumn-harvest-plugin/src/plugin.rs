@@ -476,7 +476,9 @@ async fn start_harvest_runtime(
                     () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                 }
                 if let Ok(mut conn) = acquire_conn(&pool).await {
-                    if let Ok(gates) = autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await {
+                    if let Ok(gates) =
+                        autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await
+                    {
                         cache.refresh(gates);
                     }
                 }
@@ -499,7 +501,11 @@ async fn start_harvest_runtime(
 
     {
         let mut guard = slot.lock().expect("harvest lock poisoned");
-        guard.runtime = Some(HarvestRuntime { runner, outbox, gate_refresh });
+        guard.runtime = Some(HarvestRuntime {
+            runner,
+            outbox,
+            gate_refresh,
+        });
     }
 
     Ok(())

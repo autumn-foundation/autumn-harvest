@@ -29,8 +29,8 @@ use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::admission_gate::db as admission_gate_db;
+use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::OP_BATCH_START;
 use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
@@ -38,11 +38,12 @@ use autumn_harvest::audit::{
     OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK,
     OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL,
     OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
-    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKER_DRAIN,
-    OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
-    OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH,
-    TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY,
-    TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
+    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL,
+    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER,
+    TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -540,10 +541,7 @@ impl HarvestApiState {
     ///
     /// Called before the worker pool starts so there is no admission window
     /// between boot and re-apply. Also spawns the background refresh task.
-    pub fn initialize_gate_cache(
-        &self,
-        gates: Vec<autumn_harvest::AdmissionGate>,
-    ) {
+    pub fn initialize_gate_cache(&self, gates: Vec<autumn_harvest::AdmissionGate>) {
         self.gate_cache.refresh(gates);
     }
 
@@ -4789,15 +4787,16 @@ async fn start_workflow(
             .workflows
             .get(&workflow_name)
             .and_then(|i| i.owner);
-        let gates = api_state.gate_cache().check(
-            &workflow_name,
-            &queue_name,
-            0,
-            wf_owner,
-        );
+        let gates = api_state
+            .gate_cache()
+            .check(&workflow_name, &queue_name, 0, wf_owner);
         if let Some((gate_id, reason)) = gates {
             // Truncate reason to 64 chars for bounded metric cardinality (issue #377).
-            let reason_label = if reason.len() > 64 { &reason[..64] } else { &reason };
+            let reason_label = if reason.len() > 64 {
+                &reason[..64]
+            } else {
+                &reason
+            };
             runtime
                 .registry
                 .telemetry()
@@ -5800,12 +5799,9 @@ async fn signal_with_start_workflow(
             .workflows
             .get(&workflow_name)
             .and_then(|i| i.owner);
-        let gate_hit = api_state.gate_cache().check(
-            &workflow_name,
-            &queue_name,
-            0,
-            wf_owner,
-        );
+        let gate_hit = api_state
+            .gate_cache()
+            .check(&workflow_name, &queue_name, 0, wf_owner);
         if let Some((gate_id, reason)) = gate_hit {
             if let Ok(pool) = api_state.storage_pool()
                 && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
