@@ -5986,12 +5986,18 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
         @for row in rows.iter().filter(|r| r.lifted_at.is_none()) {
             @let id_str = row.id.to_string();
             @let id_short = &id_str[..8];
+            @let now = chrono::Utc::now();
+            @let is_expired = row.expires_at.is_some_and(|exp| exp <= now);
             div.card {
                 div style="display:flex;justify-content:space-between;align-items:center" {
                     div {
                         strong { code { (id_short) } }
                         " "
-                        span.badge.FAILED { "ACTIVE" }
+                        @if is_expired {
+                            span.badge style="background:#374151;color:#9ca3af" { "EXPIRED" }
+                        } @else {
+                            span.badge.FAILED { "ACTIVE" }
+                        }
                         " "
                         span { (row.scope_kind) }
                         @if let Some(ref v) = row.scope_value {
@@ -6004,14 +6010,20 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
                             "created by " (row.created_by)
                             " at " (row.created_at.format("%Y-%m-%d %H:%M:%S UTC"))
                             @if let Some(exp) = row.expires_at {
-                                " · expires " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                                @if is_expired {
+                                    " · expired " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                                } @else {
+                                    " · expires " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                                }
                             }
                         }
-                        form method="POST" action={ "gates/" (id_str) "/lift" }
-                            onsubmit="return confirm('Lift this gate?')" {
-                            button type="submit"
-                                style="background:#15803d;color:#dcfce7;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px" {
-                                "Lift"
+                        @if !is_expired {
+                            form method="POST" action={ "gates/" (id_str) "/lift" }
+                                onsubmit="return confirm('Lift this gate?')" {
+                                button type="submit"
+                                    style="background:#15803d;color:#dcfce7;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px" {
+                                    "Lift"
+                                }
                             }
                         }
                     }

@@ -5265,30 +5265,7 @@ async fn batch_start_workflows(
                 item.workflow_name
             ))
         } else {
-            // issue #377: check admission gates per item.
-            let item_queue = runtime
-                .queues
-                .as_slice()
-                .first()
-                .map_or("default", String::as_str);
-            let item_owner = runtime
-                .registry
-                .workflows
-                .get(&item.workflow_name)
-                .and_then(|i| i.owner);
-            // Use ShardId 0 for gate shard-scope matching in batch; the actual
-            // shard is not known until the per-item routing loop below.
-            if let Some((gate_id, gate_reason, _)) =
-                api_state
-                    .gate_cache()
-                    .check(&item.workflow_name, item_queue, 0, item_owner)
-            {
-                Some(format!(
-                    "admission blocked by gate {gate_id}: {gate_reason}"
-                ))
-            } else {
-                None
-            }
+            None
         };
         if let Some(reason) = err {
             pre_rejected.push(BatchStartItemResult {
@@ -5369,11 +5346,17 @@ async fn batch_start_workflows(
 
     let mut rejected_count = pre_rejected_idxs.len();
 
-    // ── Phase 1: compute routing data and group valid items by shard ──────────
+    // ── Phase 1: compute routing data, gate-check with actual shard, group by shard ──
     // Precomputing workflow_ids here ensures the same value is used for shard
     // selection and for start_or_load_workflow_execution below.
+    let item_queue = runtime
+        .queues
+        .as_slice()
+        .first()
+        .map_or("default", String::as_str);
     let mut shard_groups: std::collections::BTreeMap<ShardId, Vec<(usize, String)>> =
         std::collections::BTreeMap::new();
+    let mut gate_rejected: Vec<BatchStartItemResult> = Vec::new();
     for (idx, item) in request.items.iter().enumerate() {
         if pre_rejected_idxs.contains(&idx) {
             continue;
@@ -5385,10 +5368,83 @@ async fn batch_start_workflows(
         let shard = runtime
             .router
             .pick_for_new_workflow(&item.workflow_name, &workflow_id);
+
+        // issue #377: gate check with the actual target shard.
+        let item_owner = runtime
+            .registry
+            .workflows
+            .get(&item.workflow_name)
+            .and_then(|i| i.owner);
+        if let Some((gate_id, gate_reason, scope_kind)) = api_state.gate_cache().check(
+            &item.workflow_name,
+            item_queue,
+            shard.as_i32(),
+            item_owner,
+        ) {
+            let reason_label = match gate_reason.char_indices().nth(64) {
+                Some((idx2, _)) => &gate_reason[..idx2],
+                None => &gate_reason,
+            };
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_admission_blocked(scope_kind, reason_label);
+            gate_rejected.push(BatchStartItemResult {
+                index: idx,
+                status: BatchStartItemStatus::Rejected,
+                execution_id: None,
+                error: Some(format!(
+                    "admission blocked by gate {gate_id}: {gate_reason}"
+                )),
+            });
+            continue;
+        }
+
         shard_groups
             .entry(shard)
             .or_default()
             .push((idx, workflow_id));
+    }
+
+    // Atomic mode: if any item was gate-rejected, fail the whole batch.
+    if request.atomic && !gate_rejected.is_empty() {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_BATCH_START,
+                target_type: TARGET_BATCH,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("atomic batch rejected: one or more items blocked by gate"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return (
+            StatusCode::CONFLICT,
+            Json(BatchStartRejectedResponse {
+                message: format!(
+                    "{} of {} items blocked by admission gate; no executions inserted (atomic=true)",
+                    gate_rejected.len(),
+                    request.items.len()
+                ),
+                rejected: gate_rejected,
+            }),
+        )
+            .into_response();
+    }
+
+    // Non-atomic: add gate rejections to the result list.
+    for r in gate_rejected {
+        results.push(r);
+        rejected_count += 1;
     }
 
     // ── Phase 2: per-shard, acquire ONE connection and process all items ──────
@@ -8718,6 +8774,38 @@ async fn trigger_schedule_now(
             ));
         }
     };
+
+    // issue #377: check admission gates before firing a manual trigger.
+    {
+        let wf_owner = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|i| i.owner)
+            .or_else(|| {
+                runtime
+                    .dags()
+                    .get(&workflow_name)
+                    .and_then(|d| d.owner.as_deref())
+            });
+        let gate_hit = api_state
+            .gate_cache()
+            .check(&workflow_name, &queue_name, 0, wf_owner);
+        if let Some((gate_id, gate_reason, scope_kind)) = gate_hit {
+            let reason_label = match gate_reason.char_indices().nth(64) {
+                Some((idx, _)) => &gate_reason[..idx],
+                None => &gate_reason,
+            };
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_admission_blocked(scope_kind, reason_label);
+            return Err(AutumnError::service_unavailable_msg(format!(
+                "admission blocked by gate {gate_id}: {gate_reason}"
+            )));
+        }
+    }
 
     let triggered_at = chrono::Utc::now();
     // Append a UUID v4 so concurrent trigger calls within the same millisecond each

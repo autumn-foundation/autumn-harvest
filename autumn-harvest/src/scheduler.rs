@@ -1369,7 +1369,12 @@ async fn tick_workflow_schedules(
             let owner = registry
                 .workflows
                 .get(wf_name.as_str())
-                .and_then(|i| i.owner);
+                .and_then(|i| i.owner)
+                .or_else(|| {
+                    registered_dags
+                        .get(wf_name.as_str())
+                        .and_then(|d| d.owner.as_deref())
+                });
             if let Some(gate) = crate::admission_gate::check_admission(
                 &active_gates,
                 wf_name,
@@ -1384,7 +1389,7 @@ async fn tick_workflow_schedules(
                     reason = %gate.reason,
                     "harvest: schedule fire skipped due to admission gate"
                 );
-                metrics.record_schedule_skipped(wf_name, wf_name, "admission_blocked");
+                metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
                 crate::schedule_decision::record_decision_graceful(
                     conn,
                     Some(&**metrics),
