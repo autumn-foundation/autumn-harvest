@@ -9794,14 +9794,22 @@ fn url_encode_for_redirect(input: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_replay_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    #[allow(clippy::cast_possible_truncation)]
+    let limit = api_state.batch_start_max_bytes() as usize;
+    let body_bytes = match axum::body::to_bytes(body, limit).await {
+        Ok(b) => b,
+        Err(e) => return autumn_web::error::AutumnError::bad_request_msg(format!("payload too large or read failed: {e}")).into_response(),
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -9902,14 +9910,22 @@ async fn bulk_replay_dead_letters_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_discard_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    #[allow(clippy::cast_possible_truncation)]
+    let limit = api_state.batch_start_max_bytes() as usize;
+    let body_bytes = match axum::body::to_bytes(body, limit).await {
+        Ok(b) => b,
+        Err(e) => return autumn_web::error::AutumnError::bad_request_msg(format!("payload too large or read failed: {e}")).into_response(),
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };

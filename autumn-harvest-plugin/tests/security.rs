@@ -762,3 +762,53 @@ async fn eris_require_auth_blocks_trigger_schedule() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn test_bulk_dlq_dos_payload_limits() {
+    let app = authenticated_app();
+
+    let large_body = vec![b'x'; 10 * 1024 * 1024];
+
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/dead-letters/replay")
+        .header("Content-Type", "application/json")
+        .header("X-Autumn-Actor", "admin")
+        .body(Body::from(large_body))
+        .unwrap();
+
+    let mut data = HashMap::new();
+    data.insert("user_id".to_string(), "operator-1".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        data,
+    ));
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_bulk_discard_dos_payload_limits() {
+    let app = authenticated_app();
+
+    let large_body = vec![b'x'; 10 * 1024 * 1024];
+
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/dead-letters/discard")
+        .header("Content-Type", "application/json")
+        .header("X-Autumn-Actor", "admin")
+        .body(Body::from(large_body))
+        .unwrap();
+
+    let mut data = HashMap::new();
+    data.insert("user_id".to_string(), "operator-1".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        data,
+    ));
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
