@@ -518,7 +518,7 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route(
             "/build-routing/retire",
-            post(build_routing_retire_ui).route_layer(require_admin),
+            post(build_routing_retire_ui).route_layer(require_admin.clone()),
         )
         .route("/schedules", get(list_schedules_ui))
         .route("/schedules/bulk-pause", post(schedule_bulk_pause_ui))
@@ -527,9 +527,12 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/schedules/{id}/resume", post(schedule_resume_ui))
         .route("/schedules/{id}/delete", post(schedule_delete_ui))
         .route("/schedules/{id}/trigger-now", post(schedule_trigger_now_ui))
-        // issue #377: admission gates UI page and one-click lift
+        // issue #377: admission gates UI page and one-click lift (lift requires admin)
         .route("/admin/gates", get(list_gates_ui))
-        .route("/admin/gates/{id}/lift", post(lift_gate_ui))
+        .route(
+            "/admin/gates/{id}/lift",
+            post(lift_gate_ui).route_layer(require_admin),
+        )
         .layer(Extension(api_state))
 }
 
@@ -5929,13 +5932,11 @@ async fn lift_gate_ui(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<uuid::Uuid>,
 ) -> axum::response::Response {
-    let pool = match api_state.storage_pool() {
-        Ok(p) => p,
-        Err(_) => return axum::response::Redirect::to("../../admin/gates").into_response(),
+    let Ok(pool) = api_state.storage_pool() else {
+        return axum::response::Redirect::to("../../admin/gates").into_response();
     };
-    let mut conn = match acquire_conn(pool.default_pool()).await {
-        Ok(c) => c,
-        Err(_) => return axum::response::Redirect::to("../../admin/gates").into_response(),
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return axum::response::Redirect::to("../../admin/gates").into_response();
     };
 
     let id_str = id.to_string();

@@ -1687,17 +1687,14 @@ async fn create_gate_handler(
 ) -> axum::response::Response {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
-    let scope = match GateScope::from_db(&body.scope_kind, body.scope_value.as_deref()) {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("unknown scope_kind '{}'", body.scope_kind)
-                })),
-            )
-                .into_response();
-        }
+    let Some(scope) = GateScope::from_db(&body.scope_kind, body.scope_value.as_deref()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unknown scope_kind '{}'", body.scope_kind)
+            })),
+        )
+            .into_response();
     };
 
     let pool = match api_state.storage_pool() {
@@ -4780,6 +4777,11 @@ async fn start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let input = request.input.unwrap_or(Value::Null);
 
+    // Compute target shard early so the gate check can filter by shard-scoped gates.
+    let shard = runtime
+        .router
+        .pick_for_new_workflow(&workflow_name, &workflow_id);
+
     // issue #377: check admission gates before touching the DB.
     {
         let wf_owner = runtime
@@ -4787,9 +4789,10 @@ async fn start_workflow(
             .workflows
             .get(&workflow_name)
             .and_then(|i| i.owner);
-        let gates = api_state
-            .gate_cache()
-            .check(&workflow_name, &queue_name, 0, wf_owner);
+        let gates =
+            api_state
+                .gate_cache()
+                .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner);
         if let Some((gate_id, reason, scope_kind)) = gates {
             // Truncate reason to 64 *characters* (not bytes) for bounded metric
             // cardinality; char_indices avoids splitting a multi-byte code point.
@@ -5006,9 +5009,7 @@ async fn start_workflow(
             (key, Some(policy.limit))
         });
 
-    let shard = runtime
-        .router
-        .pick_for_new_workflow(&workflow_name, &workflow_id);
+    // shard computed above (before gate check); reuse it here.
     let exec_id = ExecutionId::new_for_shard(shard);
     let mut conn = match db_conn_for_shard(&api_state, shard).await {
         Ok(c) => c,
@@ -5264,7 +5265,30 @@ async fn batch_start_workflows(
                 item.workflow_name
             ))
         } else {
-            None
+            // issue #377: check admission gates per item.
+            let item_queue = runtime
+                .queues
+                .as_slice()
+                .first()
+                .map_or("default", String::as_str);
+            let item_owner = runtime
+                .registry
+                .workflows
+                .get(&item.workflow_name)
+                .and_then(|i| i.owner);
+            // Use ShardId 0 for gate shard-scope matching in batch; the actual
+            // shard is not known until the per-item routing loop below.
+            if let Some((gate_id, gate_reason, _)) =
+                api_state
+                    .gate_cache()
+                    .check(&item.workflow_name, item_queue, 0, item_owner)
+            {
+                Some(format!(
+                    "admission blocked by gate {gate_id}: {gate_reason}"
+                ))
+            } else {
+                None
+            }
         };
         if let Some(reason) = err {
             pre_rejected.push(BatchStartItemResult {
@@ -5791,57 +5815,6 @@ async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
-    // issue #377: check admission gates for the START path only.
-    // Signals to existing executions are not affected — only fresh starts are blocked.
-    {
-        let wf_owner = runtime
-            .registry
-            .workflows
-            .get(&workflow_name)
-            .and_then(|i| i.owner);
-        let gate_hit = api_state
-            .gate_cache()
-            .check(&workflow_name, &queue_name, 0, wf_owner);
-        if let Some((gate_id, reason, scope_kind)) = gate_hit {
-            let reason_label = match reason.char_indices().nth(64) {
-                Some((idx, _)) => &reason[..idx],
-                None => &reason,
-            };
-            runtime
-                .registry
-                .telemetry()
-                .metrics
-                .record_admission_blocked(scope_kind, reason_label);
-            if let Ok(pool) = api_state.storage_pool()
-                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-            {
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_WORKFLOW_SIGNAL_WITH_START,
-                    target_type: TARGET_WORKFLOW,
-                    target_id: Some(workflow_name.as_str()),
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: None,
-                    status: STATUS_FAILED,
-                    error_summary: Some("admission blocked by gate"),
-                    shard_id: None,
-                    source: &source,
-                };
-                let _ = audit::insert_audit(&mut conn, &ar).await;
-            }
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "admission blocked",
-                    "gate_id": gate_id,
-                    "reason": reason,
-                })),
-            )
-                .into_response();
-        }
-    }
-
     // Issue #252: resolve cap values. Both caps are enforced inside
     // signal_with_start_workflow_execution — after idempotency dedupe and
     // only on the fresh-start path for start_input — to avoid spurious 413s
@@ -5934,7 +5907,7 @@ async fn signal_with_start_workflow(
         }
     }
 
-    let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
+    let (shard, mut conn, exec_id, will_attach) = if let Some(tuple) = found_shard {
         tuple
     } else {
         let shard = runtime
@@ -5946,6 +5919,57 @@ async fn signal_with_start_workflow(
         };
         (shard, conn, ExecutionId::new_for_shard(shard), false)
     };
+
+    // issue #377: check admission gates only on the fresh-start path.
+    // Signals delivered to an existing RUNNING execution (will_attach = true) are never gated
+    // so that incident-mode gates do not prevent operators from delivering stop/cancel signals.
+    if !will_attach {
+        let wf_owner = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|i| i.owner);
+        let gate_hit =
+            api_state
+                .gate_cache()
+                .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner);
+        if let Some((gate_id, reason, scope_kind)) = gate_hit {
+            let reason_label = match reason.char_indices().nth(64) {
+                Some((idx, _)) => &reason[..idx],
+                None => &reason,
+            };
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_admission_blocked(scope_kind, reason_label);
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("admission blocked by gate"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
+    }
 
     // issue #373: validate start_input against the workflow's published JSON Schema (if any).
     // Always runs regardless of will_attach: the pre-scan that sets will_attach is unlocked, so

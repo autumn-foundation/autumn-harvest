@@ -475,12 +475,11 @@ async fn start_harvest_runtime(
                     () = cancel_for_task.cancelled() => return,
                     () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                 }
-                if let Ok(mut conn) = acquire_conn(&pool).await {
-                    if let Ok(gates) =
+                if let Ok(mut conn) = acquire_conn(&pool).await
+                    && let Ok(gates) =
                         autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await
-                    {
-                        cache.refresh(gates);
-                    }
+                {
+                    cache.refresh(gates);
                 }
             }
         });
