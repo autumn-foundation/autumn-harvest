@@ -62,7 +62,7 @@ pub enum GateScope {
 impl GateScope {
     /// The discriminator string persisted in `scope_kind`.
     #[must_use]
-    pub fn kind_str(&self) -> &'static str {
+    pub const fn kind_str(&self) -> &'static str {
         match self {
             Self::Fleet => "fleet",
             Self::WorkflowName(_) => "workflow_name",
@@ -165,10 +165,7 @@ impl AdmissionGate {
     /// A gate is inactive when `expires_at` is `Some` and in the past.
     #[must_use]
     pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
-        match self.expires_at {
-            None => true,
-            Some(exp) => exp > now,
-        }
+        self.expires_at.is_none_or(|exp| exp > now)
     }
 
     /// Returns `true` if this gate matches the given admission parameters.
@@ -188,7 +185,7 @@ impl AdmissionGate {
             GateScope::WorkflowName(n) => n == workflow_name,
             GateScope::Queue(q) => q == queue_name,
             GateScope::ShardId(s) => *s == shard_id,
-            GateScope::Owner(o) => owner.map_or(false, |ow| ow == o),
+            GateScope::Owner(o) => owner.is_some_and(|ow| ow == o),
         }
     }
 }
@@ -275,6 +272,10 @@ impl AdmissionGateCache {
     }
 
     /// Acquire a read lock and call `check_admission` against the snapshot.
+    ///
+    /// Returns `(gate_id, reason, scope_kind)` when a gate matches, where
+    /// `scope_kind` is the static discriminator string (e.g. `"fleet"`,
+    /// `"workflow_name"`) suitable for use as a low-cardinality metric label.
     #[must_use]
     pub fn check(
         &self,
@@ -282,16 +283,16 @@ impl AdmissionGateCache {
         queue_name: &str,
         shard_id: i32,
         owner: Option<&str>,
-    ) -> Option<(Uuid, String)> {
+    ) -> Option<(Uuid, String, &'static str)> {
         let guard = self.0.read().ok()?;
         check_admission(&guard, workflow_name, queue_name, shard_id, owner)
-            .map(|g| (g.id.0, g.reason.clone()))
+            .map(|g| (g.id.0, g.reason.clone(), g.scope.kind_str()))
     }
 
     /// Return the number of currently cached active gates.
     #[must_use]
     pub fn active_count(&self) -> usize {
-        self.0.read().map(|g| g.len()).unwrap_or(0)
+        self.0.read().map_or(0, |g| g.len())
     }
 }
 
@@ -299,7 +300,7 @@ impl AdmissionGateCache {
 
 #[cfg(feature = "db")]
 pub mod db {
-    use super::*;
+    use super::{AdmissionGate, AdmissionGateId, DateTime, GateScope, MAX_ACTIVE_GATES, Utc, Uuid};
     use crate::error::{HarvestResult, database_error};
     use crate::models::{AdmissionGateRow, NewAdmissionGateRow};
     use crate::schema::harvest_admission_gates;
@@ -398,6 +399,7 @@ pub mod db {
             .await
             .map_err(database_error)?;
 
+        #[allow(clippy::cast_possible_wrap)]
         if active_count >= MAX_ACTIVE_GATES as i64 {
             return Err(HarvestError::Config(format!(
                 "cannot create admission gate: active gate limit of {MAX_ACTIVE_GATES} reached",
@@ -515,7 +517,7 @@ impl From<AdmissionGate> for AdmissionGateView {
 impl From<&crate::models::AdmissionGateRow> for AdmissionGateView {
     fn from(row: &crate::models::AdmissionGateRow) -> Self {
         let now = Utc::now();
-        let is_active = row.lifted_at.is_none() && row.expires_at.map_or(true, |exp| exp > now);
+        let is_active = row.lifted_at.is_none() && row.expires_at.is_none_or(|exp| exp > now);
         Self {
             id: row.id,
             scope_kind: row.scope_kind.clone(),
@@ -620,7 +622,8 @@ mod tests {
         cache.refresh(vec![fleet_gate("incident-42")]);
         let result = cache.check("wf", "q", 0, None);
         assert!(result.is_some());
-        let (_, reason) = result.unwrap();
+        let (_, reason, scope_kind) = result.unwrap();
         assert_eq!(reason, "incident-42");
+        assert_eq!(scope_kind, "fleet");
     }
 }

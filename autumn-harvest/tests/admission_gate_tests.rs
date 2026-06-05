@@ -215,8 +215,8 @@ fn first_matching_gate_is_returned() {
     let gate1 = make_gate(GateScope::Fleet, "first gate");
     let gate2 = make_gate(GateScope::Fleet, "second gate");
     let first_reason = gate1.reason.clone();
-    let gates = [gate1, gate2];
-    let result = check_admission(&gates, "wf", "q", 0, None);
+    let all_gates = [gate1, gate2];
+    let result = check_admission(&all_gates, "wf", "q", 0, None);
     let matched = result.expect("must match");
     assert_eq!(
         matched.reason, first_reason,
@@ -304,7 +304,7 @@ fn gate_scope_queue_display() {
 fn gate_scope_shard_id_display() {
     let scope = GateScope::ShardId(5);
     assert!(scope.to_string().contains("shard_id"));
-    assert!(scope.to_string().contains("5"));
+    assert!(scope.to_string().contains('5'));
 }
 
 #[test]
@@ -327,13 +327,15 @@ fn gate_id_display_matches_inner_uuid() {
 
 #[test]
 fn max_active_gates_constant_is_documented() {
-    // Confirm the constant exists and has a reasonable bound
+    // Confirm the constant exists and has a reasonable bound. Read through a
+    // runtime variable so clippy::assertions_on_constants doesn't fire.
+    let cap = autumn_harvest::admission_gate::MAX_ACTIVE_GATES;
     assert!(
-        autumn_harvest::admission_gate::MAX_ACTIVE_GATES >= 10,
+        cap >= 10,
         "MAX_ACTIVE_GATES must allow at least 10 simultaneous gates"
     );
     assert!(
-        autumn_harvest::admission_gate::MAX_ACTIVE_GATES <= 1000,
+        cap <= 1000,
         "MAX_ACTIVE_GATES must be at most 1000 to bound cardinality"
     );
 }

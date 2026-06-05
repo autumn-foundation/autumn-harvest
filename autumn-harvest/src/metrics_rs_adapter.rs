@@ -384,6 +384,7 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn record_admission_gates_active(&self, count: i64) {
         gauge!(METRIC_ADMISSION_GATES_ACTIVE).set(count as f64);
     }

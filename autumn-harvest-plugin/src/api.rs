@@ -4790,18 +4790,18 @@ async fn start_workflow(
         let gates = api_state
             .gate_cache()
             .check(&workflow_name, &queue_name, 0, wf_owner);
-        if let Some((gate_id, reason)) = gates {
-            // Truncate reason to 64 chars for bounded metric cardinality (issue #377).
-            let reason_label = if reason.len() > 64 {
-                &reason[..64]
-            } else {
-                &reason
+        if let Some((gate_id, reason, scope_kind)) = gates {
+            // Truncate reason to 64 *characters* (not bytes) for bounded metric
+            // cardinality; char_indices avoids splitting a multi-byte code point.
+            let reason_label = match reason.char_indices().nth(64) {
+                Some((idx, _)) => &reason[..idx],
+                None => &reason,
             };
             runtime
                 .registry
                 .telemetry()
                 .metrics
-                .record_admission_blocked(&wf_owner.unwrap_or("fleet"), reason_label);
+                .record_admission_blocked(scope_kind, reason_label);
             if let Ok(pool) = api_state.storage_pool()
                 && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
             {
@@ -5802,7 +5802,16 @@ async fn signal_with_start_workflow(
         let gate_hit = api_state
             .gate_cache()
             .check(&workflow_name, &queue_name, 0, wf_owner);
-        if let Some((gate_id, reason)) = gate_hit {
+        if let Some((gate_id, reason, scope_kind)) = gate_hit {
+            let reason_label = match reason.char_indices().nth(64) {
+                Some((idx, _)) => &reason[..idx],
+                None => &reason,
+            };
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_admission_blocked(scope_kind, reason_label);
             if let Ok(pool) = api_state.storage_pool()
                 && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
             {

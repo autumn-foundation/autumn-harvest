@@ -437,7 +437,7 @@ diesel::table! {
     /// Admission gates that halt new workflow starts for a scoped subset of work (issue #377).
     harvest_admission_gates (id) {
         id -> Uuid,
-        /// Scope kind: 'fleet' | 'workflow_name' | 'queue' | 'shard_id' | 'owner'
+        /// Scope kind: `fleet` | `workflow_name` | `queue` | `shard_id` | `owner`
         scope_kind -> Text,
         /// Scope value: NULL for fleet; specific value for all other kinds.
         scope_value -> Nullable<Text>,
