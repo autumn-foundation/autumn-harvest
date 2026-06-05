@@ -762,3 +762,116 @@ async fn eris_require_auth_blocks_trigger_schedule() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ── Payload limit DoS tests ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn warden_batch_start_workflows_enforces_payload_limit() {
+    let api_state = HarvestApiState::new();
+    let limit = api_state.batch_start_max_bytes();
+    let app = app_with_api_state(api_state);
+
+    let large_body = vec![b'a'; usize::try_from(limit).unwrap_or(usize::MAX - 20) + 10];
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/workflows/batch_start")
+        .header("Content-Type", "application/json")
+        .body(Body::from(large_body))
+        .unwrap();
+    let mut data = HashMap::new();
+    data.insert("user_id".to_string(), "operator-1".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        data,
+    ));
+
+    let res = app.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn warden_query_workflow_post_enforces_payload_limit() {
+    let app = unauthenticated_app();
+
+    let large_body = vec![b'a'; 2 * 1024 * 1024 + 10]; // Over 2MB
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/workflows/00000000-0000-0000-0000-000000000001/query/my_query")
+        .header("Content-Type", "application/json")
+        .body(Body::from(large_body))
+        .unwrap();
+    let mut data = HashMap::new();
+    data.insert("user_id".to_string(), "operator-1".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        data,
+    ));
+
+    let res = app.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let bytes = autumn_web::reexports::axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&bytes);
+
+    assert!(body_str.contains("payload too large"));
+}
+
+#[tokio::test]
+async fn warden_bulk_replay_dead_letters_enforces_payload_limit() {
+    let app = authenticated_app();
+
+    let large_body = vec![b'a'; 2 * 1024 * 1024 + 10]; // Over 2MB
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/dead-letters/replay")
+        .header("Content-Type", "application/json")
+        .body(Body::from(large_body))
+        .unwrap();
+    let mut data = HashMap::new();
+    data.insert("user_id".to_string(), "operator-1".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        data,
+    ));
+
+    let res = app.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let bytes = autumn_web::reexports::axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&bytes);
+
+    assert!(body_str.contains("payload too large"));
+}
+
+#[tokio::test]
+async fn warden_bulk_discard_dead_letters_enforces_payload_limit() {
+    let app = authenticated_app();
+
+    let large_body = vec![b'a'; 2 * 1024 * 1024 + 10]; // Over 2MB
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri("/dead-letters/discard")
+        .header("Content-Type", "application/json")
+        .body(Body::from(large_body))
+        .unwrap();
+    let mut data = HashMap::new();
+    data.insert("user_id".to_string(), "operator-1".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        data,
+    ));
+
+    let res = app.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let bytes = autumn_web::reexports::axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&bytes);
+
+    assert!(body_str.contains("payload too large"));
+}
