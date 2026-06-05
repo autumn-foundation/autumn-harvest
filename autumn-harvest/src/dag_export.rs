@@ -96,8 +96,11 @@ pub fn export_mermaid_with_critical_path(
             // Check if this edge is part of the critical path
             let is_cp_edge = if cp_indices.contains(&upstream) && cp_indices.contains(&i) {
                 match (
-                    critical_path.path_indices.iter().position(|&x| x == upstream),
-                    critical_path.path_indices.iter().position(|&x| x == i)
+                    critical_path
+                        .path_indices
+                        .iter()
+                        .position(|&x| x == upstream),
+                    critical_path.path_indices.iter().position(|&x| x == i),
                 ) {
                     (Some(pos_u), Some(pos_i)) => pos_i == pos_u + 1,
                     _ => false,
@@ -106,10 +109,7 @@ pub fn export_mermaid_with_critical_path(
                 false
             };
             if is_cp_edge {
-                writeln!(
-                    out,
-                    "    linkStyle {link_idx} stroke:#f00,stroke-width:4px"
-                )?;
+                writeln!(out, "    linkStyle {link_idx} stroke:#f00,stroke-width:4px")?;
             }
             link_idx += 1;
         }
@@ -216,8 +216,11 @@ pub fn export_dot_with_critical_path(
         for &upstream in &task.upstreams {
             let is_cp_edge = if cp_indices.contains(&upstream) && cp_indices.contains(&i) {
                 match (
-                    critical_path.path_indices.iter().position(|&x| x == upstream),
-                    critical_path.path_indices.iter().position(|&x| x == i)
+                    critical_path
+                        .path_indices
+                        .iter()
+                        .position(|&x| x == upstream),
+                    critical_path.path_indices.iter().position(|&x| x == i),
                 ) {
                     (Some(pos_u), Some(pos_i)) => pos_i == pos_u + 1,
                     _ => false,
