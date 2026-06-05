@@ -304,6 +304,8 @@ pub const METRIC_LABEL_OUTCOME: &str = "outcome";
 pub const METRIC_LABEL_REASON_CODE: &str = "reason_code";
 /// Metric label: the completion trigger ID (issue #517).
 pub const METRIC_LABEL_TRIGGER: &str = "trigger";
+/// Metric label: admission gate scope kind (issue #377).
+pub const METRIC_LABEL_SCOPE: &str = "scope";
 
 // ---------------------------------------------------------------------------
 // TraceContextCarrier

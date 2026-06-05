@@ -4796,11 +4796,13 @@ async fn start_workflow(
             wf_owner,
         );
         if let Some((gate_id, reason)) = gates {
+            // Truncate reason to 64 chars for bounded metric cardinality (issue #377).
+            let reason_label = if reason.len() > 64 { &reason[..64] } else { &reason };
             runtime
                 .registry
                 .telemetry()
                 .metrics
-                .record_admission_blocked(&wf_owner.unwrap_or("fleet"), &reason);
+                .record_admission_blocked(&wf_owner.unwrap_or("fleet"), reason_label);
             if let Ok(pool) = api_state.storage_pool()
                 && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
             {

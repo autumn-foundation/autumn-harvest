@@ -55,6 +55,7 @@ use crate::telemetry::{
     METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED, METRIC_SCHEDULE_AUTO_PAUSED,
     METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_FIRE_ATTEMPTS,
     METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
+    METRIC_ADMISSION_BLOCKED, METRIC_ADMISSION_GATES_ACTIVE, METRIC_LABEL_SCOPE,
     METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
     METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW,
     METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
@@ -373,6 +374,19 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_OUTCOME => outcome.to_owned(),
         )
         .increment(1);
+    }
+
+    fn record_admission_blocked(&self, scope_kind: &str, reason_hash: &str) {
+        counter!(
+            METRIC_ADMISSION_BLOCKED,
+            METRIC_LABEL_SCOPE => scope_kind.to_owned(),
+            METRIC_LABEL_REASON => reason_hash.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_admission_gates_active(&self, count: i64) {
+        gauge!(METRIC_ADMISSION_GATES_ACTIVE).set(count as f64);
     }
 }
 

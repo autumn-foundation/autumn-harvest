@@ -33,10 +33,11 @@ use serde_json::Value;
 use autumn_harvest::Schedule;
 use autumn_harvest::ShardRouter;
 use autumn_harvest::audit::{
-    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_SCHEDULE_DELETE,
-    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_BUILD_ROUTING, TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
+    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_GATE_LIFT,
+    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BUILD_ROUTING, TARGET_GATE, TARGET_SCHEDULE,
+    TARGET_WORKFLOW, insert_audit,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
@@ -526,8 +527,9 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/schedules/{id}/resume", post(schedule_resume_ui))
         .route("/schedules/{id}/delete", post(schedule_delete_ui))
         .route("/schedules/{id}/trigger-now", post(schedule_trigger_now_ui))
-        // issue #377: admission gates UI page
+        // issue #377: admission gates UI page and one-click lift
         .route("/admin/gates", get(list_gates_ui))
+        .route("/admin/gates/{id}/lift", post(lift_gate_ui))
         .layer(Extension(api_state))
 }
 
@@ -5922,6 +5924,44 @@ async fn list_gates_ui(
     Ok(render_gates_page(&rows))
 }
 
+/// `POST /admin/gates/{id}/lift` — Vantage UI lift action (redirects back to gates list).
+async fn lift_gate_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<uuid::Uuid>,
+) -> axum::response::Response {
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(_) => return axum::response::Redirect::to("../../admin/gates").into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(_) => return axum::response::Redirect::to("../../admin/gates").into_response(),
+    };
+
+    let id_str = id.to_string();
+    if let Ok(Some(_gate)) = autumn_harvest::admission_gate::db::lift_gate(&mut conn, id, "ui").await {
+        if let Ok(fresh) = autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await {
+            api_state.gate_cache().refresh(fresh);
+        }
+        let ar = autumn_harvest::models::NewAuditRecord {
+            actor: "ui",
+            operation: OP_GATE_LIFT,
+            target_type: TARGET_GATE,
+            target_id: Some(id_str.as_str()),
+            route_or_command: "POST /ui/admin/gates/{id}/lift",
+            request_id: None,
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: SOURCE_UI,
+        };
+        let _ = insert_audit(&mut conn, &ar).await;
+    }
+
+    axum::response::Redirect::to("../../admin/gates").into_response()
+}
+
 fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Markup {
     let body = html! {
         h2 { "Admission Gates" }
@@ -5941,7 +5981,8 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
         }
 
         @for row in rows.iter().filter(|r| r.lifted_at.is_none()) {
-            @let id_short = &row.id.to_string()[..8];
+            @let id_str = row.id.to_string();
+            @let id_short = &id_str[..8];
             div.card {
                 div style="display:flex;justify-content:space-between;align-items:center" {
                     div {
@@ -5955,11 +5996,20 @@ fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Marku
                             code { (v) }
                         }
                     }
-                    div style="font-size:12px;color:#94a3b8" {
-                        "created by " (row.created_by)
-                        " at " (row.created_at.format("%Y-%m-%d %H:%M:%S UTC"))
-                        @if let Some(exp) = row.expires_at {
-                            " · expires " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                    div style="display:flex;gap:16px;align-items:center" {
+                        div style="font-size:12px;color:#94a3b8" {
+                            "created by " (row.created_by)
+                            " at " (row.created_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                            @if let Some(exp) = row.expires_at {
+                                " · expires " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                            }
+                        }
+                        form method="POST" action={ "gates/" (id_str) "/lift" }
+                            onsubmit="return confirm('Lift this gate?')" {
+                            button type="submit"
+                                style="background:#15803d;color:#dcfce7;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px" {
+                                "Lift"
+                            }
                         }
                     }
                 }
