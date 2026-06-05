@@ -706,7 +706,8 @@ fn extract_single_command<T>(
 fn extract_all_scheduled_activities(
     commands: &[WorkflowCommand],
 ) -> Option<Vec<ScheduledActivityCommand>> {
-    let mut scheduled = Vec::new();
+    // ⚡ Bolt: Pre-allocate capacity to avoid intermediate allocations
+    let mut scheduled = Vec::with_capacity(commands.len());
 
     for cmd in commands {
         match cmd {
@@ -744,7 +745,8 @@ fn extract_all_scheduled_activities(
 }
 
 fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<ActivityExecId>> {
-    let mut activity_ids = Vec::new();
+    // ⚡ Bolt: Pre-allocate capacity to avoid intermediate allocations
+    let mut activity_ids = Vec::with_capacity(commands.len());
 
     for cmd in commands {
         match cmd {
@@ -1082,8 +1084,9 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
 fn split_mixed_signal_batch(
     commands: Vec<WorkflowCommand>,
 ) -> (Vec<SignalBatchItem>, Vec<WorkflowCommand>) {
-    let mut signal_items = Vec::new();
-    let mut remaining = Vec::new();
+    // ⚡ Bolt: Pre-allocate capacity to avoid intermediate allocations
+    let mut signal_items = Vec::with_capacity(commands.len());
+    let mut remaining = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
             WorkflowCommand::SignalExternalWorkflow {
@@ -1133,7 +1136,7 @@ fn split_mixed_signal_batch(
 async fn persist_external_signal_inline(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    items: Vec<SignalBatchItem>,
+    items: &[SignalBatchItem],
     next_event_id: &mut i32,
 ) -> HarvestResult<Vec<WorkflowEvent>> {
     let mut new_events: Vec<WorkflowEvent> = Vec::new();
@@ -1141,10 +1144,10 @@ async fn persist_external_signal_inline(
     for item in items {
         match item {
             SignalBatchItem::Marker(event) => {
-                store::append_events(conn, exec_id, std::slice::from_ref(&event), *next_event_id)
+                store::append_events(conn, exec_id, std::slice::from_ref(event), *next_event_id)
                     .await?;
                 *next_event_id += 1;
-                new_events.push(event);
+                new_events.push(event.clone());
             }
             SignalBatchItem::Signal(run) => {
                 if !run.already_requested {
@@ -1175,7 +1178,7 @@ async fn persist_external_signal_inline(
                     conn,
                     run.target,
                     &run.signal_name,
-                    run.payload,
+                    run.payload.clone(),
                 )
                 .await
                 {
@@ -5010,7 +5013,7 @@ async fn process_workflow_task(
                         let new_events = match persist_external_signal_inline(
                             conn,
                             prepared.exec_id,
-                            signal_items,
+                            &signal_items,
                             &mut next_event_id,
                         )
                         .await
@@ -5174,11 +5177,10 @@ async fn process_workflow_task(
                 );
                 drop(execute_span);
                 let items = extract_signal_external_workflow(commands);
-                let items_clone = items.clone();
                 let new_events = match persist_external_signal_inline(
                     conn,
                     prepared.exec_id,
-                    items,
+                    &items,
                     &mut next_event_id,
                 )
                 .await
@@ -5189,7 +5191,8 @@ async fn process_workflow_task(
                             .await;
                     }
                 };
-                history_events.extend(new_events.clone());
+                // ⚡ Bolt: Avoid intermediate vector allocation
+                history_events.extend(new_events.iter().cloned());
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
                 if let Some(cap) = registry.history_policy().event_hard_cap()
@@ -5217,7 +5220,7 @@ async fn process_workflow_task(
                 // If any signal in the batch was not resolved inline (remains pending/suspended),
                 // we must break the loop and suspend the workflow task.
                 let mut all_resolved = true;
-                for item in &items_clone {
+                for item in &items {
                     if let SignalBatchItem::Signal(run) = item {
                         let resolved = new_events.iter().any(|e| match e {
                             WorkflowEvent::ExternalSignalDelivered { signal_id }
@@ -5234,8 +5237,8 @@ async fn process_workflow_task(
                 }
 
                 if !all_resolved {
-                    let mut reconstructed_commands = Vec::with_capacity(items_clone.len());
-                    for item in items_clone {
+                    let mut reconstructed_commands = Vec::with_capacity(items.len());
+                    for item in items {
                         match item {
                             SignalBatchItem::Marker(_) => {
                                 // Already persisted via persist_external_signal_inline.
@@ -5303,7 +5306,7 @@ async fn process_workflow_task(
                 let new_events = match persist_external_signal_inline(
                     conn,
                     prepared.exec_id,
-                    signal_items,
+                    &signal_items,
                     &mut next_event_id,
                 )
                 .await
