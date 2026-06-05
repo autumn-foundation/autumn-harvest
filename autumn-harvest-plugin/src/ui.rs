@@ -526,6 +526,8 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/schedules/{id}/resume", post(schedule_resume_ui))
         .route("/schedules/{id}/delete", post(schedule_delete_ui))
         .route("/schedules/{id}/trigger-now", post(schedule_trigger_now_ui))
+        // issue #377: admission gates UI page
+        .route("/admin/gates", get(list_gates_ui))
         .layer(Extension(api_state))
 }
 
@@ -810,6 +812,9 @@ async fn list_workflows_ui(
         .take(limit_usize)
         .collect::<Vec<_>>();
 
+    // issue #377: check active gate count for the UI banner (no DB call — uses in-process cache).
+    let active_gate_count = api_state.gate_cache().active_count();
+
     Ok(render_workflow_list(
         &workflows,
         page,
@@ -821,6 +826,7 @@ async fn list_workflows_ui(
         started_after,
         started_before,
         exec_id_search.as_deref(),
+        active_gate_count,
     ))
 }
 
@@ -2523,9 +2529,23 @@ fn render_workflow_list(
     started_after: Option<DateTime<Utc>>,
     started_before: Option<DateTime<Utc>>,
     exec_id_search: Option<&str>,
+    active_gate_count: usize,
 ) -> Markup {
     let body = html! {
         h2 { "Workflows" }
+
+        // issue #377: admission gate banner — shown when any gate is active.
+        @if active_gate_count > 0 {
+            div class="banner Unhealthy" {
+                strong { "⚠ Admission gate active" }
+                " — "
+                (active_gate_count)
+                @if active_gate_count == 1 { " gate is" } @else { " gates are" }
+                " blocking new workflow starts. "
+                a href="../admin/gates" { "Manage gates →" }
+            }
+        }
+
         (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after, started_before, exec_id_search, limit))
 
         @if workflows.is_empty() {
@@ -5885,6 +5905,129 @@ fn build_schedule_query_string(
         let _ = write!(out, "&refresh={secs}");
     }
     out
+}
+
+// ── Admission gates UI (issue #377) ──────────────────────────────────────────
+
+async fn list_gates_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Markup, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    let rows = autumn_harvest::admission_gate::db::list_gates(&mut conn)
+        .await
+        .map_err(map_error)?;
+
+    Ok(render_gates_page(&rows))
+}
+
+fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Markup {
+    let body = html! {
+        h2 { "Admission Gates" }
+        p.note {
+            "Active gates block new workflow starts. In-flight executions are unaffected. "
+            "Use the "
+            a href="../../admin/gates" { "management API" }
+            " ("
+            code { "POST /admin/gates" }
+            ", "
+            code { "DELETE /admin/gates/{id}" }
+            ") to create or lift gates."
+        }
+
+        @if rows.iter().all(|r| r.lifted_at.is_some()) {
+            div.card.empty { "No active admission gates." }
+        }
+
+        @for row in rows.iter().filter(|r| r.lifted_at.is_none()) {
+            @let id_short = &row.id.to_string()[..8];
+            div.card {
+                div style="display:flex;justify-content:space-between;align-items:center" {
+                    div {
+                        strong { code { (id_short) } }
+                        " "
+                        span.badge.FAILED { "ACTIVE" }
+                        " "
+                        span { (row.scope_kind) }
+                        @if let Some(ref v) = row.scope_value {
+                            " = "
+                            code { (v) }
+                        }
+                    }
+                    div style="font-size:12px;color:#94a3b8" {
+                        "created by " (row.created_by)
+                        " at " (row.created_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                        @if let Some(exp) = row.expires_at {
+                            " · expires " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                        }
+                    }
+                }
+                @if !row.reason.is_empty() {
+                    p style="margin:8px 0 0;color:#e2e8f0" { (row.reason) }
+                }
+                @if let Some(ref msg) = row.message {
+                    p style="margin:4px 0 0;color:#94a3b8;font-size:12px" { (msg) }
+                }
+            }
+        }
+
+        @let lifted: Vec<_> = rows.iter().filter(|r| r.lifted_at.is_some()).collect();
+        @if !lifted.is_empty() {
+            details style="margin-top:20px" {
+                summary style="cursor:pointer;color:#94a3b8" {
+                    (lifted.len()) " lifted gate(s)"
+                }
+                @for row in &lifted {
+                    @let id_short = &row.id.to_string()[..8];
+                    div.card style="opacity:0.6" {
+                        code { (id_short) }
+                        " "
+                        span.badge.COMPLETED { "LIFTED" }
+                        " "
+                        (row.scope_kind)
+                        @if let Some(ref v) = row.scope_value {
+                            " = " code { (v) }
+                        }
+                        " — " (row.reason)
+                    }
+                }
+            }
+        }
+    };
+    layout_gates("Admission Gates · Vantage", &body)
+}
+
+fn layout_gates(title: &str, body: &Markup) -> Markup {
+    html! {
+        (PreEscaped("<!DOCTYPE html>"))
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width,initial-scale=1";
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                header {
+                    h1 {
+                        a href="../workflows" { "🔭 Vantage" }
+                        span.subtitle { "Harvest dashboard" }
+                    }
+                    nav {
+                        a href="../workflows" { "Workflows" }
+                        a href="../workers" { "Workers" }
+                        a href="../schedules" { "Schedules" }
+                        a href="../dead-letters" { "Dead Letters" }
+                        a href="../build-routing" { "Build Routing" }
+                        a.active href="gates" { "Gates" }
+                    }
+                }
+                main { (body) }
+                footer { "Operational dashboard — autumn-harvest" }
+            }
+        }
+    }
 }
 
 fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {

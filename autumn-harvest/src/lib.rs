@@ -30,6 +30,8 @@ pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 
 /// History analyzer and linter.
 pub mod analyzer;
+/// Admission gate primitive for incident-response operators (issue #377).
+pub mod admission_gate;
 /// Audit trail for management API mutations (issue #158).
 #[cfg(feature = "db")]
 pub mod audit;
@@ -156,6 +158,10 @@ pub mod worker;
 #[cfg(feature = "db")]
 pub mod workers;
 
+pub use admission_gate::{
+    AdmissionGate, AdmissionGateCache, AdmissionGateId, AdmissionGateView, GateScope,
+    MAX_ACTIVE_GATES, check_admission,
+};
 pub use analyzer::{
     AnalyzerRule, AnalyzerWarning, ExcessiveRetriesRule, HistoryAnalyzer, LargePayloadRule,
     SuspiciousTimerRule,

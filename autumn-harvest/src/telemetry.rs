@@ -213,6 +213,21 @@ pub const METRIC_PAYLOAD_BYTES: &str = "harvest.payload.bytes";
 /// Per ADR-0001 §7, `execution.id` is span-only.
 pub const METRIC_PAYLOAD_REJECTED: &str = "harvest.payload.rejected";
 
+/// Counter: incremented each time a new workflow start is blocked by an
+/// active admission gate (issue #377).
+///
+/// Labels:
+///   - `"scope_kind"` — the gate's scope kind (`"fleet"`, `"workflow_name"`,
+///     `"queue"`, `"shard_id"`, or `"owner"`).
+///   - `"reason_hash"` — first 8 chars of a stable SHA-256 of the reason
+///     string to bound cardinality while preserving debuggability.
+///
+/// Per ADR-0001 §7, `execution.id` and `gate_id` are never metric labels.
+pub const METRIC_ADMISSION_BLOCKED: &str = "harvest.admission.blocked";
+
+/// Gauge: current number of active admission gates.
+pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active";
+
 /// Gauge: current available tokens in a rate limit bucket.
 pub const METRIC_RATE_LIMIT_TOKENS_AVAILABLE: &str = "harvest.rate_limit.tokens_available";
 
@@ -516,6 +531,20 @@ pub trait MetricsRecorder: Send + Sync {
     /// `outcome` is one of: `"started"`, `"skipped"`, `"deduped"`.
     fn record_completion_trigger_fired(&self, trigger_id: &str, outcome: &str) {
         let _ = (trigger_id, outcome);
+    }
+
+    /// A new workflow start was blocked by an active admission gate (issue #377).
+    ///
+    /// `scope_kind` is one of: `"fleet"`, `"workflow_name"`, `"queue"`,
+    /// `"shard_id"`, `"owner"`. `reason_hash` is the first 8 chars of a
+    /// stable SHA-256 of the reason string for bounded cardinality.
+    fn record_admission_blocked(&self, scope_kind: &str, reason_hash: &str) {
+        let _ = (scope_kind, reason_hash);
+    }
+
+    /// The active gate count changed (useful for alerting on nonzero gates).
+    fn record_admission_gates_active(&self, count: i64) {
+        let _ = count;
     }
 
     /// A workflow task entered the executor on a worker.

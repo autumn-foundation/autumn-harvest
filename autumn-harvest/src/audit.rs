@@ -94,10 +94,16 @@ pub const OP_BUILD_COMPAT_REVOKE: &str = "build_routing.compat.revoke";
 pub const OP_CIRCUIT_FORCE_OPEN: &str = "circuit.force_open";
 /// Audit operation: Forced an activity circuit breaker closed (issue #369).
 pub const OP_CIRCUIT_FORCE_CLOSE: &str = "circuit.force_close";
+/// Audit operation: Created an admission gate (issue #377).
+pub const OP_GATE_CREATE: &str = "gate.create";
+/// Audit operation: Lifted (removed) an admission gate (issue #377).
+pub const OP_GATE_LIFT: &str = "gate.lift";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
 pub const TARGET_CIRCUIT: &str = "circuit";
+/// Audit target type for admission gate operations (issue #377).
+pub const TARGET_GATE: &str = "gate";
 pub const TARGET_WORKFLOW: &str = "workflow";
 pub const TARGET_DAG: &str = "dag";
 pub const TARGET_SCHEDULE: &str = "schedule";

@@ -14,7 +14,7 @@ use autumn_web::plugin::Plugin;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{HarvestApiState, harvest_api_router};
+use crate::api::{HarvestApiState, acquire_conn, harvest_api_router};
 use crate::config::{HarvestMode, HarvestRuntimeConfig};
 use crate::outbox::spawn_workflow_start_outbox_relay;
 use crate::runner::{HarvestRunner, HarvestRunnerResources};
@@ -33,9 +33,15 @@ struct OutboxRuntime {
     handle: JoinHandle<()>,
 }
 
+struct GateRefreshRuntime {
+    shutdown: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
 struct HarvestRuntime {
     runner: HarvestRunner,
     outbox: Option<OutboxRuntime>,
+    gate_refresh: Option<GateRefreshRuntime>,
 }
 
 /// Plugin-local shared slot: holds the pre-built `HarvestBuilder` until the
@@ -444,7 +450,41 @@ async fn start_harvest_runtime(
         state.insert_extension(autumn_web::webhook_outbound::WebhookDelegateExt(delegate));
     }
 
-    api_state.install_storage_pool(harvest_db_pool);
+    api_state.install_storage_pool(harvest_db_pool.clone());
+
+    // issue #377: boot-time gate load — populate the cache before any traffic hits.
+    if let Ok(mut boot_conn) = acquire_conn(harvest_db_pool.default_pool()).await {
+        match autumn_harvest::admission_gate::db::load_active_gates(&mut boot_conn).await {
+            Ok(gates) => {
+                api_state.gate_cache().refresh(gates);
+                tracing::debug!("admission gate cache populated at startup");
+            }
+            Err(e) => tracing::warn!(error = %e, "could not load admission gates at startup"),
+        }
+    }
+
+    // issue #377: spawn background gate-cache refresh (≤2 s p95 cross-replica propagation).
+    let gate_refresh = {
+        let cache = api_state.gate_cache();
+        let pool = harvest_db_pool.clone_inner();
+        let shutdown = CancellationToken::new();
+        let cancel_for_task = shutdown.child_token();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = cancel_for_task.cancelled() => return,
+                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
+                if let Ok(mut conn) = acquire_conn(&pool).await {
+                    if let Ok(gates) = autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await {
+                        cache.refresh(gates);
+                    }
+                }
+            }
+        });
+        Some(GateRefreshRuntime { shutdown, handle })
+    };
+
     let outbox = app_pool.as_ref().and_then(|_| {
         if harvest_config.outbox.enabled {
             let shutdown = CancellationToken::new();
@@ -459,7 +499,7 @@ async fn start_harvest_runtime(
 
     {
         let mut guard = slot.lock().expect("harvest lock poisoned");
-        guard.runtime = Some(HarvestRuntime { runner, outbox });
+        guard.runtime = Some(HarvestRuntime { runner, outbox, gate_refresh });
     }
 
     Ok(())
@@ -515,6 +555,10 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
         return;
     };
 
+    if let Some(gate_refresh) = runtime.gate_refresh {
+        gate_refresh.shutdown.cancel();
+        let _ = gate_refresh.handle.await;
+    }
     if let Some(outbox) = runtime.outbox {
         outbox.shutdown.cancel();
         if let Err(error) = outbox.handle.await

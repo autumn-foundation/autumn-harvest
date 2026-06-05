@@ -29,18 +29,20 @@ use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
+use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::audit::OP_BATCH_START;
 use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
     OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_CIRCUIT_FORCE_CLOSE,
     OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK,
     OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL,
-    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
-    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKER_DRAIN,
+    OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
+    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKER_DRAIN,
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
     OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH,
     TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY,
-    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
+    TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -285,6 +287,13 @@ pub struct HarvestApiState {
     /// Hard caps for `POST /workflows/batch_start` (issue #357).
     batch_start_max_items: Arc<Mutex<usize>>,
     batch_start_max_bytes: Arc<Mutex<u64>>,
+    /// In-process snapshot of active admission gates (issue #377).
+    ///
+    /// Refreshed from Postgres every ≤1 s by the background gate-refresh task
+    /// so cross-replica gate creates/lifts propagate within the ≤2 s p95 SLO.
+    /// Loaded from Postgres before the worker pool starts accepting new work so
+    /// there is no admission window between plugin boot and re-apply.
+    gate_cache: Arc<autumn_harvest::AdmissionGateCache>,
 }
 
 impl Default for HarvestApiState {
@@ -311,6 +320,7 @@ impl Default for HarvestApiState {
             ))),
             batch_start_max_items: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_ITEMS)),
             batch_start_max_bytes: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_BYTES)),
+            gate_cache: Arc::new(autumn_harvest::AdmissionGateCache::new()),
         }
     }
 }
@@ -516,6 +526,25 @@ impl HarvestApiState {
             .batch_start_max_bytes
             .lock()
             .expect("harvest api state lock poisoned")
+    }
+
+    /// Return a clone of the shared admission gate cache (issue #377).
+    ///
+    /// The cache is populated at startup and refreshed every ≤1 s.
+    #[must_use]
+    pub fn gate_cache(&self) -> Arc<autumn_harvest::AdmissionGateCache> {
+        Arc::clone(&self.gate_cache)
+    }
+
+    /// Pre-load the gate cache from Postgres during plugin startup.
+    ///
+    /// Called before the worker pool starts so there is no admission window
+    /// between boot and re-apply. Also spawns the background refresh task.
+    pub fn initialize_gate_cache(
+        &self,
+        gates: Vec<autumn_harvest::AdmissionGate>,
+    ) {
+        self.gate_cache.refresh(gates);
     }
 
     /// Install a custom actor extractor used to derive the `actor` field of
@@ -1613,6 +1642,190 @@ struct DeadLetterListQuery {
     owner: Option<String>,
 }
 
+// ── Admission gate handlers (issue #377) ──────────────────────────────────────
+
+/// Request body for `POST /admin/gates`.
+#[derive(Debug, Deserialize)]
+struct CreateGateRequest {
+    /// Scope kind: `"fleet"` | `"workflow_name"` | `"queue"` | `"shard_id"` | `"owner"`
+    scope_kind: String,
+    /// Scope value: omit for fleet; required for all other kinds.
+    scope_value: Option<String>,
+    /// Required human-readable reason; included in blocked-caller errors.
+    reason: String,
+    /// Optional extended message for the Vantage UI.
+    message: Option<String>,
+    /// ISO 8601 timestamp after which the gate self-clears.
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// `GET /admin/gates` — list all active (non-lifted) gates.
+async fn list_gates_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> axum::response::Response {
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return AutumnError::internal_server_error(e).into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    match admission_gate_db::list_gates(&mut conn).await {
+        Ok(rows) => {
+            let views: Vec<AdmissionGateView> = rows.iter().map(AdmissionGateView::from).collect();
+            (StatusCode::OK, Json(serde_json::json!({ "gates": views }))).into_response()
+        }
+        Err(e) => AutumnError::internal_server_error(e).into_response(),
+    }
+}
+
+/// `POST /admin/gates` — create an admission gate.
+async fn create_gate_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<CreateGateRequest>,
+) -> axum::response::Response {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    let scope = match GateScope::from_db(&body.scope_kind, body.scope_value.as_deref()) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("unknown scope_kind '{}'", body.scope_kind)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return AutumnError::internal_server_error(e).into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let result = admission_gate_db::create_gate(
+        &mut conn,
+        &scope,
+        &body.reason,
+        body.message.as_deref(),
+        &actor,
+        body.expires_at,
+    )
+    .await;
+
+    match result {
+        Ok(gate) => {
+            // Refresh the in-process cache immediately so this replica honours
+            // the gate without waiting for the background refresh cycle.
+            if let Ok(fresh) = admission_gate_db::load_active_gates(&mut conn).await {
+                api_state.gate_cache().refresh(fresh);
+            }
+
+            let gate_id_str = gate.id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_GATE_CREATE,
+                target_type: TARGET_GATE,
+                target_id: Some(gate_id_str.as_str()),
+                route_or_command: "POST /admin/gates",
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+
+            (StatusCode::CREATED, Json(AdmissionGateView::from(gate))).into_response()
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_GATE_CREATE,
+                target_type: TARGET_GATE,
+                target_id: None,
+                route_or_command: "POST /admin/gates",
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            match e {
+                autumn_harvest::error::HarvestError::Config(msg) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": msg })),
+                )
+                    .into_response(),
+                other => AutumnError::internal_server_error(other).into_response(),
+            }
+        }
+    }
+}
+
+/// `DELETE /admin/gates/{id}` — lift (soft-delete) an admission gate.
+async fn lift_gate_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<uuid::Uuid>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return AutumnError::internal_server_error(e).into_response(),
+    };
+    let mut conn = match acquire_conn(pool.default_pool()).await {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let id_str = id.to_string();
+    match admission_gate_db::lift_gate(&mut conn, id, &actor).await {
+        Ok(Some(gate)) => {
+            // Refresh the in-process cache immediately.
+            if let Ok(fresh) = admission_gate_db::load_active_gates(&mut conn).await {
+                api_state.gate_cache().refresh(fresh);
+            }
+
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_GATE_LIFT,
+                target_type: TARGET_GATE,
+                target_id: Some(id_str.as_str()),
+                route_or_command: "DELETE /admin/gates/{id}",
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+
+            (StatusCode::OK, Json(AdmissionGateView::from(gate))).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "gate not found or already lifted" })),
+        )
+            .into_response(),
+        Err(e) => AutumnError::internal_server_error(e).into_response(),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
@@ -1857,7 +2070,19 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route(
             "/admin/build-routing/retire",
-            post(retire_build_handler).route_layer(require_admin),
+            post(retire_build_handler).route_layer(require_admin.clone()),
+        )
+        // Admission gates (issue #377): incident-response switch to halt new
+        // workflow starts fleet-wide or for a scoped subset of work.
+        // GET is read-only; POST/DELETE require admin access.
+        .route("/admin/gates", get(list_gates_handler))
+        .route(
+            "/admin/gates",
+            post(create_gate_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/gates/{id}",
+            delete(lift_gate_handler).route_layer(require_admin),
         )
         .layer(Extension(api_state))
 }
@@ -4557,6 +4782,55 @@ async fn start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let input = request.input.unwrap_or(Value::Null);
 
+    // issue #377: check admission gates before touching the DB.
+    {
+        let wf_owner = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|i| i.owner);
+        let gates = api_state.gate_cache().check(
+            &workflow_name,
+            &queue_name,
+            0,
+            wf_owner,
+        );
+        if let Some((gate_id, reason)) = gates {
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_admission_blocked(&wf_owner.unwrap_or("fleet"), &reason);
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("admission blocked by gate"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // issue #373: validate input against the workflow's published JSON Schema (if any).
     // Runs before the delayed-start checks so bad inputs fail fast and never
     // reach the DB or appear in harvest_dead_letters.
@@ -5515,6 +5789,51 @@ async fn signal_with_start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
+
+    // issue #377: check admission gates for the START path only.
+    // Signals to existing executions are not affected — only fresh starts are blocked.
+    {
+        let wf_owner = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|i| i.owner);
+        let gate_hit = api_state.gate_cache().check(
+            &workflow_name,
+            &queue_name,
+            0,
+            wf_owner,
+        );
+        if let Some((gate_id, reason)) = gate_hit {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("admission blocked by gate"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
+    }
 
     // Issue #252: resolve cap values. Both caps are enforced inside
     // signal_with_start_workflow_execution — after idempotency dedupe and

@@ -1,0 +1,627 @@
+//! Admission gate primitive for incident-response operators (issue #377).
+//!
+//! An admission gate halts new workflow starts fleet-wide or for a scoped
+//! subset of work (by workflow name, queue, shard, or owner) while letting
+//! in-flight executions drain naturally. Gates persist in Postgres and survive
+//! plugin restart; the plugin loads active gates before its worker pool starts
+//! so there is no admission window between boot and re-apply.
+//!
+//! ## Scope semantics
+//!
+//! | Scope | Blocks |
+//! |-------|--------|
+//! | `Fleet` | every new start |
+//! | `WorkflowName(n)` | starts for workflow named `n` |
+//! | `Queue(q)` | starts routed to queue `q` |
+//! | `ShardId(s)` | starts landing on shard `s` |
+//! | `Owner(o)` | starts whose `WorkflowInfo.owner` equals `o` |
+//!
+//! Multiple active gates are evaluated as OR: any match → blocked.
+//! Expired gates are never matched, regardless of scope.
+//!
+//! ## Upper bound on simultaneous gates
+//!
+//! [`MAX_ACTIVE_GATES`] documents the supported maximum. Exceeding it returns
+//! [`TooManyGates`](GateCreateError::TooManyGates) rather than silently
+//! accepting the gate.
+
+use chrono::{DateTime, Utc};
+use std::fmt;
+use uuid::Uuid;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Maximum number of simultaneously active gates.
+///
+/// Reaching this limit returns [`GateCreateError::TooManyGates`] rather than
+/// silently accepting more. This bounds the scan cost of the admission check
+/// and prevents unbounded metric cardinality growth from the `gate_id` label.
+///
+/// 100 is intentionally generous for incident-response use; normal production
+/// usage is 1–5 gates at a time.
+pub const MAX_ACTIVE_GATES: usize = 100;
+
+// ── GateScope ─────────────────────────────────────────────────────────────────
+
+/// The scope over which an admission gate blocks new workflow starts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum GateScope {
+    /// Block all new workflow starts on this plugin deployment.
+    Fleet,
+    /// Block new starts for the workflow named `value`.
+    WorkflowName(String),
+    /// Block new starts routed to the named task queue.
+    Queue(String),
+    /// Block new starts landing on the given Postgres shard (0-indexed).
+    ShardId(i32),
+    /// Block new starts whose `WorkflowInfo.owner` equals `value`.
+    Owner(String),
+}
+
+impl GateScope {
+    /// The discriminator string persisted in `scope_kind`.
+    #[must_use]
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Fleet => "fleet",
+            Self::WorkflowName(_) => "workflow_name",
+            Self::Queue(_) => "queue",
+            Self::ShardId(_) => "shard_id",
+            Self::Owner(_) => "owner",
+        }
+    }
+
+    /// The value persisted in `scope_value` (None for Fleet).
+    #[must_use]
+    pub fn value_str(&self) -> Option<String> {
+        match self {
+            Self::Fleet => None,
+            Self::WorkflowName(v) | Self::Queue(v) | Self::Owner(v) => Some(v.clone()),
+            Self::ShardId(n) => Some(n.to_string()),
+        }
+    }
+
+    /// Reconstruct a `GateScope` from the `scope_kind` / `scope_value` pair
+    /// stored in the database.
+    ///
+    /// Returns `None` when `kind` is unrecognised (forward-compat with future
+    /// variants added after this deployment).
+    #[must_use]
+    pub fn from_db(kind: &str, value: Option<&str>) -> Option<Self> {
+        match kind {
+            "fleet" => Some(Self::Fleet),
+            "workflow_name" => Some(Self::WorkflowName(value?.to_string())),
+            "queue" => Some(Self::Queue(value?.to_string())),
+            "shard_id" => {
+                let n: i32 = value?.parse().ok()?;
+                Some(Self::ShardId(n))
+            }
+            "owner" => Some(Self::Owner(value?.to_string())),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for GateScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fleet => write!(f, "fleet"),
+            Self::WorkflowName(v) => write!(f, "workflow_name:{v}"),
+            Self::Queue(v) => write!(f, "queue:{v}"),
+            Self::ShardId(n) => write!(f, "shard_id:{n}"),
+            Self::Owner(v) => write!(f, "owner:{v}"),
+        }
+    }
+}
+
+// ── AdmissionGateId ───────────────────────────────────────────────────────────
+
+/// Newtype wrapper for the admission gate UUID primary key.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct AdmissionGateId(pub Uuid);
+
+impl fmt::Display for AdmissionGateId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<Uuid> for AdmissionGateId {
+    fn from(u: Uuid) -> Self {
+        Self(u)
+    }
+}
+
+// ── AdmissionGate ─────────────────────────────────────────────────────────────
+
+/// An in-memory representation of a persisted admission gate.
+///
+/// Constructed from [`crate::models::AdmissionGateRow`] after loading from the
+/// database. The [`AdmissionGateCache`] holds a `Vec<AdmissionGate>` refreshed
+/// every second; the admission check reads from this snapshot without hitting
+/// the database.
+#[derive(Debug, Clone)]
+pub struct AdmissionGate {
+    /// Unique gate identifier.
+    pub id: AdmissionGateId,
+    /// What work this gate blocks.
+    pub scope: GateScope,
+    /// Human-readable reason; surfaced in the blocked-caller error.
+    pub reason: String,
+    /// Optional extended message displayed in the Vantage UI.
+    pub message: Option<String>,
+    /// Identity of the operator who created the gate.
+    pub created_by: String,
+    /// Wall-clock time the gate was created.
+    pub created_at: DateTime<Utc>,
+    /// Optional expiry; `None` = no expiry.
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl AdmissionGate {
+    /// Returns `true` if the gate is still active at `now`.
+    ///
+    /// A gate is inactive when `expires_at` is `Some` and in the past.
+    #[must_use]
+    pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
+        match self.expires_at {
+            None => true,
+            Some(exp) => exp > now,
+        }
+    }
+
+    /// Returns `true` if this gate matches the given admission parameters.
+    ///
+    /// The gate must also be active (see [`is_active_at`](Self::is_active_at))
+    /// for the combined result to constitute a block.
+    #[must_use]
+    pub fn matches(
+        &self,
+        workflow_name: &str,
+        queue_name: &str,
+        shard_id: i32,
+        owner: Option<&str>,
+    ) -> bool {
+        match &self.scope {
+            GateScope::Fleet => true,
+            GateScope::WorkflowName(n) => n == workflow_name,
+            GateScope::Queue(q) => q == queue_name,
+            GateScope::ShardId(s) => *s == shard_id,
+            GateScope::Owner(o) => owner.map_or(false, |ow| ow == o),
+        }
+    }
+}
+
+// ── check_admission ───────────────────────────────────────────────────────────
+
+/// Returns the first active gate that matches the given admission parameters,
+/// or `None` if admission is allowed.
+///
+/// The caller should supply a snapshot of the currently active gates (e.g.
+/// from [`AdmissionGateCache`]). This function is pure and does not touch the
+/// database.
+///
+/// # Arguments
+///
+/// * `gates` – slice of active gates (may include expired ones; they are
+///   filtered out internally against `Utc::now()`).
+/// * `workflow_name` – the workflow type name being started.
+/// * `queue_name` – the task queue the execution would be routed to.
+/// * `shard_id` – the Postgres shard the execution would land on.
+/// * `owner` – the `WorkflowInfo.owner` value, if any.
+#[must_use]
+pub fn check_admission<'a>(
+    gates: &'a [AdmissionGate],
+    workflow_name: &str,
+    queue_name: &str,
+    shard_id: i32,
+    owner: Option<&str>,
+) -> Option<&'a AdmissionGate> {
+    let now = Utc::now();
+    gates
+        .iter()
+        .find(|g| g.is_active_at(now) && g.matches(workflow_name, queue_name, shard_id, owner))
+}
+
+// ── GateCreateError ───────────────────────────────────────────────────────────
+
+/// Error returned when a gate cannot be created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateCreateError {
+    /// The active gate count reached [`MAX_ACTIVE_GATES`].
+    TooManyGates { limit: usize },
+    /// The reason string was empty.
+    EmptyReason,
+}
+
+impl fmt::Display for GateCreateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyGates { limit } => write!(
+                f,
+                "cannot create gate: active gate limit of {limit} reached"
+            ),
+            Self::EmptyReason => write!(f, "cannot create gate: reason must not be empty"),
+        }
+    }
+}
+
+impl std::error::Error for GateCreateError {}
+
+// ── AdmissionGateCache ────────────────────────────────────────────────────────
+
+/// In-process snapshot of active admission gates.
+///
+/// The plugin's background refresh task updates this every ≤1 second so
+/// cross-replica gate creates/lifts propagate within the ≤2 s p95 SLO stated
+/// in issue #377. Reads use a `RwLock` read-guard so gate checks are cheap
+/// and never block one another.
+#[derive(Debug, Default)]
+pub struct AdmissionGateCache(pub std::sync::RwLock<Vec<AdmissionGate>>);
+
+impl AdmissionGateCache {
+    /// Create an empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the cached gate list with a freshly loaded snapshot.
+    pub fn refresh(&self, gates: Vec<AdmissionGate>) {
+        if let Ok(mut guard) = self.0.write() {
+            *guard = gates;
+        }
+    }
+
+    /// Acquire a read lock and call `check_admission` against the snapshot.
+    #[must_use]
+    pub fn check(
+        &self,
+        workflow_name: &str,
+        queue_name: &str,
+        shard_id: i32,
+        owner: Option<&str>,
+    ) -> Option<(Uuid, String)> {
+        let guard = self.0.read().ok()?;
+        check_admission(&guard, workflow_name, queue_name, shard_id, owner)
+            .map(|g| (g.id.0, g.reason.clone()))
+    }
+
+    /// Return the number of currently cached active gates.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.0.read().map(|g| g.len()).unwrap_or(0)
+    }
+}
+
+// ── DB layer (requires `db` feature) ─────────────────────────────────────────
+
+#[cfg(feature = "db")]
+pub mod db {
+    use super::*;
+    use crate::error::{HarvestResult, database_error};
+    use crate::models::{AdmissionGateRow, NewAdmissionGateRow};
+    use crate::schema::harvest_admission_gates;
+    use diesel::{BoolExpressionMethods, ExpressionMethods, NullableExpressionMethods, QueryDsl};
+    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+
+    /// Convert a DB row into an in-memory [`AdmissionGate`].
+    ///
+    /// Rows whose `scope_kind` / `scope_value` cannot be parsed into a known
+    /// [`GateScope`] are silently dropped: forward-compat with variants added
+    /// in future versions.
+    #[must_use]
+    pub fn row_to_gate(row: AdmissionGateRow) -> Option<AdmissionGate> {
+        let scope = GateScope::from_db(&row.scope_kind, row.scope_value.as_deref())?;
+        Some(AdmissionGate {
+            id: AdmissionGateId(row.id),
+            scope,
+            reason: row.reason,
+            message: row.message,
+            created_by: row.created_by,
+            created_at: row.created_at,
+            expires_at: row.expires_at,
+        })
+    }
+
+    /// Load all currently active (not lifted, not expired) gates.
+    ///
+    /// Called by the plugin's background refresh task and at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HarvestError::Database` if the query fails.
+    pub async fn load_active_gates(
+        conn: &mut AsyncPgConnection,
+    ) -> HarvestResult<Vec<AdmissionGate>> {
+        use harvest_admission_gates::dsl as g;
+        let now = Utc::now();
+
+        let rows = g::harvest_admission_gates
+            .filter(g::lifted_at.is_null())
+            .filter(
+                g::expires_at
+                    .is_null()
+                    .or(g::expires_at.assume_not_null().gt(now)),
+            )
+            .order_by(g::created_at.asc())
+            .load::<AdmissionGateRow>(conn)
+            .await
+            .map_err(database_error)?;
+
+        Ok(rows.into_iter().filter_map(row_to_gate).collect())
+    }
+
+    /// Create a new gate and return it.
+    ///
+    /// Validates that:
+    /// - `reason` is not empty.
+    /// - The number of currently active (not lifted, not expired) gates is
+    ///   below [`MAX_ACTIVE_GATES`].
+    ///
+    /// # Errors
+    ///
+    /// - `HarvestError::Config` when `reason` is empty.
+    /// - `HarvestError::Config` when the active gate count would exceed
+    ///   [`MAX_ACTIVE_GATES`].
+    /// - `HarvestError::Database` if the insert or count query fails.
+    pub async fn create_gate(
+        conn: &mut AsyncPgConnection,
+        scope: &GateScope,
+        reason: &str,
+        message: Option<&str>,
+        actor: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> HarvestResult<AdmissionGate> {
+        use crate::error::HarvestError;
+        use harvest_admission_gates::dsl as g;
+
+        if reason.trim().is_empty() {
+            return Err(HarvestError::Config(
+                "admission gate reason must not be empty".to_string(),
+            ));
+        }
+
+        let now = Utc::now();
+
+        // Count active gates to enforce upper bound
+        let active_count: i64 = g::harvest_admission_gates
+            .filter(g::lifted_at.is_null())
+            .filter(
+                g::expires_at
+                    .is_null()
+                    .or(g::expires_at.assume_not_null().gt(now)),
+            )
+            .count()
+            .get_result::<i64>(conn)
+            .await
+            .map_err(database_error)?;
+
+        if active_count >= MAX_ACTIVE_GATES as i64 {
+            return Err(HarvestError::Config(format!(
+                "cannot create admission gate: active gate limit of {MAX_ACTIVE_GATES} reached",
+            )));
+        }
+
+        let scope_value_owned = scope.value_str();
+        let scope_value = scope_value_owned.as_deref();
+
+        let new_gate = NewAdmissionGateRow {
+            id: Uuid::new_v4(),
+            scope_kind: scope.kind_str(),
+            scope_value,
+            reason,
+            message,
+            created_by: actor,
+            expires_at,
+        };
+
+        let row: AdmissionGateRow = diesel::insert_into(g::harvest_admission_gates)
+            .values(&new_gate)
+            .get_result(conn)
+            .await
+            .map_err(database_error)?;
+
+        row_to_gate(row).ok_or_else(|| {
+            crate::error::HarvestError::Config(
+                "created gate row could not be decoded".to_string(),
+            )
+        })
+    }
+
+    /// Soft-delete a gate by setting `lifted_at`.
+    ///
+    /// Returns the lifted gate record, or `None` if the gate was not found or
+    /// was already lifted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HarvestError::Database` if the update query fails.
+    pub async fn lift_gate(
+        conn: &mut AsyncPgConnection,
+        gate_id: Uuid,
+        actor: &str,
+    ) -> HarvestResult<Option<AdmissionGate>> {
+        use harvest_admission_gates::dsl as g;
+        use diesel::OptionalExtension;
+
+        let now = Utc::now();
+
+        let row: Option<AdmissionGateRow> = diesel::update(
+            g::harvest_admission_gates
+                .find(gate_id)
+                .filter(g::lifted_at.is_null()),
+        )
+        .set((
+            g::lifted_at.eq(Some(now)),
+            g::lifted_by.eq(Some(actor)),
+        ))
+        .get_result(conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+
+        Ok(row.and_then(row_to_gate))
+    }
+
+    /// List all non-lifted gates (includes expired ones for UI display).
+    ///
+    /// # Errors
+    ///
+    /// Returns `HarvestError::Database` if the query fails.
+    pub async fn list_gates(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<AdmissionGateRow>> {
+        use harvest_admission_gates::dsl as g;
+
+        g::harvest_admission_gates
+            .filter(g::lifted_at.is_null())
+            .order_by(g::created_at.asc())
+            .load(conn)
+            .await
+            .map_err(database_error)
+    }
+}
+
+// ── Serialisable view (for API responses) ────────────────────────────────────
+
+/// JSON-serialisable view of an admission gate for API responses.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AdmissionGateView {
+    pub id: Uuid,
+    pub scope_kind: String,
+    pub scope_value: Option<String>,
+    pub reason: String,
+    pub message: Option<String>,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// `true` when the gate is currently blocking (active + not expired).
+    pub is_active: bool,
+}
+
+impl From<AdmissionGate> for AdmissionGateView {
+    fn from(g: AdmissionGate) -> Self {
+        let is_active = g.is_active_at(Utc::now());
+        Self {
+            id: g.id.0,
+            scope_kind: g.scope.kind_str().to_string(),
+            scope_value: g.scope.value_str(),
+            reason: g.reason,
+            message: g.message,
+            created_by: g.created_by,
+            created_at: g.created_at,
+            expires_at: g.expires_at,
+            is_active,
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl From<&crate::models::AdmissionGateRow> for AdmissionGateView {
+    fn from(row: &crate::models::AdmissionGateRow) -> Self {
+        let now = Utc::now();
+        let is_active = row.lifted_at.is_none()
+            && row.expires_at.map_or(true, |exp| exp > now);
+        Self {
+            id: row.id,
+            scope_kind: row.scope_kind.clone(),
+            scope_value: row.scope_value.clone(),
+            reason: row.reason.clone(),
+            message: row.message.clone(),
+            created_by: row.created_by.clone(),
+            created_at: row.created_at,
+            expires_at: row.expires_at,
+            is_active,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fleet_gate(reason: &str) -> AdmissionGate {
+        AdmissionGate {
+            id: AdmissionGateId(Uuid::new_v4()),
+            scope: GateScope::Fleet,
+            reason: reason.to_string(),
+            message: None,
+            created_by: "test".to_string(),
+            created_at: Utc::now(),
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn gate_scope_kind_str_round_trips() {
+        assert_eq!(GateScope::Fleet.kind_str(), "fleet");
+        assert_eq!(GateScope::WorkflowName("x".into()).kind_str(), "workflow_name");
+        assert_eq!(GateScope::Queue("q".into()).kind_str(), "queue");
+        assert_eq!(GateScope::ShardId(0).kind_str(), "shard_id");
+        assert_eq!(GateScope::Owner("o".into()).kind_str(), "owner");
+    }
+
+    #[test]
+    fn gate_scope_from_db_round_trips() {
+        let cases = [
+            ("fleet", None, GateScope::Fleet),
+            ("workflow_name", Some("foo"), GateScope::WorkflowName("foo".into())),
+            ("queue", Some("q1"), GateScope::Queue("q1".into())),
+            ("shard_id", Some("3"), GateScope::ShardId(3)),
+            ("owner", Some("team"), GateScope::Owner("team".into())),
+        ];
+        for (kind, val, expected) in cases {
+            let got = GateScope::from_db(kind, val).expect("should parse");
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn unknown_scope_kind_returns_none() {
+        assert!(GateScope::from_db("region", Some("us-east-1")).is_none());
+    }
+
+    #[test]
+    fn active_gate_with_no_expiry_matches() {
+        let g = fleet_gate("test");
+        let now = Utc::now();
+        assert!(g.is_active_at(now));
+    }
+
+    #[test]
+    fn gate_with_future_expiry_is_active() {
+        let mut g = fleet_gate("test");
+        g.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        assert!(g.is_active_at(Utc::now()));
+    }
+
+    #[test]
+    fn gate_with_past_expiry_is_inactive() {
+        let mut g = fleet_gate("test");
+        g.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert!(!g.is_active_at(Utc::now()));
+    }
+
+    #[test]
+    fn check_admission_empty_gates_allows() {
+        assert!(check_admission(&[], "wf", "q", 0, None).is_none());
+    }
+
+    #[test]
+    fn cache_check_returns_none_when_empty() {
+        let cache = AdmissionGateCache::new();
+        assert!(cache.check("wf", "q", 0, None).is_none());
+    }
+
+    #[test]
+    fn cache_check_returns_reason_after_refresh() {
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![fleet_gate("incident-42")]);
+        let result = cache.check("wf", "q", 0, None);
+        assert!(result.is_some());
+        let (_, reason) = result.unwrap();
+        assert_eq!(reason, "incident-42");
+    }
+}
