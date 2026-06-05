@@ -7226,6 +7226,7 @@ async fn list_dag_runs(
     Ok(Json(runs))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn trigger_dag_run(
     Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
@@ -7251,6 +7252,31 @@ async fn trigger_dag_run(
         .as_deref()
         .unwrap_or("default")
         .to_string();
+
+    // issue #377: check admission gates before creating a new DAG run.
+    {
+        let gate_hit = api_state.gate_cache().check(
+            &dag_name,
+            &default_queue,
+            shard.as_i32(),
+            dag.owner.as_deref(),
+        );
+        if let Some((gate_id, gate_reason, scope_kind)) = gate_hit {
+            let reason_label = match gate_reason.char_indices().nth(64) {
+                Some((idx, _)) => &gate_reason[..idx],
+                None => &gate_reason,
+            };
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_admission_blocked(scope_kind, reason_label);
+            return Err(AutumnError::service_unavailable_msg(format!(
+                "admission blocked by gate {gate_id}: {gate_reason}"
+            )));
+        }
+    }
+
     let mut schedule_conn = acquire_conn(pool.pool_for(shard)).await?;
     ensure_dag_schedule(&mut schedule_conn, &dag)
         .await

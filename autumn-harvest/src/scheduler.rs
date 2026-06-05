@@ -1363,66 +1363,6 @@ async fn tick_workflow_schedules(
             continue;
         };
 
-        // issue #377: skip this schedule if an active admission gate applies.
-        {
-            let queue_name = schedule.queue_name.as_deref().unwrap_or("default");
-            let owner = registry
-                .workflows
-                .get(wf_name.as_str())
-                .and_then(|i| i.owner)
-                .or_else(|| {
-                    registered_dags
-                        .get(wf_name.as_str())
-                        .and_then(|d| d.owner.as_deref())
-                });
-            if let Some(gate) = crate::admission_gate::check_admission(
-                &active_gates,
-                wf_name,
-                queue_name,
-                current_shard.as_i32(),
-                owner,
-            ) {
-                let gate_id_str = gate.id.to_string();
-                tracing::info!(
-                    workflow_name = %wf_name,
-                    gate_id = %gate_id_str,
-                    reason = %gate.reason,
-                    "harvest: schedule fire skipped due to admission gate"
-                );
-                metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
-                crate::schedule_decision::record_decision_graceful(
-                    conn,
-                    Some(&**metrics),
-                    Some(schedule.id),
-                    wf_name,
-                    "workflow",
-                    "skipped",
-                    "admission_blocked",
-                    Some(serde_json::json!({
-                        "gate_id": gate_id_str,
-                        "reason": gate.reason,
-                    })),
-                    now,
-                    now,
-                    i16::try_from(current_shard.as_i32()).unwrap_or(0),
-                )
-                .await;
-                // Advance next_run_at so this slot doesn't get re-attempted on the
-                // next tick; let the schedule continue ticking normally once the gate
-                // is lifted.
-                let parsed_schedule = schedule
-                    .schedule_expr
-                    .as_deref()
-                    .and_then(parse_schedule_from_expr);
-                let next_run = next_run_after(parsed_schedule.as_ref(), now);
-                let _ = diesel::update(dsl::harvest_schedules.find(schedule.id))
-                    .set((dsl::next_run_at.eq(next_run), dsl::updated_at.eq(now)))
-                    .execute(conn)
-                    .await;
-                continue;
-            }
-        }
-
         if let Some(ref dag_name) = schedule.dag_name
             && !registered_dags.contains_key(dag_name)
         {
@@ -1510,6 +1450,64 @@ async fn tick_workflow_schedules(
             continue;
         }
         metrics.record_schedule_fire_attempt(wf_name, "claimed");
+
+        // issue #377: gate check runs AFTER the HA claim to prevent every
+        // replica from independently recording a skip metric and advancing
+        // next_run_at for the same slot. Only the replica that wins the claim
+        // skips or fires the slot.
+        {
+            let queue_name = schedule.queue_name.as_deref().unwrap_or("default");
+            let owner = registry
+                .workflows
+                .get(wf_name.as_str())
+                .and_then(|i| i.owner)
+                .or_else(|| {
+                    registered_dags
+                        .get(wf_name.as_str())
+                        .and_then(|d| d.owner.as_deref())
+                });
+            if let Some(gate) = crate::admission_gate::check_admission(
+                &active_gates,
+                wf_name,
+                queue_name,
+                current_shard.as_i32(),
+                owner,
+            ) {
+                let gate_id_str = gate.id.to_string();
+                tracing::info!(
+                    workflow_name = %wf_name,
+                    gate_id = %gate_id_str,
+                    reason = %gate.reason,
+                    "harvest: schedule fire skipped due to admission gate"
+                );
+                metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
+                crate::schedule_decision::record_decision_graceful(
+                    conn,
+                    Some(&**metrics),
+                    Some(schedule.id),
+                    wf_name,
+                    "workflow",
+                    "skipped",
+                    "admission_blocked",
+                    Some(serde_json::json!({
+                        "gate_id": gate_id_str,
+                        "reason": gate.reason,
+                    })),
+                    now,
+                    now,
+                    i16::try_from(current_shard.as_i32()).unwrap_or(0),
+                )
+                .await;
+                // Advance next_run_at so this slot doesn't re-fire on the next
+                // tick; the schedule resumes normally once the gate is lifted.
+                let next_run = next_run_after(parsed_schedule.as_ref(), now);
+                let _ = diesel::update(dsl::harvest_schedules.find(schedule.id))
+                    .set((dsl::next_run_at.eq(next_run), dsl::updated_at.eq(now)))
+                    .execute(conn)
+                    .await;
+                continue;
+            }
+        }
 
         if let Err(error) = tick_one_workflow_schedule(
             conn,

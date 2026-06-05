@@ -248,26 +248,43 @@ impl std::error::Error for GateCreateError {}
 
 // ── AdmissionGateCache ────────────────────────────────────────────────────────
 
-/// In-process snapshot of active admission gates.
+#[derive(Debug)]
+/// In-process cache for active admission gates.
 ///
-/// The plugin's background refresh task updates this every ≤1 second so
-/// cross-replica gate creates/lifts propagate within the ≤2 s p95 SLO stated
-/// in issue #377. Reads use a `RwLock` read-guard so gate checks are cheap
-/// and never block one another.
-#[derive(Debug, Default)]
-pub struct AdmissionGateCache(pub std::sync::RwLock<Vec<AdmissionGate>>);
+/// Populated at plugin boot and refreshed every ≤1 second by a background
+/// task. `check()` **fails closed** when the cache has not yet been
+/// successfully populated — i.e. it returns a synthetic "blocked" result —
+/// so a DB error during startup cannot create an admission window for
+/// persisted gates.
+pub struct AdmissionGateCache {
+    gates: std::sync::RwLock<Vec<AdmissionGate>>,
+    /// Set to `true` after the first successful `refresh()`.
+    initialized: std::sync::atomic::AtomicBool,
+}
+
+impl Default for AdmissionGateCache {
+    fn default() -> Self {
+        Self {
+            gates: std::sync::RwLock::new(Vec::new()),
+            initialized: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
 
 impl AdmissionGateCache {
-    /// Create an empty cache.
+    /// Create an uninitialized (fail-closed) cache.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Replace the cached gate list with a freshly loaded snapshot.
+    /// Replace the cached gate list with a freshly loaded snapshot and mark
+    /// the cache as initialized.
     pub fn refresh(&self, gates: Vec<AdmissionGate>) {
-        if let Ok(mut guard) = self.0.write() {
+        if let Ok(mut guard) = self.gates.write() {
             *guard = gates;
+            self.initialized
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -276,6 +293,9 @@ impl AdmissionGateCache {
     /// Returns `(gate_id, reason, scope_kind)` when a gate matches, where
     /// `scope_kind` is the static discriminator string (e.g. `"fleet"`,
     /// `"workflow_name"`) suitable for use as a low-cardinality metric label.
+    ///
+    /// **Fail-closed**: returns a synthetic fleet-scope block when the cache
+    /// has not yet been successfully populated from the database.
     #[must_use]
     pub fn check(
         &self,
@@ -284,7 +304,16 @@ impl AdmissionGateCache {
         shard_id: i32,
         owner: Option<&str>,
     ) -> Option<(Uuid, String, &'static str)> {
-        let guard = self.0.read().ok()?;
+        if !self.initialized.load(std::sync::atomic::Ordering::Acquire) {
+            // Cache not yet populated from DB — fail closed so that a transient
+            // startup DB error cannot bypass persisted incident gates.
+            return Some((
+                Uuid::nil(),
+                "admission gate cache not yet initialized (fail-closed)".to_string(),
+                "fleet",
+            ));
+        }
+        let guard = self.gates.read().ok()?;
         check_admission(&guard, workflow_name, queue_name, shard_id, owner)
             .map(|g| (g.id.0, g.reason.clone(), g.scope.kind_str()))
     }
@@ -292,7 +321,7 @@ impl AdmissionGateCache {
     /// Return the number of currently cached active gates.
     #[must_use]
     pub fn active_count(&self) -> usize {
-        self.0.read().map_or(0, |g| g.len())
+        self.gates.read().map_or(0, |g| g.len())
     }
 }
 
@@ -611,8 +640,23 @@ mod tests {
     }
 
     #[test]
-    fn cache_check_returns_none_when_empty() {
+    fn cache_check_fails_closed_when_uninitialized() {
+        // A freshly-created cache has not been populated from the DB yet.
+        // check() must return Some (blocked) to prevent an admission window
+        // during a restart where the boot gate load transiently fails.
         let cache = AdmissionGateCache::new();
+        assert!(
+            cache.check("wf", "q", 0, None).is_some(),
+            "uninitialized cache must fail closed"
+        );
+    }
+
+    #[test]
+    fn cache_check_returns_none_when_initialized_empty() {
+        // After a successful refresh with an empty list (no active gates),
+        // check() allows admissions.
+        let cache = AdmissionGateCache::new();
+        cache.refresh(vec![]);
         assert!(cache.check("wf", "q", 0, None).is_none());
     }
 
