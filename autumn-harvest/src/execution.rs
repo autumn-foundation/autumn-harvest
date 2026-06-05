@@ -106,6 +106,45 @@ impl StartWorkflowParams<'_> {
     }
 }
 
+fn resolve_target_start_time(
+    start_at: Option<chrono::DateTime<chrono::Utc>>,
+    delay: Option<chrono::Duration>,
+    max_workflow_start_delay: Option<chrono::Duration>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> HarvestResult<chrono::DateTime<chrono::Utc>> {
+    if start_at.is_some() && delay.is_some() {
+        return Err(HarvestError::Config(
+            "Cannot specify both start_at and delay".to_string(),
+        ));
+    }
+
+    let max_delay = max_workflow_start_delay.unwrap_or_else(|| chrono::Duration::days(365));
+
+    if let Some(d) = delay {
+        if d < chrono::Duration::zero() {
+            return Err(HarvestError::Config(
+                "Start delay cannot be negative".to_string(),
+            ));
+        }
+        if d > max_delay {
+            return Err(HarvestError::Config(format!(
+                "Requested delay ({d:?}) exceeds maximum permitted delay ({max_delay:?})",
+            )));
+        }
+    }
+
+    if let Some(sa) = start_at {
+        let max_start_at = now + max_delay;
+        if sa > max_start_at {
+            return Err(HarvestError::Config(format!(
+                "Requested start_at ({sa:?}) exceeds maximum permitted delay ({max_start_at:?})",
+            )));
+        }
+    }
+
+    Ok(delay.map_or_else(|| start_at.unwrap_or(now), |d| now + d))
+}
+
 /// Result of an idempotent workflow start attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartedWorkflowExecution {
@@ -199,48 +238,13 @@ pub async fn start_or_load_workflow_execution(
     let exec_id = request.exec_id;
     let shard_id_value = request.shard_id();
 
-    // Validate delayed start parameters (issue #322)
-    if request.start_at.is_some() && request.delay.is_some() {
-        return Err(HarvestError::Config(
-            "Cannot specify both start_at and delay".to_string(),
-        ));
-    }
-
-    let max_delay = request
-        .max_workflow_start_delay
-        .unwrap_or_else(|| chrono::Duration::days(365));
-
-    if let Some(d) = request.delay {
-        if d < chrono::Duration::zero() {
-            return Err(HarvestError::Config(
-                "Start delay cannot be negative".to_string(),
-            ));
-        }
-        if d > max_delay {
-            return Err(HarvestError::Config(format!(
-                "Requested delay ({d:?}) exceeds maximum permitted delay ({max_delay:?})",
-            )));
-        }
-    }
-
     let now = Utc::now();
-
-    if let Some(sa) = request.start_at {
-        let max_start_at = now + max_delay;
-        if sa > max_start_at {
-            return Err(HarvestError::Config(format!(
-                "Requested start_at ({sa:?}) exceeds maximum permitted delay ({max_start_at:?})",
-            )));
-        }
-    }
-
-    let target_start_time = if let Some(d) = request.delay {
-        now + d
-    } else if let Some(sa) = request.start_at {
-        sa
-    } else {
-        now
-    };
+    let target_start_time = resolve_target_start_time(
+        request.start_at,
+        request.delay,
+        request.max_workflow_start_delay,
+        now,
+    )?;
 
     // For TerminateIfRunning: if there is an existing RUNNING execution, cancel
     // it (Transaction 1) before the start transaction below (Transaction 2). A
