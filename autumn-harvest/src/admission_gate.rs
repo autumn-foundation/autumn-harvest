@@ -272,10 +272,45 @@ impl Default for AdmissionGateCache {
 }
 
 impl AdmissionGateCache {
-    /// Create an uninitialized (fail-closed) cache.
+    /// Create an initialized, empty cache (fail-open).
+    ///
+    /// Suitable for standalone API routers and test setups that do not load
+    /// gates from a database. The plugin uses this path too — it immediately
+    /// calls [`refresh`](Self::refresh) with gates loaded from Postgres before
+    /// workers start accepting work, so the brief open window is harmless.
     #[must_use]
     pub fn new() -> Self {
+        let cache = Self::default();
+        // Mark as initialized so `check()` treats an empty list as "no gates
+        // active" rather than triggering the fail-closed sentinel block.
+        cache
+            .initialized
+            .store(true, std::sync::atomic::Ordering::Release);
+        cache
+    }
+
+    /// Create an uninitialized (fail-closed) cache.
+    ///
+    /// `check()` returns a synthetic block until the first successful
+    /// [`refresh`](Self::refresh), preventing new workflow starts from slipping
+    /// through a startup DB error when persisted gates are present.
+    ///
+    /// Used internally by the plugin boot path, which calls `refresh()` before
+    /// the worker pool starts accepting work.
+    #[must_use]
+    pub fn new_fail_closed() -> Self {
         Self::default()
+    }
+
+    /// Revert the cache to fail-closed (uninitialized) mode.
+    ///
+    /// After this call `check()` returns a synthetic block until the next
+    /// `refresh()`. Used by the plugin to arm the fail-closed semantic after
+    /// construction so the window between HTTP server bind and the boot-time
+    /// gate load is safe.
+    pub fn set_fail_closed(&self) {
+        self.initialized
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Replace the cached gate list with a freshly loaded snapshot and mark
@@ -640,24 +675,30 @@ mod tests {
     }
 
     #[test]
-    fn cache_check_fails_closed_when_uninitialized() {
-        // A freshly-created cache has not been populated from the DB yet.
-        // check() must return Some (blocked) to prevent an admission window
-        // during a restart where the boot gate load transiently fails.
+    fn cache_new_is_initialized_and_open() {
+        // new() starts initialized-empty so standalone routers pass admission
+        // checks without requiring a DB load.
         let cache = AdmissionGateCache::new();
         assert!(
-            cache.check("wf", "q", 0, None).is_some(),
-            "uninitialized cache must fail closed"
+            cache.check("wf", "q", 0, None).is_none(),
+            "new() cache must be open (no active gates)"
         );
     }
 
     #[test]
-    fn cache_check_returns_none_when_initialized_empty() {
-        // After a successful refresh with an empty list (no active gates),
-        // check() allows admissions.
-        let cache = AdmissionGateCache::new();
+    fn cache_new_fail_closed_blocks_until_refreshed() {
+        // new_fail_closed() starts uninitialized so a transient boot DB error
+        // cannot create an admission window for persisted gates.
+        let cache = AdmissionGateCache::new_fail_closed();
+        assert!(
+            cache.check("wf", "q", 0, None).is_some(),
+            "new_fail_closed() cache must fail closed until refresh()"
+        );
         cache.refresh(vec![]);
-        assert!(cache.check("wf", "q", 0, None).is_none());
+        assert!(
+            cache.check("wf", "q", 0, None).is_none(),
+            "after refresh with empty list, cache must be open"
+        );
     }
 
     #[test]

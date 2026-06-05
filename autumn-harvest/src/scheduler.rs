@@ -1338,9 +1338,18 @@ async fn tick_workflow_schedules(
     let now = Utc::now();
 
     // issue #377: load active admission gates once per tick for the gate-check below.
-    let active_gates = crate::admission_gate::db::load_active_gates(conn)
-        .await
-        .unwrap_or_default();
+    // Fail-closed on error: if the gate table is unreadable we skip the entire
+    // tick rather than firing through persisted incident gates silently.
+    let active_gates = match crate::admission_gate::db::load_active_gates(conn).await {
+        Ok(gates) => gates,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "harvest: could not load admission gates; skipping schedule tick (fail-closed)"
+            );
+            return Ok(());
+        }
+    };
 
     let due: Vec<HarvestSchedule> = dsl::harvest_schedules
         .filter(dsl::workflow_name.is_not_null())
@@ -1498,13 +1507,25 @@ async fn tick_workflow_schedules(
                     i16::try_from(current_shard.as_i32()).unwrap_or(0),
                 )
                 .await;
-                // Advance next_run_at so this slot doesn't re-fire on the next
-                // tick; the schedule resumes normally once the gate is lifted.
+                // Advance next_run_at and clear the claim token so the next
+                // tick can re-claim this schedule immediately. Without clearing
+                // the token, the claim would block other replicas for up to the
+                // full 30 s TTL before they could re-examine the slot.
                 let next_run = next_run_after(parsed_schedule.as_ref(), now);
-                let _ = diesel::update(dsl::harvest_schedules.find(schedule.id))
-                    .set((dsl::next_run_at.eq(next_run), dsl::updated_at.eq(now)))
-                    .execute(conn)
-                    .await;
+                let _ = diesel::sql_query(
+                    "UPDATE harvest_schedules \
+                     SET next_run_at = $1, \
+                         updated_at = $2, \
+                         fire_claim_token = NULL, \
+                         fire_claimed_until = NULL \
+                     WHERE id = $3 AND fire_claim_token = $4",
+                )
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run)
+                .bind::<diesel::sql_types::Timestamptz, _>(now)
+                .bind::<diesel::sql_types::Uuid, _>(schedule.id)
+                .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
+                .execute(conn)
+                .await;
                 continue;
             }
         }

@@ -187,6 +187,9 @@ impl Plugin for HarvestPlugin {
             runtime: None,
         }));
         let api_state = HarvestApiState::new();
+        // issue #377: arm fail-closed so any request in the window between
+        // HTTP server bind and the boot-time gate load is safely rejected.
+        api_state.arm_gate_cache_fail_closed();
         api_state.set_admin_auth_boundary(api_middleware.is_some());
 
         let startup_slot = Arc::clone(&slot);

@@ -3840,6 +3840,72 @@
         },
         { "status": 503, "description": "Database unavailable." }
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/gates",
+      "category": "admission_gates",
+      "read_only": true,
+      "description": "List all active (non-lifted) admission gates.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [],
+      "request_body": { "required": false, "free_form": true },
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        { "status": 503, "description": "Database unavailable." }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/gates",
+      "category": "admission_gates",
+      "read_only": false,
+      "description": "Create an admission gate to halt new workflow starts for the specified scope.",
+      "idempotency": "Not idempotent: each call creates a new gate row with a fresh UUID.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          { "name": "scope_kind", "required": true, "description": "One of: fleet, workflow_name, queue, shard_id, owner." },
+          { "name": "scope_value", "required": false, "description": "Required for non-fleet scopes." },
+          { "name": "reason", "required": true, "description": "Human-readable incident description." },
+          { "name": "expires_at", "required": false, "description": "ISO 8601 timestamp after which the gate self-clears." }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "fields": ["id", "scope_kind", "scope_value", "reason", "created_at", "expires_at"]
+      },
+      "error_responses": [
+        { "status": 400, "description": "Invalid scope_kind/scope_value combination or empty reason." },
+        { "status": 401, "description": "Unauthenticated request." },
+        { "status": 429, "description": "Active gate limit (100) reached." },
+        { "status": 503, "description": "Database unavailable." }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/gates/{id}",
+      "category": "admission_gates",
+      "read_only": false,
+      "description": "Lift (soft-delete) an admission gate, immediately re-opening the blocked scope.",
+      "idempotency": "Idempotent: lifting a gate that does not exist or is already lifted returns lifted=false without error.",
+      "params": [
+        { "name": "id", "in": "path", "required": true, "description": "UUID of the gate to lift." }
+      ],
+      "request_body": { "required": false, "free_form": false, "fields": [] },
+      "success_response": {
+        "status": 200,
+        "fields": ["lifted"]
+      },
+      "error_responses": [
+        { "status": 401, "description": "Unauthenticated request." },
+        { "status": 503, "description": "Database unavailable." }
+      ]
     }
   ]
 }

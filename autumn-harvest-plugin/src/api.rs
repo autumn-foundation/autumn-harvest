@@ -537,6 +537,17 @@ impl HarvestApiState {
         Arc::clone(&self.gate_cache)
     }
 
+    /// Switch the gate cache to fail-closed mode during plugin boot.
+    ///
+    /// The plugin calls this immediately after `new()` so any request that
+    /// arrives in the window between the HTTP server binding and the boot-time
+    /// gate load (see `initialize_gate_cache`) is rejected rather than allowed
+    /// through a transient DB error. Standalone routers that do not call this
+    /// start with an initialized-empty (fail-open) cache.
+    pub fn arm_gate_cache_fail_closed(&self) {
+        self.gate_cache.set_fail_closed();
+    }
+
     /// Pre-load the gate cache from Postgres during plugin startup.
     ///
     /// Called before the worker pool starts so there is no admission window
@@ -2219,6 +2230,10 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "/admin/build-routing/compat/{build_id}/{compat_with}",
         ),
         ("POST", "/admin/build-routing/retire"),
+        // ── admission gates (issue #377) ──────────────────────────────────────
+        ("GET", "/admin/gates"),
+        ("POST", "/admin/gates"),
+        ("DELETE", "/admin/gates/{id}"),
     ]
 }
 
@@ -2443,6 +2458,13 @@ pub const fn management_api_request_fields()
                 "from",
             ]),
         ),
+        // ── admission gates (issue #377) ──────────────────────────────────────
+        (
+            "POST",
+            "/admin/gates",
+            Some(&["scope_kind", "scope_value", "reason", "expires_at"]),
+        ),
+        ("DELETE", "/admin/gates/{id}", Some(&[])),
     ]
 }
 
@@ -2954,6 +2976,25 @@ pub const fn management_api_response_fields()
                 "pending_tasks",
             ]),
         ),
+        // ── admission gates (issue #377) ──────────────────────────────────────
+        (
+            "GET",
+            "/admin/gates",
+            None, // array of AdmissionGate rows
+        ),
+        (
+            "POST",
+            "/admin/gates",
+            Some(&[
+                "id",
+                "scope_kind",
+                "scope_value",
+                "reason",
+                "created_at",
+                "expires_at",
+            ]),
+        ),
+        ("DELETE", "/admin/gates/{id}", Some(&["lifted"])),
     ]
 }
 
@@ -5963,7 +6004,7 @@ async fn signal_with_start_workflow(
         }
     }
 
-    let (shard, mut conn, exec_id, will_attach) = if let Some(tuple) = found_shard {
+    let (shard, mut conn, exec_id, _will_attach) = if let Some(tuple) = found_shard {
         tuple
     } else {
         let shard = runtime
@@ -5976,10 +6017,13 @@ async fn signal_with_start_workflow(
         (shard, conn, ExecutionId::new_for_shard(shard), false)
     };
 
-    // issue #377: check admission gates only on the fresh-start path.
-    // Signals delivered to an existing RUNNING execution (will_attach = true) are never gated
-    // so that incident-mode gates do not prevent operators from delivering stop/cancel signals.
-    if !will_attach {
+    // issue #377: check admission gates unconditionally.
+    // Although `will_attach = true` means we observed an existing RUNNING execution,
+    // that pre-scan is unlocked — the resolver can still start a fresh execution if
+    // the RUNNING run completes before the FOR UPDATE lock is taken. Always checking
+    // the gate closes that TOCTOU window at the cost of also blocking signals to
+    // existing runs during an incident (use POST /workflows/{id}/signal instead).
+    {
         let wf_owner = runtime
             .registry
             .workflows
@@ -6028,10 +6072,10 @@ async fn signal_with_start_workflow(
     }
 
     // issue #373: validate start_input against the workflow's published JSON Schema (if any).
-    // Always runs regardless of will_attach: the pre-scan that sets will_attach is unlocked, so
-    // if the observed RUNNING execution completes before the core resolver takes its FOR UPDATE
-    // lock, the core path can escalate AllowDuplicate to a fresh start and write start_input
-    // without validation. Validating unconditionally closes this TOCTOU window.
+    // Always runs unconditionally: the pre-scan is unlocked, so if the observed RUNNING
+    // execution completes before the core resolver takes its FOR UPDATE lock, the core path
+    // can escalate AllowDuplicate to a fresh start and write start_input without validation.
+    // Validating unconditionally closes this TOCTOU window.
     if let Some(info) = runtime.registry.workflows.get(&workflow_name)
         && let Err(violations) = info.validate_input(&start_input)
     {
@@ -7253,6 +7297,9 @@ async fn trigger_dag_run(
         .unwrap_or("default")
         .to_string();
 
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /dags/{dag_name}/trigger";
+
     // issue #377: check admission gates before creating a new DAG run.
     {
         let gate_hit = api_state.gate_cache().check(
@@ -7271,6 +7318,23 @@ async fn trigger_dag_run(
                 .telemetry()
                 .metrics
                 .record_admission_blocked(scope_kind, reason_label);
+            if let Ok(mut audit_conn) = acquire_conn(pool.pool_for(shard)).await {
+                let err_str = format!("admission blocked by gate {gate_id}: {gate_reason}");
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_DAG_TRIGGER,
+                    target_type: TARGET_DAG,
+                    target_id: Some(dag_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_str.as_str()),
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut audit_conn, &ar).await;
+            }
             return Err(AutumnError::service_unavailable_msg(format!(
                 "admission blocked by gate {gate_id}: {gate_reason}"
             )));
@@ -7282,9 +7346,6 @@ async fn trigger_dag_run(
         .await
         .map_err(map_error)?;
     drop(schedule_conn);
-
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /dags/{dag_name}/trigger";
 
     let trigger_result = trigger_unified_dag(
         pool.pool_for(shard).clone(),
@@ -8827,6 +8888,23 @@ async fn trigger_schedule_now(
                 .telemetry()
                 .metrics
                 .record_admission_blocked(scope_kind, reason_label);
+            if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+                let err_str = format!("admission blocked by gate {gate_id}: {gate_reason}");
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_SCHEDULE_TRIGGER,
+                    target_type: TARGET_SCHEDULE,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some(err_str.as_str()),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
             return Err(AutumnError::service_unavailable_msg(format!(
                 "admission blocked by gate {gate_id}: {gate_reason}"
             )));
