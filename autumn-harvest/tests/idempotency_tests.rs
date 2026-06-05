@@ -312,29 +312,29 @@ fn subkey_slash_in_name_does_not_collide_with_nested_subkey() {
 }
 
 #[test]
-#[should_panic(expected = "non-empty printable ASCII without '/'")]
-fn subkey_panics_on_slash_in_name() {
+fn subkey_sanitizes_slash_in_name() {
     let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
-    let _ = key.subkey("a/b");
+    assert!(key.subkey("a/b").as_str().ends_with("/a%2Fb"));
 }
 
 #[test]
-#[should_panic(expected = "non-empty printable ASCII without '/'")]
-fn subkey_panics_on_empty_name() {
+fn subkey_sanitizes_empty_name() {
     let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
-    let _ = key.subkey("");
+    assert!(key.subkey("").as_str().ends_with("/default"));
 }
 
 #[test]
-#[should_panic(expected = "non-empty printable ASCII without '/'")]
-fn subkey_panics_on_non_ascii_name() {
+fn subkey_sanitizes_non_ascii_name() {
     let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
-    let _ = key.subkey("café");
+    assert!(key.subkey("café").as_str().ends_with("/caf%C3%A9"));
 }
 
 #[test]
-#[should_panic(expected = "non-empty printable ASCII without '/'")]
-fn subkey_panics_on_control_char_in_name() {
+fn subkey_sanitizes_control_char_in_name() {
     let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
-    let _ = key.subkey("charge\tcard");
+    assert!(
+        key.subkey("charge\tcard")
+            .as_str()
+            .ends_with("/charge%09card")
+    );
 }

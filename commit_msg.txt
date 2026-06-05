@@ -1,0 +1,8 @@
+👺 Havoc: Prevent workflow task panic on invalid IdempotencyKey subkey input
+
+🧨 The Trigger: A workflow author passes user input to `IdempotencyKey::subkey(name)`. If `name` contains non-printable ASCII, slashes, or is empty, the function asserts and panics. This crashes the workflow task thread, introducing a Denial of Service (DoS) vulnerability. Users will input Emoji where you expect Integers.
+📉 The Stack Trace:
+thread 'test_idempotency_subkey_fuzz' panicked at autumn-harvest/src/types.rs:749:9:
+IdempotencyKey::subkey: name must be non-empty printable ASCII without '/'; got "👀"
+🧪 Reproduction: Call `IdempotencyKey::subkey("👀")`.
+😈 Comment: You assumed subkey names would only ever be safe programmer constants. You were wrong.

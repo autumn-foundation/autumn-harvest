@@ -220,6 +220,7 @@ dependencies = [
  "loom",
  "lru 0.16.4",
  "metrics",
+ "percent-encoding",
  "proptest",
  "schemars 0.8.22",
  "scoped-futures",
