@@ -3948,9 +3948,14 @@ async fn reuse_policy_allow_duplicate_cancelled_returns_existing() {
     let first = start_or_load_workflow_execution(&mut conn, params.clone())
         .await
         .expect("first start should succeed");
-    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        first.exec_id,
+        "test cancel",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let second = start_or_load_workflow_execution(&mut conn, params)
@@ -4044,9 +4049,14 @@ async fn reuse_policy_reject_duplicate_cancelled_errors() {
     let first = start_or_load_workflow_execution(&mut conn, params.clone())
         .await
         .expect("first start should succeed");
-    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        first.exec_id,
+        "test cancel",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let err = start_or_load_workflow_execution(&mut conn, params)
@@ -4134,9 +4144,14 @@ async fn reuse_policy_allow_failed_only_cancelled_starts_fresh() {
     let first = start_or_load_workflow_execution(&mut conn, params.clone())
         .await
         .expect("first start should succeed");
-    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        first.exec_id,
+        "test cancel",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
@@ -4246,9 +4261,14 @@ async fn reuse_policy_terminate_if_running_cancelled_starts_fresh() {
     let first = start_or_load_workflow_execution(&mut conn, params.clone())
         .await
         .expect("first start should succeed");
-    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        first.exec_id,
+        "test cancel",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
@@ -4275,9 +4295,14 @@ async fn reuse_policy_terminate_if_running_retry_after_partial_failure_is_idempo
     let first = start_or_load_workflow_execution(&mut conn, params.clone())
         .await
         .expect("initial start should succeed");
-    cancel_workflow_execution(&mut conn, first.exec_id, "simulated T1 complete")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        first.exec_id,
+        "simulated T1 complete",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     // Now retry with TerminateIfRunning. Prior run is CANCELLED → start fresh.
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
@@ -6561,9 +6586,14 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
     );
     {
         let mut conn = pool.get().await.expect("pool get failed");
-        terminate_workflow_execution(&mut conn, running_ids[0], "overlap restart test cleanup")
-            .await
-            .expect("terminate must succeed");
+        terminate_workflow_execution(
+            &mut conn,
+            running_ids[0],
+            "overlap restart test cleanup",
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("terminate must succeed");
     }
 
     // ---- Phase 2: restart scheduler; drain dispatches the buffered slot ----

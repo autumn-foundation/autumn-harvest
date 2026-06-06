@@ -558,9 +558,14 @@ async fn batch_resumes_from_partial_progress_cursor() {
         .await
         .unwrap();
     for exec_id in ids.iter().take(8).copied() {
-        cancel_workflow_execution(&mut conn, exec_id, "simulated mid-batch progress")
-            .await
-            .unwrap();
+        cancel_workflow_execution(
+            &mut conn,
+            exec_id,
+            "simulated mid-batch progress",
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .unwrap();
     }
     let job_uuid: uuid::Uuid = job_id.parse().unwrap();
     // Record the 8 already-cancelled exec ids in `processed_ids` so the next
