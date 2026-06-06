@@ -3265,7 +3265,10 @@ async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
 ///
 /// Used in the retry path to short-circuit requeue and instead emit a
 /// `ScheduleToClose` timeout (issue #378).
-fn schedule_to_close_deadline_exceeded(task: &TaskQueueItem, retry_delay: chrono::Duration) -> bool {
+fn schedule_to_close_deadline_exceeded(
+    task: &TaskQueueItem,
+    retry_delay: chrono::Duration,
+) -> bool {
     let Some(deadline) = task.schedule_to_close_at else {
         return false;
     };
@@ -3295,15 +3298,6 @@ async fn record_schedule_to_close_activity_timeout(
         let error = error.clone();
         async move {
             let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
-            let activity_name = task
-                .activity_name
-                .as_deref()
-                .unwrap_or(&task.task_type);
-            let Some(pending_id) =
-                pending_activity_id_for_task(&history.events, task, activity_name)?
-            else {
-                return Ok(());
-            };
             let Some(state) = task_state_for_update(conn, task.id).await? else {
                 return Ok(());
             };
@@ -3311,7 +3305,7 @@ async fn record_schedule_to_close_activity_timeout(
                 return Ok(());
             }
             let timeout_event = WorkflowEvent::ActivityTimedOut {
-                activity_id: pending_id,
+                activity_id,
                 timeout_type: crate::error::TimeoutType::ScheduleToClose,
             };
             store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
@@ -3363,7 +3357,10 @@ async fn handle_activity_result(
                 // starts, fail with ScheduleToClose instead of requeuing.
                 if schedule_to_close_deadline_exceeded(task, delay) {
                     return record_schedule_to_close_activity_timeout(
-                        conn, task, exec_id, activity_id,
+                        conn,
+                        task,
+                        exec_id,
+                        activity_id,
                     )
                     .await;
                 }

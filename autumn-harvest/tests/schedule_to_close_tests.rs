@@ -200,7 +200,10 @@ async fn scanner_times_out_pending_task_with_expired_schedule_to_close() {
         .await
         .map(|r| r.state)
         .expect("task state query");
-    assert_eq!(state, "FAILED", "PENDING task must be FAILED after ScheduleToClose");
+    assert_eq!(
+        state, "FAILED",
+        "PENDING task must be FAILED after ScheduleToClose"
+    );
 
     let history = store::load_history(&mut conn, exec_id)
         .await
@@ -446,7 +449,10 @@ async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
     )
     .await
     .expect("enforce_timeouts_once");
-    assert!(enforced >= 1, "deadline-exceeded task must be caught by scanner");
+    assert!(
+        enforced >= 1,
+        "deadline-exceeded task must be caught by scanner"
+    );
 
     let history = store::load_history(&mut conn, exec_id)
         .await
@@ -465,9 +471,10 @@ async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
         "ActivityTimedOut {{ ScheduleToClose }} must appear in history when pre-retry deadline is exceeded; events: {:?}",
         history.events
     );
-    let has_plain_failure = history.events.iter().any(|e| {
-        matches!(e, WorkflowEvent::ActivityFailed { .. })
-    });
+    let has_plain_failure = history
+        .events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. }));
     assert!(
         !has_plain_failure,
         "ActivityFailed must NOT appear when ScheduleToClose fires (no retry should be attempted)"
@@ -524,19 +531,20 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
         .expect("enqueue");
 
     // Verify the deadline was written to the DB
-    let stored_deadline: Option<chrono::DateTime<Utc>> = diesel::sql_query(
-        "SELECT schedule_to_close_at FROM harvest_task_queue WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(task_id)
-    .get_result::<DeadlineRow>(&mut conn)
-    .await
-    .map(|r| r.schedule_to_close_at)
-    .expect("deadline query");
+    let stored_deadline: Option<chrono::DateTime<Utc>> =
+        diesel::sql_query("SELECT schedule_to_close_at FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(task_id)
+            .get_result::<DeadlineRow>(&mut conn)
+            .await
+            .map(|r| r.schedule_to_close_at)
+            .expect("deadline query");
     assert!(
         stored_deadline.is_some(),
         "schedule_to_close_at must be persisted"
     );
-    let diff = (stored_deadline.unwrap() - future_deadline).num_seconds().abs();
+    let diff = (stored_deadline.unwrap() - future_deadline)
+        .num_seconds()
+        .abs();
     assert!(diff < 2, "stored deadline must match the one passed in");
 
     // Scanner must NOT fire for this task (deadline is in the future)
@@ -558,7 +566,10 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
         .await
         .map(|r| r.state)
         .expect("state query");
-    assert_eq!(state, "PENDING", "task with future deadline must stay PENDING");
+    assert_eq!(
+        state, "PENDING",
+        "task with future deadline must stay PENDING"
+    );
 }
 
 // ── RetryPolicy::fixed smoke-check (unit, no DB needed) ─────────────────────

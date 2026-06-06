@@ -1471,8 +1471,7 @@ mod tests {
     #[test]
     fn enqueue_params_schedule_to_close_at_can_be_set() {
         let deadline = Utc::now() + Duration::seconds(300);
-        let mut params =
-            EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
+        let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
         params.schedule_to_close_at = Some(deadline);
         assert_eq!(params.schedule_to_close_at, Some(deadline));
     }
