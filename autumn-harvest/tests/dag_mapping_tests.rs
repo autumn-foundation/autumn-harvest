@@ -386,11 +386,7 @@ async fn replay_detects_width_n_mismatch() {
         .await;
 
     assert!(
-        matches!(
-            report.status,
-            ReplayStatus::WorkflowFailed { ref error, .. }
-                if error.contains("N differs between live and replay")
-        ),
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
         "Expected non-determinism fail for N mismatch: {report}"
     );
 }

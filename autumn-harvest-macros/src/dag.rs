@@ -221,15 +221,6 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                         ::autumn_harvest::serde_json::Value::Array(__arr) => __arr,
                                         _ => return Err("mapped upstream output is not a JSON array".to_owned()),
                                     };
-                                    if ctx.is_replaying() {
-                                        let __expected_n = ctx.count_mapped_scheduled(&__activity_name_clone);
-                                        if __array.len() != __expected_n {
-                                            return Err(format!(
-                                                "NonDeterministic: N differs between live and replay for mapped task '{}': expected {}, got {}",
-                                                __activity_name_clone, __expected_n, __array.len()
-                                            ));
-                                        }
-                                    }
                                     let __n_instances = __array.len();
                                     if __n_instances == 0 {
                                         return Ok((__task_idx, ::autumn_harvest::policy::TaskStatus::Succeeded, ::autumn_harvest::serde_json::Value::Array(Vec::new())));
@@ -268,10 +259,16 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                                 Ok(__val) => {
                                                     __results[__i] = __val;
                                                 }
-                                                Err(_) => {
-                                                    __status = ::autumn_harvest::policy::TaskStatus::Failed;
-                                                    drop(__stream);
-                                                    break;
+                                                Err(__err) => {
+                                                    match &__err {
+                                                        ::autumn_harvest::HarvestError::ActivityFailed { .. }
+                                                        | ::autumn_harvest::HarvestError::Timeout { .. } => {
+                                                            __status = ::autumn_harvest::policy::TaskStatus::Failed;
+                                                            drop(__stream);
+                                                            break;
+                                                        }
+                                                        _ => return Err(__err.to_string()),
+                                                    }
                                                 }
                                             }
                                         }
@@ -554,95 +551,98 @@ fn emit_workflow_companion(
                                     let __retry_override_clone = __retry_override.clone();
                                     let __stc_override_clone = __stc_override;
                                     __activity_futs.push(::std::boxed::Box::pin(async move {
-                                        let __array = match &__upstream_val {
-                                            ::autumn_harvest::serde_json::Value::Array(__arr) => __arr,
-                                            _ => return Err("mapped upstream output is not a JSON array".to_owned()),
-                                        };
-                                        if ctx.is_replaying() {
-                                            let __expected_n = ctx.count_mapped_scheduled(&__activity_name_clone);
-                                            if __array.len() != __expected_n {
-                                                return Err(format!(
-                                                    "NonDeterministic: N differs between live and replay for mapped task '{}': expected {}, got {}",
-                                                    __activity_name_clone, __expected_n, __array.len()
-                                                ));
-                                            }
-                                        }
-                                        let __n_instances = __array.len();
-                                        if __n_instances == 0 {
-                                            return Ok((__task_idx, ::autumn_harvest::policy::TaskStatus::Succeeded, ::autumn_harvest::serde_json::Value::Array(Vec::new())));
-                                        }
+                                     let __array = match &__upstream_val {
+                                         ::autumn_harvest::serde_json::Value::Array(__arr) => __arr,
+                                         _ => return Err("mapped upstream output is not a JSON array".to_owned()),
+                                     };
+                                     let __n_instances = __array.len();
+                                     if __n_instances == 0 {
+                                         return Ok((__task_idx, ::autumn_harvest::policy::TaskStatus::Succeeded, ::autumn_harvest::serde_json::Value::Array(Vec::new())));
+                                     }
 
-                                        let mut __instance_futs = ::std::vec::Vec::new();
-                                        for (__i, __item) in __array.iter().enumerate() {
-                                            let __item_input = __item.clone();
-                                            let __act_name = __activity_name_clone.clone();
-                                            let __q_str = __queue_str_clone.clone();
-                                            let __ret_override = __retry_override_clone.clone();
-                                            let __stc_over = __stc_override_clone;
-                                            __instance_futs.push(async move {
-                                                let __res = ctx
-                                                    .execute_activity_raw_with_opts(
-                                                        &__act_name,
-                                                        __item_input,
-                                                        &__q_str,
-                                                        __ret_override,
-                                                        __stc_over,
-                                                    )
-                                                    .await;
-                                                (__i, __res)
-                                            });
-                                        }
+                                     let mut __instance_futs = ::std::vec::Vec::new();
+                                     for (__i, __item) in __array.iter().enumerate() {
+                                         let __item_input = __item.clone();
+                                         let __act_name = __activity_name_clone.clone();
+                                         let __q_str = __queue_str_clone.clone();
+                                         let __ret_override = __retry_override_clone.clone();
+                                         let __stc_over = __stc_override_clone;
+                                         __instance_futs.push(async move {
+                                             let __res = ctx
+                                                 .execute_activity_raw_with_opts(
+                                                     &__act_name,
+                                                     __item_input,
+                                                     &__q_str,
+                                                     __ret_override,
+                                                     __stc_over,
+                                                 )
+                                                 .await;
+                                             (__i, __res)
+                                         });
+                                     }
 
-                                        let mut __results = vec![::autumn_harvest::serde_json::Value::Null; __n_instances];
-                                        let mut __status = ::autumn_harvest::policy::TaskStatus::Succeeded;
-                                        let mut __final_val = ::autumn_harvest::serde_json::Value::Null;
+                                     let mut __results = vec![::autumn_harvest::serde_json::Value::Null; __n_instances];
+                                     let mut __status = ::autumn_harvest::policy::TaskStatus::Succeeded;
+                                     let mut __final_val = ::autumn_harvest::serde_json::Value::Null;
 
-                                        if __policy == ::autumn_harvest::policy::MapFailurePolicy::FailFast {
-                                            use ::autumn_harvest::futures::StreamExt as _;
-                                            let mut __stream = __instance_futs.into_iter().collect::<::autumn_harvest::futures::stream::FuturesUnordered<_>>();
-                                            while let Some((__i, __res)) = __stream.next().await {
-                                                match __res {
-                                                    Ok(__val) => {
-                                                        __results[__i] = __val;
-                                                    }
-                                                    Err(_) => {
-                                                        __status = ::autumn_harvest::policy::TaskStatus::Failed;
-                                                        drop(__stream);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            if __status == ::autumn_harvest::policy::TaskStatus::Succeeded {
-                                                __final_val = ::autumn_harvest::serde_json::Value::Array(__results);
-                                            }
-                                        } else {
-                                            let mut __collect_results = vec![::autumn_harvest::serde_json::Value::Null; __n_instances];
-                                            for __res_item in ::autumn_harvest::futures::future::join_all(__instance_futs).await {
-                                                let (__i, __res) = __res_item;
-                                                let __obj = match __res {
-                                                    Ok(__val) => ::autumn_harvest::serde_json::json!({
-                                                        "status": "succeeded",
-                                                        "value": __val
-                                                    }),
-                                                    Err(__err) => {
-                                                        let __err_str = match &__err {
-                                                            ::autumn_harvest::HarvestError::ActivityFailed { source, .. } => source.to_string(),
-                                                            _ => __err.to_string(),
-                                                        };
-                                                        ::autumn_harvest::serde_json::json!({
-                                                            "status": "failed",
-                                                            "error": __err_str
-                                                        })
-                                                    }
-                                                };
-                                                __collect_results[__i] = __obj;
-                                            }
-                                            __status = ::autumn_harvest::policy::TaskStatus::Succeeded;
-                                            __final_val = ::autumn_harvest::serde_json::Value::Array(__collect_results);
-                                        }
+                                     if __policy == ::autumn_harvest::policy::MapFailurePolicy::FailFast {
+                                         use ::autumn_harvest::futures::StreamExt as _;
+                                         let mut __stream = __instance_futs.into_iter().collect::<::autumn_harvest::futures::stream::FuturesUnordered<_>>();
+                                         while let Some((__i, __res)) = __stream.next().await {
+                                             match __res {
+                                                 Ok(__val) => {
+                                                     __results[__i] = __val;
+                                                 }
+                                                 Err(__err) => {
+                                                     match &__err {
+                                                         ::autumn_harvest::HarvestError::ActivityFailed { .. }
+                                                         | ::autumn_harvest::HarvestError::Timeout { .. } => {
+                                                             __status = ::autumn_harvest::policy::TaskStatus::Failed;
+                                                             drop(__stream);
+                                                             break;
+                                                         }
+                                                         _ => return Err(__err.to_string()),
+                                                     }
+                                                 }
+                                             }
+                                         }
+                                         if __status == ::autumn_harvest::policy::TaskStatus::Succeeded {
+                                             __final_val = ::autumn_harvest::serde_json::Value::Array(__results);
+                                         }
+                                     } else {
+                                         let mut __collect_results = vec![::autumn_harvest::serde_json::Value::Null; __n_instances];
+                                         for __res_item in ::autumn_harvest::futures::future::join_all(__instance_futs).await {
+                                             let (__i, __res) = __res_item;
+                                             let __obj = match __res {
+                                                 Ok(__val) => ::autumn_harvest::serde_json::json!({
+                                                     "status": "succeeded",
+                                                     "value": __val
+                                                 }),
+                                                 Err(__err) => {
+                                                     match &__err {
+                                                         ::autumn_harvest::HarvestError::ActivityFailed { .. }
+                                                         | ::autumn_harvest::HarvestError::Timeout { .. } => {
+                                                             let __err_str = match &__err {
+                                                                 ::autumn_harvest::HarvestError::ActivityFailed { source, .. } => source.to_string(),
+                                                                 _ => __err.to_string(),
+                                                             };
+                                                             ::autumn_harvest::serde_json::json!({
+                                                                 "status": "failed",
+                                                                 "error": __err_str
+                                                             })
+                                                         }
+                                                         _ => return Err(__err.to_string()),
+                                                     }
+                                                 }
+                                             };
+                                             __collect_results[__i] = __obj;
+                                         }
+                                         __status = ::autumn_harvest::policy::TaskStatus::Succeeded;
+                                         __final_val = ::autumn_harvest::serde_json::Value::Array(__collect_results);
+                                     }
 
-                                        Ok::<_, ::std::string::String>((__task_idx, __status, __final_val))
-                                    }));
+                                     Ok::<_, ::std::string::String>((__task_idx, __status, __final_val))
+                                 }));
                                 } else {
                                     let __has_mapped_upstream = __upstreams.iter().any(|&__i| __tasks[__i].map_upstream.is_some());
                                     let __activity_input = if __has_mapped_upstream {

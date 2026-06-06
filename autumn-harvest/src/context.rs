@@ -965,20 +965,6 @@ impl WorkflowContext {
             .has_buffered_history()
     }
 
-    /// Count occurrences of `ActivityScheduled` events for a mapped activity
-    /// starting from the current cursor position before the first corresponding completion/failure.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal matcher mutex is poisoned.
-    #[must_use]
-    pub fn count_mapped_scheduled(&self, name: &str) -> usize {
-        self.matcher
-            .lock()
-            .expect("matcher lock poisoned")
-            .count_mapped_scheduled(name)
-    }
-
     /// Access typed shared state (e.g., email clients, config) injected via the builder.
     ///
     /// Because workflows must be deterministic and pure, they often need to access
