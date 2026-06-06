@@ -386,7 +386,7 @@ async fn task_state_for_update(
 /// set, guarding against double-enforcement races (e.g. two scanner ticks
 /// racing on the same row, or a worker completing a task between the scan
 /// and enforcement).
-fn expected_task_states_for_timeout(reason: &TimeoutReason) -> &'static [&'static str] {
+const fn expected_task_states_for_timeout(reason: &TimeoutReason) -> &'static [&'static str] {
     match reason {
         TimeoutReason::Heartbeat | TimeoutReason::StartToClose => &["RUNNING"],
         TimeoutReason::ScheduleToStart => &["PENDING"],
