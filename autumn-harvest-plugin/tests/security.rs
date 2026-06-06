@@ -146,6 +146,62 @@ async fn eris_unauthenticated_start_workflow_terminate_if_running_is_blocked() {
 }
 
 #[tokio::test]
+async fn warden_bulk_replay_dlq_rejects_oversized_payload() {
+    let app = authenticated_app();
+    let large_body = "x".repeat(3 * 1024 * 1024);
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/dead-letters/replay")
+        .header(
+            autumn_web::reexports::axum::http::header::CONTENT_TYPE,
+            "application/json",
+        )
+        .body(Body::from(large_body))
+        .unwrap();
+
+    let mut data = std::collections::HashMap::new();
+    data.insert("user_id".to_string(), "operator-1".to_string());
+
+    request
+        .extensions_mut()
+        .insert(autumn_web::session::Session::new_for_test(
+            "harvest-test-session".to_string(),
+            data,
+        ));
+
+    let res = app.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn warden_bulk_discard_dlq_rejects_oversized_payload() {
+    let app = authenticated_app();
+    let large_body = "x".repeat(3 * 1024 * 1024);
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/dead-letters/discard")
+        .header(
+            autumn_web::reexports::axum::http::header::CONTENT_TYPE,
+            "application/json",
+        )
+        .body(Body::from(large_body))
+        .unwrap();
+
+    let mut data = std::collections::HashMap::new();
+    data.insert("user_id".to_string(), "operator-1".to_string());
+
+    request
+        .extensions_mut()
+        .insert(autumn_web::session::Session::new_for_test(
+            "harvest-test-session".to_string(),
+            data,
+        ));
+
+    let res = app.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn eris_start_workflow_terminate_if_running_honors_configured_session_key() {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_session_key("operator_id");

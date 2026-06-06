@@ -10737,14 +10737,27 @@ fn url_encode_for_redirect(input: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_replay_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    #[allow(clippy::cast_possible_truncation)]
+    let body_bytes = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                axum::Json(serde_json::json!({"error": format!("payload too large: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
@@ -10845,14 +10858,27 @@ async fn bulk_replay_dead_letters_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn bulk_discard_dead_letters_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    let request = match parse_bulk_dlq_request(&headers, &body) {
+    #[allow(clippy::cast_possible_truncation)]
+    let body_bytes = match axum::body::to_bytes(body, 2 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                axum::Json(serde_json::json!({"error": format!("payload too large: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let request = match parse_bulk_dlq_request(&headers, &body_bytes) {
         Ok(request) => request,
         Err(error) => return error.into_response(),
     };
