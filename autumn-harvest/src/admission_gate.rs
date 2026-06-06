@@ -6,15 +6,26 @@
 //! plugin restart; the plugin loads active gates before its worker pool starts
 //! so there is no admission window between boot and re-apply.
 //!
-//! ## Known gap — completion trigger starts
+//! ## Known gaps — ungated workflow producers
 //!
-//! Completion triggers (`completion_trigger.rs`) call
-//! `start_or_load_workflow_execution` directly in a background task, bypassing
-//! the HTTP admission-gate checks in the plugin's API handlers. A follow-up
-//! issue should pass the `AdmissionGateCache` into the completion trigger
-//! runner so that fleet/name/queue/owner gates are honoured for
-//! trigger-initiated starts during an incident. Until then, completion trigger
-//! starts are ungated.
+//! The following code paths call `start_or_load_workflow_execution` without
+//! consulting the admission gate cache. Each is a follow-up candidate.
+//!
+//! * **Completion triggers** (`completion_trigger.rs`): runs in a background
+//!   task; the `AdmissionGateCache` is not threaded through to it. Pass the
+//!   cache into the completion trigger runner so fleet/name/queue/owner gates
+//!   are honoured for trigger-initiated starts during an incident.
+//!
+//! * **Outbox relay** (`outbox.rs` — `spawn_workflow_start_outbox_relay`):
+//!   replays workflow-start events that were durably written to the outbox
+//!   before the gate was raised. Gating outbox relay is semantically
+//!   questionable (the commit already happened) but can be useful for
+//!   rate-limiting recovery after an incident.
+//!
+//! * **Webhook delegate** (`plugin.rs` — `WebhookDelegate`): the Autumn
+//!   webhook integration starts a workflow inline in the HTTP handler path.
+//!   The delegate does not have access to the gate cache today; thread it in
+//!   via `AppState` extension so webhook-triggered starts can be gated.
 //!
 //! ## Scope semantics
 //!

@@ -2489,6 +2489,18 @@ async fn drain_buffered_schedule_runs(
 
     let now = Utc::now();
 
+    // issue #377: load active gates once per drain call, fail-closed on error.
+    let active_gates = match crate::admission_gate::db::load_active_gates(conn).await {
+        Ok(gates) => gates,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "harvest: could not load admission gates; skipping buffered drain (fail-closed)"
+            );
+            return Ok(());
+        }
+    };
+
     // Query schedules that have buffered runs and are not paused (manually or auto-paused).
     let pending: Vec<HarvestSchedule> = dsl::harvest_schedules
         .filter(dsl::workflow_name.is_not_null())
@@ -2539,6 +2551,36 @@ async fn drain_buffered_schedule_runs(
         }
 
         let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
+
+        // issue #377: gate check — skip draining this schedule if any active gate matches.
+        {
+            let owner = registry
+                .workflows
+                .get(wf_name.as_str())
+                .and_then(|i| i.owner)
+                .or_else(|| {
+                    registered_dags
+                        .get(wf_name.as_str())
+                        .and_then(|d| d.owner.as_deref())
+                });
+            if let Some(gate) = crate::admission_gate::check_admission(
+                &active_gates,
+                wf_name,
+                dispatch_queue,
+                current_shard.as_i32(),
+                owner,
+            ) {
+                tracing::info!(
+                    workflow_name = %wf_name,
+                    gate_id = %gate.id,
+                    reason = %gate.reason,
+                    "harvest: buffered drain skipped due to admission gate"
+                );
+                metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
+                continue;
+            }
+        }
+
         let mut dispatched: u32 = 0;
 
         while dispatched < u32::try_from(available).unwrap_or(u32::MAX) && !buffered.is_empty() {

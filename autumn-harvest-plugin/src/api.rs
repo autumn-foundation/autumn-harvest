@@ -1745,7 +1745,14 @@ async fn create_gate_handler(
             // Refresh the in-process cache immediately so this replica honours
             // the gate without waiting for the background refresh cycle.
             if let Ok(fresh) = admission_gate_db::load_active_gates(&mut conn).await {
+                let count = i64::try_from(fresh.len()).unwrap_or(0);
                 api_state.gate_cache().refresh(fresh);
+                if let Ok(rt) = api_state.runtime() {
+                    rt.registry()
+                        .telemetry()
+                        .metrics
+                        .record_admission_gates_active(count);
+                }
             }
 
             let gate_id_str = gate.id.to_string();
@@ -1783,11 +1790,15 @@ async fn create_gate_handler(
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
             match e {
-                autumn_harvest::error::HarvestError::Config(msg) => (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": msg })),
-                )
-                    .into_response(),
+                autumn_harvest::error::HarvestError::Config(msg) => {
+                    // Active gate cap exceeded → 429; other config errors → 400.
+                    let status = if msg.contains("active gate limit") {
+                        StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    };
+                    (status, Json(serde_json::json!({ "error": msg }))).into_response()
+                }
                 other => AutumnError::internal_server_error(other).into_response(),
             }
         }
@@ -1816,7 +1827,14 @@ async fn lift_gate_handler(
         Ok(Some(_gate)) => {
             // Refresh the in-process cache immediately.
             if let Ok(fresh) = admission_gate_db::load_active_gates(&mut conn).await {
+                let count = i64::try_from(fresh.len()).unwrap_or(0);
                 api_state.gate_cache().refresh(fresh);
+                if let Ok(rt) = api_state.runtime() {
+                    rt.registry()
+                        .telemetry()
+                        .metrics
+                        .record_admission_gates_active(count);
+                }
             }
 
             let ar = NewAuditRecord {

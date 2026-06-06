@@ -469,6 +469,7 @@ async fn start_harvest_runtime(
     // issue #377: spawn background gate-cache refresh (≤2 s p95 cross-replica propagation).
     let gate_refresh = {
         let cache = api_state.gate_cache();
+        let api_state_for_metrics = api_state.clone();
         let pool = harvest_db_pool.clone_inner();
         let shutdown = CancellationToken::new();
         let cancel_for_task = shutdown.child_token();
@@ -486,7 +487,16 @@ async fn start_harvest_runtime(
                     Ok(mut conn) => {
                         match autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await
                         {
-                            Ok(gates) => cache.refresh(gates),
+                            Ok(gates) => {
+                                let count = i64::try_from(gates.len()).unwrap_or(0);
+                                cache.refresh(gates);
+                                if let Ok(rt) = api_state_for_metrics.runtime() {
+                                    rt.registry()
+                                        .telemetry()
+                                        .metrics
+                                        .record_admission_gates_active(count);
+                                }
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,

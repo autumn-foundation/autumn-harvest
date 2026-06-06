@@ -5131,6 +5131,7 @@ async fn execute_schedule_trigger_ui(
     conn: &mut crate::api::PoolConn,
     pool: &crate::HarvestDbPool,
     runtime: &HarvestApiRuntime,
+    gate_cache: &autumn_harvest::admission_gate::AdmissionGateCache,
     row: &HarvestSchedule,
     id_str: &str,
     name: &str,
@@ -5138,6 +5139,37 @@ async fn execute_schedule_trigger_ui(
     input: serde_json::Value,
     queue: &str,
 ) -> axum::response::Response {
+    // issue #377: check admission gates before firing this manual schedule trigger.
+    {
+        let wf_owner = runtime
+            .registry()
+            .workflows
+            .get(workflow_name)
+            .and_then(|i| i.owner)
+            .or_else(|| {
+                runtime
+                    .dags()
+                    .get(workflow_name)
+                    .and_then(|d| d.owner.as_deref())
+            });
+        if let Some((gate_id, gate_reason, scope_kind)) =
+            gate_cache.check(workflow_name, queue, 0, wf_owner)
+        {
+            let reason_label = match gate_reason.char_indices().nth(64) {
+                Some((idx, _)) => &gate_reason[..idx],
+                None => &gate_reason,
+            };
+            runtime
+                .registry()
+                .telemetry()
+                .metrics
+                .record_admission_blocked(scope_kind, reason_label);
+            let ar = build_trigger_audit("ui", id_str, STATUS_FAILED, Some("admission_blocked"));
+            let _ = insert_audit(conn, &ar).await;
+            return schedule_redirect(&format!("Trigger blocked by gate {gate_id}: {gate_reason}"));
+        }
+    }
+
     // Count RUNNING executions across ALL shards. The async block returns None if
     // any shard is unreachable — used for fail-closed Skip enforcement.
     let running_count: Option<i64> = async {
@@ -5362,6 +5394,7 @@ async fn schedule_trigger_now_ui(
         &mut conn,
         &pool,
         &runtime,
+        &api_state.gate_cache(),
         &row,
         &id_str,
         &name,
