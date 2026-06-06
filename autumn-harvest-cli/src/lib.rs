@@ -283,6 +283,10 @@ pub enum CliError {
         /// Server-supplied error detail.
         message: String,
     },
+
+    /// A CLI argument value was invalid (e.g. unrecognised scope format).
+    #[error("{0}")]
+    InvalidInput(String),
 }
 
 impl CliError {
@@ -370,6 +374,12 @@ enum Commands {
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
+    },
+    /// Manage admission gates for incident-response halts (issue #377).
+    #[command(alias = "gates")]
+    Gate {
+        #[command(subcommand)]
+        command: GateCommand,
     },
     /// Report recorded workflow version-gate usage.
     VersionUsage {
@@ -537,6 +547,36 @@ enum AuditCommand {
         /// Maximum number of records to return [1–500].
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=500))]
         limit: Option<i64>,
+    },
+}
+
+/// Admission gate subcommands (issue #377).
+#[derive(Debug, Subcommand)]
+enum GateCommand {
+    /// Create an admission gate to halt new workflow starts.
+    #[command(alias = "add")]
+    Create {
+        /// Scope: `fleet`, `workflow_name=<name>`, `queue=<name>`, `shard_id=<N>`, or `owner=<id>`.
+        #[arg(long)]
+        scope: String,
+        /// Required human-readable reason included in blocked-caller errors and the audit log.
+        #[arg(long)]
+        reason: String,
+        /// Optional extended message shown in the Vantage UI.
+        #[arg(long)]
+        message: Option<String>,
+        /// ISO 8601 expiry timestamp after which the gate self-clears (e.g. 2026-06-06T12:00:00Z).
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
+    /// List all active (non-lifted) admission gates.
+    #[command(alias = "ls")]
+    List,
+    /// Lift (remove) an admission gate by ID.
+    #[command(alias = "delete", alias = "rm", alias = "remove")]
+    Lift {
+        /// Gate ID (UUID) to lift.
+        id: String,
     },
 }
 
@@ -1207,6 +1247,7 @@ impl Cli {
             Commands::RateLimit { command } => Ok(rate_limit_request(command)),
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
+            Commands::Gate { command } => gate_request(command),
             Commands::Worker { command } => Ok(worker_request(command)),
             Commands::VersionUsage {
                 workflow_name,
@@ -3289,6 +3330,54 @@ fn build_bulk_dlq_body(
         body.insert("dry_run".to_string(), json!(true));
     }
     Value::Object(body)
+}
+
+fn gate_request(command: &GateCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        GateCommand::List => Ok(ApiRequest::get("/admin/gates")),
+        GateCommand::Lift { id } => Ok(ApiRequest {
+            method: ApiMethod::Delete,
+            path: format!("/admin/gates/{}", path_segment(id)),
+            body: None,
+        }),
+        GateCommand::Create {
+            scope,
+            reason,
+            message,
+            expires_at,
+        } => {
+            // Parse scope string: "fleet", "workflow_name=X", "queue=X", "shard_id=N", "owner=X"
+            let (scope_kind, scope_value) = if scope == "fleet" {
+                ("fleet".to_string(), None::<String>)
+            } else if let Some(v) = scope.strip_prefix("workflow_name=") {
+                ("workflow_name".to_string(), Some(v.to_string()))
+            } else if let Some(v) = scope.strip_prefix("queue=") {
+                ("queue".to_string(), Some(v.to_string()))
+            } else if let Some(v) = scope.strip_prefix("shard_id=") {
+                ("shard_id".to_string(), Some(v.to_string()))
+            } else if let Some(v) = scope.strip_prefix("owner=") {
+                ("owner".to_string(), Some(v.to_string()))
+            } else {
+                return Err(CliError::InvalidInput(format!(
+                    "unknown scope '{scope}'; expected: fleet, workflow_name=<name>, queue=<name>, shard_id=<N>, or owner=<id>"
+                )));
+            };
+            let mut body = serde_json::json!({
+                "scope_kind": scope_kind,
+                "reason": reason,
+            });
+            if let Some(v) = scope_value {
+                body["scope_value"] = serde_json::json!(v);
+            }
+            if let Some(msg) = message {
+                body["message"] = serde_json::json!(msg);
+            }
+            if let Some(exp) = expires_at {
+                body["expires_at"] = serde_json::json!(exp);
+            }
+            Ok(ApiRequest::post("/admin/gates", Some(body)))
+        }
+    }
 }
 
 fn worker_request(command: &WorkerCommand) -> ApiRequest {

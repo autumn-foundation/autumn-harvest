@@ -139,7 +139,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
-    )
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql")
 );
 type HarvestApiApp = axum::Router;
 

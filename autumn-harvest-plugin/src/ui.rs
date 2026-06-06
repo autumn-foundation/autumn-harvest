@@ -33,10 +33,11 @@ use serde_json::Value;
 use autumn_harvest::Schedule;
 use autumn_harvest::ShardRouter;
 use autumn_harvest::audit::{
-    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_SCHEDULE_DELETE,
-    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_WORKFLOW_CANCEL,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_BUILD_ROUTING, TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
+    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_GATE_LIFT,
+    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BUILD_ROUTING, TARGET_GATE, TARGET_SCHEDULE,
+    TARGET_WORKFLOW, insert_audit,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
@@ -517,7 +518,7 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route(
             "/build-routing/retire",
-            post(build_routing_retire_ui).route_layer(require_admin),
+            post(build_routing_retire_ui).route_layer(require_admin.clone()),
         )
         .route("/schedules", get(list_schedules_ui))
         .route("/schedules/bulk-pause", post(schedule_bulk_pause_ui))
@@ -526,6 +527,12 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/schedules/{id}/resume", post(schedule_resume_ui))
         .route("/schedules/{id}/delete", post(schedule_delete_ui))
         .route("/schedules/{id}/trigger-now", post(schedule_trigger_now_ui))
+        // issue #377: admission gates UI page and one-click lift (lift requires admin)
+        .route("/admin/gates", get(list_gates_ui))
+        .route(
+            "/admin/gates/{id}/lift",
+            post(lift_gate_ui).route_layer(require_admin),
+        )
         .layer(Extension(api_state))
 }
 
@@ -810,6 +817,9 @@ async fn list_workflows_ui(
         .take(limit_usize)
         .collect::<Vec<_>>();
 
+    // issue #377: check active gate count for the UI banner (no DB call — uses in-process cache).
+    let active_gate_count = api_state.gate_cache().active_count();
+
     Ok(render_workflow_list(
         &workflows,
         page,
@@ -821,6 +831,7 @@ async fn list_workflows_ui(
         started_after,
         started_before,
         exec_id_search.as_deref(),
+        active_gate_count,
     ))
 }
 
@@ -2523,9 +2534,23 @@ fn render_workflow_list(
     started_after: Option<DateTime<Utc>>,
     started_before: Option<DateTime<Utc>>,
     exec_id_search: Option<&str>,
+    active_gate_count: usize,
 ) -> Markup {
     let body = html! {
         h2 { "Workflows" }
+
+        // issue #377: admission gate banner — shown when any gate is active.
+        @if active_gate_count > 0 {
+            div class="banner Unhealthy" {
+                strong { "⚠ Admission gate active" }
+                " — "
+                (active_gate_count)
+                @if active_gate_count == 1 { " gate is" } @else { " gates are" }
+                " blocking new workflow starts. "
+                a href="../admin/gates" { "Manage gates →" }
+            }
+        }
+
         (render_filters(state_filter, workflow_name_filter, search_attr_filter, started_after, started_before, exec_id_search, limit))
 
         @if workflows.is_empty() {
@@ -4913,11 +4938,19 @@ fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters
     }
 }
 
-/// Find a schedule by id across all shards. Returns the row and a conn on success.
+/// Find a schedule by id across all shards. Returns the row, the shard it lives
+/// on, and a conn to that shard on success.
 async fn find_schedule_row(
     api_state: &HarvestApiState,
     id_str: &str,
-) -> Result<Option<(HarvestSchedule, crate::api::PoolConn)>, axum::response::Response> {
+) -> Result<
+    Option<(
+        HarvestSchedule,
+        autumn_harvest::types::ShardId,
+        crate::api::PoolConn,
+    )>,
+    axum::response::Response,
+> {
     use autumn_harvest::schema::harvest_schedules::dsl;
     use axum::response::IntoResponse as _;
 
@@ -4930,7 +4963,7 @@ async fn find_schedule_row(
         .storage_pool()
         .map_err(|e| map_error(e).into_response())?;
 
-    for (_shard, shard_pool) in pool.iter_shards() {
+    for (shard, shard_pool) in pool.iter_shards() {
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
@@ -4942,7 +4975,7 @@ async fn find_schedule_row(
             .optional()
             .unwrap_or(None);
         if let Some(row) = row {
-            return Ok(Some((row, conn)));
+            return Ok(Some((row, shard, conn)));
         }
     }
     Ok(None)
@@ -4967,7 +5000,7 @@ async fn schedule_pause_ui(
         Err(response) => return response,
     };
 
-    let flash = if let Some((row, mut conn)) = found {
+    let flash = if let Some((row, _shard, mut conn)) = found {
         let name = schedule_name(&row);
         let now = Utc::now();
         let _ = diesel::update(
@@ -5015,7 +5048,7 @@ async fn schedule_resume_ui(
         Err(response) => return response,
     };
 
-    let flash = if let Some((row, mut conn)) = found {
+    let flash = if let Some((row, _shard, mut conn)) = found {
         let name = schedule_name(&row);
         let now = Utc::now();
         let _ = diesel::update(
@@ -5064,7 +5097,7 @@ async fn schedule_delete_ui(
         Err(response) => return response,
     };
 
-    let flash = if let Some((row, mut conn)) = found {
+    let flash = if let Some((row, _shard, mut conn)) = found {
         let name = schedule_name(&row);
         let n = diesel::delete(dsl::harvest_schedules.find(row.id))
             .execute(&mut conn)
@@ -5106,6 +5139,7 @@ async fn execute_schedule_trigger_ui(
     conn: &mut crate::api::PoolConn,
     pool: &crate::HarvestDbPool,
     runtime: &HarvestApiRuntime,
+    gate_cache: &autumn_harvest::admission_gate::AdmissionGateCache,
     row: &HarvestSchedule,
     id_str: &str,
     name: &str,
@@ -5113,6 +5147,52 @@ async fn execute_schedule_trigger_ui(
     input: serde_json::Value,
     queue: &str,
 ) -> axum::response::Response {
+    // Pre-generate workflow_id and triggered_at so the gate check uses the
+    // actual execution shard (determined by the router) rather than the shard
+    // where the schedule row was found.  The values are reused below.
+    let triggered_at = chrono::Utc::now();
+    let workflow_id = format!(
+        "manual-{}-{}-{}",
+        row.id,
+        triggered_at.timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let exec_shard = runtime
+        .router()
+        .pick_for_new_workflow(workflow_name, &workflow_id);
+
+    // issue #377: check admission gates before firing this manual schedule trigger.
+    {
+        let dag_name_for_owner = row.dag_name.as_deref().unwrap_or(workflow_name);
+        let wf_owner = runtime
+            .registry()
+            .workflows
+            .get(workflow_name)
+            .and_then(|i| i.owner)
+            .or_else(|| {
+                runtime
+                    .dags()
+                    .get(dag_name_for_owner)
+                    .and_then(|d| d.owner.as_deref())
+            });
+        if let Some((gate_id, gate_reason, scope_kind)) =
+            gate_cache.check(workflow_name, queue, exec_shard.as_i32(), wf_owner)
+        {
+            let reason_label = match gate_reason.char_indices().nth(64) {
+                Some((idx, _)) => &gate_reason[..idx],
+                None => &gate_reason,
+            };
+            runtime
+                .registry()
+                .telemetry()
+                .metrics
+                .record_admission_blocked(scope_kind, reason_label);
+            let ar = build_trigger_audit("ui", id_str, STATUS_FAILED, Some("admission_blocked"));
+            let _ = insert_audit(conn, &ar).await;
+            return schedule_redirect(&format!("Trigger blocked by gate {gate_id}: {gate_reason}"));
+        }
+    }
+
     // Count RUNNING executions across ALL shards. The async block returns None if
     // any shard is unreachable — used for fail-closed Skip enforcement.
     let running_count: Option<i64> = async {
@@ -5163,13 +5243,7 @@ async fn execute_schedule_trigger_ui(
             Some(_) => {}
         }
     }
-    let triggered_at = chrono::Utc::now();
-    let workflow_id = format!(
-        "manual-{}-{}-{}",
-        row.id,
-        triggered_at.timestamp_millis(),
-        uuid::Uuid::new_v4().simple()
-    );
+    // triggered_at and workflow_id were pre-generated above for the gate check.
     let exec_id = HarvestExecutionId::new();
     let (owner, runbook_url, severity) = {
         let wf_meta = runtime
@@ -5308,7 +5382,7 @@ async fn schedule_trigger_now_ui(
         Ok(f) => f,
         Err(response) => return response,
     };
-    let Some((row, _)) = found else {
+    let Some((row, _found_shard, _)) = found else {
         return schedule_redirect(&format!(
             "Schedule {} not found",
             &id_str[..8.min(id_str.len())]
@@ -5337,6 +5411,7 @@ async fn schedule_trigger_now_ui(
         &mut conn,
         &pool,
         &runtime,
+        &api_state.gate_cache(),
         &row,
         &id_str,
         &name,
@@ -5885,6 +5960,192 @@ fn build_schedule_query_string(
         let _ = write!(out, "&refresh={secs}");
     }
     out
+}
+
+// ── Admission gates UI (issue #377) ──────────────────────────────────────────
+
+async fn list_gates_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Markup, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut conn = acquire_conn(pool.default_pool()).await?;
+
+    let rows = autumn_harvest::admission_gate::db::list_gates(&mut conn)
+        .await
+        .map_err(map_error)?;
+
+    Ok(render_gates_page(&rows))
+}
+
+/// `POST /admin/gates/{id}/lift` — Vantage UI lift action (redirects back to gates list).
+async fn lift_gate_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<uuid::Uuid>,
+) -> axum::response::Response {
+    let Ok(pool) = api_state.storage_pool() else {
+        return axum::response::Redirect::to("../../admin/gates").into_response();
+    };
+    let Ok(mut conn) = acquire_conn(pool.default_pool()).await else {
+        return axum::response::Redirect::to("../../admin/gates").into_response();
+    };
+
+    let id_str = id.to_string();
+    if let Ok(Some(_gate)) =
+        autumn_harvest::admission_gate::db::lift_gate(&mut conn, id, "ui").await
+    {
+        if let Ok(fresh) = autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await {
+            api_state.gate_cache().refresh(fresh);
+        }
+        let ar = autumn_harvest::models::NewAuditRecord {
+            actor: "ui",
+            operation: OP_GATE_LIFT,
+            target_type: TARGET_GATE,
+            target_id: Some(id_str.as_str()),
+            route_or_command: "POST /ui/admin/gates/{id}/lift",
+            request_id: None,
+            idempotency_key: None,
+            status: STATUS_SUCCEEDED,
+            error_summary: None,
+            shard_id: None,
+            source: SOURCE_UI,
+        };
+        let _ = insert_audit(&mut conn, &ar).await;
+    }
+
+    // Correct relative target from /ui/admin/gates/{id}/lift back to the
+    // gates list at /ui/admin/gates.  "../../admin/gates" would resolve to
+    // /ui/admin/admin/gates (one "admin" too many).
+    axum::response::Redirect::to("../../gates").into_response()
+}
+
+fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Markup {
+    let body = html! {
+        h2 { "Admission Gates" }
+        p.note {
+            "Active gates block new workflow starts. In-flight executions are unaffected. "
+            "Use the "
+            a href="../../admin/gates" { "management API" }
+            " ("
+            code { "POST /admin/gates" }
+            ", "
+            code { "DELETE /admin/gates/{id}" }
+            ") to create or lift gates."
+        }
+
+        @if rows.iter().all(|r| r.lifted_at.is_some()) {
+            div.card.empty { "No active admission gates." }
+        }
+
+        @for row in rows.iter().filter(|r| r.lifted_at.is_none()) {
+            @let id_str = row.id.to_string();
+            @let id_short = &id_str[..8];
+            @let now = chrono::Utc::now();
+            @let is_expired = row.expires_at.is_some_and(|exp| exp <= now);
+            div.card {
+                div style="display:flex;justify-content:space-between;align-items:center" {
+                    div {
+                        strong { code { (id_short) } }
+                        " "
+                        @if is_expired {
+                            span.badge style="background:#374151;color:#9ca3af" { "EXPIRED" }
+                        } @else {
+                            span.badge.FAILED { "ACTIVE" }
+                        }
+                        " "
+                        span { (row.scope_kind) }
+                        @if let Some(ref v) = row.scope_value {
+                            " = "
+                            code { (v) }
+                        }
+                    }
+                    div style="display:flex;gap:16px;align-items:center" {
+                        div style="font-size:12px;color:#94a3b8" {
+                            "created by " (row.created_by)
+                            " at " (row.created_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                            @if let Some(exp) = row.expires_at {
+                                @if is_expired {
+                                    " · expired " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                                } @else {
+                                    " · expires " (exp.format("%Y-%m-%d %H:%M:%S UTC"))
+                                }
+                            }
+                        }
+                        @if !is_expired {
+                            form method="POST" action={ "gates/" (id_str) "/lift" }
+                                onsubmit="return confirm('Lift this gate?')" {
+                                button type="submit"
+                                    style="background:#15803d;color:#dcfce7;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px" {
+                                    "Lift"
+                                }
+                            }
+                        }
+                    }
+                }
+                @if !row.reason.is_empty() {
+                    p style="margin:8px 0 0;color:#e2e8f0" { (row.reason) }
+                }
+                @if let Some(ref msg) = row.message {
+                    p style="margin:4px 0 0;color:#94a3b8;font-size:12px" { (msg) }
+                }
+            }
+        }
+
+        @let lifted: Vec<_> = rows.iter().filter(|r| r.lifted_at.is_some()).collect();
+        @if !lifted.is_empty() {
+            details style="margin-top:20px" {
+                summary style="cursor:pointer;color:#94a3b8" {
+                    (lifted.len()) " lifted gate(s)"
+                }
+                @for row in &lifted {
+                    @let id_short = &row.id.to_string()[..8];
+                    div.card style="opacity:0.6" {
+                        code { (id_short) }
+                        " "
+                        span.badge.COMPLETED { "LIFTED" }
+                        " "
+                        (row.scope_kind)
+                        @if let Some(ref v) = row.scope_value {
+                            " = " code { (v) }
+                        }
+                        " — " (row.reason)
+                    }
+                }
+            }
+        }
+    };
+    layout_gates("Admission Gates · Vantage", &body)
+}
+
+fn layout_gates(title: &str, body: &Markup) -> Markup {
+    html! {
+        (PreEscaped("<!DOCTYPE html>"))
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width,initial-scale=1";
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                header {
+                    h1 {
+                        a href="../workflows" { "🔭 Vantage" }
+                        span.subtitle { "Harvest dashboard" }
+                    }
+                    nav {
+                        a href="../workflows" { "Workflows" }
+                        a href="../workers" { "Workers" }
+                        a href="../schedules" { "Schedules" }
+                        a href="../dead-letters" { "Dead Letters" }
+                        a href="../build-routing" { "Build Routing" }
+                        a.active href="gates" { "Gates" }
+                    }
+                }
+                main { (body) }
+                footer { "Operational dashboard — autumn-harvest" }
+            }
+        }
+    }
 }
 
 fn layout_schedules(title: &str, body: &Markup, refresh: Option<u64>) -> Markup {

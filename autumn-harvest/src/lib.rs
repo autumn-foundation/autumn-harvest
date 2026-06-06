@@ -28,6 +28,8 @@ macro_rules! cfg_db {
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
 
+/// Admission gate primitive for incident-response operators (issue #377).
+pub mod admission_gate;
 /// History analyzer and linter.
 pub mod analyzer;
 /// Audit trail for management API mutations (issue #158).
@@ -156,6 +158,10 @@ pub mod worker;
 #[cfg(feature = "db")]
 pub mod workers;
 
+pub use admission_gate::{
+    AdmissionGate, AdmissionGateCache, AdmissionGateId, AdmissionGateView, GateScope,
+    MAX_ACTIVE_GATES, check_admission,
+};
 pub use analyzer::{
     AnalyzerRule, AnalyzerWarning, ExcessiveRetriesRule, HistoryAnalyzer, LargePayloadRule,
     SuspiciousTimerRule,

@@ -8,6 +8,8 @@
 //! — it's an HTTP response wrapper. `HarvestError` converts to `AutumnError` via
 //! the blanket `From<E: Error> for AutumnError` impl automatically.
 
+use uuid::Uuid;
+
 use crate::types::{ExecutionId, ExternalSignalId};
 
 // ---------------------------------------------------------------------------
@@ -319,6 +321,24 @@ pub enum HarvestError {
         /// The activity name, when the violation is activity-scoped.
         /// `None` for workflow-input, signal-payload, and side-effect violations.
         activity_name: Option<String>,
+    },
+
+    /// A new workflow start was blocked by an active admission gate (issue #377).
+    ///
+    /// Returned by the admission check when at least one active gate matches
+    /// the incoming start request. The `gate_id` identifies which gate fired
+    /// so operators can correlate with the audit trail. Blocked callers receive
+    /// this error synchronously; no workflow execution is created and nothing
+    /// is written to `harvest_events`.
+    ///
+    /// Surfaces as `503 Service Unavailable` at the management API layer with a
+    /// JSON body containing `gate_id` and `reason`.
+    #[error("admission blocked by gate {gate_id}: {reason}")]
+    AdmissionBlocked {
+        /// The UUID of the matching admission gate.
+        gate_id: Uuid,
+        /// Human-readable reason recorded on the gate.
+        reason: String,
     },
 
     /// Delivery of a `signal_external_workflow` call failed permanently.

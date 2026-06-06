@@ -582,6 +582,43 @@ pub async fn tick_once_sharded(
 
     let metrics = Arc::clone(&registry.telemetry().metrics);
 
+    // issue #377: load active gates ONCE from the central gate store (default
+    // pool) before iterating shards. `harvest_admission_gates` is a
+    // single-shard table stored on the default shard; reading it through a
+    // per-shard connection would find an empty table on every shard 1+.
+    // Fail-closed on error: skip the entire tick so gates are never bypassed
+    // by a DB hiccup.
+    #[cfg(feature = "db")]
+    let active_gates: Vec<crate::admission_gate::AdmissionGate> = {
+        match pool.pool_for_execution(ExecutionId::new()).get().await {
+            Ok(mut gate_conn) => {
+                match crate::admission_gate::db::load_active_gates(&mut gate_conn).await {
+                    Ok(gates) => gates,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "harvest: could not load admission gates; \
+                             skipping scheduler tick (fail-closed)"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "harvest: could not acquire gate-store connection; \
+                     skipping scheduler tick (fail-closed)"
+                );
+                return Ok(());
+            }
+        }
+    };
+    // When the `db` feature is absent the gate table does not exist; use an
+    // empty slice so the downstream functions compile without gates.
+    #[cfg(not(feature = "db"))]
+    let active_gates: Vec<crate::admission_gate::AdmissionGate> = Vec::new();
+
     for (shard, shard_pool) in pool.iter_shards() {
         let mut conn = shard_pool
             .get()
@@ -607,6 +644,7 @@ pub async fn tick_once_sharded(
             dags.as_ref(),
             registry.as_ref(),
             &metrics,
+            &active_gates,
         )
         .await
         {
@@ -617,9 +655,15 @@ pub async fn tick_once_sharded(
             );
         }
 
-        if let Err(error) =
-            tick_workflow_schedules(&mut conn, shard, dags.as_ref(), registry.as_ref(), &metrics)
-                .await
+        if let Err(error) = tick_workflow_schedules(
+            &mut conn,
+            shard,
+            dags.as_ref(),
+            registry.as_ref(),
+            &metrics,
+            &active_gates,
+        )
+        .await
         {
             tracing::warn!(
                 error = %error,
@@ -1332,6 +1376,7 @@ async fn tick_workflow_schedules(
     registered_dags: &DagCatalog,
     registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+    active_gates: &[crate::admission_gate::AdmissionGate],
 ) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
 
@@ -1357,6 +1402,7 @@ async fn tick_workflow_schedules(
         let Some(logical_date) = schedule.next_run_at else {
             continue;
         };
+
         if let Some(ref dag_name) = schedule.dag_name
             && !registered_dags.contains_key(dag_name)
         {
@@ -1444,6 +1490,80 @@ async fn tick_workflow_schedules(
             continue;
         }
         metrics.record_schedule_fire_attempt(wf_name, "claimed");
+
+        // issue #377: gate check runs AFTER the HA claim to prevent every
+        // replica from independently recording a skip metric and advancing
+        // next_run_at for the same slot. Only the replica that wins the claim
+        // skips or fires the slot.
+        {
+            let queue_name = schedule.queue_name.as_deref().unwrap_or("default");
+            // Use dag_name (not wf_name) when looking up DAG metadata so that an
+            // owner-scoped gate is matched even when the workflow name differs from
+            // the DAG name (e.g. unified DAG aliases).
+            let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(wf_name.as_str());
+            let owner = registry
+                .workflows
+                .get(wf_name.as_str())
+                .and_then(|i| i.owner)
+                .or_else(|| {
+                    registered_dags
+                        .get(dag_lookup_key)
+                        .and_then(|d| d.owner.as_deref())
+                });
+            if let Some(gate) = crate::admission_gate::check_admission(
+                active_gates,
+                wf_name,
+                queue_name,
+                current_shard.as_i32(),
+                owner,
+            ) {
+                let gate_id_str = gate.id.to_string();
+                tracing::info!(
+                    workflow_name = %wf_name,
+                    gate_id = %gate_id_str,
+                    reason = %gate.reason,
+                    "harvest: schedule fire skipped due to admission gate"
+                );
+                metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
+                crate::schedule_decision::record_decision_graceful(
+                    conn,
+                    Some(&**metrics),
+                    Some(schedule.id),
+                    wf_name,
+                    "workflow",
+                    "skipped",
+                    "admission_blocked",
+                    Some(serde_json::json!({
+                        "gate_id": gate_id_str,
+                        "reason": gate.reason,
+                    })),
+                    now,
+                    now,
+                    i16::try_from(current_shard.as_i32()).unwrap_or(0),
+                )
+                .await;
+                // Advance next_run_at and clear the claim token so the next
+                // tick can re-claim this schedule immediately. Without clearing
+                // the token, the claim would block other replicas for up to the
+                // full 30 s TTL before they could re-examine the slot.
+                let next_run = next_run_after(parsed_schedule.as_ref(), now);
+                let _ = diesel::sql_query(
+                    "UPDATE harvest_schedules \
+                     SET next_run_at = $1, \
+                         updated_at = $2, \
+                         fire_claim_token = NULL, \
+                         fire_claimed_until = NULL \
+                     WHERE id = $3 AND fire_claim_token = $4",
+                )
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(next_run)
+                .bind::<diesel::sql_types::Timestamptz, _>(now)
+                .bind::<diesel::sql_types::Uuid, _>(schedule.id)
+                .bind::<diesel::sql_types::Uuid, _>(my_claim_token)
+                .execute(conn)
+                .await;
+                continue;
+            }
+        }
 
         if let Err(error) = tick_one_workflow_schedule(
             conn,
@@ -2398,6 +2518,7 @@ async fn drain_buffered_schedule_runs(
     registered_dags: &DagCatalog,
     registry: &crate::worker::HandlerRegistry,
     metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+    active_gates: &[crate::admission_gate::AdmissionGate],
 ) -> HarvestResult<()> {
     use crate::schema::harvest_schedules::dsl;
     use diesel_async::RunQueryDsl;
@@ -2454,6 +2575,37 @@ async fn drain_buffered_schedule_runs(
         }
 
         let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
+
+        // issue #377: gate check — skip draining this schedule if any active gate matches.
+        {
+            let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(wf_name.as_str());
+            let owner = registry
+                .workflows
+                .get(wf_name.as_str())
+                .and_then(|i| i.owner)
+                .or_else(|| {
+                    registered_dags
+                        .get(dag_lookup_key)
+                        .and_then(|d| d.owner.as_deref())
+                });
+            if let Some(gate) = crate::admission_gate::check_admission(
+                active_gates,
+                wf_name,
+                dispatch_queue,
+                current_shard.as_i32(),
+                owner,
+            ) {
+                tracing::info!(
+                    workflow_name = %wf_name,
+                    gate_id = %gate.id,
+                    reason = %gate.reason,
+                    "harvest: buffered drain skipped due to admission gate"
+                );
+                metrics.record_schedule_skipped("workflow", wf_name, "admission_blocked");
+                continue;
+            }
+        }
+
         let mut dispatched: u32 = 0;
 
         while dispatched < u32::try_from(available).unwrap_or(u32::MAX) && !buffered.is_empty() {

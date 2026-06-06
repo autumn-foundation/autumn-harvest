@@ -94,10 +94,16 @@ pub const OP_BUILD_COMPAT_REVOKE: &str = "build_routing.compat.revoke";
 pub const OP_CIRCUIT_FORCE_OPEN: &str = "circuit.force_open";
 /// Audit operation: Forced an activity circuit breaker closed (issue #369).
 pub const OP_CIRCUIT_FORCE_CLOSE: &str = "circuit.force_close";
+/// Audit operation: Created an admission gate (issue #377).
+pub const OP_GATE_CREATE: &str = "gate.create";
+/// Audit operation: Lifted (removed) an admission gate (issue #377).
+pub const OP_GATE_LIFT: &str = "gate.lift";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
 pub const TARGET_CIRCUIT: &str = "circuit";
+/// Audit target type for admission gate operations (issue #377).
+pub const TARGET_GATE: &str = "gate";
 pub const TARGET_WORKFLOW: &str = "workflow";
 pub const TARGET_DAG: &str = "dag";
 pub const TARGET_SCHEDULE: &str = "schedule";
@@ -233,6 +239,10 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/history/exports", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs/{token}", RouteClass::ReadOnly),
+    // Admission gates (issue #377)
+    ("GET /admin/gates", RouteClass::ReadOnly),
+    ("POST /admin/gates", RouteClass::Mutating),
+    ("DELETE /admin/gates/{id}", RouteClass::Mutating),
     ("GET /admin/schedules", RouteClass::ReadOnly),
     ("GET /admin/rate-limits", RouteClass::ReadOnly),
     ("GET /admin/audit", RouteClass::ReadOnly),
@@ -349,6 +359,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_BUILD_POLICY_SET,
     OP_BUILD_COMPAT_DECLARE,
     OP_BUILD_COMPAT_REVOKE,
+    // Admission gates (issue #377)
+    OP_GATE_CREATE,
+    OP_GATE_LIFT,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -400,6 +413,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/build-routing",
     "GET /admin/build-routing/compat",
     "POST /admin/build-routing/retire",
+    // Admission gate list is read-only.
+    "GET /admin/gates",
 ];
 
 /// Declarative manifest of every route in `harvest_api_router`.
@@ -524,6 +539,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ),
     // retire is a read-only safety check — no state is mutated.
     ("POST /admin/build-routing/retire", None),
+    // Admission gates (issue #377)
+    ("GET /admin/gates", None),
+    ("POST /admin/gates", Some(OP_GATE_CREATE)),
+    ("DELETE /admin/gates/{id}", Some(OP_GATE_LIFT)),
 ];
 
 // ── Query filters ─────────────────────────────────────────────────────────────

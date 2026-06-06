@@ -431,6 +431,26 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Admission gates that halt new workflow starts for a scoped subset of work (issue #377).
+    harvest_admission_gates (id) {
+        id -> Uuid,
+        /// Scope kind: `fleet` | `workflow_name` | `queue` | `shard_id` | `owner`
+        scope_kind -> Text,
+        /// Scope value: NULL for fleet; specific value for all other kinds.
+        scope_value -> Nullable<Text>,
+        reason -> Text,
+        message -> Nullable<Text>,
+        created_by -> Text,
+        created_at -> Timestamptz,
+        expires_at -> Nullable<Timestamptz>,
+        lifted_at -> Nullable<Timestamptz>,
+        lifted_by -> Nullable<Text>,
+    }
+}
+
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_signals -> harvest_workflow_executions (workflow_exec_id));

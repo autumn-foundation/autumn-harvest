@@ -10,8 +10,8 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_audit_log, harvest_backfill_log, harvest_batch_jobs, harvest_build_compat,
-    harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
+    harvest_admission_gates, harvest_audit_log, harvest_backfill_log, harvest_batch_jobs,
+    harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
     harvest_completion_trigger_fires, harvest_completion_trigger_outbox,
     harvest_completion_triggers, harvest_dead_letters, harvest_events, harvest_external_tasks,
     harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_signals,
@@ -861,4 +861,43 @@ pub struct NewCompletionTriggerOutboxDb {
     pub concurrency_limit: Option<i32>,
     pub priority: serde_json::Value,
     pub max_workflow_input_bytes: i64,
+}
+
+// ── AdmissionGate ─────────────────────────────────────────────────────────────
+
+/// A persisted admission gate row from `harvest_admission_gates` (issue #377).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_admission_gates)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AdmissionGateRow {
+    pub id: Uuid,
+    /// Scope kind discriminator: `"fleet"`, `"workflow_name"`, `"queue"`,
+    /// `"shard_id"`, or `"owner"`.
+    pub scope_kind: String,
+    /// Scope value: `None` for `"fleet"`, the specific string for all others.
+    pub scope_value: Option<String>,
+    pub reason: String,
+    pub message: Option<String>,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    /// `None` = no expiry; auto-ignored at/after this time.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// `None` = still active; set on lift.
+    pub lifted_at: Option<DateTime<Utc>>,
+    pub lifted_by: Option<String>,
+}
+
+/// Insert struct for creating a new admission gate.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_admission_gates)]
+pub struct NewAdmissionGateRow<'a> {
+    pub id: Uuid,
+    pub scope_kind: &'a str,
+    pub scope_value: Option<&'a str>,
+    pub reason: &'a str,
+    pub message: Option<&'a str>,
+    pub created_by: &'a str,
+    pub expires_at: Option<DateTime<Utc>>,
 }
