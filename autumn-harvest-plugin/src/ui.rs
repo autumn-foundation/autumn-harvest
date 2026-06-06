@@ -5962,7 +5962,10 @@ async fn lift_gate_ui(
         let _ = insert_audit(&mut conn, &ar).await;
     }
 
-    axum::response::Redirect::to("../../admin/gates").into_response()
+    // Correct relative target from /ui/admin/gates/{id}/lift back to the
+    // gates list at /ui/admin/gates.  "../../admin/gates" would resolve to
+    // /ui/admin/admin/gates (one "admin" too many).
+    axum::response::Redirect::to("../../gates").into_response()
 }
 
 fn render_gates_page(rows: &[autumn_harvest::models::AdmissionGateRow]) -> Markup {

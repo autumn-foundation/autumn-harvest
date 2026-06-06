@@ -6,6 +6,16 @@
 //! plugin restart; the plugin loads active gates before its worker pool starts
 //! so there is no admission window between boot and re-apply.
 //!
+//! ## Known gap — completion trigger starts
+//!
+//! Completion triggers (`completion_trigger.rs`) call
+//! `start_or_load_workflow_execution` directly in a background task, bypassing
+//! the HTTP admission-gate checks in the plugin's API handlers. A follow-up
+//! issue should pass the `AdmissionGateCache` into the completion trigger
+//! runner so that fleet/name/queue/owner gates are honoured for
+//! trigger-initiated starts during an incident. Until then, completion trigger
+//! starts are ungated.
+//!
 //! ## Scope semantics
 //!
 //! | Scope | Blocks |

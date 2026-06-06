@@ -1698,6 +1698,19 @@ async fn create_gate_handler(
 ) -> axum::response::Response {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
+    // Validate scope/value combination before parsing: fleet scope must not
+    // carry a scope_value (a caller who accidentally sends both intends a
+    // narrower scope but would create a fleet-wide gate instead).
+    if body.scope_kind == "fleet" && body.scope_value.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "scope_kind 'fleet' must not include a scope_value"
+            })),
+        )
+            .into_response();
+    }
+
     let Some(scope) = GateScope::from_db(&body.scope_kind, body.scope_value.as_deref()) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -1800,7 +1813,7 @@ async fn lift_gate_handler(
 
     let id_str = id.to_string();
     match admission_gate_db::lift_gate(&mut conn, id, &actor).await {
-        Ok(Some(gate)) => {
+        Ok(Some(_gate)) => {
             // Refresh the in-process cache immediately.
             if let Ok(fresh) = admission_gate_db::load_active_gates(&mut conn).await {
                 api_state.gate_cache().refresh(fresh);
@@ -1821,13 +1834,11 @@ async fn lift_gate_handler(
             };
             let _ = audit::insert_audit(&mut conn, &ar).await;
 
-            (StatusCode::OK, Json(AdmissionGateView::from(gate))).into_response()
+            (StatusCode::OK, Json(serde_json::json!({ "lifted": true }))).into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "gate not found or already lifted" })),
-        )
-            .into_response(),
+        // Gate not found or already lifted — return lifted:false for idempotent
+        // cleanup; callers do not need to pre-check existence before lifting.
+        Ok(None) => (StatusCode::OK, Json(serde_json::json!({ "lifted": false }))).into_response(),
         Err(e) => AutumnError::internal_server_error(e).into_response(),
     }
 }

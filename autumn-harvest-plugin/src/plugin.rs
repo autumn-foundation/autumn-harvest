@@ -478,11 +478,32 @@ async fn start_harvest_runtime(
                     () = cancel_for_task.cancelled() => return,
                     () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                 }
-                if let Ok(mut conn) = acquire_conn(&pool).await
-                    && let Ok(gates) =
-                        autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await
-                {
-                    cache.refresh(gates);
+                // Fail-closed on any error: if the gate table is
+                // unreadable the cache transitions to uninitialized so
+                // check() blocks new starts rather than silently admitting
+                // them with a stale open snapshot.
+                match acquire_conn(&pool).await {
+                    Ok(mut conn) => {
+                        match autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await
+                        {
+                            Ok(gates) => cache.refresh(gates),
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "admission gate refresh failed; entering fail-closed mode"
+                                );
+                                cache.set_fail_closed();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "admission gate refresh: could not acquire DB connection; \
+                             entering fail-closed mode"
+                        );
+                        cache.set_fail_closed();
+                    }
                 }
             }
         });
