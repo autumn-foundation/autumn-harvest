@@ -3312,7 +3312,10 @@ impl WorkflowContext {
             );
             // Propagate workflow_id for logger correlation. Arc was just created;
             // no other reference exists yet so get_mut always succeeds.
-            std::sync::Arc::get_mut(&mut ctx).unwrap().workflow_id.clone_from(&workflow_id);
+            std::sync::Arc::get_mut(&mut ctx)
+                .unwrap()
+                .workflow_id
+                .clone_from(&workflow_id);
             handler_fn(ctx, input)
         });
 
@@ -3369,7 +3372,10 @@ impl WorkflowContext {
                 self.cancellation_reason.clone(),
                 std::sync::Arc::clone(&self.state),
             );
-            std::sync::Arc::get_mut(&mut ctx).unwrap().workflow_id.clone_from(&self.workflow_id);
+            std::sync::Arc::get_mut(&mut ctx)
+                .unwrap()
+                .workflow_id
+                .clone_from(&self.workflow_id);
             h(ctx, input)
         })
     }
