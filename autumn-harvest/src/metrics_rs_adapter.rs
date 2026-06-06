@@ -95,12 +95,7 @@ impl MetricsRecorder for MetricsRsRecorder {
         .record(duration_secs);
     }
 
-    fn record_workflow_terminal(
-        &self,
-        workflow_name: &str,
-        queue: &str,
-        outcome: WorkflowStatus,
-    ) {
+    fn record_workflow_terminal(&self, workflow_name: &str, queue: &str, outcome: WorkflowStatus) {
         counter!(
             METRIC_WORKFLOW_TERMINAL,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),

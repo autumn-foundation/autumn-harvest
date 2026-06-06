@@ -634,12 +634,7 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter [`METRIC_WORKFLOW_TERMINAL`] with labels
     /// `workflow`, `queue`, and `outcome`.
     /// Per ADR-0001 §7, `execution.id` must never be a label here.
-    fn record_workflow_terminal(
-        &self,
-        workflow_name: &str,
-        queue: &str,
-        outcome: WorkflowStatus,
-    ) {
+    fn record_workflow_terminal(&self, workflow_name: &str, queue: &str, outcome: WorkflowStatus) {
         let _ = (workflow_name, queue, outcome);
     }
 
@@ -1177,12 +1172,7 @@ mod tests {
         struct TerminalCounter(AtomicUsize);
 
         impl MetricsRecorder for TerminalCounter {
-            fn record_workflow_terminal(
-                &self,
-                _wf: &str,
-                _q: &str,
-                outcome: WorkflowStatus,
-            ) {
+            fn record_workflow_terminal(&self, _wf: &str, _q: &str, outcome: WorkflowStatus) {
                 // The counter should fire exactly once per terminal outcome
                 // and never for Suspended.
                 assert!(
