@@ -1,8 +1,8 @@
 /// Tests for issue #379: replay-safe workflow logger.
 ///
 /// Red phase: these tests define the expected behaviour before implementation.
-/// They fail until WorkflowLogger, ctx.logger(), ctx.log_info/warn/error(),
-/// and guardrail rule HVG009 are in place.
+/// They fail until `WorkflowLogger`, `ctx.logger()`, `ctx.log_info`, `ctx.log_warn`,
+/// `ctx.log_error`, and guardrail rule HVG009 are in place.
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -22,27 +22,18 @@ use tracing_subscriber::layer::SubscriberExt;
 /// A visitor that extracts string values from tracing event fields.
 struct FieldCapture {
     pub fields: std::collections::HashMap<String, String>,
-    pub message: String,
 }
 
 impl tracing::field::Visit for FieldCapture {
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-        } else {
-            self.fields
-                .insert(field.name().to_string(), value.to_string());
-        }
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         let s = format!("{value:?}");
-        let clean = s.trim_matches('"').to_string();
-        if field.name() == "message" {
-            self.message = clean;
-        } else {
-            self.fields.insert(field.name().to_string(), clean);
-        }
+        self.fields
+            .insert(field.name().to_string(), s.trim_matches('"').to_string());
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
@@ -55,9 +46,7 @@ impl tracing::field::Visit for FieldCapture {
 #[derive(Debug)]
 struct CapturedEvent {
     pub level: String,
-    pub target: String,
     pub fields: std::collections::HashMap<String, String>,
-    pub message: String,
 }
 
 /// A `tracing_subscriber::Layer` that records events from the workflow logger.
@@ -78,14 +67,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturingLayer {
         }
         let mut visitor = FieldCapture {
             fields: std::collections::HashMap::new(),
-            message: String::new(),
         };
         event.record(&mut visitor);
         self.captured.lock().unwrap().push(CapturedEvent {
             level: meta.level().to_string(),
-            target: meta.target().to_string(),
             fields: visitor.fields,
-            message: visitor.message,
         });
     }
 }
@@ -119,7 +105,7 @@ fn logging_workflow_via_logger<'a>(
     })
 }
 
-/// Workflow that calls `ctx.log_info/warn/error` convenience methods once, then suspends.
+/// Workflow that calls `ctx.log_info`, `ctx.log_warn`, `ctx.log_error` convenience methods once, then suspends.
 fn logging_workflow_direct<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -159,7 +145,7 @@ fn multi_suspend_logging_workflow<'a>(
     })
 }
 
-/// Build a fully-completed history for multi_suspend_logging_workflow.
+/// Build a fully-completed history for `multi_suspend_logging_workflow`.
 fn make_full_history() -> Vec<WorkflowEvent> {
     let act1 = ActivityExecId::new();
     let act2 = ActivityExecId::new();
@@ -256,12 +242,10 @@ async fn logger_emits_event_in_live_mode() {
         "expected suspension, got {outcome:?}"
     );
 
-    let events = captured.lock().unwrap();
+    let event_count = captured.lock().unwrap().len();
     assert_eq!(
-        events.len(),
-        1,
-        "expected exactly 1 log event in live mode, got {}",
-        events.len()
+        event_count, 1,
+        "expected exactly 1 log event in live mode, got {event_count}"
     );
 }
 
@@ -293,12 +277,10 @@ async fn logger_suppresses_events_during_full_replay() {
         "expected completion, got {outcome:?}"
     );
 
-    let events = captured.lock().unwrap();
+    let event_count = captured.lock().unwrap().len();
     assert_eq!(
-        events.len(),
-        0,
-        "expected 0 log events during full replay, got {}",
-        events.len()
+        event_count, 0,
+        "expected 0 log events during full replay, got {event_count}"
     );
 }
 
@@ -330,12 +312,10 @@ async fn direct_log_methods_suppressed_during_replay() {
         "expected completion, got {outcome:?}"
     );
 
-    let events = captured.lock().unwrap();
+    let event_count = captured.lock().unwrap().len();
     assert_eq!(
-        events.len(),
-        0,
-        "expected 0 log events during full replay, got {}",
-        events.len()
+        event_count, 0,
+        "expected 0 log events during full replay, got {event_count}"
     );
 }
 
@@ -354,13 +334,11 @@ async fn direct_log_methods_emit_in_live_mode() {
         "expected suspension, got {outcome:?}"
     );
 
-    let events = captured.lock().unwrap();
     // log_info + log_warn + log_error = 3 events
+    let event_count = captured.lock().unwrap().len();
     assert_eq!(
-        events.len(),
-        3,
-        "expected 3 log events (info + warn + error) in live mode, got {}",
-        events.len()
+        event_count, 3,
+        "expected 3 log events (info + warn + error) in live mode, got {event_count}"
     );
 }
 
@@ -373,8 +351,8 @@ async fn log_events_independent_of_replay_cycle_count() {
     let exec_id = ExecutionId::new();
 
     // ── First pass: live execution (only WorkflowStarted → suspension) ──
-    let (captured, _guard) = install_capture();
-    {
+    let first_pass_count = {
+        let (captured, _guard) = install_capture();
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
@@ -387,17 +365,17 @@ async fn log_events_independent_of_replay_cycle_count() {
         )
         .await;
         assert!(matches!(outcome, WorkflowOutcome::Suspended { .. }));
-    }
-    let first_pass_count = captured.lock().unwrap().len();
+        captured.lock().unwrap().len()
+        // _guard drops here, uninstalling the first subscriber
+    };
     assert_eq!(
         first_pass_count, 1,
         "live pass must emit exactly 1 log event"
     );
-    drop(_guard);
 
     // ── Replay pass: full history with all 3 activities already completed ──
-    let (captured2, _guard2) = install_capture();
-    {
+    let replay_count = {
+        let (captured2, _guard2) = install_capture();
         let history = make_full_history();
         let outcome = run_workflow(
             exec_id,
@@ -410,8 +388,9 @@ async fn log_events_independent_of_replay_cycle_count() {
             matches!(outcome, WorkflowOutcome::Completed { .. }),
             "expected completion on full history replay"
         );
-    }
-    let replay_count = captured2.lock().unwrap().len();
+        captured2.lock().unwrap().len()
+        // _guard2 drops here
+    };
     assert_eq!(
         replay_count, 0,
         "replay pass must emit 0 log events, got {replay_count}"
@@ -434,12 +413,18 @@ fn logger_emits_execution_id_field() {
     let (captured, _guard) = install_capture();
     ctx.logger().info("test message");
 
-    let events = captured.lock().unwrap();
-    let event = events.first().expect("expected one log event");
+    let (has_exec_id, keys_str) = captured
+        .lock()
+        .unwrap()
+        .first()
+        .map(|e| {
+            let keys: Vec<_> = e.fields.keys().collect();
+            (e.fields.contains_key("execution_id"), format!("{keys:?}"))
+        })
+        .expect("expected one log event");
     assert!(
-        event.fields.contains_key("execution_id"),
-        "expected execution_id field, got fields: {:?}",
-        event.fields.keys().collect::<Vec<_>>()
+        has_exec_id,
+        "expected execution_id field, got fields: {keys_str}"
     );
 }
 
@@ -458,13 +443,21 @@ fn logger_emits_workflow_type_field() {
     let (captured, _guard) = install_capture();
     ctx.logger().info("field test");
 
-    let events = captured.lock().unwrap();
-    let event = events.first().expect("expected one log event");
+    let (wf_type, fields_str) = captured
+        .lock()
+        .unwrap()
+        .first()
+        .map(|e| {
+            (
+                e.fields.get("workflow_type").cloned(),
+                format!("{:?}", e.fields),
+            )
+        })
+        .expect("expected one log event");
     assert_eq!(
-        event.fields.get("workflow_type").map(|s| s.as_str()),
+        wf_type.as_deref(),
         Some("my_workflow"),
-        "expected workflow_type = my_workflow, got: {:?}",
-        event.fields
+        "expected workflow_type = my_workflow, got: {fields_str}"
     );
 }
 
@@ -482,13 +475,16 @@ fn logger_emits_replay_false_field() {
     let (captured, _guard) = install_capture();
     ctx.logger().info("replay field test");
 
-    let events = captured.lock().unwrap();
-    let event = events.first().expect("expected one log event");
+    let (replay_val, fields_str) = captured
+        .lock()
+        .unwrap()
+        .first()
+        .map(|e| (e.fields.get("replay").cloned(), format!("{:?}", e.fields)))
+        .expect("expected one log event");
     assert_eq!(
-        event.fields.get("replay").map(|s| s.as_str()),
+        replay_val.as_deref(),
         Some("false"),
-        "expected replay = false, got: {:?}",
-        event.fields
+        "expected replay = false, got: {fields_str}"
     );
 }
 
@@ -507,13 +503,21 @@ fn logger_emits_workflow_id_field() {
     let (captured, _guard) = install_capture();
     ctx.logger().info("workflow_id field test");
 
-    let events = captured.lock().unwrap();
-    let event = events.first().expect("expected one log event");
+    let (wf_id, fields_str) = captured
+        .lock()
+        .unwrap()
+        .first()
+        .map(|e| {
+            (
+                e.fields.get("workflow_id").cloned(),
+                format!("{:?}", e.fields),
+            )
+        })
+        .expect("expected one log event");
     assert_eq!(
-        event.fields.get("workflow_id").map(|s| s.as_str()),
+        wf_id.as_deref(),
         Some("order-42"),
-        "expected workflow_id = order-42, got: {:?}",
-        event.fields
+        "expected workflow_id = order-42, got: {fields_str}"
     );
 }
 
@@ -533,11 +537,19 @@ fn log_level_matches_method() {
     ctx.logger().warn("warn msg");
     ctx.logger().error("error msg");
 
-    let events = captured.lock().unwrap();
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0].level, "INFO");
-    assert_eq!(events[1].level, "WARN");
-    assert_eq!(events[2].level, "ERROR");
+    let (len, l0, l1, l2) = {
+        let events = captured.lock().unwrap();
+        (
+            events.len(),
+            events[0].level.clone(),
+            events[1].level.clone(),
+            events[2].level.clone(),
+        )
+    };
+    assert_eq!(len, 3);
+    assert_eq!(l0, "INFO");
+    assert_eq!(l1, "WARN");
+    assert_eq!(l2, "ERROR");
 }
 
 // ── Tests: guardrail catalog HVG009 ──────────────────────────────────────────
@@ -654,11 +666,9 @@ async fn replayer_produces_zero_log_events() {
         "replay must succeed, got: {report}"
     );
 
-    let events = captured.lock().unwrap();
+    let event_count = captured.lock().unwrap().len();
     assert_eq!(
-        events.len(),
-        0,
-        "WorkflowReplayer must produce 0 log events (pure replay), got {}",
-        events.len()
+        event_count, 0,
+        "WorkflowReplayer must produce 0 log events (pure replay), got {event_count}"
     );
 }
