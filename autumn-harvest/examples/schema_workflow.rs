@@ -15,6 +15,13 @@
 //! Run with:
 //!   cargo run --example schema_workflow --features schema
 
+#![allow(
+    clippy::unused_async,
+    clippy::doc_markdown,
+    clippy::missing_errors_doc,
+    clippy::used_underscore_binding
+)]
+
 use autumn_harvest::info::RegisteredWorkflowRecord;
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};

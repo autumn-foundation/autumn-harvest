@@ -179,7 +179,7 @@ pub use context::{
     WorkflowHistoryPolicy,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
-pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
+pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagMapTaskRef, DagTask, DagTaskRef};
 pub use dag_export::{export_dot, export_mermaid};
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
@@ -228,7 +228,8 @@ pub use info::{
 pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
 pub use policy::validate_schedule;
 pub use policy::{
-    OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule, WorkflowSchedule,
+    MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule,
+    WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;

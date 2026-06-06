@@ -894,6 +894,38 @@ impl HistoryMatcher {
         result
     }
 
+    /// Count occurrences of `ActivityScheduled` events for a mapped activity
+    /// starting from the current cursor before the first corresponding completion/failure/timeout.
+    #[must_use]
+    pub fn count_mapped_scheduled(&self, activity_name: &str) -> usize {
+        let mut count = 0;
+        let mut scan_cursor = self.cursor;
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+            match &self.events[scan_cursor] {
+                WorkflowEvent::ActivityScheduled { name, .. } if name == activity_name => {
+                    count += 1;
+                }
+                WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. } => {
+                    let aid = *activity_id;
+                    if self.events.iter().any(|e| {
+                        matches!(e, WorkflowEvent::ActivityScheduled { activity_id: id, name, .. } if *id == aid && name == activity_name)
+                    }) {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            scan_cursor += 1;
+        }
+        count
+    }
+
     /// Match an `execute_activity` command against history.
     ///
     /// Expects `ActivityScheduled { name }` at the current cursor position,
