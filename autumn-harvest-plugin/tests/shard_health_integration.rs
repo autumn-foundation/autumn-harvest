@@ -176,6 +176,7 @@ fn activity_info(queue: Option<&'static str>) -> ActivityInfo {
         default_start_to_close: None,
         default_heartbeat_timeout: None,
         default_schedule_to_start: None,
+        default_schedule_to_close: None,
         default_queue: queue,
         max_concurrent: None,
         concurrency_key: None,

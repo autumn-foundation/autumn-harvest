@@ -92,7 +92,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
     "\n",
-    include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql")
+    include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
+    include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
+    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql")
 );
 
 // -------------------------------------------------------------------------
@@ -242,6 +244,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 default_start_to_close: None,
                 default_heartbeat_timeout: None,
                 default_schedule_to_start: None,
+                default_schedule_to_close: None,
                 default_queue: Some("default"),
                 max_concurrent: None,
                 concurrency_key: None,
@@ -261,6 +264,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 default_start_to_close: None,
                 default_heartbeat_timeout: None,
                 default_schedule_to_start: None,
+                default_schedule_to_close: None,
                 default_queue: Some("default"),
                 max_concurrent: None,
                 concurrency_key: None,

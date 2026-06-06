@@ -614,6 +614,15 @@ pub struct ActivityInfo {
     /// `max_concurrent` budget. Defaults to the activity's own name when
     /// `max_concurrent` is set and `concurrency_key` is not specified.
     pub concurrency_key: Option<&'static str>,
+    /// Default schedule-to-close timeout: maximum wall-clock duration for the
+    /// entire activity across all retry attempts and back-off sleeps combined.
+    ///
+    /// `None` = no total deadline; the retry policy's `max_attempts` is the
+    /// only bound (today's unbounded behaviour).
+    ///
+    /// Declared via `#[activity(schedule_to_close = "5m")]`.
+    /// **Not supported on local activities** — the macro rejects it at compile time.
+    pub default_schedule_to_close: Option<Duration>,
     /// When `true`, the worker runs this activity inline on the workflow task
     /// (never enqueued). Local activities must not set `heartbeat_timeout`,
     /// `schedule_to_start`, or `queue` — the macro enforces this at compile time.
@@ -787,6 +796,7 @@ impl std::fmt::Debug for ActivityInfo {
             .field("default_start_to_close", &self.default_start_to_close)
             .field("default_heartbeat_timeout", &self.default_heartbeat_timeout)
             .field("default_schedule_to_start", &self.default_schedule_to_start)
+            .field("default_schedule_to_close", &self.default_schedule_to_close)
             .field("default_queue", &self.default_queue)
             .field("max_concurrent", &self.max_concurrent)
             .field("concurrency_key", &self.concurrency_key)
@@ -1150,6 +1160,7 @@ mod tests {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
@@ -1178,6 +1189,7 @@ mod tests {
             default_start_to_close: Some(std::time::Duration::from_secs(10)),
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
@@ -1214,6 +1226,7 @@ mod tests {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: Some(5),
             concurrency_key: Some("email"),
@@ -1228,6 +1241,68 @@ mod tests {
         };
         assert_eq!(info.max_concurrent, Some(5));
         assert_eq!(info.concurrency_key, Some("email"));
+    }
+
+    // ── Issue #378: schedule_to_close ────────────────────────────────────────
+
+    #[test]
+    fn activity_info_schedule_to_close_field_accessible() {
+        let info = ActivityInfo {
+            name: "payment_auth",
+            module: "my_app::activities",
+            default_retry_policy: None,
+            default_start_to_close: Some(std::time::Duration::from_secs(30)),
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: Some(std::time::Duration::from_secs(300)),
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        assert_eq!(
+            info.default_schedule_to_close,
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            info.default_start_to_close,
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn activity_info_schedule_to_close_none_by_default() {
+        let info = ActivityInfo {
+            name: "simple_activity",
+            module: "my_app::activities",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        assert!(
+            info.default_schedule_to_close.is_none(),
+            "activities without schedule_to_close must have None (unbounded)"
+        );
     }
 
     #[test]
@@ -1296,6 +1371,7 @@ mod tests {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,

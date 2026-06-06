@@ -140,8 +140,10 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
     ),
-    "\n",
-    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
+    include_str!(
+        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
+    )
 );
 type HarvestApiApp = axum::Router;
 
@@ -424,6 +426,7 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         default_start_to_close: None,
         default_heartbeat_timeout: None,
         default_schedule_to_start: None,
+        default_schedule_to_close: None,
         default_queue: Some("default"),
         max_concurrent: None,
         concurrency_key: None,
@@ -446,6 +449,7 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         default_start_to_close: Some(start_to_close),
         default_heartbeat_timeout: None,
         default_schedule_to_start: None,
+        default_schedule_to_close: None,
         default_queue: Some("default"),
         max_concurrent: None,
         concurrency_key: None,
@@ -4679,6 +4683,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,

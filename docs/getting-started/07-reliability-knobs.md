@@ -33,6 +33,43 @@ WorkerConfig::default().queues(vec!["default", "email-workers"])
 Useful when one activity class (e.g. PDF rendering) needs its own resource
 budget or its own scaling group.
 
+**Cross-retry wall-clock deadline (`schedule_to_close`).** All three
+per-attempt timeouts (`start_to_close`, `schedule_to_start`, `heartbeat_timeout`)
+bound a single attempt. Use `schedule_to_close` when you need a hard ceiling
+on the *total* time an activity may consume across every attempt and all
+back-off sleeps combined:
+
+```rust
+#[activity(
+    schedule_to_close = "5m",   // total budget: 5 minutes from first enqueue
+    start_to_close   = "30s",   // each attempt: 30 s
+    retry = RetryPolicy::exponential(10, Duration::from_secs(1)),
+)]
+async fn call_payment_api(ctx: &ActivityContext, req: PaymentRequest)
+    -> Result<PaymentId, String> { … }
+```
+
+If the deadline elapses while the task is queued (PENDING) or running (RUNNING),
+the timeout scanner appends `ActivityTimedOut { ScheduleToClose }` to history
+and fails the task. If the deadline would be exceeded by the next retry's
+back-off delay, the retry is skipped and the same event is appended instead of
+requeuing — so the workflow sees a clean `HarvestError::Timeout { ScheduleToClose }`
+rather than an exhausted-retry failure.
+
+**Decision matrix — which timeout to use:**
+
+| Scenario | Use |
+|---|---|
+| Bound a single attempt | `start_to_close` |
+| Bound queue wait before first attempt | `schedule_to_start` |
+| Detect a stuck activity (liveness) | `heartbeat_timeout` |
+| Bound all attempts + back-off combined | `schedule_to_close` |
+| Bound the whole workflow end-to-end | `#[workflow(execution_timeout = "…")]` |
+
+`schedule_to_close` does **not** support local activities (rejected at compile
+time with a clear error). Local activities are fast in-process work; use
+`start_to_close` + a low retry count instead.
+
 **Workflow versioning.** When you change an in-flight workflow's logic,
 fence the divergence with `ctx.version()` so old executions replay their
 recorded path while new executions take the new branch:

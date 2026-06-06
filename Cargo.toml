@@ -33,7 +33,7 @@ tracing = "0.1"
 futures = "0.3"
 
 # Database
-diesel = { version = "2.3", features = ["postgres_backend", "uuid", "chrono", "serde_json"] }
+diesel = { version = "2.3", features = ["postgres_backend", "uuid", "chrono", "serde_json", "64-column-tables"] }
 diesel-async = { version = "0.8", features = ["deadpool", "postgres"] }
 diesel_migrations = "2"
 deadpool = "0.13"

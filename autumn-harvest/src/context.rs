@@ -6342,6 +6342,7 @@ mod tests {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,

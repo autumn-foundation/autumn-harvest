@@ -224,6 +224,10 @@ pub struct TaskQueueItem {
     /// a dead worker without it having completed. When it reaches the
     /// configured poison-pill threshold the task is quarantined to the DLQ.
     pub crash_strikes: i32,
+    /// Absolute UTC deadline for the total activity lifetime across all retry
+    /// attempts (issue #378). Set once at initial enqueue; never refreshed on
+    /// retry. NULL = no total deadline (unbounded retries).
+    pub schedule_to_close_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -255,6 +259,9 @@ pub struct NewTaskQueueItem<'a> {
     pub required_build_id: Option<&'a str>,
     /// Optional rate limit key to throttle execution throughput.
     pub rate_limit_key: Option<&'a str>,
+    /// Absolute UTC deadline for the total activity lifetime (issue #378).
+    /// NULL = no total deadline enforced.
+    pub schedule_to_close_at: Option<DateTime<Utc>>,
 }
 
 /// Database representation of a rate limit bucket.

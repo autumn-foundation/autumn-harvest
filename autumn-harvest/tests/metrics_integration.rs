@@ -91,7 +91,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
     "\n",
-    include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql")
+    include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
+    include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
+    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql")
 );
 
 // ---------------------------------------------------------------------------
@@ -657,6 +659,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
@@ -1263,6 +1266,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: Some("unpolled"),
             max_concurrent: None,
             concurrency_key: None,
@@ -1441,6 +1445,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             default_start_to_close: Some(Duration::from_secs(5)),
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
@@ -1782,6 +1787,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             default_start_to_close: Some(Duration::from_secs(5)),
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
