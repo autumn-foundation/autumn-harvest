@@ -585,7 +585,15 @@ async fn enforce_activity_timeout(
     // handler-result path never sees (the worker may be gone). Record it
     // out-of-band so a hanging downstream trips the breaker just like an
     // explicit error would.
+    //
+    // ScheduleToClose on a PENDING task means the activity sat in the queue
+    // until its total deadline elapsed without any handler being dispatched.
+    // No downstream call was made, so the breaker must NOT be fed — a backlog
+    // spike would otherwise incorrectly open the circuit.
+    let downstream_call_made =
+        matches!(reason, TimeoutReason::ScheduleToClose) && task.state == "PENDING";
     if enforced
+        && !downstream_call_made
         && let Some(breakers) = circuit_breakers
         && breakers.on_external_failure(activity_name, std::time::Instant::now())
             == Some(crate::circuit_breaker::CircuitTransition::Tripped)

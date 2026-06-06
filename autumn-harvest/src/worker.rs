@@ -1237,6 +1237,13 @@ async fn run_local_activity_inline(
     let activity = registry.activities.get(&run.name).ok_or_else(|| {
         HarvestError::Config(format!("no activity handler registered for '{}'", run.name))
     })?;
+    if activity.default_schedule_to_close.is_some() {
+        return Err(HarvestError::Config(format!(
+            "activity '{}' is local but has schedule_to_close set; \
+             local activities do not support schedule_to_close (use start_to_close instead)",
+            run.name
+        )));
+    }
     let history_event_hard_cap = registry.history_policy().event_hard_cap();
 
     let per_attempt_timeout = run

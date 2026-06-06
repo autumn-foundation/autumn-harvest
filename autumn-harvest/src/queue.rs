@@ -355,6 +355,10 @@ pub async fn claim_task(
                AND state = 'PENDING' \
                AND scheduled_at <= NOW() \
                AND ( \
+                   schedule_to_close_at IS NULL \
+                   OR schedule_to_close_at > NOW() \
+               ) \
+               AND ( \
                    sticky_worker_id IS NULL \
                    OR sticky_worker_id = $1 \
                    OR sticky_until IS NULL \
