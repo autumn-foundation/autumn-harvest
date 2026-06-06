@@ -252,12 +252,19 @@ const RULES: &[Rule] = &[
         id: "DET009",
         severity: DetSeverity::Warning,
         patterns: &[
+            // Fully-qualified spellings
             "tracing::info!(",
             "tracing::warn!(",
             "tracing::error!(",
             "tracing::debug!(",
             "tracing::trace!(",
             "tracing::event!(",
+            // Imported spellings — `use tracing::{info, warn, …}` then bare call
+            "info!(",
+            "warn!(",
+            "error!(",
+            "debug!(",
+            "trace!(",
         ],
         message: "Bare tracing macro inside a workflow function fires once per replay cycle. \
                   A workflow that suspends N times will emit N copies of this log line, \
