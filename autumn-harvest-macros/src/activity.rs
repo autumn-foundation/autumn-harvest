@@ -11,6 +11,8 @@ struct ActivityAttrs {
     start_to_close: Option<String>,
     heartbeat_timeout: Option<String>,
     schedule_to_start: Option<String>,
+    /// Maximum total wall-clock duration across all retry attempts (issue #378).
+    schedule_to_close: Option<String>,
     queue: Option<String>,
     max_concurrent: Option<u32>,
     concurrency_key: Option<String>,
@@ -34,6 +36,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         start_to_close: None,
         heartbeat_timeout: None,
         schedule_to_start: None,
+        schedule_to_close: None,
         queue: None,
         max_concurrent: None,
         concurrency_key: None,
@@ -64,6 +67,10 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         } else if meta.path.is_ident("schedule_to_start") {
             let value: LitStr = meta.value()?.parse()?;
             result.schedule_to_start = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("schedule_to_close") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.schedule_to_close = Some(value.value());
             Ok(())
         } else if meta.path.is_ident("queue") {
             let value: LitStr = meta.value()?.parse()?;
@@ -142,8 +149,8 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         } else {
             Err(meta.error(
                 "unsupported attribute: expected retry, start_to_close, heartbeat_timeout, \
-                 schedule_to_start, queue, max_concurrent, concurrency_key, local, \
-                 max_input_bytes, max_result_bytes, rate_limit_rps, rate_limit_burst, \
+                 schedule_to_start, schedule_to_close, queue, max_concurrent, concurrency_key, \
+                 local, max_input_bytes, max_result_bytes, rate_limit_rps, rate_limit_burst, \
                  rate_limit_key, or circuit_breaker",
             ))
         }
@@ -255,6 +262,15 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             )
             .to_compile_error();
         }
+        if attrs.schedule_to_close.is_some() {
+            return syn::Error::new_spanned(
+                input_fn.sig.fn_token,
+                "local activities do not support schedule_to_close; \
+                 local activities run inline on the workflow worker and do not go \
+                 through the durable task queue that tracks the cross-retry deadline",
+            )
+            .to_compile_error();
+        }
     }
 
     let fn_name = &input_fn.sig.ident;
@@ -284,6 +300,14 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     let schedule_to_start_expr = attrs.schedule_to_start.as_deref().map_or_else(
+        || quote! { None },
+        |s| {
+            let d = duration_expr(s);
+            quote! { Some(#d) }
+        },
+    );
+
+    let schedule_to_close_expr = attrs.schedule_to_close.as_deref().map_or_else(
         || quote! { None },
         |s| {
             let d = duration_expr(s);
@@ -430,6 +454,7 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 default_start_to_close: #start_to_close_expr,
                 default_heartbeat_timeout: #heartbeat_timeout_expr,
                 default_schedule_to_start: #schedule_to_start_expr,
+                default_schedule_to_close: #schedule_to_close_expr,
                 default_queue: #queue_expr,
                 max_concurrent: #max_concurrent_expr,
                 concurrency_key: #concurrency_key_expr,

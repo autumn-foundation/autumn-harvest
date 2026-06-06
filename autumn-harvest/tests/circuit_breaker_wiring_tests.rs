@@ -161,6 +161,7 @@ fn local_activity_circuit_breaker_is_not_tracked() {
         default_start_to_close: Some(Duration::from_secs(5)),
         default_heartbeat_timeout: None,
         default_schedule_to_start: None,
+        default_schedule_to_close: None,
         default_queue: None,
         max_concurrent: None,
         concurrency_key: None,

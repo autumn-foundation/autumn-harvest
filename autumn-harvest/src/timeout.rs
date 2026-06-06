@@ -41,6 +41,11 @@ pub enum TimeoutReason {
     StartToClose,
     /// Task has been PENDING longer than its `schedule_to_start` limit.
     ScheduleToStart,
+    /// The cross-retry wall-clock deadline (`schedule_to_close_at`) has elapsed.
+    ///
+    /// Fires for both RUNNING tasks (mid-execution) and PENDING tasks (queued
+    /// but deadline already expired before a worker could claim the task).
+    ScheduleToClose,
 }
 
 impl std::fmt::Display for TimeoutReason {
@@ -49,6 +54,7 @@ impl std::fmt::Display for TimeoutReason {
             Self::Heartbeat => write!(f, "Heartbeat"),
             Self::StartToClose => write!(f, "StartToClose"),
             Self::ScheduleToStart => write!(f, "ScheduleToStart"),
+            Self::ScheduleToClose => write!(f, "ScheduleToClose"),
         }
     }
 }
@@ -59,6 +65,7 @@ impl TimeoutReason {
             Self::Heartbeat => TimeoutType::Heartbeat,
             Self::StartToClose => TimeoutType::StartToClose,
             Self::ScheduleToStart => TimeoutType::ScheduleToStart,
+            Self::ScheduleToClose => TimeoutType::ScheduleToClose,
         }
     }
 }
@@ -107,6 +114,25 @@ pub const fn schedule_to_start_timeout_query() -> &'static str {
      WHERE state = 'PENDING' \
      AND schedule_to_start IS NOT NULL \
      AND scheduled_at + schedule_to_start < NOW()"
+}
+
+/// SQL query to find RUNNING or PENDING tasks that exceeded their total
+/// schedule-to-close wall-clock deadline (issue #378).
+///
+/// A task is considered schedule-to-close-timed-out when:
+/// - `state IN ('RUNNING', 'PENDING')`
+/// - `schedule_to_close_at IS NOT NULL`
+/// - `schedule_to_close_at < NOW()`
+///
+/// Fires for in-flight executions (RUNNING) and tasks queued past their
+/// deadline (PENDING). The partial index on `schedule_to_close_at` makes
+/// this scan cheap.
+#[must_use]
+pub const fn schedule_to_close_timeout_query() -> &'static str {
+    "SELECT * FROM harvest_task_queue \
+     WHERE state IN ('RUNNING', 'PENDING') \
+     AND schedule_to_close_at IS NOT NULL \
+     AND schedule_to_close_at < NOW()"
 }
 
 /// SQL query to find RUNNING workflow executions that have exceeded their
@@ -172,6 +198,18 @@ pub async fn find_timed_out_tasks(
     for task in sched_start_tasks {
         if seen.insert(task.id) {
             results.push((task, TimeoutReason::ScheduleToStart));
+        }
+    }
+
+    // Schedule-to-close timeouts (cross-retry wall-clock deadline, issue #378)
+    let sched_close_tasks: Vec<TaskQueueItem> =
+        diesel::sql_query(schedule_to_close_timeout_query())
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    for task in sched_close_tasks {
+        if seen.insert(task.id) {
+            results.push((task, TimeoutReason::ScheduleToClose));
         }
     }
 
@@ -342,10 +380,19 @@ async fn task_state_for_update(
         .map_err(crate::error::database_error)
 }
 
-const fn expected_task_state_for_timeout(reason: &TimeoutReason) -> &'static str {
+/// Returns the set of task states that are valid for a given timeout reason.
+///
+/// `enforce_activity_timeout` skips rows whose current state is not in this
+/// set, guarding against double-enforcement races (e.g. two scanner ticks
+/// racing on the same row, or a worker completing a task between the scan
+/// and enforcement).
+fn expected_task_states_for_timeout(reason: &TimeoutReason) -> &'static [&'static str] {
     match reason {
-        TimeoutReason::Heartbeat | TimeoutReason::StartToClose => "RUNNING",
-        TimeoutReason::ScheduleToStart => "PENDING",
+        TimeoutReason::Heartbeat | TimeoutReason::StartToClose => &["RUNNING"],
+        TimeoutReason::ScheduleToStart => &["PENDING"],
+        // ScheduleToClose fires for both: mid-execution (RUNNING) and queued
+        // past the deadline before any worker claimed it (PENDING).
+        TimeoutReason::ScheduleToClose => &["RUNNING", "PENDING"],
     }
 }
 
@@ -506,7 +553,7 @@ async fn enforce_activity_timeout(
                 let Some(state) = task_state_for_update(conn, task.id).await? else {
                     return Ok(false);
                 };
-                if state != expected_task_state_for_timeout(reason) {
+                if !expected_task_states_for_timeout(reason).contains(&state.as_str()) {
                     return Ok(false);
                 }
                 let activity_id =
@@ -1261,6 +1308,45 @@ mod tests {
             sql.contains("scheduled_at"),
             "should reference scheduled_at column"
         );
+    }
+
+    #[test]
+    fn schedule_to_close_timeout_query_references_correct_columns() {
+        let sql = schedule_to_close_timeout_query();
+        assert!(
+            sql.contains("harvest_task_queue"),
+            "should query harvest_task_queue"
+        );
+        assert!(
+            sql.contains("RUNNING") && sql.contains("PENDING"),
+            "should filter for both RUNNING and PENDING states"
+        );
+        assert!(
+            sql.contains("schedule_to_close_at"),
+            "should reference schedule_to_close_at column"
+        );
+        assert!(sql.contains("NOW()"), "should compare against NOW()");
+    }
+
+    #[test]
+    fn timeout_reason_schedule_to_close_maps_correctly() {
+        assert_eq!(
+            TimeoutReason::ScheduleToClose.to_string(),
+            "ScheduleToClose"
+        );
+        assert_eq!(
+            TimeoutReason::ScheduleToClose.timeout_type(),
+            TimeoutType::ScheduleToClose
+        );
+        // Both RUNNING and PENDING are valid states for ScheduleToClose
+        let states = expected_task_states_for_timeout(&TimeoutReason::ScheduleToClose);
+        assert!(states.contains(&"RUNNING"), "RUNNING must be a valid state");
+        assert!(states.contains(&"PENDING"), "PENDING must be a valid state");
+        // Other reasons must NOT include both states
+        let heartbeat_states = expected_task_states_for_timeout(&TimeoutReason::Heartbeat);
+        assert_eq!(heartbeat_states, &["RUNNING"]);
+        let sched_start_states = expected_task_states_for_timeout(&TimeoutReason::ScheduleToStart);
+        assert_eq!(sched_start_states, &["PENDING"]);
     }
 
     #[test]

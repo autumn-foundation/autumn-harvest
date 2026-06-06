@@ -2252,6 +2252,11 @@ async fn persist_scheduled_activities(
                 "schedule_to_start timeout",
             )?);
         }
+        if let Some(timeout) = activity.default_schedule_to_close {
+            let deadline = chrono::Utc::now()
+                + chrono_duration_from_std(timeout, "schedule_to_close timeout")?;
+            params.schedule_to_close_at = Some(deadline);
+        }
 
         let effective_key = activity
             .concurrency_key
@@ -3255,6 +3260,69 @@ async fn observe_task_cancellation(pool: &DbPool, task_id: uuid::Uuid) {
     }
 }
 
+/// Returns `true` when the cross-retry wall-clock deadline would be exceeded
+/// before the next retry attempt could start.
+///
+/// Used in the retry path to short-circuit requeue and instead emit a
+/// `ScheduleToClose` timeout (issue #378).
+fn schedule_to_close_deadline_exceeded(task: &TaskQueueItem, retry_delay: chrono::Duration) -> bool {
+    let Some(deadline) = task.schedule_to_close_at else {
+        return false;
+    };
+    chrono::Utc::now() + retry_delay >= deadline
+}
+
+/// Append `ActivityTimedOut { ScheduleToClose }` and fail the task row.
+///
+/// Called from the retry path when the cross-retry wall-clock deadline
+/// (`schedule_to_close_at`) would be exceeded before the next attempt starts.
+async fn record_schedule_to_close_activity_timeout(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+) -> HarvestResult<()> {
+    let error = HarvestError::Timeout {
+        timeout_type: crate::error::TimeoutType::ScheduleToClose,
+        task_name: task
+            .activity_name
+            .clone()
+            .unwrap_or_else(|| task.task_type.clone()),
+    }
+    .to_string();
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        let error = error.clone();
+        async move {
+            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+            let activity_name = task
+                .activity_name
+                .as_deref()
+                .unwrap_or(&task.task_type);
+            let Some(pending_id) =
+                pending_activity_id_for_task(&history.events, task, activity_name)?
+            else {
+                return Ok(());
+            };
+            let Some(state) = task_state_for_update(conn, task.id).await? else {
+                return Ok(());
+            };
+            if state != "RUNNING" {
+                return Ok(());
+            }
+            let timeout_event = WorkflowEvent::ActivityTimedOut {
+                activity_id: pending_id,
+                timeout_type: crate::error::TimeoutType::ScheduleToClose,
+            };
+            store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
+            queue::fail_task(conn, task.id, &error).await?;
+            queue::wake_workflow_task(conn, exec_id).await
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_activity_result(
@@ -3290,6 +3358,15 @@ async fn handle_activity_result(
             let delay = fail_execution_on_error(conn, task, worker_id, delay_result).await?;
 
             if let Some(delay) = delay {
+                // Pre-retry deadline check (issue #378): if the schedule_to_close
+                // wall-clock deadline would be exceeded before the next attempt
+                // starts, fail with ScheduleToClose instead of requeuing.
+                if schedule_to_close_deadline_exceeded(task, delay) {
+                    return record_schedule_to_close_activity_timeout(
+                        conn, task, exec_id, activity_id,
+                    )
+                    .await;
+                }
                 return queue::requeue_for_retry(conn, task.id, delay).await;
             }
 
@@ -6678,6 +6755,7 @@ mod tests {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,

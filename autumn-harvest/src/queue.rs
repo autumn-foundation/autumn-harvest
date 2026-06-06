@@ -103,6 +103,10 @@ pub struct EnqueueParams {
     pub required_build_id: Option<String>,
     /// Optional rate limit key to throttle execution throughput.
     pub rate_limit_key: Option<String>,
+    /// Absolute UTC deadline for the entire activity lifetime across all retry
+    /// attempts (issue #378). Computed once at initial enqueue as
+    /// `NOW() + schedule_to_close`. NULL = no total deadline.
+    pub schedule_to_close_at: Option<chrono::DateTime<Utc>>,
 }
 
 impl EnqueueParams {
@@ -136,6 +140,7 @@ impl EnqueueParams {
             max_concurrent: None,
             required_build_id: None,
             rate_limit_key: None,
+            schedule_to_close_at: None,
         }
     }
 
@@ -230,6 +235,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         concurrency_cap,
         required_build_id: params.required_build_id.as_deref(),
         rate_limit_key: params.rate_limit_key.as_deref(),
+        schedule_to_close_at: params.schedule_to_close_at,
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -1451,6 +1457,24 @@ mod tests {
         let params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
         assert!(params.concurrency_key.is_none());
         assert!(params.max_concurrent.is_none());
+    }
+
+    #[test]
+    fn enqueue_params_schedule_to_close_at_defaults_to_none() {
+        let params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
+        assert!(
+            params.schedule_to_close_at.is_none(),
+            "schedule_to_close_at must default to None (unbounded)"
+        );
+    }
+
+    #[test]
+    fn enqueue_params_schedule_to_close_at_can_be_set() {
+        let deadline = Utc::now() + Duration::seconds(300);
+        let mut params =
+            EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
+        params.schedule_to_close_at = Some(deadline);
+        assert_eq!(params.schedule_to_close_at, Some(deadline));
     }
 
     #[test]

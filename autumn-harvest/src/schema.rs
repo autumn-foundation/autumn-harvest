@@ -95,6 +95,10 @@ diesel::table! {
         /// completing (issue #367). Quarantined to the DLQ once it reaches the
         /// operator-configured poison-pill threshold. Distinct from `attempt`.
         crash_strikes -> Int4,
+        /// Absolute UTC deadline for the entire activity lifecycle across all retry
+        /// attempts (issue #378). Computed once at initial enqueue as
+        /// `NOW() + schedule_to_close`. NULL = no total deadline enforced.
+        schedule_to_close_at -> Nullable<Timestamptz>,
     }
 }
 
