@@ -937,6 +937,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
 // cancellation path.  It is only stopped by the worker's hard-abort after the
 // grace period — confirming cancellation is purely cooperative via heartbeat.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn activity_without_cancellation_check_completes_normally() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
