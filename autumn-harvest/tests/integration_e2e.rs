@@ -155,6 +155,8 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS rate_limit_key TEXT NULL;\n",
     "\n",
     include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    "\n",
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS schedule_to_close_at TIMESTAMPTZ NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return
