@@ -27,6 +27,17 @@
 //!   The delegate does not have access to the gate cache today; thread it in
 //!   via `AppState` extension so webhook-triggered starts can be gated.
 //!
+//! ## Standalone router note
+//!
+//! [`AdmissionGateCache::new`] initialises the cache as **open** (no gates).
+//! Standalone integrations that mount `harvest_api_router` without the plugin
+//! boot loader (i.e. without calling `HarvestPlugin::on_startup`) must
+//! explicitly call `load_active_gates` from the DB and pass the result to
+//! [`AdmissionGateCache::refresh`] on startup to pick up any gates that were
+//! persisted before the process restarted. Without this step, gates created in
+//! a previous process lifetime are invisible until a local create/lift happens
+//! on the same replica.
+//!
 //! ## Scope semantics
 //!
 //! | Scope | Blocks |

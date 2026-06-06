@@ -4938,11 +4938,19 @@ fn parse_schedule_bulk_filters(params: &ScheduleBulkParams) -> ScheduleUiFilters
     }
 }
 
-/// Find a schedule by id across all shards. Returns the row and a conn on success.
+/// Find a schedule by id across all shards. Returns the row, the shard it lives
+/// on, and a conn to that shard on success.
 async fn find_schedule_row(
     api_state: &HarvestApiState,
     id_str: &str,
-) -> Result<Option<(HarvestSchedule, crate::api::PoolConn)>, axum::response::Response> {
+) -> Result<
+    Option<(
+        HarvestSchedule,
+        autumn_harvest::types::ShardId,
+        crate::api::PoolConn,
+    )>,
+    axum::response::Response,
+> {
     use autumn_harvest::schema::harvest_schedules::dsl;
     use axum::response::IntoResponse as _;
 
@@ -4955,7 +4963,7 @@ async fn find_schedule_row(
         .storage_pool()
         .map_err(|e| map_error(e).into_response())?;
 
-    for (_shard, shard_pool) in pool.iter_shards() {
+    for (shard, shard_pool) in pool.iter_shards() {
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
@@ -4967,7 +4975,7 @@ async fn find_schedule_row(
             .optional()
             .unwrap_or(None);
         if let Some(row) = row {
-            return Ok(Some((row, conn)));
+            return Ok(Some((row, shard, conn)));
         }
     }
     Ok(None)
@@ -4992,7 +5000,7 @@ async fn schedule_pause_ui(
         Err(response) => return response,
     };
 
-    let flash = if let Some((row, mut conn)) = found {
+    let flash = if let Some((row, _shard, mut conn)) = found {
         let name = schedule_name(&row);
         let now = Utc::now();
         let _ = diesel::update(
@@ -5040,7 +5048,7 @@ async fn schedule_resume_ui(
         Err(response) => return response,
     };
 
-    let flash = if let Some((row, mut conn)) = found {
+    let flash = if let Some((row, _shard, mut conn)) = found {
         let name = schedule_name(&row);
         let now = Utc::now();
         let _ = diesel::update(
@@ -5089,7 +5097,7 @@ async fn schedule_delete_ui(
         Err(response) => return response,
     };
 
-    let flash = if let Some((row, mut conn)) = found {
+    let flash = if let Some((row, _shard, mut conn)) = found {
         let name = schedule_name(&row);
         let n = diesel::delete(dsl::harvest_schedules.find(row.id))
             .execute(&mut conn)
@@ -5132,6 +5140,7 @@ async fn execute_schedule_trigger_ui(
     pool: &crate::HarvestDbPool,
     runtime: &HarvestApiRuntime,
     gate_cache: &autumn_harvest::admission_gate::AdmissionGateCache,
+    schedule_shard: autumn_harvest::types::ShardId,
     row: &HarvestSchedule,
     id_str: &str,
     name: &str,
@@ -5153,7 +5162,7 @@ async fn execute_schedule_trigger_ui(
                     .and_then(|d| d.owner.as_deref())
             });
         if let Some((gate_id, gate_reason, scope_kind)) =
-            gate_cache.check(workflow_name, queue, 0, wf_owner)
+            gate_cache.check(workflow_name, queue, schedule_shard.as_i32(), wf_owner)
         {
             let reason_label = match gate_reason.char_indices().nth(64) {
                 Some((idx, _)) => &gate_reason[..idx],
@@ -5365,7 +5374,7 @@ async fn schedule_trigger_now_ui(
         Ok(f) => f,
         Err(response) => return response,
     };
-    let Some((row, _)) = found else {
+    let Some((row, found_shard, _)) = found else {
         return schedule_redirect(&format!(
             "Schedule {} not found",
             &id_str[..8.min(id_str.len())]
@@ -5395,6 +5404,7 @@ async fn schedule_trigger_now_ui(
         &pool,
         &runtime,
         &api_state.gate_cache(),
+        found_shard,
         &row,
         &id_str,
         &name,

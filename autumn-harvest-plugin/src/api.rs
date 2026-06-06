@@ -1691,6 +1691,7 @@ async fn list_gates_handler(
 }
 
 /// `POST /admin/gates` — create an admission gate.
+#[allow(clippy::too_many_lines)]
 async fn create_gate_handler(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -1744,14 +1745,26 @@ async fn create_gate_handler(
         Ok(gate) => {
             // Refresh the in-process cache immediately so this replica honours
             // the gate without waiting for the background refresh cycle.
-            if let Ok(fresh) = admission_gate_db::load_active_gates(&mut conn).await {
-                let count = i64::try_from(fresh.len()).unwrap_or(0);
-                api_state.gate_cache().refresh(fresh);
-                if let Ok(rt) = api_state.runtime() {
-                    rt.registry()
-                        .telemetry()
-                        .metrics
-                        .record_admission_gates_active(count);
+            // Fail-closed if the follow-up load fails: the gate was persisted
+            // but we cannot read the updated list, so block all admissions on
+            // this replica rather than leaving it with a stale open snapshot.
+            match admission_gate_db::load_active_gates(&mut conn).await {
+                Ok(fresh) => {
+                    let count = i64::try_from(fresh.len()).unwrap_or(0);
+                    api_state.gate_cache().refresh(fresh);
+                    if let Ok(rt) = api_state.runtime() {
+                        rt.registry()
+                            .telemetry()
+                            .metrics
+                            .record_admission_gates_active(count);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "admission gate cache refresh failed after create; entering fail-closed mode"
+                    );
+                    api_state.gate_cache().set_fail_closed();
                 }
             }
 
@@ -1825,15 +1838,26 @@ async fn lift_gate_handler(
     let id_str = id.to_string();
     match admission_gate_db::lift_gate(&mut conn, id, &actor).await {
         Ok(Some(_gate)) => {
-            // Refresh the in-process cache immediately.
-            if let Ok(fresh) = admission_gate_db::load_active_gates(&mut conn).await {
-                let count = i64::try_from(fresh.len()).unwrap_or(0);
-                api_state.gate_cache().refresh(fresh);
-                if let Ok(rt) = api_state.runtime() {
-                    rt.registry()
-                        .telemetry()
-                        .metrics
-                        .record_admission_gates_active(count);
+            // Refresh the in-process cache immediately. After a successful
+            // lift the gate is removed; a load failure leaves the replica
+            // fail-closed (blocking) rather than using the pre-lift snapshot.
+            match admission_gate_db::load_active_gates(&mut conn).await {
+                Ok(fresh) => {
+                    let count = i64::try_from(fresh.len()).unwrap_or(0);
+                    api_state.gate_cache().refresh(fresh);
+                    if let Ok(rt) = api_state.runtime() {
+                        rt.registry()
+                            .telemetry()
+                            .metrics
+                            .record_admission_gates_active(count);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "admission gate cache refresh failed after lift; entering fail-closed mode"
+                    );
+                    api_state.gate_cache().set_fail_closed();
                 }
             }
 
