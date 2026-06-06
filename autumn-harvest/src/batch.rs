@@ -498,7 +498,7 @@ mod db {
         /// connection pool — the issue's success metric calls for no more
         /// than 10% p99 regression on unrelated workflows.
         pub concurrency: u32,
-        pub metrics: Arc<dyn MetricsRecorder + Send + Sync>,
+        pub metrics: Arc<dyn MetricsRecorder>,
     }
 
     impl std::fmt::Debug for BatchExecutorConfig {
@@ -575,7 +575,7 @@ mod db {
         signal_name: Option<&str>,
         signal_payload: Option<&Value>,
         target: ExecutionId,
-        metrics: &(dyn MetricsRecorder + Send + Sync),
+        metrics: &dyn MetricsRecorder,
     ) -> Result<(), String> {
         match action {
             BatchAction::Cancel => {

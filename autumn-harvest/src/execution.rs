@@ -146,13 +146,15 @@ pub struct CancelledWorkflowExecution {
     pub workflow_name: String,
     /// Task queue the execution was dispatched on.
     pub queue_name: String,
+    /// The state the execution was in before this transition.
+    pub prior_state: String,
 }
 
 impl CancelledWorkflowExecution {
     fn idempotent(exec_id: ExecutionId, execution: WorkflowExecution) -> Self {
         Self {
             exec_id,
-            state: execution.state,
+            state: execution.state.clone(),
             reason: execution
                 .error
                 .unwrap_or_else(|| "workflow already cancelled".to_string()),
@@ -160,6 +162,7 @@ impl CancelledWorkflowExecution {
             failed_task_count: 0,
             workflow_name: execution.workflow_name,
             queue_name: execution.queue_name,
+            prior_state: execution.state,
         }
     }
 
@@ -169,6 +172,7 @@ impl CancelledWorkflowExecution {
         failed_task_count: usize,
         workflow_name: String,
         queue_name: String,
+        prior_state: String,
     ) -> Self {
         Self {
             exec_id,
@@ -178,6 +182,7 @@ impl CancelledWorkflowExecution {
             failed_task_count,
             workflow_name,
             queue_name,
+            prior_state,
         }
     }
 }
@@ -709,6 +714,7 @@ pub async fn cancel_workflow_execution(
                             total_failed_or_deleted,
                             execution.workflow_name.clone(),
                             execution.queue_name.clone(),
+                            "RUNNING".to_string(),
                         ),
                         deferred,
                     ))
@@ -1013,6 +1019,7 @@ pub async fn terminate_workflow_execution(
                     .await?;
                     deferred.extend(triggers);
 
+                    let prior_state = execution.state.clone();
                     Ok((
                         CancelledWorkflowExecution::newly_cancelled(
                             exec_id,
@@ -1020,6 +1027,7 @@ pub async fn terminate_workflow_execution(
                             failed_task_count,
                             execution.workflow_name.clone(),
                             execution.queue_name.clone(),
+                            prior_state,
                         ),
                         deferred,
                     ))
@@ -1033,7 +1041,13 @@ pub async fn terminate_workflow_execution(
         start.spawn();
     }
 
-    if cancel_result.newly_cancelled {
+    // Only emit the Terminated metric when the execution was live (RUNNING or
+    // SUSPENDED). If the prior state was already terminal (FAILED, TIMED_OUT,
+    // COMPLETED), that outcome was already counted — emitting Terminated again
+    // would inflate the SLO denominator for operator cleanup actions.
+    if cancel_result.newly_cancelled
+        && matches!(cancel_result.prior_state.as_str(), "RUNNING" | "SUSPENDED")
+    {
         metrics.record_workflow_terminal(
             &cancel_result.workflow_name,
             &cancel_result.queue_name,

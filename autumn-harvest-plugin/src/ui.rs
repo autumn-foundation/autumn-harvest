@@ -1053,7 +1053,13 @@ async fn cancel_workflow_ui(
     let exec_id_str = exec_id.as_uuid().to_string();
     let reason = form.reason.as_deref().unwrap_or("").trim().to_string();
 
-    let cancel_result = cancel_workflow_execution(&mut conn, exec_id, &reason).await;
+    let cancel_result = cancel_workflow_execution(
+        &mut conn,
+        exec_id,
+        &reason,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await;
     let (status, error_summary, flash) = match &cancel_result {
         Ok(_) => (STATUS_SUCCEEDED, None, url_encode("Workflow cancelled")),
         Err(e) => {
