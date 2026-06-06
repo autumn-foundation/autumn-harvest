@@ -487,16 +487,6 @@ mod tests {
     }
 
     #[test]
-    fn harvest_error_display_includes_task_name() {
-        let e = HarvestError::Timeout {
-            timeout_type: TimeoutType::StartToClose,
-            task_name: "send_email".into(),
-        };
-        assert!(e.to_string().contains("send_email"));
-        assert!(e.to_string().contains("StartToClose"));
-    }
-
-    #[test]
     #[allow(clippy::unnecessary_literal_unwrap)]
     fn harvest_result_ok() -> HarvestResult<()> {
         let r: HarvestResult<i32> = Ok(42);
@@ -515,34 +505,55 @@ mod tests {
     }
 
     #[test]
-    fn timeout_type_display_is_correct() {
-        assert_eq!(TimeoutType::StartToClose.to_string(), "StartToClose");
-        assert_eq!(TimeoutType::ScheduleToStart.to_string(), "ScheduleToStart");
-        assert_eq!(TimeoutType::ScheduleToClose.to_string(), "ScheduleToClose");
-        assert_eq!(TimeoutType::Heartbeat.to_string(), "Heartbeat");
-        assert_eq!(
-            TimeoutType::WorkflowExecution.to_string(),
-            "WorkflowExecution"
-        );
+    fn harvest_error_timeout_display_includes_type_and_name() {
+        let test_cases = vec![
+            (TimeoutType::StartToClose, "StartToClose", "send_email"),
+            (
+                TimeoutType::ScheduleToStart,
+                "ScheduleToStart",
+                "charge_card",
+            ),
+            (
+                TimeoutType::ScheduleToClose,
+                "ScheduleToClose",
+                "process_image",
+            ),
+            (TimeoutType::Heartbeat, "Heartbeat", "long_poll"),
+            (
+                TimeoutType::WorkflowExecution,
+                "WorkflowExecution",
+                "billing_reconciliation",
+            ),
+        ];
+
+        for (timeout_type, expected_str, task_name) in test_cases {
+            let e = HarvestError::Timeout {
+                timeout_type: timeout_type.clone(),
+                task_name: task_name.into(),
+            };
+            let msg = e.to_string();
+            assert!(msg.contains(task_name));
+            assert!(msg.contains(expected_str));
+            assert_eq!(timeout_type.to_string(), expected_str);
+        }
     }
 
     #[test]
-    fn timeout_type_workflow_execution_round_trips_serde() {
-        let t = TimeoutType::WorkflowExecution;
-        let json = serde_json::to_string(&t).unwrap();
-        let back: TimeoutType = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, TimeoutType::WorkflowExecution);
-    }
+    fn timeout_type_round_trips_serde() -> Result<(), serde_json::Error> {
+        let test_cases = vec![
+            TimeoutType::StartToClose,
+            TimeoutType::ScheduleToStart,
+            TimeoutType::ScheduleToClose,
+            TimeoutType::Heartbeat,
+            TimeoutType::WorkflowExecution,
+        ];
 
-    #[test]
-    fn harvest_error_timeout_workflow_execution_display() {
-        let e = HarvestError::Timeout {
-            timeout_type: TimeoutType::WorkflowExecution,
-            task_name: "billing_reconciliation".into(),
-        };
-        let msg = e.to_string();
-        assert!(msg.contains("billing_reconciliation"));
-        assert!(msg.contains("WorkflowExecution"));
+        for t in test_cases {
+            let json = serde_json::to_string(&t)?;
+            let back: TimeoutType = serde_json::from_str(&json)?;
+            assert_eq!(back, t);
+        }
+        Ok(())
     }
 
     #[test]

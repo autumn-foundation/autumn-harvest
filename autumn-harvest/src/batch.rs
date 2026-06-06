@@ -818,11 +818,21 @@ mod tests {
     }
 
     #[test]
-    fn batch_action_serializes_pascal_case() {
-        let value = serde_json::to_value(BatchAction::Cancel).unwrap();
-        assert_eq!(value, json!("Cancel"));
-        let deserialized: BatchAction = serde_json::from_value(json!("Signal")).unwrap();
-        assert_eq!(deserialized, BatchAction::Signal);
+    fn batch_action_serializes_pascal_case() -> Result<(), serde_json::Error> {
+        let test_cases = vec![
+            (BatchAction::Cancel, json!("Cancel")),
+            (BatchAction::Terminate, json!("Terminate")),
+            (BatchAction::Signal, json!("Signal")),
+        ];
+
+        for (action, expected_json) in test_cases {
+            let value = serde_json::to_value(&action)?;
+            assert_eq!(value, expected_json);
+            let deserialized: BatchAction = serde_json::from_value(expected_json)?;
+            assert_eq!(deserialized, action);
+        }
+
+        Ok(())
     }
 
     #[test]
@@ -858,13 +868,14 @@ mod tests {
     }
 
     #[test]
-    fn batch_target_error_round_trips_json() {
+    fn batch_target_error_round_trips_json() -> Result<(), serde_json::Error> {
         let err = BatchTargetError {
             execution_id: "00000000-0000-4000-8000-000000000001".to_string(),
             reason: "workflow execution already terminal (COMPLETED)".to_string(),
         };
-        let value = serde_json::to_value(&err).unwrap();
-        let back: BatchTargetError = serde_json::from_value(value).unwrap();
+        let value = serde_json::to_value(&err)?;
+        let back: BatchTargetError = serde_json::from_value(value)?;
         assert_eq!(back, err);
+        Ok(())
     }
 }
