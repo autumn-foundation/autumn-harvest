@@ -2141,7 +2141,16 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route(
             "/admin/gates/{id}",
-            delete(lift_gate_handler).route_layer(require_admin),
+            delete(lift_gate_handler).route_layer(require_admin.clone()),
+        )
+        // Stuck-task triage eligibility explainer (issue #380)
+        .route(
+            "/admin/queues/{queue_name}/eligibility",
+            get(get_queue_eligibility).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/tasks/{id}/eligibility",
+            get(get_task_eligibility).route_layer(require_admin),
         )
         .layer(Extension(api_state))
 }
@@ -2287,6 +2296,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/gates"),
         ("POST", "/admin/gates"),
         ("DELETE", "/admin/gates/{id}"),
+        // ── stuck-task triage eligibility (issue #380) ────────────────────────
+        ("GET", "/admin/queues/{queue_name}/eligibility"),
+        ("GET", "/admin/tasks/{id}/eligibility"),
     ]
 }
 
@@ -3054,6 +3066,37 @@ pub const fn management_api_response_fields()
             ]),
         ),
         ("DELETE", "/admin/gates/{id}", Some(&["lifted"])),
+        (
+            "GET",
+            "/admin/queues/{queue_name}/eligibility",
+            Some(&[
+                "queue_name",
+                "pending_count",
+                "oldest_pending_age_secs",
+                "required_build_ids",
+                "eligible_workers",
+                "ineligible_workers",
+                "summary",
+                "shards",
+                "shard_errors",
+            ]),
+        ),
+        (
+            "GET",
+            "/admin/tasks/{id}/eligibility",
+            Some(&[
+                "task_id",
+                "queue_name",
+                "pending_count",
+                "oldest_pending_age_secs",
+                "required_build_id",
+                "assigned_shard",
+                "concurrency_key",
+                "eligible_workers",
+                "ineligible_workers",
+                "summary",
+            ]),
+        ),
     ]
 }
 
@@ -15317,6 +15360,621 @@ async fn retire_build_handler(
         )
             .into_response()
     }
+}
+
+// ── Stuck-task triage eligibility explainer structures (issue #380) ──────────
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QueueEligibilityResponse {
+    pub queue_name: String,
+    pub pending_count: i64,
+    pub oldest_pending_age_secs: Option<i64>,
+    pub required_build_ids: Vec<String>,
+    pub eligible_workers: Vec<EligibleWorkerInfo>,
+    pub ineligible_workers: Vec<IneligibleWorkerInfo>,
+    pub summary: EligibilitySummary,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub shards: std::collections::BTreeMap<String, ShardEligibilityResponse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shard_errors: Vec<EligibilityShardError>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ShardEligibilityResponse {
+    pub pending_count: i64,
+    pub oldest_pending_age_secs: Option<i64>,
+    pub required_build_ids: Vec<String>,
+    pub eligible_workers: Vec<EligibleWorkerInfo>,
+    pub ineligible_workers: Vec<IneligibleWorkerInfo>,
+    pub summary: EligibilitySummary,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EligibilityShardError {
+    pub shard_id: i32,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EligibleWorkerInfo {
+    pub worker_id: String,
+    pub build_id: String,
+    pub deployment_name: Option<String>,
+    pub shard_assignments: Vec<i32>,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct IneligibleWorkerInfo {
+    pub worker_id: String,
+    pub reason_codes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EligibilitySummary {
+    pub diagnosis: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TaskEligibilityResponse {
+    pub task_id: uuid::Uuid,
+    pub queue_name: String,
+    pub pending_count: i64,
+    pub oldest_pending_age_secs: Option<i64>,
+    pub required_build_id: Option<String>,
+    pub assigned_shard: i32,
+    pub concurrency_key: Option<String>,
+    pub eligible_workers: Vec<EligibleWorkerInfo>,
+    pub ineligible_workers: Vec<IneligibleWorkerInfo>,
+    pub summary: EligibilitySummary,
+}
+
+async fn evaluate_eligibility_for_shard(
+    api_state: &HarvestApiState,
+    shard_id: ShardId,
+    queue_name: &str,
+    target_task_id: Option<uuid::Uuid>,
+) -> Result<ShardEligibilityResponse, AutumnError> {
+    use std::collections::{HashMap, HashSet};
+    let mut conn = db_conn_for_shard(api_state, shard_id).await?;
+
+    let mut tasks = Vec::new();
+    if let Some(task_id) = target_task_id {
+        let task = harvest_task_queue::table
+            .find(task_id)
+            .select(autumn_harvest::models::TaskQueueItem::as_select())
+            .first::<autumn_harvest::models::TaskQueueItem>(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        if let Some(t) = task {
+            tasks.push(t);
+        }
+    } else {
+        tasks = harvest_task_queue::table
+            .filter(harvest_task_queue::queue_name.eq(queue_name))
+            .filter(harvest_task_queue::state.eq("PENDING"))
+            .order((
+                harvest_task_queue::priority.desc(),
+                harvest_task_queue::scheduled_at.asc(),
+            ))
+            .limit(100)
+            .select(autumn_harvest::models::TaskQueueItem::as_select())
+            .load::<autumn_harvest::models::TaskQueueItem>(&mut conn)
+            .await
+            .map_err(database_error)?;
+    }
+
+    let pending_count = if target_task_id.is_some() {
+        if tasks.iter().any(|t| t.state == "PENDING") {
+            1
+        } else {
+            0
+        }
+    } else {
+        let count: i64 = harvest_task_queue::table
+            .filter(harvest_task_queue::queue_name.eq(queue_name))
+            .filter(harvest_task_queue::state.eq("PENDING"))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .map_err(database_error)?;
+        count
+    };
+
+    let oldest_pending_age_secs = if target_task_id.is_some() {
+        tasks
+            .get(0)
+            .and_then(|t| if t.state == "PENDING" { Some(t) } else { None })
+            .map(|t| {
+                let age = chrono::Utc::now().signed_duration_since(t.scheduled_at);
+                age.num_seconds()
+            })
+    } else {
+        let oldest_scheduled: Option<chrono::DateTime<chrono::Utc>> = harvest_task_queue::table
+            .filter(harvest_task_queue::queue_name.eq(queue_name))
+            .filter(harvest_task_queue::state.eq("PENDING"))
+            .select(harvest_task_queue::scheduled_at)
+            .order(harvest_task_queue::scheduled_at.asc())
+            .first::<chrono::DateTime<chrono::Utc>>(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        oldest_scheduled.map(|ts| {
+            let age = chrono::Utc::now().signed_duration_since(ts);
+            age.num_seconds()
+        })
+    };
+
+    let mut required_build_ids = Vec::new();
+    for t in &tasks {
+        if t.state == "PENDING" {
+            if let Some(ref bid) = t.required_build_id {
+                if !required_build_ids.contains(bid) {
+                    required_build_ids.push(bid.clone());
+                }
+            }
+        }
+    }
+
+    let stale_threshold = api_state.worker_stale_threshold();
+    let workers = list_workers(
+        &mut conn,
+        &WorkerFilters {
+            limit: i64::MAX,
+            ..Default::default()
+        },
+        stale_threshold,
+    )
+    .await
+    .map_err(map_error)?;
+
+    let online_workers: Vec<_> = workers
+        .into_iter()
+        .filter(|w| w.health == autumn_harvest::workers::WorkerHealth::Healthy)
+        .collect();
+
+    let compat_set = autumn_harvest::build_routing::load_compat_set(&mut conn)
+        .await
+        .map_err(map_error)?;
+
+    let mut keys_to_check = Vec::new();
+    for t in &tasks {
+        if t.state == "PENDING" {
+            if let Some(ref k) = t.concurrency_key {
+                if !keys_to_check.contains(k) {
+                    keys_to_check.push(k.clone());
+                }
+            }
+        }
+    }
+
+    let mut concurrency_saturated_keys = HashSet::new();
+    if !keys_to_check.is_empty() {
+        #[derive(diesel::QueryableByName)]
+        struct ConcurrencyRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            key: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            task_type: String,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            running_count: i64,
+        }
+
+        let rows: Vec<ConcurrencyRow> = diesel::sql_query(
+            "SELECT concurrency_key AS key, task_type, COUNT(*) AS running_count \
+             FROM harvest_task_queue \
+             WHERE state = 'RUNNING' \
+               AND concurrency_key = ANY($1) \
+               AND worker_id IS NOT NULL \
+             GROUP BY concurrency_key, task_type",
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&keys_to_check)
+        .load(&mut conn)
+        .await
+        .map_err(database_error)?;
+
+        let mut running_map = HashMap::new();
+        for r in rows {
+            running_map.insert((r.key, r.task_type), r.running_count);
+        }
+
+        for t in &tasks {
+            if t.state == "PENDING" {
+                if let (Some(key), Some(cap)) = (&t.concurrency_key, t.concurrency_cap) {
+                    let running = running_map
+                        .get(&(key.clone(), t.task_type.clone()))
+                        .cloned()
+                        .unwrap_or(0);
+                    if running >= i64::from(cap) {
+                        concurrency_saturated_keys.insert((key.clone(), t.task_type.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut eligible_workers = Vec::new();
+    let mut ineligible_workers = Vec::new();
+
+    let pending_tasks: Vec<_> = tasks.iter().filter(|t| t.state == "PENDING").collect();
+
+    for w in &online_workers {
+        let w_id = w.worker.worker_id.clone();
+        let build_id = w.worker.build_id.clone();
+        let deployment_name = w.worker.deployment_name.clone();
+        let shard_assignments: Vec<i32> = w
+            .worker
+            .shard_assignments
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_i64().map(|n| n as i32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let status = w.worker.status.clone();
+
+        let w_info = EligibleWorkerInfo {
+            worker_id: w_id.clone(),
+            build_id,
+            deployment_name,
+            shard_assignments: shard_assignments.clone(),
+            status: status.clone(),
+        };
+
+        let mut worker_reasons = Vec::new();
+
+        let subscribed_queues: Vec<String> = w
+            .worker
+            .queues
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !subscribed_queues.contains(&queue_name.to_string()) {
+            worker_reasons.push("wrong_queue_subscription".to_string());
+        }
+
+        if !shard_assignments.contains(&(shard_id.as_i32())) {
+            worker_reasons.push("wrong_shard_assignment".to_string());
+        }
+
+        if status == "Draining" {
+            worker_reasons.push("worker_draining".to_string());
+        }
+
+        if status == "Stopped" {
+            worker_reasons.push("worker_stopped".to_string());
+        }
+
+        if !worker_reasons.is_empty() {
+            ineligible_workers.push(IneligibleWorkerInfo {
+                worker_id: w_id,
+                reason_codes: worker_reasons,
+            });
+            continue;
+        }
+
+        if pending_tasks.is_empty() {
+            eligible_workers.push(w_info);
+        } else {
+            let mut eligible_for_any = false;
+            let mut task_failures = Vec::new();
+
+            for t in &pending_tasks {
+                let mut reasons = Vec::new();
+
+                if !compat_set.is_eligible(&w.worker.build_id, t.required_build_id.as_deref()) {
+                    reasons.push("build_incompatible".to_string());
+                }
+
+                if let Some(ref sticky_worker) = t.sticky_worker_id {
+                    if let Some(ref sticky_until) = t.sticky_until {
+                        if *sticky_until > chrono::Utc::now()
+                            && w.worker.worker_id != *sticky_worker
+                        {
+                            reasons.push("sticky_owned_by_other_worker".to_string());
+                        }
+                    }
+                }
+
+                if let Some(ref key) = t.concurrency_key {
+                    if concurrency_saturated_keys.contains(&(key.clone(), t.task_type.clone())) {
+                        reasons.push("concurrency_saturated".to_string());
+                    }
+                }
+
+                if reasons.is_empty() {
+                    eligible_for_any = true;
+                    break;
+                } else {
+                    task_failures.push(reasons);
+                }
+            }
+
+            if eligible_for_any {
+                eligible_workers.push(w_info);
+            } else {
+                let mut merged_reasons = HashSet::new();
+                for tf in task_failures {
+                    for r in tf {
+                        merged_reasons.insert(r);
+                    }
+                }
+                let mut reason_codes: Vec<String> = merged_reasons.into_iter().collect();
+                reason_codes.sort();
+                if reason_codes.is_empty() {
+                    reason_codes.push("unknown".to_string());
+                }
+                ineligible_workers.push(IneligibleWorkerInfo {
+                    worker_id: w_id,
+                    reason_codes,
+                });
+            }
+        }
+    }
+
+    let num_online = eligible_workers.len() + ineligible_workers.len();
+    let diagnosis = if num_online == 0 {
+        "no_online_workers".to_string()
+    } else {
+        let all_draining = eligible_workers.iter().all(|w| w.status == "Draining")
+            && ineligible_workers
+                .iter()
+                .all(|w| w.reason_codes.contains(&"worker_draining".to_string()));
+        if all_draining {
+            "all_draining".to_string()
+        } else {
+            let eligible_non_draining: Vec<_> = eligible_workers
+                .iter()
+                .filter(|w| w.status != "Draining")
+                .collect();
+
+            if eligible_workers.is_empty() {
+                "no_eligible_workers".to_string()
+            } else if !eligible_non_draining.is_empty() {
+                let mut all_full = true;
+                for w_info in &eligible_non_draining {
+                    if let Some(w) = online_workers
+                        .iter()
+                        .find(|w| w.worker.worker_id == w_info.worker_id)
+                    {
+                        if w.worker.in_flight_count < w.worker.max_concurrency {
+                            all_full = false;
+                            break;
+                        }
+                    }
+                }
+                if all_full {
+                    "all_capacity_full".to_string()
+                } else {
+                    "healthy".to_string()
+                }
+            } else {
+                "healthy".to_string()
+            }
+        }
+    };
+
+    let summary = EligibilitySummary { diagnosis };
+
+    Ok(ShardEligibilityResponse {
+        pending_count,
+        oldest_pending_age_secs,
+        required_build_ids,
+        eligible_workers,
+        ineligible_workers,
+        summary,
+    })
+}
+
+async fn get_queue_eligibility(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(queue_name): Path<String>,
+) -> Result<Json<QueueEligibilityResponse>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut shards = std::collections::BTreeMap::new();
+    let mut shard_errors = Vec::new();
+
+    let mut global_pending_count = 0;
+    let mut global_oldest_pending_age_secs = None;
+    let mut global_required_build_ids = std::collections::HashSet::new();
+
+    let mut shard_eligible = std::collections::HashMap::new();
+    let mut shard_ineligible = std::collections::HashMap::new();
+    let mut online_worker_ids = std::collections::HashSet::new();
+
+    for (shard_id, _shard_pool) in pool.iter_shards() {
+        match evaluate_eligibility_for_shard(&api_state, shard_id, &queue_name, None).await {
+            Ok(res) => {
+                global_pending_count += res.pending_count;
+                if let Some(age) = res.oldest_pending_age_secs {
+                    global_oldest_pending_age_secs = Some(match global_oldest_pending_age_secs {
+                        Some(current) => std::cmp::max(current, age),
+                        None => age,
+                    });
+                }
+                for bid in &res.required_build_ids {
+                    global_required_build_ids.insert(bid.clone());
+                }
+
+                for w in &res.eligible_workers {
+                    shard_eligible.insert(w.worker_id.clone(), w.clone());
+                    online_worker_ids.insert(w.worker_id.clone());
+                }
+
+                for w in &res.ineligible_workers {
+                    shard_ineligible
+                        .entry(w.worker_id.clone())
+                        .or_insert_with(std::collections::HashSet::new)
+                        .extend(w.reason_codes.iter().cloned());
+                    online_worker_ids.insert(w.worker_id.clone());
+                }
+
+                shards.insert(shard_id.as_i32().to_string(), res);
+            }
+            Err(e) => {
+                shard_errors.push(EligibilityShardError {
+                    shard_id: shard_id.as_i32(),
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+
+    let mut eligible_workers = Vec::new();
+    let mut ineligible_workers = Vec::new();
+
+    for w_id in online_worker_ids {
+        if let Some(w_info) = shard_eligible.get(&w_id) {
+            eligible_workers.push(w_info.clone());
+        } else if let Some(reasons_set) = shard_ineligible.get(&w_id) {
+            let mut reason_codes: Vec<String> = reasons_set.iter().cloned().collect();
+            reason_codes.sort();
+            ineligible_workers.push(IneligibleWorkerInfo {
+                worker_id: w_id,
+                reason_codes,
+            });
+        }
+    }
+
+    eligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+    ineligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+
+    let num_online = eligible_workers.len() + ineligible_workers.len();
+    let diagnosis = if num_online == 0 {
+        "no_online_workers".to_string()
+    } else {
+        let all_draining = eligible_workers.iter().all(|w| w.status == "Draining")
+            && ineligible_workers
+                .iter()
+                .all(|w| w.reason_codes.contains(&"worker_draining".to_string()));
+        if all_draining {
+            "all_draining".to_string()
+        } else {
+            let eligible_non_draining: Vec<_> = eligible_workers
+                .iter()
+                .filter(|w| w.status != "Draining")
+                .collect();
+
+            if eligible_workers.is_empty() {
+                "no_eligible_workers".to_string()
+            } else if !eligible_non_draining.is_empty() {
+                let mut all_full = true;
+                for w_info in &eligible_non_draining {
+                    let mut found_cap = false;
+                    for (_shard_id, shard_pool) in pool.iter_shards() {
+                        if let Ok(mut conn) = acquire_conn(shard_pool).await {
+                            let stale_threshold = api_state.worker_stale_threshold();
+                            if let Ok(w) = list_workers(
+                                &mut conn,
+                                &WorkerFilters {
+                                    limit: 100,
+                                    build_id: Some(w_info.build_id.clone()),
+                                    ..Default::default()
+                                },
+                                stale_threshold,
+                            )
+                            .await
+                            {
+                                if let Some(worker_row) =
+                                    w.iter().find(|w| w.worker.worker_id == w_info.worker_id)
+                                {
+                                    if worker_row.worker.in_flight_count
+                                        < worker_row.worker.max_concurrency
+                                    {
+                                        found_cap = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if found_cap {
+                        all_full = false;
+                        break;
+                    }
+                }
+                if all_full {
+                    "all_capacity_full".to_string()
+                } else {
+                    "healthy".to_string()
+                }
+            } else {
+                "healthy".to_string()
+            }
+        }
+    };
+
+    let mut req_builds: Vec<String> = global_required_build_ids.into_iter().collect();
+    req_builds.sort();
+
+    Ok(Json(QueueEligibilityResponse {
+        queue_name,
+        pending_count: global_pending_count,
+        oldest_pending_age_secs: global_oldest_pending_age_secs,
+        required_build_ids: req_builds,
+        eligible_workers,
+        ineligible_workers,
+        summary: EligibilitySummary { diagnosis },
+        shards,
+        shard_errors,
+    }))
+}
+
+async fn get_task_eligibility(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(task_id_str): Path<String>,
+) -> Result<Json<TaskEligibilityResponse>, AutumnError> {
+    let task_id = task_id_str
+        .parse::<uuid::Uuid>()
+        .map_err(|_| AutumnError::bad_request_msg(format!("invalid task id '{task_id_str}'")))?;
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let task = harvest_task_queue::table
+            .find(task_id)
+            .select(autumn_harvest::models::TaskQueueItem::as_select())
+            .first::<autumn_harvest::models::TaskQueueItem>(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+
+        if let Some(t) = task {
+            let res =
+                evaluate_eligibility_for_shard(&api_state, shard_id, &t.queue_name, Some(task_id))
+                    .await?;
+
+            let mut eligible_workers = res.eligible_workers;
+            let mut ineligible_workers = res.ineligible_workers;
+            eligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+            ineligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+
+            return Ok(Json(TaskEligibilityResponse {
+                task_id,
+                queue_name: t.queue_name,
+                pending_count: res.pending_count,
+                oldest_pending_age_secs: res.oldest_pending_age_secs,
+                required_build_id: t.required_build_id,
+                assigned_shard: shard_id.as_i32(),
+                concurrency_key: t.concurrency_key,
+                eligible_workers,
+                ineligible_workers,
+                summary: res.summary,
+            }));
+        }
+    }
+
+    Err(AutumnError::not_found_msg(format!(
+        "task {task_id} not found"
+    )))
 }
 
 #[cfg(test)]
