@@ -306,6 +306,17 @@ impl CircuitBreakerPolicy {
     }
 }
 
+/// Failure semantics for mapped nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MapFailurePolicy {
+    /// First instance failure fails the mapped node, and any in-flight instances are cancelled.
+    #[default]
+    FailFast,
+    /// The collect node receives per-slot success/failure, making partial batch failures observable.
+    CollectAll,
+}
+
 /// Status of a completed DAG task, used by trigger rules.
 ///
 /// ## Examples

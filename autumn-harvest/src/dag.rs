@@ -10,7 +10,7 @@ use std::fmt;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crate::policy::{RetryPolicy, TriggerRule};
+use crate::policy::{MapFailurePolicy, RetryPolicy, TriggerRule};
 
 #[derive(Debug, Clone)]
 struct PendingDagTask {
@@ -20,6 +20,8 @@ struct PendingDagTask {
     retry_policy: Option<RetryPolicy>,
     start_to_close: Option<Duration>,
     queue: Option<String>,
+    map_upstream: Option<usize>,
+    map_failure_policy: MapFailurePolicy,
 }
 
 /// Immutable task definition produced by [`DagBuilder::build`].
@@ -37,6 +39,10 @@ pub struct DagTask {
     pub start_to_close: Option<Duration>,
     /// The optional specific queue to schedule this task on.
     pub queue: Option<String>,
+    /// The index of the upstream task mapped over (if any).
+    pub map_upstream: Option<usize>,
+    /// Failure policy for mapped tasks.
+    pub map_failure_policy: MapFailurePolicy,
 }
 
 impl From<PendingDagTask> for DagTask {
@@ -48,6 +54,8 @@ impl From<PendingDagTask> for DagTask {
             retry_policy: task.retry_policy,
             start_to_close: task.start_to_close,
             queue: task.queue,
+            map_upstream: task.map_upstream,
+            map_failure_policy: task.map_failure_policy,
         }
     }
 }
@@ -150,12 +158,53 @@ impl DagTaskRef {
         self.mutate(|task| task.queue = Some(queue.into()))
     }
 
+    /// Set the mapped failure policy. Only applies to mapped tasks.
+    #[must_use]
+    pub fn map_failure_policy(self, policy: MapFailurePolicy) -> Self {
+        self.mutate(|task| task.map_failure_policy = policy)
+    }
+
     fn mutate(self, update: impl FnOnce(&mut PendingDagTask)) -> Self {
         {
             let mut tasks = self.tasks.borrow_mut();
             update(&mut tasks[self.index]);
         }
         self
+    }
+}
+
+/// Opaque handle to a mapped task being defined inside a [`DagBuilder`].
+#[derive(Debug, Clone)]
+pub struct DagMapTaskRef {
+    tasks: SharedTasks,
+    index: usize,
+}
+
+impl DagMapTaskRef {
+    /// Bind this mapped task to map over `upstream`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and `upstream` were created by different
+    /// [`DagBuilder`] instances.
+    #[must_use]
+    pub fn over(self, upstream: &DagTaskRef) -> DagTaskRef {
+        assert!(
+            Rc::ptr_eq(&self.tasks, &upstream.tasks),
+            "cannot connect tasks from different DagBuilder instances"
+        );
+        {
+            let mut tasks = self.tasks.borrow_mut();
+            let task = &mut tasks[self.index];
+            task.map_upstream = Some(upstream.index);
+            if !task.upstreams.contains(&upstream.index) {
+                task.upstreams.push(upstream.index);
+            }
+        }
+        DagTaskRef {
+            tasks: self.tasks,
+            index: self.index,
+        }
     }
 }
 
@@ -234,9 +283,37 @@ impl DagBuilder {
             retry_policy: None,
             start_to_close: None,
             queue: self.default_queue.clone(),
+            map_upstream: None,
+            map_failure_policy: MapFailurePolicy::FailFast,
         });
 
         DagTaskRef {
+            tasks: Rc::clone(&self.tasks),
+            index,
+        }
+    }
+
+    /// Add a mapped activity task to the DAG.
+    #[must_use]
+    pub fn map_activity<F>(&mut self, activity: F) -> DagMapTaskRef
+    where
+        F: Copy + 'static,
+    {
+        let activity_name = short_activity_name(type_name_of_val(&activity));
+        let mut tasks = self.tasks.borrow_mut();
+        let index = tasks.len();
+        tasks.push(PendingDagTask {
+            activity_name,
+            upstreams: Vec::new(),
+            trigger_rule: TriggerRule::AllSuccess,
+            retry_policy: None,
+            start_to_close: None,
+            queue: self.default_queue.clone(),
+            map_upstream: None,
+            map_failure_policy: MapFailurePolicy::FailFast,
+        });
+
+        DagMapTaskRef {
             tasks: Rc::clone(&self.tasks),
             index,
         }
@@ -518,11 +595,31 @@ mod tests {
     }
 
     #[test]
-    fn should_return_task_index() {
+    fn should_support_mapped_activity_builder() {
         let mut builder = DagBuilder::new();
         let a = builder.activity(dummy_activity);
-        assert_eq!(a.index(), 0);
-        let b = builder.activity(dummy_activity);
-        assert_eq!(b.index(), 1);
+        let _b = builder.map_activity(dummy_activity2).over(&a);
+
+        let dag = builder.build().unwrap();
+        let tasks = dag.tasks();
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].map_upstream, Some(0));
+        assert_eq!(tasks[1].map_failure_policy, MapFailurePolicy::FailFast);
+        assert_eq!(tasks[1].upstreams, vec![0]);
+    }
+
+    #[test]
+    fn should_support_mapped_failure_policy_override() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder
+            .map_activity(dummy_activity2)
+            .over(&a)
+            .map_failure_policy(MapFailurePolicy::CollectAll);
+
+        let dag = builder.build().unwrap();
+        let tasks = dag.tasks();
+        assert_eq!(tasks[1].map_failure_policy, MapFailurePolicy::CollectAll);
     }
 }

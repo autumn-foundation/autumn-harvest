@@ -13,7 +13,9 @@ pub use crate::circuit_breaker::{
     DispatchDecision, DispatchToken,
 };
 pub use crate::context::{ActivityContext, WorkflowContext};
-pub use crate::dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
+pub use crate::dag::{
+    DagBuildError, DagBuilder, DagDefinition, DagMapTaskRef, DagTask, DagTaskRef,
+};
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
 pub use crate::event::WorkflowEvent;
 pub use crate::failure::{ActivityFailure, IntoActivityErrorString};
@@ -28,8 +30,8 @@ pub use crate::handle_typed::{
 };
 pub use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 pub use crate::policy::{
-    CircuitBreakerPolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus,
-    TriggerRule, WorkflowSchedule,
+    CircuitBreakerPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy,
+    TaskStatus, TriggerRule, WorkflowSchedule,
 };
 pub use crate::query::QueryRegistry;
 pub use crate::saga::Saga;

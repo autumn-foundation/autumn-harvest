@@ -81,6 +81,67 @@ That's the whole vocabulary. Three things to notice:
   terminal state, regardless of outcome. Useful for end-of-pipeline
   notification and cleanup.
 
+## Dynamic Task Mapping (Fan-Out)
+
+Sometimes, the width of the graph isn't known at design time. You might query a database for a list of partition IDs, and then want to process each partition in parallel.
+
+Harvest supports **dynamic task mapping** (issue #485). A mapped task maps over an upstream task that returns a JSON array, executing one concurrent instance of the activity for each element in the array.
+
+### Declaring a Mapped Task
+
+Use `dag.map_activity` and chain `.over(&upstream)` to bind the fan-out to the upstream task:
+
+```rust
+#[activity]
+async fn list_partitions(_ctx: &ActivityContext) -> HarvestResult<Vec<String>> {
+    Ok(vec!["p0".into(), "p1".into(), "p2".into()])
+}
+
+#[activity]
+async fn process_partition(_ctx: &ActivityContext, partition: String) -> HarvestResult<Value> {
+    // Process single partition...
+    Ok(serde_json::Value::Null)
+}
+
+#[activity]
+async fn combine_results(_ctx: &ActivityContext, results: Vec<Value>) -> HarvestResult<Value> {
+    // Downstream collect task receives the gathered array
+    Ok(serde_json::Value::Null)
+}
+
+#[dag]
+pub fn partition_etl(dag: &mut DagBuilder) {
+    // 1. Upstream node produces a JSON array
+    let list = dag.activity(list_partitions);
+
+    // 2. Mapped node fans out over the array in parallel
+    let process = dag.map_activity(process_partition).over(&list);
+
+    // 3. Downstream collect node receives the array of results
+    let _combine = dag.activity(combine_results).upstream(&process);
+}
+```
+
+### Failure Policies
+
+By default, mapped nodes use the `FailFast` failure policy. You can override it via `.map_failure_policy(...)`:
+
+```rust
+let process = dag.map_activity(process_partition)
+    .over(&list)
+    .map_failure_policy(MapFailurePolicy::CollectAll);
+```
+
+| Policy | Behavior | Downstream Input |
+|---|---|---|
+| `FailFast` *(default)* | Stop execution and cancel in-flight instances on first failure. The mapped task fails. | Downstream does not run (unless trigger rule permits). |
+| `CollectAll` | Execute all N instances to completion. Gathers outcomes for all slots into a status array. Mapped task succeeds. | Downstream receives array of outcome objects: `[{"status":"succeeded","value":v}, {"status":"failed","error":"err"}]`. |
+
+### Behavior and Guarantees
+
+- **Empty Arrays (N = 0)**: If the upstream returns `[]`, the mapped task completes immediately as a successful no-op. Downstream collect nodes receive `[]` and still fire.
+- **Replay Determinism**: The fanned-out width N is a pure function of recorded upstream outputs. During replay, Harvest validates that the number of scheduled instances matches the runtime length of the array. If N differs on replay, Harvest halts execution with a `NonDeterministic` error.
+
 ## Under the hood — unified execution
 
 Since Harvest 0.3 (`unified-dag-execution` feature, on by default), `#[dag]`
