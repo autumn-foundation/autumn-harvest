@@ -3873,6 +3873,7 @@
           { "name": "scope_kind", "required": true, "description": "One of: fleet, workflow_name, queue, shard_id, owner." },
           { "name": "scope_value", "required": false, "description": "Required for non-fleet scopes." },
           { "name": "reason", "required": true, "description": "Human-readable incident description." },
+          { "name": "message", "required": false, "description": "Optional extended message surfaced in the Vantage UI." },
           { "name": "expires_at", "required": false, "description": "ISO 8601 timestamp after which the gate self-clears." }
         ]
       },

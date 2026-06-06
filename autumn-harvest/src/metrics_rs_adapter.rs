@@ -376,10 +376,18 @@ impl MetricsRecorder for MetricsRsRecorder {
     }
 
     fn record_admission_blocked(&self, scope_kind: &str, reason_hash: &str) {
+        // Bound cardinality: use the first 8 hex chars of a FNV-1a hash of the
+        // reason string rather than the raw free-text label (ADR-0001 §7).
+        let mut h: u64 = 14_695_981_039_346_656_037;
+        for b in reason_hash.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(1_099_511_628_211);
+        }
+        let hashed = format!("{:08x}", h & 0xFFFF_FFFF);
         counter!(
             METRIC_ADMISSION_BLOCKED,
             METRIC_LABEL_SCOPE => scope_kind.to_owned(),
-            METRIC_LABEL_REASON => reason_hash.to_owned(),
+            METRIC_LABEL_REASON => hashed,
         )
         .increment(1);
     }

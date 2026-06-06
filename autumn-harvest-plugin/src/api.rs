@@ -2515,7 +2515,13 @@ pub const fn management_api_request_fields()
         (
             "POST",
             "/admin/gates",
-            Some(&["scope_kind", "scope_value", "reason", "expires_at"]),
+            Some(&[
+                "scope_kind",
+                "scope_value",
+                "reason",
+                "message",
+                "expires_at",
+            ]),
         ),
         ("DELETE", "/admin/gates/{id}", Some(&[])),
     ]
@@ -5475,6 +5481,45 @@ async fn batch_start_workflows(
             shard.as_i32(),
             item_owner,
         ) {
+            // Idempotent retry bypass: if the caller supplied an explicit
+            // workflow_id, check whether an active (RUNNING/SUSPENDED) execution
+            // already exists on this shard.  AllowDuplicate would return the
+            // existing run without creating anything new, so the gate must not
+            // block an idempotent re-attach.  The DB call is made lazily — only
+            // when the gate is actually active — so there is no overhead on the
+            // common path where no gate is set.
+            let is_idempotent_retry = if item.workflow_id.is_some() {
+                match api_state.storage_pool() {
+                    Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
+                        Ok(mut pre_conn) => harvest_workflow_executions::table
+                            .filter(
+                                harvest_workflow_executions::workflow_name.eq(&item.workflow_name),
+                            )
+                            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                            .filter(
+                                harvest_workflow_executions::state.eq_any(["RUNNING", "SUSPENDED"]),
+                            )
+                            .select(harvest_workflow_executions::id)
+                            .first::<uuid::Uuid>(&mut pre_conn)
+                            .await
+                            .optional()
+                            .unwrap_or(None)
+                            .is_some(),
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+            if is_idempotent_retry {
+                // Active execution found — let Phase 2 return it via AllowDuplicate.
+                shard_groups
+                    .entry(shard)
+                    .or_default()
+                    .push((idx, workflow_id));
+                continue;
+            }
             let reason_label = match gate_reason.char_indices().nth(64) {
                 Some((idx2, _)) => &gate_reason[..idx2],
                 None => &gate_reason,
@@ -8917,6 +8962,7 @@ async fn trigger_schedule_now(
 
     // issue #377: check admission gates before firing a manual trigger.
     {
+        let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(&workflow_name);
         let wf_owner = runtime
             .registry
             .workflows
@@ -8925,7 +8971,7 @@ async fn trigger_schedule_now(
             .or_else(|| {
                 runtime
                     .dags()
-                    .get(&workflow_name)
+                    .get(dag_lookup_key)
                     .and_then(|d| d.owner.as_deref())
             });
         let gate_hit = api_state
