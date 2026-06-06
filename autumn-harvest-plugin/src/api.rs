@@ -4868,6 +4868,7 @@ async fn start_workflow(
             return e.into_response();
         }
     };
+    let explicit_workflow_id = request.workflow_id.is_some();
     let workflow_id = request
         .workflow_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -4894,44 +4895,77 @@ async fn start_workflow(
                 .gate_cache()
                 .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner);
         if let Some((gate_id, reason, scope_kind)) = gates {
-            // Truncate reason to 64 *characters* (not bytes) for bounded metric
-            // cardinality; char_indices avoids splitting a multi-byte code point.
-            let reason_label = match reason.char_indices().nth(64) {
-                Some((idx, _)) => &reason[..idx],
-                None => &reason,
+            // Idempotent retry bypass: if the caller supplied an explicit
+            // workflow_id, check whether a non-terminal execution already
+            // exists on this shard.  start_or_load_workflow_execution with
+            // AllowDuplicate (or AllowDuplicateFailedOnly for live runs) would
+            // return it without creating new work, so the gate must not block.
+            let is_idempotent_retry = if explicit_workflow_id {
+                match api_state.storage_pool() {
+                    Ok(pool) => match acquire_conn(pool.pool_for(shard)).await {
+                        Ok(mut pre_conn) => harvest_workflow_executions::table
+                            .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
+                            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+                            .filter(
+                                harvest_workflow_executions::state
+                                    .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                            )
+                            .select(harvest_workflow_executions::id)
+                            .first::<uuid::Uuid>(&mut pre_conn)
+                            .await
+                            .optional()
+                            .unwrap_or(None)
+                            .is_some(),
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
+                }
+            } else {
+                false
             };
-            runtime
-                .registry
-                .telemetry()
-                .metrics
-                .record_admission_blocked(scope_kind, reason_label);
-            if let Ok(pool) = api_state.storage_pool()
-                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
-            {
-                let ar = NewAuditRecord {
-                    actor: &actor,
-                    operation: OP_WORKFLOW_START,
-                    target_type: TARGET_WORKFLOW,
-                    target_id: Some(workflow_name.as_str()),
-                    route_or_command: route,
-                    request_id: request_id.as_deref(),
-                    idempotency_key: None,
-                    status: STATUS_FAILED,
-                    error_summary: Some("admission blocked by gate"),
-                    shard_id: None,
-                    source: &source,
+            if is_idempotent_retry {
+                // Existing execution found — fall through to start_or_load which
+                // will return it under AllowDuplicate without inserting anything.
+            } else {
+                // Truncate reason to 64 *characters* (not bytes) for bounded metric
+                // cardinality; char_indices avoids splitting a multi-byte code point.
+                let reason_label = match reason.char_indices().nth(64) {
+                    Some((idx, _)) => &reason[..idx],
+                    None => &reason,
                 };
-                let _ = audit::insert_audit(&mut conn, &ar).await;
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_admission_blocked(scope_kind, reason_label);
+                if let Ok(pool) = api_state.storage_pool()
+                    && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+                {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_WORKFLOW_START,
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(workflow_name.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: STATUS_FAILED,
+                        error_summary: Some("admission blocked by gate"),
+                        shard_id: None,
+                        source: &source,
+                    };
+                    let _ = audit::insert_audit(&mut conn, &ar).await;
+                }
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "admission blocked",
+                        "gate_id": gate_id,
+                        "reason": reason,
+                    })),
+                )
+                    .into_response();
             }
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "admission blocked",
-                    "gate_id": gate_id,
-                    "reason": reason,
-                })),
-            )
-                .into_response();
         }
     }
 
@@ -5497,7 +5531,10 @@ async fn batch_start_workflows(
                             )
                             .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
                             .filter(
-                                harvest_workflow_executions::state.eq_any(["RUNNING", "SUSPENDED"]),
+                                // Mirror AllowDuplicate: any row except CONTINUED_AS_NEW
+                                // or TERMINATED is returned without inserting a new one.
+                                harvest_workflow_executions::state
+                                    .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
                             )
                             .select(harvest_workflow_executions::id)
                             .first::<uuid::Uuid>(&mut pre_conn)
@@ -8960,6 +8997,20 @@ async fn trigger_schedule_now(
         }
     };
 
+    // Pre-generate triggered_at and workflow_id so the gate check uses the
+    // actual execution shard (router-determined) rather than a hard-coded 0.
+    let triggered_at = chrono::Utc::now();
+    // Append a UUID v4 so concurrent trigger calls within the same millisecond
+    // each produce a distinct workflow_id and start independent executions.
+    let workflow_id = format!(
+        "manual-{schedule_id}-{}-{}",
+        triggered_at.timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let trigger_exec_shard = runtime
+        .router
+        .pick_for_new_workflow(&workflow_name, &workflow_id);
+
     // issue #377: check admission gates before firing a manual trigger.
     {
         let dag_lookup_key = schedule.dag_name.as_deref().unwrap_or(&workflow_name);
@@ -8974,9 +9025,12 @@ async fn trigger_schedule_now(
                     .get(dag_lookup_key)
                     .and_then(|d| d.owner.as_deref())
             });
-        let gate_hit = api_state
-            .gate_cache()
-            .check(&workflow_name, &queue_name, 0, wf_owner);
+        let gate_hit = api_state.gate_cache().check(
+            &workflow_name,
+            &queue_name,
+            trigger_exec_shard.as_i32(),
+            wf_owner,
+        );
         if let Some((gate_id, gate_reason, scope_kind)) = gate_hit {
             let reason_label = match gate_reason.char_indices().nth(64) {
                 Some((idx, _)) => &gate_reason[..idx],
@@ -9010,14 +9064,7 @@ async fn trigger_schedule_now(
         }
     }
 
-    let triggered_at = chrono::Utc::now();
-    // Append a UUID v4 so concurrent trigger calls within the same millisecond each
-    // produce a distinct workflow_id and start independent executions.
-    let workflow_id = format!(
-        "manual-{schedule_id}-{}-{}",
-        triggered_at.timestamp_millis(),
-        uuid::Uuid::new_v4().simple()
-    );
+    // triggered_at and workflow_id were pre-generated above for the gate check.
 
     // Acquire the DB connection early so it is available for both the overlap-skip
     // audit record and the normal start call.

@@ -5140,7 +5140,6 @@ async fn execute_schedule_trigger_ui(
     pool: &crate::HarvestDbPool,
     runtime: &HarvestApiRuntime,
     gate_cache: &autumn_harvest::admission_gate::AdmissionGateCache,
-    schedule_shard: autumn_harvest::types::ShardId,
     row: &HarvestSchedule,
     id_str: &str,
     name: &str,
@@ -5148,8 +5147,23 @@ async fn execute_schedule_trigger_ui(
     input: serde_json::Value,
     queue: &str,
 ) -> axum::response::Response {
+    // Pre-generate workflow_id and triggered_at so the gate check uses the
+    // actual execution shard (determined by the router) rather than the shard
+    // where the schedule row was found.  The values are reused below.
+    let triggered_at = chrono::Utc::now();
+    let workflow_id = format!(
+        "manual-{}-{}-{}",
+        row.id,
+        triggered_at.timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let exec_shard = runtime
+        .router()
+        .pick_for_new_workflow(workflow_name, &workflow_id);
+
     // issue #377: check admission gates before firing this manual schedule trigger.
     {
+        let dag_name_for_owner = row.dag_name.as_deref().unwrap_or(workflow_name);
         let wf_owner = runtime
             .registry()
             .workflows
@@ -5158,11 +5172,11 @@ async fn execute_schedule_trigger_ui(
             .or_else(|| {
                 runtime
                     .dags()
-                    .get(workflow_name)
+                    .get(dag_name_for_owner)
                     .and_then(|d| d.owner.as_deref())
             });
         if let Some((gate_id, gate_reason, scope_kind)) =
-            gate_cache.check(workflow_name, queue, schedule_shard.as_i32(), wf_owner)
+            gate_cache.check(workflow_name, queue, exec_shard.as_i32(), wf_owner)
         {
             let reason_label = match gate_reason.char_indices().nth(64) {
                 Some((idx, _)) => &gate_reason[..idx],
@@ -5229,13 +5243,7 @@ async fn execute_schedule_trigger_ui(
             Some(_) => {}
         }
     }
-    let triggered_at = chrono::Utc::now();
-    let workflow_id = format!(
-        "manual-{}-{}-{}",
-        row.id,
-        triggered_at.timestamp_millis(),
-        uuid::Uuid::new_v4().simple()
-    );
+    // triggered_at and workflow_id were pre-generated above for the gate check.
     let exec_id = HarvestExecutionId::new();
     let (owner, runbook_url, severity) = {
         let wf_meta = runtime
@@ -5374,7 +5382,7 @@ async fn schedule_trigger_now_ui(
         Ok(f) => f,
         Err(response) => return response,
     };
-    let Some((row, found_shard, _)) = found else {
+    let Some((row, _found_shard, _)) = found else {
         return schedule_redirect(&format!(
             "Schedule {} not found",
             &id_str[..8.min(id_str.len())]
@@ -5404,7 +5412,6 @@ async fn schedule_trigger_now_ui(
         &pool,
         &runtime,
         &api_state.gate_cache(),
-        found_shard,
         &row,
         &id_str,
         &name,

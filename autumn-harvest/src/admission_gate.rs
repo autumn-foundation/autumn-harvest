@@ -401,7 +401,8 @@ pub mod db {
     use crate::models::{AdmissionGateRow, NewAdmissionGateRow};
     use crate::schema::harvest_admission_gates;
     use diesel::{BoolExpressionMethods, ExpressionMethods, NullableExpressionMethods, QueryDsl};
-    use diesel_async::{AsyncPgConnection, RunQueryDsl};
+    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use scoped_futures::ScopedFutureExt;
 
     /// Convert a DB row into an in-memory [`AdmissionGate`].
     ///
@@ -472,7 +473,6 @@ pub mod db {
         expires_at: Option<DateTime<Utc>>,
     ) -> HarvestResult<AdmissionGate> {
         use crate::error::HarvestError;
-        use harvest_admission_gates::dsl as g;
 
         if reason.trim().is_empty() {
             return Err(HarvestError::Config(
@@ -480,50 +480,70 @@ pub mod db {
             ));
         }
 
-        let now = Utc::now();
-
-        // Count active gates to enforce upper bound
-        let active_count: i64 = g::harvest_admission_gates
-            .filter(g::lifted_at.is_null())
-            .filter(
-                g::expires_at
-                    .is_null()
-                    .or(g::expires_at.assume_not_null().gt(now)),
-            )
-            .count()
-            .get_result::<i64>(conn)
-            .await
-            .map_err(database_error)?;
-
-        #[allow(clippy::cast_possible_wrap)]
-        if active_count >= MAX_ACTIVE_GATES as i64 {
-            return Err(HarvestError::Config(format!(
-                "cannot create admission gate: active gate limit of {MAX_ACTIVE_GATES} reached",
-            )));
-        }
-
+        // Capture owned copies so they can be moved into the transaction closure.
+        let scope_kind = scope.kind_str();
         let scope_value_owned = scope.value_str();
-        let scope_value = scope_value_owned.as_deref();
+        let reason_owned = reason.to_owned();
+        let message_owned = message.map(str::to_owned);
+        let actor_owned = actor.to_owned();
 
-        let new_gate = NewAdmissionGateRow {
-            id: Uuid::new_v4(),
-            scope_kind: scope.kind_str(),
-            scope_value,
-            reason,
-            message,
-            created_by: actor,
-            expires_at,
-        };
+        conn.transaction::<AdmissionGate, HarvestError, _>(|conn| {
+            async move {
+                use harvest_admission_gates::dsl as g;
 
-        let row: AdmissionGateRow = diesel::insert_into(g::harvest_admission_gates)
-            .values(&new_gate)
-            .get_result(conn)
-            .await
-            .map_err(database_error)?;
+                // Serialise concurrent gate creates so the count-check + insert is
+                // atomic and the MAX_ACTIVE_GATES cap cannot be exceeded under
+                // concurrent POST /admin/gates requests.  Advisory lock key 377 =
+                // issue number; xact-scoped so it auto-releases on commit/rollback.
+                diesel::sql_query("SELECT pg_advisory_xact_lock(377)")
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
 
-        row_to_gate(row).ok_or_else(|| {
-            crate::error::HarvestError::Config("created gate row could not be decoded".to_string())
+                let now = Utc::now();
+                let active_count: i64 = g::harvest_admission_gates
+                    .filter(g::lifted_at.is_null())
+                    .filter(
+                        g::expires_at
+                            .is_null()
+                            .or(g::expires_at.assume_not_null().gt(now)),
+                    )
+                    .count()
+                    .get_result::<i64>(conn)
+                    .await
+                    .map_err(database_error)?;
+
+                #[allow(clippy::cast_possible_wrap)]
+                if active_count >= MAX_ACTIVE_GATES as i64 {
+                    return Err(HarvestError::Config(format!(
+                        "cannot create admission gate: active gate limit of {MAX_ACTIVE_GATES} reached",
+                    )));
+                }
+
+                let scope_value_ref = scope_value_owned.as_deref();
+                let new_gate = NewAdmissionGateRow {
+                    id: Uuid::new_v4(),
+                    scope_kind,
+                    scope_value: scope_value_ref,
+                    reason: &reason_owned,
+                    message: message_owned.as_deref(),
+                    created_by: &actor_owned,
+                    expires_at,
+                };
+
+                let row: AdmissionGateRow = diesel::insert_into(g::harvest_admission_gates)
+                    .values(&new_gate)
+                    .get_result(conn)
+                    .await
+                    .map_err(database_error)?;
+
+                row_to_gate(row).ok_or_else(|| {
+                    HarvestError::Config("created gate row could not be decoded".to_string())
+                })
+            }
+            .scope_boxed()
         })
+        .await
     }
 
     /// Soft-delete a gate by setting `lifted_at`.
