@@ -60,3 +60,47 @@ fn test_havoc_external_task_duration_panic() {
     });
     assert!(res.is_ok());
 }
+
+#[test]
+fn havoc_test_admission_gate_cache_deadlocks() {
+    loom::model(|| {
+        let cache = std::sync::Arc::new(autumn_harvest::admission_gate::AdmissionGateCache::new());
+        let c1 = cache.clone();
+        let t1 = loom::thread::spawn(move || {
+            let _ = c1.check("wf1", "q1", 0, None);
+        });
+
+        let c2 = cache;
+        let t2 = loom::thread::spawn(move || {
+            c2.refresh(vec![]);
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+    });
+}
+
+#[test]
+fn havoc_test_execute_query_deadlocks() {
+    loom::model(|| {
+        use autumn_harvest::{WorkflowContext, types::ExecutionId};
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let ctx = Arc::new(WorkflowContext::for_replay(ExecutionId::new(), vec![]));
+        let ctx_clone = Arc::clone(&ctx);
+
+        ctx.register_query("other", || json!({"status": "ok"}));
+        ctx.register_query("deadlock", move || {
+            ctx_clone.execute_query("other").unwrap();
+            json!({})
+        });
+
+        let ctx_run = ctx;
+        let t1 = loom::thread::spawn(move || {
+            let _ = ctx_run.execute_query("deadlock");
+        });
+
+        t1.join().unwrap();
+    });
+}
