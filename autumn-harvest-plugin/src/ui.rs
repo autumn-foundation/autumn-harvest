@@ -130,6 +130,8 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .badge.Active{background:#166534;color:#dcfce7}
 .badge.Draining{background:#92400e;color:#fef3c7}
 .badge.Stopped{background:#334155;color:#e2e8f0}
+.badge.timezone{background:#1e3a8a;color:#93c5fd;border:1px solid #3b82f6}
+.timezone-utc{color:#64748b;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
 .badge-owner{background:#312e81;color:#c7d2fe;border:1px solid #4338ca}
 .badge-sev-sev1{background:#7f1d1d;color:#fee2e2;border:1px solid #b91c1c}
 .badge-sev-sev2{background:#7c2d12;color:#ffedd5;border:1px solid #c2410c}
@@ -5791,6 +5793,7 @@ fn render_schedule_hidden_filters(filters: &ScheduleUiFilters) -> Markup {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_schedule_table(
     rows: &[(ShardId, HarvestSchedule)],
     is_multi_shard: bool,
@@ -5804,6 +5807,7 @@ fn render_schedule_table(
                     th { "Kind" }
                     th { "Target" }
                     th { "Expression" }
+                    th { "Timezone" }
                     th { "Next Run" }
                     th { "Last Run" }
                     th { "State" }
@@ -5852,6 +5856,13 @@ fn render_schedule_table(
                             }
                         }
                         td { code { (expr) } }
+                        td {
+                            @if row.timezone == "UTC" {
+                                span class="timezone-utc" { "UTC" }
+                            } @else {
+                                span.badge.timezone { (row.timezone) }
+                            }
+                        }
                         td { (format_timestamp(row.next_run_at)) }
                         td { (format_timestamp(row.last_run_at)) }
                         td { (schedule_state_badge(row.is_paused)) }
