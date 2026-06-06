@@ -141,6 +141,11 @@ pub struct CancelledWorkflowExecution {
     pub newly_cancelled: bool,
     /// Number of pending/running task rows failed by this request.
     pub failed_task_count: usize,
+    /// Workflow type name — used by callers that want to emit per-workflow
+    /// metrics without re-querying the execution row.
+    pub workflow_name: String,
+    /// Task queue the execution was dispatched on.
+    pub queue_name: String,
 }
 
 impl CancelledWorkflowExecution {
@@ -153,16 +158,26 @@ impl CancelledWorkflowExecution {
                 .unwrap_or_else(|| "workflow already cancelled".to_string()),
             newly_cancelled: false,
             failed_task_count: 0,
+            workflow_name: execution.workflow_name,
+            queue_name: execution.queue_name,
         }
     }
 
-    fn newly_cancelled(exec_id: ExecutionId, reason: String, failed_task_count: usize) -> Self {
+    fn newly_cancelled(
+        exec_id: ExecutionId,
+        reason: String,
+        failed_task_count: usize,
+        workflow_name: String,
+        queue_name: String,
+    ) -> Self {
         Self {
             exec_id,
             state: "CANCELLED".to_string(),
             reason,
             newly_cancelled: true,
             failed_task_count,
+            workflow_name,
+            queue_name,
         }
     }
 }
@@ -256,8 +271,13 @@ pub async fn start_or_load_workflow_execution(
         // Ignore Config errors: the execution may have transitioned to a terminal
         // state between the pre-check and the cancel lock. In that race the prior
         // run is already done, so we just continue to the start transaction below.
-        match cancel_workflow_execution(conn, existing_exec_id, "terminated to start new execution")
-            .await
+        match cancel_workflow_execution(
+            conn,
+            existing_exec_id,
+            "terminated to start new execution",
+            &crate::telemetry::NoOpMetrics,
+        )
+        .await
         {
             Ok(_) | Err(HarvestError::Config(_)) => {}
             Err(e) => return Err(e),
@@ -580,6 +600,7 @@ pub async fn cancel_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
     let reason = reason.trim();
     let reason = if reason.is_empty() {
@@ -686,6 +707,8 @@ pub async fn cancel_workflow_execution(
                             exec_id,
                             reason,
                             total_failed_or_deleted,
+                            execution.workflow_name.clone(),
+                            execution.queue_name.clone(),
                         ),
                         deferred,
                     ))
@@ -697,6 +720,14 @@ pub async fn cancel_workflow_execution(
 
     for start in deferred_starts {
         start.spawn();
+    }
+
+    if cancel_result.newly_cancelled {
+        metrics.record_workflow_terminal(
+            &cancel_result.workflow_name,
+            &cancel_result.queue_name,
+            crate::telemetry::WorkflowStatus::Cancelled,
+        );
     }
 
     Ok(cancel_result)
@@ -911,6 +942,7 @@ pub async fn terminate_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
     let reason = reason.trim();
     let reason = if reason.is_empty() {
@@ -986,6 +1018,8 @@ pub async fn terminate_workflow_execution(
                             exec_id,
                             reason,
                             failed_task_count,
+                            execution.workflow_name.clone(),
+                            execution.queue_name.clone(),
                         ),
                         deferred,
                     ))
@@ -997,6 +1031,14 @@ pub async fn terminate_workflow_execution(
 
     for start in deferred_starts {
         start.spawn();
+    }
+
+    if cancel_result.newly_cancelled {
+        metrics.record_workflow_terminal(
+            &cancel_result.workflow_name,
+            &cancel_result.queue_name,
+            crate::telemetry::WorkflowStatus::Terminated,
+        );
     }
 
     Ok(cancel_result)

@@ -4870,6 +4870,11 @@ async fn fail_workflow_for_history_cap(
     telemetry
         .metrics
         .record_workflow_history_size(&execution.workflow_name, terminal_count);
+    telemetry.metrics.record_workflow_terminal(
+        &execution.workflow_name,
+        &task.queue_name,
+        WorkflowStatus::Failed,
+    );
 
     let reason = DeadLetterReason::HistoryCapExceeded {
         count: event_count,
@@ -5520,6 +5525,27 @@ async fn process_workflow_task(
         telemetry
             .metrics
             .record_workflow_continue_as_new(&prepared.execution.workflow_name);
+    }
+    // Emit the once-per-terminal-outcome counter (issue #519).
+    // Suspended is not a terminal state — a workflow that suspends N times
+    // and then completes must produce exactly one `completed` increment.
+    match &outcome {
+        WorkflowOutcome::Completed { .. } => telemetry.metrics.record_workflow_terminal(
+            &prepared.execution.workflow_name,
+            &task.queue_name,
+            WorkflowStatus::Completed,
+        ),
+        WorkflowOutcome::Failed { .. } => telemetry.metrics.record_workflow_terminal(
+            &prepared.execution.workflow_name,
+            &task.queue_name,
+            WorkflowStatus::Failed,
+        ),
+        WorkflowOutcome::ContinuedAsNew { .. } => telemetry.metrics.record_workflow_terminal(
+            &prepared.execution.workflow_name,
+            &task.queue_name,
+            WorkflowStatus::ContinuedAsNew,
+        ),
+        WorkflowOutcome::Suspended { .. } => {} // not terminal — no counter
     }
 
     // Keep the in-memory execution snapshot current so that

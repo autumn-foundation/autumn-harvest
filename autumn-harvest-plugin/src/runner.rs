@@ -310,6 +310,7 @@ impl HarvestRunner {
                 prepared.storage_pool.sharded_pool().clone(),
                 BatchExecutorConfig {
                     concurrency: config.batch.concurrency,
+                    metrics: Arc::clone(&registry.telemetry().metrics),
                 },
                 std::time::Duration::from_millis(config.batch.tick_interval_ms),
             ))
