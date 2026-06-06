@@ -1,7 +1,7 @@
 //! Integration tests for DAG dynamic task mapping (issue #485).
 //!
 //! Requires features: `unified-dag-execution` + `testing`.
-
+#![cfg(all(feature = "unified-dag-execution", feature = "testing"))]
 #![allow(clippy::unused_async)]
 
 use autumn_harvest::event::WorkflowEvent;
