@@ -366,6 +366,20 @@ pub enum WorkflowCommand {
     },
 }
 
+impl WorkflowCommand {
+    /// Returns `true` if this command is a bookkeeping command.
+    #[must_use]
+    pub const fn is_bookkeeping(&self) -> bool {
+        matches!(
+            self,
+            Self::RecordMarker { .. }
+                | Self::RecordUpdateResult { .. }
+                | Self::UpsertSearchAttributes { .. }
+                | Self::SpawnDetachedChildWorkflow { .. }
+        )
+    }
+}
+
 // Manual Debug because oneshot::Sender is not Debug.
 impl std::fmt::Debug for WorkflowCommand {
     #[allow(clippy::too_many_lines)]

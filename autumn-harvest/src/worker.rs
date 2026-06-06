@@ -486,31 +486,19 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
     });
 
     let only_wait_or_bookkeeping = commands.iter().all(|cmd| {
-        matches!(
-            cmd,
-            WorkflowCommand::WaitForSignal { .. }
-                | WorkflowCommand::SignalExternalWorkflow { .. }
-                | WorkflowCommand::RecordMarker { .. }
-                | WorkflowCommand::RecordUpdateResult { .. }
-                | WorkflowCommand::UpsertSearchAttributes { .. }
-                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-        )
+        cmd.is_bookkeeping()
+            || matches!(
+                cmd,
+                WorkflowCommand::WaitForSignal { .. }
+                    | WorkflowCommand::SignalExternalWorkflow { .. }
+            )
     });
 
     has_wait && only_wait_or_bookkeeping
 }
 
 fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
-    !commands.is_empty()
-        && commands.iter().all(|cmd| {
-            matches!(
-                cmd,
-                WorkflowCommand::RecordMarker { .. }
-                    | WorkflowCommand::RecordUpdateResult { .. }
-                    | WorkflowCommand::UpsertSearchAttributes { .. }
-                    | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-            )
-        })
+    !commands.is_empty() && commands.iter().all(WorkflowCommand::is_bookkeeping)
 }
 
 #[derive(Debug, Clone)]
@@ -709,11 +697,10 @@ fn extract_all_scheduled_activities(
     let mut scheduled = Vec::new();
 
     for cmd in commands {
+        if cmd.is_bookkeeping() {
+            continue;
+        }
         match cmd {
-            WorkflowCommand::RecordMarker { .. }
-            | WorkflowCommand::RecordUpdateResult { .. }
-            | WorkflowCommand::UpsertSearchAttributes { .. }
-            | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
             WorkflowCommand::ScheduleActivity {
                 activity_id,
                 name,
@@ -747,11 +734,10 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
     let mut activity_ids = Vec::new();
 
     for cmd in commands {
+        if cmd.is_bookkeeping() {
+            continue;
+        }
         match cmd {
-            WorkflowCommand::RecordMarker { .. }
-            | WorkflowCommand::RecordUpdateResult { .. }
-            | WorkflowCommand::UpsertSearchAttributes { .. }
-            | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
             WorkflowCommand::WaitForActivity { activity_id, .. } => activity_ids.push(*activity_id),
             _ => return None,
         }
@@ -793,16 +779,13 @@ fn extract_started_timer_for_suspension(
 
     // Now verify that all other commands in the batch are either bookkeeping OR signal waits.
     let is_valid = commands.iter().all(|cmd| {
-        matches!(
-            cmd,
-            WorkflowCommand::StartTimer { .. }
-                | WorkflowCommand::WaitForSignal { .. }
-                | WorkflowCommand::SignalExternalWorkflow { .. }
-                | WorkflowCommand::RecordMarker { .. }
-                | WorkflowCommand::RecordUpdateResult { .. }
-                | WorkflowCommand::UpsertSearchAttributes { .. }
-                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-        )
+        cmd.is_bookkeeping()
+            || matches!(
+                cmd,
+                WorkflowCommand::StartTimer { .. }
+                    | WorkflowCommand::WaitForSignal { .. }
+                    | WorkflowCommand::SignalExternalWorkflow { .. }
+            )
     });
 
     if is_valid { Some(first_timer) } else { None }
@@ -815,18 +798,8 @@ fn extract_started_timer_for_suspension(
 fn extract_all_started_child_workflows(
     commands: &[WorkflowCommand],
 ) -> Option<Vec<StartedChildWorkflowCommand>> {
-    let non_markers: Vec<&WorkflowCommand> = commands
-        .iter()
-        .filter(|c| {
-            !matches!(
-                c,
-                WorkflowCommand::RecordMarker { .. }
-                    | WorkflowCommand::RecordUpdateResult { .. }
-                    | WorkflowCommand::UpsertSearchAttributes { .. }
-                    | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-            )
-        })
-        .collect();
+    let non_markers: Vec<&WorkflowCommand> =
+        commands.iter().filter(|c| !c.is_bookkeeping()).collect();
 
     if non_markers.is_empty() {
         return None;
