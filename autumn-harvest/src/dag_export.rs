@@ -6,6 +6,9 @@
 use crate::dag::DagDefinition;
 use std::fmt::Write;
 
+#[cfg(feature = "testing")]
+use crate::dag_profiler::{DagProfile, ProfilerEventKind};
+
 /// Exports the DAG definition to a Mermaid.js flowchart.
 ///
 /// # Examples
@@ -91,6 +94,44 @@ pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+/// Exports the DAG profile to a Mermaid.js Gantt chart.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "testing")]
+pub fn export_mermaid_gantt(profile: &DagProfile) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "gantt")?;
+    writeln!(out, "    title DAG Profile")?;
+    writeln!(out, "    dateFormat X")?;
+    writeln!(out, "    axisFormat %s")?;
+    writeln!(out, "    section Execution")?;
+
+    let mut starts = std::collections::HashMap::new();
+
+    for event in &profile.timeline {
+        match &event.kind {
+            ProfilerEventKind::TaskStarted(idx, name) => {
+                starts.insert(*idx, (name.clone(), event.time));
+            }
+            ProfilerEventKind::TaskCompleted(idx, _name) => {
+                if let Some((name, start_time)) = starts.remove(idx) {
+                    let diff_secs = event.time.saturating_sub(start_time).as_secs();
+                    writeln!(
+                        out,
+                        "    {} : {}, {}s",
+                        name,
+                        start_time.as_secs(),
+                        diff_secs
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +151,29 @@ mod tests {
 
         let dot = export_dot(&dag).unwrap();
         assert_eq!(dot, "digraph DAG {\n}\n");
+    }
+
+    #[cfg(feature = "testing")]
+    use crate::dag_profiler::DagProfiler;
+    use std::time::Duration;
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn test_export_mermaid_gantt() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity2).upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let profiler = DagProfiler::new(dag)
+            .mock_duration("dummy_activity", Duration::from_secs(2))
+            .mock_duration("dummy_activity2", Duration::from_secs(3));
+        let profile = profiler.profile();
+
+        let gantt = crate::dag_export::export_mermaid_gantt(&profile).unwrap();
+        assert!(gantt.contains("gantt"));
+        assert!(gantt.contains("dummy_activity"));
+        assert!(gantt.contains("dummy_activity2"));
     }
 
     #[test]
