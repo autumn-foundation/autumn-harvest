@@ -3292,22 +3292,27 @@ impl WorkflowContext {
             .or_insert(info.handler);
 
         // Wrap the fn pointer in a BoxUpdateHandler that creates a handler-mode
-        // WorkflowContext on each invocation. Inherit exec_id, start_time, and
-        // cancellation_reason from the parent so handlers see consistent values.
+        // WorkflowContext on each invocation. Inherit exec_id, start_time,
+        // cancellation_reason, and workflow_id from the parent so handlers see
+        // consistent values and logger correlation keys.
         let handler_fn = info.handler;
         let exec_id = self.exec_id;
         let start_time = self.start_time;
         let cancellation_reason = self.cancellation_reason.clone();
         let state = std::sync::Arc::clone(&self.state);
         let name = info.name;
+        let workflow_id = self.workflow_id.clone();
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
-            let ctx = Self::new_for_handler(
+            let mut ctx = Self::new_for_handler(
                 exec_id,
                 start_time,
                 cancellation_reason.clone(),
                 std::sync::Arc::clone(&state),
             );
+            // Propagate workflow_id for logger correlation. Arc was just created;
+            // no other reference exists yet so get_mut always succeeds.
+            std::sync::Arc::get_mut(&mut ctx).unwrap().workflow_id.clone_from(&workflow_id);
             handler_fn(ctx, input)
         });
 
@@ -3358,12 +3363,13 @@ impl WorkflowContext {
             .get(name)
             .copied();
         handler.map(|h| {
-            let ctx = Self::new_for_handler(
+            let mut ctx = Self::new_for_handler(
                 self.exec_id,
                 self.start_time,
                 self.cancellation_reason.clone(),
                 std::sync::Arc::clone(&self.state),
             );
+            std::sync::Arc::get_mut(&mut ctx).unwrap().workflow_id.clone_from(&self.workflow_id);
             h(ctx, input)
         })
     }
