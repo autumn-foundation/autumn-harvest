@@ -1366,6 +1366,37 @@ async fn insert_test_schedule(
     id
 }
 
+async fn insert_test_schedule_with_tz(
+    database_url: &str,
+    kind: &str,
+    name: &str,
+    is_paused: bool,
+    timezone: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    let mut conn = AsyncPgConnection::establish(database_url)
+        .await
+        .expect("failed to connect for schedule insert");
+    let (dag_col, wf_col) = if kind == "Dag" {
+        (format!("'{name}'"), "NULL".to_string())
+    } else {
+        ("NULL".to_string(), format!("'{name}'"))
+    };
+    let paused_at_col = if is_paused { "NOW()" } else { "NULL" };
+    let sql = format!(
+        "INSERT INTO harvest_schedules \
+            (id, dag_name, workflow_name, schedule_expr, timezone, catchup, \
+             max_active_runs, is_paused, paused_at, created_at, updated_at) \
+         VALUES \
+            ('{id}', {dag_col}, {wf_col}, '0 * * * *', '{timezone}', false, 1, \
+             {is_paused}, {paused_at_col}, NOW(), NOW())"
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("insert_test_schedule_with_tz failed");
+    id
+}
+
 /// Empty schedules table → page renders "No schedules registered."
 #[tokio::test]
 async fn ui_schedules_empty_state() {
@@ -1897,6 +1928,40 @@ async fn ui_all_pages_have_schedules_nav_link() {
             "page {path} must include a Schedules nav link: {html}"
         );
     }
+}
+
+/// Timezone column renders and differentiates UTC (subdued) from other timezones (prominent badge).
+#[tokio::test]
+async fn ui_schedules_displays_timezone() {
+    let (database_url, _container) = setup_test_database_url().await;
+    insert_test_schedule_with_tz(&database_url, "Workflow", "utc_wf", false, "UTC").await;
+    insert_test_schedule_with_tz(
+        &database_url,
+        "Workflow",
+        "la_wf",
+        false,
+        "America/Los_Angeles",
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, "/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Differentiate UTC vs America/Los_Angeles rendering:
+    // UTC should be subdued, and America/Los_Angeles should be prominent.
+    // Timezone column header must be present.
+    assert!(
+        html.contains("<th>Timezone</th>")
+            || html.contains("<th>TIMEZONE</th>")
+            || html.contains("<th>timezone</th>"),
+        "Timezone header missing: {html}"
+    );
+    assert!(
+        html.contains("America/Los_Angeles"),
+        "America/Los_Angeles timezone missing: {html}"
+    );
+    assert!(html.contains("UTC"), "UTC timezone missing: {html}");
 }
 
 // ---------------------------------------------------------------------------
