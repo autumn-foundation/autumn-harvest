@@ -13,7 +13,7 @@
 //!    task queue.
 //!
 //! Run with:
-//!   cargo run --example schema_workflow --features schema
+//!   cargo run --example `schema_workflow` --features schema
 
 use autumn_harvest::info::RegisteredWorkflowRecord;
 use autumn_harvest::prelude::*;
@@ -46,9 +46,12 @@ pub struct OnboardOutput {
 // ── Workflows ────────────────────────────────────────────────────────────────
 
 #[workflow(description = "Handles new-user onboarding from signup to first action")]
+/// # Errors
+/// Returns a `String` if the onboarding process fails.
+#[allow(clippy::unused_async, clippy::used_underscore_binding)]
 pub async fn onboarding(
     _ctx: &WorkflowContext,
-    _input: OnboardInput,
+    #[allow(unused_variables)] input: OnboardInput,
 ) -> Result<OnboardOutput, String> {
     // Real implementation would dispatch activities here.
     Ok(OnboardOutput {
@@ -57,8 +60,14 @@ pub async fn onboarding(
 }
 
 /// A minimal no-schema workflow for comparison.
+/// # Errors
+/// Returns a `String` if the workflow fails.
 #[workflow]
-pub async fn no_schema_workflow(_ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
+#[allow(clippy::unused_async, clippy::used_underscore_binding)]
+pub async fn no_schema_workflow(
+    _ctx: &WorkflowContext,
+    #[allow(unused_variables)] input: (),
+) -> Result<(), String> {
     Ok(())
 }
 

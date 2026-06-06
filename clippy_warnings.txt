@@ -1,0 +1,113 @@
+    Checking autumn-harvest-plugin v0.3.0 (/app/autumn-harvest-plugin)
+    Checking autumn-harvest-cli v0.3.0 (/app/autumn-harvest-cli)
+    Checking quickstart v0.3.0 (/app/examples/quickstart)
+    Checking billing-autumn-web v0.3.0 (/app/examples/billing-autumn-web)
+    Checking standalone-runner v0.3.0 (/app/examples/standalone-runner)
+    Checking autumn-harvest v0.3.0 (/app/autumn-harvest)
+error: item in documentation is missing backticks
+  --> autumn-harvest/examples/schema_workflow.rs:16:27
+   |
+16 | //!   cargo run --example schema_workflow --features schema
+   |                           ^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#doc_markdown
+   = note: `-D clippy::doc-markdown` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::doc_markdown)]`
+help: try
+   |
+16 - //!   cargo run --example schema_workflow --features schema
+16 + //!   cargo run --example `schema_workflow` --features schema
+   |
+
+error: docs for function returning `Result` missing `# Errors` section
+  --> autumn-harvest/examples/schema_workflow.rs:49:1
+   |
+49 | / pub async fn onboarding(
+50 | |     _ctx: &WorkflowContext,
+51 | |     _input: OnboardInput,
+52 | | ) -> Result<OnboardOutput, String> {
+   | |__________________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#missing_errors_doc
+   = note: `-D clippy::missing-errors-doc` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::missing_errors_doc)]`
+
+error: used underscore-prefixed binding
+  --> autumn-harvest/examples/schema_workflow.rs:51:5
+   |
+51 |     _input: OnboardInput,
+   |     ^^^^^^
+   |
+note: binding is defined here
+  --> autumn-harvest/examples/schema_workflow.rs:51:5
+   |
+51 |     _input: OnboardInput,
+   |     ^^^^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#used_underscore_binding
+   = note: `-D clippy::used-underscore-binding` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::used_underscore_binding)]`
+
+error: used underscore-prefixed binding
+  --> autumn-harvest/examples/schema_workflow.rs:51:5
+   |
+51 |     _input: OnboardInput,
+   |     ^^^^^^
+   |
+note: binding is defined here
+  --> autumn-harvest/examples/schema_workflow.rs:51:5
+   |
+51 |     _input: OnboardInput,
+   |     ^^^^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#used_underscore_binding
+
+error: docs for function returning `Result` missing `# Errors` section
+  --> autumn-harvest/examples/schema_workflow.rs:61:1
+   |
+61 | pub async fn no_schema_workflow(_ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#missing_errors_doc
+
+error: used underscore-prefixed binding
+  --> autumn-harvest/examples/schema_workflow.rs:61:57
+   |
+61 | pub async fn no_schema_workflow(_ctx: &WorkflowContext, _input: ()) -> R...
+   |                                                         ^^^^^^
+   |
+note: binding is defined here
+  --> autumn-harvest/examples/schema_workflow.rs:61:57
+   |
+61 | pub async fn no_schema_workflow(_ctx: &WorkflowContext, _input: ()) -> R...
+   |                                                         ^^^^^^
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#used_underscore_binding
+
+error: unused `async` for function with no await statements
+  --> autumn-harvest/examples/schema_workflow.rs:49:1
+   |
+49 | / pub async fn onboarding(
+50 | |     _ctx: &WorkflowContext,
+51 | |     _input: OnboardInput,
+52 | | ) -> Result<OnboardOutput, String> {
+...  |
+56 | |     })
+57 | | }
+   | |_^
+   |
+   = help: consider removing the `async` from this function
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unused_async
+   = note: `-D clippy::unused-async` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::unused_async)]`
+
+error: unused `async` for function with no await statements
+  --> autumn-harvest/examples/schema_workflow.rs:61:1
+   |
+61 | / pub async fn no_schema_workflow(_ctx: &WorkflowContext, _input: ()) ->...
+62 | |     Ok(())
+63 | | }
+   | |_^
+   |
+   = help: consider removing the `async` from this function
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unused_async
+
+error: could not compile `autumn-harvest` (example "schema_workflow") due to 13 previous errors
+warning: build failed, waiting for other jobs to finish...

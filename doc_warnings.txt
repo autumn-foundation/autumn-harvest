@@ -1,0 +1,136 @@
+warning: unresolved link to `HarvestError::QueryTimedOut`
+    --> autumn-harvest/src/builder.rs:1506:46
+     |
+1506 | ... and returns [`HarvestError::QueryTimedOut`] to
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `HarvestError` in scope
+     |
+     = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default
+
+warning: unresolved link to `resolve_concurrency_key`
+  |
+  = note: the link appears in this line:
+
+          JSON input (via [`resolve_concurrency_key`]) to get the concrete group key
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `resolve_concurrency_key` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `crate::testing::WorkflowReplayer`
+   --> autumn-harvest/src/context.rs:755:38
+    |
+755 | ...flowReplayer`](crate::testing::WorkflowReplayer) to catch
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `testing` in module `autumn_harvest`
+
+warning: unresolved link to `ActivityInfo`
+    --> autumn-harvest/src/context.rs:2016:41
+     |
+2016 | ...g its [`ActivityInfo`] for name, queue, and defaults.
+     |            ^^^^^^^^^^^^ no item named `ActivityInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ActivityInfo`
+    --> autumn-harvest/src/context.rs:2079:76
+     |
+2079 | ...g its [`ActivityInfo`].
+     |            ^^^^^^^^^^^^ no item named `ActivityInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `WorkflowInfo`
+    --> autumn-harvest/src/context.rs:2146:63
+     |
+2146 | ...ing a [`WorkflowInfo`].
+     |            ^^^^^^^^^^^^ no item named `WorkflowInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `QueryHandlerInfo`
+    --> autumn-harvest/src/context.rs:3115:55
+     |
+3115 | ...a [`QueryHandlerInfo`] companion record.
+     |        ^^^^^^^^^^^^^^^^ no item named `QueryHandlerInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `UpdateHandlerInfo`
+    --> autumn-harvest/src/context.rs:3132:57
+     |
+3132 | ... [`UpdateHandlerInfo`] companion record.
+     |       ^^^^^^^^^^^^^^^^^ no item named `UpdateHandlerInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Self::new_test`
+    --> autumn-harvest/src/context.rs:3686:45
+     |
+3686 |     /// [`Self::with_idempotency_key`] or [`Self::new_test`] which always
+     |                                             ^^^^^^^^^^^^^^ the struct `ActivityContext` has no field or associated item named `new_test`
+
+warning: unresolved link to `Ok(())`
+    --> autumn-harvest/src/context.rs:3849:57
+     |
+3849 | ...).  Returns [`Ok(())`] otherwise.
+     |                  ^^^^^^ no item named `Ok(())` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `crate::testing::WorkflowReplayer`
+   --> autumn-harvest/src/executor.rs:105:26
+    |
+105 | /// [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `testing` in module `autumn_harvest`
+
+warning: unresolved link to `Self::with_schemas`
+   --> autumn-harvest/src/info.rs:184:45
+    |
+184 |     /// `schema` feature's [`with_schemas`](Self::with_schemas) method.
+    |                                             ^^^^^^^^^^^^^^^^^^ the struct `WorkflowInfo` has no field or associated item named `with_schemas`
+
+warning: unresolved link to `OverlapPolicy::Skip`
+   --> autumn-harvest/src/info.rs:681:23
+    |
+681 |     /// Defaults to [`OverlapPolicy::Skip`].
+    |                       ^^^^^^^^^^^^^^^^^^^ no item named `OverlapPolicy` in scope
+
+warning: unresolved link to `OverlapPolicy::BufferAll`
+   --> autumn-harvest/src/info.rs:683:40
+    |
+683 | ...ed slots under [`OverlapPolicy::BufferAll`]. Default 100.
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^ no item named `OverlapPolicy` in scope
+
+warning: unresolved link to `HarvestError::ActivityFailed`
+  --> autumn-harvest/src/replay.rs:39:15
+   |
+39 |         /// [`HarvestError::ActivityFailed`] without parsing the message.
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `HarvestError` in scope
+
+warning: unresolved link to `crate::testing::WorkflowReplayer`
+   --> autumn-harvest/src/replay.rs:944:42
+    |
+944 | ...flowReplayer`](crate::testing::WorkflowReplayer) to detect
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `testing` in module `autumn_harvest`
+
+warning: unresolved link to `crate::testing::WorkflowReplayer`
+    --> autumn-harvest/src/replay.rs:1929:42
+     |
+1929 | ...owReplayer`](crate::testing::WorkflowReplayer) in strict replay mode.
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `testing` in module `autumn_harvest`
+
+warning: unresolved link to `WorkflowContext::spawn_child_workflow_detached_raw`
+   --> autumn-harvest/src/types.rs:772:7
+    |
+772 | /// [`WorkflowContext::spawn_child_workflow_detached_raw`]. Children sp...
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `WorkflowContext` in scope
+
+warning: unresolved link to `database_error`
+  --> autumn-harvest/src/schedule_decision.rs:56:17
+   |
+56 | /// Returns a [`database_error`] if the database query execution fails.
+   |                 ^^^^^^^^^^^^^^ no item named `database_error` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: `autumn-harvest` (lib doc) generated 19 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s
+   Generated /app/target/doc/autumn_harvest/index.html and 1 other file
