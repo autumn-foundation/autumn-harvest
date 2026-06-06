@@ -216,6 +216,68 @@ async fn wait_for_timeout(ctx: &WorkflowContext) -> Result<(), String> {
 
 ---
 
+### HVG009 — Bare tracing calls inside a workflow body (Warning)
+
+| | Example |
+|---|---|
+| **Disallowed** | `tracing::info!("order {} started", order_id)` |
+| **Disallowed** | `tracing::warn!("retrying payment")` |
+| **Allowed** | `ctx.logger().info("order started")` |
+| **Allowed** | `ctx.log_info("order started")` |
+
+The workflow executor re-runs the function body from the top on every suspend/resume cycle (replay). A bare `tracing::info!()` call placed in the workflow body therefore fires **N times** for a workflow that suspends N times: once on the original live run, and once on each subsequent replay before the suspension point is reached. This amplifies log volume in proportion to replay depth and produces duplicate lines in Loki/Elastic that lack correlation keys, making incident triage much harder.
+
+#### The Harvest-safe alternative
+
+`ctx.logger()` returns a [`WorkflowLogger`](../autumn-harvest/src/context.rs) that:
+- **Suppresses** all output when `ctx.is_replaying()` is `true` — so each log statement fires at most once per execution, regardless of replay depth.
+- **Auto-tags** every event with `workflow_id`, `execution_id`, `workflow_type`, and `replay = false` — so a single `loki | jq 'select(.execution_id == "…")'` returns a clean chronological narrative of the run.
+
+**Migration example:**
+
+```rust
+// Before — fires once per replay cycle (N times for N suspensions)
+#[workflow]
+async fn process_order(ctx: &WorkflowContext, order_id: String) -> Result<(), String> {
+    tracing::info!("processing order {}", order_id); // ← HVG009: fires on every replay
+
+    ctx.execute_activity(&charge_card_info(), order_id.clone()).await?;
+    ctx.execute_activity(&ship_order_info(), order_id).await?;
+    Ok(())
+}
+
+// After — fires exactly once, on the live (non-replay) execution
+#[workflow]
+async fn process_order(ctx: &WorkflowContext, order_id: String) -> Result<(), String> {
+    ctx.logger().info("processing order");          // suppressed during replay ✓
+    // or the equivalent shorthand:
+    ctx.log_info("processing order");               // same behaviour
+
+    ctx.execute_activity(&charge_card_info(), order_id.clone()).await?;
+    ctx.execute_activity(&ship_order_info(), order_id).await?;
+    Ok(())
+}
+```
+
+#### Auto-tagged structured fields
+
+Every event emitted by `ctx.logger()` carries:
+
+| Field | Value | Purpose |
+|---|---|---|
+| `workflow_id` | Business-level workflow key (e.g. `"order-42"`) | Correlate all events for one logical workflow instance |
+| `execution_id` | Unique run UUID | Correlate all events for one specific run |
+| `workflow_type` | Registered function name (e.g. `"process_order"`) | Filter by workflow type across all runs |
+| `replay` | `false` | Confirm event was not emitted during replay |
+
+These match the Temporal / Cadence / DBOS convention so existing log dashboards need no changes.
+
+#### Guardrail severity
+
+HVG009 is a **Warning** (not a HardBlocker): bare tracing calls do not break determinism or corrupt workflow state — they only amplify log volume. The rule is surfaced so authors can fix it without CI being blocked by a false positive.
+
+---
+
 ## Machine-readable findings and suppressions
 
 `GuardrailFinding` and `GuardrailSuppression` both implement `serde::Serialize`/`Deserialize` and can be serialized to JSON for CI reports or external tooling.

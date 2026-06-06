@@ -61,6 +61,9 @@ const SUSPENSION_TIMEOUT: Duration = Duration::from_millis(100);
 pub struct WorkflowExecuteSpanMeta {
     /// Logical workflow name (recorded as `harvest.workflow.id`).
     pub workflow_name: String,
+    /// Business-level workflow identifier (e.g. `"subscription-123"`).
+    /// Forwarded to [`WorkflowContext`] so [`WorkflowLogger`] can tag events.
+    pub workflow_id: String,
     /// Shard identifier (recorded as `harvest.shard.id`).
     pub shard_id: i64,
     /// Task queue name (recorded as `harvest.queue`).
@@ -258,6 +261,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
         history_policy,
     )
     .with_workflow_name(workflow_name)
+    .with_workflow_id(span_meta.map_or("", |m| m.workflow_id.as_str()))
     .with_payload_caps(
         max_activity_input_bytes,
         0,

@@ -27,6 +27,11 @@ use autumn_web::reexports::axum::extract::State;
     severity = "sev4"
 )]
 async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> {
+    // ctx.logger() is replay-aware: this line fires exactly once even if the
+    // worker restarts and replays the history — use it instead of tracing::info!
+    // directly in workflow bodies (see guardrail HVG009).
+    ctx.logger().info("greeting workflow started");
+
     let welcome: serde_json::Value = ctx
         .execute_activity(
             &send_greeting_info(),
@@ -39,12 +44,16 @@ async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> 
     // the welcome activity above.
     ctx.timer("greeting-pause", 30).await?;
 
+    ctx.logger().info("timer fired, delivering farewell");
+
     let farewell: serde_json::Value = ctx
         .execute_activity(
             &send_greeting_info(),
             serde_json::json!({ "name": name, "kind": "farewell" }),
         )
         .await?;
+
+    ctx.logger().info("greeting workflow completed");
 
     Ok(format!(
         "{} — {}",
