@@ -5013,6 +5013,7 @@ async fn process_workflow_task(
 
         let span_meta = WorkflowExecuteSpanMeta {
             workflow_name: prepared.execution.workflow_name.clone(),
+            workflow_id: prepared.execution.workflow_id.clone(),
             shard_id: i64::from(prepared.execution.shard_id),
             queue_name: task.queue_name.clone(),
             is_replay,

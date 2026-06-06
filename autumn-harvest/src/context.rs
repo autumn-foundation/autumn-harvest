@@ -563,6 +563,70 @@ fn validate_search_attr_value(value: &Value) -> HarvestResult<()> {
 }
 
 // ---------------------------------------------------------------------------
+// WorkflowLogger  (issue #379)
+// ---------------------------------------------------------------------------
+
+/// Replay-aware logger scoped to a single workflow execution.
+///
+/// Obtained via [`WorkflowContext::logger`]. Suppresses all `tracing` events
+/// while the executor is replaying recorded history (`is_replaying() == true`),
+/// so that each `log_*` call fires at most once per execution regardless of
+/// how many replay cycles occur.
+///
+/// Every emitted event carries the following structured fields:
+/// - `workflow_id` — the business-level workflow identifier
+/// - `execution_id` — the unique run UUID
+/// - `workflow_type` — the registered workflow function name
+/// - `replay = false` — confirms the event was not emitted during replay
+pub struct WorkflowLogger<'ctx> {
+    ctx: &'ctx WorkflowContext,
+}
+
+impl WorkflowLogger<'_> {
+    /// Emit an INFO-level event. No-op when `ctx.is_replaying()` is `true`.
+    pub fn info(&self, message: &str) {
+        if !self.ctx.is_replaying() {
+            tracing::info!(
+                target: "autumn_harvest::context",
+                workflow_id = self.ctx.workflow_id(),
+                execution_id = %self.ctx.execution_id(),
+                workflow_type = self.ctx.workflow_type(),
+                replay = false,
+                "{message}"
+            );
+        }
+    }
+
+    /// Emit a WARN-level event. No-op when `ctx.is_replaying()` is `true`.
+    pub fn warn(&self, message: &str) {
+        if !self.ctx.is_replaying() {
+            tracing::warn!(
+                target: "autumn_harvest::context",
+                workflow_id = self.ctx.workflow_id(),
+                execution_id = %self.ctx.execution_id(),
+                workflow_type = self.ctx.workflow_type(),
+                replay = false,
+                "{message}"
+            );
+        }
+    }
+
+    /// Emit an ERROR-level event. No-op when `ctx.is_replaying()` is `true`.
+    pub fn error(&self, message: &str) {
+        if !self.ctx.is_replaying() {
+            tracing::error!(
+                target: "autumn_harvest::context",
+                workflow_id = self.ctx.workflow_id(),
+                execution_id = %self.ctx.execution_id(),
+                workflow_type = self.ctx.workflow_type(),
+                replay = false,
+                "{message}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WorkflowContext
 // ---------------------------------------------------------------------------
 
@@ -619,6 +683,10 @@ pub struct WorkflowContext {
     /// Logical workflow type name for use in `PayloadTooLarge` errors.
     /// Empty string when not known (legacy contexts, update handlers).
     workflow_name: String,
+    /// Business-level workflow identifier (e.g. "subscription-123").
+    /// Empty when not known (legacy contexts, testing, update handlers).
+    /// Set by the worker via `with_workflow_id` before executing the handler.
+    workflow_id: String,
     /// Global cap on activity input payloads (bytes). Checked at schedule time.
     payload_max_activity_input: u64,
     /// Global cap on workflow/child-workflow input payloads (bytes).
@@ -737,6 +805,7 @@ impl WorkflowContext {
             cancellation_reason,
             strict_replay: false,
             workflow_name: String::new(),
+            workflow_id: String::new(),
             payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
@@ -818,6 +887,7 @@ impl WorkflowContext {
             cancellation_reason,
             strict_replay: false,
             workflow_name: String::new(),
+            workflow_id: String::new(),
             payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
@@ -849,6 +919,7 @@ impl WorkflowContext {
             cancellation_reason: None,
             strict_replay: false,
             workflow_name: String::new(),
+            workflow_id: String::new(),
             payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
@@ -902,6 +973,17 @@ impl WorkflowContext {
         self
     }
 
+    /// Set the business-level workflow identifier (e.g. `"subscription-123"`).
+    ///
+    /// Called by the worker so that [`WorkflowLogger`] events can carry the
+    /// correlation key that operators use to search Loki / Elastic for a
+    /// specific workflow run.
+    #[must_use]
+    pub fn with_workflow_id(mut self, id: impl Into<String>) -> Self {
+        self.workflow_id = id.into();
+        self
+    }
+
     // ── Accessors ─────────────────────────────────────────────────────
 
     /// Deterministic "wall clock" -- returns the `WorkflowStarted` timestamp
@@ -915,6 +997,23 @@ impl WorkflowContext {
     #[must_use]
     pub const fn execution_id(&self) -> ExecutionId {
         self.exec_id
+    }
+
+    /// The business-level workflow identifier set at workflow start.
+    ///
+    /// Returns an empty string when the context was created without an explicit
+    /// workflow ID (e.g. in unit tests via [`Self::new_test`]).
+    #[must_use]
+    pub fn workflow_id(&self) -> &str {
+        &self.workflow_id
+    }
+
+    /// The logical workflow type name (the function name decorated with `#[workflow]`).
+    ///
+    /// Returns an empty string when not explicitly set (update handler contexts).
+    #[must_use]
+    pub fn workflow_type(&self) -> &str {
+        &self.workflow_name
     }
 
     /// Number of events currently loaded in this workflow execution history.
@@ -963,6 +1062,54 @@ impl WorkflowContext {
             .lock()
             .expect("matcher lock poisoned")
             .has_buffered_history()
+    }
+
+    // ── Replay-safe logging (issue #379) ──────────────────────────────
+
+    /// Return a replay-aware logger scoped to this workflow execution.
+    ///
+    /// The logger suppresses all output when [`Self::is_replaying`] is `true`
+    /// so that each log statement fires at most once per workflow execution,
+    /// regardless of how many replay cycles the executor performs.
+    ///
+    /// Every event emitted carries `workflow_id`, `execution_id`,
+    /// `workflow_type`, and `replay = false` as structured fields, enabling
+    /// log correlation in Loki / Elastic / OpenTelemetry backends.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::context::WorkflowContext;
+    /// # fn example(ctx: &WorkflowContext) {
+    /// ctx.logger().info("payment started");
+    /// ctx.logger().warn("retrying payment");
+    /// ctx.logger().error("payment failed");
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn logger(&self) -> WorkflowLogger<'_> {
+        WorkflowLogger { ctx: self }
+    }
+
+    /// Emit an INFO-level log event, suppressed during replay.
+    ///
+    /// Equivalent to `ctx.logger().info(message)`.
+    pub fn log_info(&self, message: &str) {
+        self.logger().info(message);
+    }
+
+    /// Emit a WARN-level log event, suppressed during replay.
+    ///
+    /// Equivalent to `ctx.logger().warn(message)`.
+    pub fn log_warn(&self, message: &str) {
+        self.logger().warn(message);
+    }
+
+    /// Emit an ERROR-level log event, suppressed during replay.
+    ///
+    /// Equivalent to `ctx.logger().error(message)`.
+    pub fn log_error(&self, message: &str) {
+        self.logger().error(message);
     }
 
     /// Access typed shared state (e.g., email clients, config) injected via the builder.

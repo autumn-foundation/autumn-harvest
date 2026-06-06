@@ -22,6 +22,7 @@
 //! | HVG006 | DirectIo      | HardBlocker  | Direct network / DB / filesystem I/O |
 //! | HVG007 | ProcessGlobal | HardBlocker  | Process-global state mutation        |
 //! | HVG008 | NonDeterministicPredicate| HardBlocker | Non-deterministic predicate closures|
+//! | HVG009 | UnsafeLogging | Warning      | Bare tracing calls amplified by replay |
 
 /// Severity of a guardrail rule violation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -51,6 +52,9 @@ pub enum RuleCategory {
     ProcessGlobal,
     /// Non-deterministic predicate evaluated inside `await_condition` closures.
     NonDeterministicPredicate,
+    /// Bare `tracing::{info,warn,error}!` calls inside a `#[workflow]` body that
+    /// fire on every replay cycle, amplifying log volume.
+    UnsafeLogging,
 }
 
 /// A single entry in the guardrail rule catalog.
@@ -181,6 +185,22 @@ static CATALOG: &[RuleEntry] = &[
         alternative: "Use durable timers (ctx.timer()) for time-based pauses, and ensure the \
             predicate closure relies purely on local variables mutated by deterministic signals or \
             activities.",
+    },
+    RuleEntry {
+        id: "HVG009",
+        severity: Severity::Warning,
+        category: RuleCategory::UnsafeLogging,
+        explanation: "Calling tracing::info!(), tracing::warn!(), tracing::error!(), or any other \
+            bare tracing macro directly inside a #[workflow] body emits one log event per replay \
+            cycle. Because the workflow executor re-runs the function from the top on every \
+            suspension/resume, a single log statement fires N times for a workflow that suspends \
+            N times. This amplifies log volume in proportion to replay depth and fills Loki/Elastic \
+            with duplicate lines that lack correlation keys, making incident triage harder.",
+        alternative: "Use ctx.logger().info(message), ctx.logger().warn(message), \
+            ctx.logger().error(message), or the convenience wrappers ctx.log_info(message), \
+            ctx.log_warn(message), ctx.log_error(message). These are suppressed automatically \
+            during replay (is_replaying() == true) and auto-tag every event with workflow_id, \
+            execution_id, workflow_type, and replay = false for log correlation.",
     },
 ];
 
