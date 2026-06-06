@@ -425,7 +425,7 @@
         "expressions": [
           {
             "kind": "promql",
-            "expr": "sum by (workflow) (rate(harvest_workflow_terminal_total{outcome=\"failed\"}[5m])) / sum by (workflow) (rate(harvest_workflow_terminal_total[5m])) > 0.10"
+            "expr": "sum by (workflow) (rate(harvest_workflow_terminal_total{outcome=\"failed\"}[5m])) / sum by (workflow) (rate(harvest_workflow_terminal_total{outcome!=\"continued_as_new\"}[5m])) > 0.10"
           }
         ]
       },

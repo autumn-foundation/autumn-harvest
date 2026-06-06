@@ -7,6 +7,7 @@
 #![allow(clippy::literal_string_with_formatting_args)]
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use std::collections::HashMap;
 
@@ -1053,13 +1054,13 @@ async fn cancel_workflow_ui(
     let exec_id_str = exec_id.as_uuid().to_string();
     let reason = form.reason.as_deref().unwrap_or("").trim().to_string();
 
-    let cancel_result = cancel_workflow_execution(
-        &mut conn,
-        exec_id,
-        &reason,
-        &autumn_harvest::telemetry::NoOpMetrics,
-    )
-    .await;
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry().telemetry().metrics),
+        );
+    let cancel_result =
+        cancel_workflow_execution(&mut conn, exec_id, &reason, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &cancel_result {
         Ok(_) => (STATUS_SUCCEEDED, None, url_encode("Workflow cancelled")),
         Err(e) => {
