@@ -3293,8 +3293,8 @@ impl WorkflowContext {
 
         // Wrap the fn pointer in a BoxUpdateHandler that creates a handler-mode
         // WorkflowContext on each invocation. Inherit exec_id, start_time,
-        // cancellation_reason, and workflow_id from the parent so handlers see
-        // consistent values and logger correlation keys.
+        // cancellation_reason, workflow_id, and workflow_name from the parent
+        // so handlers see consistent values and all logger correlation keys.
         let handler_fn = info.handler;
         let exec_id = self.exec_id;
         let start_time = self.start_time;
@@ -3302,6 +3302,7 @@ impl WorkflowContext {
         let state = std::sync::Arc::clone(&self.state);
         let name = info.name;
         let workflow_id = self.workflow_id.clone();
+        let workflow_name = self.workflow_name.clone();
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -3310,12 +3311,13 @@ impl WorkflowContext {
                 cancellation_reason.clone(),
                 std::sync::Arc::clone(&state),
             );
-            // Propagate workflow_id for logger correlation. Arc was just created;
+            // Propagate correlation fields for logger. Arc was just created;
             // no other reference exists yet so get_mut always succeeds.
-            std::sync::Arc::get_mut(&mut ctx)
-                .unwrap()
-                .workflow_id
-                .clone_from(&workflow_id);
+            {
+                let inner = std::sync::Arc::get_mut(&mut ctx).unwrap();
+                inner.workflow_id.clone_from(&workflow_id);
+                inner.workflow_name.clone_from(&workflow_name);
+            }
             handler_fn(ctx, input)
         });
 
@@ -3372,10 +3374,11 @@ impl WorkflowContext {
                 self.cancellation_reason.clone(),
                 std::sync::Arc::clone(&self.state),
             );
-            std::sync::Arc::get_mut(&mut ctx)
-                .unwrap()
-                .workflow_id
-                .clone_from(&self.workflow_id);
+            {
+                let inner = std::sync::Arc::get_mut(&mut ctx).unwrap();
+                inner.workflow_id.clone_from(&self.workflow_id);
+                inner.workflow_name.clone_from(&self.workflow_name);
+            }
             h(ctx, input)
         })
     }
