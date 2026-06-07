@@ -7015,7 +7015,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
 /// Shared state captured by the retry-aware activity across all attempts.
 #[derive(Default)]
 struct RetryObservations {
-    /// (attempt_number, previous_failure) collected on each invocation.
+    /// `(attempt_number, previous_failure)` collected on each invocation.
     records: Mutex<Vec<(u32, Option<String>)>>,
 }
 

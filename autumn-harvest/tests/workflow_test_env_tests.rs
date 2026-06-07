@@ -936,7 +936,7 @@ async fn test_mock_activity_retries_all_fail_terminal_failure_is_non_retryable()
     );
 
     // Exactly one ActivityFailed — the terminal one — with non_retryable = true.
-    let terminal_failures: Vec<_> = outcome
+    let terminal_failure_count = outcome
         .events()
         .iter()
         .filter(|e| {
@@ -948,10 +948,9 @@ async fn test_mock_activity_retries_all_fail_terminal_failure_is_non_retryable()
                 }
             )
         })
-        .collect();
+        .count();
     assert_eq!(
-        terminal_failures.len(),
-        1,
+        terminal_failure_count, 1,
         "exactly one terminal non-retryable ActivityFailed expected"
     );
 }

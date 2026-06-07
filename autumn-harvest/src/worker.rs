@@ -3637,7 +3637,7 @@ async fn process_activity_task(
     .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
     .with_attempt(task_attempt(task))
     .with_max_attempts(u32::try_from(task.max_attempts.max(1)).unwrap_or(1))
-    .with_previous_failure(if task.attempt > 1 {
+    .with_previous_failure(if task_attempt(task) > 1 {
         // task.error carries the human-readable message from the previous
         // failed attempt, stored by requeue_for_retry at reschedule time.
         task.error.clone()

@@ -1726,12 +1726,21 @@ impl WorkflowTestEnv {
     ///
     /// Calling this method multiple times for the same activity name registers
     /// independent sequences consumed in FIFO order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `attempts` is empty, since an empty sequence would leave the
+    /// activity without a terminal event and silently hang the test.
     #[must_use]
     pub fn mock_activity_retries(
         mut self,
         name: impl Into<String>,
         attempts: Vec<Result<Value, String>>,
     ) -> Self {
+        assert!(
+            !attempts.is_empty(),
+            "mock_activity_retries requires at least one attempt"
+        );
         self.retry_sequences
             .entry(name.into())
             .or_default()
