@@ -15582,7 +15582,7 @@ async fn evaluate_eligibility_for_shard(
         }
     }
 
-    let mut concurrency_saturated_keys = HashSet::new();
+    let mut running_map = HashMap::new();
     if !keys_to_check.is_empty() {
         #[derive(diesel::QueryableByName)]
         struct ConcurrencyRow {
@@ -15607,21 +15607,8 @@ async fn evaluate_eligibility_for_shard(
         .await
         .map_err(database_error)?;
 
-        let mut running_map = HashMap::new();
         for r in rows {
             running_map.insert((r.key, r.task_type), r.running_count);
-        }
-
-        for t in tasks.iter().filter(|t| t.state == "PENDING") {
-            if let (Some(key), Some(cap)) = (&t.concurrency_key, t.concurrency_cap) {
-                let running = running_map
-                    .get(&(key.clone(), t.task_type.clone()))
-                    .copied()
-                    .unwrap_or(0);
-                if running >= i64::from(cap) {
-                    concurrency_saturated_keys.insert((key.clone(), t.task_type.clone()));
-                }
-            }
         }
     }
 
@@ -15783,10 +15770,14 @@ async fn evaluate_eligibility_for_shard(
                     }
                 }
 
-                if t.concurrency_key.as_ref().is_some_and(|key| {
-                    concurrency_saturated_keys.contains(&(key.clone(), t.task_type.clone()))
-                }) {
-                    reasons.push("concurrency_saturated".to_string());
+                if let (Some(key), Some(cap)) = (&t.concurrency_key, t.concurrency_cap) {
+                    let running = running_map
+                        .get(&(key.clone(), t.task_type.clone()))
+                        .copied()
+                        .unwrap_or(0);
+                    if running >= i64::from(cap) {
+                        reasons.push("concurrency_saturated".to_string());
+                    }
                 }
 
                 if let Some(ref rlk) = t.rate_limit_key {
@@ -15929,7 +15920,50 @@ async fn get_queue_eligibility(
         )));
     }
 
-    for res in shards.values() {
+    let shards_with_pending: Vec<_> = shards
+        .values()
+        .filter(|res| res.pending_count > 0)
+        .collect();
+
+    let target_shards = if shards_with_pending.is_empty() {
+        shards.values().collect::<Vec<_>>()
+    } else {
+        shards_with_pending
+    };
+
+    let mut worst_rank = 0;
+    let mut worst_diag = "healthy".to_string();
+    for shard_res in &target_shards {
+        let diag = &shard_res.summary.diagnosis;
+        let rank = match diag.as_str() {
+            "no_online_workers" => 4,
+            "no_eligible_workers" => 3,
+            "all_draining" => 2,
+            "all_capacity_full" => 1,
+            _ => 0,
+        };
+        if rank > worst_rank {
+            worst_rank = rank;
+            worst_diag.clone_from(diag);
+        }
+    }
+    let diagnosis = worst_diag;
+
+    let responsible_shards: Vec<_> = target_shards
+        .into_iter()
+        .filter(|res| {
+            let rank = match res.summary.diagnosis.as_str() {
+                "no_online_workers" => 4,
+                "no_eligible_workers" => 3,
+                "all_draining" => 2,
+                "all_capacity_full" => 1,
+                _ => 0,
+            };
+            rank == worst_rank
+        })
+        .collect();
+
+    for res in responsible_shards {
         let has_pending_tasks = res.pending_count > 0;
 
         for w in &res.eligible_workers {
@@ -15966,35 +16000,6 @@ async fn get_queue_eligibility(
 
     eligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
     ineligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
-
-    let shards_with_pending: Vec<_> = shards
-        .values()
-        .filter(|res| res.pending_count > 0)
-        .collect();
-
-    let target_shards = if shards_with_pending.is_empty() {
-        shards.values().collect::<Vec<_>>()
-    } else {
-        shards_with_pending
-    };
-
-    let mut worst_rank = 0;
-    let mut worst_diag = "healthy".to_string();
-    for shard_res in target_shards {
-        let diag = &shard_res.summary.diagnosis;
-        let rank = match diag.as_str() {
-            "no_online_workers" => 4,
-            "no_eligible_workers" => 3,
-            "all_draining" => 2,
-            "all_capacity_full" => 1,
-            _ => 0,
-        };
-        if rank > worst_rank {
-            worst_rank = rank;
-            worst_diag.clone_from(diag);
-        }
-    }
-    let diagnosis = worst_diag;
 
     let mut req_builds: Vec<String> = global_required_build_ids.into_iter().collect();
     req_builds.sort();

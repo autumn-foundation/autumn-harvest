@@ -815,6 +815,12 @@ async fn test_eligibility_optimizations_and_resilience() {
     .await;
     assert_eq!(status_multi, StatusCode::OK);
     assert_eq!(body_multi["summary"]["diagnosis"], "no_eligible_workers");
+    assert!(
+        body_multi["eligible_workers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     // 6. Test all_draining classification refinement
     // Clean up workers table to prevent interference
@@ -882,6 +888,94 @@ async fn test_eligibility_optimizations_and_resilience() {
     .await;
     assert_eq!(status_d2, StatusCode::OK);
     assert_eq!(body_d2["summary"]["diagnosis"], "no_eligible_workers");
+
+    // 7. Test concurrency saturation tied to task-level cap
+    // Clean up workers table
+    {
+        let mut conn = pool.get().await.expect("connection");
+        diesel::sql_query("DELETE FROM harvest_workers")
+            .execute(&mut conn)
+            .await
+            .expect("delete workers");
+    }
+
+    let state_mixed = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for(&["test-queue-mixed"], ShardRouter::single()),
+    );
+    state_mixed.set_admin_auth_boundary(true);
+    let app_mixed =
+        harvest_api_router(state_mixed).with_state(AppState::for_test().with_profile("test"));
+
+    // Seed running task with mixed-key to occupy 1 slot
+    {
+        let mut conn = pool.get().await.expect("running task connection");
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue (
+                id, queue_name, task_type, input, state, priority, max_attempts, scheduled_at,
+                concurrency_key, concurrency_cap, worker_id
+             ) VALUES (
+                gen_random_uuid(), 'test-queue-mixed', 'workflow', '{}'::jsonb, 'RUNNING', 0, 1, NOW(),
+                'mixed-key', 1, 'worker-mixed-cap'
+             )",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert running task to saturate concurrency");
+    }
+
+    // Seed task A (cap = 1, saturated)
+    let _task_a = seed_task_detailed(
+        &pool,
+        "test-queue-mixed",
+        None,
+        None,
+        None,
+        Some("mixed-key"),
+        Some(1),
+    )
+    .await;
+
+    // Seed task B (cap = 5, not saturated)
+    let _task_b = seed_task_detailed(
+        &pool,
+        "test-queue-mixed",
+        None,
+        None,
+        None,
+        Some("mixed-key"),
+        Some(5),
+    )
+    .await;
+
+    // Register active worker
+    register_active_worker_with_build(
+        &pool,
+        "worker-mixed-cap",
+        &["test-queue-mixed"],
+        &[0],
+        "v1",
+        5,
+        0,
+    )
+    .await;
+
+    // Query queue eligibility. Since the worker is eligible for Task B (not saturated),
+    // the diagnosis should be "healthy" and the worker should be in the eligible_workers list.
+    let (status_mixed, body_mixed) = get_json_with_auth(
+        &app_mixed,
+        "/admin/queues/test-queue-mixed/eligibility",
+        true,
+    )
+    .await;
+    assert_eq!(status_mixed, StatusCode::OK);
+    assert_eq!(body_mixed["summary"]["diagnosis"], "healthy");
+    assert!(
+        !body_mixed["eligible_workers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     // Now test service unavailable: if we only query a broken queue, or if all shards fail
     let all_broken_pool = build_two_shard_pool(
