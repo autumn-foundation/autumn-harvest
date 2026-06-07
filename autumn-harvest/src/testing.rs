@@ -51,7 +51,7 @@ use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::executor::{WorkflowOutcome, run_workflow_strict, run_workflow_with_state};
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
-use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy};
+use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, WorkerId};
 
 // ---------------------------------------------------------------------------
 // NonDeterminismKind
@@ -1601,6 +1601,15 @@ pub struct WorkflowTestEnv {
     /// for this activity name (across all iterations).  This corresponds to
     /// explicit workflow-level retries, not worker-level retry attempts.
     attempt_results: HashMap<(String, u32), Result<Value, String>>,
+    /// Worker-level retry sequences: activity name → queue of per-invocation
+    /// attempt result lists. Each inner `Vec` models one scheduling of the
+    /// activity with multiple worker-level retry attempts.
+    ///
+    /// Registered via `mock_activity_retries`. When a `ScheduleActivity`
+    /// command is processed, the first queued sequence for that name is popped
+    /// and each result is emitted as a separate `ActivityFailed` (with
+    /// incrementing `attempt` numbers) or a terminal `ActivityCompleted`.
+    retry_sequences: HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
     /// Child-workflow stubs: workflow name → closure(input) → result.
     child_mocks: HashMap<String, MockFn>,
     /// Simulated wall-clock time.  Used as the `WorkflowStarted` timestamp so
@@ -1630,6 +1639,7 @@ impl WorkflowTestEnv {
         Self {
             activity_mocks: HashMap::new(),
             attempt_results: HashMap::new(),
+            retry_sequences: HashMap::new(),
             child_mocks: HashMap::new(),
             simulated_now: Utc::now(),
             queued_signals: Vec::new(),
@@ -1681,6 +1691,60 @@ impl WorkflowTestEnv {
     ) -> Self {
         self.attempt_results
             .insert((name.into(), call_number), result);
+        self
+    }
+
+    /// Simulate worker-level retry attempts for one activity invocation.
+    ///
+    /// Each element in `attempts` is the result of one worker-level attempt for a
+    /// **single** `execute_activity_raw` call from the workflow.  Mirrors real
+    /// worker behavior: each attempt emits `ActivityStarted`; non-terminal
+    /// failures call `requeue_for_retry` (no event written); the last failure
+    /// emits `ActivityFailed { non_retryable: true }`; success emits
+    /// `ActivityCompleted`.  The replay engine skips `ActivityStarted`, so the
+    /// workflow sees only the final terminal outcome.
+    ///
+    /// This models the case where the activity succeeds on attempt 3 of 3:
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::testing::WorkflowTestEnv;
+    /// # use serde_json::json;
+    /// let env = WorkflowTestEnv::new()
+    ///     .mock_activity_retries("charge_card", vec![
+    ///         Err("transient_1".into()),
+    ///         Err("transient_2".into()),
+    ///         Ok(json!({"status": "charged"})),
+    ///     ]);
+    /// ```
+    ///
+    /// The resulting history contains:
+    /// - `ActivityScheduled`
+    /// - `ActivityStarted` (attempt 1 — skipped by replay engine)
+    /// - `ActivityStarted` (attempt 2 — skipped by replay engine)
+    /// - `ActivityStarted` (attempt 3 — skipped by replay engine)
+    /// - `ActivityCompleted`
+    ///
+    /// Calling this method multiple times for the same activity name registers
+    /// independent sequences consumed in FIFO order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `attempts` is empty, since an empty sequence would leave the
+    /// activity without a terminal event and silently hang the test.
+    #[must_use]
+    pub fn mock_activity_retries(
+        mut self,
+        name: impl Into<String>,
+        attempts: Vec<Result<Value, String>>,
+    ) -> Self {
+        assert!(
+            !attempts.is_empty(),
+            "mock_activity_retries requires at least one attempt"
+        );
+        self.retry_sequences
+            .entry(name.into())
+            .or_default()
+            .push_back(attempts);
         self
     }
 
@@ -1771,6 +1835,7 @@ impl WorkflowTestEnv {
 
         let mut call_counts: HashMap<String, u32> = HashMap::new();
         let mut remaining_signals = self.queued_signals.clone();
+        let mut retry_sequences = self.retry_sequences.clone();
 
         for _iter in 0..MAX_TEST_ITERATIONS {
             let (outcome, pending_cmds, _span) = run_workflow_with_state(
@@ -1790,6 +1855,7 @@ impl WorkflowTestEnv {
                         &mut history,
                         &mut remaining_signals,
                         &mut call_counts,
+                        &mut retry_sequences,
                     ) {
                         Ok(p) => p,
                         Err(e) => {
@@ -1948,6 +2014,10 @@ impl WorkflowTestEnv {
         history: &mut Vec<WorkflowEvent>,
         remaining_signals: &mut Vec<(String, Value)>,
         call_counts: &mut HashMap<String, u32>,
+        retry_sequences: &mut HashMap<
+            String,
+            std::collections::VecDeque<Vec<Result<Value, String>>>,
+        >,
     ) -> Result<bool, String> {
         let signal_will_resolve = commands.iter().any(|cmd| {
             if let WorkflowCommand::WaitForSignal { signal_name, .. } = cmd {
@@ -1967,6 +2037,7 @@ impl WorkflowTestEnv {
                 &mut deferred_events,
                 remaining_signals,
                 call_counts,
+                retry_sequences,
             )?;
         }
         history.extend(deferred_events);
@@ -1978,7 +2049,7 @@ impl WorkflowTestEnv {
     /// Returns `Ok(true)` when a command produced progress, `Ok(false)` when
     /// the command was a no-op, or `Err(msg)` when a mock/stub lookup failed
     /// (harness configuration error — the test must be fixed, not the workflow).
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn process_command(
         &self,
         cmd: WorkflowCommand,
@@ -1987,6 +2058,10 @@ impl WorkflowTestEnv {
         deferred_events: &mut Vec<WorkflowEvent>,
         remaining_signals: &mut Vec<(String, Value)>,
         call_counts: &mut HashMap<String, u32>,
+        retry_sequences: &mut HashMap<
+            String,
+            std::collections::VecDeque<Vec<Result<Value, String>>>,
+        >,
     ) -> Result<bool, String> {
         match cmd {
             WorkflowCommand::ScheduleActivity {
@@ -1996,14 +2071,24 @@ impl WorkflowTestEnv {
                 queue,
                 ..
             } => {
-                let call_num = Self::next_call_count(call_counts, &name);
-                let result = self.resolve_activity(&name, act_input.clone(), call_num)?;
                 history.push(WorkflowEvent::ActivityScheduled {
                     activity_id,
                     name: name.clone(),
-                    input: act_input,
+                    input: act_input.clone(),
                     queue,
                 });
+                // Worker-level retry sequence takes priority over per-call mocks.
+                // Increment the per-name call counter regardless so that any
+                // subsequent workflow-level calls for the same activity name see
+                // the correct call number when resolved against per-call mocks.
+                let call_num = Self::next_call_count(call_counts, &name);
+                if let Some(seq) = retry_sequences.get_mut(&name)
+                    && let Some(attempts) = seq.pop_front()
+                {
+                    Self::push_activity_retry_sequence(deferred_events, activity_id, attempts);
+                    return Ok(true);
+                }
+                let result = self.resolve_activity(&name, act_input, call_num)?;
                 Self::push_activity_terminal(deferred_events, activity_id, result);
                 Ok(true)
             }
@@ -2183,6 +2268,59 @@ impl WorkflowTestEnv {
             "WorkflowTestEnv: no mock registered for child workflow '{name}'. \
              Register one with mock_child_workflow()."
         ))
+    }
+
+    /// Simulate a worker-level retry sequence for one activity scheduling.
+    ///
+    /// Mirrors the real worker: each attempt emits `ActivityStarted`; non-
+    /// terminal failures call `requeue_for_retry` (no event); the last failure
+    /// emits `ActivityFailed { non_retryable: true }`; success emits
+    /// `ActivityCompleted`.  The replay engine skips `ActivityStarted` events,
+    /// so the workflow sees only the terminal outcome — identical to production.
+    fn push_activity_retry_sequence(
+        history: &mut Vec<WorkflowEvent>,
+        activity_id: ActivityExecId,
+        attempts: Vec<Result<Value, String>>,
+    ) {
+        let total = u32::try_from(attempts.len()).unwrap_or(u32::MAX);
+        for (i, result) in attempts.into_iter().enumerate() {
+            let attempt_num = u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1);
+            history.push(WorkflowEvent::ActivityStarted {
+                activity_id,
+                worker_id: WorkerId::new("test-worker"),
+            });
+            match result {
+                Ok(output) => {
+                    history.push(WorkflowEvent::ActivityCompleted {
+                        activity_id,
+                        output,
+                    });
+                    return;
+                }
+                Err(error) => {
+                    // Parse the payload so we can honour typed non-retryable
+                    // failures mid-sequence, matching production's
+                    // next_retry_delay check which stops immediately for
+                    // non_retryable payloads regardless of remaining budget.
+                    let parsed = crate::failure::parse_error_payload_full(&error);
+                    if attempt_num == total || parsed.non_retryable {
+                        // Retry budget exhausted, or payload is explicitly
+                        // non-retryable → emit the terminal ActivityFailed.
+                        history.push(WorkflowEvent::ActivityFailed {
+                            activity_id,
+                            error: parsed.message,
+                            attempt: attempt_num,
+                            error_type: parsed.error_type,
+                            non_retryable: parsed.non_retryable,
+                            details: parsed.details,
+                        });
+                        return;
+                    }
+                    // Non-terminal retryable: requeue_for_retry stores the
+                    // error in the task row but writes no event.
+                }
+            }
+        }
     }
 
     /// Append `ActivityCompleted` or `ActivityFailed` to history.

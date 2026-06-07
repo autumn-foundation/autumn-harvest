@@ -207,6 +207,11 @@ mod scanner {
                         // heartbeat_details is preserved so a retry can still
                         // read the last flushed checkpoint.
                         dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+                        // Clear the previous error: crashes don't leave a
+                        // meaningful error string, and the stale message from an
+                        // earlier clean failure would otherwise appear as
+                        // previous_failure() on the next attempt.
+                        dsl::error.eq(None::<String>),
                         dsl::crash_strikes.eq(new_strikes),
                         dsl::scheduled_at.eq(Utc::now()),
                     ))

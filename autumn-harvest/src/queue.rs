@@ -655,6 +655,7 @@ pub async fn complete_task(
         dsl::state.eq("COMPLETED"),
         dsl::output.eq(Some(output)),
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
+        dsl::error.eq(None::<String>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -852,13 +853,52 @@ pub async fn record_heartbeat(
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// Reschedule a `RUNNING` task back to `PENDING` after a retryable failure.
+///
+/// Stores `previous_error` in the task row's `error` column so the next
+/// dispatch can surface it via `ActivityContext::previous_failure()`.
+/// The heartbeat details payload is preserved so the retry attempt can resume
+/// from the last flushed checkpoint.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn requeue_for_retry(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     delay: Duration,
+    previous_error: &str,
 ) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
     let next_run = Utc::now() + delay;
-    reschedule_task(conn, task_id, next_run).await
+
+    let queue_name = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::crash_strikes.eq(0),
+        dsl::scheduled_at.eq(next_run),
+        dsl::error.eq(Some(previous_error)),
+    ))
+    .returning(dsl::queue_name)
+    .get_result::<String>(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?
+    .ok_or_else(|| {
+        crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
+    })?;
+
+    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
+
+    Ok(())
 }
 
 /// Reset a task to `PENDING` at an explicit timestamp.
