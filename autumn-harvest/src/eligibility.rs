@@ -12,10 +12,10 @@ pub enum Requirement {
 /// Helper to strip leading and trailing quotes from a string token.
 fn strip_quotes(s: &str) -> &str {
     let mut s = s.trim();
-    if s.len() >= 2 {
-        if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-            s = &s[1..s.len() - 1];
-        }
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s = &s[1..s.len() - 1];
     }
     s.trim()
 }
@@ -24,6 +24,9 @@ fn strip_quotes(s: &str) -> &str {
 ///
 /// Supports exact matches like `key = "value"` and set membership like
 /// `key in ["a", "b"]`. Handles spaces and quotes robustly.
+/// # Errors
+///
+/// Returns an error string if the requirement syntax is invalid or if it contains an empty key.
 pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -77,14 +80,13 @@ fn parse_single_requirement(token: &str) -> Result<Requirement, String> {
 
         let key = strip_quotes(key_raw).to_string();
         if key.is_empty() {
-            return Err(format!("empty key in requirement '{}'", token));
+            return Err(format!("empty key in requirement '{token}'"));
         }
 
         let val_trimmed = val_raw.trim();
         if !val_trimmed.starts_with('[') || !val_trimmed.ends_with(']') {
             return Err(format!(
-                "invalid set syntax in requirement '{}'; expected [...]",
-                token
+                "invalid set syntax in requirement '{token}'; expected [...]"
             ));
         }
 
@@ -107,15 +109,14 @@ fn parse_single_requirement(token: &str) -> Result<Requirement, String> {
 
         let key = strip_quotes(key_raw).to_string();
         if key.is_empty() {
-            return Err(format!("empty key in requirement '{}'", token));
+            return Err(format!("empty key in requirement '{token}'"));
         }
         let value = strip_quotes(val_raw).to_string();
 
         Ok(Requirement::Exact { key, value })
     } else {
         Err(format!(
-            "invalid requirement syntax: '{}'; expected '=' or 'in'",
-            token
+            "invalid requirement syntax: '{token}'; expected '=' or 'in'"
         ))
     }
 }
