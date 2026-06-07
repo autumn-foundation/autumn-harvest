@@ -2298,24 +2298,26 @@ impl WorkflowTestEnv {
                     return;
                 }
                 Err(error) => {
-                    if attempt_num == total {
-                        // All retries exhausted → terminal failure.
-                        // Use non_retryable: false to match production: plain
-                        // Err(String) payloads parse as retryable in
-                        // finalize_activity_failure; exhaustion is determined
-                        // by the retry policy, not the non_retryable flag.
+                    // Parse the payload so we can honour typed non-retryable
+                    // failures mid-sequence, matching production's
+                    // next_retry_delay check which stops immediately for
+                    // non_retryable payloads regardless of remaining budget.
+                    let parsed = crate::failure::parse_error_payload_full(&error);
+                    if attempt_num == total || parsed.non_retryable {
+                        // Retry budget exhausted, or payload is explicitly
+                        // non-retryable → emit the terminal ActivityFailed.
                         history.push(WorkflowEvent::ActivityFailed {
                             activity_id,
-                            error,
+                            error: parsed.message,
                             attempt: attempt_num,
-                            error_type: "Error".to_string(),
-                            non_retryable: false,
-                            details: None,
+                            error_type: parsed.error_type,
+                            non_retryable: parsed.non_retryable,
+                            details: parsed.details,
                         });
                         return;
                     }
-                    // Non-terminal: requeue_for_retry stores error in the task
-                    // row but writes no event — match that here by doing nothing.
+                    // Non-terminal retryable: requeue_for_retry stores the
+                    // error in the task row but writes no event.
                 }
             }
         }
