@@ -61,7 +61,7 @@ pub struct StartWorkflowParams<'a> {
     /// Pre-resolved concurrency group key for this workflow run (issue #247).
     ///
     /// Callers resolve the key expression from `WorkflowInfo.concurrency.key_expr`
-    /// against the input payload via [`crate::concurrency::resolve_concurrency_key`]
+    /// against the input payload via `` `crate::concurrency::resolve_concurrency_key` ``
     /// before constructing `StartWorkflowParams`. When `None`, no per-key cap is
     /// applied and only the worker-level semaphore limits concurrency.
     pub concurrency_key: Option<String>,
