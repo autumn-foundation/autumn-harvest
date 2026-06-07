@@ -1124,8 +1124,7 @@ async fn test_worker_capabilities_routing_and_triage() {
         reasons
             .iter()
             .any(|r| r == "unsatisfied_requirement:gpu=true"),
-        "worker-gpu-false should have unsatisfied requirement gpu=true: {:?}",
-        reasons
+        "worker-gpu-false should have unsatisfied requirement gpu=true: {reasons:?}"
     );
 
     // worker-gpu-true should be in eligible_workers

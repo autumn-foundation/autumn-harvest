@@ -36,18 +36,27 @@ pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_brackets = false;
+    let mut in_quotes = None;
 
     for c in s.chars() {
         match c {
-            '[' => {
+            '\'' | '"' => {
+                if in_quotes == Some(c) {
+                    in_quotes = None;
+                } else if in_quotes.is_none() {
+                    in_quotes = Some(c);
+                }
+                current.push(c);
+            }
+            '[' if in_quotes.is_none() => {
                 in_brackets = true;
                 current.push(c);
             }
-            ']' => {
+            ']' if in_quotes.is_none() => {
                 in_brackets = false;
                 current.push(c);
             }
-            ',' if !in_brackets => {
+            ',' if !in_brackets && in_quotes.is_none() => {
                 let trimmed = current.trim();
                 if !trimmed.is_empty() {
                     tokens.push(trimmed.to_string());
@@ -73,34 +82,7 @@ pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
 }
 
 fn parse_single_requirement(token: &str) -> Result<Requirement, String> {
-    let token_lower = token.to_lowercase();
-    if let Some(idx) = token_lower.find(" in ") {
-        let key_raw = &token[..idx];
-        let val_raw = &token[idx + 4..];
-
-        let key = strip_quotes(key_raw).to_string();
-        if key.is_empty() {
-            return Err(format!("empty key in requirement '{token}'"));
-        }
-
-        let val_trimmed = val_raw.trim();
-        if !val_trimmed.starts_with('[') || !val_trimmed.ends_with(']') {
-            return Err(format!(
-                "invalid set syntax in requirement '{token}'; expected [...]"
-            ));
-        }
-
-        let inner = &val_trimmed[1..val_trimmed.len() - 1];
-        let mut values = Vec::new();
-        for item in inner.split(',') {
-            let item_stripped = strip_quotes(item);
-            if !item_stripped.is_empty() {
-                values.push(item_stripped.to_string());
-            }
-        }
-
-        Ok(Requirement::In { key, values })
-    } else if let Some(idx) = token.find('=') {
+    if let Some(idx) = token.find('=') {
         let key_raw = &token[..idx];
         let mut val_raw = &token[idx + 1..];
         if val_raw.starts_with('=') {
@@ -115,9 +97,38 @@ fn parse_single_requirement(token: &str) -> Result<Requirement, String> {
 
         Ok(Requirement::Exact { key, value })
     } else {
-        Err(format!(
-            "invalid requirement syntax: '{token}'; expected '=' or 'in'"
-        ))
+        let token_lower = token.to_lowercase();
+        if let Some(idx) = token_lower.find(" in ") {
+            let key_raw = &token[..idx];
+            let val_raw = &token[idx + 4..];
+
+            let key = strip_quotes(key_raw).to_string();
+            if key.is_empty() {
+                return Err(format!("empty key in requirement '{token}'"));
+            }
+
+            let val_trimmed = val_raw.trim();
+            if !val_trimmed.starts_with('[') || !val_trimmed.ends_with(']') {
+                return Err(format!(
+                    "invalid set syntax in requirement '{token}'; expected [...]"
+                ));
+            }
+
+            let inner = &val_trimmed[1..val_trimmed.len() - 1];
+            let mut values = Vec::new();
+            for item in inner.split(',') {
+                let item_stripped = strip_quotes(item);
+                if !item_stripped.is_empty() {
+                    values.push(item_stripped.to_string());
+                }
+            }
+
+            Ok(Requirement::In { key, values })
+        } else {
+            Err(format!(
+                "invalid requirement syntax: '{token}'; expected '=' or 'in'"
+            ))
+        }
     }
 }
 
@@ -229,6 +240,38 @@ mod tests {
         assert!(parse_requirements("gpu").is_err());
         assert!(parse_requirements("region in").is_err());
         assert!(parse_requirements("region in eu-west-1").is_err());
+    }
+
+    #[test]
+    fn test_parse_requirements_edge_cases() {
+        // Exact match with 'in' inside quotes
+        let parsed1 = parse_requirements("description = 'written in rust'").unwrap();
+        assert_eq!(
+            parsed1,
+            vec![Requirement::Exact {
+                key: "description".to_string(),
+                value: "written in rust".to_string()
+            }]
+        );
+
+        let parsed2 = parse_requirements("location = \"in Berlin\"").unwrap();
+        assert_eq!(
+            parsed2,
+            vec![Requirement::Exact {
+                key: "location".to_string(),
+                value: "in Berlin".to_string()
+            }]
+        );
+
+        // Commas enclosed in quoted strings
+        let parsed3 = parse_requirements("some_key = \"value, with, comma\"").unwrap();
+        assert_eq!(
+            parsed3,
+            vec![Requirement::Exact {
+                key: "some_key".to_string(),
+                value: "value, with, comma".to_string()
+            }]
+        );
     }
 
     #[test]

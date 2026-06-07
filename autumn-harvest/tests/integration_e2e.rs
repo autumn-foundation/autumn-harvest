@@ -111,7 +111,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
     "\n",
-    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql")
+    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -2790,7 +2791,7 @@ async fn wake_workflow_task_does_not_requeue_active_running_task() {
         serde_json::json!({"wake": false}),
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(10);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
@@ -6730,7 +6731,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
     // Enqueue a RUNNING workflow task (simulating the worker parked the task).
     let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(10);
     let task_id = queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue workflow task failed");
