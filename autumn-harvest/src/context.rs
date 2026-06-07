@@ -3688,6 +3688,16 @@ pub struct ActivityContext {
     /// Which attempt of the logical activity invocation this context represents.
     /// `1` for the first attempt. Stable retries share a key but differ here.
     attempt: Option<u32>,
+    /// Error string from the most recent failed attempt, if this is a retry.
+    ///
+    /// `None` on the first attempt. Derived from the task row's last recorded
+    /// failure at dispatch time; populated identically for regular activities,
+    /// local activities, and Saga steps.
+    previous_failure: Option<String>,
+    /// Maximum number of attempts configured for this activity (retry policy
+    /// `max_attempts`, or `1` if no policy). Use `attempt() == max_attempts()`
+    /// to detect the final attempt and branch on last-attempt behaviour.
+    max_attempts: Option<u32>,
     /// State needed by [`Self::run_transactional`].
     ///
     /// `None` for test contexts, local activity contexts, and any context that
@@ -3720,6 +3730,8 @@ impl ActivityContext {
             trace_context: None,
             idempotency_key: None,
             attempt: None,
+            previous_failure: None,
+            max_attempts: None,
             #[cfg(feature = "db")]
             transactional_state: None,
         }
@@ -3753,6 +3765,8 @@ impl ActivityContext {
             trace_context: None,
             idempotency_key: None,
             attempt: None,
+            previous_failure: None,
+            max_attempts: None,
             transactional_state: None,
         }
     }
@@ -3773,6 +3787,8 @@ impl ActivityContext {
             trace_context: None,
             idempotency_key: None,
             attempt: None,
+            previous_failure: None,
+            max_attempts: None,
             #[cfg(feature = "db")]
             transactional_state: None,
         }
@@ -3819,6 +3835,27 @@ impl ActivityContext {
         self
     }
 
+    /// Set the error message from the most recent failed attempt.
+    ///
+    /// `None` means this is the first attempt (no prior failure). The engine
+    /// sets this automatically from the task queue's stored error; you only
+    /// need it when constructing a context manually in tests.
+    #[must_use]
+    pub fn with_previous_failure(mut self, failure: Option<String>) -> Self {
+        self.previous_failure = failure;
+        self
+    }
+
+    /// Set the maximum number of attempts for this activity invocation.
+    ///
+    /// Mirrors `RetryPolicy::max_attempts`. The engine sets this automatically;
+    /// you only need it when constructing a context manually in tests.
+    #[must_use]
+    pub const fn with_max_attempts(mut self, max: u32) -> Self {
+        self.max_attempts = Some(max);
+        self
+    }
+
     /// Attach the transactional state needed by [`Self::run_transactional`].
     ///
     /// Called by the worker after the `ActivityStarted` event is committed so
@@ -3857,18 +3894,74 @@ impl ActivityContext {
         })
     }
 
-    /// Which attempt of the logical activity invocation this context
-    /// represents.  `Some(1)` for the first attempt, `Some(2)` for the first
-    /// retry, and so on.  `None` if the engine did not set an attempt (e.g.
-    /// contexts built with the bare `new` constructor).
+    /// 1-indexed attempt number for this activity invocation.
+    ///
+    /// Returns `1` on the first dispatch and increments with each worker-level
+    /// retry.  Use `attempt() == max_attempts()` to detect the final attempt:
+    ///
+    /// ```rust
+    /// use autumn_harvest::context::ActivityContext;
+    ///
+    /// # fn example(ctx: &ActivityContext) {
+    /// if ctx.attempt() == ctx.max_attempts() {
+    ///     // Last attempt — write a fallback row, page an on-call, emit a metric.
+    /// }
+    /// if let Some(prev) = ctx.previous_failure() {
+    ///     tracing::warn!(attempt = ctx.attempt(), error = prev, "retrying after previous failure");
+    /// }
+    /// # }
+    /// ```
     ///
     /// The default idempotency key is **retry-stable** (same value for all
     /// attempts).  Call `ctx.idempotency_key()?.subkey(&format!("attempt-{}",
-    /// ctx.attempt().unwrap_or(1)))` to opt into an attempt-scoped subkey if
-    /// your downstream API requires distinct keys per attempt.
+    /// ctx.attempt()))` to opt into an attempt-scoped subkey if your downstream
+    /// API requires distinct keys per attempt.
     #[must_use]
-    pub const fn attempt(&self) -> Option<u32> {
-        self.attempt
+    pub const fn attempt(&self) -> u32 {
+        match self.attempt {
+            Some(n) => n,
+            None => 1,
+        }
+    }
+
+    /// Error string from the most recent failed attempt.
+    ///
+    /// Returns `None` on the first attempt.  On a retry, contains the
+    /// human-readable error message recorded when the previous attempt failed.
+    /// Use with [`attempt`](Self::attempt) and [`max_attempts`](Self::max_attempts)
+    /// to implement retry-aware logging or last-attempt escape hatches.
+    #[must_use]
+    pub fn previous_failure(&self) -> Option<&str> {
+        self.previous_failure.as_deref()
+    }
+
+    /// Maximum number of attempts configured for this activity.
+    ///
+    /// Reflects the `RetryPolicy::max_attempts` value for the activity (or `1`
+    /// if no retry policy was configured).  Combine with [`attempt`](Self::attempt)
+    /// to detect the final attempt: `ctx.attempt() == ctx.max_attempts()`.
+    #[must_use]
+    pub const fn max_attempts(&self) -> u32 {
+        match self.max_attempts {
+            Some(n) => n,
+            None => 1,
+        }
+    }
+
+    /// Returns `true` when this is the last allowed attempt.
+    ///
+    /// Equivalent to `self.attempt() == self.max_attempts()`.
+    #[must_use]
+    pub const fn is_last_attempt(&self) -> bool {
+        self.attempt() == self.max_attempts()
+    }
+
+    /// Returns `true` when this is a retry (attempt > 1).
+    ///
+    /// Equivalent to `self.attempt() > 1`.
+    #[must_use]
+    pub const fn is_retrying(&self) -> bool {
+        self.attempt() > 1
     }
 
     /// Access typed shared state.
@@ -4331,6 +4424,7 @@ impl ActivityContext {
         )
         .with_idempotency_key(IdempotencyKey::from_activity_exec_id(id))
         .with_attempt(1)
+        .with_max_attempts(1)
     }
 
     /// Like [`new_test`](Self::new_test) but intentionally omits the

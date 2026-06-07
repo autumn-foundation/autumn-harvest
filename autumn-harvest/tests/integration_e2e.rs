@@ -7009,3 +7009,171 @@ async fn per_key_concurrency_does_not_block_other_keys() {
         "next claimable task should be loud-key"
     );
 }
+
+// ──────────── ActivityContext::attempt() / previous_failure() via worker ─────
+
+/// Shared state captured by the retry-aware activity across all attempts.
+#[derive(Default)]
+struct RetryObservations {
+    /// (attempt_number, previous_failure) collected on each invocation.
+    records: Mutex<Vec<(u32, Option<String>)>>,
+}
+
+fn workflow_calling_retry_activity<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("retry_context_activity", serde_json::json!(null), "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Activity that records `ctx.attempt()` and `ctx.previous_failure()` on each
+/// invocation, fails on attempts 1 and 2 with a retryable error, and succeeds
+/// on attempt 3.
+fn retry_context_activity<'a>(
+    ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let obs = Arc::clone(
+            ctx.state::<Arc<RetryObservations>>()
+                .expect("RetryObservations must be registered"),
+        );
+        let attempt = ctx.attempt();
+        let prev = ctx.previous_failure().map(str::to_string);
+        obs.records.lock().unwrap().push((attempt, prev));
+
+        if attempt < 3 {
+            Err(format!("fail_attempt_{attempt}"))
+        } else {
+            Ok(serde_json::json!("success"))
+        }
+    })
+}
+
+/// Verifies that `ActivityContext::attempt()` increments correctly across
+/// worker-level retries and that `previous_failure()` carries the last error
+/// string on subsequent attempts.
+///
+/// AC #8 of issue #381: "at least one end-to-end integration test asserts that
+/// an activity which fails twice and succeeds on attempt 3 observes
+/// `ctx.attempt() == 1, 2, 3` and `ctx.previous_failure() == None,
+/// Some("…"), Some("…")`".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!(null);
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let observations = Arc::new(RetryObservations::default());
+
+    let mut shared_state_map = HashMap::new();
+    shared_state_map.insert(
+        TypeId::of::<Arc<RetryObservations>>(),
+        Box::new(Arc::clone(&observations)) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    let shared_state = Arc::new(shared_state_map);
+
+    let registry = Arc::new(HandlerRegistry::with_state(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_calling_retry_activity,
+            execution_timeout: None,
+            concurrency: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![ActivityInfo {
+            name: "retry_context_activity",
+            module: "integration_e2e",
+            default_retry_policy: Some(autumn_harvest::RetryPolicy::fixed(
+                3,
+                std::time::Duration::from_millis(0),
+            )),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            handler: retry_context_activity,
+        }],
+        shared_state,
+    ));
+
+    let worker = build_runtime_worker("worker-retry-ctx", 2, 4, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let records = observations.records.lock().unwrap().clone();
+
+    assert_eq!(records.len(), 3, "activity must have run exactly 3 times");
+
+    let (a1, p1) = &records[0];
+    assert_eq!(*a1, 1, "first invocation must be attempt 1");
+    assert!(
+        p1.is_none(),
+        "first invocation must have no previous_failure"
+    );
+
+    let (a2, p2) = &records[1];
+    assert_eq!(*a2, 2, "second invocation must be attempt 2");
+    assert_eq!(
+        p2.as_deref(),
+        Some("fail_attempt_1"),
+        "second invocation previous_failure must be the attempt-1 error"
+    );
+
+    let (a3, p3) = &records[2];
+    assert_eq!(*a3, 3, "third invocation must be attempt 3");
+    assert_eq!(
+        p3.as_deref(),
+        Some("fail_attempt_2"),
+        "third invocation previous_failure must be the attempt-2 error"
+    );
+}

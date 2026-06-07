@@ -1311,11 +1311,21 @@ async fn run_local_activity_inline(
         ));
     }
 
+    // Track the error from the previous attempt to surface via previous_failure().
+    // For crash-recovery (start_attempt > 1), the last recorded error is in run.last_error.
+    let mut previous_failure: Option<String> = if start_attempt > 1 {
+        run.last_error.clone()
+    } else {
+        None
+    };
+
     for attempt in start_attempt..=max_attempts {
         let ctx =
             ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
                 .with_idempotency_key(local_idempotency_key.clone())
-                .with_attempt(attempt);
+                .with_attempt(attempt)
+                .with_max_attempts(max_attempts)
+                .with_previous_failure(previous_failure.clone());
         let result = tokio::time::timeout(per_attempt_timeout, (handler)(&ctx, run.input.clone()))
             .await
             .unwrap_or_else(|_| {
@@ -1445,6 +1455,8 @@ async fn run_local_activity_inline(
                 .await?;
                 *next_event_id += 1;
                 all_new_events.push(failed_event);
+                // Capture error for previous_failure() on the next attempt.
+                previous_failure = Some(stored_error.clone());
                 if let Some(event_count) =
                     local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
                 {
@@ -3371,7 +3383,10 @@ async fn handle_activity_result(
                     )
                     .await;
                 }
-                return queue::requeue_for_retry(conn, task.id, delay).await;
+                // Store the human-readable error for ActivityContext::previous_failure()
+                // on the next attempt. Typed payloads are unwrapped to their message.
+                let previous_error = crate::failure::parse_error_payload_full(&error).message;
+                return queue::requeue_for_retry(conn, task.id, delay, &previous_error).await;
             }
 
             finalize_activity_failure(conn, task, exec_id, activity_id, &error).await
@@ -3620,7 +3635,15 @@ async fn process_activity_task(
     )
     .with_trace_context(trace_carrier.clone())
     .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
-    .with_attempt(task_attempt(task));
+    .with_attempt(task_attempt(task))
+    .with_max_attempts(u32::try_from(task.max_attempts.max(1)).unwrap_or(1))
+    .with_previous_failure(if task.attempt > 1 {
+        // task.error carries the human-readable message from the previous
+        // failed attempt, stored by requeue_for_retry at reschedule time.
+        task.error.clone()
+    } else {
+        None
+    });
     // Compute cap before the handler so run_transactional can enforce it
     // inside the transaction (before ActivityCompleted is committed).
     let effective_result_cap = activity

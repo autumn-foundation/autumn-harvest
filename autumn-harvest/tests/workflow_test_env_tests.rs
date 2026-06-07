@@ -804,3 +804,172 @@ async fn test_third_attempt_succeeds() {
         .count();
     assert_eq!(scheduled, 3, "expected exactly 3 scheduled events");
 }
+
+// ─────────────── mock_activity_retries (worker-level retry sequences) ─────────
+
+/// Workflow that calls one activity a single time, expecting the worker to
+/// handle retries transparently.
+fn single_call_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("resilient_op", json!(null), "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tokio::test]
+async fn test_mock_activity_retries_succeeds_on_third_worker_attempt() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity_retries(
+            "resilient_op",
+            vec![
+                Err("transient_1".into()),
+                Err("transient_2".into()),
+                Ok(json!({"status": "ok"})),
+            ],
+        )
+        .run(single_call_workflow, json!(null))
+        .await;
+
+    assert_eq!(outcome.result, Ok(json!({"status": "ok"})));
+}
+
+#[tokio::test]
+async fn test_mock_activity_retries_all_fail_returns_error() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity_retries(
+            "resilient_op",
+            vec![Err("err1".into()), Err("err2".into()), Err("err3".into())],
+        )
+        .run(single_call_workflow, json!(null))
+        .await;
+
+    assert!(
+        outcome.result.is_err(),
+        "all-fail retry sequence should propagate error to workflow"
+    );
+}
+
+#[tokio::test]
+async fn test_mock_activity_retries_history_has_one_scheduled_event() {
+    // Worker-level retries are transparent: one execute_activity_raw call →
+    // one ActivityScheduled, but multiple ActivityFailed + ActivityCompleted.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity_retries("resilient_op", vec![Err("fail".into()), Ok(json!("done"))])
+        .run(single_call_workflow, json!(null))
+        .await;
+
+    let scheduled_count = outcome
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "resilient_op"))
+        .count();
+    assert_eq!(
+        scheduled_count, 1,
+        "worker-level retries must share one ActivityScheduled event"
+    );
+}
+
+#[tokio::test]
+async fn test_mock_activity_retries_history_has_no_intermediate_failures() {
+    // Non-terminal retries do not produce ActivityFailed events in the real
+    // worker (requeue_for_retry is called instead), so the test harness must
+    // match: only the terminal outcome writes ActivityFailed.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity_retries(
+            "resilient_op",
+            vec![
+                Err("transient_1".into()),
+                Err("transient_2".into()),
+                Ok(json!("done")),
+            ],
+        )
+        .run(single_call_workflow, json!(null))
+        .await;
+
+    let events = outcome.events();
+
+    // No ActivityFailed at all — the sequence ends in ActivityCompleted.
+    let failed_count = events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityFailed { .. }))
+        .count();
+    assert_eq!(
+        failed_count, 0,
+        "intermediate retries must not write ActivityFailed to history"
+    );
+
+    // Terminal ActivityCompleted event is present.
+    let completed = events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }));
+    assert!(completed, "expected a final ActivityCompleted event");
+
+    // Three ActivityStarted events (one per attempt) are present.
+    let started_count = events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityStarted { .. }))
+        .count();
+    assert_eq!(started_count, 3, "expected one ActivityStarted per attempt");
+}
+
+#[tokio::test]
+async fn test_mock_activity_retries_all_fail_terminal_failure_is_non_retryable() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity_retries(
+            "resilient_op",
+            vec![
+                Err("fail_1".into()),
+                Err("fail_2".into()),
+                Err("fail_3".into()),
+            ],
+        )
+        .run(single_call_workflow, json!(null))
+        .await;
+
+    assert!(
+        outcome.result.is_err(),
+        "exhausted retry sequence must fail"
+    );
+
+    // Exactly one ActivityFailed — the terminal one — with non_retryable = true.
+    let terminal_failures: Vec<_> = outcome
+        .events()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                WorkflowEvent::ActivityFailed {
+                    non_retryable: true,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(
+        terminal_failures.len(),
+        1,
+        "exactly one terminal non-retryable ActivityFailed expected"
+    );
+}
+
+#[tokio::test]
+async fn test_mock_activity_retries_single_ok_returns_success() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity_retries("resilient_op", vec![Ok(json!("immediate"))])
+        .run(single_call_workflow, json!(null))
+        .await;
+
+    assert_eq!(outcome.result, Ok(json!("immediate")));
+
+    // No intermediate failures when the first attempt succeeds.
+    let failed_count = outcome
+        .events()
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityFailed { .. }))
+        .count();
+    assert_eq!(failed_count, 0);
+}

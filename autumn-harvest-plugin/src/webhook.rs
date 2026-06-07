@@ -81,7 +81,7 @@ pub async fn deliver_webhook(
     let Some(sub) = subs.into_iter().find(|s| s.id == input.subscription_id) else {
         // If subscription is not active or deleted, fail fast and don't retry,
         // but write a failed delivery log for auditability before returning.
-        let attempt = ctx.attempt().unwrap_or(1);
+        let attempt = ctx.attempt();
         let log = WebhookDeliveryLog {
             id: uuid::Uuid::new_v4().to_string(),
             subscription_id: input.subscription_id.clone(),
@@ -111,7 +111,7 @@ pub async fn deliver_webhook(
     if sub.status == WebhookSubscriptionStatus::Disabled {
         tracing::info!(subscription_id = %sub.id, "Webhook subscription is disabled; skipping delivery");
 
-        let attempt = ctx.attempt().unwrap_or(1);
+        let attempt = ctx.attempt();
         let log = WebhookDeliveryLog {
             id: uuid::Uuid::new_v4().to_string(),
             subscription_id: sub.id.clone(),
@@ -143,7 +143,7 @@ pub async fn deliver_webhook(
     request_headers.insert("Content-Type".to_owned(), "application/json".to_owned());
     request_headers.insert("Autumn-Signature".to_owned(), signature_header.clone());
 
-    let attempt = ctx.attempt().unwrap_or(1);
+    let attempt = ctx.attempt();
     let max_attempts = 5;
 
     let mut log = WebhookDeliveryLog {
