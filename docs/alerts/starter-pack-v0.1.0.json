@@ -402,6 +402,38 @@
         "SELECT id, workflow_name, fire_claim_token, fire_claimed_until FROM harvest_schedules WHERE fire_claimed_until IS NOT NULL ORDER BY fire_claimed_until DESC LIMIT 10;"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_schedule_ha_domination"
+    },
+    {
+      "id": "harvest_workflow_failure_rate",
+      "status": "enforceable",
+      "signal_source": "harvest.workflow.terminal counter with outcome label (issue #519).",
+      "default_threshold": "Page when rate(harvest_workflow_terminal_total{outcome='failed'}[5m]) / rate(harvest_workflow_terminal_total[5m]) > 0.10 for any workflow.name. Tune per SLO.",
+      "severity": "page",
+      "owner_persona": "runtime on-call",
+      "description": "The fraction of terminal workflow executions that ended in 'failed' has exceeded the threshold for a given workflow type. This is the primary success-rate SLO signal. Separate outcome labels (completed, failed, cancelled, timed_out, terminated, continued_as_new) allow paging only on unexpected failure while treating operator-driven cancellations and timeouts separately.",
+      "first_action": "harvest workflow list --state FAILED --workflow <name> | head -20 to inspect recent failures; check DLQ for poison-pill tasks",
+      "dependencies": [
+        {
+          "ref": "#519",
+          "status": "shipped",
+          "surface": "harvest.workflow.terminal{outcome,workflow.name,queue} counter emitted exactly once per terminal outcome"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "outcome label is low-cardinality (6 values). workflow.name must be bounded to registered workflow types. Do NOT add execution.id as a label.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow) (rate(harvest_workflow_terminal_total{outcome=\"failed\"}[5m])) / sum by (workflow) (rate(harvest_workflow_terminal_total{outcome!=\"continued_as_new\"}[5m])) > 0.10"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?state=FAILED",
+        "GET /api/harvest/dlq"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_failure_rate"
     }
   ]
 }

@@ -1614,6 +1614,7 @@ async fn cancel_in_flight_runs(
     workflow_name: &str,
     reason: &str,
     max_to_cancel: u32,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<u32> {
     use crate::execution::cancel_workflow_execution;
 
@@ -1633,7 +1634,7 @@ async fn cancel_in_flight_runs(
         .take(usize::try_from(max_to_cancel).unwrap_or(usize::MAX))
     {
         let exec_id = ExecutionId::from_uuid(raw_id);
-        match cancel_workflow_execution(conn, exec_id, reason).await {
+        match cancel_workflow_execution(conn, exec_id, reason, metrics).await {
             Ok(_) => count += 1,
             Err(error) => {
                 tracing::warn!(
@@ -1657,6 +1658,7 @@ async fn terminate_in_flight_runs(
     workflow_name: &str,
     reason: &str,
     max_to_terminate: u32,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<u32> {
     use crate::execution::terminate_workflow_execution;
 
@@ -1676,7 +1678,7 @@ async fn terminate_in_flight_runs(
         .take(usize::try_from(max_to_terminate).unwrap_or(usize::MAX))
     {
         let exec_id = ExecutionId::from_uuid(raw_id);
-        match terminate_workflow_execution(conn, exec_id, reason).await {
+        match terminate_workflow_execution(conn, exec_id, reason, metrics).await {
             Ok(_) => count += 1,
             Err(error) => {
                 tracing::warn!(
@@ -2032,6 +2034,7 @@ async fn tick_one_workflow_schedule(
                     wf_name,
                     "overlap policy CancelOther: new firing",
                     needed,
+                    metrics.as_ref(),
                 )
                 .await?;
                 running -= i64::from(cancelled);
@@ -2046,6 +2049,7 @@ async fn tick_one_workflow_schedule(
                     wf_name,
                     "overlap policy TerminateOther: new firing",
                     needed,
+                    metrics.as_ref(),
                 )
                 .await?;
                 running -= i64::from(terminated);

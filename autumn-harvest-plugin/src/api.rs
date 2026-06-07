@@ -6426,7 +6426,13 @@ async fn cancel_workflow(
         .unwrap_or("workflow cancellation requested");
     let exec_id_str = exec_id.to_string();
 
-    let cancel_result = cancel_workflow_execution(&mut conn, exec_id, reason).await;
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry.telemetry().metrics),
+        );
+    let cancel_result =
+        cancel_workflow_execution(&mut conn, exec_id, reason, metrics_ref.as_ref()).await;
     match cancel_result {
         Err(e) => {
             let err_str = e.to_string();

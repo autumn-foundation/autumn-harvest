@@ -58,7 +58,7 @@ use crate::telemetry::{
     METRIC_SCHEDULE_SKIPPED, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
     METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW,
     METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
-    MetricsRecorder, WorkflowStatus,
+    METRIC_WORKFLOW_TERMINAL, MetricsRecorder, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -93,6 +93,16 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_STATUS => status.as_str(),
         )
         .record(duration_secs);
+    }
+
+    fn record_workflow_terminal(&self, workflow_name: &str, queue: &str, outcome: WorkflowStatus) {
+        counter!(
+            METRIC_WORKFLOW_TERMINAL,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_OUTCOME => outcome.as_str(),
+        )
+        .increment(1);
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -448,6 +458,25 @@ mod tests {
         rec.record_rate_limit_tokens_available("rl", 10.0);
         rec.record_rate_limit_refill_rate("rl", 2.0);
         rec.record_rate_limit_throttled("rl");
+    }
+
+    // -----------------------------------------------------------------------
+    // RED-phase tests: record_workflow_terminal bridge (issue #519)
+    // These tests fail until MetricsRsRecorder implements record_workflow_terminal.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn record_workflow_terminal_does_not_panic_for_all_outcomes() {
+        use crate::telemetry::WorkflowStatus;
+        let rec = MetricsRsRecorder;
+        // Must not panic with no global recorder installed (metrics 0.24
+        // routes to a no-op sink).
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Completed);
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Failed);
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Cancelled);
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::TimedOut);
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Terminated);
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::ContinuedAsNew);
     }
 
     #[test]

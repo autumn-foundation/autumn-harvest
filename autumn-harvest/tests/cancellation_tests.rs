@@ -284,9 +284,14 @@ async fn cancel_running_workflow_marks_execution_cancelled_and_fails_open_tasks(
         .await
         .expect("activity task should enqueue");
 
-    let cancelled = cancel_workflow_execution(&mut conn, exec_id, "operator requested shutdown")
-        .await
-        .expect("workflow cancellation should succeed");
+    let cancelled = cancel_workflow_execution(
+        &mut conn,
+        exec_id,
+        "operator requested shutdown",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("workflow cancellation should succeed");
 
     assert_eq!(cancelled.exec_id, exec_id);
     assert_eq!(cancelled.state, "CANCELLED");
@@ -330,12 +335,22 @@ async fn cancelling_an_already_cancelled_workflow_is_idempotent() {
     let (mut conn, _container) = setup_test_db().await;
     let exec_id = start_test_workflow(&mut conn).await;
 
-    cancel_workflow_execution(&mut conn, exec_id, "first reason")
-        .await
-        .expect("first cancellation should succeed");
-    let second = cancel_workflow_execution(&mut conn, exec_id, "second reason")
-        .await
-        .expect("second cancellation should be idempotent");
+    cancel_workflow_execution(
+        &mut conn,
+        exec_id,
+        "first reason",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("first cancellation should succeed");
+    let second = cancel_workflow_execution(
+        &mut conn,
+        exec_id,
+        "second reason",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("second cancellation should be idempotent");
 
     assert!(!second.newly_cancelled);
     assert_eq!(second.reason, "first reason");
@@ -359,9 +374,14 @@ async fn cancelling_an_already_cancelled_workflow_is_idempotent() {
 async fn signals_to_cancelled_workflows_are_rejected() {
     let (mut conn, _container) = setup_test_db().await;
     let exec_id = start_test_workflow(&mut conn).await;
-    cancel_workflow_execution(&mut conn, exec_id, "no more signals")
-        .await
-        .expect("workflow cancellation should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        exec_id,
+        "no more signals",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("workflow cancellation should succeed");
 
     let error = signal::send_signal(
         &mut conn,
@@ -532,6 +552,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
         &mut conn,
         exec_id,
         "operator cancelled while activity was running",
+        &autumn_harvest::telemetry::NoOpMetrics,
     )
     .await
     .expect("workflow cancellation should succeed");
@@ -722,9 +743,14 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
         .await
         .expect("activity should start before cancellation");
 
-    cancel_workflow_execution(&mut conn, exec_id, "operator hard-stop")
-        .await
-        .expect("workflow cancellation should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        exec_id,
+        "operator hard-stop",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("workflow cancellation should succeed");
 
     // Give the worker time to: observe cancellation (up to ~500ms poll),
     // cancel the token, elapse the 500ms grace period, then abort the
@@ -856,9 +882,14 @@ async fn activity_exits_early_on_workflow_cancellation() {
         .await
         .expect("activity should start within 10 s");
 
-    cancel_workflow_execution(&mut conn, exec_id, "ac-test cancel")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        exec_id,
+        "ac-test cancel",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     tokio::time::timeout(Duration::from_secs(10), async {
         while !probe.activity_saw_cancel.as_ref().load(Ordering::SeqCst) {
@@ -906,6 +937,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
 // cancellation path.  It is only stopped by the worker's hard-abort after the
 // grace period — confirming cancellation is purely cooperative via heartbeat.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn activity_without_cancellation_check_completes_normally() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -986,9 +1018,14 @@ async fn activity_without_cancellation_check_completes_normally() {
         .await
         .expect("activity should start");
 
-    cancel_workflow_execution(&mut conn, exec_id, "stop it")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        exec_id,
+        "stop it",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     // Wait for the worker to hard-abort the task after the grace period.
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -1067,9 +1104,14 @@ async fn heartbeat_checkpoint_preserved_across_cancel_signal() {
     );
 
     // Cancel the workflow — this clears heartbeat_details on RUNNING tasks.
-    cancel_workflow_execution(&mut conn, exec_id, "cancel checkpoint test")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        exec_id,
+        "cancel checkpoint test",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     // Post-cancel: the task row's heartbeat_details is cleared (fresh retry starts clean).
     let post_cancel_details = dsl::harvest_task_queue

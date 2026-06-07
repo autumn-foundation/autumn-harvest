@@ -72,6 +72,33 @@ pub const METRIC_WORKFLOW_HISTORY_SIZE: &str = "harvest.workflow.history_size";
 /// Counter: incremented once for each continue-as-new rotation.
 pub const METRIC_WORKFLOW_CONTINUE_AS_NEW: &str = "harvest.workflow.continue_as_new";
 
+/// Counter: incremented **exactly once** when a workflow execution reaches a
+/// terminal state.
+///
+/// Unlike `harvest.workflow.duration` (which fires on every executor cycle,
+/// including suspended cycles), this counter fires at the final
+/// terminal-state transition only — so `completed / (completed + failed +
+/// cancelled + timed_out)` gives a reliable per-scrape-interval success rate
+/// without any normalisation.
+///
+/// Labels (all low-cardinality):
+/// - `workflow` — the workflow type name.
+/// - `queue`    — the task-queue the execution was dispatched on.
+/// - `outcome`  — one of the six bounded values below.
+///
+/// Bounded `outcome` values:
+/// - `"completed"` — handler returned `Ok(…)`.
+/// - `"failed"`    — handler returned `Err(…)` or exhausted retries.
+/// - `"cancelled"` — gracefully cancelled via `cancel_workflow_execution`.
+/// - `"timed_out"` — execution deadline (`deadline_at`) elapsed.
+/// - `"terminated"`— force-killed via `terminate_workflow_execution`.
+/// - `"continued_as_new"` — execution rotated; **excluded from the
+///   success-rate denominator** (`completed + failed + cancelled + timed_out`).
+///
+/// Per ADR-0001 §7, `execution.id` is **span-only** and must never appear
+/// as a label on this counter.
+pub const METRIC_WORKFLOW_TERMINAL: &str = "harvest.workflow.terminal";
+
 /// Histogram: wall-clock seconds an activity invocation took (success or failure).
 pub const METRIC_ACTIVITY_DURATION: &str = "harvest.activity.duration";
 
@@ -483,10 +510,25 @@ pub enum WorkflowStatus {
     Failed,
     /// Handler suspended awaiting activity results or timer firings; this run
     /// of the executor did not complete the workflow.
+    ///
+    /// **Not a terminal state.** Used only for the per-cycle
+    /// `harvest.workflow.duration` histogram. Must never be passed to
+    /// [`MetricsRecorder::record_workflow_terminal`].
     Suspended,
     /// Handler signalled `continue_as_new`: the current run is sealed and a
     /// fresh execution with the same `WorkflowId` is started in its place.
+    ///
+    /// Counted by `harvest.workflow.terminal{outcome="continued_as_new"}` but
+    /// **excluded from the success-rate denominator**
+    /// (`completed + failed + cancelled + timed_out`) because the logical
+    /// workflow continues in a new execution.
     ContinuedAsNew,
+    /// Gracefully cancelled via `cancel_workflow_execution`.
+    Cancelled,
+    /// Execution deadline (`deadline_at`) elapsed before the workflow completed.
+    TimedOut,
+    /// Force-killed via `terminate_workflow_execution` (operator override).
+    Terminated,
 }
 
 impl WorkflowStatus {
@@ -498,6 +540,9 @@ impl WorkflowStatus {
             Self::Failed => "failed",
             Self::Suspended => "suspended",
             Self::ContinuedAsNew => "continued_as_new",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Terminated => "terminated",
         }
     }
 }
@@ -572,6 +617,25 @@ pub trait MetricsRecorder: Send + Sync {
     /// A workflow reached a terminal state with this durable history size.
     fn record_workflow_history_size(&self, workflow_name: &str, event_count: u64) {
         let _ = (workflow_name, event_count);
+    }
+
+    /// A workflow execution reached a terminal state.
+    ///
+    /// Fires **exactly once** per execution at the terminal-state transition.
+    /// Unlike [`record_workflow_completed`](Self::record_workflow_completed),
+    /// this counter never fires for suspended executor cycles — a workflow
+    /// that suspends N times and then completes produces exactly one
+    /// `Completed` increment.
+    ///
+    /// `outcome` must be one of the six terminal variants of [`WorkflowStatus`]:
+    /// `Completed`, `Failed`, `Cancelled`, `TimedOut`, `Terminated`, or
+    /// `ContinuedAsNew`. Callers must **never** pass `Suspended`.
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_TERMINAL`] with labels
+    /// `workflow`, `queue`, and `outcome`.
+    /// Per ADR-0001 §7, `execution.id` must never be a label here.
+    fn record_workflow_terminal(&self, workflow_name: &str, queue: &str, outcome: WorkflowStatus) {
+        let _ = (workflow_name, queue, outcome);
     }
 
     /// A workflow execution rotated using continue-as-new.
@@ -1042,6 +1106,110 @@ mod tests {
         assert_eq!(METRIC_LABEL_WORKFLOW_TYPE, "workflow.type");
         assert_eq!(METRIC_LABEL_ACTIVITY, "activity");
         assert_eq!(METRIC_LABEL_QUEUE, "queue");
+    }
+
+    // -----------------------------------------------------------------------
+    // RED-phase tests for harvest.workflow.terminal counter (issue #519)
+    // These tests fail until the implementation is complete.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn metric_workflow_terminal_constant_has_correct_name() {
+        // The terminal counter name is specified by ADR-0001 §7 naming convention.
+        assert_eq!(METRIC_WORKFLOW_TERMINAL, "harvest.workflow.terminal");
+    }
+
+    #[test]
+    fn workflow_status_terminal_variants_stringify_correctly() {
+        // Outcome label values for the terminal counter are
+        // bounded: completed | failed | cancelled | timed_out | terminated | continued_as_new
+        assert_eq!(WorkflowStatus::Cancelled.as_str(), "cancelled");
+        assert_eq!(WorkflowStatus::TimedOut.as_str(), "timed_out");
+        assert_eq!(WorkflowStatus::Terminated.as_str(), "terminated");
+    }
+
+    #[test]
+    fn workflow_status_suspended_is_not_a_terminal_counter_outcome() {
+        // Suspended executor cycles must NOT increment the terminal counter.
+        // Verify that "suspended" is not in the bounded terminal outcome set.
+        let terminal_outcomes = [
+            WorkflowStatus::Completed.as_str(),
+            WorkflowStatus::Failed.as_str(),
+            WorkflowStatus::Cancelled.as_str(),
+            WorkflowStatus::TimedOut.as_str(),
+            WorkflowStatus::Terminated.as_str(),
+            WorkflowStatus::ContinuedAsNew.as_str(),
+        ];
+        assert!(
+            !terminal_outcomes.contains(&WorkflowStatus::Suspended.as_str()),
+            "Suspended must not appear in the terminal outcome label set; \
+             a suspended executor cycle does not mark a workflow as terminal"
+        );
+    }
+
+    #[test]
+    fn record_workflow_terminal_has_noop_default() {
+        // MetricsRecorder::record_workflow_terminal must exist with a no-op
+        // default body so existing MetricsRecorder implementations compile
+        // without changes.
+        let rec = NoOpMetrics;
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Completed);
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Failed);
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Cancelled);
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::TimedOut);
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::Terminated);
+        rec.record_workflow_terminal("onboarding", "default", WorkflowStatus::ContinuedAsNew);
+        // Calling for Suspended is allowed by the type system but callers
+        // must never do so in practice (enforced by worker.rs call sites).
+    }
+
+    #[test]
+    fn record_workflow_terminal_fires_once_per_distinct_outcome() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct TerminalCounter(AtomicUsize);
+
+        impl MetricsRecorder for TerminalCounter {
+            fn record_workflow_terminal(&self, _wf: &str, _q: &str, outcome: WorkflowStatus) {
+                // The counter should fire exactly once per terminal outcome
+                // and never for Suspended.
+                assert!(
+                    !matches!(outcome, WorkflowStatus::Suspended),
+                    "record_workflow_terminal must not be called with Suspended"
+                );
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(TerminalCounter::default());
+        for outcome in [
+            WorkflowStatus::Completed,
+            WorkflowStatus::Failed,
+            WorkflowStatus::Cancelled,
+            WorkflowStatus::TimedOut,
+            WorkflowStatus::Terminated,
+            WorkflowStatus::ContinuedAsNew,
+        ] {
+            counter.record_workflow_terminal("wf", "q", outcome);
+        }
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            6,
+            "should emit once for each of the 6 terminal outcomes"
+        );
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_workflow_terminal() {
+        // ADR-0001 §7 cardinality rule: execution.id is span-only.
+        // This test verifies by construction that record_workflow_terminal
+        // accepts only (workflow_name, queue, outcome) — no execution id.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_workflow_terminal("billing", "default", WorkflowStatus::Completed);
+        // If execution.id were a parameter the call above would require an
+        // extra UUID argument and this test would fail to compile.
     }
 
     #[test]

@@ -406,9 +406,14 @@ async fn test_delayed_start_cancel_before_firing() {
     assert_eq!(tasks[0].state, "PENDING");
 
     // Cancel workflow execution
-    let cancelled = cancel_workflow_execution(&mut conn, exec_id, "user request before start")
-        .await
-        .expect("should cancel");
+    let cancelled = cancel_workflow_execution(
+        &mut conn,
+        exec_id,
+        "user request before start",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("should cancel");
 
     assert_eq!(cancelled.state, "CANCELLED");
     assert!(cancelled.newly_cancelled);

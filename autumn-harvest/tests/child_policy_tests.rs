@@ -1063,9 +1063,14 @@ async fn parent_terminate_cascade_applies_child_descendant_policy() {
     )
     .await;
 
-    cancel_workflow_execution(&mut conn, parent_exec_id, "operator closed parent")
-        .await
-        .expect("parent cancellation should cascade");
+    cancel_workflow_execution(
+        &mut conn,
+        parent_exec_id,
+        "operator closed parent",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("parent cancellation should cascade");
 
     wait_for_state(&mut conn, child_exec_id, &["FAILED"]).await;
     wait_for_state(&mut conn, grandchild_exec_id, &["CANCELLED"]).await;
@@ -1095,9 +1100,14 @@ async fn cascade_records_child_events_only_after_winning_child_transition() {
     .await;
     force_parent_close_transition_to_lose(&mut conn, child_exec_id).await;
 
-    cancel_workflow_execution(&mut conn, parent_exec_id, "operator closed parent")
-        .await
-        .expect("parent cancellation should succeed despite lost child transition");
+    cancel_workflow_execution(
+        &mut conn,
+        parent_exec_id,
+        "operator closed parent",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("parent cancellation should succeed despite lost child transition");
 
     let child_history = load_history_events(&mut conn, child_exec_id).await;
     assert!(
@@ -1376,9 +1386,14 @@ async fn child_workflow_cancel_cascade_request_cancel() {
     let child_exec_id = wait_for_child_execution(&mut conn, parent_exec_id).await;
 
     // Operator cancels the parent.
-    cancel_workflow_execution(&mut conn, parent_exec_id, "operator cancel test")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        parent_exec_id,
+        "operator cancel test",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     // Parent should become CANCELLED.
     wait_for_state(&mut conn, parent_exec_id, &["CANCELLED"]).await;
