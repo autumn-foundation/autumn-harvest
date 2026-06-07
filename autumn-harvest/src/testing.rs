@@ -2078,13 +2078,16 @@ impl WorkflowTestEnv {
                     queue,
                 });
                 // Worker-level retry sequence takes priority over per-call mocks.
+                // Increment the per-name call counter regardless so that any
+                // subsequent workflow-level calls for the same activity name see
+                // the correct call number when resolved against per-call mocks.
+                let call_num = Self::next_call_count(call_counts, &name);
                 if let Some(seq) = retry_sequences.get_mut(&name)
                     && let Some(attempts) = seq.pop_front()
                 {
                     Self::push_activity_retry_sequence(deferred_events, activity_id, attempts);
                     return Ok(true);
                 }
-                let call_num = Self::next_call_count(call_counts, &name);
                 let result = self.resolve_activity(&name, act_input, call_num)?;
                 Self::push_activity_terminal(deferred_events, activity_id, result);
                 Ok(true)
@@ -2296,13 +2299,17 @@ impl WorkflowTestEnv {
                 }
                 Err(error) => {
                     if attempt_num == total {
-                        // All retries exhausted → terminal non-retryable failure.
+                        // All retries exhausted → terminal failure.
+                        // Use non_retryable: false to match production: plain
+                        // Err(String) payloads parse as retryable in
+                        // finalize_activity_failure; exhaustion is determined
+                        // by the retry policy, not the non_retryable flag.
                         history.push(WorkflowEvent::ActivityFailed {
                             activity_id,
                             error,
                             attempt: attempt_num,
                             error_type: "Error".to_string(),
-                            non_retryable: true,
+                            non_retryable: false,
                             details: None,
                         });
                         return;

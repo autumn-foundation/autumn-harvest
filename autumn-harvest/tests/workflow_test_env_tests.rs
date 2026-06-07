@@ -935,23 +935,18 @@ async fn test_mock_activity_retries_all_fail_terminal_failure_is_non_retryable()
         "exhausted retry sequence must fail"
     );
 
-    // Exactly one ActivityFailed — the terminal one — with non_retryable = true.
+    // Exactly one ActivityFailed event — the terminal failure — with
+    // non_retryable: false, matching production behaviour for plain
+    // Err(String) payloads (exhaustion is determined by the retry policy,
+    // not the non_retryable flag on the event).
     let terminal_failure_count = outcome
         .events()
         .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                WorkflowEvent::ActivityFailed {
-                    non_retryable: true,
-                    ..
-                }
-            )
-        })
+        .filter(|e| matches!(e, WorkflowEvent::ActivityFailed { .. }))
         .count();
     assert_eq!(
         terminal_failure_count, 1,
-        "exactly one terminal non-retryable ActivityFailed expected"
+        "exactly one ActivityFailed event expected when all attempts fail"
     );
 }
 

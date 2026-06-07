@@ -655,6 +655,7 @@ pub async fn complete_task(
         dsl::state.eq("COMPLETED"),
         dsl::output.eq(Some(output)),
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
+        dsl::error.eq(None::<String>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
