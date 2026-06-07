@@ -15402,6 +15402,8 @@ pub struct EligibleWorkerInfo {
     pub deployment_name: Option<String>,
     pub shard_assignments: Vec<i32>,
     pub status: String,
+    pub in_flight_count: i32,
+    pub max_concurrency: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -15429,6 +15431,11 @@ pub struct TaskEligibilityResponse {
     pub summary: EligibilitySummary,
 }
 
+#[allow(
+    clippy::collapsible_if,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines
+)]
 async fn evaluate_eligibility_for_shard(
     api_state: &HarvestApiState,
     shard_id: ShardId,
@@ -15454,11 +15461,17 @@ async fn evaluate_eligibility_for_shard(
         tasks = harvest_task_queue::table
             .filter(harvest_task_queue::queue_name.eq(queue_name))
             .filter(harvest_task_queue::state.eq("PENDING"))
+            .filter(harvest_task_queue::scheduled_at.le(chrono::Utc::now()))
+            .filter(
+                harvest_task_queue::schedule_to_close_at
+                    .is_null()
+                    .or(harvest_task_queue::schedule_to_close_at.gt(chrono::Utc::now())),
+            )
             .order((
                 harvest_task_queue::priority.desc(),
                 harvest_task_queue::scheduled_at.asc(),
             ))
-            .limit(100)
+            .limit(1000)
             .select(autumn_harvest::models::TaskQueueItem::as_select())
             .load::<autumn_harvest::models::TaskQueueItem>(&mut conn)
             .await
@@ -15466,15 +15479,22 @@ async fn evaluate_eligibility_for_shard(
     }
 
     let pending_count = if target_task_id.is_some() {
-        if tasks.iter().any(|t| t.state == "PENDING") {
-            1
-        } else {
-            0
-        }
+        i64::from(tasks.iter().any(|t| {
+            t.state == "PENDING"
+                && t.scheduled_at <= chrono::Utc::now()
+                && (t.schedule_to_close_at.is_none()
+                    || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+        }))
     } else {
         let count: i64 = harvest_task_queue::table
             .filter(harvest_task_queue::queue_name.eq(queue_name))
             .filter(harvest_task_queue::state.eq("PENDING"))
+            .filter(harvest_task_queue::scheduled_at.le(chrono::Utc::now()))
+            .filter(
+                harvest_task_queue::schedule_to_close_at
+                    .is_null()
+                    .or(harvest_task_queue::schedule_to_close_at.gt(chrono::Utc::now())),
+            )
             .count()
             .get_result(&mut conn)
             .await
@@ -15484,8 +15504,19 @@ async fn evaluate_eligibility_for_shard(
 
     let oldest_pending_age_secs = if target_task_id.is_some() {
         tasks
-            .get(0)
-            .and_then(|t| if t.state == "PENDING" { Some(t) } else { None })
+            .as_slice()
+            .first()
+            .and_then(|t| {
+                if t.state == "PENDING"
+                    && t.scheduled_at <= chrono::Utc::now()
+                    && (t.schedule_to_close_at.is_none()
+                        || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+                {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
             .map(|t| {
                 let age = chrono::Utc::now().signed_duration_since(t.scheduled_at);
                 age.num_seconds()
@@ -15494,6 +15525,12 @@ async fn evaluate_eligibility_for_shard(
         let oldest_scheduled: Option<chrono::DateTime<chrono::Utc>> = harvest_task_queue::table
             .filter(harvest_task_queue::queue_name.eq(queue_name))
             .filter(harvest_task_queue::state.eq("PENDING"))
+            .filter(harvest_task_queue::scheduled_at.le(chrono::Utc::now()))
+            .filter(
+                harvest_task_queue::schedule_to_close_at
+                    .is_null()
+                    .or(harvest_task_queue::schedule_to_close_at.gt(chrono::Utc::now())),
+            )
             .select(harvest_task_queue::scheduled_at)
             .order(harvest_task_queue::scheduled_at.asc())
             .first::<chrono::DateTime<chrono::Utc>>(&mut conn)
@@ -15507,12 +15544,10 @@ async fn evaluate_eligibility_for_shard(
     };
 
     let mut required_build_ids = Vec::new();
-    for t in &tasks {
-        if t.state == "PENDING" {
-            if let Some(ref bid) = t.required_build_id {
-                if !required_build_ids.contains(bid) {
-                    required_build_ids.push(bid.clone());
-                }
+    for t in tasks.iter().filter(|t| t.state == "PENDING") {
+        if let Some(ref bid) = t.required_build_id {
+            if !required_build_ids.contains(bid) {
+                required_build_ids.push(bid.clone());
             }
         }
     }
@@ -15539,12 +15574,10 @@ async fn evaluate_eligibility_for_shard(
         .map_err(map_error)?;
 
     let mut keys_to_check = Vec::new();
-    for t in &tasks {
-        if t.state == "PENDING" {
-            if let Some(ref k) = t.concurrency_key {
-                if !keys_to_check.contains(k) {
-                    keys_to_check.push(k.clone());
-                }
+    for t in tasks.iter().filter(|t| t.state == "PENDING") {
+        if let Some(ref k) = t.concurrency_key {
+            if !keys_to_check.contains(k) {
+                keys_to_check.push(k.clone());
             }
         }
     }
@@ -15579,17 +15612,77 @@ async fn evaluate_eligibility_for_shard(
             running_map.insert((r.key, r.task_type), r.running_count);
         }
 
-        for t in &tasks {
-            if t.state == "PENDING" {
-                if let (Some(key), Some(cap)) = (&t.concurrency_key, t.concurrency_cap) {
-                    let running = running_map
-                        .get(&(key.clone(), t.task_type.clone()))
-                        .cloned()
-                        .unwrap_or(0);
-                    if running >= i64::from(cap) {
-                        concurrency_saturated_keys.insert((key.clone(), t.task_type.clone()));
-                    }
+        for t in tasks.iter().filter(|t| t.state == "PENDING") {
+            if let (Some(key), Some(cap)) = (&t.concurrency_key, t.concurrency_cap) {
+                let running = running_map
+                    .get(&(key.clone(), t.task_type.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                if running >= i64::from(cap) {
+                    concurrency_saturated_keys.insert((key.clone(), t.task_type.clone()));
                 }
+            }
+        }
+    }
+
+    let cb_activities = api_state
+        .runtime()
+        .ok()
+        .map(|r| {
+            r.registry()
+                .circuit_breakers()
+                .tracked_activity_names()
+                .to_vec()
+        })
+        .unwrap_or_default();
+
+    let mut rate_limit_keys = Vec::new();
+    for t in tasks.iter().filter(|t| t.state == "PENDING") {
+        if let Some(ref rlk) = t.rate_limit_key {
+            let has_cb = t
+                .activity_name
+                .as_ref()
+                .is_some_and(|act_name| cb_activities.contains(act_name));
+            if !has_cb && !rate_limit_keys.contains(rlk) {
+                rate_limit_keys.push(rlk.clone());
+            }
+        }
+    }
+
+    let mut saturated_rate_limits = HashSet::new();
+    if !rate_limit_keys.is_empty() {
+        #[derive(diesel::QueryableByName)]
+        struct RateLimitRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            key: String,
+            #[diesel(sql_type = diesel::sql_types::Double)]
+            tokens: f64,
+            #[diesel(sql_type = diesel::sql_types::Double)]
+            burst: f64,
+            #[diesel(sql_type = diesel::sql_types::Double)]
+            refill_rate: f64,
+            #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+            last_refilled_at: chrono::DateTime<chrono::Utc>,
+        }
+
+        let rows: Vec<RateLimitRow> = diesel::sql_query(
+            "SELECT key, tokens, burst, refill_rate, last_refilled_at \
+             FROM harvest_rate_limit_buckets \
+             WHERE key = ANY($1)",
+        )
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(&rate_limit_keys)
+        .load(&mut conn)
+        .await
+        .map_err(database_error)?;
+
+        for r in rows {
+            let elapsed = chrono::Utc::now()
+                .signed_duration_since(r.last_refilled_at)
+                .num_milliseconds() as f64
+                / 1000.0;
+            let current_tokens = (r.tokens + elapsed * r.refill_rate).min(r.burst);
+            if current_tokens < 1.0 {
+                saturated_rate_limits.insert(r.key);
             }
         }
     }
@@ -15597,7 +15690,15 @@ async fn evaluate_eligibility_for_shard(
     let mut eligible_workers = Vec::new();
     let mut ineligible_workers = Vec::new();
 
-    let pending_tasks: Vec<_> = tasks.iter().filter(|t| t.state == "PENDING").collect();
+    let pending_tasks: Vec<_> = tasks
+        .iter()
+        .filter(|t| {
+            t.state == "PENDING"
+                && t.scheduled_at <= chrono::Utc::now()
+                && (t.schedule_to_close_at.is_none()
+                    || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+        })
+        .collect();
 
     for w in &online_workers {
         let w_id = w.worker.worker_id.clone();
@@ -15609,7 +15710,7 @@ async fn evaluate_eligibility_for_shard(
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_i64().map(|n| n as i32))
+                    .filter_map(|v| v.as_i64().and_then(|n| i32::try_from(n).ok()))
                     .collect()
             })
             .unwrap_or_default();
@@ -15621,6 +15722,8 @@ async fn evaluate_eligibility_for_shard(
             deployment_name,
             shard_assignments: shard_assignments.clone(),
             status: status.clone(),
+            in_flight_count: w.worker.in_flight_count,
+            max_concurrency: w.worker.max_concurrency,
         };
 
         let mut worker_reasons = Vec::new();
@@ -15631,7 +15734,7 @@ async fn evaluate_eligibility_for_shard(
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter_map(|v| v.as_str().map(ToString::to_string))
                     .collect()
             })
             .unwrap_or_default();
@@ -15672,18 +15775,26 @@ async fn evaluate_eligibility_for_shard(
                     reasons.push("build_incompatible".to_string());
                 }
 
-                if let Some(ref sticky_worker) = t.sticky_worker_id {
-                    if let Some(ref sticky_until) = t.sticky_until {
-                        if *sticky_until > chrono::Utc::now()
-                            && w.worker.worker_id != *sticky_worker
-                        {
-                            reasons.push("sticky_owned_by_other_worker".to_string());
-                        }
+                if let (Some(sticky_worker), Some(sticky_until)) =
+                    (&t.sticky_worker_id, &t.sticky_until)
+                {
+                    if *sticky_until > chrono::Utc::now() && w.worker.worker_id != *sticky_worker {
+                        reasons.push("sticky_owned_by_other_worker".to_string());
                     }
                 }
 
-                if let Some(ref key) = t.concurrency_key {
-                    if concurrency_saturated_keys.contains(&(key.clone(), t.task_type.clone())) {
+                if t.concurrency_key.as_ref().is_some_and(|key| {
+                    concurrency_saturated_keys.contains(&(key.clone(), t.task_type.clone()))
+                }) {
+                    reasons.push("concurrency_saturated".to_string());
+                }
+
+                if let Some(ref rlk) = t.rate_limit_key {
+                    let has_cb = t
+                        .activity_name
+                        .as_ref()
+                        .is_some_and(|act_name| cb_activities.contains(act_name));
+                    if !has_cb && saturated_rate_limits.contains(rlk) {
                         reasons.push("concurrency_saturated".to_string());
                     }
                 }
@@ -15691,9 +15802,8 @@ async fn evaluate_eligibility_for_shard(
                 if reasons.is_empty() {
                     eligible_for_any = true;
                     break;
-                } else {
-                    task_failures.push(reasons);
                 }
+                task_failures.push(reasons);
             }
 
             if eligible_for_any {
@@ -15739,14 +15849,9 @@ async fn evaluate_eligibility_for_shard(
             } else if !eligible_non_draining.is_empty() {
                 let mut all_full = true;
                 for w_info in &eligible_non_draining {
-                    if let Some(w) = online_workers
-                        .iter()
-                        .find(|w| w.worker.worker_id == w_info.worker_id)
-                    {
-                        if w.worker.in_flight_count < w.worker.max_concurrency {
-                            all_full = false;
-                            break;
-                        }
+                    if w_info.in_flight_count < w_info.max_concurrency {
+                        all_full = false;
+                        break;
                     }
                 }
                 if all_full {
@@ -15772,6 +15877,7 @@ async fn evaluate_eligibility_for_shard(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn get_queue_eligibility(
     Extension(api_state): Extension<HarvestApiState>,
     Path(queue_name): Path<String>,
@@ -15794,26 +15900,13 @@ async fn get_queue_eligibility(
             Ok(res) => {
                 global_pending_count += res.pending_count;
                 if let Some(age) = res.oldest_pending_age_secs {
-                    global_oldest_pending_age_secs = Some(match global_oldest_pending_age_secs {
-                        Some(current) => std::cmp::max(current, age),
-                        None => age,
-                    });
+                    global_oldest_pending_age_secs = Some(
+                        global_oldest_pending_age_secs
+                            .map_or(age, |current| std::cmp::max(current, age)),
+                    );
                 }
                 for bid in &res.required_build_ids {
                     global_required_build_ids.insert(bid.clone());
-                }
-
-                for w in &res.eligible_workers {
-                    shard_eligible.insert(w.worker_id.clone(), w.clone());
-                    online_worker_ids.insert(w.worker_id.clone());
-                }
-
-                for w in &res.ineligible_workers {
-                    shard_ineligible
-                        .entry(w.worker_id.clone())
-                        .or_insert_with(std::collections::HashSet::new)
-                        .extend(w.reason_codes.iter().cloned());
-                    online_worker_ids.insert(w.worker_id.clone());
                 }
 
                 shards.insert(shard_id.as_i32().to_string(), res);
@@ -15824,6 +15917,33 @@ async fn get_queue_eligibility(
                     error: e.to_string(),
                 });
             }
+        }
+    }
+
+    if shards.is_empty() && !shard_errors.is_empty() {
+        let first_err = shard_errors.remove(0);
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "failed to inspect any shard. First error on shard {}: {}",
+            first_err.shard_id, first_err.error
+        )));
+    }
+
+    for res in shards.values() {
+        let has_pending_tasks = res.pending_count > 0;
+
+        for w in &res.eligible_workers {
+            if has_pending_tasks || global_pending_count == 0 {
+                shard_eligible.insert(w.worker_id.clone(), w.clone());
+            }
+            online_worker_ids.insert(w.worker_id.clone());
+        }
+
+        for w in &res.ineligible_workers {
+            shard_ineligible
+                .entry(w.worker_id.clone())
+                .or_insert_with(std::collections::HashSet::new)
+                .extend(w.reason_codes.iter().cloned());
+            online_worker_ids.insert(w.worker_id.clone());
         }
     }
 
@@ -15868,31 +15988,12 @@ async fn get_queue_eligibility(
                 let mut all_full = true;
                 for w_info in &eligible_non_draining {
                     let mut found_cap = false;
-                    for (_shard_id, shard_pool) in pool.iter_shards() {
-                        if let Ok(mut conn) = acquire_conn(shard_pool).await {
-                            let stale_threshold = api_state.worker_stale_threshold();
-                            if let Ok(w) = list_workers(
-                                &mut conn,
-                                &WorkerFilters {
-                                    limit: 100,
-                                    build_id: Some(w_info.build_id.clone()),
-                                    ..Default::default()
-                                },
-                                stale_threshold,
-                            )
-                            .await
-                            {
-                                if let Some(worker_row) =
-                                    w.iter().find(|w| w.worker.worker_id == w_info.worker_id)
-                                {
-                                    if worker_row.worker.in_flight_count
-                                        < worker_row.worker.max_concurrency
-                                    {
-                                        found_cap = true;
-                                        break;
-                                    }
-                                }
-                            }
+                    for shard_res in shards.values() {
+                        if shard_res.eligible_workers.iter().any(|w| {
+                            w.worker_id == w_info.worker_id && w.in_flight_count < w.max_concurrency
+                        }) {
+                            found_cap = true;
+                            break;
                         }
                     }
                     if found_cap {
@@ -15938,38 +16039,43 @@ async fn get_task_eligibility(
     let pool = api_state.storage_pool().map_err(map_error)?;
 
     for (shard_id, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let task = harvest_task_queue::table
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
+        let Ok(Some(t)) = harvest_task_queue::table
             .find(task_id)
             .select(autumn_harvest::models::TaskQueueItem::as_select())
             .first::<autumn_harvest::models::TaskQueueItem>(&mut conn)
             .await
             .optional()
-            .map_err(database_error)?;
+        else {
+            continue;
+        };
 
-        if let Some(t) = task {
-            let res =
-                evaluate_eligibility_for_shard(&api_state, shard_id, &t.queue_name, Some(task_id))
-                    .await?;
+        let Ok(res) =
+            evaluate_eligibility_for_shard(&api_state, shard_id, &t.queue_name, Some(task_id))
+                .await
+        else {
+            continue;
+        };
 
-            let mut eligible_workers = res.eligible_workers;
-            let mut ineligible_workers = res.ineligible_workers;
-            eligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
-            ineligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+        let mut eligible_workers = res.eligible_workers;
+        let mut ineligible_workers = res.ineligible_workers;
+        eligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+        ineligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
 
-            return Ok(Json(TaskEligibilityResponse {
-                task_id,
-                queue_name: t.queue_name,
-                pending_count: res.pending_count,
-                oldest_pending_age_secs: res.oldest_pending_age_secs,
-                required_build_id: t.required_build_id,
-                assigned_shard: shard_id.as_i32(),
-                concurrency_key: t.concurrency_key,
-                eligible_workers,
-                ineligible_workers,
-                summary: res.summary,
-            }));
-        }
+        return Ok(Json(TaskEligibilityResponse {
+            task_id,
+            queue_name: t.queue_name,
+            pending_count: res.pending_count,
+            oldest_pending_age_secs: res.oldest_pending_age_secs,
+            required_build_id: t.required_build_id,
+            assigned_shard: shard_id.as_i32(),
+            concurrency_key: t.concurrency_key,
+            eligible_workers,
+            ineligible_workers,
+            summary: res.summary,
+        }));
     }
 
     Err(AutumnError::not_found_msg(format!(

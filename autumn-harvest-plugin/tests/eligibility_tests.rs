@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_lines)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +19,6 @@ use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -189,37 +190,25 @@ async fn seed_task_detailed(
     let mut conn = pool.get().await.expect("task seeding connection");
     let id = uuid::Uuid::new_v4();
 
-    let required_build_clause = required_build_id
-        .map(|v| format!("'{}'", v))
-        .unwrap_or_else(|| "NULL".to_string());
-    let sticky_worker_clause = sticky_worker_id
-        .map(|v| format!("'{}'", v))
-        .unwrap_or_else(|| "NULL".to_string());
+    let required_build_clause =
+        required_build_id.map_or_else(|| "NULL".to_string(), |v| format!("'{v}'"));
+    let sticky_worker_clause =
+        sticky_worker_id.map_or_else(|| "NULL".to_string(), |v| format!("'{v}'"));
     let sticky_until_clause = sticky_until_interval
-        .map(|v| format!("NOW() + INTERVAL '{}'", v))
-        .unwrap_or_else(|| "NULL".to_string());
-    let concurrency_key_clause = concurrency_key
-        .map(|v| format!("'{}'", v))
-        .unwrap_or_else(|| "NULL".to_string());
-    let concurrency_cap_clause = concurrency_cap
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "NULL".to_string());
+        .map_or_else(|| "NULL".to_string(), |v| format!("NOW() + INTERVAL '{v}'"));
+    let concurrency_key_clause =
+        concurrency_key.map_or_else(|| "NULL".to_string(), |v| format!("'{v}'"));
+    let concurrency_cap_clause =
+        concurrency_cap.map_or_else(|| "NULL".to_string(), |v| v.to_string());
 
     diesel::sql_query(format!(
         "INSERT INTO harvest_task_queue (
             id, queue_name, task_type, input, state, priority, max_attempts, scheduled_at,
             required_build_id, sticky_worker_id, sticky_until, concurrency_key, concurrency_cap
          ) VALUES (
-            '{}', '{}', 'workflow', '{{}}'::jsonb, 'PENDING', 0, 1, NOW() - INTERVAL '5 seconds',
-            {}, {}, {}, {}, {}
-         )",
-        id,
-        queue_name,
-        required_build_clause,
-        sticky_worker_clause,
-        sticky_until_clause,
-        concurrency_key_clause,
-        concurrency_cap_clause
+            '{id}', '{queue_name}', 'workflow', '{{}}'::jsonb, 'PENDING', 0, 1, NOW() - INTERVAL '5 seconds',
+            {required_build_clause}, {sticky_worker_clause}, {sticky_until_clause}, {concurrency_key_clause}, {concurrency_cap_clause}
+         )"
     ))
     .execute(&mut conn)
     .await
@@ -240,7 +229,7 @@ async fn get_json_with_auth(
     uri: impl Into<String>,
     has_admin: bool,
 ) -> (StatusCode, Value) {
-    let mut req = Request::builder()
+    let req = Request::builder()
         .method("GET")
         .uri(uri.into())
         .body(Body::empty())
@@ -395,13 +384,14 @@ async fn test_queue_and_task_eligibility_scenarios() {
     assert!(body["oldest_pending_age_secs"].as_i64().is_some());
 
     // Distinct build IDs across pending rows: "v2" and null (null should be absent or represented, required_build_ids is a list of strings)
-    let req_builds: Vec<String> = body["required_build_ids"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-    assert!(req_builds.contains(&"v2".to_string()));
+    // Distinct build IDs across pending rows: "v2" and null (null should be absent or represented, required_build_ids is a list of strings)
+    assert!(
+        body["required_build_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap() == "v2")
+    );
 
     // Eligible workers check: worker-eligible passes all gates for at least one task (specifically Task A and C, wait, Task C has concurrency key saturated, but Task A doesn't).
     let eligible_list = body["eligible_workers"].as_array().unwrap();
@@ -410,68 +400,83 @@ async fn test_queue_and_task_eligibility_scenarios() {
         .map(|w| w["worker_id"].as_str().unwrap())
         .collect();
     assert!(eligible_ids.contains(&"worker-eligible"));
+    let w_el = eligible_list
+        .iter()
+        .find(|w| w["worker_id"] == "worker-eligible")
+        .unwrap();
+    assert_eq!(w_el["in_flight_count"], 0);
+    assert_eq!(w_el["max_concurrency"], 10);
+
+    assert!(eligible_ids.contains(&"worker-full-capacity"));
+    let w_full = eligible_list
+        .iter()
+        .find(|w| w["worker_id"] == "worker-full-capacity")
+        .unwrap();
+    assert_eq!(w_full["in_flight_count"], 2);
+    assert_eq!(w_full["max_concurrency"], 2);
+
     // worker-stale is offline, should not be in either list
     assert!(!eligible_ids.contains(&"worker-stale"));
 
     // Ineligible workers check
     let ineligible_list = body["ineligible_workers"].as_array().unwrap();
-    let ineligible_ids: Vec<&str> = ineligible_list
-        .iter()
-        .map(|w| w["worker_id"].as_str().unwrap())
-        .collect();
-    assert!(!ineligible_ids.contains(&"worker-stale"));
+    assert!(
+        !ineligible_list
+            .iter()
+            .any(|w| w["worker_id"].as_str().unwrap() == "worker-stale")
+    );
 
     // Check wrong_queue_subscription
     let w_wrong_q = ineligible_list
         .iter()
         .find(|w| w["worker_id"] == "worker-wrong-queue")
         .unwrap();
-    let reasons: Vec<&str> = w_wrong_q["reason_codes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert!(reasons.contains(&"wrong_queue_subscription"));
+    assert!(
+        w_wrong_q["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap() == "wrong_queue_subscription")
+    );
 
     // Check wrong_shard_assignment
     let w_wrong_s = ineligible_list
         .iter()
         .find(|w| w["worker_id"] == "worker-wrong-shard")
         .unwrap();
-    let reasons: Vec<&str> = w_wrong_s["reason_codes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert!(reasons.contains(&"wrong_shard_assignment"));
+    assert!(
+        w_wrong_s["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap() == "wrong_shard_assignment")
+    );
 
     // Check worker_draining
     let w_drain = ineligible_list
         .iter()
         .find(|w| w["worker_id"] == "worker-draining")
         .unwrap();
-    let reasons: Vec<&str> = w_drain["reason_codes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert!(reasons.contains(&"worker_draining"));
+    assert!(
+        w_drain["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap() == "worker_draining")
+    );
 
     // Check worker_stopped
     let w_stop = ineligible_list
         .iter()
         .find(|w| w["worker_id"] == "worker-stopped")
         .unwrap();
-    let reasons: Vec<&str> = w_stop["reason_codes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert!(reasons.contains(&"worker_stopped"));
+    assert!(
+        w_stop["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap() == "worker_stopped")
+    );
 
     // Check diagnosis is "healthy" since we have worker-eligible which is active, eligible, and has capacity
     assert_eq!(body["summary"]["diagnosis"], "healthy");
@@ -505,7 +510,7 @@ async fn test_task_eligibility_endpoints() {
     let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
 
     let (status, body) =
-        get_json_with_auth(&app, format!("/admin/tasks/{}/eligibility", task_id), true).await;
+        get_json_with_auth(&app, format!("/admin/tasks/{task_id}/eligibility"), true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["task_id"], task_id.to_string());
     assert_eq!(body["queue_name"], "test-queue");
@@ -517,14 +522,258 @@ async fn test_task_eligibility_endpoints() {
         .iter()
         .find(|w| w["worker_id"] == "worker-incompatible")
         .unwrap();
-    let reasons: Vec<&str> = w_incompat["reason_codes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert!(reasons.contains(&"build_incompatible"));
+    assert!(
+        w_incompat["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap() == "build_incompatible")
+    );
 
     // Since only worker-incompatible is online and it is incompatible, the diagnosis should be "no_eligible_workers"
     assert_eq!(body["summary"]["diagnosis"], "no_eligible_workers");
+}
+
+async fn seed_rate_limit_bucket(
+    pool: &DbPool,
+    key: &str,
+    refill_rate: f64,
+    burst: f64,
+    tokens: f64,
+) {
+    let mut conn = pool
+        .get()
+        .await
+        .expect("rate limit bucket seeding connection");
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, NOW(), NOW(), NOW())"
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .bind::<diesel::sql_types::Double, _>(refill_rate)
+    .bind::<diesel::sql_types::Double, _>(burst)
+    .bind::<diesel::sql_types::Double, _>(tokens)
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert rate limit bucket");
+}
+
+async fn seed_task_with_rate_limit_and_date(
+    pool: &DbPool,
+    queue_name: &str,
+    rate_limit_key: Option<&str>,
+    activity_name: Option<&str>,
+    scheduled_at_clause: &str,
+    schedule_to_close_at_clause: &str,
+) -> uuid::Uuid {
+    let mut conn = pool.get().await.expect("task seeding connection");
+    let id = uuid::Uuid::new_v4();
+
+    let rate_limit_key_clause =
+        rate_limit_key.map_or_else(|| "NULL".to_string(), |v| format!("'{v}'"));
+    let activity_name_clause =
+        activity_name.map_or_else(|| "NULL".to_string(), |v| format!("'{v}'"));
+
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_task_queue (
+            id, queue_name, task_type, input, state, priority, max_attempts, scheduled_at,
+            rate_limit_key, activity_name, schedule_to_close_at
+         ) VALUES (
+            '{id}', '{queue_name}', 'workflow', '{{}}'::jsonb, 'PENDING', 0, 1, {scheduled_at_clause},
+            {rate_limit_key_clause}, {activity_name_clause}, {schedule_to_close_at_clause}
+         )"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert test task");
+
+    id
+}
+
+fn build_two_shard_pool(shard0_pool: DbPool, shard1_pool: DbPool) -> HarvestDbPool {
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), shard0_pool);
+    pools.insert(ShardId::new(1), shard1_pool);
+    HarvestDbPool::sharded(ShardedDbPool::from_map(pools, ShardId::new(0)))
+}
+
+fn two_shard_router() -> ShardRouter {
+    ShardRouter::new(
+        vec![ShardId::new(0), ShardId::new(1)],
+        vec![ShardId::new(0), ShardId::new(1)],
+        ShardId::new(0),
+    )
+}
+
+#[tokio::test]
+async fn test_eligibility_optimizations_and_resilience() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    // 1. Seed rate limit bucket with 0 tokens (saturated)
+    seed_rate_limit_bucket(&pool, "my-rate-limit-key", 0.0, 1.0, 0.0).await;
+
+    // Seed task with saturated rate limit key
+    let _task_rl = seed_task_with_rate_limit_and_date(
+        &pool,
+        "test-queue-rl",
+        Some("my-rate-limit-key"),
+        Some("my-activity"),
+        "NOW() - INTERVAL '5 seconds'",
+        "NULL",
+    )
+    .await;
+
+    // 2. Seed non-claimable task A: scheduled in the future (scheduled_at > NOW())
+    seed_task_with_rate_limit_and_date(
+        &pool,
+        "test-queue-rl",
+        None,
+        None,
+        "NOW() + INTERVAL '10 minutes'",
+        "NULL",
+    )
+    .await;
+
+    // Seed non-claimable task B: expired (schedule_to_close_at < NOW())
+    seed_task_with_rate_limit_and_date(
+        &pool,
+        "test-queue-rl",
+        None,
+        None,
+        "NOW() - INTERVAL '10 minutes'",
+        "NOW() - INTERVAL '5 seconds'",
+    )
+    .await;
+
+    // Register active worker for rate limit queue
+    register_active_worker_with_build(
+        &pool,
+        "worker-rate-limited",
+        &["test-queue-rl"],
+        &[0],
+        "v1",
+        10,
+        0,
+    )
+    .await;
+
+    let state = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for(&["test-queue-rl"], ShardRouter::single()),
+    );
+    state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    // Query queue eligibility
+    let (status, body) =
+        get_json_with_auth(&app, "/admin/queues/test-queue-rl/eligibility", true).await;
+    assert_eq!(status, StatusCode::OK);
+    // pending_count should be exactly 1 (only the rate-limited one is claimable; scheduled in future and expired are excluded)
+    assert_eq!(body["pending_count"], 1);
+
+    // worker-rate-limited should be marked ineligible with reason "concurrency_saturated"
+    let ineligible_list = body["ineligible_workers"].as_array().unwrap();
+    let w_rl = ineligible_list
+        .iter()
+        .find(|w| w["worker_id"] == "worker-rate-limited")
+        .unwrap();
+    assert!(
+        w_rl["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap() == "concurrency_saturated")
+    );
+
+    // 3. Test capacity limit: register a worker that has max capacity reached
+    // Seed a new clean queue task
+    let task_cap = seed_task_detailed(&pool, "test-queue-cap", None, None, None, None, None).await;
+    register_active_worker_with_build(
+        &pool,
+        "worker-at-capacity",
+        &["test-queue-cap"],
+        &[0],
+        "v1",
+        5,
+        5, // in_flight_count = max_concurrency
+    )
+    .await;
+
+    let state_cap = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for(&["test-queue-cap"], ShardRouter::single()),
+    );
+    state_cap.set_admin_auth_boundary(true);
+    let app_cap =
+        harvest_api_router(state_cap).with_state(AppState::for_test().with_profile("test"));
+
+    let (status_cap, body_cap) =
+        get_json_with_auth(&app_cap, "/admin/queues/test-queue-cap/eligibility", true).await;
+    assert_eq!(status_cap, StatusCode::OK);
+    // worker-at-capacity should be in eligible_workers, but because it's full, diagnosis should be "all_capacity_full"
+    let eligible_cap = body_cap["eligible_workers"].as_array().unwrap();
+    assert!(
+        eligible_cap
+            .iter()
+            .any(|w| w["worker_id"] == "worker-at-capacity")
+    );
+    assert_eq!(body_cap["summary"]["diagnosis"], "all_capacity_full");
+
+    // 4. Test multi-shard resilience (graceful skip of unhealthy shard)
+    // Setup two shards: Shard 0 (healthy) and Shard 1 (broken/unhealthy)
+    let shard0_pool = pool.clone();
+    // Simulate broken connection by using a non-existent port
+    let shard1_pool = build_test_pool("postgres://postgres:postgres@localhost:54321/nonexistent");
+
+    let sharded_pool = build_two_shard_pool(shard0_pool, shard1_pool);
+    let state_sharded = api_state(
+        sharded_pool,
+        runtime_for(&["test-queue-cap"], two_shard_router()),
+    );
+    state_sharded.set_admin_auth_boundary(true);
+    let app_sharded =
+        harvest_api_router(state_sharded).with_state(AppState::for_test().with_profile("test"));
+
+    // GET /admin/tasks/{id}/eligibility for task_cap on shard 0 should succeed, skipping/ignoring the unhealthy shard 1
+    let (status_task, body_task) = get_json_with_auth(
+        &app_sharded,
+        format!("/admin/tasks/{task_cap}/eligibility"),
+        true,
+    )
+    .await;
+    assert_eq!(status_task, StatusCode::OK);
+    assert_eq!(body_task["task_id"], task_cap.to_string());
+    assert_eq!(body_task["assigned_shard"], 0);
+
+    // GET /admin/queues/test-queue-cap/eligibility should also succeed because at least one shard (shard 0) is healthy
+    let (status_queue, body_queue) = get_json_with_auth(
+        &app_sharded,
+        "/admin/queues/test-queue-cap/eligibility",
+        true,
+    )
+    .await;
+    assert_eq!(status_queue, StatusCode::OK);
+    assert_eq!(body_queue["queue_name"], "test-queue-cap");
+
+    // Now test service unavailable: if we only query a broken queue, or if all shards fail
+    let all_broken_pool = build_two_shard_pool(
+        build_test_pool("postgres://postgres:postgres@localhost:54321/nonexistent"),
+        build_test_pool("postgres://postgres:postgres@localhost:54321/nonexistent"),
+    );
+    let state_all_broken = api_state(
+        all_broken_pool,
+        runtime_for(&["test-queue-cap"], two_shard_router()),
+    );
+    state_all_broken.set_admin_auth_boundary(true);
+    let app_all_broken =
+        harvest_api_router(state_all_broken).with_state(AppState::for_test().with_profile("test"));
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/queues/test-queue-cap/eligibility")
+        .body(Body::empty())
+        .unwrap();
+    let res = app_all_broken.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
