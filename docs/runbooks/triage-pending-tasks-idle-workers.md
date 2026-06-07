@@ -100,6 +100,12 @@ Common reason codes and their fixes:
   - Wait for in-flight tasks of that concurrency key to finish.
   - Or increase the concurrency cap for that key/workflow.
 
+#### `rate_limit_saturated`
+- **Meaning**: The tasks have a rate limit key, and the rate limit bucket for this key has fewer than 1.0 token.
+- **Fix**:
+  - Wait for the rate-limit bucket to refill.
+  - Or increase the rate limit refill rate or burst size.
+
 ---
 
 ### 5. `healthy`

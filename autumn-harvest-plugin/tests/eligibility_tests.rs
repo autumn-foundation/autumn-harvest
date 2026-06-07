@@ -672,7 +672,7 @@ async fn test_eligibility_optimizations_and_resilience() {
     // pending_count should be exactly 1 (only the rate-limited one is claimable; scheduled in future and expired are excluded)
     assert_eq!(body["pending_count"], 1);
 
-    // worker-rate-limited should be marked ineligible with reason "concurrency_saturated"
+    // worker-rate-limited should be marked ineligible with reason "rate_limit_saturated"
     let ineligible_list = body["ineligible_workers"].as_array().unwrap();
     let w_rl = ineligible_list
         .iter()
@@ -683,7 +683,7 @@ async fn test_eligibility_optimizations_and_resilience() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|v| v.as_str().unwrap() == "concurrency_saturated")
+            .any(|v| v.as_str().unwrap() == "rate_limit_saturated")
     );
 
     // 3. Test capacity limit: register a worker that has max capacity reached
@@ -755,6 +755,133 @@ async fn test_eligibility_optimizations_and_resilience() {
     .await;
     assert_eq!(status_queue, StatusCode::OK);
     assert_eq!(body_queue["queue_name"], "test-queue-cap");
+
+    // 5. Test multi-shard diagnosis aggregation (prevent stuck shard hiding)
+    // Clean up workers table to prevent interference
+    {
+        let mut conn = pool.get().await.expect("connection");
+        diesel::sql_query("DELETE FROM harvest_workers")
+            .execute(&mut conn)
+            .await
+            .expect("delete workers");
+    }
+
+    // Setup two healthy shards pointing to the same pool
+    let sharded_pool_healthy = build_two_shard_pool(pool.clone(), pool.clone());
+    let state_sharded_healthy = api_state(
+        sharded_pool_healthy,
+        runtime_for(&["test-queue-multi"], two_shard_router()),
+    );
+    state_sharded_healthy.set_admin_auth_boundary(true);
+    let app_sharded_healthy = harvest_api_router(state_sharded_healthy)
+        .with_state(AppState::for_test().with_profile("test"));
+
+    // Seed task on "test-queue-multi"
+    let _task_multi =
+        seed_task_detailed(&pool, "test-queue-multi", None, None, None, None, None).await;
+
+    // Register worker 0 assigned to shard 0, but stop it (so shard 0 has no eligible workers -> no_eligible_workers)
+    register_active_worker_with_build(
+        &pool,
+        "worker-shard0",
+        &["test-queue-multi"],
+        &[0],
+        "v1",
+        5,
+        0,
+    )
+    .await;
+    mark_worker_stopped(&pool, "worker-shard0").await;
+
+    // Register worker 1 assigned to shard 1, healthy (so shard 1 is healthy)
+    register_active_worker_with_build(
+        &pool,
+        "worker-shard1",
+        &["test-queue-multi"],
+        &[1],
+        "v1",
+        5,
+        0,
+    )
+    .await;
+
+    // Query global queue eligibility. Since shard 0 is stuck (no_eligible_workers) and shard 1 is healthy,
+    // the global diagnosis must bubble up the worst-case (no_eligible_workers), rather than "healthy".
+    let (status_multi, body_multi) = get_json_with_auth(
+        &app_sharded_healthy,
+        "/admin/queues/test-queue-multi/eligibility",
+        true,
+    )
+    .await;
+    assert_eq!(status_multi, StatusCode::OK);
+    assert_eq!(body_multi["summary"]["diagnosis"], "no_eligible_workers");
+
+    // 6. Test all_draining classification refinement
+    // Clean up workers table to prevent interference
+    {
+        let mut conn = pool.get().await.expect("connection");
+        diesel::sql_query("DELETE FROM harvest_workers")
+            .execute(&mut conn)
+            .await
+            .expect("delete workers");
+    }
+
+    let state_drain = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for(&["test-queue-drain"], ShardRouter::single()),
+    );
+    state_drain.set_admin_auth_boundary(true);
+    let app_drain =
+        harvest_api_router(state_drain).with_state(AppState::for_test().with_profile("test"));
+
+    // Seed task
+    let _task_drain =
+        seed_task_detailed(&pool, "test-queue-drain", None, None, None, None, None).await;
+
+    // Register worker A: draining
+    register_active_worker_with_build(
+        &pool,
+        "worker-drain-only",
+        &["test-queue-drain"],
+        &[0],
+        "v1",
+        5,
+        0,
+    )
+    .await;
+    mark_worker_draining(&pool, "worker-drain-only").await;
+
+    // Query when only draining worker is present -> should be "all_draining"
+    let (status_d1, body_d1) = get_json_with_auth(
+        &app_drain,
+        "/admin/queues/test-queue-drain/eligibility",
+        true,
+    )
+    .await;
+    assert_eq!(status_d1, StatusCode::OK);
+    assert_eq!(body_d1["summary"]["diagnosis"], "all_draining");
+
+    // Now register worker B: not draining, but has wrong queue subscription (so ineligible for other reasons)
+    register_active_worker_with_build(
+        &pool,
+        "worker-wrong-sub",
+        &["test-queue-wrong"], // subscribed to wrong queue
+        &[0],
+        "v1",
+        5,
+        0,
+    )
+    .await;
+
+    // Query again -> since there is a worker ineligible for a non-drain reason, it should prefer "no_eligible_workers"
+    let (status_d2, body_d2) = get_json_with_auth(
+        &app_drain,
+        "/admin/queues/test-queue-drain/eligibility",
+        true,
+    )
+    .await;
+    assert_eq!(status_d2, StatusCode::OK);
+    assert_eq!(body_d2["summary"]["diagnosis"], "no_eligible_workers");
 
     // Now test service unavailable: if we only query a broken queue, or if all shards fail
     let all_broken_pool = build_two_shard_pool(

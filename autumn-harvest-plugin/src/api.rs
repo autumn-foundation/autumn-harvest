@@ -15795,7 +15795,7 @@ async fn evaluate_eligibility_for_shard(
                         .as_ref()
                         .is_some_and(|act_name| cb_activities.contains(act_name));
                     if !has_cb && saturated_rate_limits.contains(rlk) {
-                        reasons.push("concurrency_saturated".to_string());
+                        reasons.push("rate_limit_saturated".to_string());
                     }
                 }
 
@@ -15832,10 +15832,11 @@ async fn evaluate_eligibility_for_shard(
     let diagnosis = if num_online == 0 {
         "no_online_workers".to_string()
     } else {
-        let all_draining = eligible_workers.iter().all(|w| w.status == "Draining")
+        let all_draining = eligible_workers.is_empty()
+            && !ineligible_workers.is_empty()
             && ineligible_workers
                 .iter()
-                .all(|w| w.reason_codes.contains(&"worker_draining".to_string()));
+                .all(|w| w.reason_codes == vec!["worker_draining".to_string()]);
         if all_draining {
             "all_draining".to_string()
         } else {
@@ -15966,51 +15967,34 @@ async fn get_queue_eligibility(
     eligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
     ineligible_workers.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
 
-    let num_online = eligible_workers.len() + ineligible_workers.len();
-    let diagnosis = if num_online == 0 {
-        "no_online_workers".to_string()
-    } else {
-        let all_draining = eligible_workers.iter().all(|w| w.status == "Draining")
-            && ineligible_workers
-                .iter()
-                .all(|w| w.reason_codes.contains(&"worker_draining".to_string()));
-        if all_draining {
-            "all_draining".to_string()
-        } else {
-            let eligible_non_draining: Vec<_> = eligible_workers
-                .iter()
-                .filter(|w| w.status != "Draining")
-                .collect();
+    let shards_with_pending: Vec<_> = shards
+        .values()
+        .filter(|res| res.pending_count > 0)
+        .collect();
 
-            if eligible_workers.is_empty() {
-                "no_eligible_workers".to_string()
-            } else if !eligible_non_draining.is_empty() {
-                let mut all_full = true;
-                for w_info in &eligible_non_draining {
-                    let mut found_cap = false;
-                    for shard_res in shards.values() {
-                        if shard_res.eligible_workers.iter().any(|w| {
-                            w.worker_id == w_info.worker_id && w.in_flight_count < w.max_concurrency
-                        }) {
-                            found_cap = true;
-                            break;
-                        }
-                    }
-                    if found_cap {
-                        all_full = false;
-                        break;
-                    }
-                }
-                if all_full {
-                    "all_capacity_full".to_string()
-                } else {
-                    "healthy".to_string()
-                }
-            } else {
-                "healthy".to_string()
-            }
-        }
+    let target_shards = if shards_with_pending.is_empty() {
+        shards.values().collect::<Vec<_>>()
+    } else {
+        shards_with_pending
     };
+
+    let mut worst_rank = 0;
+    let mut worst_diag = "healthy".to_string();
+    for shard_res in target_shards {
+        let diag = &shard_res.summary.diagnosis;
+        let rank = match diag.as_str() {
+            "no_online_workers" => 4,
+            "no_eligible_workers" => 3,
+            "all_draining" => 2,
+            "all_capacity_full" => 1,
+            _ => 0,
+        };
+        if rank > worst_rank {
+            worst_rank = rank;
+            worst_diag.clone_from(diag);
+        }
+    }
+    let diagnosis = worst_diag;
 
     let mut req_builds: Vec<String> = global_required_build_ids.into_iter().collect();
     req_builds.sort();
@@ -16051,6 +16035,8 @@ async fn get_task_eligibility(
         else {
             continue;
         };
+
+        drop(conn);
 
         let Ok(res) =
             evaluate_eligibility_for_shard(&api_state, shard_id, &t.queue_name, Some(task_id))
