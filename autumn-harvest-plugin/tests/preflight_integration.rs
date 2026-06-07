@@ -241,6 +241,7 @@ fn activity_info(queue: Option<&'static str>) -> ActivityInfo {
         rate_limit_burst: None,
         rate_limit_key: None,
         circuit_breaker: None,
+        requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
     }
 }
@@ -310,6 +311,7 @@ async fn register_active_worker(pool: &DbPool, worker_id: &str, queues: &[String
         Some(env!("CARGO_PKG_VERSION")),
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .expect("worker registration should succeed");

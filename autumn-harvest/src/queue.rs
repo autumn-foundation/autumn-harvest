@@ -297,6 +297,7 @@ pub async fn claim_task(
     worker_build_id: &str,
     priority_aging_secs: Option<u32>,
     circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -386,6 +387,11 @@ pub async fn claim_task(
                    ) \
                ) \
                AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR NOT (activity_name = ANY($6)) \
+               ) \
+               AND ( \
                    rate_limit_key IS NULL \
                    OR harvest_task_queue.activity_name = ANY($5) \
                    OR EXISTS ( \
@@ -446,6 +452,7 @@ pub async fn claim_task(
     .bind::<diesel::sql_types::Text, _>(worker_build_id)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ineligible_activities)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;

@@ -594,6 +594,7 @@ fn activity_info_schedule_to_close_duration_roundtrip() {
         rate_limit_burst: None,
         rate_limit_key: None,
         circuit_breaker: None,
+        requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
     };
 

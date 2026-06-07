@@ -255,6 +255,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 rate_limit_burst: None,
                 rate_limit_key: None,
                 circuit_breaker: None,
+                requires: None,
                 handler: telem_activity,
             },
             ActivityInfo {
@@ -275,6 +276,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 rate_limit_burst: None,
                 rate_limit_key: None,
                 circuit_breaker: None,
+                requires: None,
                 handler: telem_activity,
             },
         ],
@@ -387,6 +389,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         priority_aging_secs: None,
                         unknown_target_grace_window: Duration::from_secs(5),
                         poison_pill_threshold: 3,
+                        labels: std::collections::HashMap::new(),
                         sharded_pool: None,
                     },
                     registry,

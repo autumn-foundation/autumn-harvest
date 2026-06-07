@@ -343,6 +343,7 @@ mod db_tests {
             Some("0.3.0"),
             "v1.0",
             Some("prod-blue"),
+            &std::collections::HashMap::new(),
         )
         .await
         .expect("register_worker");
@@ -372,6 +373,7 @@ mod db_tests {
             None,
             "v1.0",
             None,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -385,6 +387,7 @@ mod db_tests {
             None,
             "v2.0",
             None,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -500,6 +503,7 @@ mod db_tests {
             "v1.0",
             None,
             &[],
+            &[],
         )
         .await
         .expect("claim_task");
@@ -520,6 +524,7 @@ mod db_tests {
             "worker-b",
             "v2.0",
             None,
+            &[],
             &[],
         )
         .await
@@ -546,6 +551,7 @@ mod db_tests {
             "v2.0",
             None,
             &[],
+            &[],
         )
         .await
         .expect("claim_task");
@@ -570,6 +576,7 @@ mod db_tests {
             "v99.0",
             None,
             &[],
+            &[],
         )
         .await
         .expect("claim_task");
@@ -593,6 +600,7 @@ mod db_tests {
             "worker-legacy",
             "",
             None,
+            &[],
             &[],
         )
         .await
@@ -626,6 +634,7 @@ mod db_tests {
             None,
             "v1.0",
             None,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -639,6 +648,7 @@ mod db_tests {
             None,
             "v2.0",
             None,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();

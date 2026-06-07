@@ -66,6 +66,7 @@ pub mod dag_simulator;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;
+pub mod eligibility;
 pub mod error;
 pub mod event;
 #[cfg(feature = "db")]

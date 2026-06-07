@@ -130,6 +130,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
             #[cfg(feature = "db")]
+            labels: std::collections::HashMap::new(),
             sharded_pool: None,
         },
         registry,
@@ -296,6 +297,7 @@ fn local_activity_info(
         rate_limit_burst: None,
         rate_limit_key: None,
         circuit_breaker: None,
+        requires: None,
         handler,
     }
 }

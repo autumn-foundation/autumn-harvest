@@ -548,6 +548,8 @@ pub struct HarvestWorker {
     pub build_id: String,
     /// Optional human-readable deployment name (issue #171).
     pub deployment_name: Option<String>,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: serde_json::Value,
 }
 
 /// Insert struct for registering a new worker process.
@@ -564,6 +566,8 @@ pub struct NewHarvestWorker<'a> {
     pub build_id: &'a str,
     /// Optional deployment name for operator observability.
     pub deployment_name: Option<&'a str>,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: serde_json::Value,
 }
 
 // ── BatchJob ──────────────────────────────────────────────────────────────────

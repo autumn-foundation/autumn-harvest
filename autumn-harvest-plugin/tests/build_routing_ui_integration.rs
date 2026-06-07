@@ -379,6 +379,7 @@ async fn workers_page_nav_includes_build_routing() {
         None,
         "sha-v1",
         Some("prod-v1"),
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -972,6 +973,7 @@ async fn workers_page_build_id_filter_works() {
         None,
         "sha-v1",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -985,6 +987,7 @@ async fn workers_page_build_id_filter_works() {
         None,
         "sha-v2",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();

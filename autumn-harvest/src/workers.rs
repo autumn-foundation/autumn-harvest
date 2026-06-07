@@ -53,6 +53,8 @@ pub struct WorkerRegistration {
     pub build_id: String,
     /// Optional human-readable deployment name, e.g. `"prod-blue"` (issue #171).
     pub deployment_name: Option<String>,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: std::collections::HashMap<String, String>,
 }
 use crate::models::{HarvestWorker, NewHarvestWorker};
 use crate::schema::{harvest_task_queue, harvest_workers, harvest_workflow_executions};
@@ -285,7 +287,7 @@ pub fn parse_worker_filters(pairs: &[(String, String)]) -> Result<WorkerFilters,
 ///
 /// Returns [`HarvestError`] on serialization or database failure.
 #[allow(clippy::too_many_arguments)]
-pub async fn register_worker(
+pub async fn register_worker<S: std::hash::BuildHasher>(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
     queues: &[String],
@@ -295,12 +297,14 @@ pub async fn register_worker(
     version: Option<&str>,
     build_id: &str,
     deployment_name: Option<&str>,
+    labels: &std::collections::HashMap<String, String, S>,
 ) -> HarvestResult<()> {
     use diesel::pg::upsert::excluded;
 
     let queues_json = serde_json::to_value(queues).map_err(HarvestError::Serialization)?;
     let shards_json =
         serde_json::to_value(shard_assignments).map_err(HarvestError::Serialization)?;
+    let labels_json = serde_json::to_value(labels).map_err(HarvestError::Serialization)?;
 
     let row = NewHarvestWorker {
         worker_id,
@@ -311,6 +315,7 @@ pub async fn register_worker(
         version,
         build_id,
         deployment_name,
+        labels: labels_json,
     };
 
     diesel::insert_into(harvest_workers::table)
@@ -328,6 +333,7 @@ pub async fn register_worker(
             harvest_workers::version.eq(excluded(harvest_workers::version)),
             harvest_workers::build_id.eq(excluded(harvest_workers::build_id)),
             harvest_workers::deployment_name.eq(excluded(harvest_workers::deployment_name)),
+            harvest_workers::labels.eq(excluded(harvest_workers::labels)),
             harvest_workers::status.eq(WorkerStatus::Active.as_str()),
         ))
         .execute(conn)
@@ -1050,6 +1056,7 @@ pub fn spawn_worker_heartbeat(
                                 registration.version.as_deref(),
                                 &registration.build_id,
                                 registration.deployment_name.as_deref(),
+                                &registration.labels,
                             )
                             .await
                             {
@@ -1348,6 +1355,7 @@ mod tests {
             version: Some("0.3.0".to_string()),
             build_id: String::new(),
             deployment_name: None,
+            labels: std::collections::HashMap::new(),
         };
         assert_eq!(reg.worker_id, "w1");
         assert_eq!(reg.queues, vec!["default"]);
@@ -1373,6 +1381,7 @@ mod tests {
                 drain_deadline_at: None,
                 build_id: String::new(),
                 deployment_name: None,
+                labels: serde_json::json!({}),
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],
@@ -1441,6 +1450,7 @@ mod tests {
                 drain_deadline_at: None,
                 build_id: String::new(),
                 deployment_name: None,
+                labels: serde_json::json!({}),
             },
             health: WorkerHealth::Healthy,
             active_task_ids,
@@ -1624,6 +1634,7 @@ mod tests {
                 drain_deadline_at: None,
                 build_id: String::new(),
                 deployment_name: None,
+                labels: serde_json::json!({}),
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],

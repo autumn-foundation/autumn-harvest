@@ -544,6 +544,7 @@ mod db_tests {
             "", // legacy build id — claims anything
             None,
             &[],
+            &[],
         )
         .await
         .expect("claim_task");
@@ -583,6 +584,7 @@ mod db_tests {
             "worker-delta", // not the sticky worker
             "",
             None,
+            &[],
             &[],
         )
         .await
@@ -630,6 +632,7 @@ mod db_tests {
             "",
             None,
             &[],
+            &[],
         )
         .await
         .expect("claim_task");
@@ -669,6 +672,7 @@ mod db_tests {
             "worker-eta",
             "",
             None,
+            &[],
             &[],
         )
         .await
@@ -722,6 +726,7 @@ mod db_tests {
             "worker-theta",
             "",
             None,
+            &[],
             &[],
         )
         .await
@@ -839,6 +844,7 @@ mod db_tests {
             "",
             None,
             &[],
+            &[],
         )
         .await
         .expect("claim_task")
@@ -899,6 +905,7 @@ mod db_tests {
             "worker-lambda",
             "",
             None,
+            &[],
             &[],
         )
         .await

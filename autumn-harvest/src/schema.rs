@@ -265,6 +265,7 @@ diesel::table! {
         build_id -> Text,
         /// Optional human-readable deployment name (issue #171).
         deployment_name -> Nullable<Text>,
+        labels -> Jsonb,
     }
 }
 
