@@ -3907,6 +3907,68 @@
         { "status": 401, "description": "Unauthenticated request." },
         { "status": 503, "description": "Database unavailable." }
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/queues/{queue_name}/eligibility",
+      "category": "queue",
+      "read_only": true,
+      "description": "Get detailed worker and queue status eligibility and diagnostic breakdown for triaging stuck tasks in a specific queue.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [
+        { "name": "queue_name", "in": "path", "required": true, "description": "Target task queue name." }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "queue_name",
+          "pending_count",
+          "oldest_pending_age_secs",
+          "required_build_ids",
+          "eligible_workers",
+          "ineligible_workers",
+          "summary",
+          "shards",
+          "shard_errors"
+        ]
+      },
+      "error_responses": [
+        { "status": 401, "description": "Unauthenticated request." },
+        { "status": 503, "description": "Database or shard unavailable." }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/tasks/{id}/eligibility",
+      "category": "queue",
+      "read_only": true,
+      "description": "Get detailed worker eligibility and diagnostic breakdown narrowed to a single pending task.",
+      "idempotency": "Read-only; always idempotent.",
+      "params": [
+        { "name": "id", "in": "path", "required": true, "description": "Task UUID." }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "task_id",
+          "queue_name",
+          "pending_count",
+          "oldest_pending_age_secs",
+          "required_build_id",
+          "assigned_shard",
+          "concurrency_key",
+          "eligible_workers",
+          "ineligible_workers",
+          "summary"
+        ]
+      },
+      "error_responses": [
+        { "status": 401, "description": "Unauthenticated request." },
+        { "status": 404, "description": "Task not found across any shard." },
+        { "status": 503, "description": "Database or shard unavailable." }
+      ]
     }
   ]
 }
