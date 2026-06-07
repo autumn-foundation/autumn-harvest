@@ -68,6 +68,12 @@ pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
             }
         }
     }
+    if in_quotes.is_some() {
+        return Err("unbalanced quotes in requirements string".to_string());
+    }
+    if in_brackets {
+        return Err("unbalanced brackets in requirements string".to_string());
+    }
     let trimmed = current.trim();
     if !trimmed.is_empty() {
         tokens.push(trimmed.to_string());
@@ -240,6 +246,10 @@ mod tests {
         assert!(parse_requirements("gpu").is_err());
         assert!(parse_requirements("region in").is_err());
         assert!(parse_requirements("region in eu-west-1").is_err());
+        assert!(parse_requirements("gpu = 'true").is_err());
+        assert!(parse_requirements("region in [eu-west-1").is_err());
+        assert!(parse_requirements("region in ['eu-west-1', \"eu-central-1\"").is_err());
+        assert!(parse_requirements("some_key = \"value").is_err());
     }
 
     #[test]

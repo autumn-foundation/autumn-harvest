@@ -14076,19 +14076,30 @@ async fn list_workers_handler(
     if let Some(ref act_name) = capable_of {
         if let Ok(runtime) = api_state.runtime() {
             if let Some(activity) = runtime.registry().activities.get(act_name) {
-                if let Some(req_str) = activity.requires
-                    && let Ok(parsed_reqs) =
-                        autumn_harvest::eligibility::parse_requirements(req_str)
-                {
-                    results.retain(|w| {
+                let target_queue = activity.default_queue.unwrap_or("default");
+                let parsed_reqs = activity.requires.and_then(|req_str| {
+                    autumn_harvest::eligibility::parse_requirements(req_str).ok()
+                });
+
+                results.retain(|w| {
+                    let is_subscribed =
+                        w.worker.queues.as_array().is_some_and(|arr| {
+                            arr.iter().any(|v| v.as_str() == Some(target_queue))
+                        });
+                    if !is_subscribed {
+                        return false;
+                    }
+
+                    if activity.requires.is_some() && parsed_reqs.is_none() {
+                        return false;
+                    }
+
+                    parsed_reqs.as_ref().is_none_or(|reqs| {
                         let worker_labels: std::collections::HashMap<String, String> =
                             serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
-                        autumn_harvest::eligibility::matches_requirements(
-                            &parsed_reqs,
-                            &worker_labels,
-                        )
-                    });
-                }
+                        autumn_harvest::eligibility::matches_requirements(reqs, &worker_labels)
+                    })
+                });
             } else {
                 results.clear();
             }

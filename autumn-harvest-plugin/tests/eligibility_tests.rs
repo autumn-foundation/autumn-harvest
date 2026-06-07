@@ -1013,7 +1013,7 @@ async fn test_worker_capabilities_routing_and_triage() {
         default_heartbeat_timeout: None,
         default_schedule_to_start: None,
         default_schedule_to_close: None,
-        default_queue: None,
+        default_queue: Some("test-queue-capabilities"),
         max_concurrent: None,
         concurrency_key: None,
         is_local: false,
@@ -1147,4 +1147,96 @@ fn runtime_for_activities(
         HarvestRetentionRuntime::disabled(RetentionConfig::default()),
         router,
     )
+}
+
+#[tokio::test]
+async fn test_worker_queue_filtering_for_capable_of() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    let activity = autumn_harvest::info::ActivityInfo {
+        name: "transcode_activity",
+        module: "tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some("transcoding"),
+        max_concurrent: None,
+        concurrency_key: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        circuit_breaker: None,
+        requires: Some("gpu = true"),
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+    };
+
+    let state = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for_activities(
+            &["transcoding", "other-queue"],
+            vec![activity],
+            ShardRouter::single(),
+        ),
+    );
+    state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    let mut matching_labels = std::collections::HashMap::new();
+    matching_labels.insert("gpu".to_string(), "true".to_string());
+
+    // 1. Register a worker with matching labels and matching queue
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-gpu-transcoding",
+            &["transcoding".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &matching_labels,
+        )
+        .await
+        .unwrap();
+    }
+
+    // 2. Register a worker with matching labels but WRONG queue
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-gpu-other",
+            &["other-queue".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &matching_labels,
+        )
+        .await
+        .unwrap();
+    }
+
+    // 3. Request capable_of
+    let (status, body) =
+        get_json_with_auth(&app, "/workers?capable_of=transcode_activity", true).await;
+    assert_eq!(status, StatusCode::OK);
+    let workers = body.as_array().unwrap();
+    assert_eq!(
+        workers.len(),
+        1,
+        "only 1 worker should be returned because the other is on the wrong queue"
+    );
+    assert_eq!(workers[0]["worker_id"], "worker-gpu-transcoding");
 }
