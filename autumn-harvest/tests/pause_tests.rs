@@ -351,6 +351,86 @@ async fn pause_then_resume_transitions_and_records_events() {
 }
 
 #[tokio::test]
+async fn resume_extends_deadline_by_pause_duration() {
+    // Pause suspends the SLA clock (issue #383 × #243): on resume the absolute
+    // `deadline_at` is pushed forward by the time spent paused so paused
+    // wall-clock is not charged against the workflow's execution_timeout.
+    use autumn_harvest::schema::harvest_workflow_executions as e;
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "deadline-1").await;
+
+    pause_workflow_execution(&mut conn, exec_id, Some("hold"), "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+
+    // Establish a known pre-resume deadline and a 30-minute backdated pause so
+    // the resume computes a deterministic, non-zero span.
+    let now = chrono::Utc::now();
+    let deadline_before = now + chrono::Duration::minutes(30);
+    let paused_at = now - chrono::Duration::minutes(30);
+    diesel::update(e::table.filter(e::id.eq(exec_id.as_uuid())))
+        .set((
+            e::deadline_at.eq(Some(deadline_before)),
+            e::paused_at.eq(Some(paused_at)),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("set deadline/paused_at for test");
+
+    resume_workflow_execution(&mut conn, exec_id, "oncall", &NoOpMetrics)
+        .await
+        .expect("resume should succeed");
+
+    let deadline_after: Option<chrono::DateTime<chrono::Utc>> = e::table
+        .filter(e::id.eq(exec_id.as_uuid()))
+        .select(e::deadline_at)
+        .first(&mut conn)
+        .await
+        .expect("execution must exist");
+
+    let deadline_after = deadline_after.expect("deadline_at must remain set after resume");
+    // Expected ≈ deadline_before + 30min pause span. Allow a few seconds of
+    // slack for the wall-clock read inside resume.
+    let expected = deadline_before + chrono::Duration::minutes(30);
+    let drift = (deadline_after - expected).num_seconds().abs();
+    assert!(
+        drift <= 5,
+        "deadline should advance by the pause span: after={deadline_after}, expected≈{expected} (drift {drift}s)"
+    );
+}
+
+#[tokio::test]
+async fn resume_without_deadline_leaves_it_null() {
+    // A workflow with no execution_timeout (deadline_at NULL) must stay NULL
+    // across a pause/resume cycle — the SLA-clock extension is a no-op.
+    use autumn_harvest::schema::harvest_workflow_executions as e;
+
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "wf", "deadline-null-1").await;
+
+    pause_workflow_execution(&mut conn, exec_id, None, "oncall", &NoOpMetrics)
+        .await
+        .expect("pause should succeed");
+    resume_workflow_execution(&mut conn, exec_id, "oncall", &NoOpMetrics)
+        .await
+        .expect("resume should succeed");
+
+    let deadline_after: Option<chrono::DateTime<chrono::Utc>> = e::table
+        .filter(e::id.eq(exec_id.as_uuid()))
+        .select(e::deadline_at)
+        .first(&mut conn)
+        .await
+        .expect("execution must exist");
+    assert!(
+        deadline_after.is_none(),
+        "deadline_at must stay NULL when no execution_timeout was set"
+    );
+}
+
+#[tokio::test]
 async fn pause_is_idempotent() {
     let (url, _c) = setup().await;
     let mut conn = connect(&url).await;

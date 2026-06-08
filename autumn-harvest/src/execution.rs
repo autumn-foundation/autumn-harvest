@@ -990,12 +990,21 @@ pub async fn resume_workflow_execution(
                     )));
                 }
 
-                // `to_std()` yields `Err` for a negative span, so a clock skew
-                // that puts `paused_at` ahead of `resumed_at` reports 0.0.
-                let pause_duration_secs = execution
+                // Clamp the pause span to a non-negative duration so a clock skew
+                // that puts `paused_at` ahead of `resumed_at` neither reports a
+                // negative pause nor rewinds the deadline.
+                let pause_span = execution
                     .paused_at
-                    .and_then(|p| (resumed_at - p).to_std().ok())
-                    .map_or(0.0, |d| d.as_secs_f64());
+                    .map(|p| resumed_at - p)
+                    .filter(|span| *span > chrono::Duration::zero())
+                    .unwrap_or_else(chrono::Duration::zero);
+                let pause_duration_secs = pause_span.to_std().map_or(0.0, |d| d.as_secs_f64());
+
+                // Pause suspends the SLA clock (issue #383 × #243): push the
+                // absolute execution deadline forward by the time spent paused so
+                // paused wall-clock does not count against the workflow's
+                // `execution_timeout`. `None` (no deadline) stays `None`.
+                let new_deadline_at = execution.deadline_at.map(|d| d + pause_span);
 
                 let history = store::load_history(conn, exec_id).await?;
                 store::append_events(
@@ -1018,6 +1027,7 @@ pub async fn resume_workflow_execution(
                                 .eq(None::<chrono::DateTime<Utc>>),
                             harvest_workflow_executions::pause_reason.eq(None::<String>),
                             harvest_workflow_executions::pause_actor.eq(None::<String>),
+                            harvest_workflow_executions::deadline_at.eq(new_deadline_at),
                         ))
                         .execute(conn)
                         .await

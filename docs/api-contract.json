@@ -567,6 +567,107 @@
     },
     {
       "method": "POST",
+      "path": "/workflows/{id}/pause",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Pause a running workflow execution. While paused the executor dispatches no new commands; in-flight activities run to completion. PAUSED is a non-terminal active state.",
+      "idempotency": "Idempotent: pausing an already-paused execution is a no-op (newly_paused=false).",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable pause reason (max 500 chars) recorded in audit log."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "reason",
+          "actor",
+          "newly_paused"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Pause reason exceeds the length cap."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 409,
+          "description": "Execution is in a terminal state and cannot be paused."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/resume",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Resume a paused workflow execution, re-arming command dispatch and waking the parked task.",
+      "idempotency": "Not idempotent: only an execution in the PAUSED state can be resumed (409 otherwise).",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "actor",
+          "pause_duration_secs"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 409,
+          "description": "Execution is not in the PAUSED state."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/workflows/{id}/reset",
       "category": "workflow",
       "read_only": false,

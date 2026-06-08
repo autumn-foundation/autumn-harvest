@@ -2241,6 +2241,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{id}/cancel"),
+        ("POST", "/workflows/{id}/pause"),
+        ("POST", "/workflows/{id}/resume"),
         ("POST", "/workflows/{id}/reset"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
         ("GET", "/workflows/{id}/queries"),
@@ -2387,6 +2389,8 @@ pub const fn management_api_request_fields()
         // ── batch workflow start (issue #357) ─────────────────────────────────
         ("POST", "/workflows/batch_start", Some(&["items", "atomic"])),
         ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
+        ("POST", "/workflows/{id}/pause", Some(&["reason"])),
+        ("POST", "/workflows/{id}/resume", Some(&[])),
         (
             "POST",
             "/workflows/{id}/reset",
@@ -2654,6 +2658,29 @@ pub const fn management_api_response_fields()
                 "reason",
                 "newly_cancelled",
                 "failed_task_count",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/pause",
+            Some(&[
+                "ok",
+                "execution_id",
+                "state",
+                "reason",
+                "actor",
+                "newly_paused",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/resume",
+            Some(&[
+                "ok",
+                "execution_id",
+                "state",
+                "actor",
+                "pause_duration_secs",
             ]),
         ),
         (
@@ -10164,7 +10191,9 @@ async fn schedule_backfill(
     }))
 }
 
-/// Count RUNNING workflow executions or DAG runs for the named entity.
+/// Count active (RUNNING or PAUSED) workflow executions or DAG runs for the
+/// named entity. A PAUSED run still occupies an active slot for
+/// `max_active_runs`/overlap enforcement (issue #383), matching the scheduler.
 /// Returns the total count across all shards, or all shard failures that made
 /// the count unsafe to use for `max_active_runs` enforcement.
 async fn query_running_count(
@@ -10187,7 +10216,7 @@ async fn query_running_count(
         // DAGs are now unified as workflows (issue #256 step 5).
         let count_result = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::workflow_name.eq(name))
-            .filter(harvest_workflow_executions::state.eq("RUNNING"))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
             .count()
             .get_result::<i64>(&mut conn)
             .await;
