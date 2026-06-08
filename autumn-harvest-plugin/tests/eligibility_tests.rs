@@ -10,7 +10,7 @@ use autumn_harvest::scheduler::DagCatalog;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
-use autumn_harvest::workers::{WorkerStatus, register_worker, heartbeat_worker, get_worker};
+use autumn_harvest::workers::{WorkerStatus, get_worker, heartbeat_worker, register_worker};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
@@ -1381,10 +1381,9 @@ async fn test_worker_heartbeat_updates_labels() {
             .await
             .unwrap()
             .expect("worker should exist");
-        
+
         let worker_labels: std::collections::HashMap<String, String> =
             serde_json::from_value(worker_row.worker.labels).unwrap();
         assert_eq!(worker_labels.get("gpu").map(String::as_str), Some("true"));
     }
 }
-
