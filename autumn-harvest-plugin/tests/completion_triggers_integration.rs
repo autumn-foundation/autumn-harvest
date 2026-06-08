@@ -138,6 +138,9 @@ const INIT_SQL: &str = concat!(
     ),
     include_str!(
         "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
+    ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
     )
 );
 

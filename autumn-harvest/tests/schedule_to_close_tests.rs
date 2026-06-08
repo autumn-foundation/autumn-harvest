@@ -87,7 +87,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     // schedule_to_close column on harvest_task_queue (issue #378)
     include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
-    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql")
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql")
 );
 
 async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {

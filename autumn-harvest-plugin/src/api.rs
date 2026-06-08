@@ -15838,17 +15838,34 @@ async fn evaluate_eligibility_for_shard(
                     }
                 }
 
-                if t.task_type == "activity"
-                    && let Some(ref act_name) = t.activity_name
-                    && let Some(ref reg) = registry
-                    && let Some(activity) = reg.activities.get(act_name)
-                    && let Some(req_str) = activity.requires
-                    && let Ok(parsed_reqs) =
-                        autumn_harvest::eligibility::parse_requirements(req_str)
-                {
+                let parsed_reqs = if t.task_type == "activity" {
+                    t.required_capabilities.as_ref().map_or_else(
+                        || {
+                            if let Some(ref act_name) = t.activity_name
+                                && let Some(ref reg) = registry
+                                && let Some(activity) = reg.activities.get(act_name)
+                                && let Some(req_str) = activity.requires
+                            {
+                                autumn_harvest::eligibility::parse_requirements(req_str).ok()
+                            } else {
+                                None
+                            }
+                        },
+                        |req_val| {
+                            serde_json::from_value::<Vec<autumn_harvest::eligibility::Requirement>>(
+                                req_val.clone(),
+                            )
+                            .ok()
+                        },
+                    )
+                } else {
+                    None
+                };
+
+                if let Some(reqs) = parsed_reqs {
                     let worker_labels: std::collections::HashMap<String, String> =
                         serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
-                    for req in &parsed_reqs {
+                    for req in &reqs {
                         let satisfied = match req {
                             autumn_harvest::eligibility::Requirement::Exact { key, value } => {
                                 worker_labels.get(key) == Some(value)
