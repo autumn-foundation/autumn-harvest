@@ -53,7 +53,7 @@ pub async fn record_decision_graceful(
 ///
 /// # Errors
 ///
-/// Returns a [`database_error`] if the database query execution fails.
+/// Returns a [`database_error`](crate::error::database_error) if the database query execution fails.
 pub async fn purge_old_schedule_decisions(
     conn: &mut AsyncPgConnection,
     retention_days: i64,

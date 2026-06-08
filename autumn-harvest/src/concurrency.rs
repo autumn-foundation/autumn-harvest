@@ -14,7 +14,7 @@
 //! ```
 //!
 //! At dispatch time the worker resolves the expression against the workflow's
-//! JSON input (via [`resolve_concurrency_key`]) to get the concrete group key
+//! JSON input (via [`resolve_concurrency_key`](crate::concurrency::resolve_concurrency_key)) to get the concrete group key
 //! (e.g. `"acme"`), then passes `(key, limit)` to [`crate::queue::EnqueueParams`]
 //! so the `SKIP LOCKED` claim query enforces it across the whole fleet.
 //!
