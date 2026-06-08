@@ -212,6 +212,22 @@ pub enum WorkflowCommand {
         /// Optional details or payload associated with the marker.
         details: Value,
     },
+    /// Record a deterministic side-effect value (issue #384).
+    ///
+    /// Emitted by the `WorkflowContext` deterministic primitives — `system_now()`,
+    /// `new_uuid()`, `random_*()`, and `side_effect()` — when running live (past
+    /// end of history). The worker persists this as a
+    /// [`WorkflowEvent::SideEffectRecorded`] so subsequent replays return the
+    /// recorded value. Like [`Self::RecordMarker`] it is a bookkeeping command:
+    /// it carries no result channel and never drives a suspension.
+    RecordSideEffect {
+        /// Which built-in helper produced the value.
+        kind: crate::event::SideEffectKind,
+        /// Author-supplied dedup key for `side_effect()`; `None` for built-ins.
+        name: Option<String>,
+        /// The recorded JSON value.
+        value: Value,
+    },
     /// Schedule an activity that completes externally via a task token.
     ScheduleExternalActivity {
         /// The unique execution ID of the activity.
@@ -408,6 +424,12 @@ impl std::fmt::Debug for WorkflowCommand {
                 .debug_struct("RecordMarker")
                 .field("name", name)
                 .field("details", details)
+                .finish(),
+            Self::RecordSideEffect { kind, name, value } => f
+                .debug_struct("RecordSideEffect")
+                .field("kind", kind)
+                .field("name", name)
+                .field("value", value)
                 .finish(),
             Self::ScheduleExternalActivity {
                 activity_id,
@@ -699,6 +721,15 @@ pub struct WorkflowContext {
     /// Per-activity input cap overrides: `activity_name → max_bytes`.
     /// When an entry exists, the effective cap is `max(global, override)`.
     activity_input_cap_overrides: HashMap<String, u64>,
+    /// First non-determinism error observed by an infallible deterministic
+    /// primitive (`system_now`, `new_uuid`, `random_*`). Those helpers return a
+    /// plain value (not a `Result`), so they cannot surface a divergence to the
+    /// caller directly. They record the first divergence here and the executor
+    /// converts the workflow outcome to `Failed` after the handler returns, so
+    /// the [`WorkflowReplayer`](crate::testing::WorkflowReplayer) reports a
+    /// structured `SideEffectDrift` non-determinism rather than a silent pass
+    /// (issue #384).
+    deferred_nd_error: Mutex<Option<String>>,
 }
 
 impl WorkflowContext {
@@ -811,6 +842,7 @@ impl WorkflowContext {
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             activity_input_cap_overrides: HashMap::new(),
+            deferred_nd_error: Mutex::new(None),
         }
     }
 
@@ -893,6 +925,7 @@ impl WorkflowContext {
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             activity_input_cap_overrides: HashMap::new(),
+            deferred_nd_error: Mutex::new(None),
         })
     }
 
@@ -925,6 +958,7 @@ impl WorkflowContext {
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             activity_input_cap_overrides: HashMap::new(),
+            deferred_nd_error: Mutex::new(None),
         }
     }
 
@@ -1366,14 +1400,215 @@ impl WorkflowContext {
                     });
                 }
 
-                self.push_command(WorkflowCommand::RecordMarker {
-                    name: format!("side_effect:{id}"),
-                    details: output,
+                self.push_command(WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Custom,
+                    name: Some(id.to_string()),
+                    value: output,
                 });
 
                 Ok(result)
             }
         }
+    }
+
+    // ── Deterministic built-in primitives (issue #384) ────────────────────────
+
+    /// Record the first non-determinism error seen by an infallible primitive.
+    ///
+    /// Only the first error is retained; later divergences in the same execution
+    /// cycle do not overwrite it. The executor drains this via
+    /// [`take_deferred_nd_error`](Self::take_deferred_nd_error).
+    fn record_deferred_nd(&self, msg: String) {
+        let mut slot = self
+            .deferred_nd_error
+            .lock()
+            .expect("deferred_nd_error lock poisoned");
+        if slot.is_none() {
+            *slot = Some(msg);
+        }
+    }
+
+    /// Take the first deferred non-determinism error recorded by an infallible
+    /// primitive (`system_now`, `new_uuid`, `random_*`), if any.
+    ///
+    /// Called by the executor after the workflow handler returns so a divergence
+    /// absorbed by a plain-value primitive still fails the replay cleanly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `deferred_nd_error` mutex is poisoned.
+    #[must_use]
+    pub fn take_deferred_nd_error(&self) -> Option<String> {
+        self.deferred_nd_error
+            .lock()
+            .expect("deferred_nd_error lock poisoned")
+            .take()
+    }
+
+    /// Shared lowering for the infallible built-in primitives.
+    ///
+    /// Matches a [`WorkflowEvent::SideEffectRecorded`] of `kind` at the current
+    /// cursor during replay and returns the recorded value; on the first live
+    /// run it invokes `f`, records the value, and emits a `RecordSideEffect`
+    /// command. On a genuine divergence it records a deferred non-determinism
+    /// error (the executor converts the outcome to `Failed`) and falls back to a
+    /// freshly computed value so the rest of the cycle can still run.
+    fn capture_builtin<F, T>(&self, kind: crate::event::SideEffectKind, f: F) -> T
+    where
+        F: FnOnce() -> T,
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let history_match = self.match_history(|m| m.match_side_effect_event(kind, None));
+
+        match history_match {
+            HistoryMatch::Matched { output } => match serde_json::from_value(output) {
+                Ok(value) => value,
+                Err(e) => {
+                    self.record_deferred_nd(format!(
+                        "side-effect drift mismatch: expected SideEffectRecorded({}), \
+                         got an undeserialisable recorded value ({e})",
+                        kind.as_str()
+                    ));
+                    f()
+                }
+            },
+            HistoryMatch::Diverged { expected, actual } => {
+                self.record_deferred_nd(format!(
+                    "side-effect drift mismatch: expected {expected}, got {actual}"
+                ));
+                f()
+            }
+            HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    self.record_deferred_nd(format!(
+                        "side-effect drift mismatch: expected <end of history>, \
+                         got SideEffectRecorded({})",
+                        kind.as_str()
+                    ));
+                }
+                let result = f();
+                // Built-in values (timestamps, UUIDs, u64/f64) always serialise.
+                let value = serde_json::to_value(&result)
+                    .expect("built-in side-effect value must serialise");
+                self.push_command(WorkflowCommand::RecordSideEffect {
+                    kind,
+                    name: None,
+                    value,
+                });
+                result
+            }
+            _ => unreachable!("match_side_effect_event only returns Matched, Diverged or NoMatch"),
+        }
+    }
+
+    /// Deterministic wall-clock read, captured once and replayed verbatim.
+    ///
+    /// Unlike [`now`](Self::now) — which returns the fixed `WorkflowStarted`
+    /// timestamp (the workflow-logical start clock) — `system_now` captures the
+    /// *current* wall-clock instant the first time it executes at this point in
+    /// the workflow, freezes it into history as a
+    /// [`WorkflowEvent::SideEffectRecorded`], and returns that exact instant on
+    /// every subsequent replay. Use it for "is this event older than 24h *now*?"
+    /// style decisions inside a long-running workflow.
+    ///
+    /// This is the safe, replay-deterministic alternative to calling
+    /// `chrono::Utc::now()` directly (guardrail HVG001).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    #[must_use]
+    pub fn system_now(&self) -> DateTime<Utc> {
+        let millis = self.capture_builtin(crate::event::SideEffectKind::Now, || {
+            Utc::now().timestamp_millis()
+        });
+        DateTime::from_timestamp_millis(millis).unwrap_or(self.start_time)
+    }
+
+    /// Deterministic wall-clock read as a [`std::time::SystemTime`].
+    ///
+    /// Identical capture semantics to [`system_now`](Self::system_now); use this
+    /// when you need a `SystemTime` rather than a `chrono` value. Each call
+    /// records its own [`WorkflowEvent::SideEffectRecorded`] event.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    #[must_use]
+    pub fn system_time_now(&self) -> std::time::SystemTime {
+        let millis = self.capture_builtin(crate::event::SideEffectKind::Now, || {
+            Utc::now().timestamp_millis()
+        });
+        let millis_u64 = u64::try_from(millis.max(0)).unwrap_or(0);
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis_u64)
+    }
+
+    /// Deterministic UUID (version 7), captured once and replayed verbatim.
+    ///
+    /// Mints a fresh time-ordered `UUIDv7` on the first live execution, records it
+    /// in history, and returns the same value on every replay. This is the safe,
+    /// replay-deterministic alternative to calling `Uuid::new_v4()` /
+    /// `Uuid::now_v7()` directly inside a workflow (guardrail HVG002) — ideal for
+    /// idempotency keys.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    #[must_use]
+    pub fn new_uuid(&self) -> uuid::Uuid {
+        self.capture_builtin(crate::event::SideEffectKind::Uuid, uuid::Uuid::now_v7)
+    }
+
+    /// Deterministic random `u64`, captured once and replayed verbatim.
+    ///
+    /// The draw is **not** cryptographically secure — it is intended for
+    /// sampling and idempotency-key style work. Security-grade entropy belongs in
+    /// a regular activity (see issue #384 "Out of Scope").
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    #[must_use]
+    pub fn random_u64(&self) -> u64 {
+        self.capture_builtin(crate::event::SideEffectKind::Random, || {
+            rand::random::<u64>()
+        })
+    }
+
+    /// Deterministic random `f64` in the half-open range `[0, 1)`, captured once
+    /// and replayed verbatim.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    #[must_use]
+    pub fn random_f64(&self) -> f64 {
+        self.capture_builtin(crate::event::SideEffectKind::Random, || {
+            rand::random::<f64>()
+        })
+    }
+
+    /// Deterministic random value drawn uniformly from `range`, captured once and
+    /// replayed verbatim.
+    ///
+    /// Mirrors [`rand::Rng::gen_range`]; works for any range whose element type
+    /// implements [`rand::distributions::uniform::SampleUniform`] and round-trips
+    /// through JSON (e.g. `0..100`, `1.0..2.0`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is empty, or if the internal matcher/commands mutex is
+    /// poisoned.
+    pub fn random_range<T, R>(&self, range: R) -> T
+    where
+        T: serde::Serialize
+            + serde::de::DeserializeOwned
+            + rand::distributions::uniform::SampleUniform,
+        R: rand::distributions::uniform::SampleRange<T>,
+    {
+        self.capture_builtin(crate::event::SideEffectKind::Random, move || {
+            rand::Rng::gen_range(&mut rand::thread_rng(), range)
+        })
     }
 
     /// Convenience wrapper around `side_effect` for generating a deterministic UUID.
@@ -5134,11 +5369,12 @@ mod tests {
         let cmds = ctx.drain_commands();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
-            WorkflowCommand::RecordMarker { name, details } => {
-                assert_eq!(name, "side_effect:random_num");
-                assert_eq!(details, &serde_json::json!(42));
+            WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                assert_eq!(*kind, crate::event::SideEffectKind::Custom);
+                assert_eq!(name.as_deref(), Some("random_num"));
+                assert_eq!(value, &serde_json::json!(42));
             }
-            _ => panic!("Expected RecordMarker command"),
+            _ => panic!("Expected RecordSideEffect command"),
         }
     }
 
@@ -5170,12 +5406,222 @@ mod tests {
         let cmds = ctx.drain_commands();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
-            WorkflowCommand::RecordMarker { name, details } => {
-                assert_eq!(name, "side_effect:txn_id");
-                assert_eq!(details, &serde_json::json!(result));
+            WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                assert_eq!(*kind, crate::event::SideEffectKind::Custom);
+                assert_eq!(name.as_deref(), Some("txn_id"));
+                assert_eq!(value, &serde_json::json!(result));
             }
-            _ => panic!("Expected RecordMarker command"),
+            _ => panic!("Expected RecordSideEffect command"),
         }
+    }
+
+    // ── Deterministic built-in primitives (issue #384) ────────────────────────
+
+    use crate::event::SideEffectKind;
+
+    #[test]
+    fn system_now_emits_side_effect_event_during_live_execution() {
+        let ctx = WorkflowContext::new_test();
+        let t = ctx.system_now();
+        // The captured instant is a real wall-clock value (>= the year 2020).
+        assert!(t.timestamp() > 1_577_836_800);
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            WorkflowCommand::RecordSideEffect { kind, name, .. } => {
+                assert_eq!(*kind, SideEffectKind::Now);
+                assert_eq!(*name, None, "built-in primitives have no name");
+            }
+            other => panic!("expected RecordSideEffect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_now_replays_recorded_value_verbatim() {
+        let frozen_millis = 1_700_000_123_456_i64;
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Now,
+                name: None,
+                value: serde_json::json!(frozen_millis),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let t = ctx.system_now();
+        assert_eq!(t.timestamp_millis(), frozen_millis);
+        // No command emitted on replay.
+        assert!(ctx.drain_commands().is_empty());
+        assert!(ctx.take_deferred_nd_error().is_none());
+    }
+
+    #[test]
+    fn new_uuid_is_v7_and_captured() {
+        let ctx = WorkflowContext::new_test();
+        let id = ctx.new_uuid();
+        assert_eq!(id.get_version_num(), 7, "new_uuid must mint a UUIDv7");
+        let cmds = ctx.drain_commands();
+        assert!(matches!(
+            &cmds[0],
+            WorkflowCommand::RecordSideEffect {
+                kind: SideEffectKind::Uuid,
+                name: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn new_uuid_replays_recorded_value() {
+        let expected = uuid::Uuid::now_v7();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Uuid,
+                name: None,
+                value: serde_json::json!(expected),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert_eq!(ctx.new_uuid(), expected);
+    }
+
+    #[test]
+    fn random_helpers_replay_recorded_values() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Random,
+                name: None,
+                value: serde_json::json!(42_u64),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Random,
+                name: None,
+                value: serde_json::json!(7_i32),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert_eq!(ctx.random_u64(), 42);
+        assert_eq!(ctx.random_range(0..100_i32), 7);
+        assert!(ctx.take_deferred_nd_error().is_none());
+    }
+
+    /// Replay safety (AC): a workflow that calls `system_now()` 1,000 times
+    /// produces a byte-identical sequence of recorded values on every replay.
+    #[test]
+    fn thousand_now_calls_replay_byte_identical() {
+        // Build a history with 1,000 distinct recorded Now values.
+        let mut events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }];
+        for i in 0..1000_i64 {
+            events.push(WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Now,
+                name: None,
+                value: serde_json::json!(1_700_000_000_000_i64 + i),
+            });
+        }
+
+        // Replay twice; both passes must yield the identical ordered sequence.
+        let run = || {
+            let ctx = WorkflowContext::for_replay(ExecutionId::new(), events.clone());
+            let seq: Vec<i64> = (0..1000)
+                .map(|_| ctx.system_now().timestamp_millis())
+                .collect();
+            assert!(ctx.take_deferred_nd_error().is_none());
+            seq
+        };
+        let first = run();
+        let second = run();
+        assert_eq!(first, second);
+        assert_eq!(first[0], 1_700_000_000_000);
+        assert_eq!(first[999], 1_700_000_000_999);
+    }
+
+    /// Drift detection (AC): an infallible built-in that diverges from history
+    /// records a deferred non-determinism error the executor can surface.
+    #[test]
+    fn builtin_primitive_records_deferred_nd_on_divergence() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            // History expects an activity here, but the code calls system_now().
+            WorkflowEvent::ActivityScheduled {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "some_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let _ = ctx.system_now(); // returns a fallback value, records the drift
+        let nd = ctx
+            .take_deferred_nd_error()
+            .expect("drift must be recorded");
+        assert!(
+            nd.contains("side-effect drift mismatch"),
+            "message must classify as side-effect drift: {nd}"
+        );
+        assert!(nd.contains("ActivityScheduled"), "actual event named: {nd}");
+    }
+
+    #[test]
+    fn builtin_kind_mismatch_records_drift() {
+        // History recorded a Uuid capture but the code now calls system_now().
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Uuid,
+                name: None,
+                value: serde_json::json!(uuid::Uuid::now_v7()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let _ = ctx.system_now();
+        let nd = ctx
+            .take_deferred_nd_error()
+            .expect("kind drift must be recorded");
+        assert!(nd.contains("side-effect drift mismatch"), "{nd}");
+        assert!(
+            nd.contains("SideEffectRecorded(uuid)"),
+            "actual kind named: {nd}"
+        );
+    }
+
+    #[test]
+    fn side_effect_reads_legacy_marker_for_in_flight_compat() {
+        // In-flight executions recorded side effects as MarkerRecorded under the
+        // pre-#384 engine. The migrated matcher must still replay them.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "side_effect:legacy".into(),
+                details: serde_json::json!("hello"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let v: String = ctx.side_effect("legacy", || "fresh".to_string()).unwrap();
+        assert_eq!(v, "hello");
     }
 
     #[tokio::test]

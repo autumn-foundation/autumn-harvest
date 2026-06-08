@@ -356,7 +356,9 @@ impl MermaidExporter {
                 | WorkflowEvent::ChildWorkflowCascadeApplied { .. } => {
                     self.handle_child_workflow_event(event)?;
                 }
-                WorkflowEvent::SignalReceived { .. } | WorkflowEvent::MarkerRecorded { .. } => {
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. } => {
                     self.handle_misc_event(event)?;
                 }
                 WorkflowEvent::ActivityAwaitingExternal { .. }
@@ -619,6 +621,10 @@ impl MermaidExporter {
             }
             WorkflowEvent::MarkerRecorded { name, .. } => {
                 writeln!(self.out, "    Note over WF: Marker: {name}")?;
+            }
+            WorkflowEvent::SideEffectRecorded { kind, name, .. } => {
+                let label = name.as_deref().unwrap_or(kind.as_str());
+                writeln!(self.out, "    Note over WF: Side Effect: {label}")?;
             }
             _ => unreachable!(),
         }

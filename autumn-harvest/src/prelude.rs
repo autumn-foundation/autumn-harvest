@@ -17,7 +17,7 @@ pub use crate::dag::{
     DagBuildError, DagBuilder, DagDefinition, DagMapTaskRef, DagTask, DagTaskRef,
 };
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
-pub use crate::event::WorkflowEvent;
+pub use crate::event::{SideEffectKind, WorkflowEvent};
 pub use crate::failure::{ActivityFailure, IntoActivityErrorString};
 #[cfg(feature = "db")]
 pub use crate::handle::{

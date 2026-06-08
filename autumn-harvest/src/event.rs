@@ -21,6 +21,47 @@ fn default_error_type() -> String {
     "Error".to_string()
 }
 
+/// Which deterministic built-in produced a [`WorkflowEvent::SideEffectRecorded`]
+/// event (issue #384).
+///
+/// This is a **bounded** enum — it has a fixed, small set of variants and is
+/// safe to use as a low-cardinality `OTel` attribute value (ADR-0001 §7). Each of
+/// the `WorkflowContext` deterministic primitives lowers onto a single
+/// `SideEffectRecorded` event and stamps the originating helper here so replay
+/// diagnostics and metrics can distinguish a clock read from a UUID mint without
+/// inspecting the recorded value.
+///
+/// **Append-only invariant:** never remove or rename a variant. The serialised
+/// form is the bare variant name (`"Now"`, `"Uuid"`, …); stored events depend on
+/// it. New helper kinds are added at the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SideEffectKind {
+    /// `ctx.system_now()` / `ctx.system_time_now()` — a captured wall-clock instant.
+    Now,
+    /// `ctx.new_uuid()` — a captured `UUIDv7`.
+    Uuid,
+    /// `ctx.random_u64()` / `ctx.random_f64()` / `ctx.random_range(..)` — a captured draw.
+    Random,
+    /// `ctx.side_effect(name, f)` — an author-named one-shot value capture.
+    Custom,
+}
+
+impl SideEffectKind {
+    /// Stable, low-cardinality string label for metrics / diagnostics.
+    ///
+    /// These values are bounded (one per variant) and safe to use as an `OTel`
+    /// attribute value per ADR-0001 §7.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Now => "now",
+            Self::Uuid => "uuid",
+            Self::Random => "random",
+            Self::Custom => "custom",
+        }
+    }
+}
+
 /// All possible events in a workflow's history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -440,6 +481,32 @@ pub enum WorkflowEvent {
         /// The actual wall-clock time when the scanner detected and enforced the timeout.
         timed_out_at: DateTime<Utc>,
     },
+
+    // ── Deterministic side-effect primitives (issue #384) ─────────────────────
+    /// A deterministic value was captured during live execution and frozen into
+    /// history so subsequent replays return the identical value.
+    ///
+    /// All of the `WorkflowContext` deterministic primitives — `system_now()`,
+    /// `system_time_now()`, `new_uuid()`, `random_u64()`, `random_f64()`,
+    /// `random_range()`, and `side_effect()` — lower onto this single variant so
+    /// the event-schema cost of the feature is paid exactly once. The `kind`
+    /// discriminator (a bounded enum) records which helper produced the value;
+    /// `name` is `Some` only for `side_effect()` (the author-supplied dedup key)
+    /// and `None` for the built-in unnamed helpers; `value` is the recorded JSON
+    /// result returned on every replay.
+    ///
+    /// This is an **append-only** variant added at the end of the enum. The
+    /// `harvest_events` table stores it as opaque JSON, so no migration is
+    /// required. `name` is omitted from the serialised form when `None`.
+    SideEffectRecorded {
+        /// Which built-in helper produced this value.
+        kind: SideEffectKind,
+        /// Author-supplied dedup key for `side_effect()`; `None` for built-ins.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// The recorded JSON value, replayed verbatim on every subsequent pass.
+        value: serde_json::Value,
+    },
 }
 
 impl WorkflowEvent {
@@ -485,6 +552,7 @@ impl WorkflowEvent {
             Self::WorkflowExecutionTimedOut { .. } => "WorkflowExecutionTimedOut",
             Self::ChildWorkflowSpawnedDetached { .. } => "ChildWorkflowSpawnedDetached",
             Self::ChildWorkflowCascadeApplied { .. } => "ChildWorkflowCascadeApplied",
+            Self::SideEffectRecorded { .. } => "SideEffectRecorded",
         }
     }
 
@@ -840,11 +908,86 @@ mod tests {
                 deadline: Utc::now(),
                 timed_out_at: Utc::now(),
             },
+            WorkflowEvent::SideEffectRecorded {
+                kind: crate::event::SideEffectKind::Now,
+                name: None,
+                value: serde_json::Value::Null,
+            },
         ];
 
-        assert_eq!(events.len(), 34);
+        assert_eq!(events.len(), 35);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 34, "duplicate type names detected");
+        assert_eq!(names.len(), 35, "duplicate type names detected");
+    }
+
+    // ── SideEffectRecorded tests (issue #384) ─────────────────────────────────
+
+    #[test]
+    fn side_effect_recorded_round_trips_without_name() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!(1_700_000_000_u64),
+        };
+        assert_eq!(event.type_name(), "SideEffectRecorded");
+        let json = serde_json::to_string(&event)?;
+        // `name: None` must be omitted from the serialised form.
+        assert!(
+            !json.contains("\"name\""),
+            "name should be skipped when None"
+        );
+        assert!(
+            json.contains("\"kind\":\"Now\""),
+            "kind tag must be present"
+        );
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::SideEffectRecorded { kind, name, value } => {
+                assert_eq!(kind, SideEffectKind::Now);
+                assert_eq!(name, None);
+                assert_eq!(value, serde_json::json!(1_700_000_000_u64));
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn side_effect_recorded_round_trips_with_custom_name() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Custom,
+            name: Some("env_lookup".into()),
+            value: serde_json::json!({"region": "us-east-1"}),
+        };
+        let json = serde_json::to_string(&event)?;
+        assert!(json.contains("\"name\":\"env_lookup\""));
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn side_effect_recorded_is_not_terminal_lifecycle() {
+        let event = WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::Value::Null,
+        };
+        assert!(!event.is_terminal_lifecycle());
+    }
+
+    #[test]
+    fn side_effect_kind_labels_are_bounded() {
+        assert_eq!(SideEffectKind::Now.as_str(), "now");
+        assert_eq!(SideEffectKind::Uuid.as_str(), "uuid");
+        assert_eq!(SideEffectKind::Random.as_str(), "random");
+        assert_eq!(SideEffectKind::Custom.as_str(), "custom");
     }
 
     #[test]

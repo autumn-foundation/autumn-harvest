@@ -44,6 +44,7 @@ futures = { workspace = true }
 lru = "0.16"
 croner = "2.2"
 seahash = "4.1"
+rand = { workspace = true }
 deadpool = { workspace = true, optional = true }
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }

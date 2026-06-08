@@ -201,7 +201,7 @@ pub use det_check::{
 };
 pub use diagnostic::{DiagnosticReport, SimulatorResultExt};
 pub use error::{HarvestError, HarvestResult, TimeoutType};
-pub use event::WorkflowEvent;
+pub use event::{SideEffectKind, WorkflowEvent};
 #[cfg(feature = "db")]
 pub use execution::{
     CancelledWorkflowExecution, SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams,

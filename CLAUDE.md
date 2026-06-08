@@ -76,6 +76,7 @@ Two crates in the workspace. `autumn-harvest` is the public library. `autumn-har
 - **Phase 3.19** (implemented): Published workflow input/output JSON Schema for self-service triggering — see issue #373. `WorkflowInfo` gains four new optional fields: `description: Option<&'static str>`, `input_schema: Option<fn() -> serde_json::Value>`, `output_schema: Option<fn() -> serde_json::Value>`, `error_schema: Option<fn() -> serde_json::Value>`. Three fluent builder methods: `with_description`, `with_input_schema_fn`, `with_output_schema_fn`, `with_error_schema_fn` (all `#[must_use]`). Under the new `schema` Cargo feature, `with_schemas::<I, O, E>()` derives all three schemas automatically from types that implement `schemars::JsonSchema`. Two new management API routes: `GET /workflows/registered` (sorted list of all registered workflow types with optional schemas) and `GET /workflows/registered/{name}/schema` (404 for unknown names). `POST /workflows/{name}/start` validates input against the published schema when one is set; on failure returns `400` with a structured JSON body `{"error": "input validation failed", "violations": [{"message": "…", "field_path": "…"}]}` where `field_path` is a JSON Pointer (RFC 6901). `WorkflowInfo::validate_input` is the pure validation method — returns `Ok(())` or `Err(Vec<SchemaViolation>)`. `validate_against_schema` is the standalone recursive validator. `#[workflow(description = "…")]` attribute wires description through the companion function. Opt-in: workflows without a schema compile and run identically to today — no breakage. **No new `WorkflowEvent` variants, no migrations, no shard-routing changes, no replay-determinism impact.** `RegisteredWorkflowRecord` is the serialisable discovery record. Example: `autumn-harvest/examples/schema_workflow.rs` (requires `--features schema`). New types in `info.rs`: `SchemaViolation`, `RegisteredWorkflowRecord`, `validate_against_schema`.
 - **Phase 3.21** (implemented): Workflow terminal-outcome counter for success-rate SLOs and alerting — see issue #519. New counter `harvest.workflow.terminal` (`METRIC_WORKFLOW_TERMINAL`) incremented **exactly once** per terminal workflow outcome. Labels: `outcome` (6 bounded values: `completed`/`failed`/`cancelled`/`timed_out`/`terminated`/`continued_as_new`), `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue`. `execution.id` is never a label (ADR-0001 §7 cardinality rule). Emission points: `worker.rs` (`process_workflow_task` for Completed/Failed/ContinuedAsNew and `fail_workflow_for_history_cap`), `timeout.rs` (`enforce_workflow_execution_timeouts` for TimedOut), `execution.rs` (`cancel_workflow_execution` for Cancelled, `terminate_workflow_execution` for Terminated). `WorkflowStatus` enum extended with `Cancelled`, `TimedOut`, `Terminated` variants. `record_workflow_terminal` added to `MetricsRecorder` trait as a no-op default (additive, no breaking change). Bridged in `metrics_rs_adapter` (`MetricsRsRecorder`). `BatchExecutorConfig` gains `metrics: Arc<dyn MetricsRecorder>` field (default `NoOpMetrics`). Suspended executor cycles never increment the counter. Workflow-failure-rate alert added to `docs/alerts/starter-pack-v0.1.0.json`. ADR-0001 §7 metric catalogue updated. **No new `WorkflowEvent` variant, no migration.**
 - **Phase 3.20** (implemented): Per-activity cross-retry wall-clock deadline (`schedule_to_close`) for SLA enforcement — see issue #378. `ActivityInfo.default_schedule_to_close: Option<Duration>` (`None` = unbounded, no regression for existing activities). `#[activity(schedule_to_close = "5m", start_to_close = "30s", retry = ...)]` parses cleanly (compile-time error if used on `local = true` activities). Migration `20260606000001_harvest_activity_schedule_to_close` adds `schedule_to_close_at TIMESTAMPTZ NULL` to `harvest_task_queue` with a partial index on `(schedule_to_close_at) WHERE state IN ('RUNNING', 'PENDING') AND schedule_to_close_at IS NOT NULL`. Worker sets `EnqueueParams::schedule_to_close_at = Some(Utc::now() + schedule_to_close)` at schedule time. Retry path: before calling `requeue_for_retry`, `schedule_to_close_deadline_exceeded(task, delay)` checks if `now + retry_delay >= deadline`; if so, `record_schedule_to_close_activity_timeout` appends `ActivityTimedOut { timeout_type: ScheduleToClose }` and fails the task instead of requeuing. Scanner: `TimeoutReason::ScheduleToClose` added to `find_timed_out_tasks`; `expected_task_states_for_timeout` returns `&["RUNNING", "PENDING"]` for this reason so both in-flight and queued-past-deadline tasks are caught. `TimeoutType::ScheduleToClose` already existed in `error.rs` — no new `WorkflowEvent` variant needed. Decision matrix documented in `docs/getting-started/07-reliability-knobs.md`. Integration tests in `tests/schedule_to_close_tests.rs`.
+- **Phase 3.22** (implemented): Deterministic side-effect primitives on `WorkflowContext` — see issue #384. New public methods `system_now() -> DateTime<Utc>` and `system_time_now() -> SystemTime` (per-call wall-clock captured at first execution; distinct from the pre-existing `now()` which returns the fixed `WorkflowStarted` start-time logical clock and is **unchanged** for backward + in-flight safety), `new_uuid() -> Uuid` (UUIDv7 idempotency keys), `random_u64()`/`random_f64()`/`random_range(range)` (sampling draws), plus the pre-existing `side_effect(name, f)` and `random_uuid(id)`. All of them lower onto a **single new** append-only `WorkflowEvent::SideEffectRecorded { kind: SideEffectKind, name: Option<String>, value }` variant (added at the end of the enum; `SideEffectKind` is a bounded enum `Now`/`Uuid`/`Random`/`Custom` with `as_str()` for OTel labels), so the event-schema cost is paid once forever. New internal `WorkflowCommand::RecordSideEffect` (bookkeeping, persisted by the worker exactly like `RecordMarker`). `HistoryMatcher::match_side_effect_event(kind, name)` matches them in command (cursor) order and surfaces drift as `HistoryMatch::Diverged`; `match_side_effect(id)` delegates to it and remains **backward-compatible** with pre-#384 executions that recorded `side_effect` as `MarkerRecorded { name: "side_effect:{id}" }`. The infallible built-ins (`system_now`/`new_uuid`/`random_*`) return plain values, so on a replay divergence they record a deferred non-determinism error (`WorkflowContext::take_deferred_nd_error`) that the executor converts to `WorkflowFailed`; `WorkflowReplayer` classifies it as the new `NonDeterminismKind::SideEffectDrift`. Guardrails HVG001/HVG002 now recommend these primitives by name. Deps: `uuid` gains the `v7` feature, new `rand` workspace dep. **No DB migration** (the variant is opaque JSON in `harvest_events`), no change to the adjacently-tagged event JSON contract, no macro-path change. Example: `autumn-harvest/examples/deterministic_primitives.rs`. Tests: unit tests in `event.rs`/`context.rs`/`replay.rs`, replayer drift tests in `tests/replayer_tests.rs`.
 - **Phase 4** (next): production hardening -- sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`). Note: the cancellation primitive and `Saga` both ship; their interaction semantics, idempotency contract, and replay-determinism contract are documented in `docs/saga.md` and locked in by three integration tests in `tests/saga_tests.rs` (issue #238).
 
 ---
@@ -187,7 +188,7 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `types.rs` | 1 | Newtypes: `WorkflowId` (String), `ExecutionId` (Uuid v4), `ActivityExecId` (Uuid v4), `TimerId` (String), `WorkerId` (String) |
 | `error.rs` | 1 | `HarvestError` (thiserror), `HarvestResult<T>`, `TimeoutType` enum |
 | `policy.rs` | 1 | `RetryPolicy`, `TriggerRule`, `Schedule`, `TaskStatus`, `compute_retry_delay` |
-| `event.rs` | 1 | `WorkflowEvent` enum (28 variants, adjacently-tagged serde), `type_name()`. Variants added in issue #140: `UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed` |
+| `event.rs` | 1 | `WorkflowEvent` enum (35 variants, adjacently-tagged serde), `type_name()`. Variants added in issue #140: `UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed`. `SideEffectRecorded` + bounded `SideEffectKind` enum added in issue #384 (deterministic primitives) |
 | `context.rs` | 1+2 | `WorkflowContext` (replay, suspension, version gate, timers), `ActivityContext` (heartbeat channel, cancellation) |
 | `info.rs` | 1 | `WorkflowInfo`, `ActivityInfo`, `WorkflowHandlerFn`, `ActivityHandlerFn` type aliases |
 | `builder.rs` | 1 | `HarvestBuilder` (fluent), `WorkerConfig` (queues, concurrency, timeouts) |
@@ -452,6 +453,41 @@ let results = ctx.execute_activity_fan_out_raw(vec![
 **Cancellation**: both methods check `ctx.is_cancelled()` before dispatching and return `HarvestError::Cancelled` if the workflow has been cancelled.
 
 See `autumn-harvest/examples/fanout_batch.rs` for a complete end-to-end example covering all three shapes (static N, dynamic N from a prior activity, and collect-all with partial failure).
+
+### Deterministic Primitives (issue #384)
+
+First-class, replay-safe alternatives to the non-deterministic APIs the guardrails (HVG001 wall-clock, HVG002 randomness) warn about. One `WorkflowContext` method call per value — no local-activity definition, no magic strings. Each helper captures its value on the **first** live execution, freezes it into a single `SideEffectRecorded` event, and replays the identical value on every subsequent pass and every worker.
+
+| Method | Returns | Captures |
+|--------|---------|----------|
+| `ctx.system_now()` | `DateTime<Utc>` | wall-clock instant at the call site |
+| `ctx.system_time_now()` | `std::time::SystemTime` | same instant as a `SystemTime` |
+| `ctx.new_uuid()` | `Uuid` | a fresh UUIDv7 (idempotency keys) |
+| `ctx.random_u64()` / `ctx.random_f64()` | `u64` / `f64` | a sampling draw |
+| `ctx.random_range(range)` | `T` | a uniform draw from `range` (e.g. `0..100`) |
+| `ctx.side_effect(name, f)` | `HarvestResult<T>` | any one-shot value; `name` dedups within an execution |
+
+`now()` (unchanged) returns the fixed `WorkflowStarted` timestamp — the workflow-logical *start* clock. Use `system_now()` when you need the *current* wall clock captured at the call site (e.g. "skip the notification if the event is older than 24h now").
+
+```rust
+#[workflow]
+async fn notify(ctx: &WorkflowContext, event: Event) -> Result<(), String> {
+    // Wall-clock decision — captured once, replayed verbatim.
+    let fresh = ctx.system_now().timestamp() - event.occurred_at < 24 * 60 * 60;
+    // Idempotency key — UUIDv7 captured once; safe across retries.
+    let key = ctx.new_uuid().to_string();
+    // Sampling — deterministic across replays.
+    let in_rollout = ctx.random_range(0..100) < 10;
+    // One-shot environment capture.
+    let region: String = ctx
+        .side_effect("region", || std::env::var("REGION").unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    // ...
+    Ok(())
+}
+```
+
+All six lower onto the single append-only `WorkflowEvent::SideEffectRecorded { kind, name, value }` variant (`kind: SideEffectKind` ∈ `Now`/`Uuid`/`Random`/`Custom`). The `HistoryMatcher` matches them in command order; a divergence (reorder/insert/remove/rename across a code change) is surfaced by `WorkflowReplayer` as `NonDeterminismKind::SideEffectDrift`. `side_effect`/`random_uuid` recorded under the pre-#384 engine (as `MarkerRecorded`) still replay correctly. Randomness is **not** cryptographically secure — for security-grade entropy, use a regular activity. See `autumn-harvest/examples/deterministic_primitives.rs`.
 
 ### Local Activities
 
