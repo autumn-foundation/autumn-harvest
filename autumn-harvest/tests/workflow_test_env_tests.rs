@@ -80,6 +80,23 @@ fn race_workflow<'a>(
     })
 }
 
+/// Captures a deterministic side-effect (`system_now`) BEFORE suspending on an
+/// activity. Exercises that the test harness persists the pre-suspension
+/// `SideEffectRecorded` event so the next replay iteration does not see drift.
+fn side_effect_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let captured_at = ctx.system_now().timestamp_millis();
+        let result = ctx
+            .execute_activity_raw("send_email", json!({"to": "user@example.com"}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({"sent": result, "captured_at": captured_at}))
+    })
+}
+
 /// Two sequential activities, used for event-log ordering assertions.
 fn two_step_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -267,6 +284,48 @@ async fn test_happy_path_one_activity() {
             .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
         "expected ActivityCompleted"
     );
+}
+
+#[tokio::test]
+async fn test_side_effect_captured_before_suspension_is_persisted() {
+    // Regression (issue #384): a deterministic primitive emitted before parking
+    // on an activity must be persisted to history by the harness. If dropped,
+    // the next iteration would replay system_now() against ActivityScheduled and
+    // record spurious side-effect drift, failing the run.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("send_email", |_| Ok(json!("delivered")))
+        .run(side_effect_then_activity_workflow, json!(null))
+        .await;
+
+    assert!(
+        outcome.result.is_ok(),
+        "workflow must not fail with spurious side-effect drift: {:?}",
+        outcome.result
+    );
+    assert_eq!(outcome.result.as_ref().unwrap()["sent"], json!("delivered"));
+
+    let events = outcome.events();
+    // The SideEffectRecorded event must be persisted, and ahead of the activity.
+    let se_idx = events
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. }))
+        .expect("SideEffectRecorded must be persisted in history");
+    let act_idx = events
+        .iter()
+        .position(
+            |e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "send_email"),
+        )
+        .expect("ActivityScheduled must be present");
+    assert!(
+        se_idx < act_idx,
+        "side effect must be recorded before the activity it precedes"
+    );
+    // Exactly one capture — not duplicated across replay iterations.
+    let se_count = events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. }))
+        .count();
+    assert_eq!(se_count, 1, "side effect must be recorded exactly once");
 }
 
 // ─────────────────────── (b) Retry test ──────────────────────────────────────

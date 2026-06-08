@@ -1458,11 +1458,43 @@ impl WorkflowContext {
         F: FnOnce() -> T,
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
+        self.capture_builtin_validated(kind, |_| true, f)
+    }
+
+    /// Like [`capture_builtin`](Self::capture_builtin) but additionally validates
+    /// a replayed value against `is_valid`.
+    ///
+    /// All random helpers lower onto the same `SideEffectKind::Random`, so a code
+    /// change that swaps one helper for another at a call site (e.g. `random_u64`
+    /// → `random_f64`) would otherwise deserialize the recorded JSON without
+    /// complaint — a `42` integer reads back as `42.0`, silently violating the new
+    /// helper's documented domain. `is_valid` lets a helper reject a replayed
+    /// value that falls outside its contract (e.g. `random_f64`'s `[0, 1)`),
+    /// recording it as a deferred non-determinism error instead.
+    fn capture_builtin_validated<F, V, T>(
+        &self,
+        kind: crate::event::SideEffectKind,
+        is_valid: V,
+        f: F,
+    ) -> T
+    where
+        F: FnOnce() -> T,
+        V: FnOnce(&T) -> bool,
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
         let history_match = self.match_history(|m| m.match_side_effect_event(kind, None));
 
         match history_match {
-            HistoryMatch::Matched { output } => match serde_json::from_value(output) {
-                Ok(value) => value,
+            HistoryMatch::Matched { output } => match serde_json::from_value::<T>(output) {
+                Ok(value) if is_valid(&value) => value,
+                Ok(_) => {
+                    self.record_deferred_nd(format!(
+                        "side-effect drift mismatch: expected SideEffectRecorded({}) within its \
+                         documented domain, got an out-of-domain replayed value",
+                        kind.as_str()
+                    ));
+                    f()
+                }
                 Err(e) => {
                     self.record_deferred_nd(format!(
                         "side-effect drift mismatch: expected SideEffectRecorded({}), \
@@ -1578,14 +1610,21 @@ impl WorkflowContext {
     /// Deterministic random `f64` in the half-open range `[0, 1)`, captured once
     /// and replayed verbatim.
     ///
+    /// On replay a recorded value outside `[0, 1)` (e.g. because the call site was
+    /// changed from `random_u64()`, whose draw shares the same
+    /// `SideEffectKind::Random`) is rejected as a deferred non-determinism error
+    /// rather than silently returning an out-of-contract value.
+    ///
     /// # Panics
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
     #[must_use]
     pub fn random_f64(&self) -> f64 {
-        self.capture_builtin(crate::event::SideEffectKind::Random, || {
-            rand::random::<f64>()
-        })
+        self.capture_builtin_validated(
+            crate::event::SideEffectKind::Random,
+            |v: &f64| (0.0..1.0).contains(v),
+            rand::random::<f64>,
+        )
     }
 
     /// Deterministic random value drawn uniformly from `range`, captured once and
@@ -1624,8 +1663,8 @@ impl WorkflowContext {
                         value
                     } else {
                         self.record_deferred_nd(
-                            "side-effect drift: replayed random_range value is outside \
-                             the current range bounds"
+                            "side-effect drift mismatch: expected SideEffectRecorded(random) \
+                             within the current range, got an out-of-range replayed value"
                                 .to_string(),
                         );
                         rand::Rng::gen_range(&mut rand::thread_rng(), range)
@@ -5571,6 +5610,78 @@ mod tests {
         assert_eq!(ctx.random_u64(), 42);
         assert_eq!(ctx.random_range(0..100_i32), 7);
         assert!(ctx.take_deferred_nd_error().is_none());
+    }
+
+    #[test]
+    fn random_f64_rejects_out_of_domain_replayed_value() {
+        // A call site changed from random_u64() to random_f64(): the recorded
+        // draw (42) deserializes fine as 42.0 but violates the [0, 1) contract.
+        // It must be reported as drift, not silently returned.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Random,
+                name: None,
+                value: serde_json::json!(42_u64),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let v = ctx.random_f64();
+        assert!(
+            (0.0..1.0).contains(&v),
+            "fallback draw must still honour the contract"
+        );
+        let nd = ctx
+            .take_deferred_nd_error()
+            .expect("out-of-domain replay must record drift");
+        assert!(nd.contains("side-effect drift mismatch"), "{nd}");
+        assert!(nd.contains("out-of-domain"), "{nd}");
+    }
+
+    #[test]
+    fn random_f64_replays_valid_recorded_value() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Random,
+                name: None,
+                value: serde_json::json!(0.25_f64),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert!((ctx.random_f64() - 0.25).abs() < f64::EPSILON);
+        assert!(ctx.take_deferred_nd_error().is_none());
+    }
+
+    #[test]
+    fn random_range_rejects_out_of_range_replayed_value() {
+        // History captured 7 from random_range(0..100); the code now narrows to
+        // 0..5. The replayed 7 is outside the current range and must drift.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Random,
+                name: None,
+                value: serde_json::json!(7_i32),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let v: i32 = ctx.random_range(0..5_i32);
+        assert!((0..5).contains(&v), "fallback draw must honour the range");
+        let nd = ctx
+            .take_deferred_nd_error()
+            .expect("out-of-range replay must record drift");
+        assert!(nd.contains("side-effect drift mismatch"), "{nd}");
+        assert!(nd.contains("out-of-range"), "{nd}");
     }
 
     /// Replay safety (AC): a workflow that calls `system_now()` 1,000 times

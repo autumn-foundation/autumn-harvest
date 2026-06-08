@@ -2221,11 +2221,22 @@ impl WorkflowTestEnv {
                 Ok(true)
             }
 
+            // Deterministic side-effect capture (system_now/new_uuid/random_*/
+            // side_effect) emitted before a suspending command. The real worker
+            // persists these via build_suspension_events, so the harness must do
+            // the same — otherwise the next replay iteration sees the following
+            // event where it expects SideEffectRecorded and reports spurious drift.
+            // Pushed to `history` (not deferred_events) to preserve command order
+            // ahead of the suspending command's own scheduled event.
+            WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                history.push(WorkflowEvent::SideEffectRecorded { kind, name, value });
+                Ok(false)
+            }
+
             // WaitForActivity: activity was scheduled in a previous iteration;
             // its terminal event is already in history and will be matched on replay.
             WorkflowCommand::WaitForActivity { .. }
             | WorkflowCommand::RecordMarker { .. }
-            | WorkflowCommand::RecordSideEffect { .. }
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::ScheduleExternalActivity { .. }

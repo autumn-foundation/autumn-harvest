@@ -158,7 +158,16 @@ pub async fn run_workflow_strict(
                     error: format!("non-deterministic replay: {nd}"),
                 },
             ),
-            Ok(Err(error)) => WorkflowOutcome::Failed { error },
+            // A primitive may have drifted before the workflow returned Err from
+            // its own logic; prefer the non-determinism error (issue #384).
+            Ok(Err(error)) => {
+                ctx.take_deferred_nd_error()
+                    .map_or(WorkflowOutcome::Failed { error }, |nd| {
+                        WorkflowOutcome::Failed {
+                            error: format!("non-deterministic replay: {nd}"),
+                        }
+                    })
+            }
             Err(_elapsed) => {
                 // A plain-value built-in primitive (system_now/new_uuid/random_*)
                 // may have recorded a divergence before the workflow parked on an
@@ -354,7 +363,18 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
                 );
                 (outcome, ctx.drain_commands())
             }
-            Ok(Err(error)) => (WorkflowOutcome::Failed { error }, ctx.drain_commands()),
+            // A primitive may have drifted before the workflow returned Err from
+            // its own logic; prefer the non-determinism error (issue #384).
+            Ok(Err(error)) => {
+                let outcome =
+                    ctx.take_deferred_nd_error()
+                        .map_or(WorkflowOutcome::Failed { error }, |nd| {
+                            WorkflowOutcome::Failed {
+                                error: format!("non-deterministic replay: {nd}"),
+                            }
+                        });
+                (outcome, ctx.drain_commands())
+            }
 
             // Timeout elapsed -- the handler is suspended on a oneshot channel.
             // Drain the commands it emitted before suspending. RecordUpdateResult
@@ -425,6 +445,18 @@ mod tests {
         Box::pin(async move { Err("something went wrong".to_string()) })
     }
 
+    /// A workflow that captures a side-effect (drifts against history) and then
+    /// returns Err from its own logic.
+    fn drift_then_error_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = ctx.system_now(); // diverges from the recorded activity event
+            Err("business rule violated".to_string())
+        })
+    }
+
     /// A workflow that calls an activity (will suspend if not in history).
     fn activity_workflow<'a>(
         ctx: &'a WorkflowContext,
@@ -475,6 +507,44 @@ mod tests {
                 assert!(error.contains("something went wrong"));
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_prefers_deferred_drift_over_workflow_error() {
+        // Regression (issue #384): a primitive that drifts before the workflow
+        // returns Err from its own logic must surface as non-determinism rather
+        // than masquerading as an ordinary workflow failure.
+        let exec_id = ExecutionId::new();
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            // The workflow calls system_now() here, but history recorded an
+            // activity — a genuine divergence.
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "some_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+
+        let outcome = run_workflow(exec_id, history, drift_then_error_workflow, Value::Null).await;
+
+        match outcome {
+            WorkflowOutcome::Failed { error } => {
+                assert!(
+                    error.contains("non-deterministic replay"),
+                    "drift must win over the workflow's own error: {error}"
+                );
+                assert!(
+                    !error.contains("business rule violated"),
+                    "the workflow's Err must not mask the drift: {error}"
+                );
+            }
+            other => panic!("expected Failed(non-determinism), got {other:?}"),
         }
     }
 
