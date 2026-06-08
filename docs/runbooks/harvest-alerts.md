@@ -167,10 +167,45 @@ the workflow owner if failures are deterministic payload or code regressions.
 
 ## harvest_dlq_growth
 
+### DLQ flood — the first 60 seconds
+
+When the DLQ entry count crosses the alert threshold during an incident, the
+first question is *the shape of the fire*, not any single entry. Lead with the
+aggregation endpoint instead of paging the flat list or opening `psql`:
+
+```bash
+# What is this fire made of? One root cause or ten?
+harvest dlq aggregate \
+  --group-by workflow_name,failure_signature \
+  --since 24h --samples-per-group 3
+```
+
+Read the table top-down:
+
+- **One dominant group** (e.g. `onboarding / "stripe: rate limited" → 1,842`):
+  a single root cause. Fix the dependency, then bulk-replay with confidence
+  using the sample IDs to spot-check first
+  (`harvest dlq bulk-replay --dry-run …`).
+- **A flat spread across many groups**: unrelated bugs. Do *not* bulk-replay;
+  triage case by case from the largest groups down.
+
+`failure_signature` normalizes UUIDs, hex, and numbers in the first line of
+each error to fixed placeholders, so the same root cause aggregates identically
+across queries and shards. Counts sum across shards; `_other` rolls up the long
+tail so totals reconcile to `filtered_total`. Narrow with the same filters as
+the list endpoint (`--workflow-name`, `--activity-name`, `--queue-name`,
+`--since`, `--until`, `--min-attempts`) and pivot to a single entry via the
+`sample_dead_letter_ids`. The endpoint backing this is
+`GET /api/harvest/dead-letters/aggregate` (admin auth, parity with the list
+endpoint). The same view is one click away in the Vantage UI: open the **Dead
+Letters** page and flip the **Summary** toggle to see the top groups, switch the
+`group_by` dimension, and drill into the filtered list.
+
 ### Triage steps
 
-1. Run `harvest dlq list --limit 25`.
-2. Group entries by activity, workflow, shard, and error summary.
+1. Run the `harvest dlq aggregate` summary above to classify the flood.
+2. For the dominant group, pivot to its `sample_dead_letter_ids`, or list a
+   slice with `harvest dlq list --limit 25` for full row detail.
 3. Check whether the same activity failure alert is firing.
 4. Pick one affected execution and run `harvest workflow stack <execution_id>`.
 

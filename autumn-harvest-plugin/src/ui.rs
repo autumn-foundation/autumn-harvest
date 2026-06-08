@@ -78,6 +78,12 @@ const DEFAULT_PAGE_SIZE: i64 = 25;
 const DEFAULT_DLQ_PAGE_SIZE: i64 = 50;
 const MAX_PAGE_SIZE: i64 = 200;
 const DLQ_BULK_ACTION_LIMIT: usize = autumn_harvest::dlq::MAX_BULK_LIMIT as usize;
+/// Default grouping for the DLQ summary view (issue #385).
+const DEFAULT_DLQ_SUMMARY_GROUP_BY: &str = "workflow_name,failure_signature";
+/// Top-N groups rendered in the DLQ summary view before long-tail rollup.
+const DLQ_SUMMARY_GROUP_LIMIT: u32 = 25;
+/// Sample dead-letter IDs surfaced per summary group.
+const DLQ_SUMMARY_SAMPLES_PER_GROUP: u32 = 3;
 
 const KNOWN_STATES: &[&str] = KNOWN_WORKFLOW_STATES;
 
@@ -145,6 +151,15 @@ td code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;c
 .flash{background:#172554;color:#bfdbfe;border:1px solid #1d4ed8;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px}
 .shard-header{margin:20px 0 8px;font-size:13px;color:#94a3b8;font-weight:600;text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid #1e293b;padding-bottom:6px}
 .shard-error{background:#1c1917;border:1px solid #57534e;border-radius:6px;padding:12px 16px;color:#a8a29e;font-size:13px;margin-bottom:12px}
+.view-toggle{display:inline-flex;gap:2px;margin:0 0 16px;border:1px solid #334155;border-radius:6px;overflow:hidden;font-size:13px}
+.view-toggle a,.view-toggle span{padding:6px 14px;display:inline-block}
+.view-toggle a{color:#93c5fd;text-decoration:none}
+.view-toggle a:hover{background:#1e293b}
+.view-toggle span.active{background:#2563eb;color:#fff;font-weight:600}
+.summary-stats{display:flex;gap:18px;flex-wrap:wrap;margin:0 0 16px;font-size:13px;color:#94a3b8}
+.summary-stats strong{color:#e2e8f0}
+.summary-stats .note{color:#fbbf24}
+code.sample{display:inline-block;margin:0 4px 2px 0;font-size:11px;color:#cbd5e1}
 .pagination{display:flex;gap:8px;align-items:center;margin-top:16px;font-size:13px;color:#94a3b8}
 .pagination a,.pagination span{padding:6px 10px;border-radius:6px;border:1px solid #334155}
 .pagination a{color:#93c5fd}
@@ -325,6 +340,12 @@ pub(crate) struct DeadLetterListParams {
     refresh: Option<u64>,
     #[serde(default)]
     flash: Option<String>,
+    /// `summary` switches to the root-cause aggregation view (issue #385).
+    #[serde(default)]
+    view: Option<String>,
+    /// Comma-separated grouping dimensions for the summary view.
+    #[serde(default)]
+    group_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1362,6 +1383,20 @@ async fn list_dead_letters_ui(
     )?;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
+
+    // Summary toggle (issue #385): the root-cause aggregation view.
+    if params.view.as_deref() == Some("summary") {
+        return render_dead_letters_summary_view(
+            &pool,
+            &filters,
+            params.group_by.as_deref(),
+            limit,
+            params.refresh,
+            params.flash.as_deref(),
+        )
+        .await;
+    }
+
     let fetch_limit = offset.saturating_add(limit).saturating_add(1);
     let shard_results = load_dead_letters_from_shards_for_ui(&pool, &filters, fetch_limit).await;
     let is_multi_shard = shard_results.len() > 1;
@@ -1787,6 +1822,7 @@ fn render_dead_letters_page(
         @if let Some(message) = flash {
             div.flash { (message) }
         }
+        (render_dead_letter_view_toggle(filters, limit, refresh, None, false))
         (render_dead_letter_filters(filters, limit, refresh))
         (render_dead_letter_bulk_actions(filters, limit, refresh, total_matching))
 
@@ -1817,6 +1853,388 @@ fn render_dead_letters_page(
     };
 
     layout_dead_letters("Dead Letters · Vantage", &body, refresh)
+}
+
+// ---------------------------------------------------------------------------
+// DLQ root-cause summary view (issue #385)
+// ---------------------------------------------------------------------------
+
+/// Render the DLQ summary view: in-process root-cause aggregation, the same
+/// computation behind `GET /dead-letters/aggregate`, surfaced as a UI toggle.
+async fn render_dead_letters_summary_view(
+    pool: &crate::HarvestDbPool,
+    filters: &DeadLetterUiFilters,
+    group_by_raw: Option<&str>,
+    limit: i64,
+    refresh: Option<u64>,
+    flash: Option<&str>,
+) -> Result<Markup, AutumnError> {
+    let group_by = parse_dlq_summary_group_by(group_by_raw)?;
+    let group_by_value = group_by
+        .iter()
+        .map(|dim| dim.as_wire())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let params = autumn_harvest::dlq::DlqAggregateParams {
+        group_by: group_by.clone(),
+        time_bucket: autumn_harvest::dlq::TimeBucketGranularity::Hour,
+        workflow_name: filters.workflow_name.clone(),
+        activity_name: None,
+        queue_name: None,
+        task_type: filters.task_kind.map(|k| k.as_db_value().to_string()),
+        since: filters.failed_after,
+        until: filters.failed_before,
+        min_attempts: None,
+        limit_groups: DLQ_SUMMARY_GROUP_LIMIT,
+        samples_per_group: DLQ_SUMMARY_SAMPLES_PER_GROUP,
+    };
+
+    let (response, shard_errors) =
+        aggregate_dead_letters_for_ui(pool, &params, filters.shard_id).await;
+
+    let body = html! {
+        h2 { "Dead Letters" }
+        @if let Some(message) = flash {
+            div.flash { (message) }
+        }
+        (render_dead_letter_view_toggle(filters, limit, refresh, Some(&group_by_value), true))
+        (render_dead_letter_filters(filters, limit, refresh))
+        (render_dlq_summary_group_by_form(filters, limit, refresh, &group_by))
+
+        @for (shard_id, error) in &shard_errors {
+            div.shard-error {
+                strong { "Shard " (shard_id.as_i32()) " unavailable: " }
+                (error)
+            }
+        }
+
+        (render_dlq_summary_stats(&response))
+
+        @if response.groups.is_empty() {
+            div.card.empty {
+                @if filters.is_empty() {
+                    "No dead-lettered tasks. Healthy."
+                } @else {
+                    "No entries match this filter."
+                }
+            }
+        } @else {
+            (render_dlq_summary_table(&response, &group_by, filters, limit, refresh))
+        }
+    };
+
+    Ok(layout_dead_letters(
+        "Dead Letters · Summary · Vantage",
+        &body,
+        refresh,
+    ))
+}
+
+/// Parse the comma-separated `group_by` query value into validated dimensions,
+/// falling back to [`DEFAULT_DLQ_SUMMARY_GROUP_BY`] when empty. Mirrors the
+/// `400`-on-unknown-dimension contract of the aggregation endpoint.
+fn parse_dlq_summary_group_by(
+    raw: Option<&str>,
+) -> Result<Vec<autumn_harvest::dlq::DlqGroupDimension>, AutumnError> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_DLQ_SUMMARY_GROUP_BY);
+
+    let mut dims: Vec<autumn_harvest::dlq::DlqGroupDimension> = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let dim = autumn_harvest::dlq::DlqGroupDimension::from_wire(part).ok_or_else(|| {
+            AutumnError::bad_request_msg(format!(
+                "unknown group_by dimension '{part}'; expected one of: workflow_name, \
+                 activity_name, queue_name, task_type, time_bucket, failure_signature"
+            ))
+        })?;
+        if !dims.contains(&dim) {
+            dims.push(dim);
+        }
+    }
+
+    if dims.is_empty() {
+        return Err(AutumnError::bad_request_msg(
+            "at least one group_by dimension is required",
+        ));
+    }
+    Ok(dims)
+}
+
+/// Fan out the per-shard aggregation and merge into a single response, mirroring
+/// the management endpoint's `iter_shards()` merge. Per-shard errors are
+/// surfaced rather than failing the whole view.
+async fn aggregate_dead_letters_for_ui(
+    pool: &crate::HarvestDbPool,
+    params: &autumn_harvest::dlq::DlqAggregateParams,
+    shard_filter: Option<i32>,
+) -> (
+    autumn_harvest::dlq::DlqAggregateResponse,
+    Vec<(ShardId, String)>,
+) {
+    let futs: Vec<_> = pool
+        .iter_shards()
+        .map(|(shard_id, shard_pool)| async move {
+            if shard_filter.is_some_and(|wanted| wanted != shard_id.as_i32()) {
+                return (shard_id, Ok(None));
+            }
+            let result = async {
+                let mut conn = acquire_conn(shard_pool).await.map_err(|e| e.to_string())?;
+                autumn_harvest::dlq::aggregate_dead_letters(&mut conn, params)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            (shard_id, result.map(Some))
+        })
+        .collect();
+
+    let results = futures::future::join_all(futs).await;
+    let mut partials = Vec::new();
+    let mut errors = Vec::new();
+    for (shard_id, result) in results {
+        match result {
+            Ok(Some(partial)) => partials.push(partial),
+            Ok(None) => {}
+            Err(error) => errors.push((shard_id, error)),
+        }
+    }
+
+    (
+        autumn_harvest::dlq::merge_dlq_aggregates(params, partials),
+        errors,
+    )
+}
+
+fn render_dead_letter_view_toggle(
+    filters: &DeadLetterUiFilters,
+    limit: i64,
+    refresh: Option<u64>,
+    group_by_value: Option<&str>,
+    summary_active: bool,
+) -> Markup {
+    let base = build_dead_letter_query_string(limit, filters, refresh);
+    let list_href = if base.is_empty() {
+        "dead-letters".to_string()
+    } else {
+        format!("dead-letters?{}", &base[1..])
+    };
+    let group_by_query = group_by_value
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("&group_by={}", url_encode(value)))
+        .unwrap_or_default();
+    let summary_href = format!("dead-letters?view=summary{base}{group_by_query}");
+
+    html! {
+        div."view-toggle" {
+            @if summary_active {
+                a href=(list_href) { "List" }
+                span.active { "Summary" }
+            } @else {
+                span.active { "List" }
+                a href=(summary_href) { "Summary" }
+            }
+        }
+    }
+}
+
+fn render_dlq_summary_group_by_form(
+    filters: &DeadLetterUiFilters,
+    limit: i64,
+    refresh: Option<u64>,
+    selected: &[autumn_harvest::dlq::DlqGroupDimension],
+) -> Markup {
+    // Presets cover the high-value triage cuts; the selected value is preserved
+    // even if it is not one of the presets (custom query string).
+    const PRESETS: &[(&str, &str)] = &[
+        ("workflow_name,failure_signature", "Workflow × signature"),
+        ("failure_signature", "Failure signature"),
+        ("workflow_name", "Workflow"),
+        ("activity_name", "Activity"),
+        ("activity_name,failure_signature", "Activity × signature"),
+        ("queue_name", "Queue"),
+        ("task_type", "Task type"),
+        ("time_bucket", "Time bucket (hour)"),
+    ];
+    let selected_value = selected
+        .iter()
+        .map(|dim| dim.as_wire())
+        .collect::<Vec<_>>()
+        .join(",");
+    let selected_is_preset = PRESETS.iter().any(|(value, _)| *value == selected_value);
+
+    html! {
+        form.filters method="get" action="dead-letters" {
+            input type="hidden" name="view" value="summary";
+            (render_dead_letter_hidden_filters(filters))
+            @if limit != DEFAULT_DLQ_PAGE_SIZE {
+                input type="hidden" name="limit" value=(limit);
+            }
+            @if let Some(refresh) = refresh {
+                input type="hidden" name="refresh" value=(refresh);
+            }
+            label {
+                "Group by"
+                select name="group_by" {
+                    @for (value, label) in PRESETS {
+                        option value=(value) selected[*value == selected_value] { (label) }
+                    }
+                    @if !selected_is_preset {
+                        option value=(selected_value) selected { (selected_value) }
+                    }
+                }
+            }
+            button type="submit" { "Group" }
+        }
+    }
+}
+
+fn render_dlq_summary_stats(response: &autumn_harvest::dlq::DlqAggregateResponse) -> Markup {
+    html! {
+        div."summary-stats" {
+            span { strong { (response.filtered_total) } " matching" }
+            span { strong { (response.total) } " total in DLQ" }
+            span { strong { (response.groups.len()) } " groups" }
+            @if response.truncated {
+                span.note { "long tail rolled into “other”" }
+            }
+        }
+    }
+}
+
+fn render_dlq_summary_table(
+    response: &autumn_harvest::dlq::DlqAggregateResponse,
+    group_by: &[autumn_harvest::dlq::DlqGroupDimension],
+    filters: &DeadLetterUiFilters,
+    limit: i64,
+    refresh: Option<u64>,
+) -> Markup {
+    html! {
+        table {
+            thead {
+                tr {
+                    @for dim in group_by {
+                        th { (dim.as_wire()) }
+                    }
+                    th { "count" }
+                    th { "first_seen" }
+                    th { "last_seen" }
+                    th { "samples" }
+                    th { "actions" }
+                }
+            }
+            tbody {
+                @for group in &response.groups {
+                    @let is_other = group
+                        .key
+                        .get("_other")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    tr {
+                        @if is_other {
+                            td colspan=(group_by.len()) { em { "other (long tail)" } }
+                        } @else {
+                            @for dim in group_by {
+                                td { (dlq_summary_key_cell(&group.key, dim.as_wire())) }
+                            }
+                        }
+                        td { (group.count) }
+                        td { (format_timestamp(group.first_seen)) }
+                        td { (format_timestamp(group.last_seen)) }
+                        td {
+                            @if group.sample_dead_letter_ids.is_empty() {
+                                "—"
+                            } @else {
+                                @for sample in &group.sample_dead_letter_ids {
+                                    code.sample { (sample) }
+                                }
+                            }
+                        }
+                        td {
+                            @if is_other {
+                                "—"
+                            } @else {
+                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, limit, refresh);
+                                a href=(href) title=[partial.then_some("Some dimensions have no list-view filter — results may include extra rows from other groups")] {
+                                    @if partial {
+                                        "View entries (partial filter) →"
+                                    } @else {
+                                        "View entries →"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn dlq_summary_key_cell(key: &serde_json::Value, dim: &str) -> String {
+    match key.get(dim) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Null) | None => "—".to_string(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Build a click-through link into the list view with whatever filters the list
+/// view can express pre-applied from this group's key.
+///
+/// Returns `(href, is_partial)`. `is_partial` is `true` when one or more
+/// group dimensions (`activity_name`, `queue_name`, `time_bucket`,
+/// `failure_signature`) have no equivalent list-view filter — the resulting
+/// link will show a superset of the selected group.
+fn dlq_summary_drilldown_href(
+    key: &serde_json::Value,
+    group_by: &[autumn_harvest::dlq::DlqGroupDimension],
+    filters: &DeadLetterUiFilters,
+    limit: i64,
+    refresh: Option<u64>,
+) -> (String, bool) {
+    use autumn_harvest::dlq::DlqGroupDimension;
+
+    // Start from the filters already applied to the summary so drill-down
+    // narrows rather than widens.
+    let mut drill = filters.clone();
+    let mut partial = false;
+    for dim in group_by {
+        match dim {
+            DlqGroupDimension::WorkflowName => {
+                if let Some(serde_json::Value::String(name)) = key.get("workflow_name") {
+                    drill.workflow_name = Some(name.clone());
+                }
+            }
+            DlqGroupDimension::TaskType => {
+                if let Some(serde_json::Value::String(task_type)) = key.get("task_type") {
+                    drill.task_kind = DeadLetterTaskKind::parse(task_type).ok();
+                }
+            }
+            // No list-view filter exists for these dimensions; the link will
+            // show more rows than belong to this exact group.
+            DlqGroupDimension::ActivityName
+            | DlqGroupDimension::QueueName
+            | DlqGroupDimension::TimeBucket
+            | DlqGroupDimension::FailureSignature => {
+                partial = true;
+            }
+        }
+    }
+
+    let query = build_dead_letter_query_string(limit, &drill, refresh);
+    let href = if query.is_empty() {
+        "dead-letters".to_string()
+    } else {
+        format!("dead-letters?{}", &query[1..])
+    };
+    (href, partial)
 }
 
 fn render_dead_letter_filters(
