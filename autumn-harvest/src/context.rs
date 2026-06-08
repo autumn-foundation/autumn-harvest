@@ -1663,9 +1663,7 @@ impl WorkflowContext {
                 });
                 result
             }
-            _ => unreachable!(
-                "match_side_effect_event only returns Matched, Diverged or NoMatch"
-            ),
+            _ => unreachable!("match_side_effect_event only returns Matched, Diverged or NoMatch"),
         }
     }
 
