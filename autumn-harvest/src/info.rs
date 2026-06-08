@@ -352,7 +352,52 @@ fn validate_node(
         return;
     };
 
-    // field_path helper: returns None for the root, Some(ptr) otherwise.
+    if !validate_type(schema_obj, value, ptr, out) {
+        return;
+    }
+
+    validate_required(schema_obj, value, ptr, out);
+
+    validate_properties(root, schema_obj, value, ptr, out);
+
+    validate_enum(schema_obj, value, ptr, out);
+
+    validate_array_items(root, schema_obj, value, ptr, out);
+
+    validate_string_length(schema_obj, value, ptr, out);
+
+    validate_number_range(schema_obj, value, ptr, out);
+
+    validate_additional_props(root, schema_obj, value, ptr, out);
+
+    validate_all_of(root, schema_obj, value, ptr, out);
+    validate_any_of(root, schema_obj, value, ptr, out);
+    validate_one_of(root, schema_obj, value, ptr, out);
+}
+
+fn validate_all_of(
+    root: &serde_json::Value,
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
+    if let Some(all_of) = schema_obj.get("allOf").and_then(|v| v.as_array()) {
+        for sub_schema in all_of {
+            let mut sub_violations = Vec::new();
+            validate_node(root, sub_schema, value, ptr, &mut sub_violations);
+            out.extend(sub_violations);
+        }
+    }
+}
+
+fn validate_any_of(
+    root: &serde_json::Value,
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
     let path = || {
         if ptr.is_empty() {
             None
@@ -361,130 +406,63 @@ fn validate_node(
         }
     };
 
-    // type check — handles both scalar "type": "string" and multi-type "type": ["string","null"]
-    if let Some(type_node) = schema_obj.get("type") {
-        let type_ok = type_node.as_str().map_or_else(
-            || {
-                type_node.as_array().is_none_or(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .any(|t| type_matches(t, value))
-                })
-            },
-            |single| type_matches(single, value),
-        );
-        if !type_ok {
-            let expected = type_node.to_string();
-            out.push(SchemaViolation {
-                message: format!("expected type {expected}, got '{}'", json_type_name(value)),
-                field_path: path(),
-            });
-            return;
-        }
-    }
-
-    // required fields
-    if let (Some(required), Some(obj)) = (
-        schema_obj.get("required").and_then(|v| v.as_array()),
-        value.as_object(),
-    ) {
-        for req in required {
-            if let Some(field) = req.as_str()
-                && !obj.contains_key(field)
-            {
-                // Escape field name per RFC 6901: ~ → ~0, / → ~1.
-                let escaped = field.replace('~', "~0").replace('/', "~1");
-                out.push(SchemaViolation {
-                    message: format!("missing required field '{field}'"),
-                    field_path: Some(format!("{ptr}/{escaped}")),
-                });
-            }
-        }
-    }
-
-    // properties — recurse
-    if let (Some(properties), Some(obj)) = (
-        schema_obj.get("properties").and_then(|v| v.as_object()),
-        value.as_object(),
-    ) {
-        for (prop_name, prop_schema) in properties {
-            if let Some(prop_value) = obj.get(prop_name) {
-                // Escape property name per RFC 6901: ~ → ~0, / → ~1.
-                let escaped_name = prop_name.replace('~', "~0").replace('/', "~1");
-                let child_ptr = format!("{ptr}/{escaped_name}");
-                validate_node(root, prop_schema, prop_value, &child_ptr, out);
-            }
-        }
-    }
-
-    // enum check
-    if let Some(enum_vals) = schema_obj.get("enum").and_then(|v| v.as_array())
-        && !enum_vals.contains(value)
-    {
-        out.push(SchemaViolation {
-            message: "value is not one of the allowed enum values".to_string(),
-            field_path: path(),
+    if let Some(any_of) = schema_obj.get("anyOf").and_then(|v| v.as_array()) {
+        let satisfied = any_of.iter().any(|sub_schema| {
+            let mut sub_violations = Vec::new();
+            validate_node(root, sub_schema, value, ptr, &mut sub_violations);
+            sub_violations.is_empty()
         });
-    }
-
-    // array items — recurse into each element
-    if let (Some(items_schema), Some(arr)) = (schema_obj.get("items"), value.as_array()) {
-        for (i, elem) in arr.iter().enumerate() {
-            let child_ptr = format!("{ptr}/{i}");
-            validate_node(root, items_schema, elem, &child_ptr, out);
-        }
-    }
-
-    // minLength / maxLength for strings
-    if let Some(s) = value.as_str() {
-        let char_count = s.chars().count() as u64;
-        if let Some(min) = schema_obj
-            .get("minLength")
-            .and_then(serde_json::Value::as_u64)
-            && char_count < min
-        {
+        if !satisfied {
             out.push(SchemaViolation {
-                message: format!("string is shorter than minLength {min}"),
-                field_path: path(),
-            });
-        }
-        if let Some(max) = schema_obj
-            .get("maxLength")
-            .and_then(serde_json::Value::as_u64)
-            && char_count > max
-        {
-            out.push(SchemaViolation {
-                message: format!("string is longer than maxLength {max}"),
+                message: "value does not match any of the allowed schemas (anyOf)".to_string(),
                 field_path: path(),
             });
         }
     }
+}
 
-    // minimum / maximum for numbers
-    if let Some(n) = value.as_f64() {
-        if let Some(min) = schema_obj
-            .get("minimum")
-            .and_then(serde_json::Value::as_f64)
-            && n < min
-        {
-            out.push(SchemaViolation {
-                message: format!("value {n} is less than minimum {min}"),
-                field_path: path(),
-            });
+fn validate_one_of(
+    root: &serde_json::Value,
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
+    let path = || {
+        if ptr.is_empty() {
+            None
+        } else {
+            Some(ptr.to_string())
         }
-        if let Some(max) = schema_obj
-            .get("maximum")
-            .and_then(serde_json::Value::as_f64)
-            && n > max
-        {
+    };
+
+    if let Some(one_of) = schema_obj.get("oneOf").and_then(|v| v.as_array()) {
+        let matched = one_of
+            .iter()
+            .filter(|sub_schema| {
+                let mut sub_violations = Vec::new();
+                validate_node(root, sub_schema, value, ptr, &mut sub_violations);
+                sub_violations.is_empty()
+            })
+            .count();
+        if matched != 1 {
             out.push(SchemaViolation {
-                message: format!("value {n} is greater than maximum {max}"),
+                message: format!(
+                    "value matches {matched} of the allowed schemas (oneOf requires exactly 1)"
+                ),
                 field_path: path(),
             });
         }
     }
+}
 
-    // additionalProperties — reject unknown keys (false) or validate them against a sub-schema
+fn validate_additional_props(
+    root: &serde_json::Value,
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
     if let (Some(add_props), Some(obj)) =
         (schema_obj.get("additionalProperties"), value.as_object())
     {
@@ -515,50 +493,206 @@ fn validate_node(
             }
         }
     }
+}
 
-    // allOf — value must satisfy every sub-schema
-    if let Some(all_of) = schema_obj.get("allOf").and_then(|v| v.as_array()) {
-        for sub_schema in all_of {
-            let mut sub_violations = Vec::new();
-            validate_node(root, sub_schema, value, ptr, &mut sub_violations);
-            out.extend(sub_violations);
+fn validate_number_range(
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
+    let path = || {
+        if ptr.is_empty() {
+            None
+        } else {
+            Some(ptr.to_string())
+        }
+    };
+
+    if let Some(n) = value.as_f64() {
+        if let Some(min) = schema_obj
+            .get("minimum")
+            .and_then(serde_json::Value::as_f64)
+            && n < min
+        {
+            out.push(SchemaViolation {
+                message: format!("value {n} is less than minimum {min}"),
+                field_path: path(),
+            });
+        }
+        if let Some(max) = schema_obj
+            .get("maximum")
+            .and_then(serde_json::Value::as_f64)
+            && n > max
+        {
+            out.push(SchemaViolation {
+                message: format!("value {n} is greater than maximum {max}"),
+                field_path: path(),
+            });
         }
     }
+}
 
-    // anyOf — value must satisfy at least one sub-schema
-    if let Some(any_of) = schema_obj.get("anyOf").and_then(|v| v.as_array()) {
-        let satisfied = any_of.iter().any(|sub_schema| {
-            let mut sub_violations = Vec::new();
-            validate_node(root, sub_schema, value, ptr, &mut sub_violations);
-            sub_violations.is_empty()
+fn validate_string_length(
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
+    let path = || {
+        if ptr.is_empty() {
+            None
+        } else {
+            Some(ptr.to_string())
+        }
+    };
+
+    if let Some(s) = value.as_str() {
+        let char_count = s.chars().count() as u64;
+        if let Some(min) = schema_obj
+            .get("minLength")
+            .and_then(serde_json::Value::as_u64)
+            && char_count < min
+        {
+            out.push(SchemaViolation {
+                message: format!("string is shorter than minLength {min}"),
+                field_path: path(),
+            });
+        }
+        if let Some(max) = schema_obj
+            .get("maxLength")
+            .and_then(serde_json::Value::as_u64)
+            && char_count > max
+        {
+            out.push(SchemaViolation {
+                message: format!("string is longer than maxLength {max}"),
+                field_path: path(),
+            });
+        }
+    }
+}
+
+fn validate_array_items(
+    root: &serde_json::Value,
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
+    if let (Some(items_schema), Some(arr)) = (schema_obj.get("items"), value.as_array()) {
+        for (i, elem) in arr.iter().enumerate() {
+            let child_ptr = format!("{ptr}/{i}");
+            validate_node(root, items_schema, elem, &child_ptr, out);
+        }
+    }
+}
+
+fn validate_enum(
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
+    let path = || {
+        if ptr.is_empty() {
+            None
+        } else {
+            Some(ptr.to_string())
+        }
+    };
+
+    if let Some(enum_vals) = schema_obj.get("enum").and_then(|v| v.as_array())
+        && !enum_vals.contains(value)
+    {
+        out.push(SchemaViolation {
+            message: "value is not one of the allowed enum values".to_string(),
+            field_path: path(),
         });
-        if !satisfied {
-            out.push(SchemaViolation {
-                message: "value does not match any of the allowed schemas (anyOf)".to_string(),
-                field_path: path(),
-            });
-        }
     }
+}
 
-    // oneOf — value must satisfy exactly one sub-schema
-    if let Some(one_of) = schema_obj.get("oneOf").and_then(|v| v.as_array()) {
-        let matched = one_of
-            .iter()
-            .filter(|sub_schema| {
-                let mut sub_violations = Vec::new();
-                validate_node(root, sub_schema, value, ptr, &mut sub_violations);
-                sub_violations.is_empty()
-            })
-            .count();
-        if matched != 1 {
-            out.push(SchemaViolation {
-                message: format!(
-                    "value matches {matched} of the allowed schemas (oneOf requires exactly 1)"
-                ),
-                field_path: path(),
-            });
+fn validate_properties(
+    root: &serde_json::Value,
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
+    if let (Some(properties), Some(obj)) = (
+        schema_obj.get("properties").and_then(|v| v.as_object()),
+        value.as_object(),
+    ) {
+        for (prop_name, prop_schema) in properties {
+            if let Some(prop_value) = obj.get(prop_name) {
+                // Escape property name per RFC 6901: ~ → ~0, / → ~1.
+                let escaped_name = prop_name.replace('~', "~0").replace('/', "~1");
+                let child_ptr = format!("{ptr}/{escaped_name}");
+                validate_node(root, prop_schema, prop_value, &child_ptr, out);
+            }
         }
     }
+}
+
+fn validate_required(
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
+    if let (Some(required), Some(obj)) = (
+        schema_obj.get("required").and_then(|v| v.as_array()),
+        value.as_object(),
+    ) {
+        for req in required {
+            if let Some(field) = req.as_str()
+                && !obj.contains_key(field)
+            {
+                // Escape field name per RFC 6901: ~ → ~0, / → ~1.
+                let escaped = field.replace('~', "~0").replace('/', "~1");
+                out.push(SchemaViolation {
+                    message: format!("missing required field '{field}'"),
+                    field_path: Some(format!("{ptr}/{escaped}")),
+                });
+            }
+        }
+    }
+}
+
+fn validate_type(
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) -> bool {
+    let path = || {
+        if ptr.is_empty() {
+            None
+        } else {
+            Some(ptr.to_string())
+        }
+    };
+
+    if let Some(type_node) = schema_obj.get("type") {
+        let type_ok = type_node.as_str().map_or_else(
+            || {
+                type_node.as_array().is_none_or(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .any(|t| type_matches(t, value))
+                })
+            },
+            |single| type_matches(single, value),
+        );
+        if !type_ok {
+            let expected = type_node.to_string();
+            out.push(SchemaViolation {
+                message: format!("expected type {expected}, got '{}'", json_type_name(value)),
+                field_path: path(),
+            });
+            return false;
+        }
+    }
+    true
 }
 
 fn type_matches(expected_type: &str, value: &serde_json::Value) -> bool {
