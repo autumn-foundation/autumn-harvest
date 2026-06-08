@@ -160,6 +160,15 @@ pub async fn run_workflow_strict(
             ),
             Ok(Err(error)) => WorkflowOutcome::Failed { error },
             Err(_elapsed) => {
+                // A plain-value built-in primitive (system_now/new_uuid/random_*)
+                // may have recorded a divergence before the workflow parked on an
+                // await point. Fail the execution now rather than suspending from
+                // a non-deterministic state (issue #384).
+                if let Some(nd) = ctx.take_deferred_nd_error() {
+                    return WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                    };
+                }
                 let mut commands = ctx.drain_commands();
                 if let Some(idx) = commands
                     .iter()
@@ -352,6 +361,18 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
             // commands emitted in this cycle are included in the commands list and
             // will be handled by the worker alongside the suspension side-effects.
             Err(_elapsed) => {
+                // A plain-value built-in primitive (system_now/new_uuid/random_*)
+                // may have recorded a divergence before the workflow parked on an
+                // await point. Fail the execution now rather than suspending from
+                // a non-deterministic state (issue #384).
+                if let Some(nd) = ctx.take_deferred_nd_error() {
+                    return (
+                        WorkflowOutcome::Failed {
+                            error: format!("non-deterministic replay: {nd}"),
+                        },
+                        ctx.drain_commands(),
+                    );
+                }
                 let mut commands = ctx.drain_commands();
                 // ContinueAsNew is terminal: when the workflow body parks on
                 // the dedicated suspension future, the latest command in the

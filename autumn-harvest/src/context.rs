@@ -1595,6 +1595,11 @@ impl WorkflowContext {
     /// implements [`rand::distributions::uniform::SampleUniform`] and round-trips
     /// through JSON (e.g. `0..100`, `1.0..2.0`).
     ///
+    /// On replay, if the recorded value falls outside the current `range` bounds a
+    /// deferred non-determinism error is recorded (the executor converts this to a
+    /// `WorkflowFailed` outcome), preventing a range-narrowing code change from
+    /// silently returning an out-of-bounds value.
+    ///
     /// # Panics
     ///
     /// Panics if `range` is empty, or if the internal matcher/commands mutex is
@@ -1603,12 +1608,65 @@ impl WorkflowContext {
     where
         T: serde::Serialize
             + serde::de::DeserializeOwned
-            + rand::distributions::uniform::SampleUniform,
-        R: rand::distributions::uniform::SampleRange<T>,
+            + rand::distributions::uniform::SampleUniform
+            + PartialOrd,
+        R: rand::distributions::uniform::SampleRange<T> + std::ops::RangeBounds<T>,
     {
-        self.capture_builtin(crate::event::SideEffectKind::Random, move || {
-            rand::Rng::gen_range(&mut rand::thread_rng(), range)
-        })
+        use crate::event::SideEffectKind;
+
+        let history_match =
+            self.match_history(|m| m.match_side_effect_event(SideEffectKind::Random, None));
+
+        match history_match {
+            HistoryMatch::Matched { output } => match serde_json::from_value::<T>(output) {
+                Ok(value) => {
+                    if range.contains(&value) {
+                        value
+                    } else {
+                        self.record_deferred_nd(
+                            "side-effect drift: replayed random_range value is outside \
+                             the current range bounds"
+                                .to_string(),
+                        );
+                        rand::Rng::gen_range(&mut rand::thread_rng(), range)
+                    }
+                }
+                Err(e) => {
+                    self.record_deferred_nd(format!(
+                        "side-effect drift mismatch: expected SideEffectRecorded(random), \
+                         got an undeserialisable recorded value ({e})"
+                    ));
+                    rand::Rng::gen_range(&mut rand::thread_rng(), range)
+                }
+            },
+            HistoryMatch::Diverged { expected, actual } => {
+                self.record_deferred_nd(format!(
+                    "side-effect drift mismatch: expected {expected}, got {actual}"
+                ));
+                rand::Rng::gen_range(&mut rand::thread_rng(), range)
+            }
+            HistoryMatch::NoMatch => {
+                if self.strict_replay {
+                    self.record_deferred_nd(
+                        "side-effect drift mismatch: expected <end of history>, \
+                         got SideEffectRecorded(random)"
+                            .to_string(),
+                    );
+                }
+                let result = rand::Rng::gen_range(&mut rand::thread_rng(), range);
+                let value = serde_json::to_value(&result)
+                    .expect("built-in side-effect value must serialise");
+                self.push_command(WorkflowCommand::RecordSideEffect {
+                    kind: SideEffectKind::Random,
+                    name: None,
+                    value,
+                });
+                result
+            }
+            _ => unreachable!(
+                "match_side_effect_event only returns Matched, Diverged or NoMatch"
+            ),
+        }
     }
 
     /// Convenience wrapper around `side_effect` for generating a deterministic UUID.
