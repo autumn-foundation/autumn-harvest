@@ -48,6 +48,75 @@ pub fn export_mermaid(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+/// Exports a DAG profile timeline to a Mermaid.js Gantt chart.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::dag_profiler::DagProfiler;
+/// use autumn_harvest::dag_export::export_mermaid_gantt;
+/// use std::time::Duration;
+///
+/// fn my_activity() {}
+/// fn my_other_activity() {}
+///
+/// let mut builder = DagBuilder::new();
+/// let a = builder.activity(my_activity);
+/// let b = builder.activity(my_other_activity).upstream(&a);
+/// let dag = builder.build().unwrap();
+///
+/// let profile = DagProfiler::new(dag)
+///     .mock_duration("my_activity", Duration::from_secs(2))
+///     .mock_duration("my_other_activity", Duration::from_secs(3))
+///     .profile();
+///
+/// let gantt = export_mermaid_gantt(&profile).unwrap();
+/// assert!(gantt.contains("gantt"));
+/// assert!(gantt.contains("my_activity"));
+/// ```
+///
+/// # Panics
+/// Panics if a `TaskCompleted` event is encountered before its corresponding `TaskStarted` event.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "testing")]
+pub fn export_mermaid_gantt(
+    profile: &crate::dag_profiler::DagProfile,
+) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "gantt")?;
+    writeln!(out, "    title DAG Execution Profile")?;
+    writeln!(out, "    dateFormat x")?;
+    writeln!(out, "    axisFormat %H:%M:%S")?;
+    writeln!(out, "    section Tasks")?;
+
+    let mut start_times = std::collections::HashMap::new();
+    let mut task_names = std::collections::HashMap::new();
+
+    for event in &profile.timeline {
+        match &event.kind {
+            crate::dag_profiler::ProfilerEventKind::TaskStarted(idx, name) => {
+                start_times.insert(*idx, event.time);
+                task_names.insert(*idx, name.clone());
+            }
+            crate::dag_profiler::ProfilerEventKind::TaskCompleted(idx, _) => {
+                if let Some(start) = start_times.remove(idx) {
+                    let name = task_names
+                        .get(idx)
+                        .expect("Task name must exist if start time was recorded");
+                    let start_ms = start.as_millis();
+                    let end_ms = event.time.as_millis();
+                    writeln!(out, "    {name} : {start_ms}, {end_ms}")?;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// Exports the DAG definition to Graphviz DOT format.
 ///
 /// # Examples
@@ -153,5 +222,47 @@ digraph DAG {
 }
 ";
         assert_eq!(dot, expected_dot);
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn test_export_mermaid_gantt() {
+        use crate::dag_profiler::{DagProfile, ProfilerEvent, ProfilerEventKind};
+        use std::time::Duration;
+
+        let profile = DagProfile {
+            total_duration: Duration::from_secs(5),
+            peak_concurrency: 1,
+            timeline: vec![
+                ProfilerEvent {
+                    time: Duration::from_secs(0),
+                    kind: ProfilerEventKind::TaskStarted(0, "a".into()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(2),
+                    kind: ProfilerEventKind::TaskCompleted(0, "a".into()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(2),
+                    kind: ProfilerEventKind::TaskStarted(1, "b".into()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(5),
+                    kind: ProfilerEventKind::TaskCompleted(1, "b".into()),
+                },
+            ],
+        };
+
+        let gantt = export_mermaid_gantt(&profile).unwrap();
+        let expected = "\
+gantt
+    title DAG Execution Profile
+    dateFormat x
+    axisFormat %H:%M:%S
+    section Tasks
+    a : 0, 2000
+    b : 2000, 5000
+";
+        assert_eq!(gantt, expected);
     }
 }
