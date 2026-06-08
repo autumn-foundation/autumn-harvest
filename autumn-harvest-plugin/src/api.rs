@@ -3812,7 +3812,10 @@ fn parse_history_datetime(value: &str) -> Result<chrono::DateTime<chrono::Utc>, 
 
 fn states_for_history_state_group(value: &str) -> Result<Vec<String>, AutumnError> {
     match value {
-        "active" => Ok(vec!["RUNNING".to_string()]),
+        // PAUSED is a non-terminal active state (issue #383): it must be
+        // enumerated everywhere active runs are, so the `active` group includes
+        // it alongside RUNNING rather than silently omitting paused executions.
+        "active" => Ok(vec!["RUNNING".to_string(), "PAUSED".to_string()]),
         "terminal" => Ok(terminal_workflow_states()),
         "all" => Ok(Vec::new()),
         other => Err(AutumnError::bad_request_msg(format!(
@@ -6615,10 +6618,15 @@ async fn pause_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<PauseWorkflowRequest>,
+    // The request body is optional (issue #383): pausing without a reason is the
+    // common case, so a no-body / no-content-type POST must still pause rather
+    // than be rejected by the required-`Json` extractor before reaching the
+    // defaulted `reason`.
+    request: Option<Json<PauseWorkflowRequest>>,
 ) -> Result<(axum::http::StatusCode, Json<PauseWorkflowResponse>), AutumnError> {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/pause";
+    let request = request.map(|Json(body)| body).unwrap_or_default();
 
     let exec_id = parse_execution_id(&id)?;
     // Reject an over-long reason at the boundary (400) so the only conflicts the

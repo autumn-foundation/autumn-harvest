@@ -5522,6 +5522,19 @@ async fn process_workflow_task(
     // decision without persisting any new commands and re-park the task:
     // resume_workflow_execution wakes it, and the deterministic handler
     // re-derives the same commands on replay.
+    //
+    // Best-effort, by design: this is a non-locking read in autocommit, run
+    // *before* the persistence transaction below opens, so it does not
+    // serialize with `pause_workflow_execution`'s `FOR UPDATE` row lock. The
+    // claim-layer gate (`queue::claim_task`) is the authoritative defence — it
+    // prevents the task from ever being *claimed* while PAUSED. This re-check
+    // only narrows the window for a decision that was already mid-flight when
+    // the pause committed. A pause that commits in the gap between this read
+    // and the persist below may still let that single in-flight decision land,
+    // which is consistent with the activity semantics (already-dispatched
+    // activities run to completion). All *subsequent* tasks observe PAUSED at
+    // claim time and defer. We accept the narrow window rather than hold the
+    // execution row lock across the full persistence path.
     {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
         let current_state: Option<String> = exec_dsl::harvest_workflow_executions
