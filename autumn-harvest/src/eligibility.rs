@@ -87,54 +87,106 @@ pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
     Ok(requirements)
 }
 
-fn parse_single_requirement(token: &str) -> Result<Requirement, String> {
-    if let Some(idx) = token.find('=') {
-        let key_raw = &token[..idx];
-        let mut val_raw = &token[idx + 1..];
-        if val_raw.starts_with('=') {
-            val_raw = &val_raw[1..];
-        }
+fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
+    let mut eq_idx = None;
+    let mut in_idx = None;
+    let mut in_quotes = None;
+    let token_chars: Vec<char> = token.chars().collect();
+    let token_lower = token.to_lowercase();
+    let token_lower_chars: Vec<char> = token_lower.chars().collect();
 
-        let key = strip_quotes(key_raw).to_string();
-        if key.is_empty() {
-            return Err(format!("empty key in requirement '{token}'"));
-        }
-        let value = strip_quotes(val_raw).to_string();
-
-        Ok(Requirement::Exact { key, value })
-    } else {
-        let token_lower = token.to_lowercase();
-        if let Some(idx) = token_lower.find(" in ") {
-            let key_raw = &token[..idx];
-            let val_raw = &token[idx + 4..];
-
-            let key = strip_quotes(key_raw).to_string();
-            if key.is_empty() {
-                return Err(format!("empty key in requirement '{token}'"));
-            }
-
-            let val_trimmed = val_raw.trim();
-            if !val_trimmed.starts_with('[') || !val_trimmed.ends_with(']') {
-                return Err(format!(
-                    "invalid set syntax in requirement '{token}'; expected [...]"
-                ));
-            }
-
-            let inner = &val_trimmed[1..val_trimmed.len() - 1];
-            let mut values = Vec::new();
-            for item in inner.split(',') {
-                let item_stripped = strip_quotes(item);
-                if !item_stripped.is_empty() {
-                    values.push(item_stripped.to_string());
+    let mut i = 0;
+    while i < token_chars.len() {
+        let c = token_chars[i];
+        match c {
+            '\'' | '"' => {
+                if in_quotes == Some(c) {
+                    in_quotes = None;
+                } else if in_quotes.is_none() {
+                    in_quotes = Some(c);
                 }
             }
-
-            Ok(Requirement::In { key, values })
-        } else {
-            Err(format!(
-                "invalid requirement syntax: '{token}'; expected '=' or 'in'"
-            ))
+            '=' if in_quotes.is_none() && eq_idx.is_none() => {
+                eq_idx = Some(i);
+            }
+            _ => {
+                if in_quotes.is_none()
+                    && in_idx.is_none()
+                    && i + 3 < token_chars.len()
+                    && token_lower_chars[i] == ' '
+                    && token_lower_chars[i + 1] == 'i'
+                    && token_lower_chars[i + 2] == 'n'
+                    && token_lower_chars[i + 3] == ' '
+                {
+                    in_idx = Some(i);
+                }
+            }
         }
+        i += 1;
+    }
+    (eq_idx, in_idx)
+}
+
+fn parse_exact(token: &str, idx: usize) -> Result<Requirement, String> {
+    let key_raw = &token[..idx];
+    let mut val_raw = &token[idx + 1..];
+    if val_raw.starts_with('=') {
+        val_raw = &val_raw[1..];
+    }
+
+    let key = strip_quotes(key_raw).to_string();
+    if key.is_empty() {
+        return Err(format!("empty key in requirement '{token}'"));
+    }
+    let value = strip_quotes(val_raw).to_string();
+
+    Ok(Requirement::Exact { key, value })
+}
+
+fn parse_in(token: &str, idx: usize) -> Result<Requirement, String> {
+    let key_raw = &token[..idx];
+    let val_raw = &token[idx + 4..];
+
+    let key = strip_quotes(key_raw).to_string();
+    if key.is_empty() {
+        return Err(format!("empty key in requirement '{token}'"));
+    }
+
+    let val_trimmed = val_raw.trim();
+    if !val_trimmed.starts_with('[') || !val_trimmed.ends_with(']') {
+        return Err(format!(
+            "invalid set syntax in requirement '{token}'; expected [...]"
+        ));
+    }
+
+    let inner = &val_trimmed[1..val_trimmed.len() - 1];
+    let mut values = Vec::new();
+    for item in inner.split(',') {
+        let item_stripped = strip_quotes(item);
+        if !item_stripped.is_empty() {
+            values.push(item_stripped.to_string());
+        }
+    }
+
+    Ok(Requirement::In { key, values })
+}
+
+fn parse_single_requirement(token: &str) -> Result<Requirement, String> {
+    let (eq_idx, in_idx) = find_operator_indices(token);
+
+    match (eq_idx, in_idx) {
+        (Some(idx), None) => parse_exact(token, idx),
+        (None, Some(idx)) => parse_in(token, idx),
+        (Some(eq_i), Some(in_i)) => {
+            if in_i < eq_i {
+                parse_in(token, in_i)
+            } else {
+                parse_exact(token, eq_i)
+            }
+        }
+        (None, None) => Err(format!(
+            "invalid requirement syntax: '{token}'; expected '=' or 'in'"
+        )),
     }
 }
 
@@ -280,6 +332,16 @@ mod tests {
             vec![Requirement::Exact {
                 key: "some_key".to_string(),
                 value: "value, with, comma".to_string()
+            }]
+        );
+
+        // Set membership with equal signs inside quoted/unquoted set items
+        let parsed4 = parse_requirements("runtime in [cuda=12, rocm=6]").unwrap();
+        assert_eq!(
+            parsed4,
+            vec![Requirement::In {
+                key: "runtime".to_string(),
+                values: vec!["cuda=12".to_string(), "rocm=6".to_string()]
             }]
         );
     }

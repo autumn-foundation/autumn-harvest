@@ -397,6 +397,7 @@ pub async fn claim_task(
                AND ( \
                    task_type != 'activity' \
                    OR activity_name IS NULL \
+                   OR required_capabilities IS NOT NULL \
                    OR NOT (activity_name = ANY($6)) \
                ) \
                AND ( \
