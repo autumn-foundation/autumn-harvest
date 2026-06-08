@@ -116,9 +116,7 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
     ),
     "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000000_harvest_workflow_pause/up.sql"
-    )
+    include_str!("../../autumn-harvest/migrations/20260607000000_harvest_workflow_pause/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
