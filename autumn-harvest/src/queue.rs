@@ -1240,7 +1240,40 @@ pub async fn wake_workflow_task(
         rows.into_iter().map(|r| r.queue_name).collect()
     };
 
+    // A workflow task may already be PENDING with an elapsed `scheduled_at` —
+    // e.g. a timer fired while the execution was PAUSED (issue #383), so the
+    // task was enqueued but never re-pended by the UPDATE above. Such a task is
+    // immediately claimable once the execution is RUNNING again, but no fresh
+    // NOTIFY was emitted for it, so a LISTEN-based worker would sleep until the
+    // next poll interval. Notify those queues too so resume re-arms promptly.
+    let already_due_queue_names: Vec<String> = {
+        use diesel::deserialize::QueryableByName;
+        use diesel::sql_types::Text;
+
+        #[derive(QueryableByName)]
+        struct QueueNameRow {
+            #[diesel(sql_type = Text)]
+            queue_name: String,
+        }
+
+        let rows: Vec<QueueNameRow> = diesel::sql_query(
+            "SELECT DISTINCT queue_name FROM harvest_task_queue \
+             WHERE workflow_exec_id = $1 \
+               AND task_type = 'workflow' \
+               AND state = 'PENDING' \
+               AND scheduled_at <= $2",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        rows.into_iter().map(|r| r.queue_name).collect()
+    };
+
     let mut queue_names = queue_names;
+    queue_names.extend(already_due_queue_names);
     queue_names.sort();
     queue_names.dedup();
 

@@ -1427,12 +1427,17 @@ pub async fn terminate_workflow_execution(
         start.spawn();
     }
 
-    // Only emit the Terminated metric when the execution was live (RUNNING or
-    // SUSPENDED). If the prior state was already terminal (FAILED, TIMED_OUT,
-    // COMPLETED), that outcome was already counted — emitting Terminated again
-    // would inflate the SLO denominator for operator cleanup actions.
+    // Only emit the Terminated metric when the execution was live (RUNNING,
+    // SUSPENDED, or PAUSED — all non-terminal active states; issue #383 routes
+    // paused scheduled runs here via TerminateOther). If the prior state was
+    // already terminal (FAILED, TIMED_OUT, COMPLETED), that outcome was already
+    // counted — emitting Terminated again would inflate the SLO denominator for
+    // operator cleanup actions.
     if cancel_result.newly_cancelled
-        && matches!(cancel_result.prior_state.as_str(), "RUNNING" | "SUSPENDED")
+        && matches!(
+            cancel_result.prior_state.as_str(),
+            "RUNNING" | "SUSPENDED" | "PAUSED"
+        )
     {
         metrics.record_workflow_terminal(
             &cancel_result.workflow_name,

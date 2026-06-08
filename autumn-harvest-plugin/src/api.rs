@@ -4163,6 +4163,7 @@ fn parse_workflow_child_status(raw: &str) -> Result<String, AutumnError> {
         .collect::<String>();
     let status = match normalized.as_str() {
         "running" => "RUNNING",
+        "paused" => "PAUSED",
         "failed" => "FAILED",
         "completed" => "COMPLETED",
         "cancelled" | "canceled" => "CANCELLED",
@@ -4171,7 +4172,7 @@ fn parse_workflow_child_status(raw: &str) -> Result<String, AutumnError> {
         "continuedasnew" => "CONTINUED_AS_NEW",
         _ => {
             return Err(AutumnError::bad_request_msg(format!(
-                "unknown workflow child status '{raw}'; expected one of Running, Failed, Completed, Cancelled, Terminated, TimedOut, ContinuedAsNew"
+                "unknown workflow child status '{raw}'; expected one of Running, Paused, Failed, Completed, Cancelled, Terminated, TimedOut, ContinuedAsNew"
             )));
         }
     };
@@ -4243,6 +4244,7 @@ fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> String {
 fn workflow_child_status_label(status: &str) -> String {
     match status {
         "RUNNING" => "Running",
+        "PAUSED" => "Paused",
         "FAILED" => "Failed",
         "COMPLETED" => "Completed",
         "CANCELLED" => "Cancelled",
@@ -16568,6 +16570,17 @@ mod tests {
             .expect("ContinuedAsNew is a valid workflow execution state");
 
         assert_eq!(filters.statuses, vec!["CONTINUED_AS_NEW".to_string()]);
+    }
+
+    #[test]
+    fn parse_workflow_children_filters_accepts_paused() {
+        // PAUSED is a non-terminal active state (issue #383): it must be a valid
+        // child-status filter so operators can narrow children to paused runs.
+        let filters = parse_workflow_children_filters(&pairs(&[("status", "Paused")]))
+            .expect("Paused is a valid workflow execution state");
+
+        assert_eq!(filters.statuses, vec!["PAUSED".to_string()]);
+        assert_eq!(workflow_child_status_label("PAUSED"), "Paused");
     }
 
     #[test]
