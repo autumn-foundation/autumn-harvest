@@ -1882,6 +1882,7 @@ async fn render_dead_letters_summary_view(
         workflow_name: filters.workflow_name.clone(),
         activity_name: None,
         queue_name: None,
+        task_type: filters.task_kind.map(|k| k.as_db_value().to_string()),
         since: filters.failed_after,
         until: filters.failed_before,
         min_attempts: None,
@@ -2159,8 +2160,13 @@ fn render_dlq_summary_table(
                             @if is_other {
                                 "—"
                             } @else {
-                                a href=(dlq_summary_drilldown_href(&group.key, group_by, filters, limit, refresh)) {
-                                    "View entries →"
+                                @let (href, partial) = dlq_summary_drilldown_href(&group.key, group_by, filters, limit, refresh);
+                                a href=(href) title=[partial.then_some("Some dimensions have no list-view filter — results may include extra rows from other groups")] {
+                                    @if partial {
+                                        "View entries (partial filter) →"
+                                    } @else {
+                                        "View entries →"
+                                    }
                                 }
                             }
                         }
@@ -2180,21 +2186,25 @@ fn dlq_summary_key_cell(key: &serde_json::Value, dim: &str) -> String {
 }
 
 /// Build a click-through link into the list view with whatever filters the list
-/// view can express pre-applied from this group's key. The list view supports
-/// `workflow_name` and `task_kind`; other dimensions (failure signature, queue,
-/// activity, time bucket) have no list filter and are simply not narrowed.
+/// view can express pre-applied from this group's key.
+///
+/// Returns `(href, is_partial)`. `is_partial` is `true` when one or more
+/// group dimensions (`activity_name`, `queue_name`, `time_bucket`,
+/// `failure_signature`) have no equivalent list-view filter — the resulting
+/// link will show a superset of the selected group.
 fn dlq_summary_drilldown_href(
     key: &serde_json::Value,
     group_by: &[autumn_harvest::dlq::DlqGroupDimension],
     filters: &DeadLetterUiFilters,
     limit: i64,
     refresh: Option<u64>,
-) -> String {
+) -> (String, bool) {
     use autumn_harvest::dlq::DlqGroupDimension;
 
     // Start from the filters already applied to the summary so drill-down
     // narrows rather than widens.
     let mut drill = filters.clone();
+    let mut partial = false;
     for dim in group_by {
         match dim {
             DlqGroupDimension::WorkflowName => {
@@ -2207,20 +2217,24 @@ fn dlq_summary_drilldown_href(
                     drill.task_kind = DeadLetterTaskKind::parse(task_type).ok();
                 }
             }
-            // No list-view filter exists for these dimensions.
+            // No list-view filter exists for these dimensions; the link will
+            // show more rows than belong to this exact group.
             DlqGroupDimension::ActivityName
             | DlqGroupDimension::QueueName
             | DlqGroupDimension::TimeBucket
-            | DlqGroupDimension::FailureSignature => {}
+            | DlqGroupDimension::FailureSignature => {
+                partial = true;
+            }
         }
     }
 
     let query = build_dead_letter_query_string(limit, &drill, refresh);
-    if query.is_empty() {
+    let href = if query.is_empty() {
         "dead-letters".to_string()
     } else {
         format!("dead-letters?{}", &query[1..])
-    }
+    };
+    (href, partial)
 }
 
 fn render_dead_letter_filters(

@@ -701,12 +701,14 @@ fn is_hex_run(token: &str) -> bool {
     {
         return !body.is_empty() && body.bytes().all(|b| b.is_ascii_hexdigit());
     }
-    // Plain hex: require length >= 8 to avoid normalizing ordinary words, and
-    // require at least one digit so an all-letter word like "deadbeef" is left
-    // intact while "deadbeef01" collapses.
+    // Plain hex: require length >= 8 to avoid normalizing short words, and
+    // require at least one hex letter (a-f/A-F) so pure decimal strings ≥8
+    // digits fall through to replace_digit_runs instead of becoming <HEX>.
     token.len() >= 8
         && token.bytes().all(|b| b.is_ascii_hexdigit())
-        && token.bytes().any(|b| b.is_ascii_digit())
+        && token
+            .bytes()
+            .any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
 }
 
 fn replace_digit_runs(token: &str) -> String {
@@ -807,6 +809,8 @@ pub struct DlqAggregateParams {
     pub activity_name: Option<String>,
     /// Filter: exact queue name.
     pub queue_name: Option<String>,
+    /// Filter: exact task type (`"activity"` or `"workflow"`, case-insensitive).
+    pub task_type: Option<String>,
     /// Filter: inclusive lower bound on `failed_at`.
     pub since: Option<DateTime<Utc>>,
     /// Filter: exclusive upper bound on `failed_at`.
@@ -827,6 +831,7 @@ impl Default for DlqAggregateParams {
             workflow_name: None,
             activity_name: None,
             queue_name: None,
+            task_type: None,
             since: None,
             until: None,
             min_attempts: None,
@@ -883,6 +888,15 @@ impl DlqAggregateParams {
                 "workflow_name" => set_filter(&mut params.workflow_name, value),
                 "activity_name" => set_filter(&mut params.activity_name, value),
                 "queue_name" => set_filter(&mut params.queue_name, value),
+                "task_type" => {
+                    let v = value.trim();
+                    if !v.eq_ignore_ascii_case("activity") && !v.eq_ignore_ascii_case("workflow") {
+                        return Err(format!(
+                            "invalid task_type '{v}'; expected 'activity' or 'workflow'"
+                        ));
+                    }
+                    params.task_type = Some(v.to_string());
+                }
                 "since" => params.since = Some(parse_instant("since", value, now)?),
                 "until" => params.until = Some(parse_instant("until", value, now)?),
                 "min_attempts" => {
@@ -1174,6 +1188,13 @@ pub async fn aggregate_dead_letters(
     }
     if let Some(ref q) = params.queue_name {
         query = query.filter(dsl::queue_name.eq(q.clone()));
+    }
+    if let Some(ref tt) = params.task_type {
+        query = query.filter(
+            sql::<Bool>("LOWER(task_type) = LOWER(")
+                .bind::<Text, _>(tt.clone())
+                .sql(")"),
+        );
     }
     if let Some(since) = params.since {
         query = query.filter(dsl::failed_at.ge(since));
@@ -1493,10 +1514,17 @@ mod tests {
     }
 
     #[test]
+    fn failure_signature_pure_decimal_gte8_digits_is_num_not_hex() {
+        // Pure decimal strings ≥8 digits must not be classified as <HEX>.
+        let sig = failure_signature("error for user 12345678 in tenant 999999999");
+        assert_eq!(sig, "error for user <NUM> in tenant <NUM>");
+    }
+
+    #[test]
     fn failure_signature_normalizes_long_hex_run() {
         let sig = failure_signature("checksum mismatch deadbeef0123cafe babe");
-        // "deadbeef0123cafe" is a long hex run with a digit -> <HEX>;
-        // "babe" is short, no digit -> left intact.
+        // "deadbeef0123cafe" contains hex letters (d, e, a, b, e, f, c, a, f, e) → <HEX>;
+        // "babe" is short → left intact.
         assert_eq!(sig, "checksum mismatch <HEX> babe");
     }
 
