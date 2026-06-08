@@ -288,6 +288,10 @@ mod scanner {
             exec_dsl::output.eq(None::<serde_json::Value>),
             exec_dsl::error.eq(Some(error.to_string())),
             exec_dsl::completed_at.eq(Some(Utc::now())),
+            // Clear active-pause metadata when a paused owner is failed (#383).
+            exec_dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            exec_dsl::pause_reason.eq(None::<String>),
+            exec_dsl::pause_actor.eq(None::<String>),
         ))
         .execute(conn)
         .await

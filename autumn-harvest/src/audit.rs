@@ -273,6 +273,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         RouteClass::Mutating,
     ),
     ("POST /workflows/{id}/cancel", RouteClass::Mutating),
+    ("POST /workflows/{id}/pause", RouteClass::Mutating),
+    ("POST /workflows/{id}/resume", RouteClass::Mutating),
     ("POST /workflows/{id}/reset", RouteClass::Mutating),
     (
         "POST /workflows/{id}/signal/{signal_name}",
@@ -341,6 +343,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_SIGNAL,
     OP_WORKFLOW_SIGNAL_WITH_START,
     OP_WORKFLOW_CANCEL,
+    OP_WORKFLOW_PAUSE,
+    OP_WORKFLOW_RESUME,
     OP_WORKFLOW_RESET,
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
@@ -445,6 +449,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         Some(OP_WORKFLOW_SIGNAL_WITH_START),
     ),
     ("POST /workflows/{id}/cancel", Some(OP_WORKFLOW_CANCEL)),
+    ("POST /workflows/{id}/pause", Some(OP_WORKFLOW_PAUSE)),
+    ("POST /workflows/{id}/resume", Some(OP_WORKFLOW_RESUME)),
     ("POST /workflows/{id}/reset", Some(OP_WORKFLOW_RESET)),
     (
         "POST /workflows/{id}/signal/{signal_name}",

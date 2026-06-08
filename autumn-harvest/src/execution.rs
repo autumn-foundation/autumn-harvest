@@ -573,6 +573,10 @@ async fn inline_cancel(
             harvest_workflow_executions::state.eq("CANCELLED"),
             harvest_workflow_executions::error.eq(Some(reason)),
             harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            // Clear active-pause metadata when a paused prior run is sealed (#383).
+            harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            harvest_workflow_executions::pause_reason.eq(None::<String>),
+            harvest_workflow_executions::pause_actor.eq(None::<String>),
         ))
         .execute(conn)
         .await
@@ -1137,7 +1141,9 @@ pub(crate) async fn parent_close_cascade_event_count(
     let policies: Vec<Option<String>> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq(Some(parent_exec_id.as_uuid())))
         .filter(harvest_workflow_executions::parent_close_policy.is_not_null())
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        // Must mirror apply_parent_close_cascade's RUNNING|PAUSED selection so the
+        // history-cap preflight count matches the events actually appended (#383).
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .select(harvest_workflow_executions::parent_close_policy)
         .load::<Option<String>>(conn)
         .await
@@ -1152,15 +1158,16 @@ pub(crate) async fn parent_close_cascade_event_count(
     })
 }
 
-/// Apply parent-close cascade to all running detached children of `parent_exec_id`.
+/// Apply parent-close cascade to all active detached children of `parent_exec_id`.
 ///
-/// Queries children with `parent_close_policy IS NOT NULL AND state = 'RUNNING'`.
+/// Queries children with `parent_close_policy IS NOT NULL AND state IN
+/// ('RUNNING','PAUSED')` — a paused child is still active (issue #383).
 /// - Abandon: no-op
 /// - `RequestCancel`: appends `WorkflowCancelled`, transitions to CANCELLED, fails tasks
 /// - `Terminate`: appends `WorkflowFailed`, transitions to FAILED, fails tasks
 ///
 /// Appends a `ChildWorkflowCascadeApplied` event to the parent history for each
-/// non-Abandon action. Idempotent: acts only on RUNNING children.
+/// non-Abandon action. Idempotent: acts only on RUNNING/PAUSED children.
 pub(crate) async fn apply_parent_close_cascade(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
@@ -1238,6 +1245,11 @@ async fn cascade_cancel_detached_child(
             harvest_workflow_executions::state.eq("CANCELLED"),
             harvest_workflow_executions::error.eq(Some(reason.to_string())),
             harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            // Clear active-pause metadata when a paused child is made terminal so
+            // it doesn't appear "terminal and still paused" in APIs/UI (#383).
+            harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            harvest_workflow_executions::pause_reason.eq(None::<String>),
+            harvest_workflow_executions::pause_actor.eq(None::<String>),
         ))
         .execute(conn)
         .await
@@ -1282,6 +1294,11 @@ async fn cascade_terminate_detached_child(
             harvest_workflow_executions::state.eq("FAILED"),
             harvest_workflow_executions::error.eq(Some(reason.to_string())),
             harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            // Clear active-pause metadata when a paused child is made terminal so
+            // it doesn't appear "terminal and still paused" in APIs/UI (#383).
+            harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            harvest_workflow_executions::pause_reason.eq(None::<String>),
+            harvest_workflow_executions::pause_actor.eq(None::<String>),
         ))
         .execute(conn)
         .await
@@ -1338,6 +1355,7 @@ async fn cascade_terminate_detached_child(
 /// `cancel_workflow_execution`, this never returns
 /// [`HarvestError::Config`] for "already terminal" — that's the whole
 /// point of the operator override.
+#[allow(clippy::too_many_lines)]
 pub async fn terminate_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -1392,6 +1410,12 @@ pub async fn terminate_workflow_execution(
                             harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                             harvest_workflow_executions::error.eq(Some(reason.clone())),
                             harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                            // Clear active-pause metadata when terminating a paused
+                            // run so it doesn't appear terminal-and-paused (#383).
+                            harvest_workflow_executions::paused_at
+                                .eq(None::<chrono::DateTime<Utc>>),
+                            harvest_workflow_executions::pause_reason.eq(None::<String>),
+                            harvest_workflow_executions::pause_actor.eq(None::<String>),
                         ))
                         .execute(conn)
                         .await
@@ -1809,7 +1833,11 @@ async fn resolve_effective_signal_with_start_policy(
     else {
         return Ok(requested);
     };
-    if existing.state == "RUNNING" {
+    if matches!(existing.state.as_str(), "RUNNING" | "PAUSED") {
+        // PAUSED is a non-terminal active state (issue #383): keep the requested
+        // policy so the start path attaches to the existing run and the signal is
+        // queued (buffered for delivery on resume), matching direct send_signal.
+        // Only a truly terminal prior is upgraded below.
         Ok(requested)
     } else {
         // Non-RUNNING prior under a non-rejecting policy: upgrade so the
