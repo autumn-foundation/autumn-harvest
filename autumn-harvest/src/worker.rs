@@ -4604,71 +4604,41 @@ async fn persist_workflow_outcome(
     }
 }
 
-async fn persist_terminal_outcome_with_pending_commands(
+/// Outcome of the pause-guarded persistence transaction in
+/// [`process_workflow_task`].
+enum WorkflowPersistFlow {
+    /// The execution was observed `PAUSED` under the row lock: the task was
+    /// re-parked inside the same transaction and the pending decision discarded
+    /// without persisting any new commands. Resume re-derives the decision on
+    /// replay.
+    ParkedPaused,
+    /// The decision was persisted under the execution row lock.
+    Persisted,
+}
+
+/// Map a terminal/suspended outcome to its deferred schedule-failure-counter
+/// action: `Some(false)` resets (success), `Some(true)` increments (failure),
+/// `None` leaves it untouched (suspended / continue-as-new). The action depends
+/// only on Completed-vs-Failed, so it is identical for root and child variants.
+const fn schedule_counter_action(outcome: &WorkflowOutcome) -> Option<bool> {
+    match outcome {
+        WorkflowOutcome::Completed { .. } => Some(false),
+        WorkflowOutcome::Failed { .. } => Some(true),
+        _ => None,
+    }
+}
+
+/// Run the deferred schedule-failure-counter update in autocommit, *after* the
+/// persistence transaction has committed. Counter queries are best-effort: a
+/// failure here must never roll back the durably-persisted workflow decision,
+/// which is why they run outside the persistence transaction (a failed query
+/// inside a Postgres transaction would abort the whole transaction).
+async fn run_deferred_schedule_counter(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     execution: &WorkflowExecution,
-    persistence: WorkflowTaskPersistence<'_>,
-    outcome: WorkflowOutcome,
-    pending_cmds: &[WorkflowCommand],
-    execute_span: &tracing::Span,
-) -> HarvestResult<()> {
-    // Capture counter action before `outcome` is consumed by the closure.
-    let counter_action = match &outcome {
-        WorkflowOutcome::Completed { .. } => Some(false), // reset
-        WorkflowOutcome::Failed { .. } => Some(true),     // increment
-        _ => None,
-    };
-
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        let mut next_event_id = persistence.next_event_id;
-        async move {
-            persist_update_result_commands(
-                conn,
-                persistence.exec_id,
-                pending_cmds,
-                &mut next_event_id,
-            )
-            .await?;
-            persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
-
-            let pre_terminal = pre_suspension_events_from_commands(pending_cmds);
-            if !pre_terminal.is_empty() {
-                store::append_events(conn, persistence.exec_id, &pre_terminal, next_event_id)
-                    .await?;
-                next_event_id = next_event_id
-                    .checked_add(i32::try_from(pre_terminal.len()).unwrap_or(i32::MAX))
-                    .ok_or_else(|| {
-                        crate::error::HarvestError::Database("Event ID overflow".to_string())
-                    })?;
-            }
-
-            create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span)
-                .await?;
-
-            // `update_schedule_counter: false` — counter updates run AFTER this
-            // transaction commits (below) to avoid aborting the transaction on a
-            // best-effort query failure.
-            persist_workflow_outcome(
-                conn,
-                registry,
-                execution,
-                WorkflowTaskPersistence {
-                    next_event_id,
-                    ..persistence
-                },
-                outcome,
-                execute_span,
-                false,
-            )
-            .await
-        }
-        .scope_boxed()
-    })
-    .await?;
-
-    // Best-effort schedule counter updates run outside the transaction so a
-    // counter query failure never rolls back the completed/failed execution.
+    counter_action: Option<bool>,
+) {
     match counter_action {
         Some(false) => {
             crate::scheduler::maybe_reset_schedule_failure_counter(
@@ -4689,8 +4659,55 @@ async fn persist_terminal_outcome_with_pending_commands(
         }
         None => {}
     }
+}
 
-    Ok(())
+/// Persist a terminal (or continue-as-new) outcome that also carries pending
+/// pre-suspension commands (update results, search-attr patches, detached
+/// children, fan-out markers).
+///
+/// Runs entirely on the caller's connection **without opening its own
+/// transaction** so the caller can wrap it — together with the authoritative
+/// `FOR UPDATE` pause guard — in a single transaction (issue #383). Schedule
+/// counters are deferred to the caller via [`run_deferred_schedule_counter`]
+/// and run only after that outer transaction commits.
+async fn persist_terminal_outcome_commands(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    execution: &WorkflowExecution,
+    persistence: WorkflowTaskPersistence<'_>,
+    outcome: WorkflowOutcome,
+    pending_cmds: &[WorkflowCommand],
+    execute_span: &tracing::Span,
+) -> HarvestResult<()> {
+    let mut next_event_id = persistence.next_event_id;
+    persist_update_result_commands(conn, persistence.exec_id, pending_cmds, &mut next_event_id)
+        .await?;
+    persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
+
+    let pre_terminal = pre_suspension_events_from_commands(pending_cmds);
+    if !pre_terminal.is_empty() {
+        store::append_events(conn, persistence.exec_id, &pre_terminal, next_event_id).await?;
+        next_event_id = next_event_id
+            .checked_add(i32::try_from(pre_terminal.len()).unwrap_or(i32::MAX))
+            .ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string()))?;
+    }
+
+    create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span).await?;
+
+    // `update_schedule_counter: false` — the caller runs counters after commit.
+    persist_workflow_outcome(
+        conn,
+        registry,
+        execution,
+        WorkflowTaskPersistence {
+            next_event_id,
+            ..persistence
+        },
+        outcome,
+        execute_span,
+        false,
+    )
+    .await
 }
 
 fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
@@ -5523,18 +5540,17 @@ async fn process_workflow_task(
     // resume_workflow_execution wakes it, and the deterministic handler
     // re-derives the same commands on replay.
     //
-    // Best-effort, by design: this is a non-locking read in autocommit, run
-    // *before* the persistence transaction below opens, so it does not
-    // serialize with `pause_workflow_execution`'s `FOR UPDATE` row lock. The
-    // claim-layer gate (`queue::claim_task`) is the authoritative defence — it
-    // prevents the task from ever being *claimed* while PAUSED. This re-check
-    // only narrows the window for a decision that was already mid-flight when
-    // the pause committed. A pause that commits in the gap between this read
-    // and the persist below may still let that single in-flight decision land,
-    // which is consistent with the activity semantics (already-dispatched
-    // activities run to completion). All *subsequent* tasks observe PAUSED at
-    // claim time and defer. We accept the narrow window rather than hold the
-    // execution row lock across the full persistence path.
+    // Fast-path optimization only: this is a non-locking read in autocommit
+    // that lets a decision paused well before persistence bail out *before*
+    // computing metrics, history-cap, and cache state below. It is NOT the
+    // authoritative guard — the persistence transaction further down opens with
+    // a `FOR UPDATE` row lock on the execution that serializes with
+    // `pause_workflow_execution`'s own lock and re-checks PAUSED under it, so a
+    // pause committing in the gap between this read and the persist is still
+    // caught and the decision discarded. The claim-layer gate
+    // (`queue::claim_task`) prevents the task from ever being *claimed* while
+    // PAUSED in the first place; this read just avoids wasted work in the
+    // common case.
     {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
         let current_state: Option<String> = exec_dsl::harvest_workflow_executions
@@ -5697,32 +5713,98 @@ async fn process_workflow_task(
         next_event_id,
         sticky_timeout,
     };
-    if !pending_cmds.is_empty() && !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
-        let result = persist_terminal_outcome_with_pending_commands(
-            conn,
-            registry,
-            &prepared.execution,
-            persistence,
-            outcome,
-            &pending_cmds,
-            &execute_span,
-        )
+
+    // Issue #383: authoritatively enforce pause across the persistence path.
+    //
+    // The fast-path re-check above is best-effort (non-locking). Here we close
+    // the residual race: open the persistence transaction with a `FOR UPDATE`
+    // row lock on the execution — mirroring `pause_workflow_execution`'s own
+    // lock — so the two serialize. If the operator's pause committed first, we
+    // observe `PAUSED` under the lock and re-park the task *inside the same
+    // transaction*, discarding the pending decision without persisting any new
+    // commands (resume re-derives them deterministically on replay). Otherwise
+    // pause blocks until this decision commits, which is exactly the
+    // "already-dispatched work runs to completion" semantics. Schedule counters
+    // are deferred to after the transaction commits (a best-effort counter
+    // failure must never roll back the persisted decision).
+    let is_terminal_with_commands =
+        !pending_cmds.is_empty() && !matches!(&outcome, WorkflowOutcome::Suspended { .. });
+    let counter_action = schedule_counter_action(&outcome);
+    let execution_ref = &prepared.execution;
+    let exec_uuid = prepared.exec_id.as_uuid();
+
+    let persist_flow = conn
+        .transaction::<WorkflowPersistFlow, HarvestError, _>(|conn| {
+            async move {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                let locked_state: Option<String> = exec_dsl::harvest_workflow_executions
+                    .find(exec_uuid)
+                    .select(exec_dsl::state)
+                    .for_update()
+                    .first::<String>(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                if locked_state.as_deref() == Some("PAUSED") {
+                    let sticky = if sticky_timeout.is_zero() {
+                        None
+                    } else {
+                        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+                    };
+                    queue::park_workflow_task(conn, task.id, sticky).await?;
+                    return Ok(WorkflowPersistFlow::ParkedPaused);
+                }
+
+                if is_terminal_with_commands {
+                    persist_terminal_outcome_commands(
+                        conn,
+                        registry,
+                        execution_ref,
+                        persistence,
+                        outcome,
+                        &pending_cmds,
+                        &execute_span,
+                    )
+                    .await?;
+                } else {
+                    persist_workflow_outcome(
+                        conn,
+                        registry,
+                        execution_ref,
+                        persistence,
+                        outcome,
+                        &execute_span,
+                        false,
+                    )
+                    .await?;
+                }
+                Ok(WorkflowPersistFlow::Persisted)
+            }
+            .scope_boxed()
+        })
         .await;
-        fail_execution_on_error(conn, task, worker_id, result).await?;
-    } else {
-        persist_workflow_outcome(
-            conn,
-            registry,
-            &prepared.execution,
-            persistence,
-            outcome,
-            &execute_span,
-            true,
-        )
-        .await?;
+    // execute_span is moved into and dropped by the transaction closure above,
+    // closing the OTel span after all producer spans have been emitted as its
+    // children.
+
+    match persist_flow {
+        Ok(WorkflowPersistFlow::ParkedPaused) => return Ok(()),
+        Ok(WorkflowPersistFlow::Persisted) => {
+            // Deferred best-effort schedule counters, in autocommit post-commit.
+            run_deferred_schedule_counter(conn, registry, &prepared.execution, counter_action)
+                .await;
+        }
+        Err(error) => {
+            // Preserve per-path error handling: a terminal-with-commands persist
+            // failure durably fails the task + execution (matching the prior
+            // `fail_execution_on_error` wrapping); a suspended/simple-terminal
+            // persist failure propagates so the task is retried.
+            if is_terminal_with_commands {
+                return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error)).await;
+            }
+            return Err(error);
+        }
     }
-    // execute_span is dropped here, closing the OTel span after all producer
-    // spans have been emitted as its children.
 
     // Update the in-process LRU cache ONLY on successful persistence.
     // A Suspended outcome inserts the warm snapshot; terminal outcomes evict.
