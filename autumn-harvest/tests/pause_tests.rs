@@ -243,6 +243,28 @@ async fn wait_for_event<F: Fn(&WorkflowEvent) -> bool>(
     panic!("expected event never appeared in history for {exec_id}");
 }
 
+/// Polls until a worker has claimed the execution's workflow task (its
+/// `worker_id` is set). Lets a test land a pause precisely while a decision
+/// task is in-flight.
+async fn wait_for_task_claimed(conn: &mut AsyncPgConnection, exec_id: ExecutionId) {
+    use autumn_harvest::schema::harvest_task_queue as t;
+    for _ in 0..300 {
+        let claimed: i64 = t::table
+            .filter(t::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(t::task_type.eq("workflow"))
+            .filter(t::worker_id.is_not_null())
+            .count()
+            .get_result(conn)
+            .await
+            .expect("count query should succeed");
+        if claimed > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("workflow task for {exec_id} was never claimed");
+}
+
 // ── Workflow handlers ──────────────────────────────────────────────────────
 
 /// Waits on a 1-second durable timer, then completes. The sub-second window in
@@ -253,6 +275,22 @@ fn timer_wf<'a>(
     _input: Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
+        ctx.timer("wait", 1).await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!("done"))
+    })
+}
+
+/// Sleeps before producing its `StartTimer` command so a test can land a pause
+/// while this workflow decision task is still mid-flight (already claimed by a
+/// worker but not yet at its suspension point). Used to exercise the
+/// claimed-then-paused race (issue #383): the worker must discard the pending
+/// decision and re-park rather than persist the timer.
+fn slow_timer_wf<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
         ctx.timer("wait", 1).await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!("done"))
     })
@@ -590,4 +628,72 @@ async fn pause_defers_timer_then_resume_fires_and_replays_deterministically() {
         }
         other => panic!("expected Completed on replay, got {other:?}"),
     }
+}
+
+// ── In-flight decision-task race: pause after claim must discard commands ────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_during_inflight_decision_task_discards_pending_commands() {
+    let (url, _c) = setup().await;
+    let pool = build_pool(&url);
+    let mut conn = connect(&url).await;
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![wf_info("slow_timer_wf", slow_timer_wf)],
+        vec![],
+    ));
+    let exec_id = start(&mut conn, "slow_timer_wf", "inflight-pause-001").await;
+
+    let worker = Arc::new(make_worker(registry));
+    let worker_pool = pool.clone();
+    let worker_ref = worker.clone();
+    let worker_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(25), worker_ref.run(&worker_pool)).await;
+    });
+
+    // Land the pause while the decision task is mid-flight: the worker has
+    // claimed it (worker_id set) but the handler is still in its 800ms sleep,
+    // so the StartTimer command has not yet been produced or persisted.
+    wait_for_task_claimed(&mut conn, exec_id).await;
+    pause_workflow_execution(
+        &mut conn,
+        exec_id,
+        Some("mid-flight"),
+        "oncall",
+        &NoOpMetrics,
+    )
+    .await
+    .expect("pause should succeed on a running execution");
+    assert_eq!(get_state(&mut conn, exec_id).await, "PAUSED");
+
+    // Give the in-flight handler ample time to finish its sleep, suspend, and
+    // reach the worker's pause guard. The guard must discard the decision: no
+    // TimerStarted may be appended while paused.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        get_state(&mut conn, exec_id).await,
+        "PAUSED",
+        "execution must remain paused while the discarded task is re-parked"
+    );
+    assert!(
+        !history(&mut conn, exec_id)
+            .await
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerStarted { .. })),
+        "an in-flight decision task must not persist new commands after pause"
+    );
+
+    // Resume: the re-parked task is re-claimed, the deterministic handler
+    // re-derives the same StartTimer command, and the workflow completes.
+    resume_workflow_execution(&mut conn, exec_id, "oncall", &NoOpMetrics)
+        .await
+        .expect("resume should succeed");
+    wait_for_event(&mut conn, exec_id, |e| {
+        matches!(e, WorkflowEvent::TimerStarted { .. })
+    })
+    .await;
+    wait_for_state(&mut conn, exec_id, &["COMPLETED"]).await;
+
+    worker.shutdown();
+    let _ = worker_handle.await;
 }

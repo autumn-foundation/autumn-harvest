@@ -738,7 +738,7 @@ pub async fn trigger_unified_dag(
 
         let running: i64 = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
-            .filter(harvest_workflow_executions::state.eq("RUNNING"))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
             .count()
             .get_result(&mut db)
             .await
@@ -1621,7 +1621,7 @@ async fn cancel_in_flight_runs(
     let running_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.like("sched:%"))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .order(harvest_workflow_executions::started_at.asc())
         .select(harvest_workflow_executions::id)
         .load(conn)
@@ -1665,7 +1665,7 @@ async fn terminate_in_flight_runs(
     let active_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
         .filter(harvest_workflow_executions::workflow_id.like("sched:%"))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .order(harvest_workflow_executions::started_at.asc())
         .select(harvest_workflow_executions::id)
         .load(conn)
@@ -1902,7 +1902,7 @@ async fn tick_one_workflow_schedule(
 
     let mut running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .count()
         .get_result(conn)
         .await
@@ -2567,7 +2567,7 @@ async fn drain_buffered_schedule_runs(
 
         let running: i64 = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
-            .filter(harvest_workflow_executions::state.eq("RUNNING"))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
             .count()
             .get_result(conn)
             .await

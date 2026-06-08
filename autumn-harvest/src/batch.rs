@@ -524,10 +524,12 @@ mod db {
     /// drops the per-call limit so a 10k batch can drain over multiple ticks.
     ///
     /// `action` is consulted only to pick the default state filter when the
-    /// caller didn't supply one: Cancel/Signal default to `RUNNING` (terminal
-    /// rows are no-ops); Terminate defaults to "every non-CANCELLED state"
-    /// because its whole purpose is to bring stuck-non-running rows to a
-    /// clean terminal state.
+    /// caller didn't supply one: Cancel/Signal default to the active states
+    /// `RUNNING`/`PAUSED` (terminal rows are no-ops, and a paused execution is
+    /// still active — cancel accepts it and a signal queues for delivery on
+    /// resume); Terminate defaults to "every non-CANCELLED state" because its
+    /// whole purpose is to bring stuck-non-running rows to a clean terminal
+    /// state.
     async fn resolve_targets_on_shard(
         conn: &mut AsyncPgConnection,
         action: BatchAction,
@@ -543,7 +545,8 @@ mod db {
                     query = query.filter(harvest_workflow_executions::state.ne("CANCELLED"));
                 }
                 BatchAction::Cancel | BatchAction::Signal => {
-                    query = query.filter(harvest_workflow_executions::state.eq("RUNNING"));
+                    query = query
+                        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]));
                 }
             }
         } else {

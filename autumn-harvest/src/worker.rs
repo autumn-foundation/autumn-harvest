@@ -5470,6 +5470,39 @@ async fn process_workflow_task(
     };
 
     let (outcome, pending_cmds, execute_span) = loop_result;
+
+    // Issue #383: an operator may have paused this execution while this
+    // workflow decision task was running. Pause is enforced at the claim layer
+    // and only blocks *future* claims; this already-claimed task would
+    // otherwise persist new activity/timer/child commands (or a terminal
+    // outcome) after a successful pause, violating the pause guarantee. The
+    // loop above only appended events for already-completed inline work (local
+    // activities / external-signal sends), which replay reproduces
+    // deterministically. If the execution became PAUSED, discard the pending
+    // decision without persisting any new commands and re-park the task:
+    // resume_workflow_execution wakes it, and the deterministic handler
+    // re-derives the same commands on replay.
+    {
+        use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+        let current_state: Option<String> = exec_dsl::harvest_workflow_executions
+            .find(prepared.exec_id.as_uuid())
+            .select(exec_dsl::state)
+            .first::<String>(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+        if current_state.as_deref() == Some("PAUSED") {
+            let sticky = if sticky_timeout.is_zero() {
+                None
+            } else {
+                Some(queue::StickyHint::new(worker_id, sticky_timeout))
+            };
+            queue::park_workflow_task(conn, task.id, sticky).await?;
+            drop(execute_span);
+            return Ok(());
+        }
+    }
+
     let terminal_parent_close_cascade_events = if matches!(
         &outcome,
         WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }

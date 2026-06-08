@@ -1488,6 +1488,7 @@ const fn default_buffer_all_max() -> u32 {
 /// filters. Anything outside this list is rejected with `400 Bad Request`.
 pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
     "RUNNING",
+    "PAUSED",
     "COMPLETED",
     "FAILED",
     "CANCELLED",
