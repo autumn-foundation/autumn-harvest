@@ -24,3 +24,24 @@ ALTER TABLE harvest_workflow_executions
 CREATE INDEX IF NOT EXISTS idx_harvest_executions_paused
     ON harvest_workflow_executions (paused_at)
     WHERE state = 'PAUSED' AND paused_at IS NOT NULL;
+
+-- 'PAUSED' is a new non-terminal execution state. The state CHECK constraint
+-- (last set by 20260503000000_harvest_workflow_reset) enumerates allowed
+-- states explicitly, so it must be widened to admit 'PAUSED' — otherwise
+-- pause_workflow_execution's UPDATE ... SET state = 'PAUSED' fails with a
+-- constraint violation on any migrated database.
+ALTER TABLE harvest_workflow_executions
+    DROP CONSTRAINT IF EXISTS harvest_workflow_executions_state_check;
+
+ALTER TABLE harvest_workflow_executions
+    ADD CONSTRAINT harvest_workflow_executions_state_check
+        CHECK (state IN (
+            'RUNNING',
+            'PAUSED',
+            'COMPLETED',
+            'FAILED',
+            'CANCELLED',
+            'TIMED_OUT',
+            'CONTINUED_AS_NEW',
+            'TERMINATED'
+        ));
