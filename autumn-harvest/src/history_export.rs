@@ -335,7 +335,9 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowContinuedAsNew { .. }
                 | WorkflowEvent::WorkflowResetFork { .. }
                 | WorkflowEvent::WorkflowResetTerminated { .. }
-                | WorkflowEvent::WorkflowExecutionTimedOut { .. } => {
+                | WorkflowEvent::WorkflowExecutionTimedOut { .. }
+                | WorkflowEvent::WorkflowExecutionPaused { .. }
+                | WorkflowEvent::WorkflowExecutionResumed { .. } => {
                     self.handle_workflow_event(event)?;
                 }
                 WorkflowEvent::ActivityScheduled { .. }
@@ -439,6 +441,16 @@ impl MermaidExporter {
                     self.out,
                     "    Note over WF: Execution Timed Out (deadline: {deadline})"
                 )?;
+            }
+            WorkflowEvent::WorkflowExecutionPaused { actor, reason, .. } => {
+                let detail = reason
+                    .as_deref()
+                    .map(|r| format!(": {}", r.replace('\n', " ").replace('"', "'")))
+                    .unwrap_or_default();
+                writeln!(self.out, "    Note over WF: Paused by {actor}{detail}")?;
+            }
+            WorkflowEvent::WorkflowExecutionResumed { actor, .. } => {
+                writeln!(self.out, "    Note over WF: Resumed by {actor}")?;
             }
             _ => unreachable!(),
         }

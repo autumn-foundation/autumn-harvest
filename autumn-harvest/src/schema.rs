@@ -39,6 +39,12 @@ diesel::table! {
         owner -> Nullable<Text>,
         runbook_url -> Nullable<Text>,
         severity -> Nullable<Text>,
+        /// Wall-clock instant the active pause was applied (issue #383). NULL = not paused.
+        paused_at -> Nullable<Timestamptz>,
+        /// Optional operator-supplied pause reason (issue #383).
+        pause_reason -> Nullable<Text>,
+        /// Identity that requested the active pause, from the audit trail (issue #383).
+        pause_actor -> Nullable<Text>,
     }
 }
 

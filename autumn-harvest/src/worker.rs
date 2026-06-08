@@ -117,6 +117,9 @@ pub struct WorkerRuntimeConfig {
     /// Consecutive worker crashes a task may cause before quarantine (issue #367).
     /// `0` disables quarantine (reclaimed poison pills are re-queued forever).
     pub poison_pill_threshold: i32,
+    /// Bounded-pause ceiling before the auto-resume scanner force-resumes a
+    /// paused execution (issue #383). Default 24 hours.
+    pub max_workflow_pause_duration: Duration,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
@@ -165,6 +168,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             priority_aging_secs: cfg.priority_aging_secs,
             unknown_target_grace_window: cfg.unknown_target_grace_window,
             poison_pill_threshold: cfg.poison_pill_threshold,
+            max_workflow_pause_duration: cfg.max_workflow_pause_duration,
             #[cfg(feature = "db")]
             sharded_pool: cfg.sharded_pool,
         }
@@ -5990,6 +5994,56 @@ struct WorkerMonitoringHandles {
     dlq_depth_samplers: Vec<tokio::task::JoinHandle<()>>,
     timeout_checker: tokio::task::JoinHandle<()>,
     poison_pill_reclaimer: tokio::task::JoinHandle<()>,
+    pause_auto_resumer: tokio::task::JoinHandle<()>,
+}
+
+/// Spawn the bounded-pause auto-resume scanner (issue #383).
+///
+/// Periodically force-resumes executions paused longer than
+/// `max_workflow_pause_duration` so orphaned pauses cannot accumulate. Runs at
+/// the worker heartbeat cadence (background maintenance, off the hot path).
+fn spawn_pause_auto_resumer(
+    pool: DbPool,
+    cancel: CancellationToken,
+    interval: Duration,
+    max_pause_duration: Duration,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            match pool.get().await {
+                Ok(mut conn) => {
+                    match crate::execution::auto_resume_expired_pauses(
+                        &mut conn,
+                        max_pause_duration,
+                        &*telemetry.metrics,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            tracing::warn!(resumed = n, "auto-resumed over-long paused executions");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(error = %e, "pause auto-resume scan failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to acquire DB connection for pause auto-resume");
+                }
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
 }
 
 impl Worker {
@@ -6184,6 +6238,13 @@ impl Worker {
             worker_stale_secs,
             self.registry.telemetry().clone(),
         );
+        let pause_auto_resumer = spawn_pause_auto_resumer(
+            pool.clone(),
+            self.shutdown.clone(),
+            self.config.worker_heartbeat_interval,
+            self.config.max_workflow_pause_duration,
+            self.registry.telemetry().clone(),
+        );
 
         WorkerMonitoringHandles {
             queue_depth_sampler,
@@ -6192,6 +6253,7 @@ impl Worker {
             dlq_depth_samplers,
             timeout_checker,
             poison_pill_reclaimer,
+            pause_auto_resumer,
         }
     }
 
@@ -6296,6 +6358,13 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "poison-pill reclaimer task failed during shutdown"
+            );
+        }
+        if let Err(error) = monitors.pause_auto_resumer.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "pause auto-resume scanner failed during shutdown"
             );
         }
         if let Err(error) = monitors.queue_depth_sampler.await {
@@ -6694,6 +6763,7 @@ mod tests {
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -6757,6 +6827,7 @@ mod tests {
             max_workflow_start_delay: Duration::from_secs(365 * 24 * 3600),
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             #[cfg(feature = "db")]
             sharded_pool: None,
         };

@@ -387,6 +387,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         priority_aging_secs: None,
                         unknown_target_grace_window: Duration::from_secs(5),
                         poison_pill_threshold: 3,
+                        max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                         sharded_pool: None,
                     },
                     registry,

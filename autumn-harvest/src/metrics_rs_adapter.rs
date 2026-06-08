@@ -57,8 +57,9 @@ use crate::telemetry::{
     METRIC_SCHEDULE_FIRE_ATTEMPTS, METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS,
     METRIC_SCHEDULE_SKIPPED, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
     METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TERMINAL, MetricsRecorder, WorkflowStatus,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_PAUSE_DURATION,
+    METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TERMINAL, MetricsRecorder,
+    WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -358,6 +359,24 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_REASON => reason.to_owned(),
         )
         .increment(1);
+    }
+
+    fn record_workflow_paused(&self, workflow_name: &str, queue: &str) {
+        counter!(
+            METRIC_WORKFLOW_PAUSED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_workflow_pause_duration(&self, workflow_name: &str, queue: &str, duration_secs: f64) {
+        histogram!(
+            METRIC_WORKFLOW_PAUSE_DURATION,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+        )
+        .record(duration_secs);
     }
 
     fn record_circuit_tripped(&self, activity_name: &str) {

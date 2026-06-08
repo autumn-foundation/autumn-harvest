@@ -630,8 +630,12 @@ pub async fn cancel_workflow_execution(
                             HarvestError::NotFound(format!("workflow execution {exec_id}"))
                         })?;
 
+                    // Cancellation beats pause (issue #383): a PAUSED execution
+                    // is cancellable just like a RUNNING one; the transition to
+                    // CANCELLED clears the pending pause record below.
+                    let prior_state = execution.state.clone();
                     match execution.state.as_str() {
-                        "RUNNING" => {}
+                        "RUNNING" | "PAUSED" => {}
                         "CANCELLED" => {
                             return Ok((
                                 CancelledWorkflowExecution::idempotent(exec_id, execution),
@@ -672,12 +676,19 @@ pub async fn cancel_workflow_execution(
 
                     let updated =
                         diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                            .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                            .filter(
+                                harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]),
+                            )
                             .set((
                                 harvest_workflow_executions::state.eq("CANCELLED"),
                                 harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                                 harvest_workflow_executions::error.eq(Some(reason.clone())),
                                 harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                                // Cancellation wins: clear the pending pause record.
+                                harvest_workflow_executions::paused_at
+                                    .eq(None::<chrono::DateTime<Utc>>),
+                                harvest_workflow_executions::pause_reason.eq(None::<String>),
+                                harvest_workflow_executions::pause_actor.eq(None::<String>),
                             ))
                             .execute(conn)
                             .await
@@ -714,7 +725,7 @@ pub async fn cancel_workflow_execution(
                             total_failed_or_deleted,
                             execution.workflow_name.clone(),
                             execution.queue_name.clone(),
-                            "RUNNING".to_string(),
+                            prior_state,
                         ),
                         deferred,
                     ))
@@ -737,6 +748,371 @@ pub async fn cancel_workflow_execution(
     }
 
     Ok(cancel_result)
+}
+
+/// Maximum length of an operator-supplied pause reason (issue #383).
+pub const MAX_PAUSE_REASON_LEN: usize = 500;
+
+/// Result of a workflow pause request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PausedWorkflowExecution {
+    /// Paused workflow execution ID.
+    pub exec_id: ExecutionId,
+    /// Execution state after the request (always `"PAUSED"`).
+    pub state: String,
+    /// Stored pause reason, if any.
+    pub reason: Option<String>,
+    /// Actor that requested the pause.
+    pub actor: String,
+    /// `true` when this request performed the `RUNNING → PAUSED` transition;
+    /// `false` when the execution was already paused (idempotent).
+    pub newly_paused: bool,
+    /// Workflow type name (for per-workflow metrics without a re-query).
+    pub workflow_name: String,
+    /// Task queue the execution was dispatched on.
+    pub queue_name: String,
+}
+
+/// Result of a workflow resume request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumedWorkflowExecution {
+    /// Resumed workflow execution ID.
+    pub exec_id: ExecutionId,
+    /// Execution state after the request (always `"RUNNING"`).
+    pub state: String,
+    /// Actor that requested the resume.
+    pub actor: String,
+    /// Wall-clock seconds the execution spent paused.
+    pub pause_duration_secs: f64,
+    /// Workflow type name (for per-workflow metrics without a re-query).
+    pub workflow_name: String,
+    /// Task queue the execution was dispatched on.
+    pub queue_name: String,
+}
+
+/// Returns `true` when a pause that started at `paused_at` has exceeded the
+/// bounded-pause ceiling `max` as of `now` (issue #383).
+///
+/// Pure helper used by the auto-resume scanner so the expiry decision can be
+/// unit-tested without a database. A non-positive `max` is treated as "expire
+/// immediately" so a misconfigured zero ceiling does not strand a paused
+/// execution forever.
+#[must_use]
+pub fn pause_timeout_exceeded(
+    paused_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+    max: std::time::Duration,
+) -> bool {
+    // An overflowing ceiling (absurdly large) effectively never expires → false.
+    chrono::Duration::from_std(max).is_ok_and(|max| now - paused_at >= max)
+}
+
+/// Pause a running workflow execution (issue #383).
+///
+/// Pausing is a durable, **non-terminal** transition: it appends a
+/// [`WorkflowEvent::WorkflowExecutionPaused`] event, marks the execution
+/// `PAUSED`, and records the pause audit metadata. The executor enforces the
+/// pause at the claim layer — a workflow task belonging to a `PAUSED` execution
+/// is never claimed, so no new commands are dispatched. In-flight activities
+/// continue to completion; their results are recorded normally and remain
+/// queued behind the pause until [`resume_workflow_execution`].
+///
+/// Repeating the request against an already-paused execution is idempotent and
+/// does not append a second event.
+///
+/// # Errors
+///
+/// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
+/// - [`HarvestError::Config`] when the execution is already terminal (→ 409),
+///   or the reason exceeds [`MAX_PAUSE_REASON_LEN`] (→ 400).
+/// - [`HarvestError::Database`] for persistence failures.
+pub async fn pause_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: Option<&str>,
+    actor: &str,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> HarvestResult<PausedWorkflowExecution> {
+    let actor = if actor.trim().is_empty() {
+        "anonymous".to_string()
+    } else {
+        actor.trim().to_string()
+    };
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+    if let Some(r) = reason
+        && r.chars().count() > MAX_PAUSE_REASON_LEN
+    {
+        return Err(HarvestError::Config(format!(
+            "pause reason exceeds {MAX_PAUSE_REASON_LEN} characters"
+        )));
+    }
+    let reason = reason.map(ToOwned::to_owned);
+
+    let paused_at = Utc::now();
+    let result = conn
+        .transaction::<PausedWorkflowExecution, HarvestError, _>(|conn| {
+            let reason = reason.clone();
+            let actor = actor.clone();
+            async move {
+                let execution = harvest_workflow_executions::table
+                    .find(exec_id.as_uuid())
+                    .select(WorkflowExecution::as_select())
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(database_error)?
+                    .ok_or_else(|| {
+                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
+                    })?;
+
+                match execution.state.as_str() {
+                    "RUNNING" => {}
+                    "PAUSED" => {
+                        return Ok(PausedWorkflowExecution {
+                            exec_id,
+                            state: "PAUSED".to_string(),
+                            reason: execution.pause_reason,
+                            actor: execution.pause_actor.unwrap_or(actor),
+                            newly_paused: false,
+                            workflow_name: execution.workflow_name,
+                            queue_name: execution.queue_name,
+                        });
+                    }
+                    state => {
+                        return Err(HarvestError::Config(format!(
+                            "workflow execution {exec_id} is already terminal ({state})"
+                        )));
+                    }
+                }
+
+                let history = store::load_history(conn, exec_id).await?;
+                store::append_events(
+                    conn,
+                    exec_id,
+                    &[WorkflowEvent::WorkflowExecutionPaused {
+                        paused_at,
+                        reason: reason.clone(),
+                        actor: actor.clone(),
+                    }],
+                    history.next_event_id,
+                )
+                .await?;
+
+                let updated =
+                    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+                        .set((
+                            harvest_workflow_executions::state.eq("PAUSED"),
+                            harvest_workflow_executions::paused_at.eq(Some(paused_at)),
+                            harvest_workflow_executions::pause_reason.eq(reason.clone()),
+                            harvest_workflow_executions::pause_actor.eq(Some(actor.clone())),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+
+                if updated == 0 {
+                    return Err(HarvestError::Config(format!(
+                        "workflow execution {exec_id} is no longer running"
+                    )));
+                }
+
+                Ok(PausedWorkflowExecution {
+                    exec_id,
+                    state: "PAUSED".to_string(),
+                    reason,
+                    actor,
+                    newly_paused: true,
+                    workflow_name: execution.workflow_name,
+                    queue_name: execution.queue_name,
+                })
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    if result.newly_paused {
+        metrics.record_workflow_paused(&result.workflow_name, &result.queue_name);
+    }
+
+    Ok(result)
+}
+
+/// Resume a paused workflow execution (issue #383).
+///
+/// Appends a [`WorkflowEvent::WorkflowExecutionResumed`] event, transitions the
+/// execution back to `RUNNING`, clears the pause audit metadata, and wakes the
+/// parked workflow task so the workflow advances on its next decision attempt.
+/// Timers whose fire time elapsed while paused fire immediately in their
+/// original order on the next decision; signals queued during the pause are
+/// delivered in order.
+///
+/// # Errors
+///
+/// - [`HarvestError::NotFound`] when the execution does not exist (→ 404).
+/// - [`HarvestError::Config`] when the execution is not in the `PAUSED` state
+///   (→ 409).
+/// - [`HarvestError::Database`] for persistence failures.
+pub async fn resume_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    actor: &str,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> HarvestResult<ResumedWorkflowExecution> {
+    let actor = if actor.trim().is_empty() {
+        "anonymous".to_string()
+    } else {
+        actor.trim().to_string()
+    };
+
+    let resumed_at = Utc::now();
+    let result = conn
+        .transaction::<ResumedWorkflowExecution, HarvestError, _>(|conn| {
+            let actor = actor.clone();
+            async move {
+                let execution = harvest_workflow_executions::table
+                    .find(exec_id.as_uuid())
+                    .select(WorkflowExecution::as_select())
+                    .for_update()
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(database_error)?
+                    .ok_or_else(|| {
+                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
+                    })?;
+
+                if execution.state != "PAUSED" {
+                    return Err(HarvestError::Config(format!(
+                        "workflow execution {exec_id} is not paused (state: {})",
+                        execution.state
+                    )));
+                }
+
+                // `to_std()` yields `Err` for a negative span, so a clock skew
+                // that puts `paused_at` ahead of `resumed_at` reports 0.0.
+                let pause_duration_secs = execution
+                    .paused_at
+                    .and_then(|p| (resumed_at - p).to_std().ok())
+                    .map_or(0.0, |d| d.as_secs_f64());
+
+                let history = store::load_history(conn, exec_id).await?;
+                store::append_events(
+                    conn,
+                    exec_id,
+                    &[WorkflowEvent::WorkflowExecutionResumed {
+                        resumed_at,
+                        actor: actor.clone(),
+                    }],
+                    history.next_event_id,
+                )
+                .await?;
+
+                let updated =
+                    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                        .filter(harvest_workflow_executions::state.eq("PAUSED"))
+                        .set((
+                            harvest_workflow_executions::state.eq("RUNNING"),
+                            harvest_workflow_executions::paused_at
+                                .eq(None::<chrono::DateTime<Utc>>),
+                            harvest_workflow_executions::pause_reason.eq(None::<String>),
+                            harvest_workflow_executions::pause_actor.eq(None::<String>),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+
+                if updated == 0 {
+                    return Err(HarvestError::Config(format!(
+                        "workflow execution {exec_id} is no longer paused"
+                    )));
+                }
+
+                // Re-arm the executor: wake the parked workflow task so the
+                // workflow advances on its next decision attempt. Any timer that
+                // fired while paused, or signal queued during the pause, is
+                // processed when the woken task is claimed.
+                queue::wake_workflow_task(conn, exec_id).await?;
+
+                Ok(ResumedWorkflowExecution {
+                    exec_id,
+                    state: "RUNNING".to_string(),
+                    actor,
+                    pause_duration_secs,
+                    workflow_name: execution.workflow_name,
+                    queue_name: execution.queue_name,
+                })
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    metrics.record_workflow_pause_duration(
+        &result.workflow_name,
+        &result.queue_name,
+        result.pause_duration_secs,
+    );
+
+    Ok(result)
+}
+
+/// Auto-resume executions that have been paused longer than `max_pause_duration`
+/// (issue #383, bounded pause).
+///
+/// Scans `PAUSED` executions whose `paused_at` exceeds the ceiling and resumes
+/// each with `actor = "auto-resume(timeout)"`. This prevents orphaned-pause
+/// backlogs when an operator pauses during an incident and forgets to resume.
+///
+/// Returns the number of executions auto-resumed.
+///
+/// # Errors
+///
+/// Returns the first database or persistence error encountered. Per-execution
+/// races (an execution resumed or cancelled concurrently) are skipped, not
+/// treated as fatal.
+pub async fn auto_resume_expired_pauses(
+    conn: &mut AsyncPgConnection,
+    max_pause_duration: std::time::Duration,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> HarvestResult<usize> {
+    let now = Utc::now();
+    // Ceiling too large to represent: nothing can exceed it.
+    let Ok(max) = chrono::Duration::from_std(max_pause_duration) else {
+        return Ok(0);
+    };
+    let cutoff = now - max;
+
+    let expired: Vec<ExecutionId> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::state.eq("PAUSED"))
+        .filter(harvest_workflow_executions::paused_at.is_not_null())
+        .filter(harvest_workflow_executions::paused_at.le(Some(cutoff)))
+        .select(harvest_workflow_executions::id)
+        .load::<Uuid>(conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(ExecutionId::from_uuid)
+        .collect();
+
+    let mut resumed = 0;
+    for exec_id in expired {
+        match resume_workflow_execution(conn, exec_id, "auto-resume(timeout)", metrics).await {
+            Ok(_) => {
+                resumed += 1;
+                tracing::warn!(
+                    exec_id = %exec_id,
+                    "auto-resumed workflow execution after exceeding max pause duration"
+                );
+            }
+            // The execution was resumed or cancelled between the scan and the
+            // claim; not a fatal condition for the sweep.
+            Err(HarvestError::Config(_) | HarvestError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(resumed)
 }
 
 /// Count running detached children that would append a parent cascade event.
@@ -1529,4 +1905,50 @@ async fn load_workflow_execution_by_key_for_update(
         .ok_or_else(|| {
             HarvestError::NotFound(format!("workflow execution {workflow_name}/{workflow_id}"))
         })
+}
+
+#[cfg(test)]
+mod pause_helper_tests {
+    use super::pause_timeout_exceeded;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use std::time::Duration;
+
+    #[test]
+    fn pause_not_expired_within_ceiling() {
+        let now = Utc::now();
+        let paused_at = now - ChronoDuration::minutes(30);
+        assert!(
+            !pause_timeout_exceeded(paused_at, now, Duration::from_secs(3600)),
+            "a 30-minute pause must not exceed a 1-hour ceiling"
+        );
+    }
+
+    #[test]
+    fn pause_expired_past_ceiling() {
+        let now = Utc::now();
+        let paused_at = now - ChronoDuration::hours(25);
+        assert!(
+            pause_timeout_exceeded(paused_at, now, Duration::from_secs(24 * 3600)),
+            "a 25-hour pause must exceed the 24-hour ceiling"
+        );
+    }
+
+    #[test]
+    fn pause_expired_exactly_at_ceiling() {
+        let now = Utc::now();
+        let paused_at = now - ChronoDuration::hours(24);
+        assert!(
+            pause_timeout_exceeded(paused_at, now, Duration::from_secs(24 * 3600)),
+            "a pause exactly at the ceiling is expired (>=)"
+        );
+    }
+
+    #[test]
+    fn zero_ceiling_expires_immediately() {
+        let now = Utc::now();
+        assert!(
+            pause_timeout_exceeded(now, now, Duration::ZERO),
+            "a zero ceiling must not strand a paused execution"
+        );
+    }
 }

@@ -277,6 +277,7 @@ async fn test_delayed_start_no_premature_dispatch() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             registry,

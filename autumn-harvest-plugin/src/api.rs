@@ -39,11 +39,11 @@ use autumn_harvest::audit::{
     OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL,
     OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER,
-    TARGET_WORKFLOW,
+    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
+    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, SOURCE_API,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT,
+    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -106,8 +106,8 @@ use autumn_harvest::workers::{
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, WorkflowHandleClient,
-    WorkflowResult, cancel_workflow_execution, signal_with_start_workflow_execution,
-    start_or_load_workflow_execution,
+    WorkflowResult, cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
+    signal_with_start_workflow_execution, start_or_load_workflow_execution,
 };
 
 use crate::preflight::{PreflightReport, build_preflight_report};
@@ -1124,6 +1124,25 @@ struct CancelWorkflowResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct PauseWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    state: String,
+    reason: Option<String>,
+    actor: String,
+    newly_paused: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ResumeWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    state: String,
+    actor: String,
+    pause_duration_secs: f64,
+}
+
+#[derive(Debug, Serialize)]
 struct ResetWorkflowResponse {
     new_exec_id: String,
     reset_from_exec_id: String,
@@ -1287,6 +1306,12 @@ struct DagTriggerRequest {
 
 #[derive(Debug, Deserialize)]
 struct CancelWorkflowRequest {
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PauseWorkflowRequest {
+    #[serde(default)]
     reason: Option<String>,
 }
 
@@ -1930,6 +1955,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route(
             "/workflows/{id}/cancel",
             post(cancel_workflow).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/{id}/pause",
+            post(pause_workflow).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/{id}/resume",
+            post(resume_workflow).route_layer(require_admin.clone()),
         )
         .route("/workflows/{id}/reset", post(reset_workflow))
         .route(
@@ -6524,6 +6557,148 @@ async fn cancel_workflow(
                 }),
             ))
         }
+    }
+}
+
+/// Build a `409 Conflict` response from a state-conflict error (issue #383).
+fn conflict_from(error: HarvestError) -> AutumnError {
+    match error {
+        // Not found stays 404.
+        HarvestError::NotFound(_) => map_error(error),
+        other => AutumnError::bad_request_msg(other.to_string())
+            .with_status(axum::http::StatusCode::CONFLICT),
+    }
+}
+
+/// `POST /workflows/{id}/pause` — halt new command dispatch for an execution
+/// (issue #383). Returns 200 on success, 409 if the workflow is already
+/// terminal, 404 if not found, 400 if the reason exceeds the length cap.
+async fn pause_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<PauseWorkflowRequest>,
+) -> Result<(axum::http::StatusCode, Json<PauseWorkflowResponse>), AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/pause";
+
+    let exec_id = parse_execution_id(&id)?;
+    // Reject an over-long reason at the boundary (400) so the only conflicts the
+    // core can return below are genuine state conflicts (mapped to 409).
+    if let Some(reason) = request.reason.as_deref()
+        && reason.chars().count() > autumn_harvest::execution::MAX_PAUSE_REASON_LEN
+    {
+        return Err(AutumnError::bad_request_msg(format!(
+            "pause reason exceeds {} characters",
+            autumn_harvest::execution::MAX_PAUSE_REASON_LEN
+        )));
+    }
+
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry.telemetry().metrics),
+        );
+
+    let result = pause_workflow_execution(
+        &mut conn,
+        exec_id,
+        request.reason.as_deref(),
+        &actor,
+        metrics_ref.as_ref(),
+    )
+    .await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_WORKFLOW_PAUSE,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(paused) => Ok((
+            axum::http::StatusCode::OK,
+            Json(PauseWorkflowResponse {
+                ok: true,
+                execution_id: paused.exec_id.to_string(),
+                state: paused.state,
+                reason: paused.reason,
+                actor: paused.actor,
+                newly_paused: paused.newly_paused,
+            }),
+        )),
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
+/// `POST /workflows/{id}/resume` — re-arm a paused execution (issue #383).
+/// Returns 200 on success, 409 if the workflow is not in the `Paused` state,
+/// 404 if not found.
+async fn resume_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<(axum::http::StatusCode, Json<ResumeWorkflowResponse>), AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/resume";
+
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry.telemetry().metrics),
+        );
+
+    let result = resume_workflow_execution(&mut conn, exec_id, &actor, metrics_ref.as_ref()).await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_WORKFLOW_RESUME,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(resumed) => Ok((
+            axum::http::StatusCode::OK,
+            Json(ResumeWorkflowResponse {
+                ok: true,
+                execution_id: resumed.exec_id.to_string(),
+                state: resumed.state,
+                actor: resumed.actor,
+                pause_duration_secs: resumed.pause_duration_secs,
+            }),
+        )),
+        Err(e) => Err(conflict_from(e)),
     }
 }
 
@@ -12973,6 +13148,12 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         } => AutumnError::bad_request_msg(message),
         HarvestError::UpdateRejected { reason } => {
             AutumnError::bad_request_msg(reason).with_status(axum::http::StatusCode::CONFLICT)
+        }
+        // An update (or other mutation) was submitted against a paused
+        // execution (issue #383): reject with 409 Conflict.
+        HarvestError::WorkflowPaused(exec_id) => {
+            AutumnError::bad_request_msg(format!("workflow paused: {exec_id}"))
+                .with_status(axum::http::StatusCode::CONFLICT)
         }
         HarvestError::PayloadTooLarge {
             kind,

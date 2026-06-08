@@ -42,6 +42,10 @@ pub const OP_WORKFLOW_SIGNAL_WITH_START: &str = "workflow.signal_with_start";
 pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
 /// Audit operation: Reset a workflow execution to a previous state.
 pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
+/// Audit operation: Paused an individual workflow execution (issue #383).
+pub const OP_WORKFLOW_PAUSE: &str = "workflow.pause";
+/// Audit operation: Resumed a paused workflow execution (issue #383).
+pub const OP_WORKFLOW_RESUME: &str = "workflow.resume";
 /// Audit operation: Manually triggered a DAG execution.
 pub const OP_DAG_TRIGGER: &str = "dag.trigger";
 /// Audit operation: Retried a DAG run from a failed node (issue #366).

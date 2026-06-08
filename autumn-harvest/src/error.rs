@@ -157,6 +157,15 @@ pub enum HarvestError {
     #[error("workflow terminated: {0}")]
     Terminated(String),
 
+    /// An operation was rejected because the workflow execution is currently
+    /// paused (issue #383).
+    ///
+    /// Returned when an update is submitted against a paused execution: updates
+    /// may admit-and-mutate workflow state, so they are rejected rather than
+    /// silently queued. Surfaces as `409 Conflict` at the management API layer.
+    #[error("workflow paused: {0}")]
+    WorkflowPaused(ExecutionId),
+
     /// A Saga compensation sequence failed while trying to rollback.
     #[error(
         "saga compensation failed after original error: {original}; compensation errors: {compensation_errors:?}"
@@ -708,6 +717,18 @@ mod tests {
         assert!(msg.contains("tenant_cancel"));
         assert!(msg.contains("target_terminal"));
         assert!(msg.contains(&target.to_string()));
+    }
+
+    #[test]
+    fn harvest_error_workflow_paused_display() {
+        let e =
+            HarvestError::WorkflowPaused("00000000-0000-0000-0000-000000000001".parse().unwrap());
+        let msg = e.to_string();
+        assert!(
+            msg.contains("paused"),
+            "WorkflowPaused display should mention 'paused'; got: {msg}"
+        );
+        assert!(msg.contains("00000000-0000-0000-0000-000000000001"));
     }
 
     #[test]

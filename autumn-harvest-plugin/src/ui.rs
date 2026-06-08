@@ -36,15 +36,14 @@ use autumn_harvest::ShardRouter;
 use autumn_harvest::audit::{
     OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_GATE_LIFT,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI,
-    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BUILD_ROUTING, TARGET_GATE, TARGET_SCHEDULE,
-    TARGET_WORKFLOW, insert_audit,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
+    OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_BUILD_ROUTING, TARGET_GATE, TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
     list_build_compat, list_build_policies, merge_reachability, revoke_compat, set_build_policy,
 };
-use autumn_harvest::cancel_workflow_execution;
 use autumn_harvest::error::{HarvestResult, database_error};
 use autumn_harvest::execution::StartWorkflowParams;
 use autumn_harvest::models::{
@@ -67,6 +66,9 @@ use autumn_harvest::types::{
     ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
 };
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
+use autumn_harvest::{
+    cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
+};
 
 use crate::api::{
     HarvestApiRuntime, HarvestApiState, KNOWN_WORKFLOW_STATES, WorkflowFilters, acquire_conn,
@@ -217,6 +219,12 @@ pub(crate) struct WorkflowDetailParams {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowCancelForm {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WorkflowPauseForm {
     #[serde(default)]
     reason: Option<String>,
 }
@@ -498,6 +506,8 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows", get(list_workflows_ui))
         .route("/workflows/{id}", get(workflow_detail_ui))
         .route("/workflows/{id}/cancel", post(cancel_workflow_ui))
+        .route("/workflows/{id}/pause", post(pause_workflow_ui))
+        .route("/workflows/{id}/resume", post(resume_workflow_ui))
         .route("/workflows/{id}/signal", post(signal_workflow_ui))
         .route("/workflows/{id}/reset", post(reset_workflow_ui))
         .route("/workflows/{id}/trigger-update", post(trigger_update_ui))
@@ -1080,6 +1090,111 @@ async fn cancel_workflow_ui(
             target_type: TARGET_WORKFLOW,
             target_id: Some(&exec_id_str),
             route_or_command: "POST /workflows/{id}/cancel",
+            request_id: None,
+            idempotency_key: None,
+            status,
+            error_summary: error_summary.as_deref(),
+            shard_id: None,
+            source: SOURCE_UI,
+        },
+    )
+    .await;
+
+    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+}
+
+async fn pause_workflow_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<WorkflowPauseForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let actor = api_state.extract_actor(&headers);
+    let exec_id_str = exec_id.as_uuid().to_string();
+    let reason = form
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry().telemetry().metrics),
+        );
+    let result =
+        pause_workflow_execution(&mut conn, exec_id, reason, &actor, metrics_ref.as_ref()).await;
+    let (status, error_summary, flash) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None, url_encode("Workflow paused")),
+        Err(e) => {
+            let msg = e.to_string();
+            (
+                STATUS_FAILED,
+                Some(msg.clone()),
+                url_encode(&format!("Pause failed: {msg}")),
+            )
+        }
+    };
+    let _ = insert_audit(
+        &mut conn,
+        &NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_PAUSE,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(&exec_id_str),
+            route_or_command: "POST /workflows/{id}/pause",
+            request_id: None,
+            idempotency_key: None,
+            status,
+            error_summary: error_summary.as_deref(),
+            shard_id: None,
+            source: SOURCE_UI,
+        },
+    )
+    .await;
+
+    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+}
+
+async fn resume_workflow_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+) -> Result<axum::response::Response, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let actor = api_state.extract_actor(&headers);
+    let exec_id_str = exec_id.as_uuid().to_string();
+
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry().telemetry().metrics),
+        );
+    let result = resume_workflow_execution(&mut conn, exec_id, &actor, metrics_ref.as_ref()).await;
+    let (status, error_summary, flash) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None, url_encode("Workflow resumed")),
+        Err(e) => {
+            let msg = e.to_string();
+            (
+                STATUS_FAILED,
+                Some(msg.clone()),
+                url_encode(&format!("Resume failed: {msg}")),
+            )
+        }
+    };
+    let _ = insert_audit(
+        &mut conn,
+        &NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_RESUME,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(&exec_id_str),
+            route_or_command: "POST /workflows/{id}/resume",
             request_id: None,
             idempotency_key: None,
             status,
@@ -3010,6 +3125,20 @@ fn render_workflow_detail(
             form method="post" action={ (exec_id_str) "/cancel" }
                   onsubmit="return confirm('Cancel this workflow execution?')" {
                 button.danger type="submit" { "Cancel" }
+            }
+            @let terminal = is_terminal_workflow_state(&execution.state);
+            @if execution.state == "PAUSED" {
+                // Paused executions show a Resume action (issue #383).
+                form method="post" action={ (exec_id_str) "/resume" } {
+                    button type="submit" { "Resume" }
+                }
+            } @else {
+                // Pause is disabled once the workflow is terminal.
+                form method="post" action={ (exec_id_str) "/pause" }
+                      onsubmit="return confirm('Pause this workflow execution?')" {
+                    button type="submit" disabled[terminal]
+                        title=[terminal.then_some("Workflow is terminal")] { "Pause" }
+                }
             }
             button disabled title="Not yet available" { "Terminate" }
             details style="display:inline-block" {
@@ -7025,6 +7154,9 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            paused_at: None,
+            pause_reason: None,
+            pause_actor: None,
         }
     }
 

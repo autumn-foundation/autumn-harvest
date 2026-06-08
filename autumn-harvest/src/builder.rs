@@ -47,6 +47,8 @@ pub const DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES: u64 = 256 * 1024; // 256 KiB
 pub const DEFAULT_MAX_WORKFLOW_INPUT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 /// Default maximum workflow start delay (365 days).
 pub const DEFAULT_MAX_WORKFLOW_START_DELAY: Duration = Duration::from_secs(365 * 24 * 3600);
+/// Default bounded-pause ceiling before auto-resume (24 hours, issue #383).
+pub const DEFAULT_MAX_WORKFLOW_PAUSE_DURATION: Duration = Duration::from_secs(24 * 3600);
 
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
@@ -1534,6 +1536,13 @@ pub struct WorkerConfig {
     /// poison pills are re-queued indefinitely — the legacy retry-loop
     /// behaviour).
     pub poison_pill_threshold: i32,
+    /// Maximum wall-clock time a workflow execution may stay paused before the
+    /// bounded-pause auto-resume scanner force-resumes it with
+    /// `actor = "auto-resume(timeout)"` (issue #383).
+    ///
+    /// This prevents orphaned-pause backlogs when an operator pauses a workflow
+    /// during an incident and never resumes it. Defaults to **24 hours**.
+    pub max_workflow_pause_duration: Duration,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
@@ -1560,6 +1569,7 @@ impl Default for WorkerConfig {
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -1725,6 +1735,16 @@ impl WorkerConfig {
         self
     }
 
+    /// Override the bounded-pause ceiling before auto-resume (issue #383).
+    ///
+    /// A workflow paused longer than this is force-resumed by the auto-resume
+    /// scanner with `actor = "auto-resume(timeout)"`. Default: 24 hours.
+    #[must_use]
+    pub const fn with_max_workflow_pause_duration(mut self, max: Duration) -> Self {
+        self.max_workflow_pause_duration = max;
+        self
+    }
+
     /// Enable sticky cross-worker routing (issue #235).
     ///
     /// Sticky routing is **off by default**. When enabled, each time a workflow
@@ -1872,6 +1892,23 @@ mod tests {
     fn worker_config_builder_adds_queues() {
         let config = WorkerConfig::default().with_queues(["email-workers", "etl"]);
         assert!(config.queues.contains(&"email-workers".to_string()));
+    }
+
+    #[test]
+    fn worker_config_default_max_pause_duration_is_24h() {
+        let config = WorkerConfig::default();
+        assert_eq!(
+            config.max_workflow_pause_duration,
+            Duration::from_secs(24 * 3600),
+            "bounded-pause ceiling must default to 24 hours"
+        );
+    }
+
+    #[test]
+    fn worker_config_with_max_pause_duration_overrides() {
+        let config =
+            WorkerConfig::default().with_max_workflow_pause_duration(Duration::from_secs(60));
+        assert_eq!(config.max_workflow_pause_duration, Duration::from_secs(60));
     }
 
     #[test]

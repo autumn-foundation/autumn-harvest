@@ -345,6 +345,14 @@ pub async fn claim_task(
     //
     // The concurrency cap is never bypassed: a real call must always respect
     // `max_concurrent`.
+    //
+    // Pause gating (issue #383): workflow tasks whose execution is in the
+    // `PAUSED` state are never claimed. They stay PENDING (or parked) until the
+    // execution is resumed, at which point they become claimable again. This is
+    // the single executor-layer chokepoint that defers timer fires, signal
+    // deliveries, and activity-completion wakes uniformly while paused — no
+    // workflow-author cooperation required. In-flight activity tasks are not
+    // `task_type = 'workflow'` and so continue to run to completion.
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let result: Vec<TaskQueueItem> = diesel::sql_query(
@@ -383,6 +391,15 @@ pub async fn claim_task(
                        SELECT 1 FROM harvest_build_compat \
                        WHERE build_id = $3 \
                          AND compatible_with = harvest_task_queue.required_build_id \
+                   ) \
+               ) \
+               AND ( \
+                   task_type <> 'workflow' \
+                   OR workflow_exec_id IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM harvest_workflow_executions e \
+                       WHERE e.id = harvest_task_queue.workflow_exec_id \
+                         AND e.state = 'PAUSED' \
                    ) \
                ) \
                AND ( \
