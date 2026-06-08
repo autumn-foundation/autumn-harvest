@@ -75,6 +75,11 @@ pub enum NonDeterminismKind {
     ChildWorkflowMismatch,
     /// A side-effect ID did not match the recorded marker.
     SideEffectMismatch,
+    /// A deterministic built-in primitive (`ctx.system_now()`, `ctx.new_uuid()`,
+    /// `ctx.random_*()`) drifted from the recorded `SideEffectRecorded` history —
+    /// a captured value was reordered, renamed, inserted, or removed across a
+    /// code change (issue #384).
+    SideEffectDrift,
     /// An external activity name did not match the recorded event.
     ExternalActivityMismatch,
     /// A `signal_external_workflow` call did not match the recorded event.
@@ -100,6 +105,7 @@ impl std::fmt::Display for NonDeterminismKind {
             Self::SignalMismatch => write!(f, "SignalMismatch"),
             Self::ChildWorkflowMismatch => write!(f, "ChildWorkflowMismatch"),
             Self::SideEffectMismatch => write!(f, "SideEffectMismatch"),
+            Self::SideEffectDrift => write!(f, "SideEffectDrift"),
             Self::ExternalActivityMismatch => write!(f, "ExternalActivityMismatch"),
             Self::ExternalSignalMismatch => write!(f, "ExternalSignalMismatch"),
             Self::ContinueAsNewMismatch => write!(f, "ContinueAsNewMismatch"),
@@ -717,6 +723,7 @@ fn classify_kind(kind_str: &str, actual: &str) -> NonDeterminismKind {
         "signal" => NonDeterminismKind::SignalMismatch,
         "child workflow" => NonDeterminismKind::ChildWorkflowMismatch,
         "side effect" => NonDeterminismKind::SideEffectMismatch,
+        "side-effect drift" => NonDeterminismKind::SideEffectDrift,
         "external activity" => NonDeterminismKind::ExternalActivityMismatch,
         "external signal" => NonDeterminismKind::ExternalSignalMismatch,
         s if s.contains("continue") => NonDeterminismKind::ContinueAsNewMismatch,
@@ -1956,6 +1963,13 @@ impl WorkflowTestEnv {
                         details: details.clone(),
                     });
                 }
+                WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                    history.push(WorkflowEvent::SideEffectRecorded {
+                        kind: *kind,
+                        name: name.clone(),
+                        value: value.clone(),
+                    });
+                }
                 WorkflowCommand::SpawnDetachedChildWorkflow {
                     child_id,
                     workflow_name,
@@ -2205,6 +2219,18 @@ impl WorkflowTestEnv {
                     parent_close_policy,
                 });
                 Ok(true)
+            }
+
+            // Deterministic side-effect capture (system_now/new_uuid/random_*/
+            // side_effect) emitted before a suspending command. The real worker
+            // persists these via build_suspension_events, so the harness must do
+            // the same — otherwise the next replay iteration sees the following
+            // event where it expects SideEffectRecorded and reports spurious drift.
+            // Pushed to `history` (not deferred_events) to preserve command order
+            // ahead of the suspending command's own scheduled event.
+            WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                history.push(WorkflowEvent::SideEffectRecorded { kind, name, value });
+                Ok(false)
             }
 
             // WaitForActivity: activity was scheduled in a previous iteration;
@@ -2571,6 +2597,10 @@ mod tests {
         assert_eq!(
             classify_kind("side effect", "ActivityScheduled"),
             NonDeterminismKind::SideEffectMismatch
+        );
+        assert_eq!(
+            classify_kind("side-effect drift", "ActivityScheduled"),
+            NonDeterminismKind::SideEffectDrift
         );
         assert_eq!(
             classify_kind("external activity", "ActivityScheduled"),

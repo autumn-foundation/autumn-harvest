@@ -127,31 +127,57 @@ pub async fn run_workflow_strict(
     async {
         let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
         match timeout_result {
-            Ok(Ok(output)) => {
-                if ctx.history_has_unconsumed_events() {
-                    WorkflowOutcome::Failed {
-                        error: "non-deterministic replay: early completion mismatch: \
-                                expected <end of history>, got <workflow returned early>"
-                            .to_string(),
+            // An infallible built-in primitive (system_now/new_uuid/random_*) may
+            // have absorbed a divergence and returned a fallback value (issue #384);
+            // surface it before the other completion checks.
+            Ok(Ok(output)) => ctx.take_deferred_nd_error().map_or_else(
+                || {
+                    if ctx.history_has_unconsumed_events() {
+                        WorkflowOutcome::Failed {
+                            error: "non-deterministic replay: early completion mismatch: \
+                                    expected <end of history>, got <workflow returned early>"
+                                .to_string(),
+                        }
+                    } else if ctx.drain_commands().into_iter().any(|cmd| {
+                        // UpsertSearchAttributes is pure metadata and does not
+                        // affect replay determinism; exclude it from this check.
+                        !matches!(cmd, WorkflowCommand::UpsertSearchAttributes { .. })
+                    }) {
+                        // New commands emitted after history was fully consumed (e.g. a
+                        // newly-added version() or side_effect() call on an old history).
+                        WorkflowOutcome::Failed {
+                            error: "non-deterministic replay: new commands emitted beyond \
+                                    recorded history"
+                                .to_string(),
+                        }
+                    } else {
+                        WorkflowOutcome::Completed { output }
                     }
-                } else if ctx.drain_commands().into_iter().any(|cmd| {
-                    // UpsertSearchAttributes is pure metadata and does not
-                    // affect replay determinism; exclude it from this check.
-                    !matches!(cmd, WorkflowCommand::UpsertSearchAttributes { .. })
-                }) {
-                    // New commands emitted after history was fully consumed (e.g. a
-                    // newly-added version() or side_effect() call on an old history).
-                    WorkflowOutcome::Failed {
-                        error: "non-deterministic replay: new commands emitted beyond \
-                                recorded history"
-                            .to_string(),
-                    }
-                } else {
-                    WorkflowOutcome::Completed { output }
-                }
+                },
+                |nd| WorkflowOutcome::Failed {
+                    error: format!("non-deterministic replay: {nd}"),
+                },
+            ),
+            // A primitive may have drifted before the workflow returned Err from
+            // its own logic; prefer the non-determinism error (issue #384).
+            Ok(Err(error)) => {
+                ctx.take_deferred_nd_error()
+                    .map_or(WorkflowOutcome::Failed { error }, |nd| {
+                        WorkflowOutcome::Failed {
+                            error: format!("non-deterministic replay: {nd}"),
+                        }
+                    })
             }
-            Ok(Err(error)) => WorkflowOutcome::Failed { error },
             Err(_elapsed) => {
+                // A plain-value built-in primitive (system_now/new_uuid/random_*)
+                // may have recorded a divergence before the workflow parked on an
+                // await point. Fail the execution now rather than suspending from
+                // a non-deterministic state (issue #384).
+                if let Some(nd) = ctx.take_deferred_nd_error() {
+                    return WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                    };
+                }
                 let mut commands = ctx.drain_commands();
                 if let Some(idx) = commands
                     .iter()
@@ -324,14 +350,49 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
             // emitted during live execution (e.g. RecordUpdateResult from
             // execute_admitted_update) so the worker can persist them before the
             // terminal WorkflowCompleted/WorkflowFailed event.
-            Ok(Ok(output)) => (WorkflowOutcome::Completed { output }, ctx.drain_commands()),
-            Ok(Err(error)) => (WorkflowOutcome::Failed { error }, ctx.drain_commands()),
+            Ok(Ok(output)) => {
+                // A plain-value built-in primitive (system_now/new_uuid/random_*)
+                // may have absorbed a replay divergence and recorded it as a
+                // deferred non-determinism error (issue #384). Surface it as a
+                // failure rather than letting the workflow complete silently.
+                let outcome = ctx.take_deferred_nd_error().map_or_else(
+                    || WorkflowOutcome::Completed { output },
+                    |nd| WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                    },
+                );
+                (outcome, ctx.drain_commands())
+            }
+            // A primitive may have drifted before the workflow returned Err from
+            // its own logic; prefer the non-determinism error (issue #384).
+            Ok(Err(error)) => {
+                let outcome =
+                    ctx.take_deferred_nd_error()
+                        .map_or(WorkflowOutcome::Failed { error }, |nd| {
+                            WorkflowOutcome::Failed {
+                                error: format!("non-deterministic replay: {nd}"),
+                            }
+                        });
+                (outcome, ctx.drain_commands())
+            }
 
             // Timeout elapsed -- the handler is suspended on a oneshot channel.
             // Drain the commands it emitted before suspending. RecordUpdateResult
             // commands emitted in this cycle are included in the commands list and
             // will be handled by the worker alongside the suspension side-effects.
             Err(_elapsed) => {
+                // A plain-value built-in primitive (system_now/new_uuid/random_*)
+                // may have recorded a divergence before the workflow parked on an
+                // await point. Fail the execution now rather than suspending from
+                // a non-deterministic state (issue #384).
+                if let Some(nd) = ctx.take_deferred_nd_error() {
+                    return (
+                        WorkflowOutcome::Failed {
+                            error: format!("non-deterministic replay: {nd}"),
+                        },
+                        ctx.drain_commands(),
+                    );
+                }
                 let mut commands = ctx.drain_commands();
                 // ContinueAsNew is terminal: when the workflow body parks on
                 // the dedicated suspension future, the latest command in the
@@ -384,6 +445,18 @@ mod tests {
         Box::pin(async move { Err("something went wrong".to_string()) })
     }
 
+    /// A workflow that captures a side-effect (drifts against history) and then
+    /// returns Err from its own logic.
+    fn drift_then_error_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = ctx.system_now(); // diverges from the recorded activity event
+            Err("business rule violated".to_string())
+        })
+    }
+
     /// A workflow that calls an activity (will suspend if not in history).
     fn activity_workflow<'a>(
         ctx: &'a WorkflowContext,
@@ -434,6 +507,44 @@ mod tests {
                 assert!(error.contains("something went wrong"));
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_prefers_deferred_drift_over_workflow_error() {
+        // Regression (issue #384): a primitive that drifts before the workflow
+        // returns Err from its own logic must surface as non-determinism rather
+        // than masquerading as an ordinary workflow failure.
+        let exec_id = ExecutionId::new();
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            // The workflow calls system_now() here, but history recorded an
+            // activity — a genuine divergence.
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "some_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+
+        let outcome = run_workflow(exec_id, history, drift_then_error_workflow, Value::Null).await;
+
+        match outcome {
+            WorkflowOutcome::Failed { error } => {
+                assert!(
+                    error.contains("non-deterministic replay"),
+                    "drift must win over the workflow's own error: {error}"
+                );
+                assert!(
+                    !error.contains("business rule violated"),
+                    "the workflow's Err must not mask the drift: {error}"
+                );
+            }
+            other => panic!("expected Failed(non-determinism), got {other:?}"),
         }
     }
 
