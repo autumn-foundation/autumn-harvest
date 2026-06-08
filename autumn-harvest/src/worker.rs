@@ -441,6 +441,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::StartTimer { .. } => "StartTimer",
         WorkflowCommand::StartChildWorkflow { .. } => "StartChildWorkflow",
         WorkflowCommand::RecordMarker { .. } => "RecordMarker",
+        WorkflowCommand::RecordSideEffect { .. } => "RecordSideEffect",
         WorkflowCommand::WaitForSignal { .. } => "WaitForSignal",
         WorkflowCommand::Complete { .. } => "Complete",
         WorkflowCommand::Fail { .. } => "Fail",
@@ -495,6 +496,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
             WorkflowCommand::WaitForSignal { .. }
                 | WorkflowCommand::SignalExternalWorkflow { .. }
                 | WorkflowCommand::RecordMarker { .. }
+                | WorkflowCommand::RecordSideEffect { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
@@ -510,6 +512,7 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
             matches!(
                 cmd,
                 WorkflowCommand::RecordMarker { .. }
+                    | WorkflowCommand::RecordSideEffect { .. }
                     | WorkflowCommand::RecordUpdateResult { .. }
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
@@ -655,6 +658,13 @@ where
                     details: details.clone(),
                 })
             }
+            WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                Some(WorkflowEvent::SideEffectRecorded {
+                    kind: *kind,
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+            }
             WorkflowCommand::SpawnDetachedChildWorkflow {
                 child_id,
                 workflow_name,
@@ -690,6 +700,7 @@ fn extract_single_command<T>(
         !matches!(
             cmd,
             WorkflowCommand::RecordMarker { .. }
+                | WorkflowCommand::RecordSideEffect { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
@@ -715,6 +726,7 @@ fn extract_all_scheduled_activities(
     for cmd in commands {
         match cmd {
             WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
@@ -753,6 +765,7 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
     for cmd in commands {
         match cmd {
             WorkflowCommand::RecordMarker { .. }
+            | WorkflowCommand::RecordSideEffect { .. }
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
@@ -803,6 +816,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::WaitForSignal { .. }
                 | WorkflowCommand::SignalExternalWorkflow { .. }
                 | WorkflowCommand::RecordMarker { .. }
+                | WorkflowCommand::RecordSideEffect { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
@@ -825,6 +839,7 @@ fn extract_all_started_child_workflows(
             !matches!(
                 c,
                 WorkflowCommand::RecordMarker { .. }
+                    | WorkflowCommand::RecordSideEffect { .. }
                     | WorkflowCommand::RecordUpdateResult { .. }
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
@@ -950,6 +965,14 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
                     pre_schedule_events.push(event);
                 }
             }
+            WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                let event = WorkflowEvent::SideEffectRecorded { kind, name, value };
+                if local_run.is_some() {
+                    post_schedule_events.push(event);
+                } else {
+                    pre_schedule_events.push(event);
+                }
+            }
             WorkflowCommand::SpawnDetachedChildWorkflow {
                 child_id,
                 workflow_name,
@@ -1049,6 +1072,13 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
                 items.push(SignalBatchItem::Marker(WorkflowEvent::MarkerRecorded {
                     name,
                     details,
+                }));
+            }
+            WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                items.push(SignalBatchItem::Marker(WorkflowEvent::SideEffectRecorded {
+                    kind,
+                    name,
+                    value,
                 }));
             }
             WorkflowCommand::SignalExternalWorkflow {
@@ -2530,6 +2560,14 @@ async fn persist_all_started_child_workflows(
                 WorkflowEvent::MarkerRecorded {
                     name: name.clone(),
                     details: details.clone(),
+                },
+            )),
+            WorkflowCommand::RecordSideEffect { kind, name, value } => Some((
+                i,
+                WorkflowEvent::SideEffectRecorded {
+                    kind: *kind,
+                    name: name.clone(),
+                    value: value.clone(),
                 },
             )),
             WorkflowCommand::SpawnDetachedChildWorkflow {
@@ -4680,6 +4718,7 @@ fn pre_suspension_event_count(commands: &[WorkflowCommand]) -> u64 {
                 matches!(
                     cmd,
                     WorkflowCommand::RecordMarker { .. }
+                        | WorkflowCommand::RecordSideEffect { .. }
                         | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
                 )
             })
@@ -5255,6 +5294,7 @@ async fn process_workflow_task(
                             c,
                             WorkflowCommand::SignalExternalWorkflow { .. }
                                 | WorkflowCommand::RecordMarker { .. }
+                                | WorkflowCommand::RecordSideEffect { .. }
                                 | WorkflowCommand::RecordUpdateResult { .. }
                                 | WorkflowCommand::UpsertSearchAttributes { .. }
                         )

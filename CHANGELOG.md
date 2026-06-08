@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **DLQ root-cause aggregation** (issue #385). New read-only management route
+  `GET /api/harvest/dead-letters/aggregate` (admin auth, parity with the DLQ
+  list endpoint; placed under the existing `/dead-letters` family) answers an operator's first incident question — *"what is the shape
+  of this fire?"* — by grouping dead-letter entries and returning per-group
+  counts plus a few representative `dead_letter_id`s. Repeatable `group_by=`
+  supports `workflow_name`, `activity_name`, `queue_name`, `task_type`,
+  `time_bucket` (with companion `time_bucket=hour|day`), and a derived
+  `failure_signature`; repeats build a hierarchical key. Filters mirror the list
+  endpoint (`workflow_name`, `activity_name`, `queue_name`, `since`, `until`,
+  `min_attempts`; `since`/`until` accept RFC 3339 or relative durations like
+  `24h`). `limit_groups` (default 50, max 500) rolls the long tail into a single
+  `{"_other": true}` group so counts reconcile to `filtered_total`;
+  `samples_per_group` (default 3, max 10) caps the sample IDs. Counts sum across
+  shards via `iter_shards()`. **Failure-signature derivation is the
+  compute-on-read normalized-substring option (zero schema change):** the first
+  line of `error`, with UUIDs/hex/decimal runs normalized to placeholders and
+  truncated to 200 chars — deterministic and shard-stable. Invalid parameter
+  values return `400` with a JSON error body (never `500`, never a silent empty
+  match). New CLI subcommand `harvest dlq aggregate --group-by … [--json]`
+  (table by default). Runbook: a "DLQ flood — first 60 seconds" section in
+  `docs/runbooks/harvest-alerts.md`. **No new `WorkflowEvent` variant, no
+  migration.** New core types in `autumn_harvest::dlq`: `failure_signature`,
+  `DlqGroupDimension`, `TimeBucketGranularity`, `DlqAggregateParams`,
+  `DlqAggregatePartial`, `DlqRawGroup`, `DlqGroup`, `DlqAggregateResponse`,
+  `aggregate_dead_letters`, `merge_dlq_aggregates`. The DLQ inspection page
+  (Vantage UI) gains a **Summary toggle** that renders the top-N groups with a
+  `group_by` selector and click-through into the filtered list view.
 - **DAG retry-from-failed-node** (issue #366). New management route
   `POST /api/harvest/dags/{dag_name}/runs/{run_exec_id}/retry` with body
   `{ from_nodes, reason, operator_id, dry_run }` lets an operator re-run a failed

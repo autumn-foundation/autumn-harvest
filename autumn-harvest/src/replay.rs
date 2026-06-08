@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 
 use crate::error::TimeoutType;
-use crate::event::WorkflowEvent;
+use crate::event::{SideEffectKind, WorkflowEvent};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalSignalId, ParentClosePolicy,
     UpdateId,
@@ -301,6 +301,10 @@ impl HistoryMatcher {
     fn actual_event_name(event: &WorkflowEvent) -> String {
         match event {
             WorkflowEvent::MarkerRecorded { name, .. } => format!("MarkerRecorded({name})"),
+            WorkflowEvent::SideEffectRecorded { kind, name, .. } => name.as_ref().map_or_else(
+                || format!("SideEffectRecorded({})", kind.as_str()),
+                |n| format!("SideEffectRecorded({}:{n})", kind.as_str()),
+            ),
             other => other.type_name().to_string(),
         }
     }
@@ -468,8 +472,9 @@ impl HistoryMatcher {
                 // interleaved when a fan-out runs concurrently with this
                 // activity (e.g. via tokio::join!). Track as an interleaved
                 // command so the cursor returns to it after matching the
-                // terminal event.
-                WorkflowEvent::MarkerRecorded { .. } => {
+                // terminal event. Deterministic side-effect captures (issue
+                // #384) are cursor-ordered like markers and treated the same.
+                WorkflowEvent::MarkerRecorded { .. } | WorkflowEvent::SideEffectRecorded { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
@@ -607,8 +612,9 @@ impl HistoryMatcher {
                 ev if Self::is_update_event(ev) => {
                     scan_cursor += 1;
                 }
-                // Fan-out markers can be interleaved during concurrent execution.
-                WorkflowEvent::MarkerRecorded { .. } => {
+                // Fan-out markers and deterministic side-effect captures (issue
+                // #384) can be interleaved during concurrent execution.
+                WorkflowEvent::MarkerRecorded { .. } | WorkflowEvent::SideEffectRecorded { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
                     scan_cursor += 1;
                 }
@@ -1877,30 +1883,72 @@ impl HistoryMatcher {
     /// - `max_version` if past end of history (new code path)
     #[must_use]
     pub fn match_side_effect(&mut self, side_effect_id: &str) -> HistoryMatch {
-        // Use prepare_match so drain_early_signals skips ExternalSignal events
-        // that may have been written before this marker in a mixed batch
-        // (e.g. tokio::join!(ctx.side_effect(...), ctx.signal_external_workflow(...))).
-        //
-        // Known limitation: the event pattern is identical for a concurrent
-        // mixed batch and a sequential call where signal_external historically
-        // preceded side_effect.  If a new workflow version reverses a sequential
-        // ordering, drain_early_signals absorbs the signal events and the marker
-        // still matches — silently accepting what should be Diverged.  Fixing
-        // this requires batch-ordering metadata in the history schema.
-        let marker_name = format!("side_effect:{side_effect_id}");
+        self.match_side_effect_event(SideEffectKind::Custom, Some(side_effect_id))
+    }
+
+    /// Match a deterministic side-effect capture against history (issue #384).
+    ///
+    /// All of the `WorkflowContext` deterministic primitives — `system_now()`,
+    /// `new_uuid()`, `random_*()`, and `side_effect()` — lower onto a single
+    /// [`WorkflowEvent::SideEffectRecorded`] variant and match through this
+    /// method in command (cursor) order. The recorded `value` is returned via
+    /// [`HistoryMatch::Matched`].
+    ///
+    /// `kind` distinguishes the built-in helper; `name` is `Some` only for the
+    /// author-named `side_effect()` path. A mismatch in either the `kind` or the
+    /// `name` at the current cursor surfaces as [`HistoryMatch::Diverged`] with
+    /// the same diagnostic quality as the activity-mismatch path.
+    ///
+    /// **Backward compatibility:** the pre-#384 `side_effect()` implementation
+    /// lowered onto `MarkerRecorded { name: "side_effect:{id}" }`. For the
+    /// `Custom` + named case this method also accepts that legacy marker so
+    /// in-flight executions recorded under the old engine replay unchanged.
+    ///
+    /// Uses `prepare_match` so `drain_early_signals` skips `ExternalSignal`
+    /// events that may have been written before this capture in a mixed batch.
+    #[must_use]
+    pub fn match_side_effect_event(
+        &mut self,
+        kind: SideEffectKind,
+        name: Option<&str>,
+    ) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
 
+        let expected = name.map_or_else(
+            || format!("SideEffectRecorded({})", kind.as_str()),
+            |n| format!("SideEffectRecorded({}:{n})", kind.as_str()),
+        );
+
+        // Legacy compatibility: the old side_effect() lowered to a MarkerRecorded
+        // with name "side_effect:{id}". Only the Custom+named path ever produced it.
+        let legacy_marker_name = name
+            .filter(|_| kind == SideEffectKind::Custom)
+            .map(|n| format!("side_effect:{n}"));
+
         match &self.events[self.cursor] {
-            WorkflowEvent::MarkerRecorded { name, details } if *name == marker_name => {
+            WorkflowEvent::SideEffectRecorded {
+                kind: recorded_kind,
+                name: recorded_name,
+                value,
+            } if *recorded_kind == kind && recorded_name.as_deref() == name => {
+                let output = value.clone();
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                HistoryMatch::Matched { output }
+            }
+            WorkflowEvent::MarkerRecorded {
+                name: marker_name,
+                details,
+            } if legacy_marker_name.as_deref() == Some(marker_name.as_str()) => {
                 let output = details.clone();
                 self.cursor += 1;
                 self.advance_to_next_unconsumed_event();
                 HistoryMatch::Matched { output }
             }
             other => HistoryMatch::Diverged {
-                expected: format!("MarkerRecorded({marker_name})"),
+                expected,
                 actual: Self::actual_event_name(other),
             },
         }

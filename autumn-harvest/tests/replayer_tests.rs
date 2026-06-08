@@ -1643,3 +1643,116 @@ async fn replay_backwards_compat_awaited_child_workflow() {
         "events_replayed must be positive"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic side-effect primitives (issue #384)
+// ---------------------------------------------------------------------------
+
+/// Calls `ctx.system_now()` then schedules an activity. The captured clock value
+/// lowers onto a `SideEffectRecorded` event, matched in command order.
+fn now_then_activity_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let _t = ctx.system_now();
+        let r = ctx
+            .execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "step": r }))
+    })
+}
+
+fn now_then_activity_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!(1_700_000_000_000_i64),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step_one".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!("ok"),
+        },
+    ];
+    (exec_id, events)
+}
+
+#[tokio::test]
+async fn replay_succeeds_for_recorded_side_effect() {
+    let (exec_id, events) = now_then_activity_history();
+    let replayer =
+        WorkflowReplayer::new().register_fn("now_then_activity", now_then_activity_workflow);
+
+    let report = replayer
+        .replay_from_snapshot(HistorySnapshot {
+            workflow_name: "now_then_activity".to_string(),
+            execution_id: exec_id,
+            events,
+        })
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "side-effect history must replay cleanly: {report}"
+    );
+}
+
+#[tokio::test]
+async fn replay_detects_side_effect_drift() {
+    // History has NO recorded side effect — the activity sits where the workflow
+    // now calls system_now(). The built-in primitive must surface SideEffectDrift.
+    let exec_id = ExecutionId::new();
+    let activity_id = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id,
+            name: "step_one".to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id,
+            output: serde_json::json!("ok"),
+        },
+    ];
+
+    let replayer =
+        WorkflowReplayer::new().register_fn("now_then_activity", now_then_activity_workflow);
+
+    let report = replayer
+        .replay_from_snapshot(HistorySnapshot {
+            workflow_name: "now_then_activity".to_string(),
+            execution_id: exec_id,
+            events,
+        })
+        .await;
+
+    match report.status {
+        ReplayStatus::NonDeterminismDetected { kind, .. } => {
+            assert_eq!(
+                kind,
+                NonDeterminismKind::SideEffectDrift,
+                "expected SideEffectDrift, got {kind:?}"
+            );
+        }
+        other => panic!("expected NonDeterminismDetected(SideEffectDrift), got {other:?}"),
+    }
+}

@@ -86,8 +86,11 @@ static CATALOG: &[RuleEntry] = &[
             non-determinism error.",
         alternative: "Use ctx.now() (WorkflowContext) to read the workflow-logical clock, \
             which returns the WorkflowStarted timestamp and replays identically on every \
-            subsequent run. If you need a real wall-clock timestamp as a side-effect, wrap it \
-            in an activity and return it as the activity output.",
+            subsequent run. For a real wall-clock instant captured at the call site (e.g. \
+            \"skip the notification if the event is older than 24h *now*\"), use \
+            ctx.system_now() -> DateTime<Utc> (or ctx.system_time_now() -> SystemTime), which \
+            captures the current time once and replays it deterministically via a recorded \
+            SideEffectRecorded event.",
     },
     RuleEntry {
         id: "HVG002",
@@ -97,10 +100,12 @@ static CATALOG: &[RuleEntry] = &[
             source of randomness directly in a workflow body produces a different value on each \
             replay pass. Since the workflow function is re-run from the top on every resume, the \
             random sequence diverges from what was recorded in harvest_events.",
-        alternative: "Generate random values inside an activity (ActivityContext) and return them \
-            as the activity result, which is durably recorded. Alternatively, pass pre-generated \
-            values as workflow input. For replay-safe UUIDs, use ctx.random_uuid(id) which \
-            records the generated UUID in history and replays it deterministically.",
+        alternative: "Use the deterministic primitives on WorkflowContext, which capture the \
+            value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), \
+            ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or \
+            ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For \
+            cryptographically secure randomness, generate it inside an activity (ActivityContext) \
+            and return it as the durably-recorded activity result instead.",
     },
     RuleEntry {
         id: "HVG003",

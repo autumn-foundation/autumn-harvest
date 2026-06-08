@@ -807,6 +807,10 @@ fn assert_dead_letter_list_html(html: &str, seeded: &[SeededDeadLetter]) {
         html.contains("action=\"../dead-letters/discard\""),
         "row discard form should post to the existing bulk discard endpoint: {html}"
     );
+    assert!(
+        html.contains("view-toggle") && html.contains("view=summary"),
+        "list view should offer a Summary toggle (issue #385): {html}"
+    );
 
     for row in seeded {
         assert!(
@@ -953,6 +957,92 @@ async fn ui_dead_letters_lists_filters_and_replays_single_entry() {
         count_task_queue_by_activity(&target.shard_url, "charge_card").await,
         1,
         "single replay should enqueue exactly one activity task"
+    );
+}
+
+/// DLQ Summary toggle (issue #385): the aggregation view groups entries,
+/// reports counts merged across shards, and links back into the filtered list.
+#[tokio::test]
+async fn ui_dead_letters_summary_view_groups_and_links() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let _seeded = seed_dead_letter_ui_fixture(&shard0_url, &shard1_url).await;
+    let app = build_sharded_api_with_ui_app(&shard0_url, &shard1_url);
+
+    let (status, html) = fetch_html(&app, "/ui/dead-letters?view=summary").await;
+    assert_eq!(status, StatusCode::OK, "summary view should render: {html}");
+
+    // Toggle is in summary mode with a link back to the list view.
+    assert!(
+        html.contains("view-toggle"),
+        "summary view should show the toggle: {html}"
+    );
+    assert!(
+        html.contains("<span class=\"active\">Summary</span>"),
+        "Summary tab should be active: {html}"
+    );
+
+    // Grouping control + default dimension columns.
+    assert!(
+        html.contains("name=\"group_by\""),
+        "summary view should expose a group_by selector: {html}"
+    );
+    assert!(
+        html.contains("workflow_name") && html.contains("failure_signature"),
+        "default grouping columns should render: {html}"
+    );
+
+    // Both seeded workflow names appear as groups, with cross-shard counts.
+    assert!(
+        html.contains("invoice_workflow") && html.contains("settlement_workflow"),
+        "both workflow groups should render: {html}"
+    );
+    // 6 invoice + 4 settlement = 10 across both shards.
+    assert!(
+        html.contains("10 total in DLQ") || html.contains("10</strong> total in DLQ"),
+        "summary stats should report the cross-shard total: {html}"
+    );
+
+    // Click-through into the list view with workflow_name pre-applied.
+    assert!(
+        html.contains("View entries") && html.contains("workflow_name=invoice_workflow"),
+        "summary groups should drill into the filtered list view: {html}"
+    );
+}
+
+/// Invalid `group_by` on the summary view returns 400, not 500 or a silent
+/// empty match (parity with the aggregation endpoint).
+#[tokio::test]
+async fn ui_dead_letters_summary_invalid_group_by_returns_400() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let app = build_single_shard_ui_app(&database_url);
+
+    let (status, _body) =
+        fetch_html(&app, "/ui/dead-letters?view=summary&group_by=tenant_id").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// The summary view can re-group on a chosen dimension and the selector
+/// reflects the active choice.
+#[tokio::test]
+async fn ui_dead_letters_summary_regroups_on_selected_dimension() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_test_database_urls().await;
+    let _seeded = seed_dead_letter_ui_fixture(&shard0_url, &shard1_url).await;
+    let app = build_sharded_api_with_ui_app(&shard0_url, &shard1_url);
+
+    let (status, html) = fetch_html(&app, "/ui/dead-letters?view=summary&group_by=task_type").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "regrouped summary should render: {html}"
+    );
+    assert!(
+        html.contains("<option value=\"task_type\" selected"),
+        "selector should reflect the active group_by: {html}"
+    );
+    // Seed inserts ACTIVITY on shard0 and WORKFLOW on shard1.
+    assert!(
+        html.contains("ACTIVITY") && html.contains("WORKFLOW"),
+        "task_type groups should render both kinds: {html}"
     );
 }
 

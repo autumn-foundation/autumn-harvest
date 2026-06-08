@@ -221,6 +221,7 @@ dependencies = [
  "lru 0.16.4",
  "metrics",
  "proptest",
+ "rand 0.8.6",
  "schemars 0.8.22",
  "scoped-futures",
  "seahash",

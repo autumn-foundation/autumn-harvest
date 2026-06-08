@@ -246,7 +246,12 @@ fn redact_value(value: &mut Value) -> Result<(), HistoryExportError> {
 }
 
 fn is_payload_field(key: &str) -> bool {
-    matches!(key, "input" | "output" | "payload" | "details")
+    // `value` is the arbitrary `ctx.side_effect(...)` result on a
+    // `SideEffectRecorded` event (issue #384). Before #384 custom side effects
+    // were stored under `MarkerRecorded.details` and redacted via "details"; the
+    // new field must be redacted too so secrets/PII captured by the closure are
+    // not leaked in a redacted export.
+    matches!(key, "input" | "output" | "payload" | "details" | "value")
 }
 
 fn is_token_field(key: &str) -> bool {
@@ -358,7 +363,9 @@ impl MermaidExporter {
                 | WorkflowEvent::ChildWorkflowCascadeApplied { .. } => {
                     self.handle_child_workflow_event(event)?;
                 }
-                WorkflowEvent::SignalReceived { .. } | WorkflowEvent::MarkerRecorded { .. } => {
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. } => {
                     self.handle_misc_event(event)?;
                 }
                 WorkflowEvent::ActivityAwaitingExternal { .. }
@@ -631,6 +638,10 @@ impl MermaidExporter {
             }
             WorkflowEvent::MarkerRecorded { name, .. } => {
                 writeln!(self.out, "    Note over WF: Marker: {name}")?;
+            }
+            WorkflowEvent::SideEffectRecorded { kind, name, .. } => {
+                let label = name.as_deref().unwrap_or(kind.as_str());
+                writeln!(self.out, "    Note over WF: Side Effect: {label}")?;
             }
             _ => unreachable!(),
         }
@@ -949,6 +960,48 @@ mod tests {
         assert_eq!(value["status"]["terminal"], false);
         assert_eq!(value["events"][0]["data"]["input"]["redacted"], true);
         assert_eq!(value["events"][3]["data"]["token"]["redacted"], true);
+    }
+
+    #[test]
+    fn redacted_history_export_redacts_side_effect_recorded_value() {
+        use crate::event::SideEffectKind;
+        use crate::types::ExecutionId;
+
+        let document = export_history(HistoryExportRequest {
+            workflow_name: "secret_capture".to_string(),
+            execution_id: ExecutionId::new(),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            events: vec![
+                WorkflowEvent::WorkflowStarted {
+                    input: serde_json::json!({}),
+                    timestamp: Utc::now(),
+                },
+                // A custom side_effect that captured a secret in its closure. Pre
+                // #384 this lived under MarkerRecorded.details and was redacted;
+                // it must remain redacted under the new SideEffectRecorded.value.
+                WorkflowEvent::SideEffectRecorded {
+                    kind: SideEffectKind::Custom,
+                    name: Some("api_credential".to_string()),
+                    value: serde_json::json!({ "token": "super-secret-credential" }),
+                },
+            ],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Redacted,
+            max_bytes: Some(64 * 1024),
+        })
+        .expect("redacted export should fit under the limit");
+
+        let json = serde_json::to_string(&document).expect("export should serialize");
+        // Event shape and the side-effect name remain visible for debugging…
+        assert!(json.contains("SideEffectRecorded"));
+        assert!(json.contains("api_credential"));
+        // …but the captured value must not leak.
+        assert!(!json.contains("super-secret-credential"));
+
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("redacted export should be valid JSON");
+        assert_eq!(value["events"][1]["data"]["value"]["redacted"], true);
     }
 
     #[test]

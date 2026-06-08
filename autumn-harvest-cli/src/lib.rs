@@ -1113,6 +1113,48 @@ enum DeadLetterCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Aggregate dead-lettered tasks by dimension for fast root-cause triage.
+    ///
+    /// Groups the DLQ by one or more dimensions and reports per-group counts
+    /// with representative sample IDs, merged across shards. Renders a table by
+    /// default; pass --json for piping.
+    Aggregate {
+        /// Grouping dimensions (comma-separated or repeated). Supported:
+        /// `workflow_name`, `activity_name`, `queue_name`, `task_type`,
+        /// `time_bucket`, `failure_signature`. Order builds a hierarchical key.
+        #[arg(long = "group-by", value_delimiter = ',', required = true)]
+        group_by: Vec<String>,
+        /// Granularity for the `time_bucket` dimension: hour (default) or day.
+        #[arg(long)]
+        time_bucket: Option<String>,
+        /// Filter by workflow name (applied before grouping).
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Filter by activity name.
+        #[arg(long)]
+        activity_name: Option<String>,
+        /// Filter by queue name.
+        #[arg(long)]
+        queue_name: Option<String>,
+        /// Inclusive lower bound on `failed_at`: RFC 3339 or relative (e.g. `24h`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Exclusive upper bound on `failed_at`: RFC 3339 or relative.
+        #[arg(long)]
+        until: Option<String>,
+        /// Only include entries with at least this many attempts.
+        #[arg(long)]
+        min_attempts: Option<i32>,
+        /// Cap on returned groups [1–500] (default 50). Long tail rolls into `_other`.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=500))]
+        limit_groups: Option<u32>,
+        /// Representative sample IDs per group [0–10] (default 3).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=10))]
+        samples_per_group: Option<u32>,
+        /// Print the raw JSON API payload instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Bulk-discard dead-lettered tasks matching a filter (delete without replay).
     ///
     /// At least one filter criterion must be provided. Use --dry-run to preview
@@ -1629,6 +1671,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if handoff_wants_table(cli) {
         return Ok(format_handoff_table(value));
     }
+    if dlq_aggregate_wants_table(cli) {
+        return Ok(format_dlq_aggregate_table(value));
+    }
     if audit_list_wants_table(cli) {
         return Ok(format_audit_table(value));
     }
@@ -1645,12 +1690,135 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         return Ok(format_rate_limit_table(value));
     }
 
-    let output = if workflow_children_wants_raw_json(cli) || handoff_wants_raw_json(cli) {
+    let output = if workflow_children_wants_raw_json(cli)
+        || handoff_wants_raw_json(cli)
+        || dlq_aggregate_wants_raw_json(cli)
+    {
         OutputFormat::Json
     } else {
         cli.output
     };
     format_output(value, output)
+}
+
+fn dlq_aggregate_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Dlq {
+            command: DeadLetterCommand::Aggregate { json: false, .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn dlq_aggregate_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Dlq {
+            command: DeadLetterCommand::Aggregate { json: true, .. }
+        }
+    )
+}
+
+/// Render the DLQ aggregation response as a human-readable table.
+///
+/// One row per group: the hierarchical key columns, the count, the time window,
+/// and a comma-joined preview of sample dead-letter IDs.
+fn format_dlq_aggregate_table(value: &Value) -> String {
+    let total = value.get("total").and_then(Value::as_i64).unwrap_or(0);
+    let filtered = value
+        .get("filtered_total")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let truncated = value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let Some(groups) = value.get("groups").and_then(Value::as_array) else {
+        return format!("total: {total}  filtered: {filtered}\nNo DLQ groups found.");
+    };
+    if groups.is_empty() {
+        return format!("total: {total}  filtered: {filtered}\nNo DLQ groups found.");
+    }
+
+    // Collect the union of key field names (in first-seen order), skipping the
+    // `_other` rollup marker so it does not create a phantom column.
+    let mut key_cols: Vec<String> = Vec::new();
+    for group in groups {
+        if let Some(obj) = group.get("key").and_then(Value::as_object) {
+            for name in obj.keys() {
+                if name != "_other" && !key_cols.iter().any(|c| c == name) {
+                    key_cols.push(name.clone());
+                }
+            }
+        }
+    }
+
+    let mut header: Vec<String> = key_cols.iter().map(|c| c.to_uppercase()).collect();
+    header.push("COUNT".to_string());
+    header.push("FIRST_SEEN".to_string());
+    header.push("LAST_SEEN".to_string());
+    header.push("SAMPLES".to_string());
+
+    let mut rows = vec![header];
+    for group in groups {
+        let key = group.get("key");
+        let is_other = key
+            .and_then(|k| k.get("_other"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut row: Vec<String> = Vec::new();
+        for (idx, col) in key_cols.iter().enumerate() {
+            if is_other {
+                // The `_other` rollup has no per-dimension key; label the first
+                // column and leave the rest blank.
+                row.push(if idx == 0 {
+                    "(other)".to_string()
+                } else {
+                    String::new()
+                });
+            } else {
+                row.push(cell_str(key.and_then(|k| k.get(col))));
+            }
+        }
+        row.push(cell_number(group.get("count")));
+        row.push(cell_str(group.get("first_seen")));
+        row.push(cell_str(group.get("last_seen")));
+        let samples = group
+            .get("sample_dead_letter_ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        row.push(samples);
+        rows.push(row);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut summary = format!("total: {total}  filtered: {filtered}");
+    if truncated {
+        summary.push_str("  (long tail rolled into _other)");
+    }
+    format!("{summary}\n\n{table}")
 }
 
 fn backfill_wants_table(cli: &Cli) -> bool {
@@ -3307,6 +3475,55 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
                 *dry_run,
             )),
         ),
+        DeadLetterCommand::Aggregate {
+            group_by,
+            time_bucket,
+            workflow_name,
+            activity_name,
+            queue_name,
+            since,
+            until,
+            min_attempts,
+            limit_groups,
+            samples_per_group,
+            json: _,
+        } => {
+            let mut params: Vec<(&str, String)> = Vec::new();
+            for dim in group_by {
+                params.push(("group_by", dim.clone()));
+            }
+            if let Some(tb) = time_bucket {
+                params.push(("time_bucket", tb.clone()));
+            }
+            if let Some(v) = workflow_name {
+                params.push(("workflow_name", v.clone()));
+            }
+            if let Some(v) = activity_name {
+                params.push(("activity_name", v.clone()));
+            }
+            if let Some(v) = queue_name {
+                params.push(("queue_name", v.clone()));
+            }
+            if let Some(v) = since {
+                params.push(("since", v.clone()));
+            }
+            if let Some(v) = until {
+                params.push(("until", v.clone()));
+            }
+            if let Some(v) = min_attempts {
+                params.push(("min_attempts", v.to_string()));
+            }
+            if let Some(v) = limit_groups {
+                params.push(("limit_groups", v.to_string()));
+            }
+            if let Some(v) = samples_per_group {
+                params.push(("samples_per_group", v.to_string()));
+            }
+            ApiRequest::get(format!(
+                "/dead-letters/aggregate?{}",
+                encode_query_params(&params)
+            ))
+        }
     }
 }
 
@@ -4749,5 +4966,152 @@ mod reuse_policy_tests {
         assert!(rendered.contains("10.00"));
         assert!(rendered.contains("8.50"));
         assert!(rendered.contains("2026-05-22T22:00:00Z"));
+    }
+}
+
+#[cfg(test)]
+mod dlq_aggregate_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn aggregate_maps_to_get_with_repeated_group_by() {
+        let req = request(&[
+            "dlq",
+            "aggregate",
+            "--group-by",
+            "workflow_name,failure_signature",
+            "--since",
+            "24h",
+            "--samples-per-group",
+            "3",
+        ]);
+        assert_eq!(req.method, ApiMethod::Get);
+        assert!(req.path.starts_with("/dead-letters/aggregate?"));
+        assert!(
+            req.path.contains("group_by=workflow_name"),
+            "path: {}",
+            req.path
+        );
+        assert!(
+            req.path.contains("group_by=failure_signature"),
+            "path: {}",
+            req.path
+        );
+        assert!(req.path.contains("since=24h"), "path: {}", req.path);
+        assert!(
+            req.path.contains("samples_per_group=3"),
+            "path: {}",
+            req.path
+        );
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn aggregate_passes_all_filters() {
+        let req = request(&[
+            "dlq",
+            "aggregate",
+            "--group-by",
+            "queue_name",
+            "--time-bucket",
+            "day",
+            "--workflow-name",
+            "onboarding",
+            "--activity-name",
+            "charge_card",
+            "--queue-name",
+            "billing",
+            "--until",
+            "2026-05-18T04:00:00Z",
+            "--min-attempts",
+            "3",
+            "--limit-groups",
+            "100",
+        ]);
+        assert!(req.path.contains("time_bucket=day"));
+        assert!(req.path.contains("workflow_name=onboarding"));
+        assert!(req.path.contains("activity_name=charge_card"));
+        assert!(req.path.contains("queue_name=billing"));
+        assert!(req.path.contains("min_attempts=3"));
+        assert!(req.path.contains("limit_groups=100"));
+    }
+
+    #[test]
+    fn aggregate_requires_group_by() {
+        let parsed = Cli::try_parse_from(["harvest", "dlq", "aggregate"]);
+        assert!(parsed.is_err(), "--group-by is required");
+    }
+
+    #[test]
+    fn aggregate_rejects_out_of_range_limit_groups() {
+        let parsed = Cli::try_parse_from([
+            "harvest",
+            "dlq",
+            "aggregate",
+            "--group-by",
+            "queue_name",
+            "--limit-groups",
+            "9999",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "limit_groups > 500 must be rejected by clap"
+        );
+    }
+
+    #[test]
+    fn aggregate_table_renders_groups_and_other_rollup() {
+        let cli = parse(&["dlq", "aggregate", "--group-by", "workflow_name"]);
+        let payload = json!({
+            "total": 100,
+            "filtered_total": 100,
+            "truncated": true,
+            "groups": [
+                {
+                    "key": {"workflow_name": "onboarding"},
+                    "count": 60,
+                    "first_seen": "2026-05-18T03:00:00Z",
+                    "last_seen": "2026-05-18T04:00:00Z",
+                    "sample_dead_letter_ids": ["id-a", "id-b"]
+                },
+                {
+                    "key": {"_other": true},
+                    "count": 40,
+                    "sample_dead_letter_ids": []
+                }
+            ]
+        });
+
+        let rendered = render_response(&cli, &payload).expect("table should render");
+        assert!(rendered.contains("WORKFLOW_NAME"), "{rendered}");
+        assert!(rendered.contains("COUNT"), "{rendered}");
+        assert!(rendered.contains("onboarding"), "{rendered}");
+        assert!(rendered.contains("(other)"), "{rendered}");
+        assert!(rendered.contains("id-a,id-b"), "{rendered}");
+        assert!(
+            rendered.contains("long tail rolled into _other"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn aggregate_json_flag_emits_raw_payload() {
+        let cli = parse(&["dlq", "aggregate", "--group-by", "workflow_name", "--json"]);
+        let payload = json!({"total": 1, "filtered_total": 1, "truncated": false, "groups": []});
+        let rendered = render_response(&cli, &payload).expect("json should render");
+        // Compact JSON (no pretty indentation) for piping.
+        assert!(rendered.starts_with('{'));
+        assert!(rendered.contains("\"total\":1"));
     }
 }

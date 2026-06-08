@@ -278,6 +278,10 @@ impl WorkflowSimulator {
                     history.push(WorkflowEvent::MarkerRecorded { name, details });
                     advanced = true;
                 }
+                WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                    history.push(WorkflowEvent::SideEffectRecorded { kind, name, value });
+                    advanced = true;
+                }
                 _ => {
                     // Commands like WaitForSignal, StartChildWorkflow are not yet fully supported.
                     // Complete and Fail are handled on the next loop iteration.

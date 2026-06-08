@@ -2002,6 +2002,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(list_dead_letters).route_layer(require_admin.clone()),
         )
         .route(
+            "/dead-letters/aggregate",
+            get(aggregate_dead_letters).route_layer(require_admin.clone()),
+        )
+        .route(
             "/dead-letters/replay",
             post(bulk_replay_dead_letters_handler).route_layer(require_admin.clone()),
         )
@@ -2252,6 +2256,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("PATCH", "/dags/{dag_name}"),
         // ── dead-letter queue ─────────────────────────────────────────────────
         ("GET", "/dead-letters"),
+        ("GET", "/dead-letters/aggregate"),
         ("POST", "/dead-letters/replay"),
         ("POST", "/dead-letters/discard"),
         ("POST", "/dead-letters/{id}/replay"),
@@ -2700,6 +2705,11 @@ pub const fn management_api_response_fields()
         ("PATCH", "/dags/{dag_name}", None),        // HarvestSchedule (external model)
         // ── dead-letter queue ─────────────────────────────────────────────────
         ("GET", "/dead-letters", None), // Vec<DeadLetter> (external model)
+        (
+            "GET",
+            "/dead-letters/aggregate",
+            Some(&["total", "filtered_total", "groups", "truncated"]),
+        ),
         (
             "POST",
             "/dead-letters/replay",
@@ -10512,6 +10522,33 @@ async fn list_dead_letters(
         .collect();
 
     Ok(Json(responses))
+}
+
+/// `GET /dead-letters/aggregate` — root-cause aggregation for DLQ triage
+/// (issue #385).
+///
+/// Groups dead-letter rows along a small named set of dimensions (`workflow_name`,
+/// `activity_name`, `queue_name`, `task_type`, `time_bucket`, `failure_signature`)
+/// and returns per-group counts plus a handful of representative
+/// `dead_letter_id`s, fanning out across shards and merging the partials.
+async fn aggregate_dead_letters(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<dlq::DlqAggregateResponse>, AutumnError> {
+    let params = dlq::DlqAggregateParams::from_query_pairs(&pairs, chrono::Utc::now())
+        .map_err(AutumnError::bad_request_msg)?;
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut partials = Vec::new();
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let partial = dlq::aggregate_dead_letters(&mut conn, &params)
+            .await
+            .map_err(map_error)?;
+        partials.push(partial);
+    }
+
+    Ok(Json(dlq::merge_dlq_aggregates(&params, partials)))
 }
 
 async fn replay_dead_letter(
