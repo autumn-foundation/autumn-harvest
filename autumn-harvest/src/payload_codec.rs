@@ -199,7 +199,14 @@ impl PayloadCodecs {
         let Some(data) = root.get_mut("data") else {
             return Ok(());
         };
-        let keys = ["input", "output", "payload", "details"];
+        // `value` is the arbitrary `ctx.side_effect(...)` closure result on a
+        // SideEffectRecorded event (issue #384). Pre-#384 custom side effects
+        // were stored under MarkerRecorded.details and were codec-encoded; the
+        // new field must be encoded too so a configured codec still encrypts /
+        // compresses any secret or PII the closure captured. `value` is unique
+        // to SideEffectRecorded among event variants, so no other event is
+        // affected.
+        let keys = ["input", "output", "payload", "details", "value"];
         for key in keys {
             if let Some(payload) = data.get_mut(key) {
                 if encode {
@@ -303,6 +310,37 @@ mod tests {
         match decoded {
             crate::event::WorkflowEvent::WorkflowStarted { input, .. } => {
                 assert_eq!(input, serde_json::json!({"user":"alice"}));
+            }
+            _ => panic!("unexpected event"),
+        }
+    }
+
+    #[test]
+    fn encode_then_decode_round_trips_side_effect_recorded_value() {
+        // issue #384: a custom side_effect closure result lands in
+        // SideEffectRecorded.value and must be codec-encoded (encryption /
+        // compression) just like the MarkerRecorded.details it replaced.
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(ReverseCodec));
+
+        let event = crate::event::WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Custom,
+            name: Some("api_credential".to_string()),
+            value: serde_json::json!({"token": "super-secret"}),
+        };
+
+        let encoded = codecs.encode_event(&event).expect("encode");
+        // The value field is wrapped in a codec envelope (not stored raw)…
+        assert_eq!(encoded["data"]["value"]["_harvest_codec_envelope"], 1);
+        assert_eq!(encoded["data"]["value"]["codec_id"], "reverse");
+        // …while the side-effect name (metadata) is left intact.
+        assert_eq!(encoded["data"]["name"], "api_credential");
+
+        let decoded = codecs.decode_event(encoded).expect("decode");
+        match decoded {
+            crate::event::WorkflowEvent::SideEffectRecorded { value, name, .. } => {
+                assert_eq!(value, serde_json::json!({"token": "super-secret"}));
+                assert_eq!(name.as_deref(), Some("api_credential"));
             }
             _ => panic!("unexpected event"),
         }
