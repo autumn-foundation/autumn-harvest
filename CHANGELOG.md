@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration.** New core types in `autumn_harvest::dlq`: `failure_signature`,
   `DlqGroupDimension`, `TimeBucketGranularity`, `DlqAggregateParams`,
   `DlqAggregatePartial`, `DlqRawGroup`, `DlqGroup`, `DlqAggregateResponse`,
-  `aggregate_dead_letters`, `merge_dlq_aggregates`. (UI Summary toggle on the
-  inspection page ships as a follow-up.)
+  `aggregate_dead_letters`, `merge_dlq_aggregates`. The DLQ inspection page
+  (Vantage UI) gains a **Summary toggle** that renders the top-N groups with a
+  `group_by` selector and click-through into the filtered list view.
 - **DAG retry-from-failed-node** (issue #366). New management route
   `POST /api/harvest/dags/{dag_name}/runs/{run_exec_id}/retry` with body
   `{ from_nodes, reason, operator_id, dry_run }` lets an operator re-run a failed

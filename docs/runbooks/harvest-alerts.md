@@ -197,7 +197,9 @@ the list endpoint (`--workflow-name`, `--activity-name`, `--queue-name`,
 `--since`, `--until`, `--min-attempts`) and pivot to a single entry via the
 `sample_dead_letter_ids`. The endpoint backing this is
 `GET /api/harvest/dead-letters/aggregate` (admin auth, parity with the list
-endpoint).
+endpoint). The same view is one click away in the Vantage UI: open the **Dead
+Letters** page and flip the **Summary** toggle to see the top groups, switch the
+`group_by` dimension, and drill into the filtered list.
 
 ### Triage steps
 
