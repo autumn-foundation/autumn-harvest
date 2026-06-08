@@ -6606,10 +6606,14 @@ async fn cancel_workflow(
 /// Build a `409 Conflict` response from a state-conflict error (issue #383).
 fn conflict_from(error: HarvestError) -> AutumnError {
     match error {
-        // Not found stays 404.
-        HarvestError::NotFound(_) => map_error(error),
-        other => AutumnError::bad_request_msg(other.to_string())
-            .with_status(axum::http::StatusCode::CONFLICT),
+        // Only a genuine state conflict (e.g. "already terminal" / "not paused"),
+        // surfaced by the core as `Config`, maps to 409. Everything else —
+        // NotFound (404), Database (500), etc. — flows through the normal mapper
+        // so a real persistence failure is not masked as a state conflict.
+        HarvestError::Config(msg) => {
+            AutumnError::bad_request_msg(msg).with_status(axum::http::StatusCode::CONFLICT)
+        }
+        other => map_error(other),
     }
 }
 

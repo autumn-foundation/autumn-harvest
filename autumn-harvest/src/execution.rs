@@ -270,7 +270,7 @@ pub async fn start_or_load_workflow_execution(
     if request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
         && let Some(existing) =
             try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
-        && existing.state == "RUNNING"
+        && matches!(existing.state.as_str(), "RUNNING" | "PAUSED")
     {
         let existing_exec_id = ExecutionId::from_uuid(existing.id);
         // Ignore Config errors: the execution may have transitioned to a terminal
@@ -443,17 +443,21 @@ pub async fn start_or_load_workflow_execution(
                         }
 
                         WorkflowIdReusePolicy::TerminateIfRunning => {
-                            // The pre-check above cancelled any RUNNING prior execution
+                            // The pre-check above cancelled any active prior execution
                             // (Transaction 1). By the time we reach this point the prior
                             // execution's state is CANCELLED, FAILED, COMPLETED, or —
-                            // under extreme concurrency — still RUNNING. All cases start
-                            // fresh; for the still-RUNNING race we inline the cancel here
-                            // so the new start is not silently blocked.
-                            let mut deferred = if existing.state == "RUNNING" {
-                                inline_cancel(conn, ExecutionId::from_uuid(existing.id)).await?
-                            } else {
-                                Vec::new()
-                            };
+                            // under extreme concurrency — still active (RUNNING/PAUSED).
+                            // All cases start fresh; for the still-active race we inline
+                            // the cancel here so the new start is not silently blocked
+                            // and the prior run's parked task is failed (PAUSED is active
+                            // and occupies the uniqueness slot, so it must be cancelled
+                            // before replace_execution seals it; issue #383).
+                            let mut deferred =
+                                if matches!(existing.state.as_str(), "RUNNING" | "PAUSED") {
+                                    inline_cancel(conn, ExecutionId::from_uuid(existing.id)).await?
+                                } else {
+                                    Vec::new()
+                                };
                             let (started_wf, mut extra_deferred) = replace_execution(
                                 conn, existing, &row, &enqueue, exec_id, &request, now,
                             )
@@ -564,7 +568,7 @@ async fn inline_cancel(
     )
     .await?;
     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .set((
             harvest_workflow_executions::state.eq("CANCELLED"),
             harvest_workflow_executions::error.eq(Some(reason)),
@@ -1163,10 +1167,14 @@ pub(crate) async fn apply_parent_close_cascade(
 ) -> HarvestResult<Vec<DeferredTriggerStart>> {
     use crate::store;
 
+    // PAUSED is a non-terminal active state (issue #383): a paused child is
+    // still an active child, so the parent-close cascade must reach it too —
+    // otherwise it could be resumed after the parent closed despite a
+    // RequestCancel/Terminate policy.
     let running_children: Vec<(Uuid, Option<String>)> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq(Some(parent_exec_id.as_uuid())))
         .filter(harvest_workflow_executions::parent_close_policy.is_not_null())
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .select((
             harvest_workflow_executions::id,
             harvest_workflow_executions::parent_close_policy,
@@ -1225,7 +1233,7 @@ async fn cascade_cancel_detached_child(
     reason: &str,
 ) -> HarvestResult<(bool, Vec<DeferredTriggerStart>)> {
     let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .set((
             harvest_workflow_executions::state.eq("CANCELLED"),
             harvest_workflow_executions::error.eq(Some(reason.to_string())),
@@ -1269,7 +1277,7 @@ async fn cascade_terminate_detached_child(
     reason: &str,
 ) -> HarvestResult<(bool, Vec<DeferredTriggerStart>)> {
     let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .set((
             harvest_workflow_executions::state.eq("FAILED"),
             harvest_workflow_executions::error.eq(Some(reason.to_string())),

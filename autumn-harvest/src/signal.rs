@@ -51,7 +51,11 @@ pub async fn send_signal(
                 .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
             match execution.state.as_str() {
-                "RUNNING" => {}
+                // PAUSED is a non-terminal active state (issue #383): a paused
+                // workflow waiting on a signal must still accept (buffer) it so
+                // it is delivered on resume. The wake below re-pends the task,
+                // which the claim gate defers until the execution is RUNNING.
+                "RUNNING" | "PAUSED" => {}
                 "CANCELLED" => {
                     return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
                         || format!("workflow execution {exec_id} is cancelled"),
