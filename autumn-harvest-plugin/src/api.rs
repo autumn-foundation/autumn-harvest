@@ -14076,7 +14076,10 @@ async fn list_workers_handler(
     if let Some(ref act_name) = capable_of {
         if let Ok(runtime) = api_state.runtime() {
             if let Some(activity) = runtime.registry().activities.get(act_name) {
-                let target_queue = activity.default_queue.unwrap_or("default");
+                let target_queue = filters
+                    .queue
+                    .as_deref()
+                    .unwrap_or_else(|| activity.default_queue.unwrap_or("default"));
                 let parsed_reqs = activity.requires.and_then(|req_str| {
                     autumn_harvest::eligibility::parse_requirements(req_str).ok()
                 });

@@ -1085,7 +1085,7 @@ async fn test_worker_capabilities_routing_and_triage() {
             "INSERT INTO harvest_task_queue (
                 id, queue_name, task_type, activity_name, input, state, priority, max_attempts, scheduled_at
              ) VALUES (
-                gen_random_uuid(), 'test-queue-capabilities', 'activity', 'gpu_activity', '{}'::jsonb, 'PENDING', 0, 1, NOW()
+                gen_random_uuid(), 'test-queue-capabilities', 'activity', 'gpu_activity', '{}'::jsonb, 'PENDING', 0, 1, NOW() - INTERVAL '5 seconds'
              )",
         )
         .execute(&mut conn)
@@ -1240,3 +1240,96 @@ async fn test_worker_queue_filtering_for_capable_of() {
     );
     assert_eq!(workers[0]["worker_id"], "worker-gpu-transcoding");
 }
+
+#[tokio::test]
+async fn test_worker_queue_filtering_with_explicit_queue_override() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    let activity = autumn_harvest::info::ActivityInfo {
+        name: "transcode_activity",
+        module: "tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some("transcoding"),
+        max_concurrent: None,
+        concurrency_key: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        circuit_breaker: None,
+        requires: Some("gpu = true"),
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+    };
+
+    let state = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for_activities(
+            &["transcoding", "custom-queue"],
+            vec![activity],
+            ShardRouter::single(),
+        ),
+    );
+    state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    let mut matching_labels = std::collections::HashMap::new();
+    matching_labels.insert("gpu".to_string(), "true".to_string());
+
+    // 1. Register a worker on default queue ("transcoding")
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-default-queue",
+            &["transcoding".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &matching_labels,
+        )
+        .await
+        .unwrap();
+    }
+
+    // 2. Register a worker on overridden queue ("custom-queue")
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-custom-queue",
+            &["custom-queue".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &matching_labels,
+        )
+        .await
+        .unwrap();
+    }
+
+    // 3. Request capable_of with queue override: GET /workers?queue=custom-queue&capable_of=transcode_activity
+    let (status, body) =
+        get_json_with_auth(&app, "/workers?queue=custom-queue&capable_of=transcode_activity", true).await;
+    assert_eq!(status, StatusCode::OK);
+    let workers = body.as_array().unwrap();
+    assert_eq!(
+        workers.len(),
+        1,
+        "only 1 worker should be returned because only worker-custom-queue is on custom-queue"
+    );
+    assert_eq!(workers[0]["worker_id"], "worker-custom-queue");
+}
+
