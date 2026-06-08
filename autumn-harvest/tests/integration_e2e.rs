@@ -4540,7 +4540,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
         let mut params =
             EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("capped_activity".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(2);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(120);
         params.concurrency_key = Some("saturated_key".to_string());
         params.max_concurrent = Some(2);
         queue::enqueue(&mut conn, &params)
@@ -4566,7 +4566,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
         let mut params =
             EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("uncapped_activity".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(60);
         // concurrency_key left as None (default) — backward-compat path.
         queue::enqueue(&mut conn, &params)
             .await

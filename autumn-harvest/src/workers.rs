@@ -356,17 +356,20 @@ pub async fn heartbeat_worker(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
     in_flight_count: i32,
+    labels: &serde_json::Value,
 ) -> HarvestResult<usize> {
     let affected = diesel::update(harvest_workers::table.find(worker_id))
         .set((
             harvest_workers::last_heartbeat_at.eq(Utc::now()),
             harvest_workers::in_flight_count.eq(in_flight_count),
+            harvest_workers::labels.eq(labels),
         ))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
     Ok(affected)
 }
+
 
 /// Transition a worker's lifecycle status.
 ///
@@ -1030,6 +1033,7 @@ pub fn spawn_worker_heartbeat(
     remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -1040,7 +1044,7 @@ pub fn spawn_worker_heartbeat(
 
             match pool.get().await {
                 Ok(mut conn) => {
-                    match heartbeat_worker(&mut conn, &registration.worker_id, in_flight).await {
+                    match heartbeat_worker(&mut conn, &registration.worker_id, in_flight, &labels_json).await {
                         Ok(0) => {
                             tracing::info!(
                                 worker_id = %registration.worker_id,

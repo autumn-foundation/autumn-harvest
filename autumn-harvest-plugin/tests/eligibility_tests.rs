@@ -10,7 +10,7 @@ use autumn_harvest::scheduler::DagCatalog;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
-use autumn_harvest::workers::{WorkerStatus, register_worker};
+use autumn_harvest::workers::{WorkerStatus, register_worker, heartbeat_worker, get_worker};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
@@ -1336,3 +1336,55 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
     );
     assert_eq!(workers[0]["worker_id"], "worker-custom-queue");
 }
+
+#[tokio::test]
+async fn test_worker_heartbeat_updates_labels() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    // 1. Register a worker with empty labels
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-hb-labels-test",
+            &["default".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    // 2. Call heartbeat_worker with new labels
+    let mut updated_labels = std::collections::HashMap::new();
+    updated_labels.insert("gpu".to_string(), "true".to_string());
+    let labels_json = serde_json::to_value(&updated_labels).unwrap();
+
+    {
+        let mut conn = pool.get().await.unwrap();
+        let affected = heartbeat_worker(&mut conn, "worker-hb-labels-test", 0, &labels_json)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+    }
+
+    // 3. Retrieve the worker details and verify the labels have been updated in the DB
+    {
+        let mut conn = pool.get().await.unwrap();
+        let worker_row = get_worker(&mut conn, "worker-hb-labels-test", Duration::from_secs(10))
+            .await
+            .unwrap()
+            .expect("worker should exist");
+        
+        let worker_labels: std::collections::HashMap<String, String> =
+            serde_json::from_value(worker_row.worker.labels).unwrap();
+        assert_eq!(worker_labels.get("gpu").map(String::as_str), Some("true"));
+    }
+}
+
