@@ -370,7 +370,6 @@ pub async fn heartbeat_worker(
     Ok(affected)
 }
 
-
 /// Transition a worker's lifecycle status.
 ///
 /// # Errors
@@ -1044,7 +1043,14 @@ pub fn spawn_worker_heartbeat(
 
             match pool.get().await {
                 Ok(mut conn) => {
-                    match heartbeat_worker(&mut conn, &registration.worker_id, in_flight, &labels_json).await {
+                    match heartbeat_worker(
+                        &mut conn,
+                        &registration.worker_id,
+                        in_flight,
+                        &labels_json,
+                    )
+                    .await
+                    {
                         Ok(0) => {
                             tracing::info!(
                                 worker_id = %registration.worker_id,
