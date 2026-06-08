@@ -7222,3 +7222,94 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
         "third invocation previous_failure must be the attempt-2 error"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to test DB");
+
+    // 1. Enqueue a capability-gated activity task (requires gpu=true)
+    let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!({}));
+    params.activity_name = Some("gpu_activity".to_string());
+
+    // Set required_capabilities to [{"Exact": {"key": "gpu", "value": "true"}}]
+    let requirements = vec![autumn_harvest::eligibility::Requirement::Exact {
+        key: "gpu".to_string(),
+        value: "true".to_string(),
+    }];
+    params.required_capabilities = Some(serde_json::to_value(&requirements).unwrap());
+
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue capability gated task");
+
+    // 2. Call claim_task representing an old worker (without gpu=true label registered in DB)
+    // Register worker-old first in the DB (without gpu label)
+    autumn_harvest::workers::register_worker(
+        &mut conn,
+        "worker-old",
+        &["default".to_string()],
+        &[0],
+        4,
+        "localhost",
+        None,
+        "v1",
+        None,
+        &std::collections::HashMap::new(),
+    )
+    .await
+    .unwrap();
+
+    // Try to claim task using worker-old. It should return None because the database filters it out.
+    let claimed_by_old = queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "worker-old",
+        "v1",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim_task for worker-old");
+    assert!(
+        claimed_by_old.is_none(),
+        "Old worker should not be able to claim capability-gated task"
+    );
+
+    // 3. Call claim_task representing a new capable worker
+    // Register worker-new with gpu=true label
+    let mut new_labels = std::collections::HashMap::new();
+    new_labels.insert("gpu".to_string(), "true".to_string());
+    autumn_harvest::workers::register_worker(
+        &mut conn,
+        "worker-new",
+        &["default".to_string()],
+        &[0],
+        4,
+        "localhost",
+        None,
+        "v1",
+        None,
+        &new_labels,
+    )
+    .await
+    .unwrap();
+
+    // Try to claim task using worker-new. It should succeed!
+    let claimed_by_new = queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "worker-new",
+        "v1",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim_task for worker-new");
+    let claimed_item = claimed_by_new.expect("New worker should successfully claim task");
+    assert_eq!(claimed_item.id, task_id);
+}

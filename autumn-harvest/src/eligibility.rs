@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 /// A single capability requirement for task execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Requirement {
     /// Exact match requirement: `key = "value"`.
     Exact { key: String, value: String },

@@ -6895,6 +6895,7 @@ mod tests {
             rate_limit_key: None,
             crash_strikes: 0,
             schedule_to_close_at: None,
+            required_capabilities: None,
         }
     }
 

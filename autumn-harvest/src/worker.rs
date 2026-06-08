@@ -2243,6 +2243,16 @@ async fn persist_scheduled_activities(
         // on the same queue (issue #249).
         params.priority = parent_priority;
 
+        if let Some(requires) = activity.requires {
+            let reqs = crate::eligibility::parse_requirements(requires).map_err(|err| {
+                HarvestError::Config(format!(
+                    "Invalid requirements for activity {}: {}",
+                    activity.name, err
+                ))
+            })?;
+            params.required_capabilities = Some(serde_json::to_value(&reqs)?);
+        }
+
         let effective_retry = scheduled
             .retry_policy_override
             .clone()

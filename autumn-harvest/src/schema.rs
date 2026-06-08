@@ -99,6 +99,8 @@ diesel::table! {
         /// attempts (issue #378). Computed once at initial enqueue as
         /// `NOW() + schedule_to_close`. NULL = no total deadline enforced.
         schedule_to_close_at -> Nullable<Timestamptz>,
+        /// Structured capability requirements JSONB payload (issue #382).
+        required_capabilities -> Nullable<Jsonb>,
     }
 }
 
