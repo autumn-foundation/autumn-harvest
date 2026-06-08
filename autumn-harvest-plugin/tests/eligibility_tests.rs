@@ -1321,8 +1321,12 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
     }
 
     // 3. Request capable_of with queue override: GET /workers?queue=custom-queue&capable_of=transcode_activity
-    let (status, body) =
-        get_json_with_auth(&app, "/workers?queue=custom-queue&capable_of=transcode_activity", true).await;
+    let (status, body) = get_json_with_auth(
+        &app,
+        "/workers?queue=custom-queue&capable_of=transcode_activity",
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let workers = body.as_array().unwrap();
     assert_eq!(
@@ -1332,4 +1336,3 @@ async fn test_worker_queue_filtering_with_explicit_queue_override() {
     );
     assert_eq!(workers[0]["worker_id"], "worker-custom-queue");
 }
-
