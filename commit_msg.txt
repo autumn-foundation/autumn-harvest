@@ -1,0 +1,18 @@
+⚡ Bolt: [performance improvement]
+
+💡 What:
+Replaced `Vec::new()` with `Vec::with_capacity(len)` in multiple batch-processing functions in `autumn-harvest/src/worker.rs`:
+- `split_mixed_signal_batch`
+- `extract_all_scheduled_activities`
+- `extract_all_activity_waits`
+- `persist_external_signal_inline`
+
+🎯 Why:
+To avoid intermediate heap reallocations when building list of items derived from input collections.
+
+📊 Impact:
+Fewer transient memory allocations and minor CPU overhead reduction during vector growth in `autumn-harvest/src/worker.rs`.
+Note: In `split_mixed_signal_batch`, setting both target capacities to the total command length slightly over-allocates (allocating `2 * N` for `N` elements total), which is an acceptable trade-off for speed in small batch processing.
+
+🔬 Measurement:
+Run `cargo bench` and observe reduced allocation metrics, or check standard system profilers for reduced memory reallocation overhead on the event loop. Tests passed completely without errors.
