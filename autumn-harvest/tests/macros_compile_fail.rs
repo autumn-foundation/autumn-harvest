@@ -18,5 +18,6 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/hvg005_background_task.rs");
     t.compile_fail("tests/compile_fail/hvg006_direct_io.rs");
     t.compile_fail("tests/compile_fail/hvg007_process_global.rs");
+    t.compile_fail("tests/compile_fail/hvg008_nondeterministic_predicate.rs");
     t.pass("tests/compile_fail/suppressed_guardrails.rs");
 }

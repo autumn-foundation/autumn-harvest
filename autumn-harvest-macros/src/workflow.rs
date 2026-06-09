@@ -185,7 +185,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     const _: () = {
                         #[deprecated(since = "0.3.0", note = #warn_msg)]
                         fn determinism_warning() {}
-                        determinism_warning();
+                        fn trigger() {
+                            determinism_warning();
+                        }
                     };
                 };
                 warnings_tokens.extend(warn_tokens);
@@ -198,6 +200,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 compile_errors.extend(err.to_compile_error());
             }
             return quote! {
+                #warnings_tokens
                 #input_fn
                 #compile_errors
             }

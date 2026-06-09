@@ -21,6 +21,7 @@ pub struct LinterFinding {
 pub struct DeterminismVisitor {
     pub findings: Vec<LinterFinding>,
     catalog: HashMap<String, RuleInfo>,
+    in_await_condition_closure: bool,
 }
 
 impl DeterminismVisitor {
@@ -28,11 +29,18 @@ impl DeterminismVisitor {
         Self {
             findings: Vec::new(),
             catalog,
+            in_await_condition_closure: false,
         }
     }
 
     fn add_finding(&mut self, rule_id: &str, span: Span) {
-        if let Some(rule) = self.catalog.get(rule_id) {
+        let actual_rule_id =
+            if self.in_await_condition_closure && (rule_id == "HVG001" || rule_id == "HVG002") {
+                "HVG008"
+            } else {
+                rule_id
+            };
+        if let Some(rule) = self.catalog.get(actual_rule_id) {
             self.findings.push(LinterFinding {
                 rule_id: rule.id.clone(),
                 severity: rule.severity.clone(),
@@ -46,9 +54,6 @@ impl DeterminismVisitor {
 
 fn path_to_string(path: &syn::Path) -> String {
     let mut s = String::new();
-    if path.leading_colon.is_some() {
-        s.push_str("::");
-    }
     for (i, segment) in path.segments.iter().enumerate() {
         if i > 0 {
             s.push_str("::");
@@ -84,6 +89,8 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
                 || path_str == "thread_rng"
                 || path_str == "Uuid::new_v4"
                 || path_str == "uuid::Uuid::new_v4"
+                || path_str == "Uuid::now_v7"
+                || path_str == "uuid::Uuid::now_v7"
             {
                 self.add_finding(
                     "HVG002",
@@ -166,8 +173,16 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             }
         }
 
+        let is_await_cond = i.method == "await_condition" || i.method == "await_condition_timeout";
+        let old_await_cond = self.in_await_condition_closure;
+        if is_await_cond {
+            self.in_await_condition_closure = true;
+        }
+
         // Delegate to nested traversal
         syn::visit::visit_expr_method_call(self, i);
+
+        self.in_await_condition_closure = old_await_cond;
     }
 
     fn visit_expr_macro(&mut self, i: &'ast syn::ExprMacro) {
