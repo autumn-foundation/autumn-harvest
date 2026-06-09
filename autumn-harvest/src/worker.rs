@@ -215,6 +215,9 @@ pub struct HandlerRegistry {
     /// in-process state. Built from the registered activities' declared
     /// [`CircuitBreakerPolicy`](crate::policy::CircuitBreakerPolicy)s.
     circuit_breakers: Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
+    /// Maximum byte length for `current_details` strings passed to the
+    /// workflow context (issue #473). Default: 1 KiB.
+    pub max_current_details_bytes: usize,
 }
 
 impl HandlerRegistry {
@@ -302,6 +305,7 @@ impl HandlerRegistry {
             max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             max_activity_result_bytes: crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            max_current_details_bytes: crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
             circuit_breakers: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
                 circuit_policies,
             )),
@@ -356,6 +360,13 @@ impl HandlerRegistry {
         if let Ok(mut lock) = crate::completion_trigger::GLOBAL_MAX_WORKFLOW_INPUT_BYTES.write() {
             *lock = max_workflow_input_bytes;
         }
+        self
+    }
+
+    /// Set the max byte length for `current_details` strings (issue #473).
+    #[must_use]
+    pub const fn with_current_details_cap(mut self, cap_bytes: usize) -> Self {
+        self.max_current_details_bytes = cap_bytes;
         self
     }
 
@@ -452,6 +463,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::RunLocalActivity { .. } => "RunLocalActivity",
         WorkflowCommand::RecordUpdateResult { .. } => "RecordUpdateResult",
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
+        WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
         WorkflowCommand::SpawnDetachedChildWorkflow { .. } => "SpawnDetachedChildWorkflow",
     }
@@ -502,6 +514,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::RecordSideEffect { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
+                | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
         )
     });
@@ -518,6 +531,7 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::RecordSideEffect { .. }
                     | WorkflowCommand::RecordUpdateResult { .. }
                     | WorkflowCommand::UpsertSearchAttributes { .. }
+                    | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             )
         })
@@ -695,7 +709,7 @@ fn extract_single_command<T>(
     commands: &[WorkflowCommand],
     extractor: impl Fn(&WorkflowCommand) -> Option<T>,
 ) -> Option<T> {
-    // RecordUpdateResult, RecordMarker, UpsertSearchAttributes, and
+    // RecordUpdateResult, RecordMarker, UpsertSearchAttributes, SetCurrentDetails, and
     // SpawnDetachedChildWorkflow are bookkeeping / fire-and-forget commands
     // that have already been (or are about to be) processed; they do not count
     // toward the suspension-type determination.
@@ -706,6 +720,7 @@ fn extract_single_command<T>(
                 | WorkflowCommand::RecordSideEffect { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
+                | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
         )
     });
@@ -732,6 +747,7 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::RecordSideEffect { .. }
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
             WorkflowCommand::ScheduleActivity {
                 activity_id,
@@ -822,6 +838,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::RecordSideEffect { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
                 | WorkflowCommand::UpsertSearchAttributes { .. }
+                | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
         )
     });
@@ -845,6 +862,7 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::RecordSideEffect { .. }
                     | WorkflowCommand::RecordUpdateResult { .. }
                     | WorkflowCommand::UpsertSearchAttributes { .. }
+                    | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             )
         })
@@ -1141,7 +1159,8 @@ fn split_mixed_signal_batch(
                 }));
             }
             WorkflowCommand::RecordUpdateResult { .. }
-            | WorkflowCommand::UpsertSearchAttributes { .. } => {}
+            | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. } => {}
             other => remaining.push(other),
         }
     }
@@ -2143,6 +2162,32 @@ async fn persist_search_attrs_from_commands(
     };
 
     store::update_search_attrs(conn, exec_id, &merged).await
+}
+
+/// Persist the last `SetCurrentDetails` command to the execution row (issue #473).
+///
+/// Scans `commands` for [`WorkflowCommand::SetCurrentDetails`] variants and
+/// writes the **last** value (last-write-wins) to
+/// `harvest_workflow_executions.current_details` in a single `UPDATE`.
+/// Does nothing when no `SetCurrentDetails` command is present.
+async fn persist_current_details_from_commands(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+) -> HarvestResult<()> {
+    // Last-write-wins: take the last SetCurrentDetails value in the command list.
+    let last = commands.iter().rev().find_map(|cmd| {
+        if let WorkflowCommand::SetCurrentDetails { value } = cmd {
+            Some(value.as_str())
+        } else {
+            None
+        }
+    });
+
+    if let Some(details) = last {
+        store::update_current_details(conn, exec_id, details).await?;
+    }
+    Ok(())
 }
 
 async fn persist_signal_wait_park(
@@ -4045,6 +4090,19 @@ async fn handle_suspended_workflow(
         .await;
     }
 
+    // Persist the last current_details breadcrumb from this execution cycle (issue #473).
+    if let Err(e) =
+        persist_current_details_from_commands(conn, context.persistence.exec_id, commands).await
+    {
+        return fail_execution_on_error(
+            conn,
+            context.persistence.task,
+            context.persistence.worker_id,
+            Err(e),
+        )
+        .await;
+    }
+
     let sticky = context.persistence.sticky_hint();
     let detached_spawns = DetachedSpawnPersistence {
         registry,
@@ -4696,6 +4754,7 @@ async fn persist_terminal_outcome_commands(
     persist_update_result_commands(conn, persistence.exec_id, pending_cmds, &mut next_event_id)
         .await?;
     persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
+    persist_current_details_from_commands(conn, persistence.exec_id, pending_cmds).await?;
 
     let pre_terminal = pre_suspension_events_from_commands(pending_cmds);
     if !pre_terminal.is_empty() {
@@ -5156,6 +5215,7 @@ async fn process_workflow_task(
                     .map_or(registry.max_workflow_input_bytes, |per| {
                         per.max(registry.max_workflow_input_bytes)
                     }),
+                registry.max_current_details_bytes,
             )
             .await;
 
@@ -5169,6 +5229,8 @@ async fn process_workflow_task(
                 // activity so that attributes are visible even if the worker
                 // crashes during inline execution.
                 persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await?;
+                // Persist the current_details breadcrumb before inline execution (issue #473).
+                persist_current_details_from_commands(conn, prepared.exec_id, &commands).await?;
                 // Sync in-memory snapshot so a subsequent continue_as_new in the
                 // same task copies the patched attrs to the successor row.
                 prepared.execution.search_attrs = apply_search_attrs_patch_in_memory(
@@ -5327,6 +5389,7 @@ async fn process_workflow_task(
                                 | WorkflowCommand::RecordSideEffect { .. }
                                 | WorkflowCommand::RecordUpdateResult { .. }
                                 | WorkflowCommand::UpsertSearchAttributes { .. }
+                                | WorkflowCommand::SetCurrentDetails { .. }
                         )
                     }) =>
             {
@@ -5349,6 +5412,11 @@ async fn process_workflow_task(
                 }
                 if let Err(e) =
                     persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                }
+                if let Err(e) =
+                    persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
                 {
                     return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
                 }
@@ -5475,6 +5543,11 @@ async fn process_workflow_task(
                 }
                 if let Err(e) =
                     persist_search_attrs_from_commands(conn, prepared.exec_id, &commands).await
+                {
+                    return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
+                }
+                if let Err(e) =
+                    persist_current_details_from_commands(conn, prepared.exec_id, &commands).await
                 {
                     return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(e)).await;
                 }

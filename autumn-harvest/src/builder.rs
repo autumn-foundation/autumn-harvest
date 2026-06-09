@@ -85,6 +85,10 @@ pub struct HarvestBuilder {
     /// Maximum allowed byte length for a workflow start input payload (issue #252).
     /// Default: 2 MiB.
     max_workflow_input_bytes: u64,
+    /// Maximum byte length for `current_details` strings set via
+    /// `ctx.set_current_details(...)` (issue #473).
+    /// Default: 1 KiB.
+    max_current_details_bytes: usize,
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
     max_workflow_start_delay: Option<Duration>,
@@ -118,6 +122,7 @@ impl Default for HarvestBuilder {
             max_activity_result_bytes: DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             max_workflow_input_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            max_current_details_bytes: crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
             max_workflow_start_delay: None,
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
@@ -194,6 +199,9 @@ pub struct BuiltHarvest {
     /// Maximum allowed byte length for a workflow start input payload (issue #252).
     /// Default: 2 MiB.
     pub max_workflow_input_bytes: u64,
+    /// Maximum byte length for `current_details` strings (issue #473).
+    /// Default: 1 KiB.
+    pub max_current_details_bytes: usize,
     /// Server-side ceiling on workflow start delay (issue #322).
     /// Default: 365 days.
     pub max_workflow_start_delay: Duration,
@@ -228,6 +236,7 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
+            .field("max_current_details_bytes", &self.max_current_details_bytes)
             .field("max_workflow_start_delay", &self.max_workflow_start_delay)
             .field(
                 "unknown_target_grace_window",
@@ -601,7 +610,8 @@ impl BuiltHarvest {
                 self.max_workflow_input_bytes,
                 self.max_activity_result_bytes,
                 self.max_signal_payload_bytes,
-            ),
+            )
+            .with_current_details_cap(self.max_current_details_bytes),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -636,7 +646,8 @@ impl BuiltHarvest {
                 self.max_workflow_input_bytes,
                 self.max_activity_result_bytes,
                 self.max_signal_payload_bytes,
-            ),
+            )
+            .with_current_details_cap(self.max_current_details_bytes),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -932,6 +943,21 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set the global maximum byte length for `current_details` strings set via
+    /// `ctx.set_current_details(...)` (issue #473).
+    ///
+    /// Values longer than the cap are silently truncated to the nearest valid
+    /// UTF-8 character boundary at or before the cap. The truncation happens
+    /// identically on the live and replay paths so it cannot itself cause a
+    /// non-determinism divergence.
+    ///
+    /// Default: 1 KiB.
+    #[must_use]
+    pub const fn with_current_details_cap(mut self, cap_bytes: usize) -> Self {
+        self.max_current_details_bytes = cap_bytes;
+        self
+    }
+
     /// Set the global maximum allowed start delay for a workflow (issue #322).
     ///
     /// Default: 365 days.
@@ -1070,6 +1096,7 @@ impl HarvestBuilder {
             max_activity_result_bytes: self.max_activity_result_bytes,
             max_signal_payload_bytes: self.max_signal_payload_bytes,
             max_workflow_input_bytes: self.max_workflow_input_bytes,
+            max_current_details_bytes: self.max_current_details_bytes,
             max_workflow_start_delay,
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,

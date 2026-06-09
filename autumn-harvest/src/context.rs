@@ -45,6 +45,10 @@ pub fn empty_shared_state() -> SharedState {
 /// Default soft history-size threshold for recommending `continue_as_new`.
 pub const DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD: u64 = 10_000;
 
+/// Default maximum byte length for the `current_details` string (issue #473).
+/// Values longer than this cap are truncated to this length on the byte boundary.
+pub const DEFAULT_CURRENT_DETAILS_CAP_BYTES: usize = 1024;
+
 /// Replay-safe history guardrails made available to workflow code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkflowHistoryPolicy {
@@ -332,6 +336,17 @@ pub enum WorkflowCommand {
         /// Per-key merge patch: `Some(v)` → set/overwrite, `None` → remove.
         patch: std::collections::HashMap<String, Option<Value>>,
     },
+    /// Overwrite the `current_details` column on the execution row (issue #473).
+    ///
+    /// Emitted by [`WorkflowContext::set_current_details`] during live execution.
+    /// Suppressed during replay so the DB write is idempotent across worker
+    /// restarts. Last-write-wins: the worker takes the **last** `SetCurrentDetails`
+    /// command from the drained list and persists only that value.
+    /// No `WorkflowEvent` is appended — zero footprint in `harvest_events`.
+    SetCurrentDetails {
+        /// The human-readable status string, already capped by the context.
+        value: String,
+    },
     /// Spawn a child workflow in detached mode and return its `ExecutionId`
     /// immediately without suspending the parent.
     ///
@@ -472,6 +487,10 @@ impl std::fmt::Debug for WorkflowCommand {
             Self::UpsertSearchAttributes { patch } => f
                 .debug_struct("UpsertSearchAttributes")
                 .field("keys", &patch.keys())
+                .finish(),
+            Self::SetCurrentDetails { value } => f
+                .debug_struct("SetCurrentDetails")
+                .field("value", value)
                 .finish(),
             Self::RecordUpdateResult { update_id, result } => f
                 .debug_struct("RecordUpdateResult")
@@ -730,6 +749,10 @@ pub struct WorkflowContext {
     /// structured `SideEffectDrift` non-determinism rather than a silent pass
     /// (issue #384).
     deferred_nd_error: Mutex<Option<String>>,
+    /// Maximum byte length for `current_details` strings (issue #473). Values
+    /// longer than this cap are truncated to the cap boundary on a UTF-8
+    /// character boundary. Configurable via `HarvestBuilder::with_current_details_cap`.
+    current_details_cap: usize,
 }
 
 impl WorkflowContext {
@@ -843,6 +866,7 @@ impl WorkflowContext {
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
+            current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
         }
     }
 
@@ -926,6 +950,7 @@ impl WorkflowContext {
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
+            current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
         })
     }
 
@@ -959,6 +984,7 @@ impl WorkflowContext {
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
+            current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
         }
     }
 
@@ -994,6 +1020,16 @@ impl WorkflowContext {
     pub fn with_activity_input_override(mut self, activity_name: &str, max_bytes: u64) -> Self {
         self.activity_input_cap_overrides
             .insert(activity_name.to_string(), max_bytes);
+        self
+    }
+
+    /// Set the maximum byte length for `current_details` strings (issue #473).
+    ///
+    /// Overrides [`DEFAULT_CURRENT_DETAILS_CAP_BYTES`]. The executor calls this
+    /// with the value from [`crate::builder::BuiltHarvest::max_current_details_bytes`].
+    #[must_use]
+    pub const fn with_current_details_cap(mut self, cap_bytes: usize) -> Self {
+        self.current_details_cap = cap_bytes;
         self
     }
 
@@ -3866,6 +3902,39 @@ impl WorkflowContext {
     }
 
     // ── Command drain ─────────────────────────────────────────────────
+
+    /// Set a durable, human-readable status breadcrumb for this execution (issue #473).
+    ///
+    /// Calls are **last-write-wins**: the worker takes the most recently emitted
+    /// value and overwrites `harvest_workflow_executions.current_details`.
+    ///
+    /// The value is **suppressed during replay** (zero new `harvest_events` rows,
+    /// zero replay-determinism impact), mirroring the zero-footprint contract of
+    /// Query handlers (#234) and `upsert_search_attrs`.
+    ///
+    /// The value is capped at [`DEFAULT_CURRENT_DETAILS_CAP_BYTES`] (configurable
+    /// via `HarvestBuilder::with_current_details_cap`). Values longer than the cap
+    /// are truncated to the cap boundary on a UTF-8 character boundary.
+    ///
+    /// Operators can read the latest value from `GET /workflows/{id}` and
+    /// `GET /workflows` without fan-out queries or a live worker.
+    pub fn set_current_details(&self, details: impl Into<String>) {
+        if self.is_replaying() {
+            return;
+        }
+        let raw = details.into();
+        let capped = if raw.len() > self.current_details_cap {
+            // Truncate to the nearest valid UTF-8 boundary at or before the cap.
+            let mut boundary = self.current_details_cap;
+            while !raw.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            raw[..boundary].to_string()
+        } else {
+            raw
+        };
+        self.push_command(WorkflowCommand::SetCurrentDetails { value: capped });
+    }
 
     /// Drain all accumulated commands. Called by the worker after the
     /// workflow coroutine suspends or completes.
@@ -7392,5 +7461,104 @@ mod tests {
 
         assert_eq!(result.unwrap(), Approval { approved: true });
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    // ── set_current_details tests (issue #473) ────────────────────────────
+
+    /// Helper: extract the last `SetCurrentDetails` value from a command list.
+    fn last_set_current_details(cmds: &[WorkflowCommand]) -> Option<&str> {
+        cmds.iter().rev().find_map(|cmd| {
+            if let WorkflowCommand::SetCurrentDetails { value } = cmd {
+                Some(value.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn set_current_details_pushes_set_current_details_command() {
+        let ctx = WorkflowContext::new_test();
+        ctx.set_current_details("Step 3/5: awaiting vendor approval");
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1, "exactly one command should be pushed");
+        assert!(
+            matches!(&cmds[0], WorkflowCommand::SetCurrentDetails { value } if value == "Step 3/5: awaiting vendor approval"),
+            "command must be SetCurrentDetails with the correct value"
+        );
+    }
+
+    #[test]
+    fn set_current_details_last_write_wins() {
+        let ctx = WorkflowContext::new_test();
+        ctx.set_current_details("first status");
+        ctx.set_current_details("second status");
+        ctx.set_current_details("third status");
+        let cmds = ctx.drain_commands();
+        // The worker takes the LAST SetCurrentDetails command.
+        assert_eq!(
+            last_set_current_details(&cmds),
+            Some("third status"),
+            "last-write-wins: the last command value wins"
+        );
+    }
+
+    #[test]
+    fn set_current_details_no_command_when_never_set() {
+        let ctx = WorkflowContext::new_test();
+        let cmds = ctx.drain_commands();
+        assert_eq!(
+            last_set_current_details(&cmds),
+            None,
+            "no SetCurrentDetails command when never set"
+        );
+    }
+
+    #[test]
+    fn set_current_details_suppressed_during_replay() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "some-marker".into(),
+                details: Value::Null,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert!(ctx.is_replaying(), "context must be in replay mode");
+        ctx.set_current_details("status during replay");
+        // During replay, set_current_details is a no-op: zero commands pushed.
+        let cmds = ctx.drain_commands();
+        assert!(
+            cmds.is_empty(),
+            "set_current_details must be suppressed during replay: no commands emitted"
+        );
+    }
+
+    #[test]
+    fn set_current_details_cap_truncates_over_limit() {
+        let ctx = WorkflowContext::new_test();
+        // Build a string just over the 1 KiB default cap.
+        let over_cap = "x".repeat(DEFAULT_CURRENT_DETAILS_CAP_BYTES + 10);
+        ctx.set_current_details(over_cap);
+        let cmds = ctx.drain_commands();
+        let stored = last_set_current_details(&cmds).expect("SetCurrentDetails command must be present");
+        assert!(
+            stored.len() <= DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            "stored value length {} exceeds cap {}",
+            stored.len(),
+            DEFAULT_CURRENT_DETAILS_CAP_BYTES
+        );
+    }
+
+    #[test]
+    fn set_current_details_within_cap_stored_unchanged() {
+        let ctx = WorkflowContext::new_test();
+        let msg = "Step 2/4: processing payment";
+        ctx.set_current_details(msg);
+        let cmds = ctx.drain_commands();
+        assert_eq!(last_set_current_details(&cmds), Some(msg));
     }
 }

@@ -139,9 +139,13 @@ pub async fn run_workflow_strict(
                                 .to_string(),
                         }
                     } else if ctx.drain_commands().into_iter().any(|cmd| {
-                        // UpsertSearchAttributes is pure metadata and does not
-                        // affect replay determinism; exclude it from this check.
-                        !matches!(cmd, WorkflowCommand::UpsertSearchAttributes { .. })
+                        // UpsertSearchAttributes and SetCurrentDetails are pure metadata
+                        // and do not affect replay determinism; exclude from this check.
+                        !matches!(
+                            cmd,
+                            WorkflowCommand::UpsertSearchAttributes { .. }
+                                | WorkflowCommand::SetCurrentDetails { .. }
+                        )
                     }) {
                         // New commands emitted after history was fully consumed (e.g. a
                         // newly-added version() or side_effect() call on an old history).
@@ -258,6 +262,7 @@ pub async fn run_workflow_with_state_and_history_policy(
         crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
         crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
         crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+        crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
     )
     .await
 }
@@ -279,6 +284,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     max_activity_input_bytes: u64,
     max_signal_payload_bytes: u64,
     max_workflow_input_bytes: u64,
+    max_current_details_bytes: usize,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
@@ -293,7 +299,8 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
         0,
         max_signal_payload_bytes,
         max_workflow_input_bytes,
-    );
+    )
+    .with_current_details_cap(max_current_details_bytes);
 
     // Auto-register declarative handlers before any workflow code runs.
     // This satisfies the AC: "authors do not call ctx.register_*_handler in

@@ -45,6 +45,9 @@ diesel::table! {
         pause_reason -> Nullable<Text>,
         /// Identity that requested the active pause, from the audit trail (issue #383).
         pause_actor -> Nullable<Text>,
+        /// Last-write-wins human-readable status string set by the workflow author
+        /// via `ctx.set_current_details(...)` (issue #473). NULL = never set.
+        current_details -> Nullable<Text>,
     }
 }
 
