@@ -25,6 +25,7 @@ pub struct DeterminismVisitor {
 }
 
 impl DeterminismVisitor {
+    #[allow(clippy::missing_const_for_fn)]
     pub fn new(catalog: HashMap<String, RuleInfo>) -> Self {
         Self {
             findings: Vec::new(),
@@ -160,15 +161,17 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
         syn::visit::visit_expr_call(self, i);
     }
 
+    #[allow(clippy::collapsible_if)]
     fn visit_expr_method_call(&mut self, i: &'ast syn::ExprMethodCall) {
         // HVG007: ProcessGlobal (lock call on uppercase static/const path receiver)
         if i.method == "lock" {
-            if let Expr::Path(expr_path) = &*i.receiver {
-                if let Some(last_seg) = expr_path.path.segments.last() {
-                    let ident_str = last_seg.ident.to_string();
-                    if ident_str.chars().all(|c| !c.is_lowercase()) {
-                        self.add_finding("HVG007", i.method.span());
-                    }
+            if let Some(last_seg) = match &*i.receiver {
+                Expr::Path(expr_path) => expr_path.path.segments.last(),
+                _ => None,
+            } {
+                let ident_str = last_seg.ident.to_string();
+                if ident_str.chars().all(|c| !c.is_lowercase()) {
+                    self.add_finding("HVG007", i.method.span());
                 }
             }
         }
@@ -180,7 +183,11 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
         }
 
         // Delegate to nested traversal
-        syn::visit::visit_expr_method_call(self, i);
+        if i.method == "side_effect" {
+            self.visit_expr(&*i.receiver);
+        } else {
+            syn::visit::visit_expr_method_call(self, i);
+        }
 
         self.in_await_condition_closure = old_await_cond;
     }

@@ -203,8 +203,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #warnings_tokens
                 #input_fn
                 #compile_errors
-            }
-            .into();
+            };
         }
     }
 

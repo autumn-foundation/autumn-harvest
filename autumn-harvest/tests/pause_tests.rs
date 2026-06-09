@@ -778,7 +778,7 @@ async fn pause_during_inflight_decision_task_discards_pending_commands() {
     // Give the in-flight handler ample time to finish its sleep, suspend, and
     // reach the worker's pause guard. The guard must discard the decision: no
     // TimerStarted may be appended while paused.
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(
         get_state(&mut conn, exec_id).await,
         "PAUSED",
