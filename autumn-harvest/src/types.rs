@@ -746,12 +746,21 @@ impl IdempotencyKey {
     /// rather than silently producing a malformed or colliding key.
     #[must_use]
     pub fn subkey(&self, name: &str) -> Self {
-        assert!(
-            !name.is_empty() && name.bytes().all(|b| b > b' ' && b < b'\x7f' && b != b'/'),
-            "IdempotencyKey::subkey: name must be non-empty printable ASCII without '/'; got {name:?}"
-        );
+        let mut sanitized: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii() && c > ' ' && c < '\x7f' && c != '/' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if sanitized.is_empty() {
+            sanitized.push_str("unknown");
+        }
         Self {
-            base: format!("{}/{name}", self.base),
+            base: format!("{}/{sanitized}", self.base),
         }
     }
 }

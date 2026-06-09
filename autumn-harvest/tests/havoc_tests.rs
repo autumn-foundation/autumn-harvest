@@ -60,3 +60,16 @@ fn test_havoc_external_task_duration_panic() {
     });
     assert!(res.is_ok());
 }
+
+#[test]
+fn test_havoc_idempotency_key_subkey_panic() {
+    use autumn_harvest::types::{ActivityExecId, IdempotencyKey};
+    let key = IdempotencyKey::from_activity_exec_id(ActivityExecId::new());
+    let res = std::panic::catch_unwind(|| {
+        let _ = key.subkey("");
+    });
+    assert!(
+        res.is_ok(),
+        "The system still crashes on invalid idempotency subkey!"
+    );
+}
