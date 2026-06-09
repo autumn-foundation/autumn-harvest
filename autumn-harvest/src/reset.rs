@@ -612,8 +612,9 @@ fn validate_source_execution(
         // DAG retry-from-failed-node (issue #366): a failed DAG run is terminal,
         // so RUNNING is no longer required. A non-failure terminal state
         // (COMPLETED / TERMINATED) is still rejected — there is nothing to retry.
+        // PAUSED is a non-terminal active state (issue #383) and is resettable.
         match execution.state.as_str() {
-            "RUNNING" | "FAILED" | "CANCELLED" | "TIMED_OUT" => {}
+            "RUNNING" | "PAUSED" | "FAILED" | "CANCELLED" | "TIMED_OUT" => {}
             other => {
                 return Err(WorkflowResetError::TerminalSource {
                     exec_id,
@@ -621,7 +622,11 @@ fn validate_source_execution(
                 });
             }
         }
-    } else if execution.state != "RUNNING" {
+    } else if !matches!(execution.state.as_str(), "RUNNING" | "PAUSED") {
+        // PAUSED is non-terminal (issue #383): an operator who paused a bad run
+        // can reset it directly without resuming first (which would dispatch the
+        // parked decision they were trying to avoid). Sealing the source cancels
+        // its parked task, so the decision never lands.
         return Err(WorkflowResetError::TerminalSource {
             exec_id,
             state: execution.state.clone(),
@@ -765,16 +770,17 @@ async fn terminate_source_execution(
     .await?;
 
     // Seal the source run as TERMINATED. The state filter guards against a
-    // concurrent reset double-sealing the same row. For the standalone reset
-    // path only `RUNNING` is reachable; the DAG retry path (issue #366) accepts
-    // terminal failure states via `allow_terminal_source`, so those must also be
-    // sealed here — otherwise the update would match zero rows and leave the
-    // source in `FAILED`/`CANCELLED`/`TIMED_OUT`, defeating the caller's
-    // `TERMINATED` re-fork guard.
+    // concurrent reset double-sealing the same row. The standalone reset path
+    // reaches `RUNNING` or `PAUSED` (issue #383, both non-terminal); the DAG
+    // retry path (issue #366) accepts terminal failure states via
+    // `allow_terminal_source`, so those must also be sealed here — otherwise the
+    // update would match zero rows and leave the source in
+    // `FAILED`/`CANCELLED`/`TIMED_OUT`, defeating the caller's `TERMINATED`
+    // re-fork guard.
     let sealable_states: Vec<&str> = if request.allow_terminal_source {
-        vec!["RUNNING", "FAILED", "CANCELLED", "TIMED_OUT"]
+        vec!["RUNNING", "PAUSED", "FAILED", "CANCELLED", "TIMED_OUT"]
     } else {
-        vec!["RUNNING"]
+        vec!["RUNNING", "PAUSED"]
     };
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq_any(sealable_states))
@@ -786,6 +792,11 @@ async fn terminate_source_execution(
                 request.reason
             ))),
             harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            // Clear the now-stale pause metadata when sealing a PAUSED source so
+            // the sealed row carries no residual pause state (issue #383).
+            harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            harvest_workflow_executions::pause_reason.eq(None::<String>),
+            harvest_workflow_executions::pause_actor.eq(None::<String>),
         ))
         .execute(conn)
         .await
@@ -1033,7 +1044,83 @@ mod tests {
     use crate::event::WorkflowEvent;
     use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, TimerId};
 
-    use super::{ResetSignalReapplyPolicy, validate_reset_point};
+    use super::{
+        ResetSignalReapplyPolicy, WorkflowResetError, validate_reset_point,
+        validate_source_execution,
+    };
+
+    fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
+        crate::models::WorkflowExecution {
+            id: ExecutionId::new().as_uuid(),
+            workflow_name: "wf".into(),
+            workflow_id: "id".into(),
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            state: state.into(),
+            input: Value::Null,
+            output: None,
+            error: None,
+            parent_id: None,
+            sticky_worker_id: None,
+            queue_name: "default".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            created_at: Utc::now(),
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            paused_at: Some(Utc::now()),
+            pause_reason: Some("operator pause".into()),
+            pause_actor: Some("oncall".into()),
+        }
+    }
+
+    #[test]
+    fn validate_source_accepts_running_and_paused_as_non_terminal() {
+        // Issue #383: PAUSED is a non-terminal active state, so an operator can
+        // reset a paused run directly without resuming it first.
+        for state in ["RUNNING", "PAUSED"] {
+            let exec = execution_in_state(state);
+            assert!(
+                validate_source_execution(ExecutionId::new(), &exec, false).is_ok(),
+                "{state} must be accepted as a non-terminal reset source"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_source_rejects_terminal_states_without_override() {
+        for state in [
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "TERMINATED",
+        ] {
+            let exec = execution_in_state(state);
+            assert!(
+                matches!(
+                    validate_source_execution(ExecutionId::new(), &exec, false),
+                    Err(WorkflowResetError::TerminalSource { .. })
+                ),
+                "{state} must be rejected as a non-terminal reset source"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_source_paused_accepted_with_terminal_override() {
+        // The DAG-retry path (allow_terminal_source = true) must also admit a
+        // paused active run alongside the terminal failure states.
+        let exec = execution_in_state("PAUSED");
+        assert!(validate_source_execution(ExecutionId::new(), &exec, true).is_ok());
+    }
 
     #[test]
     fn reset_point_allows_workflow_started_boundary() {

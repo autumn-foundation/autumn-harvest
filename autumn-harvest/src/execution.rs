@@ -1738,7 +1738,10 @@ pub async fn signal_with_start_workflow_execution(
             // the policy resolver's lock and our start, the start helper returns
             // a terminal row. Escalate to TerminateIfRunning so the signal always
             // lands on a live execution rather than being silently dropped.
-            let started = if started.state != "RUNNING"
+            // PAUSED is a non-terminal active state (issue #383): treat it like
+            // RUNNING here so a signal-with-start attaches to (and buffers the
+            // signal for) the paused run instead of cancelling and replacing it.
+            let started = if !matches!(started.state.as_str(), "RUNNING" | "PAUSED")
                 && matches!(
                     request.reuse_policy,
                     WorkflowIdReusePolicy::AllowDuplicate
@@ -1766,7 +1769,8 @@ pub async fn signal_with_start_workflow_execution(
             // Check signal payload cap here — after start/attach/AlreadyExists
             // resolution — so RejectDuplicate conflicts surface as 409 AlreadyExists
             // rather than 413 PayloadTooLarge when the payload happens to be oversized.
-            if started.state == "RUNNING" {
+            // PAUSED counts as live: the signal will be staged and delivered on resume.
+            if matches!(started.state.as_str(), "RUNNING" | "PAUSED") {
                 check_sws_payload_cap(
                     &request.signal_payload,
                     crate::error::PayloadKind::SignalPayload,
@@ -1775,7 +1779,7 @@ pub async fn signal_with_start_workflow_execution(
                 )?;
             }
 
-            let signal_delivered = if started.state == "RUNNING" {
+            let signal_delivered = if matches!(started.state.as_str(), "RUNNING" | "PAUSED") {
                 stage_signal_with_idempotency(
                     conn,
                     started.exec_id,
