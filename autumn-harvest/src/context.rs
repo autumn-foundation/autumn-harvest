@@ -3924,12 +3924,7 @@ impl WorkflowContext {
         }
         let raw = details.into();
         let capped = if raw.len() > self.current_details_cap {
-            // Truncate to the nearest valid UTF-8 boundary at or before the cap.
-            let mut boundary = self.current_details_cap;
-            while !raw.is_char_boundary(boundary) {
-                boundary -= 1;
-            }
-            raw[..boundary].to_string()
+            raw[..raw.floor_char_boundary(self.current_details_cap)].to_string()
         } else {
             raw
         };
@@ -7561,5 +7556,26 @@ mod tests {
         ctx.set_current_details(msg);
         let cmds = ctx.drain_commands();
         assert_eq!(last_set_current_details(&cmds), Some(msg));
+    }
+
+    #[test]
+    fn set_current_details_cap_truncates_on_utf8_boundary() {
+        // "ä" is U+00E4, encoded as 2 bytes (0xC3 0xA4) in UTF-8.
+        // "äää" = 6 bytes. A cap of 5 must not split the 3rd char,
+        // so floor_char_boundary(5) = 4 → "ää" is the result.
+        let ctx = WorkflowContext::new_test().with_current_details_cap(5);
+        ctx.set_current_details("äää");
+        let cmds = ctx.drain_commands();
+        let stored =
+            last_set_current_details(&cmds).expect("SetCurrentDetails command must be present");
+        assert_eq!(
+            stored, "ää",
+            "truncation must land on a valid char boundary"
+        );
+        assert!(
+            stored.len() <= 5,
+            "stored length {} exceeds cap 5",
+            stored.len()
+        );
     }
 }

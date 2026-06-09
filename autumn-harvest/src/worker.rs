@@ -418,6 +418,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
+            .field("max_current_details_bytes", &self.max_current_details_bytes)
             .field("circuit_breakers", &self.circuit_breakers)
             .finish()
     }
