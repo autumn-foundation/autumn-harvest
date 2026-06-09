@@ -7544,7 +7544,8 @@ mod tests {
         let over_cap = "x".repeat(DEFAULT_CURRENT_DETAILS_CAP_BYTES + 10);
         ctx.set_current_details(over_cap);
         let cmds = ctx.drain_commands();
-        let stored = last_set_current_details(&cmds).expect("SetCurrentDetails command must be present");
+        let stored =
+            last_set_current_details(&cmds).expect("SetCurrentDetails command must be present");
         assert!(
             stored.len() <= DEFAULT_CURRENT_DETAILS_CAP_BYTES,
             "stored value length {} exceeds cap {}",
