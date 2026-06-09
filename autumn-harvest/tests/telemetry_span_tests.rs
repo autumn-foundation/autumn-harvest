@@ -94,7 +94,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
     include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql")
+    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql")
 );
 
 // -------------------------------------------------------------------------
@@ -255,6 +257,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 rate_limit_burst: None,
                 rate_limit_key: None,
                 circuit_breaker: None,
+                requires: None,
                 handler: telem_activity,
             },
             ActivityInfo {
@@ -275,6 +278,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 rate_limit_burst: None,
                 rate_limit_key: None,
                 circuit_breaker: None,
+                requires: None,
                 handler: telem_activity,
             },
         ],
@@ -387,6 +391,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         priority_aging_secs: None,
                         unknown_target_grace_window: Duration::from_secs(5),
                         poison_pill_threshold: 3,
+                        labels: std::collections::HashMap::new(),
                         sharded_pool: None,
                     },
                     registry,

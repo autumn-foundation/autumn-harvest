@@ -107,6 +107,8 @@ pub struct EnqueueParams {
     /// attempts (issue #378). Computed once at initial enqueue as
     /// `NOW() + schedule_to_close`. NULL = no total deadline.
     pub schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    /// Structured capability requirements JSONB payload (issue #382).
+    pub required_capabilities: Option<serde_json::Value>,
 }
 
 impl EnqueueParams {
@@ -141,6 +143,7 @@ impl EnqueueParams {
             required_build_id: None,
             rate_limit_key: None,
             schedule_to_close_at: None,
+            required_capabilities: None,
         }
     }
 
@@ -236,6 +239,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         required_build_id: params.required_build_id.as_deref(),
         rate_limit_key: params.rate_limit_key.as_deref(),
         schedule_to_close_at: params.schedule_to_close_at,
+        required_capabilities: params.required_capabilities.clone(),
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -297,6 +301,7 @@ pub async fn claim_task(
     worker_build_id: &str,
     priority_aging_secs: Option<u32>,
     circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -348,9 +353,13 @@ pub async fn claim_task(
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let result: Vec<TaskQueueItem> = diesel::sql_query(
-        "WITH candidate AS ( \
+        "WITH worker_info AS ( \
+             SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels \
+         ), \
+         candidate AS ( \
              SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key \
              FROM harvest_task_queue \
+             CROSS JOIN worker_info \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
                AND scheduled_at <= NOW() \
@@ -383,6 +392,32 @@ pub async fn claim_task(
                        SELECT 1 FROM harvest_build_compat \
                        WHERE build_id = $3 \
                          AND compatible_with = harvest_task_queue.required_build_id \
+                   ) \
+               ) \
+               AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR required_capabilities IS NOT NULL \
+                   OR NOT (activity_name = ANY($6)) \
+               ) \
+               AND ( \
+                   required_capabilities IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 \
+                       FROM jsonb_array_elements(required_capabilities) AS r(value) \
+                       WHERE ( \
+                           r.value ? 'Exact' AND ( \
+                               worker_info.labels->>(r.value->'Exact'->>'key') IS NULL \
+                               OR worker_info.labels->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
+                           ) \
+                       ) OR ( \
+                           r.value ? 'In' AND ( \
+                               worker_info.labels->>(r.value->'In'->>'key') IS NULL \
+                               OR NOT ( \
+                                   (r.value->'In'->'values') @> jsonb_build_array(worker_info.labels->>(r.value->'In'->>'key')) \
+                               ) \
+                           ) \
+                       ) \
                    ) \
                ) \
                AND ( \
@@ -446,6 +481,7 @@ pub async fn claim_task(
     .bind::<diesel::sql_types::Text, _>(worker_build_id)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ineligible_activities)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;

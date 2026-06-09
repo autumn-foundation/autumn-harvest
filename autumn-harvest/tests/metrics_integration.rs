@@ -93,7 +93,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
     include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
-    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql")
+    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql")
 );
 
 // ---------------------------------------------------------------------------
@@ -344,6 +346,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 sharded_pool: None,
             },
             registry,
@@ -670,6 +673,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: metrics_activity,
         }],
         autumn_harvest::context::empty_shared_state(),
@@ -1277,6 +1281,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: metrics_activity,
         }],
         autumn_harvest::context::empty_shared_state(),
@@ -1456,6 +1461,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             is_local: true,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: history_cap_always_failing_local,
         }],
         autumn_harvest::context::empty_shared_state(),
@@ -1798,6 +1804,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             is_local: true,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: history_cap_local_step,
         }],
         autumn_harvest::context::empty_shared_state(),
