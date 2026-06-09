@@ -1472,3 +1472,92 @@ fn compute_retry_delay_negative_nan() {
     let d2 = compute_retry_delay(Duration::from_secs(1), -1.0, Duration::from_secs(300), 2);
     assert_eq!(d2, Duration::from_secs(0));
 }
+
+#[test]
+fn test_compute_retry_delay_with_seed_none() {
+    let policy =
+        RetryPolicy::exponential(3, Duration::from_secs(10)).with_jitter(JitterPolicy::None);
+    for attempt in 1..=3 {
+        let expected = compute_retry_delay(
+            policy.initial_interval,
+            policy.backoff_coefficient,
+            policy.max_interval,
+            attempt,
+        );
+        let actual = compute_retry_delay_with_seed(&policy, attempt, 42);
+        assert_eq!(
+            actual, expected,
+            "None jitter should exactly match the base delay"
+        );
+    }
+}
+
+#[test]
+fn test_compute_retry_delay_with_seed_full() {
+    let policy =
+        RetryPolicy::exponential(3, Duration::from_secs(10)).with_jitter(JitterPolicy::Full);
+    for attempt in 1..=3 {
+        let base = compute_retry_delay(
+            policy.initial_interval,
+            policy.backoff_coefficient,
+            policy.max_interval,
+            attempt,
+        );
+        for seed in 0..50 {
+            let actual = compute_retry_delay_with_seed(&policy, attempt, seed);
+            assert!(actual <= base, "Full jitter must be <= base");
+        }
+    }
+}
+
+#[test]
+fn test_compute_retry_delay_with_seed_equal() {
+    let policy =
+        RetryPolicy::exponential(3, Duration::from_secs(10)).with_jitter(JitterPolicy::Equal);
+    for attempt in 1..=3 {
+        let base = compute_retry_delay(
+            policy.initial_interval,
+            policy.backoff_coefficient,
+            policy.max_interval,
+            attempt,
+        );
+        for seed in 0..50 {
+            let actual = compute_retry_delay_with_seed(&policy, attempt, seed);
+            assert!(actual <= base, "Equal jitter must be <= base");
+            assert!(actual >= base / 2, "Equal jitter must be >= base / 2");
+        }
+    }
+}
+
+#[test]
+fn test_compute_retry_delay_with_seed_decorrelated() {
+    let mut policy = RetryPolicy::exponential(3, Duration::from_secs(10))
+        .with_jitter(JitterPolicy::Decorrelated);
+    policy.max_interval = Duration::from_secs(300);
+
+    for attempt in 1..=3 {
+        let prev = if attempt <= 1 {
+            policy.initial_interval
+        } else {
+            compute_retry_delay(
+                policy.initial_interval,
+                policy.backoff_coefficient,
+                policy.max_interval,
+                attempt - 1,
+            )
+        };
+        let upper = prev.saturating_mul(3).min(policy.max_interval);
+
+        for seed in 0..50 {
+            let actual = compute_retry_delay_with_seed(&policy, attempt, seed);
+            assert!(
+                actual >= policy.initial_interval,
+                "Decorrelated jitter must be >= initial_interval"
+            );
+            assert!(
+                actual <= upper,
+                "Decorrelated jitter must be <= min(max_interval, prev * 3)"
+            );
+        }
+    }
+}
