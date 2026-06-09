@@ -184,7 +184,7 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
 
         // Delegate to nested traversal
         if i.method == "side_effect" {
-            self.visit_expr(&*i.receiver);
+            self.visit_expr(&i.receiver);
         } else {
             syn::visit::visit_expr_method_call(self, i);
         }
