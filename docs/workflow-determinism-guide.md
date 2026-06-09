@@ -32,6 +32,37 @@ let rule = rule_by_id("HVG001").unwrap();
 
 ---
 
+## Compile-time enforcement
+
+Since version 0.3.0, the `#[workflow]` attribute macro automatically scans the annotated function body at compile-time to enforce these guardrails:
+
+- **Hard Blockers** (`HVG001` through `HVG008`): Trigger compilation errors at the exact site of the violation, preventing the build from succeeding with unsafe code.
+- **Warnings** (`HVG009`): Emit standard deprecation compiler warnings (`note = "..."`) at the exact log macro site to encourage migration without breaking CI or blocking local development.
+
+### Suppressing compile-time guardrails
+
+If a workflow legitimately needs to invoke non-deterministic APIs directly, the compile-time checks can be completely disabled by providing the `allow_nondeterministic_apis` attribute flag:
+
+```rust
+#[workflow(allow_nondeterministic_apis)]
+async fn legacy_workflow(ctx: &WorkflowContext) -> Result<(), String> {
+    // HardBlockers and Warnings are now allowed at compile time
+    let now = chrono::Utc::now(); 
+    tracing::info!("bare logging");
+    Ok(())
+}
+```
+
+The flag also supports explicit boolean syntax:
+```rust
+#[workflow(allow_nondeterministic_apis = true)]
+```
+
+> [!NOTE]
+> The compile-time linter performs a shallow AST traversal (matching path segments and patterns). It is designed to catch the most common patterns, but it does not replace runtime verification. Always run [WorkflowReplayer](file:///c:/Users/markm/autumn-harvest/docs/replay-verify.md) tests for critical production workflows.
+
+---
+
 ## Allowed vs. disallowed patterns
 
 ### HVG001 — Wall-clock time (HardBlocker)

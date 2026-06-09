@@ -42,13 +42,29 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
     "\n",
+    include_str!("../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
+    "\n",
+    include_str!("../migrations/20260430000001_harvest_external_tasks/up.sql"),
+    "\n",
+    include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
+    "\n",
+    include_str!("../migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
     include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
     "\n",
+    include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
+    "\n",
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
     "\n",
     include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
     "\n",
     include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
+    "\n",
+    include_str!("../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!("../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
@@ -74,10 +90,18 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
     "\n",
-    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    "\n",
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
+    "\n",
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql")
 );
 
 async fn setup() -> (String, ContainerAsync<Postgres>) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
         .start()
@@ -291,7 +315,9 @@ fn slow_timer_wf<'a>(
     _input: Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        if ctx.history_event_count() == 1 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
         ctx.timer("wait", 1).await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!("done"))
     })
@@ -752,7 +778,7 @@ async fn pause_during_inflight_decision_task_discards_pending_commands() {
     // Give the in-flight handler ample time to finish its sleep, suspend, and
     // reach the worker's pause guard. The guard must discard the decision: no
     // TimerStarted may be appended while paused.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
     assert_eq!(
         get_state(&mut conn, exec_id).await,
         "PAUSED",

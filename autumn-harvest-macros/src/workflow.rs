@@ -30,6 +30,7 @@ struct WorkflowAttrs {
     /// Human-readable description for operator/UI discovery (issue #373).
     /// Parsed from `#[workflow(description = "...")]`.
     description: Option<String>,
+    allow_nondeterministic_apis: bool,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
@@ -41,6 +42,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         runbook: None,
         severity: None,
         description: None,
+        allow_nondeterministic_apis: false,
     };
 
     syn::meta::parser(|meta| {
@@ -82,6 +84,14 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             })?;
             result.concurrency = Some(ConcurrencyArgs { key_expr, limit });
             Ok(())
+        } else if meta.path.is_ident("allow_nondeterministic_apis") {
+            if meta.input.peek(syn::Token![=]) {
+                let value: syn::LitBool = meta.value()?.parse()?;
+                result.allow_nondeterministic_apis = value.value;
+            } else {
+                result.allow_nondeterministic_apis = true;
+            }
+            Ok(())
         } else if meta.path.is_ident("max_input_bytes") {
             let value: LitStr = meta.value()?.parse()?;
             let s = value.value();
@@ -116,7 +126,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `concurrency`, `max_input_bytes`, `owner`, `runbook`, `severity`, or `description`",
+                "unsupported attribute: expected `execution_timeout`, `concurrency`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -147,6 +157,51 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             "#[workflow] functions must be async",
         )
         .to_compile_error();
+    }
+
+    let mut warnings_tokens = quote! {};
+
+    if !attrs.allow_nondeterministic_apis {
+        use syn::visit::Visit as _;
+        let catalog = crate::determinism_lint::load_catalog_metadata();
+        let mut visitor = crate::determinism_lint::DeterminismVisitor::new(catalog);
+        visitor.visit_item_fn(&input_fn);
+
+        let mut errors = Vec::new();
+        for finding in visitor.findings {
+            if finding.severity == "HardBlocker" {
+                let compile_msg = format!(
+                    "[{}] Workflow determinism violation: {}\nAlternative: {}",
+                    finding.rule_id, finding.message, finding.alternative
+                );
+                errors.push(syn::Error::new(finding.span, compile_msg));
+            } else if finding.severity == "Warning" {
+                let warn_msg = format!(
+                    "[{}] Workflow determinism warning: {}\nAlternative: {}",
+                    finding.rule_id, finding.message, finding.alternative
+                );
+                let span = finding.span;
+                let warn_tokens = quote::quote_spanned! { span =>
+                    const _: () = {
+                        #[deprecated(since = "0.3.0", note = #warn_msg)]
+                        fn determinism_warning() {}
+                        determinism_warning();
+                    };
+                };
+                warnings_tokens.extend(warn_tokens);
+            }
+        }
+
+        if !errors.is_empty() {
+            let mut compile_errors = quote! {};
+            for err in errors {
+                compile_errors.extend(err.to_compile_error());
+            }
+            return quote! {
+                #input_fn
+                #compile_errors
+            }.into();
+        }
     }
 
     let fn_name = &input_fn.sig.ident;
@@ -265,6 +320,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
 
     quote! {
+        #warnings_tokens
         #input_fn
 
         #[doc(hidden)]

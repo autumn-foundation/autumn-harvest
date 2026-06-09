@@ -9,6 +9,7 @@ use proc_macro::TokenStream;
 mod activity;
 mod collect;
 mod dag;
+pub(crate) mod determinism_lint;
 mod query;
 mod signal;
 mod update;

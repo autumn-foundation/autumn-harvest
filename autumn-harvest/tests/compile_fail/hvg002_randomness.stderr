@@ -1,0 +1,14 @@
+error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::thread_rng(), Uuid::new_v4(), or any other source of randomness directly in a workflow body produces a different value on each replay pass. Since the workflow function is re-run from the top on every resume, the random sequence diverges from what was recorded in harvest_events.
+       Alternative: Use the deterministic primitives on WorkflowContext, which capture the value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For cryptographically secure randomness, generate it inside an activity (ActivityContext) and return it as the durably-recorded activity result instead.
+ --> tests/compile_fail/hvg002_randomness.rs:5:19
+  |
+5 |     let _ = rand::random::<u64>();
+  |                   ^^^^^^
+
+warning: unused variable: `ctx`
+ --> tests/compile_fail/hvg002_randomness.rs:4:23
+  |
+4 | async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
+  |                       ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default

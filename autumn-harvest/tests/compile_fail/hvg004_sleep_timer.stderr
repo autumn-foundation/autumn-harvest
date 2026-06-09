@@ -1,0 +1,14 @@
+error: [HVG004] Workflow determinism violation: Calling std::thread::sleep(), tokio::time::sleep(), async_std::task::sleep(), or any OS/runtime sleep primitive in a workflow body does not record a durable timer. The workflow worker's task is blocked but no timer event is appended to harvest_events. After a worker restart the sleep is replayed as a no-op, changing observable timing.
+       Alternative: Use ctx.timer(timer_id, duration_secs) (WorkflowContext) which emits a TimerStarted event into the durable history. The timer is enforced by the harvest timeout scanner and survives worker restarts. For periodic scheduling, use DagBuilder with an Interval or Cron schedule.
+ --> tests/compile_fail/hvg004_sleep_timer.rs:5:18
+  |
+5 |     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+  |                  ^^^^^
+
+warning: unused variable: `ctx`
+ --> tests/compile_fail/hvg004_sleep_timer.rs:4:23
+  |
+4 | async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
+  |                       ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
