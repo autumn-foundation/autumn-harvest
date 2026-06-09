@@ -174,7 +174,9 @@ const INIT_SQL: &str = concat!(
     ),
     include_str!(
         "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
-    )
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -247,6 +249,7 @@ fn build_worker() -> Arc<Worker> {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             registry(),

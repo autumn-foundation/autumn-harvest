@@ -187,12 +187,27 @@ pub struct HistoryMatcher {
     /// e.g. when signal events appear before `ActivityScheduled` or
     /// `TimerStarted` events in a mixed-batch history.
     pending_external_signals: Vec<StashedExternalSignal>,
+    /// Indices of events that are transparent to command-dispatch replay and
+    /// therefore pre-marked consumed (issue #383: `WorkflowExecutionPaused` /
+    /// `WorkflowExecutionResumed`). These are pure operator-lifecycle no-ops:
+    /// they have no workflow-command counterpart and must never flag
+    /// non-determinism, so every scan loop skips them via [`Self::is_consumed`].
+    transparent_events: HashSet<usize>,
 }
 
 impl HistoryMatcher {
     /// Create a new matcher from a list of recorded events.
     #[must_use]
     pub fn new(events: Vec<WorkflowEvent>) -> Self {
+        // Pre-mark pause/resume events as consumed so they are transparent to
+        // every cursor-based scan (issue #383). They carry no workflow command,
+        // so settling them up front keeps the matcher's scan loops unchanged.
+        let transparent_events = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| Self::is_pause_lifecycle_event(e))
+            .map(|(i, _)| i)
+            .collect();
         Self {
             events,
             cursor: 0,
@@ -200,13 +215,25 @@ impl HistoryMatcher {
             consumed_signal_events: HashSet::new(),
             pending_signals: VecDeque::new(),
             pending_external_signals: Vec::new(),
+            transparent_events,
         }
+    }
+
+    /// Returns `true` for operator pause/resume lifecycle events (issue #383),
+    /// which are transparent no-ops for command-dispatch replay.
+    const fn is_pause_lifecycle_event(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::WorkflowExecutionPaused { .. }
+                | WorkflowEvent::WorkflowExecutionResumed { .. }
+        )
     }
 
     /// Returns `true` if the event at `index` has already been consumed out-of-order.
     fn is_consumed(&self, index: usize) -> bool {
         self.consumed_out_of_order_events.contains(&index)
             || self.consumed_signal_events.contains(&index)
+            || self.transparent_events.contains(&index)
     }
 
     fn stash_signal(&mut self, cursor: usize, signal_name: String, payload: Value) {
@@ -3317,6 +3344,107 @@ mod tests {
                 output: serde_json::json!({"ok": true})
             },
             "signal buffered during timer scan should be returned by match_signal"
+        );
+    }
+
+    // ── Pause/Resume replay transparency (issue #383) ─────────────────────
+
+    #[test]
+    fn matcher_timer_skips_pause_resume_between_started_and_fired() {
+        // The operator paused while the workflow was waiting on a timer, then
+        // resumed; the timer fired on resume. The pause/resume pair is recorded
+        // between TimerStarted and TimerFired. match_timer must treat them as
+        // no-ops and still find TimerFired — replay determinism is unchanged.
+        let timer_id = TimerId::new("cooldown");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            WorkflowEvent::WorkflowExecutionPaused {
+                paused_at: chrono::Utc::now(),
+                reason: Some("incident".into()),
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::WorkflowExecutionResumed {
+                resumed_at: chrono::Utc::now(),
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let timer = matcher.match_timer("cooldown");
+        assert_eq!(
+            timer,
+            HistoryMatch::Matched {
+                output: Value::Null
+            },
+            "match_timer must skip pause/resume events and still find TimerFired"
+        );
+    }
+
+    #[test]
+    fn matcher_pause_resume_are_not_unconsumed_history() {
+        // A trailing pause/resume pair (e.g. paused-and-resumed with no pending
+        // work) must not be reported as unconsumed history, otherwise the
+        // executor would flag spurious non-determinism / never-settle.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+            },
+            WorkflowEvent::WorkflowExecutionPaused {
+                paused_at: chrono::Utc::now(),
+                reason: None,
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::WorkflowExecutionResumed {
+                resumed_at: chrono::Utc::now(),
+                actor: "oncall".into(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // skip WorkflowStarted
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "pause/resume events must be transparent to unconsumed-history checks"
+        );
+    }
+
+    #[test]
+    fn matcher_activity_skips_pause_resume_between_scheduled_and_completed() {
+        // Pause/resume recorded while an activity was in flight.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::WorkflowExecutionPaused {
+                paused_at: chrono::Utc::now(),
+                reason: None,
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::WorkflowExecutionResumed {
+                resumed_at: chrono::Utc::now(),
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"charged": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_activity("charge");
+        assert_eq!(
+            result,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"charged": true})
+            },
+            "match_activity must skip pause/resume and find the recorded completion"
         );
     }
 

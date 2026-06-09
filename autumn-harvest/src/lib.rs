@@ -205,8 +205,10 @@ pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::{SideEffectKind, WorkflowEvent};
 #[cfg(feature = "db")]
 pub use execution::{
-    CancelledWorkflowExecution, SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams,
-    StartedWorkflowExecution, cancel_workflow_execution, signal_with_start_workflow_execution,
+    CancelledWorkflowExecution, PausedWorkflowExecution, ResumedWorkflowExecution,
+    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, StartedWorkflowExecution,
+    auto_resume_expired_pauses, cancel_workflow_execution, pause_workflow_execution,
+    resume_workflow_execution, signal_with_start_workflow_execution,
     start_or_load_workflow_execution, terminate_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};

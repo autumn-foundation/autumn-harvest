@@ -507,6 +507,44 @@ pub enum WorkflowEvent {
         /// The recorded JSON value, replayed verbatim on every subsequent pass.
         value: serde_json::Value,
     },
+
+    // ── Pause / Resume (issue #383) ───────────────────────────────────────────
+    /// An operator paused this execution. While paused the executor refuses to
+    /// dispatch new commands (activities, timers, child workflows); in-flight
+    /// activities continue to completion and their results are recorded
+    /// normally. This is a **non-terminal** lifecycle event — the execution
+    /// resumes from exactly this point on
+    /// [`WorkflowExecutionResumed`](Self::WorkflowExecutionResumed).
+    ///
+    /// ## Replay determinism
+    ///
+    /// Pause/resume events are no-ops for command dispatch during replay: the
+    /// [`crate::replay::HistoryMatcher`] skips them transparently, so a recorded
+    /// pause/resume pair never alters the command sequence reconstructed from
+    /// history.
+    WorkflowExecutionPaused {
+        /// Wall-clock time the pause was applied.
+        paused_at: DateTime<Utc>,
+        /// Optional operator-supplied reason (max 500 chars, enforced at the API
+        /// boundary). `None` when no reason was given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Identity of the operator (or `"auto-resume(timeout)"` peer) that
+        /// requested the pause, captured from the audit trail.
+        actor: String,
+    },
+    /// An operator (or the bounded-pause auto-resume scanner) resumed a paused
+    /// execution. The executor re-arms and the workflow advances on its next
+    /// decision attempt; timers whose fire time elapsed while paused fire
+    /// immediately in their original order, and signals queued during the pause
+    /// are delivered in order.
+    WorkflowExecutionResumed {
+        /// Wall-clock time the resume was applied.
+        resumed_at: DateTime<Utc>,
+        /// Identity that requested the resume. `"auto-resume(timeout)"` when the
+        /// bounded-pause scanner resumed an over-long pause.
+        actor: String,
+    },
 }
 
 impl WorkflowEvent {
@@ -553,6 +591,8 @@ impl WorkflowEvent {
             Self::ChildWorkflowSpawnedDetached { .. } => "ChildWorkflowSpawnedDetached",
             Self::ChildWorkflowCascadeApplied { .. } => "ChildWorkflowCascadeApplied",
             Self::SideEffectRecorded { .. } => "SideEffectRecorded",
+            Self::WorkflowExecutionPaused { .. } => "WorkflowExecutionPaused",
+            Self::WorkflowExecutionResumed { .. } => "WorkflowExecutionResumed",
         }
     }
 
@@ -913,11 +953,20 @@ mod tests {
                 name: None,
                 value: serde_json::Value::Null,
             },
+            WorkflowEvent::WorkflowExecutionPaused {
+                paused_at: Utc::now(),
+                reason: Some("incident".into()),
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::WorkflowExecutionResumed {
+                resumed_at: Utc::now(),
+                actor: "oncall".into(),
+            },
         ];
 
-        assert_eq!(events.len(), 35);
+        assert_eq!(events.len(), 37);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 35, "duplicate type names detected");
+        assert_eq!(names.len(), 37, "duplicate type names detected");
     }
 
     // ── SideEffectRecorded tests (issue #384) ─────────────────────────────────
@@ -1177,5 +1226,80 @@ mod tests {
             timed_out_at: Utc::now(),
         };
         assert_eq!(e.type_name(), "WorkflowExecutionTimedOut");
+    }
+
+    // ── Pause/Resume tests (issue #383) ───────────────────────────────────────
+
+    #[test]
+    fn workflow_execution_paused_round_trips() -> Result<(), serde_json::Error> {
+        let paused_at = Utc::now();
+        let event = WorkflowEvent::WorkflowExecutionPaused {
+            paused_at,
+            reason: Some("investigating runaway dispatch".into()),
+            actor: "oncall@example.com".into(),
+        };
+
+        assert_eq!(event.type_name(), "WorkflowExecutionPaused");
+        // Pause is NOT terminal — a paused workflow resumes and keeps running.
+        assert!(
+            !event.is_terminal_lifecycle(),
+            "pause must not be a terminal lifecycle event"
+        );
+
+        let json = serde_json::to_string(&event)?;
+        assert!(json.contains("WorkflowExecutionPaused"));
+        assert!(json.contains("paused_at"));
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::WorkflowExecutionPaused { reason, actor, .. } => {
+                assert_eq!(reason.as_deref(), Some("investigating runaway dispatch"));
+                assert_eq!(actor, "oncall@example.com");
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_execution_paused_round_trips_without_reason() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::WorkflowExecutionPaused {
+            paused_at: Utc::now(),
+            reason: None,
+            actor: "auto".into(),
+        };
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::WorkflowExecutionPaused { reason: None, .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_execution_resumed_round_trips() -> Result<(), serde_json::Error> {
+        let resumed_at = Utc::now();
+        let event = WorkflowEvent::WorkflowExecutionResumed {
+            resumed_at,
+            actor: "auto-resume(timeout)".into(),
+        };
+
+        assert_eq!(event.type_name(), "WorkflowExecutionResumed");
+        assert!(
+            !event.is_terminal_lifecycle(),
+            "resume must not be a terminal lifecycle event"
+        );
+
+        let json = serde_json::to_string(&event)?;
+        assert!(json.contains("WorkflowExecutionResumed"));
+        assert!(json.contains("resumed_at"));
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::WorkflowExecutionResumed { actor, .. } => {
+                assert_eq!(actor, "auto-resume(timeout)");
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
     }
 }

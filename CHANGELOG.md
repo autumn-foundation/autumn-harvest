@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Operator pause/resume** (issue #383). New admin-only management routes
+  `POST /api/harvest/workflows/{id}/pause` and `POST /api/harvest/workflows/{id}/resume`
+  let an operator halt and re-arm an individual workflow execution. Two new
+  append-only `WorkflowEvent` variants (`WorkflowExecutionPaused`,
+  `WorkflowExecutionResumed`) are non-terminal and transparent to replay. `PAUSED`
+  is a non-terminal **active** state: it is enforced at the executor/claim layer
+  (`queue::claim_task` skips paused tasks, in-flight activities still complete),
+  is counted as active everywhere active runs are enumerated — scheduler
+  `max_active_runs`, overlap policies, batch targets, and the backfill
+  (`query_running_count`) and Vantage manual-trigger counters all count
+  `state IN ('RUNNING','PAUSED')` — and is auto-resumed after
+  `WorkerConfig::max_workflow_pause_duration` (default 24h). **Pause suspends the
+  SLA clock** (interaction with #243): the execution-timeout scanner skips paused
+  runs and `resume` pushes `deadline_at` forward by the time spent paused, so
+  paused wall-clock is not charged against `execution_timeout`. Cancellation beats
+  pause; updates submitted while paused are rejected (409), queries still serve.
+  Metrics `harvest.workflow.paused` and `harvest.workflow.pause_duration`.
+  Migration `20260607000002_harvest_workflow_pause`.
 - **DLQ root-cause aggregation** (issue #385). New read-only management route
   `GET /api/harvest/dead-letters/aggregate` (admin auth, parity with the DLQ
   list endpoint; placed under the existing `/dead-letters` family) answers an operator's first incident question — *"what is the shape

@@ -117,6 +117,9 @@ pub struct WorkerRuntimeConfig {
     /// Consecutive worker crashes a task may cause before quarantine (issue #367).
     /// `0` disables quarantine (reclaimed poison pills are re-queued forever).
     pub poison_pill_threshold: i32,
+    /// Bounded-pause ceiling before the auto-resume scanner force-resumes a
+    /// paused execution (issue #383). Default 24 hours.
+    pub max_workflow_pause_duration: Duration,
     /// Capability labels for hardware-aware and regional routing (issue #382).
     pub labels: std::collections::HashMap<String, String>,
     #[cfg(feature = "db")]
@@ -167,6 +170,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             priority_aging_secs: cfg.priority_aging_secs,
             unknown_target_grace_window: cfg.unknown_target_grace_window,
             poison_pill_threshold: cfg.poison_pill_threshold,
+            max_workflow_pause_duration: cfg.max_workflow_pause_duration,
             labels: cfg.labels,
             #[cfg(feature = "db")]
             sharded_pool: cfg.sharded_pool,
@@ -4613,71 +4617,41 @@ async fn persist_workflow_outcome(
     }
 }
 
-async fn persist_terminal_outcome_with_pending_commands(
+/// Outcome of the pause-guarded persistence transaction in
+/// [`process_workflow_task`].
+enum WorkflowPersistFlow {
+    /// The execution was observed `PAUSED` under the row lock: the task was
+    /// re-parked inside the same transaction and the pending decision discarded
+    /// without persisting any new commands. Resume re-derives the decision on
+    /// replay.
+    ParkedPaused,
+    /// The decision was persisted under the execution row lock.
+    Persisted,
+}
+
+/// Map a terminal/suspended outcome to its deferred schedule-failure-counter
+/// action: `Some(false)` resets (success), `Some(true)` increments (failure),
+/// `None` leaves it untouched (suspended / continue-as-new). The action depends
+/// only on Completed-vs-Failed, so it is identical for root and child variants.
+const fn schedule_counter_action(outcome: &WorkflowOutcome) -> Option<bool> {
+    match outcome {
+        WorkflowOutcome::Completed { .. } => Some(false),
+        WorkflowOutcome::Failed { .. } => Some(true),
+        _ => None,
+    }
+}
+
+/// Run the deferred schedule-failure-counter update in autocommit, *after* the
+/// persistence transaction has committed. Counter queries are best-effort: a
+/// failure here must never roll back the durably-persisted workflow decision,
+/// which is why they run outside the persistence transaction (a failed query
+/// inside a Postgres transaction would abort the whole transaction).
+async fn run_deferred_schedule_counter(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     execution: &WorkflowExecution,
-    persistence: WorkflowTaskPersistence<'_>,
-    outcome: WorkflowOutcome,
-    pending_cmds: &[WorkflowCommand],
-    execute_span: &tracing::Span,
-) -> HarvestResult<()> {
-    // Capture counter action before `outcome` is consumed by the closure.
-    let counter_action = match &outcome {
-        WorkflowOutcome::Completed { .. } => Some(false), // reset
-        WorkflowOutcome::Failed { .. } => Some(true),     // increment
-        _ => None,
-    };
-
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        let mut next_event_id = persistence.next_event_id;
-        async move {
-            persist_update_result_commands(
-                conn,
-                persistence.exec_id,
-                pending_cmds,
-                &mut next_event_id,
-            )
-            .await?;
-            persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
-
-            let pre_terminal = pre_suspension_events_from_commands(pending_cmds);
-            if !pre_terminal.is_empty() {
-                store::append_events(conn, persistence.exec_id, &pre_terminal, next_event_id)
-                    .await?;
-                next_event_id = next_event_id
-                    .checked_add(i32::try_from(pre_terminal.len()).unwrap_or(i32::MAX))
-                    .ok_or_else(|| {
-                        crate::error::HarvestError::Database("Event ID overflow".to_string())
-                    })?;
-            }
-
-            create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span)
-                .await?;
-
-            // `update_schedule_counter: false` — counter updates run AFTER this
-            // transaction commits (below) to avoid aborting the transaction on a
-            // best-effort query failure.
-            persist_workflow_outcome(
-                conn,
-                registry,
-                execution,
-                WorkflowTaskPersistence {
-                    next_event_id,
-                    ..persistence
-                },
-                outcome,
-                execute_span,
-                false,
-            )
-            .await
-        }
-        .scope_boxed()
-    })
-    .await?;
-
-    // Best-effort schedule counter updates run outside the transaction so a
-    // counter query failure never rolls back the completed/failed execution.
+    counter_action: Option<bool>,
+) {
     match counter_action {
         Some(false) => {
             crate::scheduler::maybe_reset_schedule_failure_counter(
@@ -4698,8 +4672,55 @@ async fn persist_terminal_outcome_with_pending_commands(
         }
         None => {}
     }
+}
 
-    Ok(())
+/// Persist a terminal (or continue-as-new) outcome that also carries pending
+/// pre-suspension commands (update results, search-attr patches, detached
+/// children, fan-out markers).
+///
+/// Runs entirely on the caller's connection **without opening its own
+/// transaction** so the caller can wrap it — together with the authoritative
+/// `FOR UPDATE` pause guard — in a single transaction (issue #383). Schedule
+/// counters are deferred to the caller via [`run_deferred_schedule_counter`]
+/// and run only after that outer transaction commits.
+async fn persist_terminal_outcome_commands(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    execution: &WorkflowExecution,
+    persistence: WorkflowTaskPersistence<'_>,
+    outcome: WorkflowOutcome,
+    pending_cmds: &[WorkflowCommand],
+    execute_span: &tracing::Span,
+) -> HarvestResult<()> {
+    let mut next_event_id = persistence.next_event_id;
+    persist_update_result_commands(conn, persistence.exec_id, pending_cmds, &mut next_event_id)
+        .await?;
+    persist_search_attrs_from_commands(conn, persistence.exec_id, pending_cmds).await?;
+
+    let pre_terminal = pre_suspension_events_from_commands(pending_cmds);
+    if !pre_terminal.is_empty() {
+        store::append_events(conn, persistence.exec_id, &pre_terminal, next_event_id).await?;
+        next_event_id = next_event_id
+            .checked_add(i32::try_from(pre_terminal.len()).unwrap_or(i32::MAX))
+            .ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string()))?;
+    }
+
+    create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span).await?;
+
+    // `update_schedule_counter: false` — the caller runs counters after commit.
+    persist_workflow_outcome(
+        conn,
+        registry,
+        execution,
+        WorkflowTaskPersistence {
+            next_event_id,
+            ..persistence
+        },
+        outcome,
+        execute_span,
+        false,
+    )
+    .await
 }
 
 fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
@@ -5519,6 +5540,51 @@ async fn process_workflow_task(
     };
 
     let (outcome, pending_cmds, execute_span) = loop_result;
+
+    // Issue #383: an operator may have paused this execution while this
+    // workflow decision task was running. Pause is enforced at the claim layer
+    // and only blocks *future* claims; this already-claimed task would
+    // otherwise persist new activity/timer/child commands (or a terminal
+    // outcome) after a successful pause, violating the pause guarantee. The
+    // loop above only appended events for already-completed inline work (local
+    // activities / external-signal sends), which replay reproduces
+    // deterministically. If the execution became PAUSED, discard the pending
+    // decision without persisting any new commands and re-park the task:
+    // resume_workflow_execution wakes it, and the deterministic handler
+    // re-derives the same commands on replay.
+    //
+    // Fast-path optimization only: this is a non-locking read in autocommit
+    // that lets a decision paused well before persistence bail out *before*
+    // computing metrics, history-cap, and cache state below. It is NOT the
+    // authoritative guard — the persistence transaction further down opens with
+    // a `FOR UPDATE` row lock on the execution that serializes with
+    // `pause_workflow_execution`'s own lock and re-checks PAUSED under it, so a
+    // pause committing in the gap between this read and the persist is still
+    // caught and the decision discarded. The claim-layer gate
+    // (`queue::claim_task`) prevents the task from ever being *claimed* while
+    // PAUSED in the first place; this read just avoids wasted work in the
+    // common case.
+    {
+        use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+        let current_state: Option<String> = exec_dsl::harvest_workflow_executions
+            .find(prepared.exec_id.as_uuid())
+            .select(exec_dsl::state)
+            .first::<String>(conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?;
+        if current_state.as_deref() == Some("PAUSED") {
+            let sticky = if sticky_timeout.is_zero() {
+                None
+            } else {
+                Some(queue::StickyHint::new(worker_id, sticky_timeout))
+            };
+            queue::park_workflow_task(conn, task.id, sticky).await?;
+            drop(execute_span);
+            return Ok(());
+        }
+    }
+
     let terminal_parent_close_cascade_events = if matches!(
         &outcome,
         WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
@@ -5660,32 +5726,98 @@ async fn process_workflow_task(
         next_event_id,
         sticky_timeout,
     };
-    if !pending_cmds.is_empty() && !matches!(&outcome, WorkflowOutcome::Suspended { .. }) {
-        let result = persist_terminal_outcome_with_pending_commands(
-            conn,
-            registry,
-            &prepared.execution,
-            persistence,
-            outcome,
-            &pending_cmds,
-            &execute_span,
-        )
+
+    // Issue #383: authoritatively enforce pause across the persistence path.
+    //
+    // The fast-path re-check above is best-effort (non-locking). Here we close
+    // the residual race: open the persistence transaction with a `FOR UPDATE`
+    // row lock on the execution — mirroring `pause_workflow_execution`'s own
+    // lock — so the two serialize. If the operator's pause committed first, we
+    // observe `PAUSED` under the lock and re-park the task *inside the same
+    // transaction*, discarding the pending decision without persisting any new
+    // commands (resume re-derives them deterministically on replay). Otherwise
+    // pause blocks until this decision commits, which is exactly the
+    // "already-dispatched work runs to completion" semantics. Schedule counters
+    // are deferred to after the transaction commits (a best-effort counter
+    // failure must never roll back the persisted decision).
+    let is_terminal_with_commands =
+        !pending_cmds.is_empty() && !matches!(&outcome, WorkflowOutcome::Suspended { .. });
+    let counter_action = schedule_counter_action(&outcome);
+    let execution_ref = &prepared.execution;
+    let exec_uuid = prepared.exec_id.as_uuid();
+
+    let persist_flow = conn
+        .transaction::<WorkflowPersistFlow, HarvestError, _>(|conn| {
+            async move {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                let locked_state: Option<String> = exec_dsl::harvest_workflow_executions
+                    .find(exec_uuid)
+                    .select(exec_dsl::state)
+                    .for_update()
+                    .first::<String>(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                if locked_state.as_deref() == Some("PAUSED") {
+                    let sticky = if sticky_timeout.is_zero() {
+                        None
+                    } else {
+                        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+                    };
+                    queue::park_workflow_task(conn, task.id, sticky).await?;
+                    return Ok(WorkflowPersistFlow::ParkedPaused);
+                }
+
+                if is_terminal_with_commands {
+                    persist_terminal_outcome_commands(
+                        conn,
+                        registry,
+                        execution_ref,
+                        persistence,
+                        outcome,
+                        &pending_cmds,
+                        &execute_span,
+                    )
+                    .await?;
+                } else {
+                    persist_workflow_outcome(
+                        conn,
+                        registry,
+                        execution_ref,
+                        persistence,
+                        outcome,
+                        &execute_span,
+                        false,
+                    )
+                    .await?;
+                }
+                Ok(WorkflowPersistFlow::Persisted)
+            }
+            .scope_boxed()
+        })
         .await;
-        fail_execution_on_error(conn, task, worker_id, result).await?;
-    } else {
-        persist_workflow_outcome(
-            conn,
-            registry,
-            &prepared.execution,
-            persistence,
-            outcome,
-            &execute_span,
-            true,
-        )
-        .await?;
+    // execute_span is moved into and dropped by the transaction closure above,
+    // closing the OTel span after all producer spans have been emitted as its
+    // children.
+
+    match persist_flow {
+        Ok(WorkflowPersistFlow::ParkedPaused) => return Ok(()),
+        Ok(WorkflowPersistFlow::Persisted) => {
+            // Deferred best-effort schedule counters, in autocommit post-commit.
+            run_deferred_schedule_counter(conn, registry, &prepared.execution, counter_action)
+                .await;
+        }
+        Err(error) => {
+            // Preserve per-path error handling: a terminal-with-commands persist
+            // failure durably fails the task + execution (matching the prior
+            // `fail_execution_on_error` wrapping); a suspended/simple-terminal
+            // persist failure propagates so the task is retried.
+            if is_terminal_with_commands {
+                return fail_execution_on_error(conn, task, worker_id, Err::<(), _>(error)).await;
+            }
+            return Err(error);
+        }
     }
-    // execute_span is dropped here, closing the OTel span after all producer
-    // spans have been emitted as its children.
 
     // Update the in-process LRU cache ONLY on successful persistence.
     // A Suspended outcome inserts the warm snapshot; terminal outcomes evict.
@@ -6045,6 +6177,56 @@ struct WorkerMonitoringHandles {
     dlq_depth_samplers: Vec<tokio::task::JoinHandle<()>>,
     timeout_checker: tokio::task::JoinHandle<()>,
     poison_pill_reclaimer: tokio::task::JoinHandle<()>,
+    pause_auto_resumer: tokio::task::JoinHandle<()>,
+}
+
+/// Spawn the bounded-pause auto-resume scanner (issue #383).
+///
+/// Periodically force-resumes executions paused longer than
+/// `max_workflow_pause_duration` so orphaned pauses cannot accumulate. Runs at
+/// the worker heartbeat cadence (background maintenance, off the hot path).
+fn spawn_pause_auto_resumer(
+    pool: DbPool,
+    cancel: CancellationToken,
+    interval: Duration,
+    max_pause_duration: Duration,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            match pool.get().await {
+                Ok(mut conn) => {
+                    match crate::execution::auto_resume_expired_pauses(
+                        &mut conn,
+                        max_pause_duration,
+                        &*telemetry.metrics,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            tracing::warn!(resumed = n, "auto-resumed over-long paused executions");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(error = %e, "pause auto-resume scan failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to acquire DB connection for pause auto-resume");
+                }
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
 }
 
 impl Worker {
@@ -6255,6 +6437,13 @@ impl Worker {
             worker_stale_secs,
             self.registry.telemetry().clone(),
         );
+        let pause_auto_resumer = spawn_pause_auto_resumer(
+            pool.clone(),
+            self.shutdown.clone(),
+            self.config.worker_heartbeat_interval,
+            self.config.max_workflow_pause_duration,
+            self.registry.telemetry().clone(),
+        );
 
         WorkerMonitoringHandles {
             queue_depth_sampler,
@@ -6263,6 +6452,7 @@ impl Worker {
             dlq_depth_samplers,
             timeout_checker,
             poison_pill_reclaimer,
+            pause_auto_resumer,
         }
     }
 
@@ -6368,6 +6558,13 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "poison-pill reclaimer task failed during shutdown"
+            );
+        }
+        if let Err(error) = monitors.pause_auto_resumer.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "pause auto-resume scanner failed during shutdown"
             );
         }
         if let Err(error) = monitors.queue_depth_sampler.await {
@@ -6768,6 +6965,7 @@ mod tests {
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             labels: std::collections::HashMap::new(),
             #[cfg(feature = "db")]
             sharded_pool: None,
@@ -6832,6 +7030,7 @@ mod tests {
             max_workflow_start_delay: Duration::from_secs(365 * 24 * 3600),
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             labels: std::collections::HashMap::new(),
             #[cfg(feature = "db")]
             sharded_pool: None,

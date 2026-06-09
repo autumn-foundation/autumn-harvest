@@ -198,6 +198,20 @@ pub const ATTR_SIGNAL_ID: &str = "harvest.signal.id";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 
+/// Counter: incremented each time a workflow execution is paused by an operator
+/// or the bounded-pause auto-resume scanner (issue #383).
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_PAUSED: &str = "harvest.workflow.paused";
+
+/// Histogram: wall-clock seconds an execution spent in the `PAUSED` state,
+/// recorded once on resume (issue #383).
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_PAUSE_DURATION: &str = "harvest.workflow.pause_duration";
+
 /// Counter: incremented each time a poison-pill task is quarantined to the
 /// dead-letter queue after crashing `poison_pill_threshold` workers in a row
 /// (issue #367).
@@ -879,6 +893,22 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.task.quarantined{queue, reason}`.
     fn record_task_quarantined(&self, queue: &str, reason: &str) {
         let _ = (queue, reason);
+    }
+
+    /// A workflow execution was paused by an operator or the auto-resume
+    /// scanner (issue #383).
+    ///
+    /// Maps to the counter `harvest.workflow.paused{workflow, queue}`.
+    fn record_workflow_paused(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A paused workflow execution was resumed; `duration_secs` is the
+    /// wall-clock time it spent in the `PAUSED` state (issue #383).
+    ///
+    /// Maps to the histogram `harvest.workflow.pause_duration{workflow, queue}`.
+    fn record_workflow_pause_duration(&self, workflow_name: &str, queue: &str, duration_secs: f64) {
+        let _ = (workflow_name, queue, duration_secs);
     }
 
     /// An activity's circuit breaker tripped open or re-opened after a failed

@@ -39,11 +39,11 @@ use autumn_harvest::audit::{
     OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL,
     OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_RESET, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER,
-    TARGET_WORKFLOW,
+    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
+    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, SOURCE_API,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT,
+    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -106,8 +106,8 @@ use autumn_harvest::workers::{
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, WorkflowHandleClient,
-    WorkflowResult, cancel_workflow_execution, signal_with_start_workflow_execution,
-    start_or_load_workflow_execution,
+    WorkflowResult, cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
+    signal_with_start_workflow_execution, start_or_load_workflow_execution,
 };
 
 use crate::preflight::{PreflightReport, build_preflight_report};
@@ -1124,6 +1124,25 @@ struct CancelWorkflowResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct PauseWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    state: String,
+    reason: Option<String>,
+    actor: String,
+    newly_paused: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ResumeWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    state: String,
+    actor: String,
+    pause_duration_secs: f64,
+}
+
+#[derive(Debug, Serialize)]
 struct ResetWorkflowResponse {
     new_exec_id: String,
     reset_from_exec_id: String,
@@ -1287,6 +1306,12 @@ struct DagTriggerRequest {
 
 #[derive(Debug, Deserialize)]
 struct CancelWorkflowRequest {
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PauseWorkflowRequest {
+    #[serde(default)]
     reason: Option<String>,
 }
 
@@ -1463,6 +1488,7 @@ const fn default_buffer_all_max() -> u32 {
 /// filters. Anything outside this list is rejected with `400 Bad Request`.
 pub(crate) const KNOWN_WORKFLOW_STATES: &[&str] = &[
     "RUNNING",
+    "PAUSED",
     "COMPLETED",
     "FAILED",
     "CANCELLED",
@@ -1931,6 +1957,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/workflows/{id}/cancel",
             post(cancel_workflow).route_layer(require_admin.clone()),
         )
+        .route(
+            "/workflows/{id}/pause",
+            post(pause_workflow).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/{id}/resume",
+            post(resume_workflow).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}/reset", post(reset_workflow))
         .route(
             "/workflows/{id}/signal/{signal_name}",
@@ -2207,6 +2241,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{id}/cancel"),
+        ("POST", "/workflows/{id}/pause"),
+        ("POST", "/workflows/{id}/resume"),
         ("POST", "/workflows/{id}/reset"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
         ("GET", "/workflows/{id}/queries"),
@@ -2353,6 +2389,8 @@ pub const fn management_api_request_fields()
         // ── batch workflow start (issue #357) ─────────────────────────────────
         ("POST", "/workflows/batch_start", Some(&["items", "atomic"])),
         ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
+        ("POST", "/workflows/{id}/pause", Some(&["reason"])),
+        ("POST", "/workflows/{id}/resume", Some(&[])),
         (
             "POST",
             "/workflows/{id}/reset",
@@ -2620,6 +2658,29 @@ pub const fn management_api_response_fields()
                 "reason",
                 "newly_cancelled",
                 "failed_task_count",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/pause",
+            Some(&[
+                "ok",
+                "execution_id",
+                "state",
+                "reason",
+                "actor",
+                "newly_paused",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/resume",
+            Some(&[
+                "ok",
+                "execution_id",
+                "state",
+                "actor",
+                "pause_duration_secs",
             ]),
         ),
         (
@@ -3751,7 +3812,10 @@ fn parse_history_datetime(value: &str) -> Result<chrono::DateTime<chrono::Utc>, 
 
 fn states_for_history_state_group(value: &str) -> Result<Vec<String>, AutumnError> {
     match value {
-        "active" => Ok(vec!["RUNNING".to_string()]),
+        // PAUSED is a non-terminal active state (issue #383): it must be
+        // enumerated everywhere active runs are, so the `active` group includes
+        // it alongside RUNNING rather than silently omitting paused executions.
+        "active" => Ok(vec!["RUNNING".to_string(), "PAUSED".to_string()]),
         "terminal" => Ok(terminal_workflow_states()),
         "all" => Ok(Vec::new()),
         other => Err(AutumnError::bad_request_msg(format!(
@@ -4099,6 +4163,7 @@ fn parse_workflow_child_status(raw: &str) -> Result<String, AutumnError> {
         .collect::<String>();
     let status = match normalized.as_str() {
         "running" => "RUNNING",
+        "paused" => "PAUSED",
         "failed" => "FAILED",
         "completed" => "COMPLETED",
         "cancelled" | "canceled" => "CANCELLED",
@@ -4107,7 +4172,7 @@ fn parse_workflow_child_status(raw: &str) -> Result<String, AutumnError> {
         "continuedasnew" => "CONTINUED_AS_NEW",
         _ => {
             return Err(AutumnError::bad_request_msg(format!(
-                "unknown workflow child status '{raw}'; expected one of Running, Failed, Completed, Cancelled, Terminated, TimedOut, ContinuedAsNew"
+                "unknown workflow child status '{raw}'; expected one of Running, Paused, Failed, Completed, Cancelled, Terminated, TimedOut, ContinuedAsNew"
             )));
         }
     };
@@ -4179,6 +4244,7 @@ fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> String {
 fn workflow_child_status_label(status: &str) -> String {
     match status {
         "RUNNING" => "Running",
+        "PAUSED" => "Paused",
         "FAILED" => "Failed",
         "COMPLETED" => "Completed",
         "CANCELLED" => "Cancelled",
@@ -6534,6 +6600,157 @@ async fn cancel_workflow(
                 }),
             ))
         }
+    }
+}
+
+/// Build a `409 Conflict` response from a state-conflict error (issue #383).
+fn conflict_from(error: HarvestError) -> AutumnError {
+    match error {
+        // Only a genuine state conflict (e.g. "already terminal" / "not paused"),
+        // surfaced by the core as `Config`, maps to 409. Everything else —
+        // NotFound (404), Database (500), etc. — flows through the normal mapper
+        // so a real persistence failure is not masked as a state conflict.
+        HarvestError::Config(msg) => {
+            AutumnError::bad_request_msg(msg).with_status(axum::http::StatusCode::CONFLICT)
+        }
+        other => map_error(other),
+    }
+}
+
+/// `POST /workflows/{id}/pause` — halt new command dispatch for an execution
+/// (issue #383). Returns 200 on success, 409 if the workflow is already
+/// terminal, 404 if not found, 400 if the reason exceeds the length cap.
+async fn pause_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    // The request body is optional (issue #383): pausing without a reason is the
+    // common case, so a no-body / no-content-type POST must still pause rather
+    // than be rejected by the required-`Json` extractor before reaching the
+    // defaulted `reason`.
+    request: Option<Json<PauseWorkflowRequest>>,
+) -> Result<(axum::http::StatusCode, Json<PauseWorkflowResponse>), AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/pause";
+    let request = request.map(|Json(body)| body).unwrap_or_default();
+
+    let exec_id = parse_execution_id(&id)?;
+    // Reject an over-long reason at the boundary (400) so the only conflicts the
+    // core can return below are genuine state conflicts (mapped to 409).
+    if let Some(reason) = request.reason.as_deref()
+        && reason.chars().count() > autumn_harvest::execution::MAX_PAUSE_REASON_LEN
+    {
+        return Err(AutumnError::bad_request_msg(format!(
+            "pause reason exceeds {} characters",
+            autumn_harvest::execution::MAX_PAUSE_REASON_LEN
+        )));
+    }
+
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry.telemetry().metrics),
+        );
+
+    let result = pause_workflow_execution(
+        &mut conn,
+        exec_id,
+        request.reason.as_deref(),
+        &actor,
+        metrics_ref.as_ref(),
+    )
+    .await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_WORKFLOW_PAUSE,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(paused) => Ok((
+            axum::http::StatusCode::OK,
+            Json(PauseWorkflowResponse {
+                ok: true,
+                execution_id: paused.exec_id.to_string(),
+                state: paused.state,
+                reason: paused.reason,
+                actor: paused.actor,
+                newly_paused: paused.newly_paused,
+            }),
+        )),
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
+/// `POST /workflows/{id}/resume` — re-arm a paused execution (issue #383).
+/// Returns 200 on success, 409 if the workflow is not in the `Paused` state,
+/// 404 if not found.
+async fn resume_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<(axum::http::StatusCode, Json<ResumeWorkflowResponse>), AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/resume";
+
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry.telemetry().metrics),
+        );
+
+    let result = resume_workflow_execution(&mut conn, exec_id, &actor, metrics_ref.as_ref()).await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_WORKFLOW_RESUME,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(resumed) => Ok((
+            axum::http::StatusCode::OK,
+            Json(ResumeWorkflowResponse {
+                ok: true,
+                execution_id: resumed.exec_id.to_string(),
+                state: resumed.state,
+                actor: resumed.actor,
+                pause_duration_secs: resumed.pause_duration_secs,
+            }),
+        )),
+        Err(e) => Err(conflict_from(e)),
     }
 }
 
@@ -9988,7 +10205,9 @@ async fn schedule_backfill(
     }))
 }
 
-/// Count RUNNING workflow executions or DAG runs for the named entity.
+/// Count active (RUNNING or PAUSED) workflow executions or DAG runs for the
+/// named entity. A PAUSED run still occupies an active slot for
+/// `max_active_runs`/overlap enforcement (issue #383), matching the scheduler.
 /// Returns the total count across all shards, or all shard failures that made
 /// the count unsafe to use for `max_active_runs` enforcement.
 async fn query_running_count(
@@ -10011,7 +10230,7 @@ async fn query_running_count(
         // DAGs are now unified as workflows (issue #256 step 5).
         let count_result = harvest_workflow_executions::table
             .filter(harvest_workflow_executions::workflow_name.eq(name))
-            .filter(harvest_workflow_executions::state.eq("RUNNING"))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
             .count()
             .get_result::<i64>(&mut conn)
             .await;
@@ -13010,6 +13229,12 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         } => AutumnError::bad_request_msg(message),
         HarvestError::UpdateRejected { reason } => {
             AutumnError::bad_request_msg(reason).with_status(axum::http::StatusCode::CONFLICT)
+        }
+        // An update (or other mutation) was submitted against a paused
+        // execution (issue #383): reject with 409 Conflict.
+        HarvestError::WorkflowPaused(exec_id) => {
+            AutumnError::bad_request_msg(format!("workflow paused: {exec_id}"))
+                .with_status(axum::http::StatusCode::CONFLICT)
         }
         HarvestError::PayloadTooLarge {
             kind,
@@ -16448,6 +16673,17 @@ mod tests {
             .expect("ContinuedAsNew is a valid workflow execution state");
 
         assert_eq!(filters.statuses, vec!["CONTINUED_AS_NEW".to_string()]);
+    }
+
+    #[test]
+    fn parse_workflow_children_filters_accepts_paused() {
+        // PAUSED is a non-terminal active state (issue #383): it must be a valid
+        // child-status filter so operators can narrow children to paused runs.
+        let filters = parse_workflow_children_filters(&pairs(&[("status", "Paused")]))
+            .expect("Paused is a valid workflow execution state");
+
+        assert_eq!(filters.statuses, vec!["PAUSED".to_string()]);
+        assert_eq!(workflow_child_status_label("PAUSED"), "Paused");
     }
 
     #[test]

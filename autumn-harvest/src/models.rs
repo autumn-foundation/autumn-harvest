@@ -104,6 +104,12 @@ pub struct WorkflowExecution {
     pub owner: Option<String>,
     pub runbook_url: Option<String>,
     pub severity: Option<String>,
+    /// Wall-clock instant the active pause was applied (issue #383). `None` = not paused.
+    pub paused_at: Option<DateTime<Utc>>,
+    /// Optional operator-supplied pause reason (issue #383).
+    pub pause_reason: Option<String>,
+    /// Identity that requested the active pause (issue #383).
+    pub pause_actor: Option<String>,
 }
 
 /// Insert struct for creating a new workflow execution.

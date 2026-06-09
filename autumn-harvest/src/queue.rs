@@ -350,6 +350,14 @@ pub async fn claim_task(
     //
     // The concurrency cap is never bypassed: a real call must always respect
     // `max_concurrent`.
+    //
+    // Pause gating (issue #383): workflow tasks whose execution is in the
+    // `PAUSED` state are never claimed. They stay PENDING (or parked) until the
+    // execution is resumed, at which point they become claimable again. This is
+    // the single executor-layer chokepoint that defers timer fires, signal
+    // deliveries, and activity-completion wakes uniformly while paused — no
+    // workflow-author cooperation required. In-flight activity tasks are not
+    // `task_type = 'workflow'` and so continue to run to completion.
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let result: Vec<TaskQueueItem> = diesel::sql_query(
@@ -392,6 +400,15 @@ pub async fn claim_task(
                        SELECT 1 FROM harvest_build_compat \
                        WHERE build_id = $3 \
                          AND compatible_with = harvest_task_queue.required_build_id \
+                   ) \
+               ) \
+               AND ( \
+                   task_type <> 'workflow' \
+                   OR workflow_exec_id IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM harvest_workflow_executions e \
+                       WHERE e.id = harvest_task_queue.workflow_exec_id \
+                         AND e.state = 'PAUSED' \
                    ) \
                ) \
                AND ( \
@@ -1259,7 +1276,40 @@ pub async fn wake_workflow_task(
         rows.into_iter().map(|r| r.queue_name).collect()
     };
 
+    // A workflow task may already be PENDING with an elapsed `scheduled_at` —
+    // e.g. a timer fired while the execution was PAUSED (issue #383), so the
+    // task was enqueued but never re-pended by the UPDATE above. Such a task is
+    // immediately claimable once the execution is RUNNING again, but no fresh
+    // NOTIFY was emitted for it, so a LISTEN-based worker would sleep until the
+    // next poll interval. Notify those queues too so resume re-arms promptly.
+    let already_due_queue_names: Vec<String> = {
+        use diesel::deserialize::QueryableByName;
+        use diesel::sql_types::Text;
+
+        #[derive(QueryableByName)]
+        struct QueueNameRow {
+            #[diesel(sql_type = Text)]
+            queue_name: String,
+        }
+
+        let rows: Vec<QueueNameRow> = diesel::sql_query(
+            "SELECT DISTINCT queue_name FROM harvest_task_queue \
+             WHERE workflow_exec_id = $1 \
+               AND task_type = 'workflow' \
+               AND state = 'PENDING' \
+               AND scheduled_at <= $2",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        rows.into_iter().map(|r| r.queue_name).collect()
+    };
+
     let mut queue_names = queue_names;
+    queue_names.extend(already_due_queue_names);
     queue_names.sort();
     queue_names.dedup();
 

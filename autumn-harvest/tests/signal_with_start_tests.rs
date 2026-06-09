@@ -62,7 +62,9 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
     include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
     include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
-    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql")
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
+    "\n",
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql")
 );
 
 async fn setup_test_db() -> (
@@ -252,6 +254,52 @@ async fn allow_duplicate_signals_running_execution_and_returns_existing_id() {
 
     let signals = load_pending_signals(&mut conn, first).await.unwrap();
     assert_eq!(signals.len(), 2, "seed + new signal both queued");
+}
+
+#[tokio::test]
+async fn allow_duplicate_attaches_to_paused_prior_and_buffers_signal() {
+    // Issue #383: PAUSED is a non-terminal active state. A signal-with-start
+    // against a paused run must attach and buffer the signal for delivery on
+    // resume — it must NOT escalate to TerminateIfRunning and cancel/replace the
+    // run an operator deliberately paused.
+    let (mut conn, _container) = setup_test_db().await;
+    let first = seed_running(&mut conn, "wf", "id-paused").await;
+    force_state(&mut conn, first, "PAUSED").await;
+
+    let p = params(
+        "wf",
+        "id-paused",
+        ExecutionId::new(),
+        "another",
+        serde_json::json!({"k": "v"}),
+        WorkflowIdReusePolicy::AllowDuplicate,
+    );
+    let out = signal_with_start_workflow_execution(&mut conn, p)
+        .await
+        .unwrap();
+
+    assert!(
+        !out.started_fresh,
+        "must attach to the paused run, not start fresh"
+    );
+    assert!(
+        out.signal_delivered,
+        "signal must be buffered on the paused run for resume"
+    );
+    assert_eq!(out.exec_id, first, "attaches to the existing paused exec");
+    assert_eq!(out.state, "PAUSED", "the prior run stays paused");
+
+    // The paused execution must be untouched (not sealed/cancelled/replaced).
+    let state: String = dsl::harvest_workflow_executions
+        .find(first.as_uuid())
+        .select(dsl::state)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(state, "PAUSED", "the paused execution must not be sealed");
+
+    let signals = load_pending_signals(&mut conn, first).await.unwrap();
+    assert_eq!(signals.len(), 2, "seed + buffered signal both queued");
 }
 
 #[tokio::test]

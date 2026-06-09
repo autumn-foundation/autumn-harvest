@@ -92,7 +92,9 @@ const HARVEST_INIT_SQL: &str = concat!(
     ),
     include_str!(
         "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
-    )
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql")
 );
 
 #[derive(Debug, QueryableByName)]

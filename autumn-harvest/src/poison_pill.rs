@@ -259,7 +259,12 @@ mod scanner {
         else {
             return Ok((None, Vec::new()));
         };
-        if state != "RUNNING" {
+        // PAUSED is a non-terminal active state (issue #383): an in-flight
+        // activity that was admitted before the pause can still be running, so a
+        // poison-pill quarantine of that activity must terminally fail the
+        // owning workflow rather than leave it parked in PAUSED forever with a
+        // dead task. Treat PAUSED like RUNNING here.
+        if state != "RUNNING" && state != "PAUSED" {
             return Ok((None, Vec::new()));
         }
 
@@ -276,13 +281,17 @@ mod scanner {
         diesel::update(
             exec_dsl::harvest_workflow_executions
                 .find(exec_id.as_uuid())
-                .filter(exec_dsl::state.eq("RUNNING")),
+                .filter(exec_dsl::state.eq_any(["RUNNING", "PAUSED"])),
         )
         .set((
             exec_dsl::state.eq("FAILED"),
             exec_dsl::output.eq(None::<serde_json::Value>),
             exec_dsl::error.eq(Some(error.to_string())),
             exec_dsl::completed_at.eq(Some(Utc::now())),
+            // Clear active-pause metadata when a paused owner is failed (#383).
+            exec_dsl::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            exec_dsl::pause_reason.eq(None::<String>),
+            exec_dsl::pause_actor.eq(None::<String>),
         ))
         .execute(conn)
         .await

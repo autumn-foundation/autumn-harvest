@@ -284,6 +284,14 @@ pub async fn admit_update_event(
                     crate::error::HarvestError::NotFound(format!("workflow execution {exec_id}"))
                 })?;
 
+            // Reject updates submitted while the execution is paused with a
+            // dedicated error (issue #383). Updates may admit-and-mutate workflow
+            // state, so they are rejected rather than silently queued behind the
+            // pause — surfacing operator intent as a 409 at the API layer.
+            if execution.state == "PAUSED" {
+                return Err(crate::error::HarvestError::WorkflowPaused(exec_id));
+            }
+
             // Reject the update if the execution is no longer running.
             if execution.state != "RUNNING" {
                 return Err(crate::error::HarvestError::UpdateRejected {

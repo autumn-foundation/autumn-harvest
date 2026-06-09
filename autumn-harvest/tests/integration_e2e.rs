@@ -113,7 +113,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
     include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
-    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql")
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
+    "\n",
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -163,6 +165,9 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS required_capabilities JSONB NULL;\n",
     "\n",
     "ALTER TABLE harvest_workers ADD COLUMN IF NOT EXISTS labels JSONB NOT NULL DEFAULT '{}';\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS pause_reason TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS pause_actor TEXT NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -698,6 +703,7 @@ fn build_runtime_worker(
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             registry,
@@ -1301,6 +1307,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             registry,
@@ -1415,6 +1422,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             registry,
@@ -1562,6 +1570,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             registry,
@@ -1770,6 +1779,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
@@ -2010,6 +2020,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
@@ -2158,6 +2169,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
@@ -4712,6 +4724,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             Arc::clone(&registry),
@@ -4824,6 +4837,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             Arc::clone(&registry),
@@ -4925,6 +4939,7 @@ async fn workflow_schedule_pause_and_resume() {
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
             Arc::clone(&registry),

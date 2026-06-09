@@ -42,6 +42,10 @@ pub const OP_WORKFLOW_SIGNAL_WITH_START: &str = "workflow.signal_with_start";
 pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
 /// Audit operation: Reset a workflow execution to a previous state.
 pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
+/// Audit operation: Paused an individual workflow execution (issue #383).
+pub const OP_WORKFLOW_PAUSE: &str = "workflow.pause";
+/// Audit operation: Resumed a paused workflow execution (issue #383).
+pub const OP_WORKFLOW_RESUME: &str = "workflow.resume";
 /// Audit operation: Manually triggered a DAG execution.
 pub const OP_DAG_TRIGGER: &str = "dag.trigger";
 /// Audit operation: Retried a DAG run from a failed node (issue #366).
@@ -269,6 +273,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         RouteClass::Mutating,
     ),
     ("POST /workflows/{id}/cancel", RouteClass::Mutating),
+    ("POST /workflows/{id}/pause", RouteClass::Mutating),
+    ("POST /workflows/{id}/resume", RouteClass::Mutating),
     ("POST /workflows/{id}/reset", RouteClass::Mutating),
     (
         "POST /workflows/{id}/signal/{signal_name}",
@@ -337,6 +343,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_SIGNAL,
     OP_WORKFLOW_SIGNAL_WITH_START,
     OP_WORKFLOW_CANCEL,
+    OP_WORKFLOW_PAUSE,
+    OP_WORKFLOW_RESUME,
     OP_WORKFLOW_RESET,
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
@@ -441,6 +449,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         Some(OP_WORKFLOW_SIGNAL_WITH_START),
     ),
     ("POST /workflows/{id}/cancel", Some(OP_WORKFLOW_CANCEL)),
+    ("POST /workflows/{id}/pause", Some(OP_WORKFLOW_PAUSE)),
+    ("POST /workflows/{id}/resume", Some(OP_WORKFLOW_RESUME)),
     ("POST /workflows/{id}/reset", Some(OP_WORKFLOW_RESET)),
     (
         "POST /workflows/{id}/signal/{signal_name}",
