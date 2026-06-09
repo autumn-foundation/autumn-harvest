@@ -200,7 +200,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             return quote! {
                 #input_fn
                 #compile_errors
-            }.into();
+            }
+            .into();
         }
     }
 

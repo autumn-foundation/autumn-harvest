@@ -1,6 +1,6 @@
+use proc_macro2::Span;
 use std::collections::HashMap;
 use syn::{Expr, visit::Visit};
-use proc_macro2::Span;
 
 #[derive(Debug, Clone)]
 pub struct RuleInfo {
@@ -62,50 +62,90 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
     fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
         if let Expr::Path(expr_path) = &*i.func {
             let path_str = path_to_string(&expr_path.path);
-            
+
             // HVG001: WallClock
-            if path_str == "chrono::Utc::now" || path_str == "Utc::now" ||
-               path_str == "std::time::Instant::now" || path_str == "Instant::now" ||
-               path_str == "std::time::SystemTime::now" || path_str == "SystemTime::now" {
-                self.add_finding("HVG001", expr_path.path.segments.last().unwrap().ident.span());
+            if path_str == "chrono::Utc::now"
+                || path_str == "Utc::now"
+                || path_str == "std::time::Instant::now"
+                || path_str == "Instant::now"
+                || path_str == "std::time::SystemTime::now"
+                || path_str == "SystemTime::now"
+            {
+                self.add_finding(
+                    "HVG001",
+                    expr_path.path.segments.last().unwrap().ident.span(),
+                );
             }
-            
+
             // HVG002: Randomness
-            if path_str == "rand::random" || path_str == "random" ||
-               path_str == "rand::thread_rng" || path_str == "thread_rng" ||
-               path_str == "Uuid::new_v4" || path_str == "uuid::Uuid::new_v4" {
-                self.add_finding("HVG002", expr_path.path.segments.last().unwrap().ident.span());
+            if path_str == "rand::random"
+                || path_str == "random"
+                || path_str == "rand::thread_rng"
+                || path_str == "thread_rng"
+                || path_str == "Uuid::new_v4"
+                || path_str == "uuid::Uuid::new_v4"
+            {
+                self.add_finding(
+                    "HVG002",
+                    expr_path.path.segments.last().unwrap().ident.span(),
+                );
             }
 
             // HVG003: ProcessEnv
-            if path_str == "std::env::var" || path_str == "env::var" ||
-               path_str == "std::env::args" || path_str == "env::args" {
-                self.add_finding("HVG003", expr_path.path.segments.last().unwrap().ident.span());
+            if path_str == "std::env::var"
+                || path_str == "env::var"
+                || path_str == "std::env::args"
+                || path_str == "env::args"
+            {
+                self.add_finding(
+                    "HVG003",
+                    expr_path.path.segments.last().unwrap().ident.span(),
+                );
             }
 
             // HVG004: SleepTimer
-            if path_str == "std::thread::sleep" || path_str == "thread::sleep" ||
-               path_str == "tokio::time::sleep" || path_str == "time::sleep" ||
-               path_str == "async_std::task::sleep" {
-                self.add_finding("HVG004", expr_path.path.segments.last().unwrap().ident.span());
+            if path_str == "std::thread::sleep"
+                || path_str == "thread::sleep"
+                || path_str == "tokio::time::sleep"
+                || path_str == "time::sleep"
+                || path_str == "async_std::task::sleep"
+            {
+                self.add_finding(
+                    "HVG004",
+                    expr_path.path.segments.last().unwrap().ident.span(),
+                );
             }
 
             // HVG005: BackgroundTask
-            if path_str == "tokio::spawn" ||
-               path_str == "std::thread::spawn" || path_str == "thread::spawn" ||
-               path_str == "async_std::task::spawn" ||
-               path_str == "rayon::spawn" {
-                self.add_finding("HVG005", expr_path.path.segments.last().unwrap().ident.span());
+            if path_str == "tokio::spawn"
+                || path_str == "std::thread::spawn"
+                || path_str == "thread::spawn"
+                || path_str == "async_std::task::spawn"
+                || path_str == "rayon::spawn"
+            {
+                self.add_finding(
+                    "HVG005",
+                    expr_path.path.segments.last().unwrap().ident.span(),
+                );
             }
 
             // HVG006: DirectIo
-            if path_str.starts_with("std::fs::") || path_str.starts_with("fs::") ||
-               path_str.starts_with("tokio::fs::") ||
-               path_str.starts_with("std::net::") || path_str.starts_with("tokio::net::") ||
-               path_str.starts_with("reqwest::") || path_str.starts_with("hyper::") ||
-               path_str.starts_with("diesel::") || path_str.starts_with("sqlx::") ||
-               path_str == "Command::new" || path_str == "std::process::Command::new" {
-                self.add_finding("HVG006", expr_path.path.segments.last().unwrap().ident.span());
+            if path_str.starts_with("std::fs::")
+                || path_str.starts_with("fs::")
+                || path_str.starts_with("tokio::fs::")
+                || path_str.starts_with("std::net::")
+                || path_str.starts_with("tokio::net::")
+                || path_str.starts_with("reqwest::")
+                || path_str.starts_with("hyper::")
+                || path_str.starts_with("diesel::")
+                || path_str.starts_with("sqlx::")
+                || path_str == "Command::new"
+                || path_str == "std::process::Command::new"
+            {
+                self.add_finding(
+                    "HVG006",
+                    expr_path.path.segments.last().unwrap().ident.span(),
+                );
             }
         }
 
@@ -133,9 +173,22 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
     fn visit_expr_macro(&mut self, i: &'ast syn::ExprMacro) {
         // HVG009: UnsafeLogging
         let path_str = path_to_string(&i.mac.path);
-        if path_str == "info" || path_str == "warn" || path_str == "error" || path_str == "debug" || path_str == "trace" ||
-           path_str == "tracing::info" || path_str == "tracing::warn" || path_str == "tracing::error" || path_str == "tracing::debug" || path_str == "tracing::trace" ||
-           path_str == "log::info" || path_str == "log::warn" || path_str == "log::error" || path_str == "log::debug" || path_str == "log::trace" {
+        if path_str == "info"
+            || path_str == "warn"
+            || path_str == "error"
+            || path_str == "debug"
+            || path_str == "trace"
+            || path_str == "tracing::info"
+            || path_str == "tracing::warn"
+            || path_str == "tracing::error"
+            || path_str == "tracing::debug"
+            || path_str == "tracing::trace"
+            || path_str == "log::info"
+            || path_str == "log::warn"
+            || path_str == "log::error"
+            || path_str == "log::debug"
+            || path_str == "log::trace"
+        {
             self.add_finding("HVG009", i.mac.path.segments.last().unwrap().ident.span());
         }
 
