@@ -1543,6 +1543,8 @@ pub struct WorkerConfig {
     /// This prevents orphaned-pause backlogs when an operator pauses a workflow
     /// during an incident and never resumes it. Defaults to **24 hours**.
     pub max_workflow_pause_duration: Duration,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: std::collections::HashMap<String, String>,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
@@ -1570,6 +1572,7 @@ impl Default for WorkerConfig {
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
             max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
+            labels: std::collections::HashMap::new(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -1776,6 +1779,20 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_sticky_routing(mut self, config: StickyRoutingConfig) -> Self {
         self.sticky_timeout = config.lease_ttl;
+        self
+    }
+
+    /// Attach a key-value capability label (issue #382).
+    #[must_use]
+    pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.labels.insert(key.into(), value.into());
+        self
+    }
+
+    /// Attach a map or list of key-value capability labels (issue #382).
+    #[must_use]
+    pub fn with_labels(mut self, labels: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.labels.extend(labels);
         self
     }
 
@@ -2064,6 +2081,7 @@ mod tests {
                 rate_limit_burst: None,
                 rate_limit_key: None,
                 circuit_breaker: None,
+                requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .state(String::from("haunted"))
@@ -2110,6 +2128,7 @@ mod tests {
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -2133,6 +2152,7 @@ mod tests {
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -2427,6 +2447,7 @@ mod tests {
                 rate_limit_burst: None,
                 rate_limit_key: None,
                 circuit_breaker: None,
+                requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .try_build();
@@ -2591,6 +2612,7 @@ mod tests {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         let act2 = ActivityInfo {
@@ -2611,6 +2633,7 @@ mod tests {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
 
@@ -2646,6 +2669,7 @@ mod tests {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
 

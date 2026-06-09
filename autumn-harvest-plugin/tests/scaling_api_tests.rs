@@ -156,6 +156,7 @@ async fn register_active_worker(pool: &DbPool, worker_id: &str, queues: &[&str],
         Some(env!("CARGO_PKG_VERSION")),
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .expect("worker registration should succeed");

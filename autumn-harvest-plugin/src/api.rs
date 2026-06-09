@@ -14330,6 +14330,49 @@ async fn list_workers_handler(
         results.append(&mut rows);
     }
 
+    let capable_of = pairs
+        .iter()
+        .find(|(k, _)| k == "capable_of")
+        .map(|(_, v)| v.clone());
+
+    if let Some(ref act_name) = capable_of {
+        if let Ok(runtime) = api_state.runtime() {
+            if let Some(activity) = runtime.registry().activities.get(act_name) {
+                let target_queue = filters
+                    .queue
+                    .as_deref()
+                    .unwrap_or_else(|| activity.default_queue.unwrap_or("default"));
+                let parsed_reqs = activity.requires.and_then(|req_str| {
+                    autumn_harvest::eligibility::parse_requirements(req_str).ok()
+                });
+
+                results.retain(|w| {
+                    let is_subscribed =
+                        w.worker.queues.as_array().is_some_and(|arr| {
+                            arr.iter().any(|v| v.as_str() == Some(target_queue))
+                        });
+                    if !is_subscribed {
+                        return false;
+                    }
+
+                    if activity.requires.is_some() && parsed_reqs.is_none() {
+                        return false;
+                    }
+
+                    parsed_reqs.as_ref().is_none_or(|reqs| {
+                        let worker_labels: std::collections::HashMap<String, String> =
+                            serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                        autumn_harvest::eligibility::matches_requirements(reqs, &worker_labels)
+                    })
+                });
+            } else {
+                results.clear();
+            }
+        } else {
+            results.clear();
+        }
+    }
+
     // Sort by worker_id for deterministic output across shards, then apply the
     // real limit globally.
     results.sort_by(|a, b| a.worker.worker_id.cmp(&b.worker.worker_id));
@@ -15945,6 +15988,8 @@ async fn evaluate_eligibility_for_shard(
     let mut eligible_workers = Vec::new();
     let mut ineligible_workers = Vec::new();
 
+    let registry = api_state.runtime().map(|r| r.registry().clone()).ok();
+
     let pending_tasks: Vec<_> = tasks
         .iter()
         .filter(|t| {
@@ -16055,6 +16100,60 @@ async fn evaluate_eligibility_for_shard(
                         .is_some_and(|act_name| cb_activities.contains(act_name));
                     if !has_cb && saturated_rate_limits.contains(rlk) {
                         reasons.push("rate_limit_saturated".to_string());
+                    }
+                }
+
+                let parsed_reqs = if t.task_type == "activity" {
+                    t.required_capabilities.as_ref().map_or_else(
+                        || {
+                            if let Some(ref act_name) = t.activity_name
+                                && let Some(ref reg) = registry
+                                && let Some(activity) = reg.activities.get(act_name)
+                                && let Some(req_str) = activity.requires
+                            {
+                                autumn_harvest::eligibility::parse_requirements(req_str).ok()
+                            } else {
+                                None
+                            }
+                        },
+                        |req_val| {
+                            serde_json::from_value::<Vec<autumn_harvest::eligibility::Requirement>>(
+                                req_val.clone(),
+                            )
+                            .ok()
+                        },
+                    )
+                } else {
+                    None
+                };
+
+                if let Some(reqs) = parsed_reqs {
+                    let worker_labels: std::collections::HashMap<String, String> =
+                        serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                    for req in &reqs {
+                        let satisfied = match req {
+                            autumn_harvest::eligibility::Requirement::Exact { key, value } => {
+                                worker_labels.get(key) == Some(value)
+                            }
+                            autumn_harvest::eligibility::Requirement::In { key, values } => {
+                                worker_labels
+                                    .get(key)
+                                    .is_some_and(|val| values.contains(val))
+                            }
+                        };
+                        if !satisfied {
+                            match req {
+                                autumn_harvest::eligibility::Requirement::Exact { key, value } => {
+                                    reasons.push(format!("unsatisfied_requirement:{key}={value}"));
+                                }
+                                autumn_harvest::eligibility::Requirement::In { key, values } => {
+                                    reasons.push(format!(
+                                        "unsatisfied_requirement:{key} in [{}]",
+                                        values.join(", ")
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
 

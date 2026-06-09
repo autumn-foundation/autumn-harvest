@@ -70,8 +70,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
     include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
     include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
     "\n",
-    include_str!("../migrations/20260607000000_harvest_workflow_pause/up.sql")
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql")
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -264,6 +266,7 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: heartbeat_activity,
         }],
         Arc::new(state),
@@ -497,6 +500,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -655,6 +659,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: uncooperative_activity,
         }],
         Arc::new(state),
@@ -693,6 +698,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -835,6 +841,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -972,6 +979,7 @@ async fn activity_without_cancellation_check_completes_normally() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },

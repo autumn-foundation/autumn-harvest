@@ -112,8 +112,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
     "\n",
     include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
     "\n",
-    include_str!("../migrations/20260607000000_harvest_workflow_pause/up.sql")
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -160,6 +162,9 @@ const LEGACY_INIT_SQL: &str = concat!(
     "\n",
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS schedule_to_close_at TIMESTAMPTZ NULL;\n",
     "\n",
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS required_capabilities JSONB NULL;\n",
+    "\n",
+    "ALTER TABLE harvest_workers ADD COLUMN IF NOT EXISTS labels JSONB NOT NULL DEFAULT '{}';\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS pause_reason TEXT NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS pause_actor TEXT NULL;\n",
@@ -697,6 +702,7 @@ fn build_runtime_worker(
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -1151,7 +1157,7 @@ async fn full_workflow_lifecycle() {
 
     // 4. Claim the task
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "worker-e2e-1", "", None, &[])
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-e2e-1", "", None, &[], &[])
         .await
         .expect("claim_task failed");
     let claimed = claimed.expect("no task claimed");
@@ -1225,7 +1231,7 @@ async fn claim_task_returns_none_on_empty_queue() {
     let (mut conn, _container) = setup_test_db().await;
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1", "", None, &[])
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1", "", None, &[], &[])
         .await
         .expect("claim_task failed");
     assert!(
@@ -1300,6 +1306,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -1414,6 +1421,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -1536,6 +1544,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: send_email_activity,
         }],
     ));
@@ -1560,6 +1569,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -1682,6 +1692,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: checkpointed_import_activity,
         }],
         heartbeat_resume_state(Arc::clone(&stats)),
@@ -1767,6 +1778,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -1790,6 +1802,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     is_local: false,
                     max_input_bytes: None,
                     max_result_bytes: None,
+                    requires: None,
                     handler: send_email_activity,
                 }],
             )),
@@ -1886,11 +1899,18 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .expect("enqueue parked workflow task failed");
 
     let default_queues = vec!["default".to_string()];
-    let claimed_workflow =
-        queue::claim_task(&mut conn, &default_queues, "parked-worker", "", None, &[])
-            .await
-            .expect("claim parked workflow task failed")
-            .expect("workflow task should be claimable");
+    let claimed_workflow = queue::claim_task(
+        &mut conn,
+        &default_queues,
+        "parked-worker",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim parked workflow task failed")
+    .expect("workflow task should be claimable");
     assert_eq!(claimed_workflow.id, workflow_task_id);
     assert_eq!(claimed_workflow.state, "RUNNING");
     queue::park_workflow_task(&mut conn, workflow_task_id, None)
@@ -1999,6 +2019,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -2037,6 +2058,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     is_local: false,
                     max_input_bytes: None,
                     max_result_bytes: None,
+                    requires: None,
                     handler: slow_activity,
                 }],
             )),
@@ -2146,6 +2168,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -2606,6 +2629,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: stateful_activity,
         }])
         .state(String::from("haunted"))
@@ -2744,7 +2768,7 @@ async fn wake_workflow_task_emits_notification() {
         .expect("enqueue should succeed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "wake-test-worker", "", None, &[])
+    let claimed = queue::claim_task(&mut conn, &queues, "wake-test-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
@@ -2784,13 +2808,13 @@ async fn wake_workflow_task_does_not_requeue_active_running_task() {
         serde_json::json!({"wake": false}),
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(10);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "active-worker", "", None, &[])
+    let claimed = queue::claim_task(&mut conn, &queues, "active-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
@@ -2830,7 +2854,7 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker", "", None, &[])
+    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("activity task should be claimable");
@@ -3228,6 +3252,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: send_email_activity,
         }],
     ));
@@ -3371,7 +3396,7 @@ async fn claim_task_prefers_sticky_worker_within_window() {
         .expect("enqueue pinned task failed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker", "", None, &[])
+    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("sticky worker should get its pinned task");
@@ -3380,7 +3405,7 @@ async fn claim_task_prefers_sticky_worker_within_window() {
         "sticky worker should claim its pinned task ahead of the higher-priority free task",
     );
 
-    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker", "", None, &[])
+    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker", "", None, &[], &[])
         .await
         .expect("second claim should succeed")
         .expect("other worker should pick up the free task");
@@ -3405,7 +3430,7 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
 
     let queues = vec!["default".to_string()];
     // Different worker must not steal a fresh sticky pin.
-    let claimed = queue::claim_task(&mut conn, &queues, "interloper", "", None, &[])
+    let claimed = queue::claim_task(&mut conn, &queues, "interloper", "", None, &[], &[])
         .await
         .expect("claim should succeed");
     assert!(
@@ -3414,7 +3439,7 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
     );
 
     // The owner can still claim it.
-    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker", "", None, &[])
+    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker", "", None, &[], &[])
         .await
         .expect("owner claim should succeed")
         .expect("owner should be able to claim its pinned task");
@@ -3443,7 +3468,7 @@ async fn claim_task_falls_back_to_any_worker_after_sticky_expires() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "", None, &[])
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("any worker may claim after sticky_until expires");
@@ -3486,7 +3511,7 @@ async fn claim_task_treats_expired_sticky_rows_like_unpinned_rows() {
         .expect("enqueue free task failed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "", None, &[])
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("one of the eligible tasks should be claimed");
@@ -3508,7 +3533,7 @@ async fn park_workflow_task_with_sticky_hint_pins_to_worker() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker", "", None, &[])
+    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("row should be claimable");
@@ -3551,9 +3576,17 @@ async fn wake_workflow_task_refreshes_sticky_until() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker", "", None, &[])
-        .await
-        .expect("claim should succeed");
+    let _claimed = queue::claim_task(
+        &mut conn,
+        &queues,
+        "wake-refresh-worker",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim should succeed");
     // Use a 5s window so both the park's sticky_until and the wake's refreshed
     // sticky_until land comfortably in the future even under DB/host clock skew
     // on CI runners. The test asserts the value was REFRESHED by comparing
@@ -4355,17 +4388,17 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
             .expect("enqueue failed");
     }
 
-    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[])
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[], &[])
         .await
         .expect("claim 1 query failed");
-    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[])
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[], &[])
         .await
         .expect("claim 2 query failed");
     assert!(t1.is_some(), "first claim should succeed");
     assert!(t2.is_some(), "second claim should succeed");
 
     // Cap is now saturated — third claim must be deferred.
-    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[])
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[], &[])
         .await
         .expect("claim 3 query failed");
     assert!(
@@ -4379,7 +4412,7 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
         .expect("complete_task failed");
 
     // Now a slot is free; one more task should be claimable.
-    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[])
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[], &[])
         .await
         .expect("claim after complete query failed");
     assert!(
@@ -4431,7 +4464,7 @@ async fn concurrency_cap_shared_key_budget_is_not_doubled() {
     // Attempt to claim all 6; the shared budget of 3 should cap the total.
     let mut claimed = 0usize;
     for _ in 0..6 {
-        if queue::claim_task(&mut conn, &queues, "worker-sk-1", "", None, &[])
+        if queue::claim_task(&mut conn, &queues, "worker-sk-1", "", None, &[], &[])
             .await
             .expect("claim query failed")
             .is_some()
@@ -4466,17 +4499,17 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
     }
 
     // Claim 2 (saturating the cap).
-    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[])
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[], &[])
         .await
         .expect("claim 1 query failed")
         .expect("first task should be claimable");
-    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[])
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[], &[])
         .await
         .expect("claim 2 query failed")
         .expect("second task should be claimable");
 
     // Cap is now saturated.
-    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[])
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[], &[])
         .await
         .expect("claim 3 query failed");
     assert!(t3.is_none(), "cap must be saturated after 2 claims");
@@ -4490,10 +4523,10 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
         .expect("fail t2 failed");
 
     // The queue must not be wedged; the remaining pending tasks must be claimable.
-    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[])
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[], &[])
         .await
         .expect("claim after fail query failed");
-    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[])
+    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[], &[])
         .await
         .expect("claim 5 query failed");
     assert!(
@@ -4519,20 +4552,20 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
         let mut params =
             EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("capped_activity".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(2);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(120);
         params.concurrency_key = Some("saturated_key".to_string());
         params.max_concurrent = Some(2);
         queue::enqueue(&mut conn, &params)
             .await
             .expect("enqueue capped task failed");
         // Immediately claim each to put it in RUNNING state.
-        queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[])
+        queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[], &[])
             .await
             .expect("claim capped task failed");
     }
 
     // Verify the key is saturated (third claim returns None).
-    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[])
+    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[], &[])
         .await
         .expect("saturation check query failed");
     assert!(
@@ -4545,7 +4578,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
         let mut params =
             EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("uncapped_activity".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(60);
         // concurrency_key left as None (default) — backward-compat path.
         queue::enqueue(&mut conn, &params)
             .await
@@ -4556,7 +4589,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
     // is at its cap — the NULL check-path must not be constrained by other keys.
     let mut claimed = 0usize;
     for _ in 0..3 {
-        if queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[])
+        if queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[], &[])
             .await
             .expect("uncapped claim query failed")
             .is_some()
@@ -4690,6 +4723,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -4802,6 +4836,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -4903,6 +4938,7 @@ async fn workflow_schedule_pause_and_resume() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 sharded_pool: None,
             },
@@ -5422,6 +5458,7 @@ async fn drain_accepted_sets_status_to_draining() {
         None,
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -5470,6 +5507,7 @@ async fn drain_already_draining_on_second_call() {
         None,
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -5528,6 +5566,7 @@ async fn drain_already_stopped_after_transition() {
         None,
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -5581,6 +5620,7 @@ async fn drain_with_explicit_deadline_is_stored() {
         None,
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -5620,6 +5660,7 @@ async fn drain_preview_returns_active_workers() {
             None,
             "",
             None,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -5758,6 +5799,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: always_non_retryable_activity,
         }],
     ));
@@ -5907,6 +5949,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: always_retryable_failure_activity,
         }],
     ));
@@ -6025,6 +6068,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: always_legacy_string_failure_activity,
         }],
     ));
@@ -6707,7 +6751,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
     // Enqueue a RUNNING workflow task (simulating the worker parked the task).
     let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(10);
     let task_id = queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue workflow task failed");
@@ -6719,6 +6763,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         "test-worker-timeout",
         "",
         None,
+        &[],
         &[],
     )
     .await
@@ -6850,6 +6895,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
             "",
             None,
             &[],
+            &[],
         )
         .await
         .expect("claim query failed");
@@ -6884,6 +6930,7 @@ async fn per_key_concurrency_cap_enforced_across_fleet() {
                 "test-worker-concurrency-a",
                 "",
                 None,
+                &[],
                 &[],
             )
             .await
@@ -6961,7 +7008,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
     }
 
     // Saturate the loud key: claim 1 loud task (cap=1 → saturated).
-    let loud_task = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[])
+    let loud_task = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[], &[])
         .await
         .expect("claim 1 query failed")
         .expect("first loud task should be claimable");
@@ -6978,9 +7025,10 @@ async fn per_key_concurrency_does_not_block_other_keys() {
     let mut quiet_claimed = 0u32;
     let mut attempts = 0u32;
     while quiet_claimed < 2 && attempts < 10 {
-        if let Some(task) = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[])
-            .await
-            .expect("claim query failed")
+        if let Some(task) =
+            queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[], &[])
+                .await
+                .expect("claim query failed")
         {
             assert_eq!(
                 task.concurrency_key.as_deref(),
@@ -7010,7 +7058,7 @@ async fn per_key_concurrency_does_not_block_other_keys() {
         .await
         .expect("complete loud task failed");
 
-    let next_loud = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[])
+    let next_loud = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[], &[])
         .await
         .expect("claim after complete query failed");
     assert!(
@@ -7153,6 +7201,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             is_local: false,
             max_input_bytes: None,
             max_result_bytes: None,
+            requires: None,
             handler: retry_context_activity,
         }],
         shared_state,
@@ -7192,4 +7241,95 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
         Some("fail_attempt_2"),
         "third invocation previous_failure must be the attempt-2 error"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to test DB");
+
+    // 1. Enqueue a capability-gated activity task (requires gpu=true)
+    let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!({}));
+    params.activity_name = Some("gpu_activity".to_string());
+
+    // Set required_capabilities to [{"Exact": {"key": "gpu", "value": "true"}}]
+    let requirements = vec![autumn_harvest::eligibility::Requirement::Exact {
+        key: "gpu".to_string(),
+        value: "true".to_string(),
+    }];
+    params.required_capabilities = Some(serde_json::to_value(&requirements).unwrap());
+
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue capability gated task");
+
+    // 2. Call claim_task representing an old worker (without gpu=true label registered in DB)
+    // Register worker-old first in the DB (without gpu label)
+    autumn_harvest::workers::register_worker(
+        &mut conn,
+        "worker-old",
+        &["default".to_string()],
+        &[0],
+        4,
+        "localhost",
+        None,
+        "v1",
+        None,
+        &std::collections::HashMap::new(),
+    )
+    .await
+    .unwrap();
+
+    // Try to claim task using worker-old. It should return None because the database filters it out.
+    let claimed_by_old = queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "worker-old",
+        "v1",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim_task for worker-old");
+    assert!(
+        claimed_by_old.is_none(),
+        "Old worker should not be able to claim capability-gated task"
+    );
+
+    // 3. Call claim_task representing a new capable worker
+    // Register worker-new with gpu=true label
+    let mut new_labels = std::collections::HashMap::new();
+    new_labels.insert("gpu".to_string(), "true".to_string());
+    autumn_harvest::workers::register_worker(
+        &mut conn,
+        "worker-new",
+        &["default".to_string()],
+        &[0],
+        4,
+        "localhost",
+        None,
+        "v1",
+        None,
+        &new_labels,
+    )
+    .await
+    .unwrap();
+
+    // Try to claim task using worker-new. It should succeed!
+    let claimed_by_new = queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "worker-new",
+        "v1",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim_task for worker-new");
+    let claimed_item = claimed_by_new.expect("New worker should successfully claim task");
+    assert_eq!(claimed_item.id, task_id);
 }

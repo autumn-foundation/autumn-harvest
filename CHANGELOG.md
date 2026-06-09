@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paused wall-clock is not charged against `execution_timeout`. Cancellation beats
   pause; updates submitted while paused are rejected (409), queries still serve.
   Metrics `harvest.workflow.paused` and `harvest.workflow.pause_duration`.
-  Migration `20260607000000_harvest_workflow_pause`.
+  Migration `20260607000002_harvest_workflow_pause`.
 - **DLQ root-cause aggregation** (issue #385). New read-only management route
   `GET /api/harvest/dead-letters/aggregate` (admin auth, parity with the DLQ
   list endpoint; placed under the existing `/dead-letters` family) answers an operator's first incident question — *"what is the shape

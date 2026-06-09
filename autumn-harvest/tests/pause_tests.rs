@@ -74,7 +74,7 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
     "\n",
-    include_str!("../migrations/20260607000000_harvest_workflow_pause/up.sql"),
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql"),
 );
 
 async fn setup() -> (String, ContainerAsync<Postgres>) {
@@ -143,6 +143,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+            labels: std::collections::HashMap::new(),
             sharded_pool: None,
         },
         registry,
@@ -559,6 +560,7 @@ async fn paused_workflow_task_is_not_claimed() {
         "",
         None,
         no_breakers,
+        no_breakers,
     )
     .await
     .expect("claim query should succeed");
@@ -578,6 +580,7 @@ async fn paused_workflow_task_is_not_claimed() {
         "w1",
         "",
         None,
+        no_breakers,
         no_breakers,
     )
     .await

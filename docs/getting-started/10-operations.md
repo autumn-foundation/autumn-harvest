@@ -1,6 +1,6 @@
-# Chapter 9 — Operating the service
+# Chapter 10 — Operating the service
 
-[← DAGs and schedules](08-dags-and-schedules.md) · [Index](README.md) · [Next: Testing your workflow code →](10-testing.md)
+[← Worker routing and capabilities](09-worker-routing.md) · [Index](README.md) · [Next: Testing your workflow code →](11-testing.md)
 
 ---
 
@@ -108,4 +108,4 @@ start. When you need stricter semantics, pass `reuse_policy`:
 
 ---
 
-[← DAGs and schedules](08-dags-and-schedules.md) · [Index](README.md) · [Next: Testing your workflow code →](10-testing.md)
+[← Worker routing and capabilities](09-worker-routing.md) · [Index](README.md) · [Next: Testing your workflow code →](11-testing.md)

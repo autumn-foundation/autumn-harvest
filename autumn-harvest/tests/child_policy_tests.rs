@@ -79,8 +79,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
     include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
     include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
     "\n",
-    include_str!("../migrations/20260607000000_harvest_workflow_pause/up.sql")
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql")
 );
 
 async fn setup_test_db_url() -> (String, ContainerAsync<Postgres>) {
@@ -133,6 +135,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             poison_pill_threshold: 3,
             max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
             #[cfg(feature = "db")]
+            labels: std::collections::HashMap::new(),
             sharded_pool: None,
         },
         registry,
@@ -299,6 +302,7 @@ fn local_activity_info(
         rate_limit_burst: None,
         rate_limit_key: None,
         circuit_breaker: None,
+        requires: None,
         handler,
     }
 }

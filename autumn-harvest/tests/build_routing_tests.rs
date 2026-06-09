@@ -312,8 +312,10 @@ mod db_tests {
         include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
         include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
         include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+        include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+        include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
         "\n",
-        include_str!("../migrations/20260607000000_harvest_workflow_pause/up.sql")
+        include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql")
     );
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -345,6 +347,7 @@ mod db_tests {
             Some("0.3.0"),
             "v1.0",
             Some("prod-blue"),
+            &std::collections::HashMap::new(),
         )
         .await
         .expect("register_worker");
@@ -374,6 +377,7 @@ mod db_tests {
             None,
             "v1.0",
             None,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -387,6 +391,7 @@ mod db_tests {
             None,
             "v2.0",
             None,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -502,6 +507,7 @@ mod db_tests {
             "v1.0",
             None,
             &[],
+            &[],
         )
         .await
         .expect("claim_task");
@@ -522,6 +528,7 @@ mod db_tests {
             "worker-b",
             "v2.0",
             None,
+            &[],
             &[],
         )
         .await
@@ -548,6 +555,7 @@ mod db_tests {
             "v2.0",
             None,
             &[],
+            &[],
         )
         .await
         .expect("claim_task");
@@ -572,6 +580,7 @@ mod db_tests {
             "v99.0",
             None,
             &[],
+            &[],
         )
         .await
         .expect("claim_task");
@@ -595,6 +604,7 @@ mod db_tests {
             "worker-legacy",
             "",
             None,
+            &[],
             &[],
         )
         .await
@@ -628,6 +638,7 @@ mod db_tests {
             None,
             "v1.0",
             None,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -641,6 +652,7 @@ mod db_tests {
             None,
             "v2.0",
             None,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();

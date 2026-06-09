@@ -120,6 +120,8 @@ pub struct WorkerRuntimeConfig {
     /// Bounded-pause ceiling before the auto-resume scanner force-resumes a
     /// paused execution (issue #383). Default 24 hours.
     pub max_workflow_pause_duration: Duration,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: std::collections::HashMap<String, String>,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
@@ -169,6 +171,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             unknown_target_grace_window: cfg.unknown_target_grace_window,
             poison_pill_threshold: cfg.poison_pill_threshold,
             max_workflow_pause_duration: cfg.max_workflow_pause_duration,
+            labels: cfg.labels,
             #[cfg(feature = "db")]
             sharded_pool: cfg.sharded_pool,
         }
@@ -2273,6 +2276,16 @@ async fn persist_scheduled_activities(
         // workflows' activities are also claimed ahead of lower-priority work
         // on the same queue (issue #249).
         params.priority = parent_priority;
+
+        if let Some(requires) = activity.requires {
+            let reqs = crate::eligibility::parse_requirements(requires).map_err(|err| {
+                HarvestError::Config(format!(
+                    "Invalid requirements for activity {}: {}",
+                    activity.name, err
+                ))
+            })?;
+            params.required_capabilities = Some(serde_json::to_value(&reqs)?);
+        }
 
         let effective_retry = scheduled
             .retry_policy_override
@@ -6135,6 +6148,8 @@ pub struct Worker {
     pub config: WorkerRuntimeConfig,
     /// Shared handler registry.
     pub registry: Arc<HandlerRegistry>,
+    /// Set of activities that this worker cannot run because of unsatisfied requirements (issue #382).
+    pub ineligible_activities: Vec<String>,
     /// Bounds concurrent workflow task executions.
     workflow_semaphore: Arc<Semaphore>,
     /// Bounds concurrent activity task executions.
@@ -6223,6 +6238,21 @@ impl Worker {
     pub fn new(config: WorkerRuntimeConfig, registry: Arc<HandlerRegistry>) -> HarvestResult<Self> {
         config.validate()?;
 
+        let mut ineligible_activities = Vec::new();
+        for activity in registry.activities.values() {
+            if let Some(requires) = activity.requires {
+                let reqs = crate::eligibility::parse_requirements(requires).map_err(|err| {
+                    HarvestError::Config(format!(
+                        "Invalid requirements for activity {}: {}",
+                        activity.name, err
+                    ))
+                })?;
+                if !crate::eligibility::matches_requirements(&reqs, &config.labels) {
+                    ineligible_activities.push(activity.name.to_string());
+                }
+            }
+        }
+
         let workflow_semaphore = Arc::new(Semaphore::new(config.max_concurrent_workflows));
         let activity_semaphore = Arc::new(Semaphore::new(config.max_concurrent_activities));
         let workflow_cache = Arc::new(tokio::sync::Mutex::new(crate::cache::WorkflowCache::new(
@@ -6232,6 +6262,7 @@ impl Worker {
         Ok(Self {
             config,
             registry,
+            ineligible_activities,
             workflow_semaphore,
             activity_semaphore,
             shutdown: CancellationToken::new(),
@@ -6454,6 +6485,7 @@ impl Worker {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 build_id: self.config.build_id.clone(),
                 deployment_name: self.config.deployment_name.clone(),
+                labels: self.config.labels.clone(),
             },
             Arc::clone(&self.workflow_semaphore),
             self.config.max_concurrent_workflows,
@@ -6594,6 +6626,7 @@ impl Worker {
                     Some(version),
                     &self.config.build_id,
                     self.config.deployment_name.as_deref(),
+                    &self.config.labels,
                 )
                 .await
                 {
@@ -6718,6 +6751,7 @@ impl Worker {
             &self.config.build_id,
             self.config.priority_aging_secs,
             circuit_breaker_activities,
+            &self.ineligible_activities,
         )
         .await
         {
@@ -6932,6 +6966,7 @@ mod tests {
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+            labels: std::collections::HashMap::new(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -6996,6 +7031,7 @@ mod tests {
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+            labels: std::collections::HashMap::new(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         };
@@ -7059,6 +7095,7 @@ mod tests {
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
 
@@ -7264,5 +7301,86 @@ mod tests {
                 .to_string()
                 .contains("exceeds chrono::Duration bounds")
         );
+    }
+
+    #[test]
+    fn test_worker_ineligible_activities() {
+        let act1 = ActivityInfo {
+            name: "act_gpu",
+            module: "app::activities",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            requires: Some("gpu = true"),
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+
+        let act2 = ActivityInfo {
+            name: "act_cpu",
+            module: "app::activities",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            requires: Some("region in [us-east-1, us-west-2]"),
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![act1, act2]));
+
+        // Worker with gpu = true, region = us-east-1
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("gpu".to_string(), "true".to_string());
+        labels.insert("region".to_string(), "us-east-1".to_string());
+        let cfg = WorkerRuntimeConfig {
+            labels,
+            ..default_runtime_config()
+        };
+        let worker = Worker::new(cfg, registry.clone()).unwrap();
+        assert!(worker.ineligible_activities.is_empty());
+
+        // Worker with cpu only, region = us-east-1 (act_gpu is ineligible)
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("region".to_string(), "us-east-1".to_string());
+        let cfg = WorkerRuntimeConfig {
+            labels,
+            ..default_runtime_config()
+        };
+        let worker = Worker::new(cfg, registry.clone()).unwrap();
+        assert_eq!(worker.ineligible_activities, vec!["act_gpu".to_string()]);
+
+        // Worker with gpu = true, region = eu-west-1 (act_cpu is ineligible)
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("gpu".to_string(), "true".to_string());
+        labels.insert("region".to_string(), "eu-west-1".to_string());
+        let cfg = WorkerRuntimeConfig {
+            labels,
+            ..default_runtime_config()
+        };
+        let worker = Worker::new(cfg, registry).unwrap();
+        assert_eq!(worker.ineligible_activities, vec!["act_cpu".to_string()]);
     }
 }

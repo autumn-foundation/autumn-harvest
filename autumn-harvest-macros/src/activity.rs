@@ -27,6 +27,7 @@ struct ActivityAttrs {
     /// Circuit-breaker policy expression (issue #369), e.g.
     /// `CircuitBreakerPolicy::new(10, Duration::from_secs(30), Duration::from_secs(60))`.
     circuit_breaker: Option<Expr>,
+    requires: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -47,6 +48,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
         rate_limit_burst: None,
         rate_limit_key: None,
         circuit_breaker: None,
+        requires: None,
     };
 
     syn::meta::parser(|meta| {
@@ -146,12 +148,16 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             let value: Expr = meta.value()?.parse()?;
             result.circuit_breaker = Some(value);
             Ok(())
+        } else if meta.path.is_ident("requires") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.requires = Some(value.value());
+            Ok(())
         } else {
             Err(meta.error(
                 "unsupported attribute: expected retry, start_to_close, heartbeat_timeout, \
                  schedule_to_start, schedule_to_close, queue, max_concurrent, concurrency_key, \
                  local, max_input_bytes, max_result_bytes, rate_limit_rps, rate_limit_burst, \
-                 rate_limit_key, or circuit_breaker",
+                 rate_limit_key, circuit_breaker, or requires",
             ))
         }
     })
@@ -268,6 +274,14 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 "local activities do not support schedule_to_close; \
                  local activities run inline on the workflow worker and do not go \
                  through the durable task queue that tracks the cross-retry deadline",
+            )
+            .to_compile_error();
+        }
+        if attrs.requires.is_some() {
+            return syn::Error::new_spanned(
+                input_fn.sig.fn_token,
+                "local activities do not support requires; \
+                 local activities run inline on the workflow worker and bypass task queue routing",
             )
             .to_compile_error();
         }
@@ -442,6 +456,11 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .as_ref()
         .map_or_else(|| quote! { None }, |expr| quote! { Some(#expr) });
 
+    let requires_expr = attrs
+        .requires
+        .as_deref()
+        .map_or_else(|| quote! { None }, |r| quote! { Some(#r) });
+
     quote! {
         #input_fn
 
@@ -465,6 +484,7 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 rate_limit_burst: #rate_limit_burst_expr,
                 rate_limit_key: #rate_limit_key_expr,
                 circuit_breaker: #circuit_breaker_expr,
+                requires: #requires_expr,
                 handler: |ctx, input| {
                     ::std::boxed::Box::pin(async move {
                         #dispatch

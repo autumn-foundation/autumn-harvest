@@ -10,7 +10,7 @@ use autumn_harvest::scheduler::DagCatalog;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
-use autumn_harvest::workers::{WorkerStatus, register_worker};
+use autumn_harvest::workers::{WorkerStatus, get_worker, heartbeat_worker, register_worker};
 use autumn_harvest_plugin::HarvestDbPool;
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
@@ -120,6 +120,7 @@ async fn register_active_worker_with_build(
         Some(env!("CARGO_PKG_VERSION")),
         build_id,
         Some("test-deploy"),
+        &std::collections::HashMap::new(),
     )
     .await
     .expect("worker registration should succeed");
@@ -997,4 +998,392 @@ async fn test_eligibility_optimizations_and_resilience() {
         .unwrap();
     let res = app_all_broken.oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_worker_capabilities_routing_and_triage() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    let activity = autumn_harvest::info::ActivityInfo {
+        name: "gpu_activity",
+        module: "tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some("test-queue-capabilities"),
+        max_concurrent: None,
+        concurrency_key: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        circuit_breaker: None,
+        requires: Some("gpu = true"),
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+    };
+
+    let state = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for_activities(
+            &["test-queue-capabilities"],
+            vec![activity],
+            ShardRouter::single(),
+        ),
+    );
+    state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    // 1. Register a worker with matching labels (gpu=true)
+    let mut matching_labels = std::collections::HashMap::new();
+    matching_labels.insert("gpu".to_string(), "true".to_string());
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-gpu-true",
+            &["test-queue-capabilities".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &matching_labels,
+        )
+        .await
+        .unwrap();
+    }
+
+    // 2. Register a worker without matching labels (no labels)
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-gpu-false",
+            &["test-queue-capabilities".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    // 3. Seed an activity task requiring gpu=true
+    {
+        let mut conn = pool.get().await.unwrap();
+        diesel::sql_query(
+            "INSERT INTO harvest_task_queue (
+                id, queue_name, task_type, activity_name, input, state, priority, max_attempts, scheduled_at
+             ) VALUES (
+                gen_random_uuid(), 'test-queue-capabilities', 'activity', 'gpu_activity', '{}'::jsonb, 'PENDING', 0, 1, NOW() - INTERVAL '5 seconds'
+             )",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    }
+
+    // 4. Test capable_of filter via GET /workers?capable_of=gpu_activity
+    let (status, body) = get_json_with_auth(&app, "/workers?capable_of=gpu_activity", true).await;
+    assert_eq!(status, StatusCode::OK);
+    let workers = body.as_array().unwrap();
+    assert_eq!(
+        workers.len(),
+        1,
+        "only 1 worker should be capable of gpu_activity"
+    );
+    assert_eq!(workers[0]["worker_id"], "worker-gpu-true");
+
+    // 5. Test triage explainer via GET /admin/queues/test-queue-capabilities/eligibility
+    let (status_elig, body_elig) = get_json_with_auth(
+        &app,
+        "/admin/queues/test-queue-capabilities/eligibility",
+        true,
+    )
+    .await;
+    assert_eq!(status_elig, StatusCode::OK);
+
+    // worker-gpu-false should be in ineligible_workers, with reason unsatisfied_requirement:gpu=true
+    let ineligible = body_elig["ineligible_workers"].as_array().unwrap();
+    let gpu_false_info = ineligible
+        .iter()
+        .find(|w| w["worker_id"] == "worker-gpu-false")
+        .unwrap();
+    let reasons = gpu_false_info["reason_codes"].as_array().unwrap();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r == "unsatisfied_requirement:gpu=true"),
+        "worker-gpu-false should have unsatisfied requirement gpu=true: {reasons:?}"
+    );
+
+    // worker-gpu-true should be in eligible_workers
+    let eligible = body_elig["eligible_workers"].as_array().unwrap();
+    assert!(eligible.iter().any(|w| w["worker_id"] == "worker-gpu-true"));
+}
+
+fn runtime_for_activities(
+    queues: &[&str],
+    activities: Vec<autumn_harvest::info::ActivityInfo>,
+    router: ShardRouter,
+) -> HarvestApiRuntime {
+    HarvestApiRuntime::new(
+        Arc::new(HandlerRegistry::new(vec![workflow_info()], activities)),
+        Arc::new(DagCatalog::new()),
+        Arc::new(Vec::new()),
+        None,
+        queues.iter().map(|queue| (*queue).to_string()).collect(),
+        autumn_harvest::scheduler::SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(RetentionConfig::default()),
+        router,
+    )
+}
+
+#[tokio::test]
+async fn test_worker_queue_filtering_for_capable_of() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    let activity = autumn_harvest::info::ActivityInfo {
+        name: "transcode_activity",
+        module: "tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some("transcoding"),
+        max_concurrent: None,
+        concurrency_key: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        circuit_breaker: None,
+        requires: Some("gpu = true"),
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+    };
+
+    let state = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for_activities(
+            &["transcoding", "other-queue"],
+            vec![activity],
+            ShardRouter::single(),
+        ),
+    );
+    state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    let mut matching_labels = std::collections::HashMap::new();
+    matching_labels.insert("gpu".to_string(), "true".to_string());
+
+    // 1. Register a worker with matching labels and matching queue
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-gpu-transcoding",
+            &["transcoding".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &matching_labels,
+        )
+        .await
+        .unwrap();
+    }
+
+    // 2. Register a worker with matching labels but WRONG queue
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-gpu-other",
+            &["other-queue".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &matching_labels,
+        )
+        .await
+        .unwrap();
+    }
+
+    // 3. Request capable_of
+    let (status, body) =
+        get_json_with_auth(&app, "/workers?capable_of=transcode_activity", true).await;
+    assert_eq!(status, StatusCode::OK);
+    let workers = body.as_array().unwrap();
+    assert_eq!(
+        workers.len(),
+        1,
+        "only 1 worker should be returned because the other is on the wrong queue"
+    );
+    assert_eq!(workers[0]["worker_id"], "worker-gpu-transcoding");
+}
+
+#[tokio::test]
+async fn test_worker_queue_filtering_with_explicit_queue_override() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    let activity = autumn_harvest::info::ActivityInfo {
+        name: "transcode_activity",
+        module: "tests",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_schedule_to_close: None,
+        default_queue: Some("transcoding"),
+        max_concurrent: None,
+        concurrency_key: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        circuit_breaker: None,
+        requires: Some("gpu = true"),
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+    };
+
+    let state = api_state(
+        HarvestDbPool::from(pool.clone()),
+        runtime_for_activities(
+            &["transcoding", "custom-queue"],
+            vec![activity],
+            ShardRouter::single(),
+        ),
+    );
+    state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(state).with_state(AppState::for_test().with_profile("test"));
+
+    let mut matching_labels = std::collections::HashMap::new();
+    matching_labels.insert("gpu".to_string(), "true".to_string());
+
+    // 1. Register a worker on default queue ("transcoding")
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-default-queue",
+            &["transcoding".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &matching_labels,
+        )
+        .await
+        .unwrap();
+    }
+
+    // 2. Register a worker on overridden queue ("custom-queue")
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-custom-queue",
+            &["custom-queue".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &matching_labels,
+        )
+        .await
+        .unwrap();
+    }
+
+    // 3. Request capable_of with queue override: GET /workers?queue=custom-queue&capable_of=transcode_activity
+    let (status, body) = get_json_with_auth(
+        &app,
+        "/workers?queue=custom-queue&capable_of=transcode_activity",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let workers = body.as_array().unwrap();
+    assert_eq!(
+        workers.len(),
+        1,
+        "only 1 worker should be returned because only worker-custom-queue is on custom-queue"
+    );
+    assert_eq!(workers[0]["worker_id"], "worker-custom-queue");
+}
+
+#[tokio::test]
+async fn test_worker_heartbeat_updates_labels() {
+    let (database_url, _container) = setup_database_url_with_migrations().await;
+    let pool = build_test_pool(&database_url);
+
+    // 1. Register a worker with empty labels
+    {
+        let mut conn = pool.get().await.unwrap();
+        register_worker(
+            &mut conn,
+            "worker-hb-labels-test",
+            &["default".to_string()],
+            &[0],
+            4,
+            "localhost",
+            None,
+            "v1",
+            None,
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    // 2. Call heartbeat_worker with new labels
+    let mut updated_labels = std::collections::HashMap::new();
+    updated_labels.insert("gpu".to_string(), "true".to_string());
+    let labels_json = serde_json::to_value(&updated_labels).unwrap();
+
+    {
+        let mut conn = pool.get().await.unwrap();
+        let affected = heartbeat_worker(&mut conn, "worker-hb-labels-test", 0, &labels_json)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+    }
+
+    // 3. Retrieve the worker details and verify the labels have been updated in the DB
+    {
+        let mut conn = pool.get().await.unwrap();
+        let worker_row = get_worker(&mut conn, "worker-hb-labels-test", Duration::from_secs(10))
+            .await
+            .unwrap()
+            .expect("worker should exist");
+
+        let worker_labels: std::collections::HashMap<String, String> =
+            serde_json::from_value(worker_row.worker.labels).unwrap();
+        assert_eq!(worker_labels.get("gpu").map(String::as_str), Some("true"));
+    }
 }

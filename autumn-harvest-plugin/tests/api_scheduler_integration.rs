@@ -144,8 +144,14 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
     ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
+    ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
+    ),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260607000000_harvest_workflow_pause/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql")
 );
 type HarvestApiApp = axum::Router;
 
@@ -439,6 +445,7 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         rate_limit_burst: None,
         rate_limit_key: None,
         circuit_breaker: None,
+        requires: None,
         handler: record_activity,
     }
 }
@@ -462,6 +469,7 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         rate_limit_burst: None,
         rate_limit_key: None,
         circuit_breaker: None,
+        requires: None,
         handler: wait_on_barrier_activity,
     }
 }
@@ -4696,6 +4704,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: record_activity,
         }],
         Arc::new(state),

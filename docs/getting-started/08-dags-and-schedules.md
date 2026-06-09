@@ -1,6 +1,6 @@
 # Chapter 8 — DAGs and schedules
 
-[← Reliability knobs](07-reliability-knobs.md) · [Index](README.md) · [Next: Operating the service →](09-operations.md)
+[← Reliability knobs](07-reliability-knobs.md) · [Index](README.md) · [Next: Worker routing and capabilities →](09-worker-routing.md)
 
 ---
 
@@ -264,4 +264,4 @@ definition in hand at test time.
 
 ---
 
-[← Reliability knobs](07-reliability-knobs.md) · [Index](README.md) · [Next: Operating the service →](09-operations.md)
+[← Reliability knobs](07-reliability-knobs.md) · [Index](README.md) · [Next: Worker routing and capabilities →](09-worker-routing.md)

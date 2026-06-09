@@ -656,6 +656,10 @@ pub struct ActivityInfo {
     /// today's behaviour (no breaker; the full retry policy applies). Declared
     /// via `#[activity(circuit_breaker = CircuitBreakerPolicy::new(...))]`.
     pub circuit_breaker: Option<crate::policy::CircuitBreakerPolicy>,
+    /// Opaque requirement expression parsed from `#[activity(requires = "...")]`.
+    /// E.g. `"gpu=true,region in [eu-west-1, eu-central-1]"`.
+    /// `None` = no capability constraints.
+    pub requires: Option<&'static str>,
     /// Type-erased dispatch function.
     pub handler: ActivityHandlerFn,
 }
@@ -807,6 +811,7 @@ impl std::fmt::Debug for ActivityInfo {
             .field("rate_limit_burst", &self.rate_limit_burst)
             .field("rate_limit_key", &self.rate_limit_key)
             .field("circuit_breaker", &self.circuit_breaker)
+            .field("requires", &self.requires)
             .field("handler", &"<fn>")
             .finish()
     }
@@ -1171,6 +1176,7 @@ mod tests {
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert!(info.default_retry_policy.is_none());
@@ -1200,6 +1206,7 @@ mod tests {
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert!(info.is_local);
@@ -1237,6 +1244,7 @@ mod tests {
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert_eq!(info.max_concurrent, Some(5));
@@ -1265,6 +1273,7 @@ mod tests {
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert_eq!(
@@ -1297,6 +1306,7 @@ mod tests {
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         assert!(
@@ -1382,6 +1392,7 @@ mod tests {
             rate_limit_burst: None,
             rate_limit_key: None,
             circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         };
         let debug_str = format!("{activity_info:?}");

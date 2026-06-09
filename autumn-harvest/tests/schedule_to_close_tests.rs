@@ -87,8 +87,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     // schedule_to_close column on harvest_task_queue (issue #378)
     include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
     "\n",
-    include_str!("../migrations/20260607000000_harvest_workflow_pause/up.sql")
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql")
 );
 
 async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -596,6 +598,7 @@ fn activity_info_schedule_to_close_duration_roundtrip() {
         rate_limit_burst: None,
         rate_limit_key: None,
         circuit_breaker: None,
+        requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
     };
 

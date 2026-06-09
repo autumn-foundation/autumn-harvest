@@ -234,6 +234,8 @@ pub struct TaskQueueItem {
     /// attempts (issue #378). Set once at initial enqueue; never refreshed on
     /// retry. NULL = no total deadline (unbounded retries).
     pub schedule_to_close_at: Option<DateTime<Utc>>,
+    /// Structured capability requirements JSONB payload (issue #382).
+    pub required_capabilities: Option<serde_json::Value>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -268,6 +270,8 @@ pub struct NewTaskQueueItem<'a> {
     /// Absolute UTC deadline for the total activity lifetime (issue #378).
     /// NULL = no total deadline enforced.
     pub schedule_to_close_at: Option<DateTime<Utc>>,
+    /// Structured capability requirements JSONB payload (issue #382).
+    pub required_capabilities: Option<serde_json::Value>,
 }
 
 /// Database representation of a rate limit bucket.
@@ -554,6 +558,8 @@ pub struct HarvestWorker {
     pub build_id: String,
     /// Optional human-readable deployment name (issue #171).
     pub deployment_name: Option<String>,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: serde_json::Value,
 }
 
 /// Insert struct for registering a new worker process.
@@ -570,6 +576,8 @@ pub struct NewHarvestWorker<'a> {
     pub build_id: &'a str,
     /// Optional deployment name for operator observability.
     pub deployment_name: Option<&'a str>,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: serde_json::Value,
 }
 
 // ── BatchJob ──────────────────────────────────────────────────────────────────
