@@ -91,10 +91,54 @@ pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+/// Exports a `DagProfile` to the Chrome Trace Event Format.
+///
+/// This JSON output can be loaded into `chrome://tracing` or Perfetto UI
+/// to visualize the timeline and concurrency of the DAG execution.
+///
+/// # Errors
+/// Returns `serde_json::Error` if serialization fails.
+#[cfg(feature = "testing")]
+pub fn export_chrome_trace(
+    profile: &crate::dag_profiler::DagProfile,
+) -> Result<String, serde_json::Error> {
+    use crate::dag_profiler::ProfilerEventKind;
+    use serde_json::json;
+
+    let mut events = Vec::new();
+
+    for event in &profile.timeline {
+        let (ph, tid, name) = match &event.kind {
+            ProfilerEventKind::TaskStarted(idx, name) => ("B", *idx, name),
+            ProfilerEventKind::TaskCompleted(idx, name) => ("E", *idx, name),
+        };
+
+        #[allow(clippy::cast_possible_truncation)]
+        let ts_micros = event.time.as_micros() as u64;
+
+        events.push(json!({
+            "name": name,
+            "cat": "task",
+            "ph": ph,
+            "ts": ts_micros,
+            "pid": 1,
+            "tid": tid,
+            "args": {}
+        }));
+    }
+
+    serde_json::to_string(&events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dag::DagBuilder;
+
+    #[cfg(feature = "testing")]
+    use crate::dag_profiler::DagProfiler;
+    #[cfg(feature = "testing")]
+    use std::time::Duration;
 
     fn dummy_activity() {}
     fn dummy_activity2() {}
@@ -153,5 +197,36 @@ digraph DAG {
 }
 ";
         assert_eq!(dot, expected_dot);
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn test_export_chrome_trace() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity2).upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let profiler = DagProfiler::new(dag)
+            .mock_duration("dummy_activity", Duration::from_secs(2))
+            .mock_duration("dummy_activity2", Duration::from_secs(3));
+
+        let profile = profiler.profile();
+
+        let trace_json = export_chrome_trace(&profile).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&trace_json).unwrap();
+        let events = parsed.as_array().expect("Expected JSON array");
+        assert_eq!(events.len(), 4);
+
+        let first_event = &events[0];
+        assert_eq!(first_event["name"], "dummy_activity");
+        assert_eq!(first_event["ph"], "B");
+        assert_eq!(first_event["ts"], 0);
+
+        let last_event = &events[3];
+        assert_eq!(last_event["name"], "dummy_activity2");
+        assert_eq!(last_event["ph"], "E");
+        assert_eq!(last_event["ts"], 5_000_000);
     }
 }
