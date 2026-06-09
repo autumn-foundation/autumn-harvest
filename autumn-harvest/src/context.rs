@@ -3924,7 +3924,13 @@ impl WorkflowContext {
         }
         let raw = details.into();
         let capped = if raw.len() > self.current_details_cap {
-            raw[..raw.floor_char_boundary(self.current_details_cap)].to_string()
+            // floor_char_boundary is not yet stable (tracking #93743); scan back
+            // manually to the nearest valid UTF-8 character boundary.
+            let mut boundary = self.current_details_cap;
+            while !raw.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            raw[..boundary].to_string()
         } else {
             raw
         };
