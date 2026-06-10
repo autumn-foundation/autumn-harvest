@@ -7578,6 +7578,7 @@ mod tests {
             paused_at: None,
             pause_reason: None,
             pause_actor: None,
+            current_details: None,
         }
     }
 

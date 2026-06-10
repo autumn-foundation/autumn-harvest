@@ -2239,6 +2239,7 @@ impl WorkflowTestEnv {
             | WorkflowCommand::RecordMarker { .. }
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
+            | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::ScheduleExternalActivity { .. }
             | WorkflowCommand::Complete { .. }
             | WorkflowCommand::Fail { .. }
