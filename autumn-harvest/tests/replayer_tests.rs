@@ -1867,3 +1867,39 @@ async fn signal_timeout_both_branches_replay_succeeded_across_randomized_orderin
         );
     }
 }
+
+#[tokio::test]
+async fn signal_timeout_timeout_branch_with_ignored_late_signal_replays_succeeded() {
+    // A late approval ingested after the deadline fired, which the workflow's
+    // auto-reject branch intentionally never consumes. This is a valid
+    // production history and must not be reported as non-determinism.
+    let timer_id = TimerId::new("__signal_timeout:1:approval");
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: 300,
+        },
+        WorkflowEvent::TimerFired { timer_id },
+        WorkflowEvent::SignalReceived {
+            signal_name: "approval".to_string(),
+            payload: serde_json::json!({"approved": true}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"escalated": true}),
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn("signal_or_deadline", signal_or_deadline_workflow)
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "timeout branch with an ignored late signal must replay:\n{report}"
+    );
+}
