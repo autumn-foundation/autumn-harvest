@@ -699,6 +699,10 @@ pub struct WorkflowContext {
     /// Each `execute_activity_fan_out*` call increments this once so each
     /// fan-out group has a stable, unique marker name across replays.
     fan_out_seq: Mutex<u32>,
+    /// Monotonically increasing counter for naming signal-timeout race timers
+    /// (issue #476). Each `wait_for_signal_timeout` call increments this once
+    /// so each race has a stable, unique timer ID across replays.
+    signal_timeout_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
@@ -851,6 +855,7 @@ impl WorkflowContext {
             history_policy,
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
+            signal_timeout_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -935,6 +940,7 @@ impl WorkflowContext {
             history_policy: WorkflowHistoryPolicy::default(),
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
+            signal_timeout_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -969,6 +975,7 @@ impl WorkflowContext {
             history_policy: WorkflowHistoryPolicy::default(),
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
+            signal_timeout_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -2776,6 +2783,151 @@ impl WorkflowContext {
         }
     }
 
+    /// Wait for a named signal, but give up after `timeout` and return `None`.
+    ///
+    /// This is the durable signal-or-deadline primitive for human-in-the-loop
+    /// and callback-driven flows (issue #476): approval gates, payment
+    /// confirmations, webhook callbacks with an SLA. Resolves to
+    /// `Ok(Some(payload))` when the signal arrives before the deadline and
+    /// `Ok(None)` when the durable timer fires first.
+    ///
+    /// # Determinism contract
+    ///
+    /// The race composes the existing `TimerStarted`/`TimerFired` and
+    /// `SignalReceived` events — no new event variant. The winner is decided
+    /// by **recorded history order**: whichever of `SignalReceived` or
+    /// `TimerFired` appears first in history wins on every replay, regardless
+    /// of wall-clock timing on the replaying worker. A history containing both
+    /// events always replays to the same branch.
+    ///
+    /// If the timer wins, no signal payload is consumed: a later delivery of
+    /// that signal remains observable by a subsequent `receive_signal*` /
+    /// `wait_for_signal*` call.
+    ///
+    /// `timeout` is rounded **up** to whole seconds (durable timers are
+    /// second-granular).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NonDeterministic`] if replay history diverges
+    /// from the requested race, or [`HarvestError::Cancelled`] if the workflow
+    /// task is dropped before a live resolution arrives.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn wait_for_signal_timeout(
+        &self,
+        signal_name: &str,
+        timeout: std::time::Duration,
+    ) -> HarvestResult<Option<Value>> {
+        use crate::replay::SignalOrTimerMatch;
+
+        // Deterministic timer ID: the counter increments on every call (live
+        // and replay alike), so the Nth race in workflow code always carries
+        // the same ID as the Nth recorded race timer.
+        let seq = {
+            let mut seq = self
+                .signal_timeout_seq
+                .lock()
+                .expect("signal_timeout_seq lock poisoned");
+            *seq += 1;
+            *seq
+        };
+        let timer_id = format!("__signal_timeout:{seq}:{signal_name}");
+        // Round up so a sub-second timeout still arms a durable timer.
+        let duration_secs = timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0);
+
+        let history_match = self.match_history(|m| {
+            m.match_signal_or_timer(signal_name, &timer_id, Some(duration_secs))
+        });
+
+        match history_match {
+            SignalOrTimerMatch::SignalWon { payload } => Ok(Some(payload)),
+            SignalOrTimerMatch::TimerWon => Ok(None),
+            SignalOrTimerMatch::Diverged { expected, actual } => {
+                Err(HarvestError::NonDeterministic(format!(
+                    "signal-or-timeout mismatch: expected {expected}, got {actual}"
+                )))
+            }
+            outcome @ (SignalOrTimerMatch::NoMatch | SignalOrTimerMatch::InProgress) => {
+                if matches!(outcome, SignalOrTimerMatch::NoMatch) {
+                    self.check_strict_replay_no_match(&format!(
+                        "SignalOrTimer({signal_name}, {timer_id})"
+                    ))?;
+                } else if self.strict_replay {
+                    // Strict replay (WorkflowReplayer) always gets complete
+                    // histories — an unresolved race is a fixture problem.
+                    return Err(HarvestError::NonDeterministic(format!(
+                        "signal-or-timeout race '{signal_name}' started but unresolved in history"
+                    )));
+                }
+
+                // First live run (NoMatch) or re-park after a spurious wake
+                // (InProgress): start/refresh the durable timer — the worker
+                // dedupes the timer row by timer_id, so re-emitting is safe —
+                // and register the signal wait. The first event the worker
+                // records resolves the race on the next replay.
+                let (timer_tx, timer_rx) = oneshot::channel();
+                let (signal_tx, signal_rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::StartTimer {
+                    timer_id: TimerId::new(&timer_id),
+                    duration_secs,
+                    result_tx: timer_tx,
+                });
+                self.push_command(WorkflowCommand::WaitForSignal {
+                    signal_name: signal_name.to_string(),
+                    result_tx: signal_tx,
+                });
+
+                SignalOrTimerRaceFut {
+                    signal_name: signal_name.to_string(),
+                    signal_rx,
+                    timer_rx,
+                    signal_gone: false,
+                    timer_gone: false,
+                }
+                .await
+            }
+        }
+    }
+
+    /// Wait for a signal with a deadline and deserialize its payload into `O`.
+    ///
+    /// This is the typed alternative to
+    /// [`wait_for_signal_timeout`](Self::wait_for_signal_timeout), mirroring
+    /// the existing [`receive_signal`](Self::receive_signal) /
+    /// [`wait_for_signal`](Self::wait_for_signal) pairing. Resolves to
+    /// `Ok(Some(payload))` when the signal arrives before the deadline and
+    /// `Ok(None)` when the deadline fires first.
+    ///
+    /// ```rust,ignore
+    /// // Await approval, else auto-reject after 24 hours:
+    /// match ctx.receive_signal_timeout::<Decision>("approval", Duration::from_secs(86_400)).await? {
+    ///     Some(decision) => apply(decision),
+    ///     None => auto_reject(),
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if the signal payload cannot be
+    /// deserialized. Propagates all errors from
+    /// [`wait_for_signal_timeout`](Self::wait_for_signal_timeout).
+    pub async fn receive_signal_timeout<O>(
+        &self,
+        signal_name: &str,
+        timeout: std::time::Duration,
+    ) -> HarvestResult<Option<O>>
+    where
+        O: serde::de::DeserializeOwned,
+    {
+        match self.wait_for_signal_timeout(signal_name, timeout).await? {
+            Some(raw) => Ok(Some(serde_json::from_value(raw)?)),
+            None => Ok(None),
+        }
+    }
+
     // ── Cross-workflow signal dispatch ────────────────────────────────────
 
     /// Send a named signal with a typed payload to another running workflow.
@@ -4050,6 +4202,60 @@ where
             std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
+    }
+}
+
+/// Live-mode future for the signal-vs-deadline race (issue #476).
+///
+/// Polls the signal channel before the timer channel so that an in-cycle
+/// resolution of both always picks the signal deterministically. A dropped
+/// channel is treated as "will never resolve" rather than an error, so a
+/// harness that resolves only one side (dropping the other sender) still
+/// completes the race; only when **both** senders are gone does the future
+/// resolve to [`HarvestError::Cancelled`].
+struct SignalOrTimerRaceFut {
+    signal_name: String,
+    signal_rx: oneshot::Receiver<Value>,
+    timer_rx: oneshot::Receiver<()>,
+    signal_gone: bool,
+    timer_gone: bool,
+}
+
+impl std::future::Future for SignalOrTimerRaceFut {
+    type Output = HarvestResult<Option<Value>>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if !this.signal_gone {
+            match std::pin::Pin::new(&mut this.signal_rx).poll(cx) {
+                std::task::Poll::Ready(Ok(payload)) => {
+                    return std::task::Poll::Ready(Ok(Some(payload)));
+                }
+                std::task::Poll::Ready(Err(_)) => this.signal_gone = true,
+                std::task::Poll::Pending => {}
+            }
+        }
+
+        if !this.timer_gone {
+            match std::pin::Pin::new(&mut this.timer_rx).poll(cx) {
+                std::task::Poll::Ready(Ok(())) => return std::task::Poll::Ready(Ok(None)),
+                std::task::Poll::Ready(Err(_)) => this.timer_gone = true,
+                std::task::Poll::Pending => {}
+            }
+        }
+
+        if this.signal_gone && this.timer_gone {
+            return std::task::Poll::Ready(Err(HarvestError::Cancelled(format!(
+                "signal-or-timeout race '{}' cancelled: result channels dropped",
+                this.signal_name
+            ))));
+        }
+
+        std::task::Poll::Pending
     }
 }
 
@@ -6475,6 +6681,265 @@ mod tests {
             .await
             .expect("signal should replay");
         assert_eq!(payload, serde_json::json!({"ok": true}));
+    }
+
+    // ── wait_for_signal_timeout / receive_signal_timeout (issue #476) ──────
+
+    #[tokio::test]
+    async fn wait_for_signal_timeout_returns_payload_when_signal_recorded_first() {
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__signal_timeout:1:approval"),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".to_string(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+
+        let result = ctx
+            .wait_for_signal_timeout("approval", std::time::Duration::from_secs(300))
+            .await
+            .expect("race should replay");
+        assert_eq!(result, Some(serde_json::json!({"approved": true})));
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_timeout_returns_none_when_timer_recorded_first() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+
+        let result = ctx
+            .wait_for_signal_timeout("approval", std::time::Duration::from_secs(300))
+            .await
+            .expect("race should replay");
+        assert_eq!(result, None);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_timeout_timer_win_keeps_late_signal_observable() {
+        // The signal arrived after the deadline: the race returns None and the
+        // late signal is still consumable by a subsequent receive_signal call.
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired { timer_id },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".to_string(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+
+        let result = ctx
+            .wait_for_signal_timeout("approval", std::time::Duration::from_secs(300))
+            .await
+            .expect("race should replay");
+        assert_eq!(result, None, "timer won — no signal payload consumed");
+
+        let late = ctx
+            .wait_for_signal("approval")
+            .await
+            .expect("late signal must still be deliverable");
+        assert_eq!(late, serde_json::json!({"approved": true}));
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_timeout_replays_signal_branch_when_both_events_exist() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".to_string(),
+                payload: serde_json::json!({"approved": true}),
+            },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+
+        // Whichever event is first in recorded history wins on every replay.
+        for _ in 0..3 {
+            let ctx = WorkflowContext::for_replay(ExecutionId::new(), history.clone());
+            let result = ctx
+                .wait_for_signal_timeout("approval", std::time::Duration::from_secs(300))
+                .await
+                .expect("race should replay");
+            assert_eq!(result, Some(serde_json::json!({"approved": true})));
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_signal_timeout_deserializes_typed_payload() {
+        #[derive(serde::Deserialize, Debug, PartialEq, Eq)]
+        struct Approval {
+            approved: bool,
+        }
+
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("__signal_timeout:1:approval"),
+                duration_secs: 60,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".to_string(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+
+        let result: Option<Approval> = ctx
+            .receive_signal_timeout("approval", std::time::Duration::from_secs(60))
+            .await
+            .expect("race should replay");
+        assert_eq!(result, Some(Approval { approved: true }));
+    }
+
+    #[tokio::test]
+    async fn receive_signal_timeout_returns_none_on_timeout_branch() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 60,
+            },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+
+        let result: Option<Value> = ctx
+            .receive_signal_timeout("approval", std::time::Duration::from_secs(60))
+            .await
+            .expect("race should replay");
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_timeout_signal_win_without_recorded_timer() {
+        // Signal arrived before the race even started on the live run — the
+        // timer was never started, so no TimerStarted event exists.
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".to_string(),
+                payload: serde_json::json!({"approved": false}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+
+        let result = ctx
+            .wait_for_signal_timeout("approval", std::time::Duration::from_secs(300))
+            .await
+            .expect("race should replay");
+        assert_eq!(result, Some(serde_json::json!({"approved": false})));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no timer must be started when the signal already won"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_timeout_live_emits_timer_and_signal_wait_commands() {
+        let ctx = WorkflowContext::new_test();
+
+        let fut = ctx.wait_for_signal_timeout("approval", std::time::Duration::from_millis(1500));
+        let mut fut = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut poll_cx = std::task::Context::from_waker(waker);
+        assert!(
+            std::future::Future::poll(fut.as_mut(), &mut poll_cx).is_pending(),
+            "live race must suspend"
+        );
+
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 2, "expected StartTimer + WaitForSignal");
+        let WorkflowCommand::StartTimer {
+            timer_id,
+            duration_secs,
+            ..
+        } = &cmds[0]
+        else {
+            panic!("first command must be StartTimer, got {cmds:?}");
+        };
+        assert_eq!(timer_id.as_str(), "__signal_timeout:1:approval");
+        assert_eq!(
+            *duration_secs, 2,
+            "sub-second timeouts round up to whole seconds"
+        );
+        assert!(
+            matches!(
+                &cmds[1],
+                WorkflowCommand::WaitForSignal { signal_name, .. } if signal_name == "approval"
+            ),
+            "second command must be WaitForSignal, got {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_timeout_diverges_on_unrelated_history() {
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+
+        let result = ctx
+            .wait_for_signal_timeout("approval", std::time::Duration::from_secs(300))
+            .await;
+        assert!(matches!(
+            result.unwrap_err(),
+            HarvestError::NonDeterministic(_)
+        ));
     }
 
     #[test]

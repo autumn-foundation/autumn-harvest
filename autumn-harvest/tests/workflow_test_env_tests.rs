@@ -1026,3 +1026,78 @@ async fn test_mock_activity_retries_single_ok_returns_success() {
         .count();
     assert_eq!(failed_count, 0);
 }
+
+// ─────────── receive_signal_timeout / wait_for_signal_timeout (issue #476) ───────────
+
+/// Awaits an approval signal with a deadline; escalates to auto-reject on timeout.
+fn approval_with_timeout_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let decision: Option<Value> = ctx
+            .receive_signal_timeout("approval", std::time::Duration::from_secs(3600))
+            .await
+            .map_err(|e| e.to_string())?;
+        match decision {
+            Some(payload) => Ok(json!({"outcome": "decided", "payload": payload})),
+            None => Ok(json!({"outcome": "auto_rejected"})),
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_receive_signal_timeout_signal_branch() {
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("approval", json!({"approved": true}))
+        .run(approval_with_timeout_workflow, json!(null))
+        .await;
+
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"outcome": "decided", "payload": {"approved": true}}))
+    );
+    assert!(
+        outcome.events().iter().any(
+            |e| matches!(e, WorkflowEvent::SignalReceived { signal_name, .. } if signal_name == "approval")
+        ),
+        "expected SignalReceived(approval)"
+    );
+
+    let report = outcome.replay_check(approval_with_timeout_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "signal branch must replay deterministically:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn test_receive_signal_timeout_timeout_branch() {
+    // No signal queued — the stubbed timer fires immediately (no real sleeping)
+    // and the workflow takes the timeout/escalation branch.
+    let outcome = WorkflowTestEnv::new()
+        .run(approval_with_timeout_workflow, json!(null))
+        .await;
+
+    assert_eq!(outcome.result, Ok(json!({"outcome": "auto_rejected"})));
+    assert!(
+        outcome
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::TimerFired { .. })),
+        "expected TimerFired for the deadline timer"
+    );
+    assert!(
+        !outcome
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::SignalReceived { .. })),
+        "no signal must be recorded on the timeout branch"
+    );
+
+    let report = outcome.replay_check(approval_with_timeout_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "timeout branch must replay deterministically:\n{report}"
+    );
+}

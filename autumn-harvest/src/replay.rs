@@ -144,6 +144,43 @@ pub enum HistoryMatch {
     },
 }
 
+/// Result of matching a signal-vs-timer race against the event history
+/// (issue #476: `WorkflowContext::receive_signal_timeout`).
+///
+/// The race is resolved **deterministically by recorded history order**:
+/// whichever of `SignalReceived` or `TimerFired` appears first in history
+/// wins on every replay, regardless of wall-clock timing on the replaying
+/// worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalOrTimerMatch {
+    /// The signal was recorded before the deadline timer fired (or before the
+    /// timer was ever started). Carries the recorded signal payload.
+    SignalWon {
+        /// The JSON payload from the winning `SignalReceived` event.
+        payload: Value,
+    },
+    /// The deadline timer fired before the signal arrived. No signal payload
+    /// is consumed — a later delivery remains observable by a subsequent
+    /// signal wait.
+    TimerWon,
+    /// `TimerStarted` is recorded but neither `TimerFired` nor a matching
+    /// `SignalReceived` exists yet. The caller should re-emit the race
+    /// commands (the worker dedupes the durable timer row by `timer_id`)
+    /// and suspend again.
+    InProgress,
+    /// Cursor is past the end of history — this is the first live execution
+    /// of the race.
+    NoMatch,
+    /// The recorded history does not match the requested race, indicating
+    /// non-determinism in the workflow code.
+    Diverged {
+        /// What the history matcher expected to find based on recorded events.
+        expected: String,
+        /// What the workflow actually requested.
+        actual: String,
+    },
+}
+
 /// Terminal outcome for an early-drained external signal.
 #[derive(Debug, Clone)]
 enum StashedSignalTerminal {
@@ -1693,6 +1730,195 @@ impl HistoryMatcher {
         }
 
         HistoryMatch::NoMatch
+    }
+
+    /// Match a signal-vs-deadline race against history (issue #476).
+    ///
+    /// The race composes the existing `TimerStarted`/`TimerFired` and
+    /// `SignalReceived` events — no new event variant. The winner is the
+    /// resolution event that appears **first in recorded history**:
+    ///
+    /// - A `SignalReceived { signal_name }` before `TimerFired { timer_id }`
+    ///   (or a signal that was stashed/recorded before the race even started)
+    ///   → [`SignalOrTimerMatch::SignalWon`]. A stray `TimerFired` for the
+    ///   race's timer that lands later in history is marked consumed so
+    ///   subsequent matches do not diverge against it.
+    /// - A `TimerFired { timer_id }` before any matching signal
+    ///   → [`SignalOrTimerMatch::TimerWon`]. A matching signal recorded
+    ///   *after* the fire is **not** consumed: it stays observable by a
+    ///   subsequent signal wait.
+    ///
+    /// Non-matching signals and external-signal triplets encountered during
+    /// the scan are stashed exactly like in [`Self::match_timer_strict`].
+    #[allow(clippy::too_many_lines)]
+    pub fn match_signal_or_timer(
+        &mut self,
+        signal_name: &str,
+        timer_id: &str,
+        expected_duration: Option<u64>,
+    ) -> SignalOrTimerMatch {
+        let replaying = self.prepare_match();
+
+        // A signal stashed by an earlier scan — or drained by prepare_match
+        // just now — arrived before this race point in recorded history. The
+        // signal wins and the timer was never started on the matching live run.
+        if let Some(index) = self
+            .pending_signals
+            .iter()
+            .position(|(name, _)| name == signal_name)
+            && let Some((_name, payload)) = self.pending_signals.remove(index)
+        {
+            return SignalOrTimerMatch::SignalWon { payload };
+        }
+
+        if !replaying {
+            return SignalOrTimerMatch::NoMatch;
+        }
+
+        let WorkflowEvent::TimerStarted {
+            timer_id: recorded_id,
+            duration_secs: recorded_duration,
+        } = &self.events[self.cursor]
+        else {
+            return SignalOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual: Self::actual_event_name(&self.events[self.cursor]),
+            };
+        };
+
+        if recorded_id.as_str() != timer_id {
+            return SignalOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id})"),
+                actual: format!("TimerStarted({recorded_id})"),
+            };
+        }
+
+        if let Some(expected) = expected_duration
+            && *recorded_duration != expected
+        {
+            return SignalOrTimerMatch::Diverged {
+                expected: format!("TimerStarted({timer_id}, duration={expected}s)"),
+                actual: format!("TimerStarted({recorded_id}, duration={recorded_duration}s)"),
+            };
+        }
+
+        // Advance past TimerStarted, then scan for the first resolution event.
+        self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_command = None;
+
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                WorkflowEvent::SignalReceived {
+                    signal_name: recorded_name,
+                    payload,
+                } if recorded_name == signal_name => {
+                    let payload = payload.clone();
+                    self.consumed_signal_events.insert(scan_cursor);
+                    // The durable timer may still fire after the signal won;
+                    // consume the stray TimerFired so later matches do not
+                    // diverge against it. (If the timer fires only after this
+                    // replay cycle, the next full replay re-runs this same
+                    // scan and consumes it then.)
+                    let mut fired_scan = scan_cursor + 1;
+                    while fired_scan < self.events.len() {
+                        if !self.is_consumed(fired_scan)
+                            && let WorkflowEvent::TimerFired { timer_id: id } =
+                                &self.events[fired_scan]
+                            && id.as_str() == timer_id
+                        {
+                            self.consumed_out_of_order_events.insert(fired_scan);
+                            break;
+                        }
+                        fired_scan += 1;
+                    }
+                    self.cursor =
+                        first_interleaved_command.unwrap_or_else(|| scan_cursor.saturating_add(1));
+                    self.advance_to_next_unconsumed_event();
+                    return SignalOrTimerMatch::SignalWon { payload };
+                }
+
+                WorkflowEvent::TimerFired { timer_id: id } if id.as_str() == timer_id => {
+                    if let Some(command_cursor) = first_interleaved_command {
+                        self.consumed_out_of_order_events.insert(scan_cursor);
+                        self.cursor = command_cursor;
+                    } else {
+                        self.cursor = scan_cursor + 1;
+                    }
+                    self.advance_to_next_unconsumed_event();
+                    return SignalOrTimerMatch::TimerWon;
+                }
+
+                // Other signals can arrive while the race is pending; stash
+                // them for later signal waits and continue scanning.
+                WorkflowEvent::SignalReceived {
+                    signal_name: recorded_name,
+                    payload,
+                } => {
+                    let recorded_name = recorded_name.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, recorded_name, payload);
+                    scan_cursor += 1;
+                }
+
+                ev if Self::is_update_event(ev) => {
+                    scan_cursor += 1;
+                }
+
+                WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                // ExternalSignal event triplets can be interleaved with the
+                // pending race; stash them for later match_external_signal.
+                WorkflowEvent::ExternalSignalRequested {
+                    signal_id,
+                    target,
+                    signal_name: sn,
+                    payload,
+                } => {
+                    self.stash_external_signal_request(
+                        scan_cursor,
+                        *signal_id,
+                        *target,
+                        sn.clone(),
+                        payload.clone(),
+                    );
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                    self.stash_external_signal_terminal(
+                        scan_cursor,
+                        *signal_id,
+                        StashedSignalTerminal::Delivered,
+                    );
+                    scan_cursor += 1;
+                }
+                WorkflowEvent::ExternalSignalFailed {
+                    signal_id,
+                    reason_code,
+                } => {
+                    self.stash_external_signal_terminal(
+                        scan_cursor,
+                        *signal_id,
+                        StashedSignalTerminal::Failed(reason_code.clone()),
+                    );
+                    scan_cursor += 1;
+                }
+
+                _ => break,
+            }
+        }
+
+        // Timer started but neither resolution event is recorded yet.
+        SignalOrTimerMatch::InProgress
     }
 
     /// Match a continue-as-new command against history.
@@ -3946,5 +4172,251 @@ mod tests {
                 .match_detached_child_spawn("monitor", &Value::Null, ParentClosePolicy::Abandon,),
             HistoryMatch::DetachedChildSpawned { child_id }
         );
+    }
+
+    // ── match_signal_or_timer (issue #476) ────────────────────────────────
+
+    #[test]
+    fn signal_or_timer_signal_wins_when_recorded_before_timer_fired() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(
+            result,
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": true})
+            }
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_signal_win_consumes_stray_timer_fired() {
+        // The durable timer fires after the signal already won. The stray
+        // TimerFired must be consumed so subsequent matches do not diverge.
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(
+            result,
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": true})
+            }
+        );
+        assert!(
+            !matcher.is_replaying(),
+            "stray TimerFired must be consumed after the signal wins"
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_timer_wins_when_fired_first() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(result, SignalOrTimerMatch::TimerWon);
+    }
+
+    #[test]
+    fn signal_or_timer_timer_win_does_not_consume_late_signal() {
+        // The signal arrives after the timer already fired: the timer wins and
+        // the late signal stays observable for a subsequent match_signal.
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(result, SignalOrTimerMatch::TimerWon);
+
+        let late = matcher.match_signal("approval");
+        assert_eq!(
+            late,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"approved": true})
+            },
+            "a signal that lost the race must remain observable later"
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_signal_wins_when_received_before_race_started() {
+        // The signal was ingested before the race point — no timer was ever
+        // started on the corresponding live run.
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "approval".into(),
+            payload: serde_json::json!({"approved": false}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result =
+            matcher.match_signal_or_timer("approval", "__signal_timeout:1:approval", Some(300));
+        assert_eq!(
+            result,
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": false})
+            }
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_no_match_on_empty_history() {
+        let mut matcher = HistoryMatcher::new(vec![]);
+        let result =
+            matcher.match_signal_or_timer("approval", "__signal_timeout:1:approval", Some(300));
+        assert_eq!(result, SignalOrTimerMatch::NoMatch);
+    }
+
+    #[test]
+    fn signal_or_timer_in_progress_when_neither_resolution_recorded() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![WorkflowEvent::TimerStarted {
+            timer_id: timer_id.clone(),
+            duration_secs: 300,
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(result, SignalOrTimerMatch::InProgress);
+    }
+
+    #[test]
+    fn signal_or_timer_diverges_on_unrelated_event() {
+        let events = vec![WorkflowEvent::ActivityScheduled {
+            activity_id: ActivityExecId::new(),
+            name: "send_email".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result =
+            matcher.match_signal_or_timer("approval", "__signal_timeout:1:approval", Some(300));
+        assert!(matches!(result, SignalOrTimerMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn signal_or_timer_diverges_on_duration_change() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(600));
+        assert!(matches!(result, SignalOrTimerMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn signal_or_timer_stashes_non_matching_signals_during_scan() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "other".into(),
+                payload: serde_json::json!(1),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(result, SignalOrTimerMatch::TimerWon);
+
+        let other = matcher.match_signal("other");
+        assert_eq!(
+            other,
+            HistoryMatch::Matched {
+                output: serde_json::json!(1)
+            },
+            "non-matching signals scanned during the race must be stashed"
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_replays_same_branch_when_both_events_exist() {
+        // Whichever event was recorded first wins on every replay regardless
+        // of wall-clock timing on the replaying worker.
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+
+        for _ in 0..3 {
+            let mut matcher = HistoryMatcher::new(events.clone());
+            let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+            assert_eq!(
+                result,
+                SignalOrTimerMatch::SignalWon {
+                    payload: serde_json::json!({"approved": true})
+                }
+            );
+        }
     }
 }
