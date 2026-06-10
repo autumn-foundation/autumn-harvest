@@ -15,7 +15,7 @@ fn main() {
         .read_dir()
         .into_iter()
         .flatten()
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
     names.sort();
