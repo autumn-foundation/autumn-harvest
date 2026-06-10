@@ -1759,6 +1759,34 @@ impl HistoryMatcher {
         HistoryMatch::NoMatch
     }
 
+    /// Settle the bookkeeping for a signal-branch win of a signal-or-deadline
+    /// race (issue #476): consume the winning `SignalReceived` event, consume
+    /// the stray `TimerFired` of the race timer if it is already recorded (if
+    /// the timer fires only after this replay cycle, the next full replay
+    /// re-runs the same scan and consumes it then), and settle the cursor on
+    /// the first interleaved sibling command, or just past the winning signal.
+    fn settle_race_signal_won(
+        &mut self,
+        signal_pos: usize,
+        first_interleaved_command: Option<usize>,
+        timer_id: &str,
+    ) {
+        self.consumed_signal_events.insert(signal_pos);
+        let mut fired_scan = signal_pos + 1;
+        while fired_scan < self.events.len() {
+            if !self.is_consumed(fired_scan)
+                && let WorkflowEvent::TimerFired { timer_id: id } = &self.events[fired_scan]
+                && id.as_str() == timer_id
+            {
+                self.consumed_out_of_order_events.insert(fired_scan);
+                break;
+            }
+            fired_scan += 1;
+        }
+        self.cursor = first_interleaved_command.unwrap_or_else(|| signal_pos.saturating_add(1));
+        self.advance_to_next_unconsumed_event();
+    }
+
     /// Match a signal-vs-deadline race against history (issue #476).
     ///
     /// The race composes the existing `TimerStarted`/`TimerFired` and
@@ -1787,12 +1815,17 @@ impl HistoryMatcher {
         let replaying = self.prepare_match();
 
         // A signal stashed by an earlier scan — or drained by prepare_match
-        // just now — arrived before this race point in recorded history. The
-        // signal wins and the timer was never started on the matching live run.
+        // just now — whose recorded position precedes this race point arrived
+        // before the race started: the signal wins and the timer was never
+        // started on the matching live run. Stashed signals recorded at or
+        // after the race point must NOT short-circuit here — history order
+        // decides, so they compete at their recorded index during the scan
+        // below.
+        let race_pos = self.cursor;
         if let Some(index) = self
             .pending_signals
             .iter()
-            .position(|(name, _, _)| name == signal_name)
+            .position(|(name, _, idx)| name == signal_name && *idx < race_pos)
             && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
         {
             return SignalOrTimerMatch::SignalWon { payload };
@@ -1836,6 +1869,19 @@ impl HistoryMatcher {
 
         while scan_cursor < self.events.len() {
             if self.is_consumed(scan_cursor) {
+                // A matching signal stashed by a sibling scan (consumed but
+                // still undelivered in the pending buffer) competes at its
+                // recorded position: if it precedes the race's TimerFired in
+                // history, the signal branch wins.
+                if let Some(index) = self
+                    .pending_signals
+                    .iter()
+                    .position(|(name, _, idx)| *idx == scan_cursor && name == signal_name)
+                    && let Some((_name, payload, _idx)) = self.pending_signals.remove(index)
+                {
+                    self.settle_race_signal_won(scan_cursor, first_interleaved_command, timer_id);
+                    return SignalOrTimerMatch::SignalWon { payload };
+                }
                 scan_cursor += 1;
                 continue;
             }
@@ -1846,27 +1892,7 @@ impl HistoryMatcher {
                     payload,
                 } if recorded_name == signal_name => {
                     let payload = payload.clone();
-                    self.consumed_signal_events.insert(scan_cursor);
-                    // The durable timer may still fire after the signal won;
-                    // consume the stray TimerFired so later matches do not
-                    // diverge against it. (If the timer fires only after this
-                    // replay cycle, the next full replay re-runs this same
-                    // scan and consumes it then.)
-                    let mut fired_scan = scan_cursor + 1;
-                    while fired_scan < self.events.len() {
-                        if !self.is_consumed(fired_scan)
-                            && let WorkflowEvent::TimerFired { timer_id: id } =
-                                &self.events[fired_scan]
-                            && id.as_str() == timer_id
-                        {
-                            self.consumed_out_of_order_events.insert(fired_scan);
-                            break;
-                        }
-                        fired_scan += 1;
-                    }
-                    self.cursor =
-                        first_interleaved_command.unwrap_or_else(|| scan_cursor.saturating_add(1));
-                    self.advance_to_next_unconsumed_event();
+                    self.settle_race_signal_won(scan_cursor, first_interleaved_command, timer_id);
                     return SignalOrTimerMatch::SignalWon { payload };
                 }
 
@@ -4797,6 +4823,100 @@ mod tests {
         assert!(
             matcher.has_non_lifecycle_unconsumed(),
             "an unconsumed signal with no race must still be flagged"
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_stashed_signal_after_fire_does_not_win() {
+        // A sibling race's scan stashes an "approval" that was recorded AFTER
+        // this race's TimerFired. The stash must not override recorded history
+        // order: the timer won, and the late approval stays deliverable.
+        let r1 = TimerId::new("__signal_timeout:1:other");
+        let r2 = TimerId::new("__signal_timeout:2:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: r1.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: r2.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: r2.clone(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: r1.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        // Race 1 ("other") scans across the whole history, stashing the
+        // non-matching "approval" recorded at index 3.
+        let first = matcher.match_signal_or_timer("other", r1.as_str(), Some(300));
+        assert_eq!(first, SignalOrTimerMatch::TimerWon);
+
+        // Race 2 ("approval"): its TimerFired (index 2) precedes the stashed
+        // approval (index 3) — the timer won by history order.
+        let second = matcher.match_signal_or_timer("approval", r2.as_str(), Some(300));
+        assert_eq!(second, SignalOrTimerMatch::TimerWon);
+
+        // The late approval remains deliverable to a subsequent wait.
+        let late = matcher.match_signal("approval");
+        assert_eq!(
+            late,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"approved": true})
+            }
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_stashed_signal_before_fire_still_wins() {
+        // The mirror case: the stashed approval was recorded BEFORE this
+        // race's TimerFired, so the signal branch wins even though a sibling
+        // scan moved the event into the pending stash.
+        let r1 = TimerId::new("__signal_timeout:1:other");
+        let r2 = TimerId::new("__signal_timeout:2:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: r1.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: r2.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: r2.clone(),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: r1.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let first = matcher.match_signal_or_timer("other", r1.as_str(), Some(300));
+        assert_eq!(first, SignalOrTimerMatch::TimerWon);
+
+        let second = matcher.match_signal_or_timer("approval", r2.as_str(), Some(300));
+        assert_eq!(
+            second,
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": true})
+            }
+        );
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "winning signal and both timer events must all be settled"
         );
     }
 
