@@ -96,7 +96,9 @@ const HARVEST_INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql")
+    include_str!(
+        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
+    )
 );
 
 #[derive(Debug, QueryableByName)]
