@@ -24,9 +24,20 @@ macro_rules! cfg_db {
     ($($item:item)*) => {};
 }
 
+/// The set of migrations currently embedded by `embed_migrations!()`. Keyed
+/// at compile time by `HARVEST_MIGRATIONS_LIST` (set by `build.rs`) so that
+/// adding or removing a migration directory invalidates the cached artifact
+/// and forces a fresh `embed_migrations!()` expansion.
 #[cfg(feature = "db")]
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
+
+// Consume the env var emitted by build.rs so that Cargo recompiles this
+// crate (and re-runs embed_migrations!()) whenever a migration is added or
+// removed — even when only the migrations/ directory changed and no Rust
+// source file was edited.
+#[cfg(feature = "db")]
+const _MIGRATIONS_LIST: &str = env!("HARVEST_MIGRATIONS_LIST");
 
 /// Admission gate primitive for incident-response operators (issue #377).
 pub mod admission_gate;
