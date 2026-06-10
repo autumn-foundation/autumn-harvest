@@ -16,4 +16,11 @@ async fn bypass_workflow(ctx: &WorkflowContext) -> Result<(), String> {
     Ok(())
 }
 
+#[workflow]
+async fn renamed_context_workflow(context: &WorkflowContext) -> Result<(), String> {
+    let _ = context.side_effect("test_id", || rand::random::<u64>());
+    Ok(())
+}
+
 fn main() {}
+

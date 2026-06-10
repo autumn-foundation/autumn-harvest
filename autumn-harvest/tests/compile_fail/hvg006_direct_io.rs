@@ -1,5 +1,10 @@
 use autumn_harvest::prelude::*;
 
+struct Command;
+impl Command {
+    fn new(_: &str) -> Self { Self }
+}
+
 #[workflow]
 async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
     let _ = std::fs::read_to_string("config.json");
@@ -11,6 +16,12 @@ async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
     
     // std::net::TcpStream connect (blocked)
     let _ = std::net::TcpStream::connect("127.0.0.1:8080");
+    
+    // Custom Command::new constructor (allowed)
+    let _ = Command::new("custom");
+    
+    // std::process::Command::new (blocked)
+    let _ = std::process::Command::new("ls");
     
     Ok(())
 }

@@ -22,6 +22,7 @@ pub struct DeterminismVisitor {
     pub findings: Vec<LinterFinding>,
     catalog: HashMap<String, RuleInfo>,
     in_await_condition_closure: bool,
+    pub context_param_name: Option<String>,
 }
 
 impl DeterminismVisitor {
@@ -31,6 +32,7 @@ impl DeterminismVisitor {
             findings: Vec::new(),
             catalog,
             in_await_condition_closure: false,
+            context_param_name: None,
         }
     }
 
@@ -65,6 +67,7 @@ fn path_to_string(path: &syn::Path) -> String {
 }
 
 impl<'ast> Visit<'ast> for DeterminismVisitor {
+    #[allow(clippy::too_many_lines)]
     fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
         if let Expr::Path(expr_path) = &*i.func {
             let path_str = path_to_string(&expr_path.path);
@@ -94,6 +97,18 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
                 || path_str == "uuid::Uuid::new_v4"
                 || path_str == "Uuid::now_v7"
                 || path_str == "uuid::Uuid::now_v7"
+                || path_str.starts_with("rand::Rng::")
+                || path_str.starts_with("Rng::")
+                || (path_str.starts_with("rand::")
+                    && (path_str.ends_with("::gen")
+                        || path_str.ends_with("::r#gen")
+                        || path_str.ends_with("::gen_range")
+                        || path_str.ends_with("::r#gen_range")
+                        || path_str.ends_with("::gen_bool")
+                        || path_str.ends_with("::gen_ratio")
+                        || path_str.ends_with("::sample")
+                        || path_str.ends_with("::fill")
+                        || path_str.ends_with("::try_fill")))
             {
                 self.add_finding(
                     "HVG002",
@@ -164,7 +179,6 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
                 || path_str.starts_with("sqlx::")
                 || path_str.starts_with("tonic::")
                 || path_str.starts_with("tokio_postgres::")
-                || path_str == "Command::new"
                 || path_str == "std::process::Command::new"
             {
                 self.add_finding(
@@ -202,19 +216,20 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
         // HVG002: Randomness method calls (gen, gen_range, etc. on Rng trait)
         let method_str = i.method.to_string();
         if method_str == "gen"
+            || method_str == "r#gen"
             || method_str == "gen_range"
+            || method_str == "r#gen_range"
             || method_str == "gen_bool"
             || method_str == "gen_ratio"
-            || method_str == "sample"
-            || method_str == "fill"
-            || method_str == "try_fill"
         {
             self.add_finding("HVG002", i.method.span());
         }
 
         let is_ctx_side_effect = if i.method == "side_effect" {
             if let syn::Expr::Path(expr_path) = &*i.receiver {
-                expr_path.path.is_ident("ctx")
+                self.context_param_name
+                    .as_ref()
+                    .map_or_else(|| expr_path.path.is_ident("ctx"), |ctx_name| expr_path.path.is_ident(ctx_name))
             } else {
                 false
             }
@@ -265,6 +280,9 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
         let path_str = path_to_string(i);
         if path_str == "rand::rngs::OsRng" || path_str == "OsRng" {
             self.add_finding("HVG002", i.segments.last().unwrap().ident.span());
+        }
+        if path_str == "std::process::Command" {
+            self.add_finding("HVG006", i.segments.last().unwrap().ident.span());
         }
         syn::visit::visit_path(self, i);
     }

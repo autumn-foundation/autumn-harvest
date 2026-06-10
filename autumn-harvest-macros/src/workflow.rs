@@ -161,10 +161,21 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut warnings_tokens = quote! {};
 
+    let ctx_param_name = if let Some(syn::FnArg::Typed(pat_type)) = input_fn.sig.inputs.first() {
+        if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
+            Some(pat_ident.ident.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if !attrs.allow_nondeterministic_apis {
         use syn::visit::Visit as _;
         let catalog = crate::determinism_lint::load_catalog_metadata();
         let mut visitor = crate::determinism_lint::DeterminismVisitor::new(catalog);
+        visitor.context_param_name = ctx_param_name;
         visitor.visit_item_fn(&input_fn);
 
         let mut errors = Vec::new();

@@ -1,35 +1,42 @@
 error: [HVG006] Workflow determinism violation: Performing network requests (reqwest, hyper, tonic), database queries (sqlx, diesel, tokio-postgres), or filesystem I/O (std::fs, tokio::fs) directly inside a workflow body creates non-idempotent side-effects that are invisible to the event store. On replay the I/O is re-executed, potentially sending duplicate requests, corrupting database state, or failing because external state has changed.
        Alternative: Wrap all I/O in activities (#[activity]). Activities are the unit of durable, retryable side-effect in Harvest. Their inputs and outputs are recorded in harvest_events so the workflow can replay without re-executing I/O. Use ctx.execute_activity_raw(name, input, queue) from the workflow body to schedule the activity.
- --> tests/compile_fail/hvg006_direct_io.rs:5:22
-  |
-5 |     let _ = std::fs::read_to_string("config.json");
-  |                      ^^^^^^^^^^^^^^
-
-error: [HVG006] Workflow determinism violation: Performing network requests (reqwest, hyper, tonic), database queries (sqlx, diesel, tokio-postgres), or filesystem I/O (std::fs, tokio::fs) directly inside a workflow body creates non-idempotent side-effects that are invisible to the event store. On replay the I/O is re-executed, potentially sending duplicate requests, corrupting database state, or failing because external state has changed.
-       Alternative: Wrap all I/O in activities (#[activity]). Activities are the unit of durable, retryable side-effect in Harvest. Their inputs and outputs are recorded in harvest_events so the workflow can replay without re-executing I/O. Use ctx.execute_activity_raw(name, input, queue) from the workflow body to schedule the activity.
- --> tests/compile_fail/hvg006_direct_io.rs:6:41
-  |
-6 |     let _ = tonic::transport::Endpoint::from_shared("http://[::1]:50051");
-  |                                         ^^^^^^^^^^^
-
-error: [HVG006] Workflow determinism violation: Performing network requests (reqwest, hyper, tonic), database queries (sqlx, diesel, tokio-postgres), or filesystem I/O (std::fs, tokio::fs) directly inside a workflow body creates non-idempotent side-effects that are invisible to the event store. On replay the I/O is re-executed, potentially sending duplicate requests, corrupting database state, or failing because external state has changed.
-       Alternative: Wrap all I/O in activities (#[activity]). Activities are the unit of durable, retryable side-effect in Harvest. Their inputs and outputs are recorded in harvest_events so the workflow can replay without re-executing I/O. Use ctx.execute_activity_raw(name, input, queue) from the workflow body to schedule the activity.
- --> tests/compile_fail/hvg006_direct_io.rs:7:29
-  |
-7 |     let _ = tokio_postgres::connect("host=localhost user=postgres", tokio_postgres::NoTls);
-  |                             ^^^^^^^
-
-error: [HVG006] Workflow determinism violation: Performing network requests (reqwest, hyper, tonic), database queries (sqlx, diesel, tokio-postgres), or filesystem I/O (std::fs, tokio::fs) directly inside a workflow body creates non-idempotent side-effects that are invisible to the event store. On replay the I/O is re-executed, potentially sending duplicate requests, corrupting database state, or failing because external state has changed.
-       Alternative: Wrap all I/O in activities (#[activity]). Activities are the unit of durable, retryable side-effect in Harvest. Their inputs and outputs are recorded in harvest_events so the workflow can replay without re-executing I/O. Use ctx.execute_activity_raw(name, input, queue) from the workflow body to schedule the activity.
-  --> tests/compile_fail/hvg006_direct_io.rs:13:34
+  --> tests/compile_fail/hvg006_direct_io.rs:10:22
    |
-13 |     let _ = std::net::TcpStream::connect("127.0.0.1:8080");
+10 |     let _ = std::fs::read_to_string("config.json");
+   |                      ^^^^^^^^^^^^^^
+
+error: [HVG006] Workflow determinism violation: Performing network requests (reqwest, hyper, tonic), database queries (sqlx, diesel, tokio-postgres), or filesystem I/O (std::fs, tokio::fs) directly inside a workflow body creates non-idempotent side-effects that are invisible to the event store. On replay the I/O is re-executed, potentially sending duplicate requests, corrupting database state, or failing because external state has changed.
+       Alternative: Wrap all I/O in activities (#[activity]). Activities are the unit of durable, retryable side-effect in Harvest. Their inputs and outputs are recorded in harvest_events so the workflow can replay without re-executing I/O. Use ctx.execute_activity_raw(name, input, queue) from the workflow body to schedule the activity.
+  --> tests/compile_fail/hvg006_direct_io.rs:11:41
+   |
+11 |     let _ = tonic::transport::Endpoint::from_shared("http://[::1]:50051");
+   |                                         ^^^^^^^^^^^
+
+error: [HVG006] Workflow determinism violation: Performing network requests (reqwest, hyper, tonic), database queries (sqlx, diesel, tokio-postgres), or filesystem I/O (std::fs, tokio::fs) directly inside a workflow body creates non-idempotent side-effects that are invisible to the event store. On replay the I/O is re-executed, potentially sending duplicate requests, corrupting database state, or failing because external state has changed.
+       Alternative: Wrap all I/O in activities (#[activity]). Activities are the unit of durable, retryable side-effect in Harvest. Their inputs and outputs are recorded in harvest_events so the workflow can replay without re-executing I/O. Use ctx.execute_activity_raw(name, input, queue) from the workflow body to schedule the activity.
+  --> tests/compile_fail/hvg006_direct_io.rs:12:29
+   |
+12 |     let _ = tokio_postgres::connect("host=localhost user=postgres", tokio_postgres::NoTls);
+   |                             ^^^^^^^
+
+error: [HVG006] Workflow determinism violation: Performing network requests (reqwest, hyper, tonic), database queries (sqlx, diesel, tokio-postgres), or filesystem I/O (std::fs, tokio::fs) directly inside a workflow body creates non-idempotent side-effects that are invisible to the event store. On replay the I/O is re-executed, potentially sending duplicate requests, corrupting database state, or failing because external state has changed.
+       Alternative: Wrap all I/O in activities (#[activity]). Activities are the unit of durable, retryable side-effect in Harvest. Their inputs and outputs are recorded in harvest_events so the workflow can replay without re-executing I/O. Use ctx.execute_activity_raw(name, input, queue) from the workflow body to schedule the activity.
+  --> tests/compile_fail/hvg006_direct_io.rs:18:34
+   |
+18 |     let _ = std::net::TcpStream::connect("127.0.0.1:8080");
    |                                  ^^^^^^^
 
+error: [HVG006] Workflow determinism violation: Performing network requests (reqwest, hyper, tonic), database queries (sqlx, diesel, tokio-postgres), or filesystem I/O (std::fs, tokio::fs) directly inside a workflow body creates non-idempotent side-effects that are invisible to the event store. On replay the I/O is re-executed, potentially sending duplicate requests, corrupting database state, or failing because external state has changed.
+       Alternative: Wrap all I/O in activities (#[activity]). Activities are the unit of durable, retryable side-effect in Harvest. Their inputs and outputs are recorded in harvest_events so the workflow can replay without re-executing I/O. Use ctx.execute_activity_raw(name, input, queue) from the workflow body to schedule the activity.
+  --> tests/compile_fail/hvg006_direct_io.rs:24:36
+   |
+24 |     let _ = std::process::Command::new("ls");
+   |                                    ^^^
+
 warning: unused variable: `ctx`
- --> tests/compile_fail/hvg006_direct_io.rs:4:23
+ --> tests/compile_fail/hvg006_direct_io.rs:9:23
   |
-4 | async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
+9 | async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
   |                       ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
   |
-  = note: `#[warn(unused_variables)]` on by default
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
