@@ -1771,10 +1771,10 @@ fn signal_or_deadline_workflow<'a>(
             .wait_for_signal_timeout("approval", std::time::Duration::from_secs(300))
             .await
             .map_err(|e| e.to_string())?;
-        match decision {
-            Some(payload) => Ok(serde_json::json!({"approved": payload})),
-            None => Ok(serde_json::json!({"escalated": true})),
-        }
+        Ok(decision.map_or_else(
+            || serde_json::json!({"escalated": true}),
+            |payload| serde_json::json!({"approved": payload}),
+        ))
     })
 }
 

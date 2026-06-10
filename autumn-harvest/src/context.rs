@@ -2835,8 +2835,11 @@ impl WorkflowContext {
             *seq
         };
         let timer_id = format!("__signal_timeout:{seq}:{signal_name}");
-        // Round up so a sub-second timeout still arms a durable timer.
-        let duration_secs = timeout.as_secs() + u64::from(timeout.subsec_nanos() > 0);
+        // Round up so a sub-second timeout still arms a durable timer
+        // (saturating: Duration::MAX must not overflow u64 seconds).
+        let duration_secs = timeout
+            .as_secs()
+            .saturating_add(u64::from(timeout.subsec_nanos() > 0));
 
         let history_match = self.match_history(|m| {
             m.match_signal_or_timer(signal_name, &timer_id, Some(duration_secs))

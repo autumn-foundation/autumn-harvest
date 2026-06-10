@@ -1039,10 +1039,10 @@ fn approval_with_timeout_workflow<'a>(
             .receive_signal_timeout("approval", std::time::Duration::from_secs(3600))
             .await
             .map_err(|e| e.to_string())?;
-        match decision {
-            Some(payload) => Ok(json!({"outcome": "decided", "payload": payload})),
-            None => Ok(json!({"outcome": "auto_rejected"})),
-        }
+        Ok(decision.map_or_else(
+            || json!({"outcome": "auto_rejected"}),
+            |payload| json!({"outcome": "decided", "payload": payload}),
+        ))
     })
 }
 

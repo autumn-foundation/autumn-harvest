@@ -1870,9 +1870,34 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
 
+                // Concurrent commands (tokio::join! siblings) can interleave
+                // with the pending race. Keep the first one as the next replay
+                // cursor — mirroring scan_activity_terminal — and scan past it
+                // so a resolution event recorded later is still found.
                 WorkflowEvent::ChildWorkflowStarted { .. }
-                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. } => {
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::TimerStarted { .. } => {
                     first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+
+                // Progress and terminal events of those concurrent siblings
+                // (and fires of foreign timers) are transparent to the race
+                // scan — their own matchers consume them after the rewind.
+                WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::TimerFired { .. } => {
                     scan_cursor += 1;
                 }
 
@@ -1917,7 +1942,13 @@ impl HistoryMatcher {
             }
         }
 
-        // Timer started but neither resolution event is recorded yet.
+        // Timer started but neither resolution event is recorded yet. Rewind
+        // to the first interleaved command so a concurrent sibling's matcher
+        // still finds its own events.
+        if let Some(command_cursor) = first_interleaved_command {
+            self.cursor = command_cursor;
+            self.advance_to_next_unconsumed_event();
+        }
         SignalOrTimerMatch::InProgress
     }
 
@@ -4386,6 +4417,167 @@ mod tests {
                 output: serde_json::json!(1)
             },
             "non-matching signals scanned during the race must be stashed"
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_signal_wins_across_interleaved_activity() {
+        // tokio::join!(receive_signal_timeout, execute_activity): the sibling
+        // activity's Scheduled event is interleaved between TimerStarted and
+        // the race resolution. The scan must skip it (tracking it as the next
+        // replay cursor) instead of reporting the race as still in progress.
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "audit_log".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("logged"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(
+            result,
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": true})
+            }
+        );
+
+        // The cursor must rewind to the interleaved command so the join
+        // sibling can match its own activity.
+        let activity = matcher.match_activity("audit_log");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!("logged")
+            }
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_timer_wins_across_interleaved_activity() {
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "audit_log".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("logged"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(result, SignalOrTimerMatch::TimerWon);
+
+        let activity = matcher.match_activity("audit_log");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!("logged")
+            }
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_in_progress_rewinds_to_interleaved_command() {
+        // The race is unresolved but a concurrent activity already has events
+        // in history: InProgress must leave the cursor on the interleaved
+        // command so the sibling matcher still finds it.
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "audit_log".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("logged"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(result, SignalOrTimerMatch::InProgress);
+
+        let activity = matcher.match_activity("audit_log");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!("logged")
+            }
+        );
+    }
+
+    #[test]
+    fn signal_or_timer_scans_past_interleaved_bookkeeping_and_sibling_timer() {
+        // Markers, side effects, and a sibling timer from concurrent branches
+        // must not hide the race resolution.
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let sibling_timer = TimerId::new("cooldown");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "fan_out:1".into(),
+                details: Value::Null,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: sibling_timer.clone(),
+                duration_secs: 60,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: sibling_timer,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(
+            result,
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": true})
+            }
         );
     }
 
