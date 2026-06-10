@@ -1581,6 +1581,23 @@ fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
     seed
 }
 
+/// Read the current time from the database clock (`NOW()`).
+///
+/// Timer due-ness checks and the signal `received_at` column default both use
+/// Postgres `NOW()`, so deadlines derived from this clock stay comparable to
+/// them regardless of worker clock skew.
+async fn db_clock_now(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<chrono::DateTime<chrono::Utc>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::Timestamptz;
+
+    diesel::select(sql::<Timestamptz>("NOW()"))
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 pub(crate) fn chrono_duration_from_secs(
     seconds: u64,
     field_name: &str,
@@ -2469,7 +2486,12 @@ async fn persist_started_timer(
         ext.fires_at
     } else {
         let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
-        chrono::Utc::now() + fire_delay
+        // Anchor the deadline to the database clock: timer due-ness and the
+        // signal `received_at` default both come from Postgres NOW(), so the
+        // chronological wake ingest (merge_wake_events) compares timestamps
+        // from a single clock regardless of worker clock skew.
+        let db_now = db_clock_now(conn).await?;
+        db_now + fire_delay
     };
 
     let is_new = existing.is_none();

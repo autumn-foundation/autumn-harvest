@@ -10,7 +10,7 @@
 //! it directly, avoiding duplicate side effects.
 
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::TimeoutType;
 use crate::event::{SideEffectKind, WorkflowEvent};
@@ -230,15 +230,18 @@ pub struct HistoryMatcher {
     /// they have no workflow-command counterpart and must never flag
     /// non-determinism, so every scan loop skips them via [`Self::is_consumed`].
     transparent_events: HashSet<usize>,
-    /// Signal names that lost a signal-or-deadline race (issue #476): a
-    /// matching `SignalReceived` was recorded *after* the race's `TimerFired`.
-    /// Such a late signal is a normal production occurrence on the timeout
-    /// branch — the workflow may intentionally never consume it — so
-    /// [`Self::has_non_lifecycle_unconsumed`] must not report it as
-    /// early-completion non-determinism. It stays deliverable to any
-    /// subsequent signal wait (the exemption only suppresses the
-    /// completed-history check, never consumption).
-    late_race_signals: HashSet<String>,
+    /// Per-name budget of signals excused by a lost signal-or-deadline race
+    /// (issue #476): each race whose `TimerFired` precedes a matching
+    /// `SignalReceived` excuses exactly **one** unconsumed occurrence of that
+    /// signal name. Such a late signal is a normal production occurrence on
+    /// the timeout branch — the workflow may intentionally never consume it —
+    /// so [`Self::has_non_lifecycle_unconsumed`] must not report it as
+    /// early-completion non-determinism. Occurrences beyond the budget (e.g.
+    /// a second same-name signal whose wait was removed by a code change)
+    /// still flag. The excused signal stays deliverable to any subsequent
+    /// signal wait (the exemption only suppresses the completed-history
+    /// check, never consumption).
+    late_race_signals: HashMap<String, u32>,
 }
 
 impl HistoryMatcher {
@@ -262,7 +265,7 @@ impl HistoryMatcher {
             pending_signals: VecDeque::new(),
             pending_external_signals: Vec::new(),
             transparent_events,
-            late_race_signals: HashSet::new(),
+            late_race_signals: HashMap::new(),
         }
     }
 
@@ -746,42 +749,50 @@ impl HistoryMatcher {
     /// without this additional check.
     #[must_use]
     pub fn has_non_lifecycle_unconsumed(&self) -> bool {
+        // Each lost signal-or-deadline race (issue #476) excuses exactly one
+        // unconsumed occurrence of its signal name; spend that budget as
+        // unconsumed signals are encountered so occurrences beyond it (e.g. a
+        // second same-name signal whose wait was removed by a code change)
+        // still flag.
+        let mut late_race_budget = self.late_race_signals.clone();
+        let mut excuse_signal = |name: &str| -> bool {
+            late_race_budget.get_mut(name).is_some_and(|budget| {
+                if *budget > 0 {
+                    *budget -= 1;
+                    true
+                } else {
+                    false
+                }
+            })
+        };
+
         let mut cursor = self.cursor;
         while cursor < self.events.len() {
             if !self.is_consumed(cursor)
                 && !self.events[cursor].is_terminal_lifecycle()
                 && !Self::is_update_event(&self.events[cursor])
-                && !self.is_late_race_signal(&self.events[cursor])
             {
-                return true;
+                match &self.events[cursor] {
+                    WorkflowEvent::SignalReceived { signal_name, .. }
+                        if excuse_signal(signal_name) => {}
+                    _ => return true,
+                }
             }
             cursor += 1;
         }
         // Signals buffered early (via drain_early_signals) that were never
-        // consumed by wait_for_signal represent unconsumed history. Signals
-        // that lost a signal-or-deadline race (issue #476) are exempt: the
-        // timeout branch may intentionally never consume them.
+        // consumed by wait_for_signal represent unconsumed history, except
+        // for occurrences excused by a lost race.
         if self
             .pending_signals
             .iter()
-            .any(|(name, _)| !self.late_race_signals.contains(name))
+            .any(|(name, _)| !excuse_signal(name))
         {
             return true;
         }
         // External signals drained early that were never consumed by
         // signal_external_workflow represent unconsumed history.
         !self.pending_external_signals.is_empty()
-    }
-
-    /// Returns `true` for a `SignalReceived` event whose name lost a
-    /// signal-or-deadline race (issue #476) and is therefore exempt from the
-    /// completed-history unconsumed check.
-    fn is_late_race_signal(&self, event: &WorkflowEvent) -> bool {
-        matches!(
-            event,
-            WorkflowEvent::SignalReceived { signal_name, .. }
-                if self.late_race_signals.contains(signal_name)
-        )
     }
 
     /// Current cursor position in the event list.
@@ -1880,7 +1891,10 @@ impl HistoryMatcher {
                         |ev| matches!(ev, WorkflowEvent::SignalReceived { signal_name: n, .. } if n == signal_name),
                     );
                     if lost_signal_exists {
-                        self.late_race_signals.insert(signal_name.to_string());
+                        *self
+                            .late_race_signals
+                            .entry(signal_name.to_string())
+                            .or_insert(0) += 1;
                     }
                     if let Some(command_cursor) = first_interleaved_command {
                         self.consumed_out_of_order_events.insert(scan_cursor);
@@ -4697,6 +4711,76 @@ mod tests {
         assert!(
             !matcher.has_non_lifecycle_unconsumed(),
             "a stashed late race signal must not flag the completed history"
+        );
+    }
+
+    #[test]
+    fn late_race_exemption_is_scoped_to_one_occurrence() {
+        // One race loss excuses exactly one unconsumed signal of that name. A
+        // second same-name signal whose wait was removed/skipped must still be
+        // reported as non-determinism.
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"n": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"n": 2}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(result, SignalOrTimerMatch::TimerWon);
+
+        assert!(
+            matcher.has_non_lifecycle_unconsumed(),
+            "only one approval lost the race — the second unconsumed approval must flag"
+        );
+    }
+
+    #[test]
+    fn late_race_exemption_accounts_for_a_consumed_sibling() {
+        // Two same-name signals: the race excuses one, a later wait consumes
+        // one — everything is accounted for, the history must pass.
+        let timer_id = TimerId::new("__signal_timeout:1:approval");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"n": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"n": 2}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let result = matcher.match_signal_or_timer("approval", timer_id.as_str(), Some(300));
+        assert_eq!(result, SignalOrTimerMatch::TimerWon);
+
+        let consumed = matcher.match_signal("approval");
+        assert!(matches!(consumed, HistoryMatch::Matched { .. }));
+
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "one excused by the race + one consumed by a wait must pass"
         );
     }
 
