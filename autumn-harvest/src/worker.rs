@@ -2596,7 +2596,31 @@ async fn persist_started_timer(
         .scope_boxed()
     })
     .instrument(span)
-    .await
+    .await?;
+
+    // A signal may have arrived while this task was actively running (before
+    // the park above). `send_signal` would have called `wake_workflow_task` at
+    // that point but found neither a parked row nor a pending
+    // mixed_signal_suspension row to pull forward — so without this re-check a
+    // signal-or-deadline wait would sleep until `fires_at` even though its
+    // signal already arrived. Mirror persist_signal_wait_park: re-check now
+    // that the mixed park is committed and self-wake if signals are pending.
+    //
+    // Safety: if a new signal arrives *after* this check returns empty, its
+    // `send_signal` caller will call `wake_workflow_task` and find the
+    // committed PENDING mixed_signal_suspension row — so the wake is
+    // guaranteed regardless of timing. Pure timer sleeps (no WaitForSignal in
+    // the batch) are excluded: a pending signal must not fire a timer early.
+    let waits_on_signal = commands
+        .iter()
+        .any(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }));
+    if waits_on_signal {
+        let pending = signal::load_pending_signals(conn, exec_id).await?;
+        if !pending.is_empty() {
+            queue::wake_workflow_task(conn, exec_id).await?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
