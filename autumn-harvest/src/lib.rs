@@ -24,10 +24,6 @@ macro_rules! cfg_db {
     ($($item:item)*) => {};
 }
 
-/// The set of migrations currently embedded by `embed_migrations!()`. Keyed
-/// at compile time by `HARVEST_MIGRATIONS_LIST` (set by `build.rs`) so that
-/// adding or removing a migration directory invalidates the cached artifact
-/// and forces a fresh `embed_migrations!()` expansion.
 #[cfg(feature = "db")]
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
