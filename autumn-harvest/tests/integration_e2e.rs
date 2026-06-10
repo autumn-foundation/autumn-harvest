@@ -115,7 +115,9 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
     include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
     "\n",
-    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql")
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -168,6 +170,7 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS pause_reason TEXT NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS pause_actor TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS current_details TEXT NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return

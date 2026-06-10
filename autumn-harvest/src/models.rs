@@ -110,6 +110,9 @@ pub struct WorkflowExecution {
     pub pause_reason: Option<String>,
     /// Identity that requested the active pause (issue #383).
     pub pause_actor: Option<String>,
+    /// Last-write-wins human-readable status string set by the workflow author
+    /// via `ctx.set_current_details(...)` (issue #473). `None` = never set.
+    pub current_details: Option<String>,
 }
 
 /// Insert struct for creating a new workflow execution.

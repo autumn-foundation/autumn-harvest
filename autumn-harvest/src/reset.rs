@@ -1078,6 +1078,7 @@ mod tests {
             paused_at: Some(Utc::now()),
             pause_reason: Some("operator pause".into()),
             pause_actor: Some("oncall".into()),
+            current_details: None,
         }
     }
 
