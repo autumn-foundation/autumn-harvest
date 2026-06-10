@@ -54,7 +54,7 @@
 //! ## Upper bound on simultaneous gates
 //!
 //! [`MAX_ACTIVE_GATES`] documents the supported maximum. Exceeding it returns
-//! [`TooManyGates`](GateCreateError::TooManyGates) rather than silently
+//! `` `GateCreateError::TooManyGates` `` rather than silently
 //! accepting the gate.
 
 use chrono::{DateTime, Utc};

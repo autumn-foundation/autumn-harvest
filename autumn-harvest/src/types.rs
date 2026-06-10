@@ -769,7 +769,7 @@ impl fmt::Display for IdempotencyKey {
 /// execution-timeout).
 ///
 /// This is only relevant for children spawned via
-/// [`WorkflowContext::spawn_child_workflow_detached_raw`]. Children spawned via
+/// [`spawn_child_workflow_detached_raw`](crate::context::WorkflowContext::spawn_child_workflow_detached_raw). Children spawned via
 /// the await path (`spawn_child_workflow_raw`) pin the parent alive until the
 /// child terminates — no cascade policy is needed.
 ///

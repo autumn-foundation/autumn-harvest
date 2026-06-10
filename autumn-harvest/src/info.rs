@@ -181,7 +181,7 @@ pub struct WorkflowInfo {
     /// endpoint accepts any JSON value without validation.
     ///
     /// Set via [`with_input_schema_fn`](Self::with_input_schema_fn) or the
-    /// `schema` feature's [`with_schemas`](Self::with_schemas) method.
+    /// `schema` feature's `` `with_schemas` `` method.
     pub input_schema: Option<fn() -> serde_json::Value>,
     /// Optional JSON Schema describing the workflow's success output type.
     pub output_schema: Option<fn() -> serde_json::Value>,
@@ -691,9 +691,9 @@ pub struct DagInfo {
     /// disables jitter (default — today's behaviour).
     pub jitter: Duration,
     /// What to do when a new firing collides with a still-running execution.
-    /// Defaults to [`OverlapPolicy::Skip`].
+    /// Defaults to [`OverlapPolicy::Skip`](crate::policy::OverlapPolicy::Skip).
     pub overlap_policy: crate::policy::OverlapPolicy,
-    /// Maximum buffered slots under [`OverlapPolicy::BufferAll`]. Default 100.
+    /// Maximum buffered slots under [`OverlapPolicy::BufferAll`](crate::policy::OverlapPolicy::BufferAll). Default 100.
     pub buffer_all_max: u32,
     /// Team owner metadata (issue #372).
     pub owner: Option<&'static str>,
