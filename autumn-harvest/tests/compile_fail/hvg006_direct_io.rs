@@ -5,6 +5,13 @@ async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
     let _ = std::fs::read_to_string("config.json");
     let _ = tonic::transport::Endpoint::from_shared("http://[::1]:50051");
     let _ = tokio_postgres::connect("host=localhost user=postgres", tokio_postgres::NoTls);
+    
+    // std::net::Ipv4Addr constructor (deterministic, allowed)
+    let _ip = std::net::Ipv4Addr::new(127, 0, 0, 1);
+    
+    // std::net::TcpStream connect (blocked)
+    let _ = std::net::TcpStream::connect("127.0.0.1:8080");
+    
     Ok(())
 }
 
@@ -25,4 +32,5 @@ mod tokio_postgres {
 }
 
 fn main() {}
+
 

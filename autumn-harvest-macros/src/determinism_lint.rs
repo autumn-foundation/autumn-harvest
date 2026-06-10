@@ -143,8 +143,21 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             if path_str.starts_with("std::fs::")
                 || path_str.starts_with("fs::")
                 || path_str.starts_with("tokio::fs::")
-                || path_str.starts_with("std::net::")
-                || path_str.starts_with("tokio::net::")
+                || path_str.starts_with("std::net::TcpStream::")
+                || path_str.starts_with("std::net::TcpListener::")
+                || path_str.starts_with("std::net::UdpSocket::")
+                || path_str.starts_with("tokio::net::TcpStream::")
+                || path_str.starts_with("tokio::net::TcpListener::")
+                || path_str.starts_with("tokio::net::UdpSocket::")
+                || path_str.starts_with("tokio::net::UnixStream::")
+                || path_str.starts_with("tokio::net::UnixListener::")
+                || path_str.starts_with("tokio::net::UnixDatagram::")
+                || path_str == "TcpStream::connect"
+                || path_str == "TcpListener::bind"
+                || path_str == "UdpSocket::bind"
+                || path_str == "UnixStream::connect"
+                || path_str == "UnixListener::bind"
+                || path_str == "UnixDatagram::bind"
                 || path_str.starts_with("reqwest::")
                 || path_str.starts_with("hyper::")
                 || path_str.starts_with("diesel::")
@@ -186,8 +199,31 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             self.in_await_condition_closure = true;
         }
 
+        // HVG002: Randomness method calls (gen, gen_range, etc. on Rng trait)
+        let method_str = i.method.to_string();
+        if method_str == "gen"
+            || method_str == "gen_range"
+            || method_str == "gen_bool"
+            || method_str == "gen_ratio"
+            || method_str == "sample"
+            || method_str == "fill"
+            || method_str == "try_fill"
+        {
+            self.add_finding("HVG002", i.method.span());
+        }
+
+        let is_ctx_side_effect = if i.method == "side_effect" {
+            if let syn::Expr::Path(expr_path) = &*i.receiver {
+                expr_path.path.is_ident("ctx")
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         // Delegate to nested traversal
-        if i.method == "side_effect" {
+        if is_ctx_side_effect {
             self.visit_expr(&i.receiver);
             if let Some(first_arg) = i.args.first() {
                 self.visit_expr(first_arg);
@@ -223,6 +259,14 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
 
         // Delegate to nested traversal
         syn::visit::visit_expr_macro(self, i);
+    }
+
+    fn visit_path(&mut self, i: &'ast syn::Path) {
+        let path_str = path_to_string(i);
+        if path_str == "rand::rngs::OsRng" || path_str == "OsRng" {
+            self.add_finding("HVG002", i.segments.last().unwrap().ident.span());
+        }
+        syn::visit::visit_path(self, i);
     }
 }
 

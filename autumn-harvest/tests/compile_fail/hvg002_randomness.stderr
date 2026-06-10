@@ -1,3 +1,14 @@
+error: expected identifier, found reserved keyword `gen`
+  --> tests/compile_fail/hvg002_randomness.rs:10:17
+   |
+10 |     let _ = rng.gen::<f64>();
+   |                 ^^^ expected identifier, found reserved keyword
+   |
+help: escape `gen` to use it as an identifier
+   |
+10 |     let _ = rng.r#gen::<f64>();
+   |                 ++
+
 error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::thread_rng(), Uuid::new_v4(), or any other source of randomness directly in a workflow body produces a different value on each replay pass. Since the workflow function is re-run from the top on every resume, the random sequence diverges from what was recorded in harvest_events.
        Alternative: Use the deterministic primitives on WorkflowContext, which capture the value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For cryptographically secure randomness, generate it inside an activity (ActivityContext) and return it as the durably-recorded activity result instead.
  --> tests/compile_fail/hvg002_randomness.rs:5:19
@@ -11,3 +22,34 @@ error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::th
   |
 6 |     let _ = ctx.side_effect(&rand::random::<u64>().to_string(), || 42);
   |                                    ^^^^^^
+
+error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::thread_rng(), Uuid::new_v4(), or any other source of randomness directly in a workflow body produces a different value on each replay pass. Since the workflow function is re-run from the top on every resume, the random sequence diverges from what was recorded in harvest_events.
+       Alternative: Use the deterministic primitives on WorkflowContext, which capture the value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For cryptographically secure randomness, generate it inside an activity (ActivityContext) and return it as the durably-recorded activity result instead.
+ --> tests/compile_fail/hvg002_randomness.rs:9:31
+  |
+9 |     let mut rng = rand::rngs::OsRng;
+  |                               ^^^^^
+
+error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::thread_rng(), Uuid::new_v4(), or any other source of randomness directly in a workflow body produces a different value on each replay pass. Since the workflow function is re-run from the top on every resume, the random sequence diverges from what was recorded in harvest_events.
+       Alternative: Use the deterministic primitives on WorkflowContext, which capture the value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For cryptographically secure randomness, generate it inside an activity (ActivityContext) and return it as the durably-recorded activity result instead.
+  --> tests/compile_fail/hvg002_randomness.rs:10:17
+   |
+10 |     let _ = rng.gen::<f64>();
+   |                 ^^^
+
+error[E0599]: no method named `r#gen` found for struct `OsRng` in the current scope
+  --> tests/compile_fail/hvg002_randomness.rs:10:17
+   |
+10 |     let _ = rng.gen::<f64>();
+   |                 ^^^ method not found in `OsRng`
+   |
+  ::: $CARGO/rand-$VERSION/src/rng.rs
+   |
+   |     fn gen<T>(&mut self) -> T
+   |        --- the method is available for `OsRng` here
+   |
+   = help: items from traits can only be used if the trait is in scope
+help: trait `Rng` which provides `r#gen` is implemented but not in scope; perhaps you want to import it
+   |
+1  + use rand::Rng;
+   |

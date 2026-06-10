@@ -13,6 +13,7 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/update_sync.rs");
     t.compile_fail("tests/compile_fail/hvg001_wallclock.rs");
     t.compile_fail("tests/compile_fail/hvg002_randomness.rs");
+    t.compile_fail("tests/compile_fail/hvg002_side_effect_escape.rs");
     t.compile_fail("tests/compile_fail/hvg003_process_env.rs");
     t.compile_fail("tests/compile_fail/hvg004_sleep_timer.rs");
     t.compile_fail("tests/compile_fail/hvg005_background_task.rs");
