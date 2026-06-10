@@ -72,6 +72,8 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             // HVG001: WallClock
             if path_str == "chrono::Utc::now"
                 || path_str == "Utc::now"
+                || path_str == "chrono::Local::now"
+                || path_str == "Local::now"
                 || path_str == "std::time::Instant::now"
                 || path_str == "Instant::now"
                 || path_str == "std::time::SystemTime::now"
@@ -147,6 +149,8 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
                 || path_str.starts_with("hyper::")
                 || path_str.starts_with("diesel::")
                 || path_str.starts_with("sqlx::")
+                || path_str.starts_with("tonic::")
+                || path_str.starts_with("tokio_postgres::")
                 || path_str == "Command::new"
                 || path_str == "std::process::Command::new"
             {
@@ -185,6 +189,9 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
         // Delegate to nested traversal
         if i.method == "side_effect" {
             self.visit_expr(&i.receiver);
+            if let Some(first_arg) = i.args.first() {
+                self.visit_expr(first_arg);
+            }
         } else {
             syn::visit::visit_expr_method_call(self, i);
         }

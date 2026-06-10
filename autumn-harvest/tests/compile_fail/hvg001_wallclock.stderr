@@ -5,10 +5,27 @@ error: [HVG001] Workflow determinism violation: Reading wall-clock time inside a
 5 |     let _ = chrono::Utc::now();
   |                          ^^^
 
-warning: unused variable: `ctx`
- --> tests/compile_fail/hvg001_wallclock.rs:4:23
+error: [HVG001] Workflow determinism violation: Reading wall-clock time inside a workflow (std::time::Instant::now(), SystemTime::now(), chrono::Utc::now(), etc.) produces a different value on every replay. The workflow engine re-executes the function body deterministically against recorded history; a fresh timestamp breaks that contract and causes a non-determinism error.
+       Alternative: Use ctx.now() (WorkflowContext) to read the workflow-logical clock, which returns the WorkflowStarted timestamp and replays identically on every subsequent run. For a real wall-clock instant captured at the call site (e.g. "skip the notification if the event is older than 24h *now*"), use ctx.system_now() -> DateTime<Utc> (or ctx.system_time_now() -> SystemTime), which captures the current time once and replays it deterministically via a recorded SideEffectRecorded event.
+ --> tests/compile_fail/hvg001_wallclock.rs:6:28
   |
-4 | async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
-  |                       ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+6 |     let _ = chrono::Local::now();
+  |                            ^^^
+
+error: [HVG001] Workflow determinism violation: Reading wall-clock time inside a workflow (std::time::Instant::now(), SystemTime::now(), chrono::Utc::now(), etc.) produces a different value on every replay. The workflow engine re-executes the function body deterministically against recorded history; a fresh timestamp breaks that contract and causes a non-determinism error.
+       Alternative: Use ctx.now() (WorkflowContext) to read the workflow-logical clock, which returns the WorkflowStarted timestamp and replays identically on every subsequent run. For a real wall-clock instant captured at the call site (e.g. "skip the notification if the event is older than 24h *now*"), use ctx.system_now() -> DateTime<Utc> (or ctx.system_time_now() -> SystemTime), which captures the current time once and replays it deterministically via a recorded SideEffectRecorded event.
+ --> tests/compile_fail/hvg001_wallclock.rs:7:20
   |
-  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+7 |     let _ = Local::now();
+  |                    ^^^
+
+error[E0433]: failed to resolve: use of undeclared type `Local`
+ --> tests/compile_fail/hvg001_wallclock.rs:7:13
+  |
+7 |     let _ = Local::now();
+  |             ^^^^^ use of undeclared type `Local`
+  |
+help: consider importing this struct
+  |
+1 + use chrono::Local;
+  |

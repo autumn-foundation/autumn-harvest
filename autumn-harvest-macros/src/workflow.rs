@@ -139,7 +139,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
 // Main macro
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(a) => a,

@@ -236,7 +236,7 @@ pub(crate) fn parse_and_validate_workflow_path(
         ));
     }
 
-    let workflow_simple_name = non_empty_parts.last().unwrap().to_string();
+    let workflow_simple_name = (*non_empty_parts.last().unwrap()).to_string();
     let module_parts = &non_empty_parts[..non_empty_parts.len() - 1];
 
     let mut path_tokens = Vec::new();
@@ -266,7 +266,7 @@ pub(crate) fn parse_and_validate_workflow_path(
         }
         let id = quote::format_ident!("{}", p);
         path_tokens.push(quote::quote! { #id });
-        original_module_parts.push(p.to_string());
+        original_module_parts.push((*p).to_string());
     }
 
     Ok(WorkflowPath {
