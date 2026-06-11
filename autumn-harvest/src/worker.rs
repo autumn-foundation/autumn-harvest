@@ -1581,6 +1581,23 @@ fn retry_stream_seed(task: &TaskQueueItem) -> u64 {
     seed
 }
 
+/// Read the current time from the database clock (`NOW()`).
+///
+/// Timer due-ness checks and the signal `received_at` column default both use
+/// Postgres `NOW()`, so deadlines derived from this clock stay comparable to
+/// them regardless of worker clock skew.
+async fn db_clock_now(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<chrono::DateTime<chrono::Utc>> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::Timestamptz;
+
+    diesel::select(sql::<Timestamptz>("NOW()"))
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 pub(crate) fn chrono_duration_from_secs(
     seconds: u64,
     field_name: &str,
@@ -2469,7 +2486,12 @@ async fn persist_started_timer(
         ext.fires_at
     } else {
         let fire_delay = chrono_duration_from_secs(timer.duration_secs, "timer duration")?;
-        chrono::Utc::now() + fire_delay
+        // Anchor the deadline to the database clock: timer due-ness and the
+        // signal `received_at` default both come from Postgres NOW(), so the
+        // chronological wake ingest (merge_wake_events) compares timestamps
+        // from a single clock regardless of worker clock skew.
+        let db_now = db_clock_now(conn).await?;
+        db_now + fire_delay
     };
 
     let is_new = existing.is_none();
@@ -2574,7 +2596,31 @@ async fn persist_started_timer(
         .scope_boxed()
     })
     .instrument(span)
-    .await
+    .await?;
+
+    // A signal may have arrived while this task was actively running (before
+    // the park above). `send_signal` would have called `wake_workflow_task` at
+    // that point but found neither a parked row nor a pending
+    // mixed_signal_suspension row to pull forward — so without this re-check a
+    // signal-or-deadline wait would sleep until `fires_at` even though its
+    // signal already arrived. Mirror persist_signal_wait_park: re-check now
+    // that the mixed park is committed and self-wake if signals are pending.
+    //
+    // Safety: if a new signal arrives *after* this check returns empty, its
+    // `send_signal` caller will call `wake_workflow_task` and find the
+    // committed PENDING mixed_signal_suspension row — so the wake is
+    // guaranteed regardless of timing. Pure timer sleeps (no WaitForSignal in
+    // the batch) are excluded: a pending signal must not fire a timer early.
+    let waits_on_signal = commands
+        .iter()
+        .any(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }));
+    if waits_on_signal {
+        let pending = signal::load_pending_signals(conn, exec_id).await?;
+        if !pending.is_empty() {
+            queue::wake_workflow_task(conn, exec_id).await?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2862,48 +2908,67 @@ async fn persist_all_started_child_workflows(
     .await
 }
 
-async fn ingest_pending_signals(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    next_event_id: i32,
-) -> HarvestResult<Vec<String>> {
-    let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
-    if pending_signals.is_empty() {
-        return Ok(vec![]);
+/// Chronologically interleave due timer fires and pending signals for a
+/// single wake-up ingest.
+///
+/// Recorded history order is the replay contract (issue #476): a signal
+/// received **strictly before** a timer's deadline must be appended before
+/// that timer's `TimerFired`, so a worker that claims the woken task late
+/// (after `fires_at`) does not retroactively flip a signal-or-deadline race
+/// to the timeout branch. A signal received at or after the deadline is
+/// appended after the fire (ties go to the timer — the deadline was reached).
+/// Relative order within each kind is preserved (`fires_at` for timers,
+/// `received_at` for signals — the orders their loaders return).
+fn merge_wake_events(
+    due_timers: Vec<(TimerId, chrono::DateTime<chrono::Utc>)>,
+    pending_signals: Vec<(String, serde_json::Value, chrono::DateTime<chrono::Utc>)>,
+) -> Vec<WorkflowEvent> {
+    let mut events = Vec::with_capacity(due_timers.len() + pending_signals.len());
+    let mut timers = due_timers.into_iter().peekable();
+    let mut signals = pending_signals.into_iter().peekable();
+
+    loop {
+        match (timers.peek(), signals.peek()) {
+            (Some((_, fires_at)), Some((_, _, received_at))) => {
+                if received_at < fires_at {
+                    let (signal_name, payload, _) = signals.next().expect("peeked");
+                    events.push(WorkflowEvent::SignalReceived {
+                        signal_name,
+                        payload,
+                    });
+                } else {
+                    let (timer_id, _) = timers.next().expect("peeked");
+                    events.push(WorkflowEvent::TimerFired { timer_id });
+                }
+            }
+            (Some(_), None) => {
+                let (timer_id, _) = timers.next().expect("peeked");
+                events.push(WorkflowEvent::TimerFired { timer_id });
+            }
+            (None, Some(_)) => {
+                let (signal_name, payload, _) = signals.next().expect("peeked");
+                events.push(WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                });
+            }
+            (None, None) => break,
+        }
     }
 
-    let (signal_ids, signals_data): (Vec<_>, Vec<_>) = pending_signals
-        .into_iter()
-        .map(|signal| {
-            let name = signal.signal_name.clone();
-            let event = WorkflowEvent::SignalReceived {
-                signal_name: signal.signal_name,
-                payload: signal.payload,
-            };
-            (signal.id, (name, event))
-        })
-        .unzip();
-
-    let (signal_names, signal_events): (Vec<_>, Vec<_>) = signals_data.into_iter().unzip();
-
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            store::append_events(conn, exec_id, &signal_events, next_event_id).await?;
-            signal::mark_signals_consumed(conn, &signal_ids).await?;
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await?;
-
-    Ok(signal_names)
+    events
 }
 
-async fn ingest_fired_timers(
+/// Ingest due timer fires and pending signals for a woken workflow task in a
+/// single atomic batch, appending events in chronological occurrence order
+/// (see [`merge_wake_events`]).
+///
+/// Returns the fired timer IDs and delivered signal names.
+async fn ingest_due_timers_and_signals(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     next_event_id: i32,
-) -> HarvestResult<Vec<TimerId>> {
+) -> HarvestResult<(Vec<TimerId>, Vec<String>)> {
     use crate::schema::harvest_timers::dsl;
     use diesel::dsl::sql;
     use diesel::sql_types::Timestamptz;
@@ -2920,39 +2985,54 @@ async fn ingest_fired_timers(
         .await
         .map_err(crate::error::database_error)?;
 
-    if due_timers.is_empty() {
-        return Ok(vec![]);
+    let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
+
+    if due_timers.is_empty() && pending_signals.is_empty() {
+        return Ok((vec![], vec![]));
     }
 
-    let (timer_row_ids, timer_events_and_ids): (Vec<_>, Vec<_>) = due_timers
+    let (timer_row_ids, timer_entries): (Vec<_>, Vec<_>) = due_timers
         .into_iter()
-        .map(|timer| {
-            let timer_id = TimerId::new(timer.timer_id);
+        .map(|timer| (timer.id, (TimerId::new(timer.timer_id), timer.fires_at)))
+        .unzip();
+    let fired_timer_ids: Vec<TimerId> = timer_entries.iter().map(|(id, _)| id.clone()).collect();
+
+    let (signal_ids, signal_entries): (Vec<_>, Vec<_>) = pending_signals
+        .into_iter()
+        .map(|signal| {
             (
-                timer.id,
-                (timer_id.clone(), WorkflowEvent::TimerFired { timer_id }),
+                signal.id,
+                (signal.signal_name, signal.payload, signal.received_at),
             )
         })
         .unzip();
+    let signal_names: Vec<String> = signal_entries
+        .iter()
+        .map(|(name, _, _)| name.clone())
+        .collect();
 
-    let (fired_timer_ids, timer_events): (Vec<_>, Vec<_>) =
-        timer_events_and_ids.into_iter().unzip();
+    let events = merge_wake_events(timer_entries, signal_entries);
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
-            store::append_events(conn, exec_id, &timer_events, next_event_id).await?;
-            diesel::update(dsl::harvest_timers.filter(dsl::id.eq_any(&timer_row_ids)))
-                .set(dsl::fired.eq(true))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            store::append_events(conn, exec_id, &events, next_event_id).await?;
+            if !timer_row_ids.is_empty() {
+                diesel::update(dsl::harvest_timers.filter(dsl::id.eq_any(&timer_row_ids)))
+                    .set(dsl::fired.eq(true))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+            if !signal_ids.is_empty() {
+                signal::mark_signals_consumed(conn, &signal_ids).await?;
+            }
             Ok(())
         }
         .scope_boxed()
     })
     .await?;
 
-    Ok(fired_timer_ids)
+    Ok((fired_timer_ids, signal_names))
 }
 
 async fn fail_task_only(
@@ -4265,16 +4345,13 @@ async fn load_workflow_replay_state(
     let history_result = store::load_history(conn, exec_id).await;
     let initial_history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
 
-    let timers_result = ingest_fired_timers(conn, exec_id, initial_history.next_event_id).await;
-    let timers_fired = fail_execution_on_error(conn, task, worker_id, timers_result).await?;
-
-    let history_after_timers_result = store::load_history(conn, exec_id).await;
-    let history_after_timers =
-        fail_execution_on_error(conn, task, worker_id, history_after_timers_result).await?;
-
-    let signals_result =
-        ingest_pending_signals(conn, exec_id, history_after_timers.next_event_id).await;
-    let signals_delivered = fail_execution_on_error(conn, task, worker_id, signals_result).await?;
+    // Single chronological ingest: due timer fires and pending signals are
+    // appended in occurrence order (signal received before a deadline lands
+    // before that TimerFired) — see merge_wake_events.
+    let ingest_result =
+        ingest_due_timers_and_signals(conn, exec_id, initial_history.next_event_id).await;
+    let (timers_fired, signals_delivered) =
+        fail_execution_on_error(conn, task, worker_id, ingest_result).await?;
 
     let final_history_result = store::load_history(conn, exec_id).await;
     let final_history =
@@ -4331,33 +4408,25 @@ async fn prepare_workflow_task_with_cache(
         let existing_delta =
             fail_execution_on_error(conn, task, worker_id, existing_delta_result).await?;
 
-        let timers_result = ingest_fired_timers(conn, exec_id, existing_delta.next_event_id).await;
-        let timers_fired = fail_execution_on_error(conn, task, worker_id, timers_result).await?;
+        // Single chronological ingest of due timers + pending signals (see
+        // merge_wake_events for the occurrence-order contract).
+        let ingest_result =
+            ingest_due_timers_and_signals(conn, exec_id, existing_delta.next_event_id).await;
+        let (timers_fired, signals_delivered) =
+            fail_execution_on_error(conn, task, worker_id, ingest_result).await?;
 
-        // Load events appended by timer ingestion.
-        let after_timers_result =
+        // Load events appended by the ingest.
+        let after_ingest_result =
             store::load_history_since(conn, exec_id, existing_delta.next_event_id).await;
-        let after_timers =
-            fail_execution_on_error(conn, task, worker_id, after_timers_result).await?;
-
-        let signals_result =
-            ingest_pending_signals(conn, exec_id, after_timers.next_event_id).await;
-        let signals_delivered =
-            fail_execution_on_error(conn, task, worker_id, signals_result).await?;
-
-        // Load events appended by signal ingestion.
-        let after_signals_result =
-            store::load_history_since(conn, exec_id, after_timers.next_event_id).await;
-        let after_signals =
-            fail_execution_on_error(conn, task, worker_id, after_signals_result).await?;
+        let after_ingest =
+            fail_execution_on_error(conn, task, worker_id, after_ingest_result).await?;
 
         // Reconstruct full history: cached snapshot + any pre-existing delta +
-        // timer events + signal events.
+        // ingested timer/signal events.
         let mut history_events = cached_state.events.clone();
         history_events.extend(existing_delta.events);
-        history_events.extend(after_timers.events);
-        history_events.extend(after_signals.events);
-        let next_event_id = after_signals.next_event_id;
+        history_events.extend(after_ingest.events);
+        let next_event_id = after_ingest.next_event_id;
 
         Ok(PreparedWorkflowTask {
             execution,
@@ -7018,6 +7087,7 @@ impl Worker {
 mod tests {
     use super::*;
     use crate::types::ParentClosePolicy;
+    use serde_json::Value;
     use tokio::sync::oneshot;
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
@@ -7051,6 +7121,108 @@ mod tests {
     fn worker_config_validates() {
         let cfg = default_runtime_config();
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── merge_wake_events (issue #476 review) ─────────────────────────────
+
+    #[test]
+    fn merge_wake_events_signal_before_deadline_is_recorded_first() {
+        let fires_at = chrono::Utc::now();
+        let received_at = fires_at - chrono::Duration::seconds(30);
+        let events = merge_wake_events(
+            vec![(TimerId::new("__signal_timeout:1:approval"), fires_at)],
+            vec![(
+                "approval".to_string(),
+                serde_json::json!({"approved": true}),
+                received_at,
+            )],
+        );
+
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], WorkflowEvent::SignalReceived { signal_name, .. } if signal_name == "approval"),
+            "a signal received before the deadline must be appended before TimerFired, got {events:?}"
+        );
+        assert!(matches!(&events[1], WorkflowEvent::TimerFired { .. }));
+    }
+
+    #[test]
+    fn merge_wake_events_signal_after_deadline_is_recorded_after_timer() {
+        let fires_at = chrono::Utc::now();
+        let received_at = fires_at + chrono::Duration::seconds(30);
+        let events = merge_wake_events(
+            vec![(TimerId::new("__signal_timeout:1:approval"), fires_at)],
+            vec![(
+                "approval".to_string(),
+                serde_json::json!({"approved": true}),
+                received_at,
+            )],
+        );
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], WorkflowEvent::TimerFired { .. }));
+        assert!(matches!(&events[1], WorkflowEvent::SignalReceived { .. }));
+    }
+
+    #[test]
+    fn merge_wake_events_tie_goes_to_the_timer() {
+        // A signal received exactly at the deadline did not beat it.
+        let fires_at = chrono::Utc::now();
+        let events = merge_wake_events(
+            vec![(TimerId::new("t"), fires_at)],
+            vec![("approval".to_string(), Value::Null, fires_at)],
+        );
+
+        assert!(matches!(&events[0], WorkflowEvent::TimerFired { .. }));
+        assert!(matches!(&events[1], WorkflowEvent::SignalReceived { .. }));
+    }
+
+    #[test]
+    fn merge_wake_events_preserves_relative_order_within_each_kind() {
+        let base = chrono::Utc::now();
+        let events = merge_wake_events(
+            vec![
+                (TimerId::new("t1"), base),
+                (TimerId::new("t2"), base + chrono::Duration::seconds(10)),
+            ],
+            vec![
+                (
+                    "s1".to_string(),
+                    Value::Null,
+                    base - chrono::Duration::seconds(5),
+                ),
+                (
+                    "s2".to_string(),
+                    Value::Null,
+                    base + chrono::Duration::seconds(5),
+                ),
+            ],
+        );
+
+        let kinds: Vec<String> = events
+            .iter()
+            .map(|e| match e {
+                WorkflowEvent::TimerFired { timer_id } => timer_id.as_str().to_string(),
+                WorkflowEvent::SignalReceived { signal_name, .. } => signal_name.clone(),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["s1", "t1", "s2", "t2"]);
+    }
+
+    #[test]
+    fn merge_wake_events_handles_single_kind_batches() {
+        let now = chrono::Utc::now();
+        let only_timers = merge_wake_events(vec![(TimerId::new("t1"), now)], vec![]);
+        assert_eq!(only_timers.len(), 1);
+        assert!(matches!(&only_timers[0], WorkflowEvent::TimerFired { .. }));
+
+        let only_signals = merge_wake_events(vec![], vec![("s1".to_string(), Value::Null, now)]);
+        assert_eq!(only_signals.len(), 1);
+        assert!(matches!(
+            &only_signals[0],
+            WorkflowEvent::SignalReceived { .. }
+        ));
     }
 
     #[test]
