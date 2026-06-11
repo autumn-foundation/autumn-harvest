@@ -677,8 +677,8 @@ async fn paused_schedule_does_not_consume_budget() {
 }
 
 /// When a schedule is exhausted by `end_at`, the `harvest_schedule_decisions`
-/// table must contain a row with `action = 'skipped'` and
-/// `reason = 'end_at_reached'`.
+/// table must contain a row with `decision = 'skipped'` and
+/// `reason_code = 'end_at_reached'`.
 #[tokio::test]
 async fn decision_log_records_end_at_reached() {
     let (mut conn, url, _c) = setup_db().await;
@@ -727,8 +727,8 @@ async fn decision_log_records_end_at_reached() {
 }
 
 /// When a schedule is exhausted by `max_runs`, the `harvest_schedule_decisions`
-/// table must contain a row with `action = 'skipped'` and
-/// `reason = 'max_runs_exhausted'`.
+/// table must contain a row with `decision = 'skipped'` and
+/// `reason_code = 'max_runs_exhausted'`.
 #[tokio::test]
 async fn decision_log_records_max_runs_exhausted() {
     let (mut conn, url, _c) = setup_db().await;
