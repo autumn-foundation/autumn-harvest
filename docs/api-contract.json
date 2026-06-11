@@ -515,6 +515,123 @@
     },
     {
       "method": "POST",
+      "path": "/workflows/{workflow_name}/update-with-start",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Atomically start a workflow if no live run for (workflow_name, workflow_id) exists, or attach to the existing run otherwise, and admit exactly one update in the same shard-local transaction (issue #479). Mirrors the reuse-policy matrix of signal-with-start but for request/response updates. PAUSED executions are rejected 409. A validator attached to the update handler runs inside the transaction; rejection rolls back any fresh WorkflowStarted event.",
+      "idempotency": "Idempotent on (workflow_name, workflow_id) per id_reuse_policy. When idempotency_key is supplied the update_id is derived deterministically via UUIDv5; a second call with the same key returns the cached outcome without re-admitting the update.",
+      "params": [
+        {
+          "name": "workflow_name",
+          "in": "path",
+          "required": true,
+          "description": "Registered workflow function name."
+        }
+      ],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "workflow_id",
+            "required": true,
+            "description": "Stable identifier used to deduplicate concurrent starts."
+          },
+          {
+            "name": "start_input",
+            "required": false,
+            "description": "Workflow input payload applied only when a fresh execution is started."
+          },
+          {
+            "name": "update_name",
+            "required": true,
+            "description": "Registered update handler name to invoke on the execution."
+          },
+          {
+            "name": "update_args",
+            "required": false,
+            "description": "Update arguments (any JSON value). Defaults to null."
+          },
+          {
+            "name": "queue",
+            "required": false,
+            "description": "Task queue name used only when a fresh execution is started."
+          },
+          {
+            "name": "memo",
+            "required": false,
+            "description": "Non-indexed metadata (JSON object) used only when a fresh execution is started."
+          },
+          {
+            "name": "search_attrs",
+            "required": false,
+            "description": "Indexed search attributes (JSON object) used only when a fresh execution is started."
+          },
+          {
+            "name": "execution_timeout_secs",
+            "required": false,
+            "description": "Overall execution timeout in seconds, applied only on fresh start."
+          },
+          {
+            "name": "id_reuse_policy",
+            "required": false,
+            "description": "Duplicate-id policy: allow_duplicate (default), reject_duplicate, allow_duplicate_failed_only, or terminate_if_running."
+          },
+          {
+            "name": "idempotency_key",
+            "required": false,
+            "description": "Optional dedup key. Derives update_id via UUIDv5 so retries with the same key return the cached outcome without re-admitting."
+          },
+          {
+            "name": "wait_for_stage",
+            "required": false,
+            "description": "Whether to poll for update completion. 'admitted' (default) returns immediately after admission; 'completed' polls until the update handler finishes."
+          },
+          {
+            "name": "timeout_secs",
+            "required": false,
+            "description": "Maximum seconds to poll when wait_for_stage=completed. Defaults to 30."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 201,
+        "note": "Returns 200 when an existing live execution is attached rather than a fresh one started.",
+        "fields": [
+          { "name": "execution_id" },
+          { "name": "workflow_name" },
+          { "name": "workflow_id" },
+          { "name": "state" },
+          { "name": "started_fresh" },
+          { "name": "update_id" },
+          { "name": "result" }
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid request body, workflow name, id_reuse_policy, or update validator rejection."
+        },
+        {
+          "status": 404,
+          "description": "Workflow function not registered."
+        },
+        {
+          "status": 409,
+          "description": "Duplicate workflow_id with id_reuse_policy=reject_duplicate, or execution is PAUSED."
+        },
+        {
+          "status": 422,
+          "description": "Update validator rejected the update_args."
+        },
+        {
+          "status": 500,
+          "description": "Database or scheduling error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/workflows/{id}/cancel",
       "category": "workflow",
       "read_only": false,

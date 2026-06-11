@@ -251,16 +251,17 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     {
                         let workflow_id = workflow_id.into();
                         let update_args = #serialize_payload;
-                        let update_id = if let ::std::option::Option::Some(ref key) = opts.idempotency_key {
-                            let ns = ::autumn_harvest::uuid::Uuid::parse_str(
-                                "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-                            ).expect("static namespace UUID is valid");
-                            ::autumn_harvest::types::UpdateId::from_uuid(
-                                ::autumn_harvest::uuid::Uuid::new_v5(&ns, key.as_bytes())
-                            )
-                        } else {
-                            ::autumn_harvest::types::UpdateId::new()
-                        };
+                        let update_id = opts.idempotency_key.as_ref().map_or_else(
+                            ::autumn_harvest::types::UpdateId::new,
+                            |key| {
+                                let ns = ::autumn_harvest::uuid::Uuid::parse_str(
+                                    "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                                ).expect("static namespace UUID is valid");
+                                ::autumn_harvest::types::UpdateId::from_uuid(
+                                    ::autumn_harvest::uuid::Uuid::new_v5(&ns, key.as_bytes())
+                                )
+                            }
+                        );
                         let exec_id = opts.exec_id.unwrap_or_else(|| {
                             let shard = client.pick_shard_for_new_workflow(#workflow_simple_name, &workflow_id);
                             ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
@@ -309,7 +310,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             runbook_url: ::std::option::Option::None,
                             severity: ::std::option::Option::None,
                         };
-                        let _ = client; // used only for shard routing
+                        let _ = client;
                         ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
                     }
                 }
@@ -369,16 +370,17 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         {
                             let workflow_id = workflow_id.into();
                             let update_args = #serialize_payload;
-                            let update_id = if let ::std::option::Option::Some(ref key) = opts.idempotency_key {
-                                let ns = ::autumn_harvest::uuid::Uuid::parse_str(
-                                    "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-                                ).expect("static namespace UUID is valid");
-                                ::autumn_harvest::types::UpdateId::from_uuid(
-                                    ::autumn_harvest::uuid::Uuid::new_v5(&ns, key.as_bytes())
-                                )
-                            } else {
-                                ::autumn_harvest::types::UpdateId::new()
-                            };
+                            let update_id = opts.idempotency_key.as_ref().map_or_else(
+                                ::autumn_harvest::types::UpdateId::new,
+                                |key| {
+                                    let ns = ::autumn_harvest::uuid::Uuid::parse_str(
+                                        "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                                    ).expect("static namespace UUID is valid");
+                                    ::autumn_harvest::types::UpdateId::from_uuid(
+                                        ::autumn_harvest::uuid::Uuid::new_v5(&ns, key.as_bytes())
+                                    )
+                                }
+                            );
                             let exec_id = opts.exec_id.unwrap_or_else(|| {
                                 let shard = client.pick_shard_for_new_workflow(#workflow_simple_name, &workflow_id);
                                 ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
@@ -427,7 +429,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 runbook_url: ::std::option::Option::None,
                                 severity: ::std::option::Option::None,
                             };
-                            let _ = client; // used only for shard routing
+                            let _ = client;
                             ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
                         }
                     }

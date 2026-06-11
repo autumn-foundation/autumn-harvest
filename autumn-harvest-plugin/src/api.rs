@@ -6896,13 +6896,14 @@ async fn update_with_start_workflow(
     }
 
     // Derive update_id — deterministic from idempotency_key if provided.
-    let update_id = if let Some(ref key) = request.idempotency_key {
-        let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-            .expect("static namespace UUID is valid");
-        UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
-    } else {
-        UpdateId::new()
-    };
+    let update_id = request
+        .idempotency_key
+        .as_ref()
+        .map_or_else(UpdateId::new, |key| {
+            let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+                .expect("static namespace UUID is valid");
+            UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
+        });
 
     let trace_ctx = tracing::info_span!(
         "harvest.workflow.schedule",
@@ -7118,10 +7119,10 @@ async fn update_with_start_workflow(
             let poll_resp = poll_response.into_parts();
             if poll_resp.0.status == axum::http::StatusCode::OK {
                 // Decode the body to extract the output.
-                if let Ok(body_bytes) = axum::body::to_bytes(poll_resp.1, usize::MAX).await {
-                    if let Ok(val) = serde_json::from_slice::<Value>(&body_bytes) {
-                        base.result = val.get("output").cloned();
-                    }
+                if let Ok(body_bytes) = axum::body::to_bytes(poll_resp.1, usize::MAX).await
+                    && let Ok(val) = serde_json::from_slice::<Value>(&body_bytes)
+                {
+                    base.result = val.get("output").cloned();
                 }
                 (status_code, Json(base)).into_response()
             } else {
@@ -7129,15 +7130,19 @@ async fn update_with_start_workflow(
                 // still carries execution_id and update_id so callers can retry or
                 // inspect history without losing the context from the admitted update.
                 let poll_status = poll_resp.0.status;
-                let error_msg =
-                    if let Ok(bytes) = axum::body::to_bytes(poll_resp.1, usize::MAX).await {
-                        serde_json::from_slice::<Value>(&bytes)
-                            .ok()
-                            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
-                            .unwrap_or_else(|| "update did not complete".to_string())
-                    } else {
-                        "update did not complete".to_string()
-                    };
+                let error_msg = axum::body::to_bytes(poll_resp.1, usize::MAX)
+                    .await
+                    .map_or_else(
+                        |_| "update did not complete".to_string(),
+                        |bytes| {
+                            serde_json::from_slice::<Value>(&bytes)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("error").and_then(|e| e.as_str()).map(String::from)
+                                })
+                                .unwrap_or_else(|| "update did not complete".to_string())
+                        },
+                    );
                 let mut resp_body = UpdateWithStartResponse::from_outcome(&outcome);
                 resp_body.result = Some(serde_json::json!({ "error": error_msg }));
                 (poll_status, Json(resp_body)).into_response()
