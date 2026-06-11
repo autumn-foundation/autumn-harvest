@@ -2256,13 +2256,19 @@ async fn tick_one_workflow_schedule(
             .await;
             break;
         }
-        // Per-slot end_at guard (issue #478): catchup loops can surface slots
-        // that are already past the configured cutoff. Stop as soon as we reach
-        // one — the post-loop exhaustion logic will mark the schedule exhausted.
+        // Per-slot end_at guard (issue #478): compare against the calendar-rebased
+        // effective value (effective_scheduled_for), not original_slot. A slot that
+        // was originally before end_at but was rebased to a business day at or past
+        // end_at must also stop. Only defer back to original_slot when it too is
+        // >= end_at (the post-loop end_at_now_exhausted check sees it and exhausts
+        // correctly); when original_slot < end_at, deferring to it creates the same
+        // stuck retry loop as the jitter case — just break.
         if let Some(end_at) = schedule.end_at
-            && *original_slot >= end_at
+            && effective_scheduled_for >= end_at
         {
-            deferred_next_run_at = Some(*original_slot);
+            if *original_slot >= end_at {
+                deferred_next_run_at = Some(*original_slot);
+            }
             break;
         }
         // Budget cap (issue #478): never dispatch beyond the remaining max_runs
