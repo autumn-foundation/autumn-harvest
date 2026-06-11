@@ -1226,7 +1226,15 @@ async fn upsert_workflow_schedule(
     // (existing.next_run_at was NULL → fresh next_run_after computation), so we only
     // need to nullify exhausted_at / exhausted_reason here.
     if existing.exhausted_at.is_some() {
-        let end_at_ok = ws.end_at.is_none_or(|end| end > now);
+        // For end_at: "limit removed" or "there is a valid next slot strictly before
+        // the new end_at". Checking `end_at > now` is not sufficient — the schedule
+        // can be legitimately exhausted before the cutoff wall-time when its last
+        // valid slot has already been dispatched (next_run_after >= end_at). Only
+        // clear exhaustion when the schedule expression will actually produce a new
+        // firing inside the new window.
+        let end_at_ok = ws.end_at.is_none_or(|new_end| {
+            next_run_after(Some(&ws.schedule), now).is_some_and(|next| next < new_end)
+        });
         let max_runs_ok = ws.max_runs.is_none_or(|max| {
             i64::from(existing.runs_started) < i64::from(i32::try_from(max).unwrap_or(i32::MAX))
         });
@@ -2288,6 +2296,15 @@ async fn tick_one_workflow_schedule(
                 effective_fire_time = %effective_fire_time,
                 "harvest: schedule jitter pending; deferring dispatch"
             );
+            break;
+        }
+        // Secondary end_at guard: jitter may push the effective dispatch time past
+        // the cutoff even when the original slot was before it. Treat a jitter-
+        // deferred dispatch that would fire after end_at the same as a slot past it.
+        if let Some(end_at) = schedule.end_at
+            && effective_fire_time >= end_at
+        {
+            deferred_next_run_at = Some(*original_slot);
             break;
         }
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, *original_slot);
