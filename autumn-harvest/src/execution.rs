@@ -1962,6 +1962,347 @@ async fn load_workflow_execution_by_key_for_update(
         })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// UpdateWithStart (issue #479)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parameters for the atomic `update_with_start` primitive.
+///
+/// Combines the inputs of [`StartWorkflowParams`] with the update name,
+/// arguments, and optional idempotency key so a single shard-local transaction
+/// can either start a fresh execution and admit the update for its first
+/// dispatch, or attach the update to an existing live execution.
+#[derive(Debug, Clone)]
+pub struct UpdateWithStartParams<'a> {
+    pub workflow_name: &'a str,
+    pub workflow_id: &'a str,
+    pub exec_id: ExecutionId,
+    pub input: serde_json::Value,
+    pub parent_id: Option<Uuid>,
+    pub queue_name: &'a str,
+    pub execution_timeout: Option<chrono::Duration>,
+    pub memo: Option<serde_json::Value>,
+    pub search_attrs: Option<serde_json::Value>,
+    pub reuse_policy: WorkflowIdReusePolicy,
+    pub trace_context: Option<TraceContextCarrier>,
+    /// Server-side ceiling applied to `execution_timeout`.
+    pub max_execution_timeout_ceiling: Option<chrono::Duration>,
+    /// Pre-resolved concurrency group key.
+    pub concurrency_key: Option<String>,
+    /// Per-key concurrency cap.
+    pub concurrency_limit: Option<u32>,
+    /// Pre-generated update ID. When `idempotency_key` is `Some`, callers
+    /// should derive this deterministically (e.g. `UUIDv5`) so the dedup lookup
+    /// matches prior admitted updates.
+    pub update_id: crate::types::UpdateId,
+    /// The name of the update handler to invoke.
+    pub update_name: String,
+    /// JSON-serialised update arguments.
+    pub update_args: serde_json::Value,
+    /// Optional dedup key, scoped to `(workflow_name, workflow_id)`. A retry
+    /// with the same key returns the previous outcome without re-admitting.
+    pub idempotency_key: Option<String>,
+    /// Payload cap for `input` (bytes). Enforced only on the fresh-start path.
+    pub max_workflow_input_bytes: u64,
+    pub owner: Option<&'a str>,
+    pub runbook_url: Option<&'a str>,
+    pub severity: Option<&'a str>,
+}
+
+/// Result of an [`update_with_start_workflow_execution`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateWithStartOutcome {
+    pub exec_id: ExecutionId,
+    pub workflow_name: String,
+    pub workflow_id: String,
+    pub state: String,
+    pub started_fresh: bool,
+    /// The update ID the caller can poll to retrieve the typed result.
+    pub update_id: crate::types::UpdateId,
+    /// `false` on an idempotency-key cache hit (update was already admitted).
+    pub update_admitted: bool,
+}
+
+/// Atomically start or attach to a workflow and admit one update.
+///
+/// Applies the same reuse-policy matrix as `signal_with_start_workflow_execution`
+/// but admits exactly one update instead of a signal.
+///
+/// ## Outcome matrix (mirrors signal-with-start except PAUSED rejects updates)
+///
+/// | Prior state         | `AllowDuplicate`       | `RejectDuplicate`   | `AllowDupFailedOnly`   | `TerminateIfRunning`      |
+/// |---------------------|------------------------|---------------------|------------------------|---------------------------|
+/// | none                | start + admit          | start + admit       | start + admit          | start + admit             |
+/// | RUNNING             | admit to existing      | `Err(AlreadyExists)`| admit to existing      | cancel + start + admit    |
+/// | PAUSED              | `Err(WorkflowPaused)`  | `Err(AlreadyExists)`| `Err(WorkflowPaused)`  | cancel + start + admit    |
+/// | COMPLETED/FAILED    | start fresh + admit    | `Err(AlreadyExists)`| start fresh + admit    | start fresh + admit       |
+/// | CANCELLED           | start fresh + admit    | `Err(AlreadyExists)`| start fresh + admit    | start fresh + admit       |
+/// | TERMINATED          | start fresh + admit    | start fresh + admit | start fresh + admit    | start fresh + admit       |
+///
+/// ## Event ordering
+///
+/// On a **fresh start** `WorkflowStarted` is appended and then
+/// `UpdateAdmitted` is appended in the same outer transaction. The worker
+/// picks up the already-admitted update before first dispatch.
+///
+/// On an **attach**, `UpdateAdmitted` is appended and the workflow task is
+/// woken — both inside the outer transaction.
+///
+/// ## Idempotency
+///
+/// When `idempotency_key` is `Some`, the call checks `harvest_events` for an
+/// existing `UpdateAdmitted` event with the same `update_id` scoped to
+/// `(workflow_name, workflow_id)`. A match returns the prior outcome without
+/// re-starting or re-admitting.
+///
+/// # Errors
+///
+/// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
+/// - [`HarvestError::WorkflowPaused`] when attaching to a PAUSED execution.
+/// - Propagates queue/event-store failures from the start/admit transactions.
+#[allow(clippy::too_many_lines)]
+pub async fn update_with_start_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    request: UpdateWithStartParams<'_>,
+) -> HarvestResult<UpdateWithStartOutcome> {
+    conn.transaction::<UpdateWithStartOutcome, HarvestError, _>(|conn| {
+        let request = request;
+        async move {
+            // Cross-execution idempotency dedupe scoped to (workflow_name, workflow_id).
+            // When an idempotency key is provided we look up by the supplied update_id
+            // (callers should derive it deterministically from the key, e.g. UUIDv5).
+            if request.idempotency_key.is_some()
+                && let Some(prior) = lookup_idempotent_update_dedupe(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    &request.update_id,
+                )
+                .await?
+            {
+                return Ok(UpdateWithStartOutcome {
+                    exec_id: prior.exec_id,
+                    workflow_name: prior.workflow_name,
+                    workflow_id: prior.workflow_id,
+                    state: prior.state,
+                    started_fresh: false,
+                    update_id: request.update_id,
+                    update_admitted: false,
+                });
+            }
+
+            // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
+            // when the prior run is terminal so the update always lands on a live
+            // execution (mirrors the signal-with-start "no signal dropped" invariant).
+            let effective_policy = resolve_effective_signal_with_start_policy(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+                request.reuse_policy,
+            )
+            .await?;
+
+            let build_start_request =
+                |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
+                    workflow_name: request.workflow_name,
+                    workflow_id: request.workflow_id,
+                    exec_id,
+                    input: request.input.clone(),
+                    parent_id: request.parent_id,
+                    queue_name: request.queue_name,
+                    execution_timeout: request.execution_timeout,
+                    memo: request.memo.clone(),
+                    search_attrs: request.search_attrs.clone(),
+                    reuse_policy: policy,
+                    trace_context: request.trace_context.clone(),
+                    max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
+                    concurrency_key: request.concurrency_key.clone(),
+                    concurrency_limit: request.concurrency_limit,
+                    priority: Priority::default(),
+                    max_workflow_input_bytes: 0,
+                    start_at: None,
+                    delay: None,
+                    max_workflow_start_delay: None,
+                    owner: request.owner,
+                    runbook_url: request.runbook_url,
+                    severity: request.severity,
+                };
+
+            let started = start_or_load_workflow_execution(
+                conn,
+                build_start_request(request.exec_id, effective_policy),
+            )
+            .await?;
+
+            // Enforce workflow input cap on fresh start.
+            if started.created {
+                check_sws_payload_cap(
+                    &request.input,
+                    crate::error::PayloadKind::WorkflowInput,
+                    request.max_workflow_input_bytes,
+                    request.workflow_name,
+                )?;
+            }
+
+            // TOCTOU guard: if a concurrent transaction completed the run between
+            // the policy resolver's lock and our start, escalate so the update lands.
+            // SUSPENDED is treated as RUNNING here (not a real DB state today, but
+            // defensive). PAUSED is a non-terminal active state; the update will be
+            // rejected by admit_update_event below (WorkflowPaused), rolling back.
+            let started = if !matches!(started.state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED")
+                && matches!(
+                    request.reuse_policy,
+                    WorkflowIdReusePolicy::AllowDuplicate
+                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                ) {
+                let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
+                let fresh = start_or_load_workflow_execution(
+                    conn,
+                    build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
+                )
+                .await?;
+                if fresh.created {
+                    check_sws_payload_cap(
+                        &request.input,
+                        crate::error::PayloadKind::WorkflowInput,
+                        request.max_workflow_input_bytes,
+                        request.workflow_name,
+                    )?;
+                }
+                fresh
+            } else {
+                started
+            };
+
+            // Post-lock idempotency re-check: two concurrent calls with the same
+            // idempotency_key may both pass the early dedupe query (which runs before
+            // the execution row lock is acquired). After the lock is held, any prior
+            // admission committed by a racing transaction is now visible — re-check so
+            // the loser returns the cached outcome rather than admitting a second time.
+            if request.idempotency_key.is_some()
+                && let Some(prior) = lookup_idempotent_update_dedupe(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    &request.update_id,
+                )
+                .await?
+            {
+                return Ok(UpdateWithStartOutcome {
+                    exec_id: prior.exec_id,
+                    workflow_name: prior.workflow_name,
+                    workflow_id: prior.workflow_id,
+                    state: prior.state,
+                    started_fresh: false,
+                    update_id: request.update_id,
+                    update_admitted: false,
+                });
+            }
+
+            // Admit the update against the resolved execution.
+            //
+            // `admit_update_event` acquires a FOR UPDATE row lock and rejects:
+            //   - PAUSED   → HarvestError::WorkflowPaused (rolls back entire tx)
+            //   - non-RUNNING → HarvestError::UpdateRejected
+            //
+            // On fresh start the execution is RUNNING so admission succeeds.
+            // The admitted update is part of the same outer transaction as the
+            // WorkflowStarted event, so a crash never leaves a half-started
+            // execution with no admitted update.
+            store::admit_update_event(
+                conn,
+                started.exec_id,
+                request.update_id,
+                request.update_name.clone(),
+                request.update_args.clone(),
+            )
+            .await?;
+
+            // Wake the workflow task. For fresh starts, `start_or_load_workflow_execution`
+            // already inserted a task queue row; wake_workflow_task is idempotent
+            // (it updates the wakeup timestamp) and harmless to call again.
+            queue::wake_workflow_task(conn, started.exec_id).await?;
+
+            Ok(UpdateWithStartOutcome {
+                exec_id: started.exec_id,
+                workflow_name: started.workflow_name,
+                workflow_id: started.workflow_id,
+                state: started.state,
+                started_fresh: started.created,
+                update_id: request.update_id,
+                update_admitted: true,
+            })
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Minimal row returned by the idempotency dedupe query.
+struct UpdateDedupeRow {
+    exec_id: ExecutionId,
+    workflow_name: String,
+    workflow_id: String,
+    state: String,
+}
+
+/// Cross-execution idempotency dedupe for `update_with_start`.
+///
+/// Searches `harvest_events` for an `UpdateAdmitted` event with the given
+/// `update_id` across all executions of `(workflow_name, workflow_id)`.
+/// Returns the owning execution if found, so a retried call can short-circuit
+/// without re-starting or re-admitting.
+///
+/// The lookup uses JSON operators on `event_data` (Postgres JSONB). This is a
+/// cold-path read (retries only) so index coverage is not critical.
+async fn lookup_idempotent_update_dedupe(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    update_id: &crate::types::UpdateId,
+) -> HarvestResult<Option<UpdateDedupeRow>> {
+    use diesel::sql_query;
+    use diesel::sql_types::Text;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        workflow_name: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        workflow_id: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+
+    let row: Option<Row> = sql_query(
+        "SELECT wf.id, wf.workflow_name, wf.workflow_id, wf.state \
+         FROM harvest_events e \
+         JOIN harvest_workflow_executions wf ON e.workflow_exec_id = wf.id \
+         WHERE wf.workflow_name = $1 \
+           AND wf.workflow_id = $2 \
+           AND e.event_data->>'type' = 'UpdateAdmitted' \
+           AND e.event_data->'data'->>'update_id' = $3 \
+         ORDER BY e.event_id DESC \
+         LIMIT 1",
+    )
+    .bind::<Text, _>(workflow_name)
+    .bind::<Text, _>(workflow_id)
+    .bind::<Text, _>(update_id.to_string())
+    .get_result(conn)
+    .await
+    .optional()
+    .map_err(database_error)?;
+
+    Ok(row.map(|r| UpdateDedupeRow {
+        exec_id: ExecutionId::from_uuid(r.id),
+        workflow_name: r.workflow_name,
+        workflow_id: r.workflow_id,
+        state: r.state,
+    }))
+}
+
 #[cfg(test)]
 mod pause_helper_tests {
     use super::pause_timeout_exceeded;

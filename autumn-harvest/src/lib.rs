@@ -214,9 +214,10 @@ pub use event::{SideEffectKind, WorkflowEvent};
 pub use execution::{
     CancelledWorkflowExecution, PausedWorkflowExecution, ResumedWorkflowExecution,
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, StartedWorkflowExecution,
-    auto_resume_expired_pauses, cancel_workflow_execution, pause_workflow_execution,
-    resume_workflow_execution, signal_with_start_workflow_execution,
-    start_or_load_workflow_execution, terminate_workflow_execution,
+    UpdateWithStartOutcome, UpdateWithStartParams, auto_resume_expired_pauses,
+    cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
+    signal_with_start_workflow_execution, start_or_load_workflow_execution,
+    terminate_workflow_execution, update_with_start_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use guardrail::{
@@ -230,7 +231,8 @@ pub use handle::{
 };
 #[cfg(feature = "db")]
 pub use handle_typed::{
-    TypedSignalWithStartOptions, TypedStartOptions, TypedWorkflowHandle, TypedWorkflowResult,
+    TypedSignalWithStartOptions, TypedStartOptions, TypedUpdateWithStartOptions,
+    TypedWorkflowHandle, TypedWorkflowResult,
 };
 pub use history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HISTORY_EXPORT_SCHEMA, HISTORY_EXPORT_VERSION,
@@ -318,6 +320,8 @@ pub use serde_json;
 pub use serde;
 // Allow macro-generated code to use ::autumn_harvest::chrono
 pub use chrono;
+// Allow macro-generated code to use ::autumn_harvest::uuid (e.g. update_with_start UUIDv5 derivation)
+pub use uuid;
 // Allow macro-generated code to use ::autumn_harvest::futures.
 #[doc(hidden)]
 pub use futures;

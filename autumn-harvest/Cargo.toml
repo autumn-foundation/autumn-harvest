@@ -114,6 +114,10 @@ required-features = ["db"]
 name = "signal_with_start_webhook"
 required-features = ["db"]
 
+[[example]]
+name = "update_with_start_cart"
+required-features = ["db"]
+
 [[test]]
 name = "cross_workflow_signal_tests"
 required-features = ["db"]

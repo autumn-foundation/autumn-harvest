@@ -38,6 +38,8 @@ pub const OP_WORKFLOW_START: &str = "workflow.start";
 pub const OP_WORKFLOW_SIGNAL: &str = "workflow.signal";
 /// Audit operation: Atomic start-or-attach + signal (issue #244).
 pub const OP_WORKFLOW_SIGNAL_WITH_START: &str = "workflow.signal_with_start";
+/// Audit operation: Atomic start-or-attach + update admission (issue #479).
+pub const OP_WORKFLOW_UPDATE_WITH_START: &str = "workflow.update_with_start";
 /// Audit operation: Cancelled a workflow execution.
 pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
 /// Audit operation: Reset a workflow execution to a previous state.

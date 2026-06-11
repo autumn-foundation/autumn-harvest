@@ -146,6 +146,33 @@ pub struct TypedStartOptions {
     pub max_workflow_start_delay: Option<chrono::Duration>,
 }
 
+/// Optional configurations when invoking an update and starting a workflow atomically.
+#[derive(Debug, Clone, Default)]
+pub struct TypedUpdateWithStartOptions {
+    /// Explicitly override the `ExecutionId` for this run.
+    pub exec_id: Option<ExecutionId>,
+    /// Set a parent workflow execution ID.
+    pub parent_id: Option<uuid::Uuid>,
+    /// Override the task queue name (defaults to `"default"`).
+    pub queue_name: Option<String>,
+    /// Set a custom workflow-level execution timeout.
+    pub execution_timeout: Option<std::time::Duration>,
+    /// Attach arbitrary metadata to the execution.
+    pub memo: Option<Value>,
+    /// Search attributes for filtering.
+    pub search_attrs: Option<Value>,
+    /// Behavior when encountering a workflow ID collision (defaults to `AllowDuplicate`).
+    pub reuse_policy: Option<crate::types::WorkflowIdReusePolicy>,
+    /// W3C trace context carrier for propagation.
+    pub trace_context: Option<crate::telemetry::TraceContextCarrier>,
+    /// Dedup key scoped to `(workflow_name, workflow_id)`.
+    ///
+    /// When provided the caller should derive `update_id` deterministically
+    /// (e.g. `UUIDv5` from this key) so that retried calls hit the dedupe lookup
+    /// and return without re-starting or re-admitting the update.
+    pub idempotency_key: Option<String>,
+}
+
 /// Optional configurations when signaling and starting a workflow atomically.
 #[derive(Debug, Clone, Default)]
 pub struct TypedSignalWithStartOptions {
