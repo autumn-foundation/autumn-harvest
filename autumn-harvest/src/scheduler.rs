@@ -2299,12 +2299,16 @@ async fn tick_one_workflow_schedule(
             break;
         }
         // Secondary end_at guard: jitter may push the effective dispatch time past
-        // the cutoff even when the original slot was before it. Treat a jitter-
-        // deferred dispatch that would fire after end_at the same as a slot past it.
+        // the cutoff even when the original slot was before it.
+        // Do NOT set deferred_next_run_at here — original_slot is still < end_at,
+        // so deferring to it would cause every tick to retry the same slot forever
+        // without ever firing or exhausting. Falling through to the post-loop
+        // end_at_now_exhausted check with deferred_next_run_at = None lets it use
+        // next_run_after_plan (which is >= end_at) and correctly mark the schedule
+        // exhausted.
         if let Some(end_at) = schedule.end_at
             && effective_fire_time >= end_at
         {
-            deferred_next_run_at = Some(*original_slot);
             break;
         }
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, *original_slot);
