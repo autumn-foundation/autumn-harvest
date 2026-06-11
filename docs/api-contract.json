@@ -585,7 +585,7 @@
           {
             "name": "wait_for_stage",
             "required": false,
-            "description": "Whether to poll for update completion. 'admitted' (default) returns immediately after admission; 'completed' polls until the update handler finishes."
+            "description": "Whether to poll for update completion. 'completed' (default) polls until the update handler finishes and returns the result; 'admitted' returns immediately after the update is admitted to history."
           },
           {
             "name": "timeout_secs",
