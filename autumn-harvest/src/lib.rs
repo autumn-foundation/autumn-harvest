@@ -320,6 +320,8 @@ pub use serde_json;
 pub use serde;
 // Allow macro-generated code to use ::autumn_harvest::chrono
 pub use chrono;
+// Allow macro-generated code to use ::autumn_harvest::uuid (e.g. update_with_start UUIDv5 derivation)
+pub use uuid;
 // Allow macro-generated code to use ::autumn_harvest::futures.
 #[doc(hidden)]
 pub use futures;
