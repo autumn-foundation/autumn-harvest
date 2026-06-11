@@ -19,7 +19,36 @@ async fn bypass_workflow(ctx: &WorkflowContext) -> Result<(), String> {
 #[workflow]
 async fn renamed_context_workflow(context: &WorkflowContext) -> Result<(), String> {
     let _ = context.side_effect("test_id", || rand::random::<u64>());
+
+    // Unrelated gen() call (allowed)
+    struct InvoiceIdGenerator;
+    impl InvoiceIdGenerator {
+        fn r#gen(&self) -> String {
+            "invoice_123".to_string()
+        }
+    }
+    let generator = InvoiceIdGenerator;
+    let _id = generator.r#gen();
+
+    // Deterministic tonic status / metadata (allowed)
+    let _status = tonic::Status::new(tonic::Code::Ok, "ok");
+    let _meta = tonic::metadata::MetadataMap::new();
+
     Ok(())
+}
+
+mod tonic {
+    pub enum Code { Ok }
+    pub struct Status;
+    impl Status {
+        pub fn new(_: Code, _: &str) -> Self { Self }
+    }
+    pub mod metadata {
+        pub struct MetadataMap;
+        impl MetadataMap {
+            pub fn new() -> Self { Self }
+        }
+    }
 }
 
 fn main() {}

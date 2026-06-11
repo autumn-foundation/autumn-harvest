@@ -66,6 +66,42 @@ fn path_to_string(path: &syn::Path) -> String {
     s
 }
 
+fn is_rng_receiver(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Path(expr_path) => {
+            let path_str = path_to_string(&expr_path.path);
+            path_str.to_lowercase().contains("rng")
+        }
+        syn::Expr::Call(expr_call) => {
+            if let syn::Expr::Path(func_path) = &*expr_call.func {
+                let path_str = path_to_string(&func_path.path);
+                path_str.to_lowercase().contains("rng")
+            } else {
+                false
+            }
+        }
+        syn::Expr::MethodCall(expr_method) => {
+            expr_method
+                .method
+                .to_string()
+                .to_lowercase()
+                .contains("rng")
+                || is_rng_receiver(&expr_method.receiver)
+        }
+        syn::Expr::Reference(expr_ref) => is_rng_receiver(&expr_ref.expr),
+        syn::Expr::Unary(expr_unary) => is_rng_receiver(&expr_unary.expr),
+        syn::Expr::Field(expr_field) => {
+            let member_is_rng = if let syn::Member::Named(ident) = &expr_field.member {
+                ident.to_string().to_lowercase().contains("rng")
+            } else {
+                false
+            };
+            member_is_rng || is_rng_receiver(&expr_field.base)
+        }
+        _ => false,
+    }
+}
+
 impl<'ast> Visit<'ast> for DeterminismVisitor {
     #[allow(clippy::too_many_lines)]
     fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
@@ -167,18 +203,22 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
                 || path_str.starts_with("tokio::net::UnixStream::")
                 || path_str.starts_with("tokio::net::UnixListener::")
                 || path_str.starts_with("tokio::net::UnixDatagram::")
-                || path_str == "TcpStream::connect"
-                || path_str == "TcpListener::bind"
-                || path_str == "UdpSocket::bind"
-                || path_str == "UnixStream::connect"
-                || path_str == "UnixListener::bind"
-                || path_str == "UnixDatagram::bind"
-                || path_str.starts_with("reqwest::")
-                || path_str.starts_with("hyper::")
+                || path_str.ends_with("::connect")
+                || path_str.ends_with("::connect_lazy")
+                || path_str.ends_with("::from_shared")
+                || path_str.ends_with("::bind")
+                || path_str.starts_with("reqwest::Client")
+                || path_str.starts_with("reqwest::blocking::Client")
+                || path_str.starts_with("reqwest::get")
+                || path_str.starts_with("hyper::client::")
+                || path_str.starts_with("hyper::server::")
+                || path_str.starts_with("hyper::service::")
+                || path_str.starts_with("hyper::rt::")
+                || path_str.starts_with("tonic::transport::")
+                || path_str.starts_with("tonic::client::")
+                || path_str.starts_with("tokio_postgres::connect")
                 || path_str.starts_with("diesel::")
                 || path_str.starts_with("sqlx::")
-                || path_str.starts_with("tonic::")
-                || path_str.starts_with("tokio_postgres::")
                 || path_str == "std::process::Command::new"
             {
                 self.add_finding(
@@ -215,21 +255,23 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
 
         // HVG002: Randomness method calls (gen, gen_range, etc. on Rng trait)
         let method_str = i.method.to_string();
-        if method_str == "gen"
+        if (method_str == "gen"
             || method_str == "r#gen"
             || method_str == "gen_range"
             || method_str == "r#gen_range"
             || method_str == "gen_bool"
-            || method_str == "gen_ratio"
+            || method_str == "gen_ratio")
+            && is_rng_receiver(&i.receiver)
         {
             self.add_finding("HVG002", i.method.span());
         }
 
         let is_ctx_side_effect = if i.method == "side_effect" {
             if let syn::Expr::Path(expr_path) = &*i.receiver {
-                self.context_param_name
-                    .as_ref()
-                    .map_or_else(|| expr_path.path.is_ident("ctx"), |ctx_name| expr_path.path.is_ident(ctx_name))
+                self.context_param_name.as_ref().map_or_else(
+                    || expr_path.path.is_ident("ctx"),
+                    |ctx_name| expr_path.path.is_ident(ctx_name),
+                )
             } else {
                 false
             }
@@ -242,6 +284,21 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             self.visit_expr(&i.receiver);
             if let Some(first_arg) = i.args.first() {
                 self.visit_expr(first_arg);
+            }
+            if let Some(second_arg) = i.args.get(1) {
+                if let syn::Expr::Closure(closure) = second_arg {
+                    for attr in &closure.attrs {
+                        self.visit_attribute(attr);
+                    }
+                    for input in &closure.inputs {
+                        self.visit_pat(input);
+                    }
+                } else {
+                    self.visit_expr(second_arg);
+                }
+            }
+            for arg in i.args.iter().skip(2) {
+                self.visit_expr(arg);
             }
         } else {
             syn::visit::visit_expr_method_call(self, i);

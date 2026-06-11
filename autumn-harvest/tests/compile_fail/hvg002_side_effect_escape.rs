@@ -16,4 +16,16 @@ async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
     Ok(())
 }
 
+fn make_closure<F>(_: F) -> impl FnOnce() {
+    || {}
+}
+
+#[workflow]
+async fn bad_workflow_factory(ctx: &WorkflowContext) -> Result<(), String> {
+    // Evaluating rand::random() before passing the closure to side_effect is a deterministic violation
+    // because it runs outside the closure at construction time, which is re-evaluated on every replay.
+    ctx.side_effect("k", make_closure(rand::random::<u64>()));
+    Ok(())
+}
+
 fn main() {}
