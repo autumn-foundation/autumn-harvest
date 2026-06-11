@@ -9585,16 +9585,40 @@ async fn trigger_schedule_now(
         Ok(exec_result) => (Some(exec_result.exec_id.as_uuid()), "fired"),
         Err(e) => {
             // Undo the pre-increment so the budget reflects actual started workflows.
+            // Do NOT guard on exhausted_at IS NULL: a scheduler tick could have raced
+            // and set exhausted_at after our pre-increment, so the guard would silently
+            // skip the rollback and leave runs_started inflated (issue #478).
             {
                 use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
                 let _ = diesel::update(sdsl::harvest_schedules.find(schedule.id))
-                    .filter(sdsl::exhausted_at.is_null())
                     .set((
                         sdsl::runs_started.eq(sdsl::runs_started - 1),
                         sdsl::updated_at.eq(triggered_at),
                     ))
                     .execute(&mut sched_conn)
                     .await;
+                // If the decrement brought runs_started below max_runs, clear any
+                // exhaustion that our (now-reversed) pre-increment may have caused.
+                // next_run_at is intentionally not restored here — a future
+                // upsert_workflow_schedule call (e.g. on server restart for
+                // code-declared schedules) will recalculate it.
+                let _ = diesel::update(
+                    sdsl::harvest_schedules
+                        .find(schedule.id)
+                        .filter(sdsl::exhausted_at.is_not_null())
+                        .filter(sdsl::max_runs.is_null().or(diesel::dsl::sql::<
+                            diesel::sql_types::Bool,
+                        >(
+                            "runs_started < max_runs"
+                        ))),
+                )
+                .set((
+                    sdsl::exhausted_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                    sdsl::exhausted_reason.eq(None::<String>),
+                    sdsl::updated_at.eq(triggered_at),
+                ))
+                .execute(&mut sched_conn)
+                .await;
             }
             let ar = NewAuditRecord {
                 actor: &actor,

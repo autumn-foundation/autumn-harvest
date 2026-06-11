@@ -1150,6 +1150,7 @@ async fn find_or_insert_workflow_schedule(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn upsert_workflow_schedule(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
@@ -1248,6 +1249,40 @@ async fn upsert_workflow_schedule(
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
+        }
+    } else {
+        // Active schedule: if the new limits are already violated, transition to
+        // exhausted immediately rather than waiting for the next due tick (issue #478).
+        // This prevents a schedule whose max_runs was lowered to the current
+        // runs_started (or whose end_at was moved before next_run_at) from lingering
+        // as active-but-never-runnable until the next tick processes it.
+        let max_runs_now_violated = ws.max_runs.is_some_and(|max| {
+            let max_i32 = i32::try_from(max).unwrap_or(i32::MAX);
+            max_i32 > 0 && existing.runs_started >= max_i32
+        });
+        let end_at_now_violated = ws.end_at.is_some_and(|new_end| {
+            next_run_after(Some(&ws.schedule), now).is_none_or(|next| next >= new_end)
+        });
+        if max_runs_now_violated || end_at_now_violated {
+            let reason: &str = if max_runs_now_violated {
+                "max_runs_exhausted"
+            } else {
+                "end_at_reached"
+            };
+            diesel::update(
+                dsl::harvest_schedules
+                    .find(existing.id)
+                    .filter(dsl::exhausted_at.is_null()),
+            )
+            .set((
+                dsl::exhausted_at.eq(Some(now)),
+                dsl::exhausted_reason.eq(Some(reason)),
+                dsl::next_run_at.eq(None::<DateTime<Utc>>),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
         }
     }
 
@@ -2195,6 +2230,19 @@ async fn tick_one_workflow_schedule(
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
     // jitter_window already computed at function entry; reused here.
 
+    // Re-read runs_started from the DB now that we hold the HA claim and have
+    // finished the overlap handling. This captures any concurrent manual trigger
+    // pre-increments that happened between the outer tick query and this point,
+    // giving the dispatch loop a fresh budget baseline so it does not over-dispatch
+    // against a budget that was already partially consumed by a manual trigger.
+    let live_runs_started: i32 = dsl::harvest_schedules
+        .find(schedule.id)
+        .filter(dsl::fire_claim_token.eq(Some(claim_token)))
+        .select(dsl::runs_started)
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
     let mut dispatched: u32 = 0;
     let mut last_dispatched_at: Option<DateTime<Utc>> = None;
     // Tracks the pre-rebase original slot of the last dispatched run. Used to
@@ -2271,12 +2319,12 @@ async fn tick_one_workflow_schedule(
             }
             break;
         }
-        // Budget cap (issue #478): never dispatch beyond the remaining max_runs
-        // budget in a single tick even when multiple catchup slots are available.
+        // Budget cap (issue #478): use the DB-fresh live_runs_started (re-read after
+        // claim, above) rather than the stale schedule.runs_started so that concurrent
+        // manual trigger pre-increments are visible here and prevent over-dispatch.
         if let Some(max_runs) = schedule.max_runs {
-            let already = schedule
-                .runs_started
-                .saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
+            let already =
+                live_runs_started.saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
             if max_runs > 0 && already >= max_runs {
                 deferred_next_run_at = Some(*original_slot);
                 break;
@@ -2455,13 +2503,14 @@ async fn tick_one_workflow_schedule(
     });
 
     // ── Budget accounting and exhaustion (issue #478) ────────────────────────
-    // Increment runs_started by the number of executions actually dispatched this
-    // tick, then check whether the max_runs budget is now exhausted.
-    // The HA claim guarantees single-concurrent processing so this increment is
-    // safe to compute in application code rather than via a DB-side expression.
-    let new_runs_started = schedule
-        .runs_started
-        .saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
+    // Increment runs_started using the DB-fresh live_runs_started baseline (re-read
+    // after claim). Manual trigger pre-increments are NOT serialized under the HA
+    // claim, so the final UPDATE must use a DB-side expression (runs_started +
+    // dispatched) rather than the in-memory computed value, ensuring the tick and
+    // any concurrent manual trigger each add their own delta without overwriting
+    // the other's contribution.
+    let new_runs_started =
+        live_runs_started.saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
     let now_budget_exhausted = schedule
         .max_runs
         .is_some_and(|max| max > 0 && dispatched > 0 && new_runs_started >= max);
@@ -2540,6 +2589,10 @@ async fn tick_one_workflow_schedule(
         effective_next_run_at
     };
 
+    // Use a DB-side runs_started + dispatched expression so that concurrent manual
+    // trigger pre-increments (which are not blocked by the HA claim) are preserved
+    // rather than overwritten by this stale in-memory value (issue #478).
+    let dispatched_i32 = i32::try_from(dispatched).unwrap_or(i32::MAX);
     diesel::update(
         dsl::harvest_schedules
             .find(schedule.id)
@@ -2548,7 +2601,7 @@ async fn tick_one_workflow_schedule(
     .set((
         dsl::last_run_at.eq(effective_last_run_at),
         dsl::next_run_at.eq(final_next_run_at),
-        dsl::runs_started.eq(new_runs_started),
+        dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
         dsl::exhausted_at.eq(budget_exhausted_at),
         dsl::exhausted_reason.eq(budget_exhausted_reason),
         // Clear the HA claim so the column stays clean after a successful
