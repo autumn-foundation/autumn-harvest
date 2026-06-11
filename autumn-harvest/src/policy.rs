@@ -726,6 +726,28 @@ pub struct WorkflowSchedule {
     /// `harvest.schedule.auto_paused` metric. Resume via the management API to restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consecutive_failure_limit: Option<u32>,
+    /// Absolute UTC cutoff for this schedule (issue #478).
+    ///
+    /// When the due fire time is `>= end_at`, the scheduler does **not** start a run and
+    /// transitions the schedule to the terminal exhausted state.  `None` (the default) means
+    /// fire forever — today's behaviour, fully backward-compatible.
+    ///
+    /// Composes with all existing knobs.  A firing suppressed by `OverlapPolicy::Skip`,
+    /// a calendar `skip_policy`, or `paused` does **not** consume the `max_runs` budget
+    /// and does **not** trigger `end_at` exhaustion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_at: Option<DateTime<Utc>>,
+    /// Total run budget for this schedule (issue #478).
+    ///
+    /// Decremented atomically at the moment a run is actually started (not merely
+    /// scheduled).  When the budget reaches zero the schedule transitions to the terminal
+    /// exhausted state.  `None` (the default) means no budget — fire forever.
+    ///
+    /// Only actually-started runs consume the budget.  Firings suppressed by
+    /// `OverlapPolicy::Skip`, a calendar `skip_policy`, or `paused` do **not** consume a
+    /// slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs: Option<u32>,
 }
 
 const fn default_buffer_all_max() -> u32 {
@@ -756,6 +778,8 @@ impl WorkflowSchedule {
             calendar: None,
             skip_policy: SkipPolicy::Skip,
             consecutive_failure_limit: None,
+            end_at: None,
+            max_runs: None,
         }
     }
 
@@ -864,6 +888,36 @@ impl WorkflowSchedule {
     #[must_use]
     pub const fn with_consecutive_failure_limit(mut self, limit: u32) -> Self {
         self.consecutive_failure_limit = Some(limit);
+        self
+    }
+
+    /// Set an absolute UTC cutoff for this schedule (issue #478).
+    ///
+    /// When the due fire time is `>= end_at`, the scheduler does not start a run and
+    /// transitions the schedule to a terminal exhausted state.  The exhaustion is
+    /// distinct from an operator `paused` state so the two are distinguishable via
+    /// `GET /admin/schedules`.
+    ///
+    /// Composes cleanly with `max_runs`, `OverlapPolicy`, calendar filtering, and
+    /// `paused`.  A skipped firing does not trigger exhaustion.
+    #[must_use]
+    pub fn with_end_at(mut self, end_at: DateTime<Utc>) -> Self {
+        self.end_at = Some(end_at);
+        self
+    }
+
+    /// Set a total run budget for this schedule (issue #478).
+    ///
+    /// Each actually-started run decrements the budget atomically.  Firings suppressed
+    /// by overlap policy, calendar filtering, or `paused` do **not** consume a slot.
+    /// When the budget reaches zero the schedule transitions to the terminal exhausted
+    /// state.
+    ///
+    /// `max_runs = 0` is treated as "no limit" (same as `None`) to avoid a schedule that
+    /// immediately exhausts before a single run can fire.
+    #[must_use]
+    pub const fn with_max_runs(mut self, max: u32) -> Self {
+        self.max_runs = Some(max);
         self
     }
 }

@@ -1406,6 +1406,20 @@ struct ScheduleEntry {
     consecutive_failure_count: i32,
     /// Timestamp when the schedule was automatically paused (issue #360). `null` = not auto-paused.
     auto_paused_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Absolute UTC cutoff for this schedule (issue #478). `null` = no cutoff (fires forever).
+    end_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Total run budget for this schedule (issue #478). `null` = no limit (fires forever).
+    max_runs: Option<i32>,
+    /// Number of executions actually started by this schedule (issue #478).
+    runs_started: i32,
+    /// Derived remaining run budget: `max_runs - runs_started` when `max_runs` is set,
+    /// `null` when `max_runs` is `null` (issue #478).
+    remaining_runs: Option<i32>,
+    /// Timestamp when the schedule was exhausted (issue #478). `null` = not yet exhausted.
+    exhausted_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Machine-readable exhaustion reason (issue #478). One of `"end_at_reached"` or
+    /// `"max_runs_exhausted"`. `null` when not exhausted.
+    exhausted_reason: Option<String>,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -1458,6 +1472,15 @@ struct CreateWorkflowScheduleRequest {
     /// `null` (the default) disables auto-pause (issue #360).
     #[serde(default)]
     consecutive_failure_limit: Option<u32>,
+    /// Absolute UTC cutoff for this schedule (issue #478).
+    /// When `next_run_at >= end_at` the scheduler stops firing and marks the schedule
+    /// exhausted. `null` (the default) = no cutoff.
+    #[serde(default)]
+    end_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Total run budget for this schedule (issue #478).
+    /// Once `runs_started` reaches `max_runs` the schedule is exhausted. `null` = no limit.
+    #[serde(default)]
+    max_runs: Option<u32>,
 }
 
 fn default_queue_name() -> String {
@@ -7960,6 +7983,7 @@ async fn list_schedules(
             let eft = effective_fire_time(s.id, s.next_run_at, s.jitter_secs);
             let buffered_count =
                 autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
+            let remaining_runs = s.max_runs.map(|max| (max - s.runs_started).max(0));
             ScheduleEntry {
                 id: s.id,
                 kind,
@@ -7985,6 +8009,12 @@ async fn list_schedules(
                 consecutive_failure_limit: s.consecutive_failure_limit,
                 consecutive_failure_count: s.consecutive_failure_count,
                 auto_paused_at: s.auto_paused_at,
+                end_at: s.end_at,
+                max_runs: s.max_runs,
+                runs_started: s.runs_started,
+                remaining_runs,
+                exhausted_at: s.exhausted_at,
+                exhausted_reason: s.exhausted_reason,
             }
         })
         .collect();
@@ -8033,6 +8063,7 @@ async fn get_schedule(
         .map(BackfillSummary::from);
 
     let buffered_count = autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
+    let remaining_runs = s.max_runs.map(|max| (max - s.runs_started).max(0));
     Ok(Json(ScheduleEntry {
         effective_fire_time: effective_fire_time(s.id, s.next_run_at, s.jitter_secs),
         jitter_secs: s.jitter_secs,
@@ -8058,6 +8089,12 @@ async fn get_schedule(
         consecutive_failure_limit: s.consecutive_failure_limit,
         consecutive_failure_count: s.consecutive_failure_count,
         auto_paused_at: s.auto_paused_at,
+        end_at: s.end_at,
+        max_runs: s.max_runs,
+        runs_started: s.runs_started,
+        remaining_runs,
+        exhausted_at: s.exhausted_at,
+        exhausted_reason: s.exhausted_reason,
     }))
 }
 
@@ -8334,6 +8371,7 @@ async fn upsert_workflow_schedule_and_read_back(
         .map_err(map_error)?;
     let buffered_count =
         autumn_harvest::scheduler::parse_buffered_runs_pub(&row.buffered_runs).len();
+    let remaining_runs = row.max_runs.map(|max| (max - row.runs_started).max(0));
     Ok(ScheduleEntry {
         effective_fire_time: effective_fire_time(row.id, row.next_run_at, row.jitter_secs),
         jitter_secs: row.jitter_secs,
@@ -8359,6 +8397,12 @@ async fn upsert_workflow_schedule_and_read_back(
         consecutive_failure_limit: row.consecutive_failure_limit,
         consecutive_failure_count: row.consecutive_failure_count,
         auto_paused_at: row.auto_paused_at,
+        end_at: row.end_at,
+        max_runs: row.max_runs,
+        runs_started: row.runs_started,
+        remaining_runs,
+        exhausted_at: row.exhausted_at,
+        exhausted_reason: row.exhausted_reason,
     })
 }
 
@@ -8493,6 +8537,8 @@ async fn create_workflow_schedule(
         calendar: request.calendar.clone(),
         skip_policy,
         consecutive_failure_limit: request.consecutive_failure_limit,
+        end_at: request.end_at,
+        max_runs: request.max_runs,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
@@ -17282,6 +17328,12 @@ mod tests {
             consecutive_failure_limit: None,
             consecutive_failure_count: 0,
             auto_paused_at: None,
+            end_at: None,
+            max_runs: None,
+            runs_started: 0,
+            remaining_runs: None,
+            exhausted_at: None,
+            exhausted_reason: None,
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(

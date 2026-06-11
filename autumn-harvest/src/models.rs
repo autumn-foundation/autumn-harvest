@@ -370,6 +370,16 @@ pub struct HarvestSchedule {
     pub consecutive_failure_count: i32,
     /// Set to the timestamp when the schedule was auto-paused (issue #360). NULL = not auto-paused.
     pub auto_paused_at: Option<DateTime<Utc>>,
+    /// Absolute UTC cutoff for this schedule (issue #478). NULL = no cutoff.
+    pub end_at: Option<DateTime<Utc>>,
+    /// Total run budget (issue #478). NULL = unlimited.
+    pub max_runs: Option<i32>,
+    /// Count of executions actually started by this schedule (issue #478).
+    pub runs_started: i32,
+    /// Set when the schedule transitions to the exhausted state (issue #478). NULL = still active.
+    pub exhausted_at: Option<DateTime<Utc>>,
+    /// Machine-readable reason for exhaustion: `"end_at_reached"` or `"max_runs_exhausted"` (issue #478).
+    pub exhausted_reason: Option<String>,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).

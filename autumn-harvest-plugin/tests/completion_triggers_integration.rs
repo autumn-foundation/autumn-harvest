@@ -1435,6 +1435,8 @@ async fn test_trigger_cross_shard_queue_preservation() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     autumn_harvest::register_workflow_schedules(&mut conn0, &[ws])
         .await

@@ -1212,6 +1212,8 @@ async fn upsert_workflow_schedule(
             dsl::consecutive_failure_limit.eq(ws
                 .consecutive_failure_limit
                 .map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
+            dsl::end_at.eq(ws.end_at),
+            dsl::max_runs.eq(ws.max_runs.map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
         ))
         .execute(conn)
         .await
@@ -1387,6 +1389,8 @@ async fn tick_workflow_schedules(
         .filter(dsl::is_paused.eq(false))
         // Auto-paused schedules (issue #360) are excluded from the due list.
         .filter(dsl::auto_paused_at.is_null())
+        // Exhausted schedules (issue #478) are permanently terminal — never re-fire.
+        .filter(dsl::exhausted_at.is_null())
         .filter(dsl::next_run_at.is_not_null())
         .filter(dsl::next_run_at.le(now))
         .order(dsl::next_run_at.asc())
@@ -1900,6 +1904,103 @@ async fn tick_one_workflow_schedule(
         return Ok(());
     }
 
+    // ── Bounded-run checks (issue #478) ───────────────────────────────────────
+    // Both checks run *after* the HA claim so only one replica records the
+    // exhaustion decision and advances next_run_at.
+
+    // Check 1 — absolute end-time cutoff.
+    if let Some(end_at) = schedule.end_at
+        && logical_date >= end_at
+    {
+        tracing::info!(
+            workflow_name = %wf_name,
+            logical_date = %logical_date,
+            end_at = %end_at,
+            "harvest: schedule end_at reached; transitioning to exhausted"
+        );
+        crate::schedule_decision::record_decision_graceful(
+            conn,
+            Some(&**metrics),
+            Some(schedule.id),
+            wf_name,
+            "workflow",
+            "skipped",
+            "end_at_reached",
+            Some(serde_json::json!({
+                "end_at": end_at,
+                "logical_date": logical_date,
+            })),
+            now,
+            now,
+            i16::try_from(current_shard.as_i32()).unwrap_or(0),
+        )
+        .await;
+        diesel::update(
+            dsl::harvest_schedules
+                .find(schedule.id)
+                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+        )
+        .set((
+            dsl::exhausted_at.eq(Some(now)),
+            dsl::exhausted_reason.eq(Some("end_at_reached")),
+            dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+        return Ok(());
+    }
+
+    // Check 2 — max_runs budget exhausted.
+    if let Some(max_runs) = schedule.max_runs
+        && max_runs > 0
+        && schedule.runs_started >= max_runs
+    {
+        tracing::info!(
+            workflow_name = %wf_name,
+            runs_started = schedule.runs_started,
+            max_runs,
+            "harvest: schedule max_runs budget exhausted; transitioning to exhausted"
+        );
+        crate::schedule_decision::record_decision_graceful(
+            conn,
+            Some(&**metrics),
+            Some(schedule.id),
+            wf_name,
+            "workflow",
+            "skipped",
+            "max_runs_exhausted",
+            Some(serde_json::json!({
+                "runs_started": schedule.runs_started,
+                "max_runs": max_runs,
+            })),
+            now,
+            now,
+            i16::try_from(current_shard.as_i32()).unwrap_or(0),
+        )
+        .await;
+        diesel::update(
+            dsl::harvest_schedules
+                .find(schedule.id)
+                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+        )
+        .set((
+            dsl::exhausted_at.eq(Some(now)),
+            dsl::exhausted_reason.eq(Some("max_runs_exhausted")),
+            dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+        return Ok(());
+    }
+
     let mut running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
@@ -2281,6 +2382,57 @@ async fn tick_one_workflow_schedule(
             next_run_after_plan
         }
     });
+
+    // ── Budget accounting (issue #478) ────────────────────────────────────────
+    // Increment runs_started by the number of executions actually dispatched this
+    // tick, then check whether the max_runs budget is now exhausted.
+    // The HA claim guarantees single-concurrent processing so this increment is
+    // safe to compute in application code rather than via a DB-side expression.
+    let new_runs_started =
+        schedule.runs_started.saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
+    let now_budget_exhausted = schedule
+        .max_runs
+        .is_some_and(|max| max > 0 && dispatched > 0 && new_runs_started >= max);
+    if now_budget_exhausted {
+        let max = schedule.max_runs.unwrap_or(0);
+        tracing::info!(
+            workflow_name = %wf_name,
+            runs_started = new_runs_started,
+            max_runs = max,
+            "harvest: schedule max_runs budget exhausted after dispatch; transitioning to exhausted"
+        );
+        crate::schedule_decision::record_decision_graceful(
+            conn,
+            Some(&**metrics),
+            Some(schedule.id),
+            wf_name,
+            "workflow",
+            "skipped",
+            "max_runs_exhausted",
+            Some(serde_json::json!({
+                "runs_started": new_runs_started,
+                "max_runs": max,
+                "exhausted_after_dispatch": true,
+            })),
+            now,
+            now,
+            i16::try_from(current_shard.as_i32()).unwrap_or(0),
+        )
+        .await;
+    }
+    let budget_exhausted_at: Option<DateTime<Utc>> =
+        if now_budget_exhausted { Some(now) } else { None };
+    let budget_exhausted_reason: Option<&str> =
+        if now_budget_exhausted { Some("max_runs_exhausted") } else { None };
+
+    // Resolve effective_next_run_at: NULL when the schedule is now exhausted so
+    // it never re-appears in the due-list query.
+    let final_next_run_at = if budget_exhausted_at.is_some() {
+        None
+    } else {
+        effective_next_run_at
+    };
+
     diesel::update(
         dsl::harvest_schedules
             .find(schedule.id)
@@ -2288,7 +2440,10 @@ async fn tick_one_workflow_schedule(
     )
     .set((
         dsl::last_run_at.eq(effective_last_run_at),
-        dsl::next_run_at.eq(effective_next_run_at),
+        dsl::next_run_at.eq(final_next_run_at),
+        dsl::runs_started.eq(new_runs_started),
+        dsl::exhausted_at.eq(budget_exhausted_at),
+        dsl::exhausted_reason.eq(budget_exhausted_reason),
         // Clear the HA claim so the column stays clean after a successful
         // fire. Guarded by token so a slow late tick cannot overwrite a
         // successor replica's live claim if the 30 s TTL expired.
