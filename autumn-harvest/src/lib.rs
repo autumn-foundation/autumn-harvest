@@ -68,6 +68,12 @@ pub mod dag_export;
 pub mod dag_linter;
 #[cfg(feature = "testing")]
 pub mod dag_profiler;
+
+#[cfg(any(test, feature = "testing"))]
+pub mod dag_resilience;
+
+#[cfg(any(test, feature = "testing"))]
+pub use dag_resilience::{ActivityFailureImpact, DagResilienceAnalyzer, ResilienceReport};
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
