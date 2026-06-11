@@ -1,0 +1,35 @@
+error: [HVG003] Workflow determinism violation: Reading std::env::var(), std::env::args(), or process environment at workflow execution time couples replay correctness to the environment of whichever worker process happens to run the replay. Environment variables may differ between the original execution host and a replay host, causing divergence.
+       Alternative: Read configuration at worker startup (WorkerConfig) and pass it as typed state via ctx.state::<T>(). For values that must vary per workflow run, pass them as workflow input parameters. Signal-based reconfiguration can use ctx.wait_for_signal() to update workflow-local state durably.
+ --> tests/compile_fail/hvg003_process_env.rs:5:23
+  |
+5 |     let _ = std::env::var("PORT");
+  |                       ^^^
+
+error: [HVG003] Workflow determinism violation: Reading std::env::var(), std::env::args(), or process environment at workflow execution time couples replay correctness to the environment of whichever worker process happens to run the replay. Environment variables may differ between the original execution host and a replay host, causing divergence.
+       Alternative: Read configuration at worker startup (WorkerConfig) and pass it as typed state via ctx.state::<T>(). For values that must vary per workflow run, pass them as workflow input parameters. Signal-based reconfiguration can use ctx.wait_for_signal() to update workflow-local state durably.
+ --> tests/compile_fail/hvg003_process_env.rs:6:23
+  |
+6 |     let _ = std::env::var_os("PORT");
+  |                       ^^^^^^
+
+error: [HVG003] Workflow determinism violation: Reading std::env::var(), std::env::args(), or process environment at workflow execution time couples replay correctness to the environment of whichever worker process happens to run the replay. Environment variables may differ between the original execution host and a replay host, causing divergence.
+       Alternative: Read configuration at worker startup (WorkerConfig) and pass it as typed state via ctx.state::<T>(). For values that must vary per workflow run, pass them as workflow input parameters. Signal-based reconfiguration can use ctx.wait_for_signal() to update workflow-local state durably.
+ --> tests/compile_fail/hvg003_process_env.rs:7:23
+  |
+7 |     let _ = std::env::args();
+  |                       ^^^^
+
+error: [HVG003] Workflow determinism violation: Reading std::env::var(), std::env::args(), or process environment at workflow execution time couples replay correctness to the environment of whichever worker process happens to run the replay. Environment variables may differ between the original execution host and a replay host, causing divergence.
+       Alternative: Read configuration at worker startup (WorkerConfig) and pass it as typed state via ctx.state::<T>(). For values that must vary per workflow run, pass them as workflow input parameters. Signal-based reconfiguration can use ctx.wait_for_signal() to update workflow-local state durably.
+ --> tests/compile_fail/hvg003_process_env.rs:8:23
+  |
+8 |     let _ = std::env::args_os();
+  |                       ^^^^^^^
+
+warning: unused variable: `ctx`
+ --> tests/compile_fail/hvg003_process_env.rs:4:23
+  |
+4 | async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
+  |                       ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default

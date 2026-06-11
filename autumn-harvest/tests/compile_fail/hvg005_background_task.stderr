@@ -1,0 +1,14 @@
+error: [HVG005] Workflow determinism violation: Spawning a background task with tokio::spawn(), std::thread::spawn(), async_std::task::spawn(), or rayon::spawn() from inside a workflow function creates untracked side-effects. The spawned task runs outside Harvest's supervision: its completion is not recorded in harvest_events, it is not retried on failure, and it is silently abandoned on worker restart.
+       Alternative: Model concurrent work as parallel activity branches using ctx.execute_activity_raw(name, input, queue) calls combined with futures::join! or futures::try_join!. Harvest records each branch's result durably and re-joins them correctly on replay. For fire-and-forget side-effects, use a local activity (#[activity(local = true)]) so the result is at least logged to history.
+ --> tests/compile_fail/hvg005_background_task.rs:5:12
+  |
+5 |     tokio::spawn(async {});
+  |            ^^^^^
+
+warning: unused variable: `ctx`
+ --> tests/compile_fail/hvg005_background_task.rs:4:23
+  |
+4 | async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
+  |                       ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
