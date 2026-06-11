@@ -85,14 +85,6 @@ impl UpdateRegistry {
         Ok(())
     }
 
-    /// Invoke the handler for `name` with `input`.
-    ///
-    /// Returns `None` if `name` is not registered.
-    #[must_use]
-    pub fn invoke(&self, name: &str, input: Value) -> Option<UpdateHandlerFuture> {
-        self.entries.get(name).map(|e| (e.handler)(input))
-    }
-
     /// Returns the validator for `name`, if registered and present.
     #[must_use]
     pub fn get_validator(&self, name: &str) -> Option<BoxUpdateValidator> {
@@ -169,15 +161,14 @@ mod tests {
 
         // Test invoke
         assert!(
-            registry
-                .invoke("unknown", serde_json::json!("valid"))
-                .is_none(),
-            "invocation should return None for unknown handler"
+            registry.get_handler("unknown").is_none(),
+            "get_handler should return None for unknown handler"
         );
 
-        let _future = registry
-            .invoke("my_update", serde_json::json!("valid"))
+        let handler = registry
+            .get_handler("my_update")
             .expect("handler should exist");
+        let _future = handler(serde_json::json!("valid"));
     }
 
     #[test]

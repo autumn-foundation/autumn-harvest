@@ -3870,13 +3870,13 @@ impl WorkflowContext {
         // Check the imperative registry first (handles both declarative handlers
         // wired in via register_declarative_update_handler and manually registered
         // ones).
-        let future = self
+        let handler_opt = self
             .update_registry
             .lock()
             .expect("update_registry lock poisoned")
-            .invoke(name, input.clone());
-        if future.is_some() {
-            return future;
+            .get_handler(name);
+        if let Some(handler) = handler_opt {
+            return Some(handler(input));
         }
 
         // Fall back to the declarative-only map. This path is taken when a
