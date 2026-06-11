@@ -143,6 +143,7 @@ mod db_tests {
     use autumn_harvest::types::{ExecutionId, Priority, UpdateId, WorkflowIdReusePolicy};
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use uuid;
 
     const INIT_SQL: &str = concat!(
         include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
@@ -410,7 +411,12 @@ mod db_tests {
     async fn should_deduplicate_via_idempotency_key() {
         let (mut conn, _container) = setup_test_db().await;
         let exec_id = ExecutionId::new();
-        let update_id = UpdateId::new();
+
+        // Callers must derive update_id deterministically from the idempotency key
+        // (e.g. via UUIDv5) so the dedupe lookup matches on retry.
+        let idem_key = "idm-key-001";
+        let ns = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap();
+        let update_id = UpdateId::from_uuid(uuid::Uuid::new_v5(&ns, idem_key.as_bytes()));
 
         // Build params with idempotency key.
         let mut params = make_params(
@@ -420,7 +426,7 @@ mod db_tests {
             update_id,
             WorkflowIdReusePolicy::AllowDuplicate,
         );
-        params.idempotency_key = Some("idm-key-001".to_string());
+        params.idempotency_key = Some(idem_key.to_string());
 
         let first = update_with_start_workflow_execution(&mut conn, params.clone())
             .await
@@ -428,10 +434,10 @@ mod db_tests {
         assert!(first.started_fresh);
         assert!(first.update_admitted);
 
-        // Second call with same idempotency key.
+        // Second call with same idempotency key — exec_id differs (as on a real
+        // HTTP retry) but update_id is the same deterministic value.
         let mut params2 = params.clone();
-        params2.exec_id = ExecutionId::new(); // different exec_id
-        params2.update_id = UpdateId::new(); // different update_id; key drives dedup
+        params2.exec_id = ExecutionId::new(); // different exec_id, same update_id
 
         let second = update_with_start_workflow_execution(&mut conn, params2)
             .await

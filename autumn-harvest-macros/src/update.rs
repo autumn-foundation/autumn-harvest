@@ -225,18 +225,20 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .map_err(::autumn_harvest::error::HarvestError::Serialization)
                     }
 
-                    /// Atomically start-or-attach the workflow and admit this update, then
-                    /// poll until the handler resolves and return the typed result.
+                    /// Atomically start-or-attach the workflow and admit this update.
+                    ///
+                    /// Returns [`UpdateWithStartOutcome`] describing whether a fresh
+                    /// execution was started and whether the update was admitted.
+                    /// Use the `update_id` in the outcome to poll for the result via the
+                    /// management API (`GET /workflows/{exec_id}/updates/{update_id}`) or
+                    /// the `poll_update_result` helper.
                     ///
                     /// `start_input` is the JSON-serialised workflow input. The update
                     /// arguments are typed from the `#[update]` function signature.
                     /// Use [`TypedUpdateWithStartOptions`] to control the reuse policy,
                     /// idempotency key, queue, and other per-call settings.
                     ///
-                    /// Returns `(UpdateWithStartOutcome, Ok_type)` — the outcome carries
-                    /// `started_fresh` and `update_id` for observability; the second
-                    /// element is the typed update result.
-                    ///
+                    /// [`UpdateWithStartOutcome`]: ::autumn_harvest::UpdateWithStartOutcome
                     /// [`TypedUpdateWithStartOptions`]: ::autumn_harvest::TypedUpdateWithStartOptions
                     pub async fn #method_name_uws(
                         conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
@@ -245,7 +247,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         start_input: ::autumn_harvest::serde_json::Value,
                         #(#params,)*
                         opts: ::autumn_harvest::TypedUpdateWithStartOptions,
-                    ) -> ::autumn_harvest::HarvestResult<(::autumn_harvest::UpdateWithStartOutcome, #ok_type)>
+                    ) -> ::autumn_harvest::HarvestResult<::autumn_harvest::UpdateWithStartOutcome>
                     {
                         let workflow_id = workflow_id.into();
                         let update_args = #serialize_payload;
@@ -307,19 +309,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             runbook_url: ::std::option::Option::None,
                             severity: ::std::option::Option::None,
                         };
-                        let outcome = ::autumn_harvest::update_with_start_workflow_execution(conn, params).await?;
-                        // Poll for the update result using the existing workflow handle path.
-                        let handle = client.handle(outcome.exec_id);
-                        let raw = handle.execute_update_in_process(
-                            conn,
-                            #workflow_simple_name,
-                            #fn_name_str,
-                            serde_json::Value::Null, // already admitted; poll only
-                            ::std::time::Duration::from_secs(30),
-                        ).await?;
-                        let typed = ::autumn_harvest::serde_json::from_value(raw)
-                            .map_err(::autumn_harvest::error::HarvestError::Serialization)?;
-                        ::autumn_harvest::HarvestResult::Ok((outcome, typed))
+                        let _ = client; // used only for shard routing
+                        ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
                     }
                 }
             }
@@ -364,8 +355,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .map_err(::autumn_harvest::error::HarvestError::Serialization)
                         }
 
-                        /// Atomically start-or-attach the workflow and admit this update, then
-                        /// poll until the handler resolves and return the typed result.
+                        /// Atomically start-or-attach the workflow and admit this update.
                         ///
                         /// See the same-module variant for full documentation.
                         pub async fn #method_name_uws(
@@ -375,7 +365,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             start_input: ::autumn_harvest::serde_json::Value,
                             #(#params,)*
                             opts: ::autumn_harvest::TypedUpdateWithStartOptions,
-                        ) -> ::autumn_harvest::HarvestResult<(::autumn_harvest::UpdateWithStartOutcome, #ok_type)>
+                        ) -> ::autumn_harvest::HarvestResult<::autumn_harvest::UpdateWithStartOutcome>
                         {
                             let workflow_id = workflow_id.into();
                             let update_args = #serialize_payload;
@@ -437,18 +427,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 runbook_url: ::std::option::Option::None,
                                 severity: ::std::option::Option::None,
                             };
-                            let outcome = ::autumn_harvest::update_with_start_workflow_execution(conn, params).await?;
-                            let handle = client.handle(outcome.exec_id);
-                            let raw = handle.execute_update_in_process(
-                                conn,
-                                #workflow_simple_name,
-                                #fn_name_str,
-                                serde_json::Value::Null,
-                                ::std::time::Duration::from_secs(30),
-                            ).await?;
-                            let typed = ::autumn_harvest::serde_json::from_value(raw)
-                                .map_err(::autumn_harvest::error::HarvestError::Serialization)?;
-                            ::autumn_harvest::HarvestResult::Ok((outcome, typed))
+                            let _ = client; // used only for shard routing
+                            ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
                         }
                     }
                 }

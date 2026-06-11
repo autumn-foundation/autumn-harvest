@@ -6785,11 +6785,11 @@ async fn update_with_start_workflow(
             }
         };
         if let Some((existing_uuid, existing_state)) = hit {
-            // Reuse the execution UUID only when attaching to a live RUNNING run
-            // under a non-rejecting policy. All other paths (terminal prior,
-            // PAUSED, TerminateIfRunning) go through replace_execution and need
-            // a fresh exec_id to avoid a primary-key conflict.
-            let will_attach = existing_state == "RUNNING"
+            // Reuse the execution UUID only when attaching to a live RUNNING or
+            // SUSPENDED run under a non-rejecting policy. All other paths (terminal
+            // prior, PAUSED, TerminateIfRunning) go through replace_execution and
+            // need a fresh exec_id to avoid a primary-key conflict.
+            let will_attach = matches!(existing_state.as_str(), "RUNNING" | "SUSPENDED")
                 && matches!(
                     reuse_policy,
                     WorkflowIdReusePolicy::AllowDuplicate
@@ -7048,7 +7048,10 @@ async fn update_with_start_workflow(
             let wait_for_stage = request.wait_for_stage.as_deref().unwrap_or("completed");
             let timeout_secs = request.timeout_secs.unwrap_or(30);
 
-            if wait_for_stage == "admitted" || !outcome.update_admitted {
+            // An idempotent retry (!update_admitted) should still poll when
+            // wait_for_stage = "completed" — the update was previously admitted
+            // with the same update_id and may already have a result in history.
+            if wait_for_stage == "admitted" {
                 // Return immediately with the update_id for the caller to poll.
                 let ar = NewAuditRecord {
                     actor: &actor,
@@ -7122,10 +7125,22 @@ async fn update_with_start_workflow(
                 }
                 (status_code, Json(base)).into_response()
             } else {
-                // Update failed or timed out — forward the poll response with extra context.
-                // Return the poll response as-is (it already has the right status code).
-                let (parts, body) = (poll_resp.0, poll_resp.1);
-                axum::response::Response::from_parts(parts, body)
+                // Update failed or timed out — return a structured error body that
+                // still carries execution_id and update_id so callers can retry or
+                // inspect history without losing the context from the admitted update.
+                let poll_status = poll_resp.0.status;
+                let error_msg =
+                    if let Ok(bytes) = axum::body::to_bytes(poll_resp.1, usize::MAX).await {
+                        serde_json::from_slice::<Value>(&bytes)
+                            .ok()
+                            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                            .unwrap_or_else(|| "update did not complete".to_string())
+                    } else {
+                        "update did not complete".to_string()
+                    };
+                let mut resp_body = UpdateWithStartResponse::from_outcome(&outcome);
+                resp_body.result = Some(serde_json::json!({ "error": error_msg }));
+                (poll_status, Json(resp_body)).into_response()
             }
         }
     }

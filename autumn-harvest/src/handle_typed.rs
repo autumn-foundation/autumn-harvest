@@ -168,7 +168,7 @@ pub struct TypedUpdateWithStartOptions {
     /// Dedup key scoped to `(workflow_name, workflow_id)`.
     ///
     /// When provided the caller should derive `update_id` deterministically
-    /// (e.g. UUIDv5 from this key) so that retried calls hit the dedupe lookup
+    /// (e.g. `UUIDv5` from this key) so that retried calls hit the dedupe lookup
     /// and return without re-starting or re-admitting the update.
     pub idempotency_key: Option<String>,
 }

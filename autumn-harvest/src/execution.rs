@@ -1992,7 +1992,7 @@ pub struct UpdateWithStartParams<'a> {
     /// Per-key concurrency cap.
     pub concurrency_limit: Option<u32>,
     /// Pre-generated update ID. When `idempotency_key` is `Some`, callers
-    /// should derive this deterministically (e.g. UUIDv5) so the dedup lookup
+    /// should derive this deterministically (e.g. `UUIDv5`) so the dedup lookup
     /// matches prior admitted updates.
     pub update_id: crate::types::UpdateId,
     /// The name of the update handler to invoke.
@@ -2023,9 +2023,10 @@ pub struct UpdateWithStartOutcome {
     pub update_admitted: bool,
 }
 
-/// Atomically start a workflow if no live run for `(workflow_name, workflow_id)`
-/// exists (subject to `reuse_policy`), or attach to the existing run, and
-/// admit exactly one update against the resolved execution.
+/// Atomically start or attach to a workflow and admit one update.
+///
+/// Applies the same reuse-policy matrix as `signal_with_start_workflow_execution`
+/// but admits exactly one update instead of a signal.
 ///
 /// ## Outcome matrix (mirrors signal-with-start except PAUSED rejects updates)
 ///
@@ -2070,25 +2071,24 @@ pub async fn update_with_start_workflow_execution(
             // Cross-execution idempotency dedupe scoped to (workflow_name, workflow_id).
             // When an idempotency key is provided we look up by the supplied update_id
             // (callers should derive it deterministically from the key, e.g. UUIDv5).
-            if let Some(_key) = request.idempotency_key.as_deref() {
-                if let Some(prior) = lookup_idempotent_update_dedupe(
+            if request.idempotency_key.is_some()
+                && let Some(prior) = lookup_idempotent_update_dedupe(
                     conn,
                     request.workflow_name,
                     request.workflow_id,
                     &request.update_id,
                 )
                 .await?
-                {
-                    return Ok(UpdateWithStartOutcome {
-                        exec_id: prior.exec_id,
-                        workflow_name: prior.workflow_name,
-                        workflow_id: prior.workflow_id,
-                        state: prior.state,
-                        started_fresh: false,
-                        update_id: request.update_id,
-                        update_admitted: false,
-                    });
-                }
+            {
+                return Ok(UpdateWithStartOutcome {
+                    exec_id: prior.exec_id,
+                    workflow_name: prior.workflow_name,
+                    workflow_id: prior.workflow_id,
+                    state: prior.state,
+                    started_fresh: false,
+                    update_id: request.update_id,
+                    update_admitted: false,
+                });
             }
 
             // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
@@ -2146,9 +2146,10 @@ pub async fn update_with_start_workflow_execution(
 
             // TOCTOU guard: if a concurrent transaction completed the run between
             // the policy resolver's lock and our start, escalate so the update lands.
-            // Note: PAUSED is a non-terminal active state; the update will be rejected
-            // by admit_update_event below (WorkflowPaused), rolling back entirely.
-            let started = if !matches!(started.state.as_str(), "RUNNING" | "PAUSED")
+            // SUSPENDED is treated as RUNNING here (not a real DB state today, but
+            // defensive). PAUSED is a non-terminal active state; the update will be
+            // rejected by admit_update_event below (WorkflowPaused), rolling back.
+            let started = if !matches!(started.state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED")
                 && matches!(
                     request.reuse_policy,
                     WorkflowIdReusePolicy::AllowDuplicate
@@ -2172,6 +2173,31 @@ pub async fn update_with_start_workflow_execution(
             } else {
                 started
             };
+
+            // Post-lock idempotency re-check: two concurrent calls with the same
+            // idempotency_key may both pass the early dedupe query (which runs before
+            // the execution row lock is acquired). After the lock is held, any prior
+            // admission committed by a racing transaction is now visible — re-check so
+            // the loser returns the cached outcome rather than admitting a second time.
+            if request.idempotency_key.is_some()
+                && let Some(prior) = lookup_idempotent_update_dedupe(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    &request.update_id,
+                )
+                .await?
+            {
+                return Ok(UpdateWithStartOutcome {
+                    exec_id: prior.exec_id,
+                    workflow_name: prior.workflow_name,
+                    workflow_id: prior.workflow_id,
+                    state: prior.state,
+                    started_fresh: false,
+                    update_id: request.update_id,
+                    update_admitted: false,
+                });
+            }
 
             // Admit the update against the resolved execution.
             //
