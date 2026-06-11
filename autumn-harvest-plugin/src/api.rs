@@ -9272,6 +9272,36 @@ async fn trigger_schedule_now(
         .with_status(axum::http::StatusCode::CONFLICT));
     }
 
+    // Reject exhausted schedules (issue #478). Manual triggers cannot bypass
+    // end_at / max_runs limits — the schedule has reached its terminal state.
+    if schedule.exhausted_at.is_some() {
+        if let Ok(mut conn) = acquire_conn(pool.default_pool()).await {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_SCHEDULE_TRIGGER,
+                target_type: TARGET_SCHEDULE,
+                target_id: Some(id.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("rejected_exhausted"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        runtime
+            .registry
+            .telemetry()
+            .metrics
+            .record_schedule_manual_trigger(&schedule_display_name, "rejected_exhausted");
+        return Err(AutumnError::bad_request_msg(format!(
+            "schedule {schedule_id} is exhausted (end_at or max_runs reached)"
+        ))
+        .with_status(axum::http::StatusCode::CONFLICT));
+    }
+
     // Resolve the effective overlap policy (body override takes precedence).
     let effective_overlap_policy = if let Some(ref op_str) = body.overlap_policy {
         match autumn_harvest::OverlapPolicy::from_user_input(op_str) {
