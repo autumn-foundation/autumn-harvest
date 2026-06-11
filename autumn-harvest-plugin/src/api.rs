@@ -40,7 +40,8 @@ use autumn_harvest::audit::{
     OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
-    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, SOURCE_API,
+    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
+    OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
     STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT,
     TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
     TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
@@ -105,9 +106,10 @@ use autumn_harvest::workers::{
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
-    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, WorkflowHandleClient,
-    WorkflowResult, cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
-    signal_with_start_workflow_execution, start_or_load_workflow_execution,
+    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, UpdateWithStartOutcome,
+    UpdateWithStartParams, WorkflowHandleClient, WorkflowResult, cancel_workflow_execution,
+    pause_workflow_execution, resume_workflow_execution, signal_with_start_workflow_execution,
+    start_or_load_workflow_execution, update_with_start_workflow_execution,
 };
 
 use crate::preflight::{PreflightReport, build_preflight_report};
@@ -1299,6 +1301,67 @@ impl SignalWithStartResponse {
     }
 }
 
+/// Request body for `POST /workflows/{workflow_name}/update-with-start` (issue #479).
+#[derive(Debug, Deserialize)]
+struct UpdateWithStartRequest {
+    workflow_id: String,
+    #[serde(default)]
+    start_input: Option<Value>,
+    update_name: String,
+    #[serde(default)]
+    update_args: Option<Value>,
+    #[serde(default)]
+    queue: Option<String>,
+    #[serde(default)]
+    memo: Option<Value>,
+    #[serde(default)]
+    search_attrs: Option<Value>,
+    #[serde(default)]
+    execution_timeout_secs: Option<i64>,
+    /// Same wire values as `POST /workflows/.../start`.
+    #[serde(default)]
+    id_reuse_policy: Option<String>,
+    /// Optional dedup key. Repeated calls with the same key scoped to
+    /// `(workflow_name, workflow_id)` are idempotent: exactly one update is
+    /// admitted, no duplicate starts are created.
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    /// `"admitted"` → return 202 with `update_id` immediately after admission.
+    /// `"completed"` (default) → poll until the update handler resolves.
+    #[serde(default)]
+    wait_for_stage: Option<String>,
+    /// Seconds to wait for the update result (default 30, `wait_for_stage = "completed"` only).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateWithStartResponse {
+    execution_id: String,
+    workflow_name: String,
+    workflow_id: String,
+    state: String,
+    started_fresh: bool,
+    update_id: String,
+    /// Present when `wait_for_stage = "completed"` and the update succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+}
+
+impl UpdateWithStartResponse {
+    fn from_outcome(outcome: &UpdateWithStartOutcome) -> Self {
+        Self {
+            execution_id: outcome.exec_id.to_string(),
+            workflow_name: outcome.workflow_name.clone(),
+            workflow_id: outcome.workflow_id.clone(),
+            state: outcome.state.clone(),
+            started_fresh: outcome.started_fresh,
+            update_id: outcome.update_id.to_string(),
+            result: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DagTriggerRequest {
     conf: Option<Value>,
@@ -1954,6 +2017,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(signal_with_start_workflow),
         )
         .route(
+            "/workflows/{workflow_name}/update-with-start",
+            post(update_with_start_workflow),
+        )
+        .route(
             "/workflows/{id}/cancel",
             post(cancel_workflow).route_layer(require_admin.clone()),
         )
@@ -2240,6 +2307,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/stack"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
+        ("POST", "/workflows/{workflow_name}/update-with-start"),
         ("POST", "/workflows/{id}/cancel"),
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
@@ -2384,6 +2452,24 @@ pub const fn management_api_request_fields()
                 "execution_timeout_secs",
                 "id_reuse_policy",
                 "idempotency_key",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{workflow_name}/update-with-start",
+            Some(&[
+                "workflow_id",
+                "start_input",
+                "update_name",
+                "update_args",
+                "queue",
+                "memo",
+                "search_attrs",
+                "execution_timeout_secs",
+                "id_reuse_policy",
+                "idempotency_key",
+                "wait_for_stage",
+                "timeout_secs",
             ]),
         ),
         // ── batch workflow start (issue #357) ─────────────────────────────────
@@ -2646,6 +2732,19 @@ pub const fn management_api_response_fields()
                 "state",
                 "started_fresh",
                 "signal_delivered",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{workflow_name}/update-with-start",
+            Some(&[
+                "execution_id",
+                "workflow_name",
+                "workflow_id",
+                "state",
+                "started_fresh",
+                "update_id",
+                "result",
             ]),
         ),
         (
@@ -6501,6 +6600,531 @@ async fn signal_with_start_workflow(
                 Json(SignalWithStartResponse::from_outcome(outcome)),
             )
                 .into_response()
+        }
+    }
+}
+
+// ── update-with-start (issue #479) ───────────────────────────────────────────
+
+/// `POST /workflows/{workflow_name}/update-with-start`
+///
+/// Atomically starts a workflow if no live run for `(workflow_name, workflow_id)`
+/// exists (subject to `id_reuse_policy`), or attaches to the existing run, and
+/// admits exactly one update against the resolved execution.
+///
+/// Mirrors the `signal-with-start` contract: same reuse-policy × prior-state
+/// matrix, same shard-routing and idempotency semantics.
+#[allow(clippy::too_many_lines)]
+async fn update_with_start_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(workflow_name): Path<String>,
+    maybe_session: Option<Extension<Session>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<UpdateWithStartRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let route = "POST /workflows/{workflow_name}/update-with-start";
+
+    // `terminate_if_running` requires admin access (same gate as signal_with_start).
+    if matches!(
+        request.id_reuse_policy.as_deref(),
+        Some("terminate_if_running")
+    ) && !has_harvest_admin_access(&api_state, maybe_session.map(|Extension(session)| session))
+        .await
+    {
+        let (actor, source, request_id) = audit_context(&headers, &api_state);
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("unauthorized: terminate_if_running requires admin access"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
+
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    if !runtime.registry.workflows.contains_key(&workflow_name) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("workflow not registered"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return AutumnError::not_found_msg(format!("workflow '{workflow_name}'")).into_response();
+    }
+    if runtime.is_registered_dag(&workflow_name) {
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(workflow_name.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some(
+                    "registered DAG cannot receive update-with-start via workflow route",
+                ),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+        }
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' is a registered DAG; update-with-start applies to plain workflows"
+        ))
+        .into_response();
+    }
+
+    let reuse_policy = match parse_reuse_policy(request.id_reuse_policy.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_UPDATE_WITH_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: request.idempotency_key.as_deref(),
+                    status: STATUS_FAILED,
+                    error_summary: Some("invalid id_reuse_policy"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return e.into_response();
+        }
+    };
+
+    let workflow_id = request.workflow_id;
+    let queue_name = request
+        .queue
+        .or_else(|| runtime.queues.as_slice().first().cloned())
+        .unwrap_or_else(|| "default".to_string());
+    let start_input = request.start_input.unwrap_or(Value::Null);
+    let update_args = request.update_args.unwrap_or(Value::Null);
+
+    let effective_wf_cap = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.max_input_bytes)
+        .map_or(runtime.registry.max_workflow_input_bytes, |per_wf| {
+            per_wf.max(runtime.registry.max_workflow_input_bytes)
+        });
+
+    // Multi-shard scan: find any existing non-terminal execution for
+    // (workflow_name, workflow_id) to determine the target shard and exec_id.
+    let pool = match api_state.storage_pool() {
+        Ok(p) => p,
+        Err(e) => return map_error(e).into_response(),
+    };
+    let mut found_shard: Option<(ShardId, PoolConn, ExecutionId)> = None;
+    for (candidate_shard, shard_pool) in pool.iter_shards() {
+        let mut shard_conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        let hit = match harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
+            .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
+            .filter(harvest_workflow_executions::state.ne_all(["CONTINUED_AS_NEW", "TERMINATED"]))
+            .select((
+                harvest_workflow_executions::id,
+                harvest_workflow_executions::state,
+            ))
+            .first::<(uuid::Uuid, String)>(&mut shard_conn)
+            .await
+            .optional()
+        {
+            Ok(hit) => hit,
+            Err(e) => {
+                return AutumnError::service_unavailable_msg(format!(
+                    "shard {} lookup failed: {e}",
+                    candidate_shard.as_i32()
+                ))
+                .into_response();
+            }
+        };
+        if let Some((existing_uuid, existing_state)) = hit {
+            // Reuse the execution UUID only when attaching to a live RUNNING run
+            // under a non-rejecting policy. All other paths (terminal prior,
+            // PAUSED, TerminateIfRunning) go through replace_execution and need
+            // a fresh exec_id to avoid a primary-key conflict.
+            let will_attach = existing_state == "RUNNING"
+                && matches!(
+                    reuse_policy,
+                    WorkflowIdReusePolicy::AllowDuplicate
+                        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+                );
+            let exec_id = if will_attach {
+                ExecutionId::from_uuid(existing_uuid)
+            } else {
+                ExecutionId::new_for_shard(candidate_shard)
+            };
+            found_shard = Some((candidate_shard, shard_conn, exec_id));
+            break;
+        }
+    }
+
+    let (shard, mut conn, exec_id) = if let Some(tuple) = found_shard {
+        tuple
+    } else {
+        let shard = runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id);
+        let conn = match db_conn_for_shard(&api_state, shard).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        (shard, conn, ExecutionId::new_for_shard(shard))
+    };
+
+    // Admission gate check (unconditional — same rationale as signal-with-start).
+    {
+        let wf_owner = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|i| i.owner);
+        let gate_hit =
+            api_state
+                .gate_cache()
+                .check(&workflow_name, &queue_name, shard.as_i32(), wf_owner);
+        if let Some((gate_id, reason, scope_kind)) = gate_hit {
+            let reason_label = match reason.char_indices().nth(64) {
+                Some((idx, _)) => &reason[..idx],
+                None => &reason,
+            };
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_admission_blocked(scope_kind, reason_label);
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_UPDATE_WITH_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("admission blocked by gate"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Validate start_input against the workflow's published JSON Schema (if any).
+    if let Some(info) = runtime.registry.workflows.get(&workflow_name)
+        && let Err(violations) = info.validate_input(&start_input)
+    {
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_UPDATE_WITH_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: None,
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: request.idempotency_key.as_deref(),
+            status: STATUS_FAILED,
+            error_summary: Some("input validation failed"),
+            shard_id: Some(shard.as_i32()),
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "input validation failed",
+                "violations": violations,
+            })),
+        )
+            .into_response();
+    }
+
+    // Derive update_id — deterministic from idempotency_key if provided.
+    let update_id = if let Some(ref key) = request.idempotency_key {
+        let namespace = uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+            .expect("static namespace UUID is valid");
+        UpdateId::from_uuid(uuid::Uuid::new_v5(&namespace, key.as_bytes()))
+    } else {
+        UpdateId::new()
+    };
+
+    let trace_ctx = tracing::info_span!(
+        "harvest.workflow.schedule",
+        "otel.kind" = "producer",
+        { ATTR_WORKFLOW_ID } = %workflow_name,
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_SHARD_ID } = i64::from(shard.as_i32()),
+        { ATTR_QUEUE } = %queue_name,
+    )
+    .in_scope(|| runtime.registry.telemetry().capture_trace_context());
+
+    let (concurrency_key, concurrency_limit) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.concurrency.as_ref())
+        .map_or((None, None), |policy| {
+            let key =
+                autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &start_input);
+            (key, Some(policy.limit))
+        });
+
+    let (owner, runbook_url, severity) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .map_or((None, None, None), |info| {
+            (info.owner, info.runbook_url, info.severity)
+        });
+
+    let params = UpdateWithStartParams {
+        workflow_name: &workflow_name,
+        workflow_id: &workflow_id,
+        exec_id,
+        input: start_input,
+        parent_id: None,
+        queue_name: &queue_name,
+        execution_timeout: request
+            .execution_timeout_secs
+            .map(chrono::Duration::seconds),
+        memo: request.memo,
+        search_attrs: request.search_attrs,
+        reuse_policy,
+        trace_context: trace_ctx,
+        max_execution_timeout_ceiling: api_state
+            .max_workflow_execution_timeout()
+            .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+        concurrency_key,
+        concurrency_limit,
+        update_id,
+        update_name: request.update_name.clone(),
+        update_args,
+        idempotency_key: request.idempotency_key.clone(),
+        max_workflow_input_bytes: effective_wf_cap,
+        owner,
+        runbook_url,
+        severity,
+    };
+
+    let result = update_with_start_workflow_execution(&mut conn, params).await;
+
+    match result {
+        Err(HarvestError::AlreadyExists {
+            existing_exec_id,
+            existing_state,
+        }) => {
+            let exec_id_str = existing_exec_id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("workflow already exists"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                axum::http::StatusCode::CONFLICT,
+                Json(AlreadyExistsResponse {
+                    existing_execution_id: existing_exec_id.to_string(),
+                    existing_state,
+                }),
+            )
+                .into_response()
+        }
+        Err(HarvestError::WorkflowPaused(paused_exec_id)) => {
+            let exec_id_str = paused_exec_id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("workflow is paused"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                axum::http::StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "workflow is paused",
+                    "execution_id": paused_exec_id.to_string(),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            map_error(e).into_response()
+        }
+        Ok(outcome) => {
+            let exec_id_str = outcome.exec_id.to_string();
+            let status_code = if outcome.started_fresh {
+                axum::http::StatusCode::CREATED
+            } else {
+                axum::http::StatusCode::OK
+            };
+
+            // If the caller wants to wait for the update result, poll history.
+            let wait_for_stage = request.wait_for_stage.as_deref().unwrap_or("completed");
+            let timeout_secs = request.timeout_secs.unwrap_or(30);
+
+            if wait_for_stage == "admitted" || !outcome.update_admitted {
+                // Return immediately with the update_id for the caller to poll.
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_UPDATE_WITH_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(exec_id_str.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: request.idempotency_key.as_deref(),
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(shard.as_i32()),
+                    source: &source,
+                };
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %audit_err,
+                        "audit insert failed for workflow.update_with_start"
+                    );
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+                return (status_code, Json(UpdateWithStartResponse::from_outcome(&outcome)))
+                    .into_response();
+            }
+
+            // Audit before the long poll to record the admission decision.
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_UPDATE_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                tracing::error!(
+                    error = %audit_err,
+                    "audit insert failed for workflow.update_with_start"
+                );
+                return AutumnError::service_unavailable_msg(format!(
+                    "audit insert failed: {audit_err}"
+                ))
+                .into_response();
+            }
+
+            // Poll for the update result, then embed it in the response.
+            let poll_response =
+                poll_update_result(&pool, outcome.exec_id, outcome.update_id, timeout_secs).await;
+
+            // Re-build response combining outcome + poll result.
+            let mut base = UpdateWithStartResponse::from_outcome(&outcome);
+            // Extract result from the poll response body when completed.
+            let poll_resp = poll_response.into_parts();
+            if poll_resp.0.status == axum::http::StatusCode::OK {
+                // Decode the body to extract the output.
+                if let Ok(body_bytes) = axum::body::to_bytes(poll_resp.1, usize::MAX).await {
+                    if let Ok(val) = serde_json::from_slice::<Value>(&body_bytes) {
+                        base.result = val.get("output").cloned();
+                    }
+                }
+                (status_code, Json(base)).into_response()
+            } else {
+                // Update failed or timed out — forward the poll response with extra context.
+                // Return the poll response as-is (it already has the right status code).
+                let (parts, body) = (poll_resp.0, poll_resp.1);
+                axum::response::Response::from_parts(parts, body)
+            }
         }
     }
 }
@@ -17814,5 +18438,45 @@ mod tests {
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["message"], "missing required field 'name'");
         assert_eq!(json["field_path"], "/name");
+    }
+
+    // ── update-with-start route registration (issue #479) ────────────────────
+
+    #[test]
+    fn management_api_routes_includes_post_update_with_start() {
+        let routes = management_api_routes();
+        assert!(
+            routes.contains(&("POST", "/workflows/{workflow_name}/update-with-start")),
+            "POST /workflows/{{workflow_name}}/update-with-start must be listed in management_api_routes; found: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn management_api_request_fields_includes_update_with_start() {
+        let fields = management_api_request_fields();
+        let entry = fields
+            .iter()
+            .find(|(m, p, _)| *m == "POST" && *p == "/workflows/{workflow_name}/update-with-start");
+        assert!(
+            entry.is_some(),
+            "POST /workflows/{{workflow_name}}/update-with-start must be in management_api_request_fields"
+        );
+        let (_, _, body_fields) = entry.unwrap();
+        let body = body_fields.expect("update-with-start must have a structured body");
+        assert!(body.contains(&"workflow_id"), "must include workflow_id field");
+        assert!(body.contains(&"update_name"), "must include update_name field");
+        assert!(body.contains(&"update_args"), "must include update_args field");
+        assert!(body.contains(&"start_input"), "must include start_input field");
+    }
+
+    #[test]
+    fn management_api_response_fields_includes_update_with_start() {
+        let fields = management_api_response_fields();
+        assert!(
+            fields
+                .iter()
+                .any(|(m, p, _)| *m == "POST" && *p == "/workflows/{workflow_name}/update-with-start"),
+            "POST /workflows/{{workflow_name}}/update-with-start must be in management_api_response_fields"
+        );
     }
 }

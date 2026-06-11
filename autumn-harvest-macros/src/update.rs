@@ -140,6 +140,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let camel_wf = to_pascal_case(&workflow_simple_name);
     let stub_ident = format_ident!("{camel_wf}Stub");
     let method_name = format_ident!("update_{fn_name}");
+    let method_name_uws = format_ident!("update_with_start_{fn_name}");
     let ok_type = extract_ok_type(&func.sig.output);
 
     let serialize_payload = if param_names.is_empty() {
@@ -223,6 +224,103 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_harvest::serde_json::from_value(raw)
                             .map_err(::autumn_harvest::error::HarvestError::Serialization)
                     }
+
+                    /// Atomically start-or-attach the workflow and admit this update, then
+                    /// poll until the handler resolves and return the typed result.
+                    ///
+                    /// `start_input` is the JSON-serialised workflow input. The update
+                    /// arguments are typed from the `#[update]` function signature.
+                    /// Use [`TypedUpdateWithStartOptions`] to control the reuse policy,
+                    /// idempotency key, queue, and other per-call settings.
+                    ///
+                    /// Returns `(UpdateWithStartOutcome, Ok_type)` — the outcome carries
+                    /// `started_fresh` and `update_id` for observability; the second
+                    /// element is the typed update result.
+                    ///
+                    /// [`TypedUpdateWithStartOptions`]: ::autumn_harvest::TypedUpdateWithStartOptions
+                    pub async fn #method_name_uws(
+                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                        client: &::autumn_harvest::WorkflowHandleClient,
+                        workflow_id: impl Into<::std::string::String>,
+                        start_input: ::autumn_harvest::serde_json::Value,
+                        #(#params,)*
+                        opts: ::autumn_harvest::TypedUpdateWithStartOptions,
+                    ) -> ::autumn_harvest::HarvestResult<(::autumn_harvest::UpdateWithStartOutcome, #ok_type)>
+                    {
+                        let workflow_id = workflow_id.into();
+                        let update_args = #serialize_payload;
+                        let update_id = if let ::std::option::Option::Some(ref key) = opts.idempotency_key {
+                            let ns = ::autumn_harvest::uuid::Uuid::parse_str(
+                                "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                            ).expect("static namespace UUID is valid");
+                            ::autumn_harvest::types::UpdateId::from_uuid(
+                                ::autumn_harvest::uuid::Uuid::new_v5(&ns, key.as_bytes())
+                            )
+                        } else {
+                            ::autumn_harvest::types::UpdateId::new()
+                        };
+                        let exec_id = opts.exec_id.unwrap_or_else(|| {
+                            let shard = client.pick_shard_for_new_workflow(#workflow_simple_name, &workflow_id);
+                            ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
+                        });
+                        let execution_timeout = match opts.execution_timeout {
+                            ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                                ::autumn_harvest::chrono::Duration::from_std(d)
+                                    .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                        "execution_timeout exceeds chrono duration range".to_string()
+                                    ))?
+                            ),
+                            ::std::option::Option::None => ::std::option::Option::None,
+                        };
+                        let max_execution_timeout_ceiling = match client.max_workflow_execution_timeout() {
+                            ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                                ::autumn_harvest::chrono::Duration::from_std(d)
+                                    .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                        "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
+                                    ))?
+                            ),
+                            ::std::option::Option::None => ::std::option::Option::None,
+                        };
+                        let params = ::autumn_harvest::UpdateWithStartParams {
+                            workflow_name: #workflow_simple_name,
+                            workflow_id: &workflow_id,
+                            exec_id,
+                            input: start_input,
+                            parent_id: opts.parent_id,
+                            queue_name: opts.queue_name.as_deref().unwrap_or("default"),
+                            execution_timeout,
+                            memo: opts.memo,
+                            search_attrs: opts.search_attrs,
+                            reuse_policy: opts.reuse_policy.unwrap_or(
+                                ::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate
+                            ),
+                            trace_context: opts.trace_context,
+                            max_execution_timeout_ceiling,
+                            concurrency_key: ::std::option::Option::None,
+                            concurrency_limit: ::std::option::Option::None,
+                            update_id,
+                            update_name: #fn_name_str.to_string(),
+                            update_args,
+                            idempotency_key: opts.idempotency_key,
+                            max_workflow_input_bytes: client.max_workflow_input_bytes(::std::option::Option::None),
+                            owner: ::std::option::Option::None,
+                            runbook_url: ::std::option::Option::None,
+                            severity: ::std::option::Option::None,
+                        };
+                        let outcome = ::autumn_harvest::update_with_start_workflow_execution(conn, params).await?;
+                        // Poll for the update result using the existing workflow handle path.
+                        let handle = client.handle(outcome.exec_id);
+                        let raw = handle.execute_update_in_process(
+                            conn,
+                            #workflow_simple_name,
+                            #fn_name_str,
+                            serde_json::Value::Null, // already admitted; poll only
+                            ::std::time::Duration::from_secs(30),
+                        ).await?;
+                        let typed = ::autumn_harvest::serde_json::from_value(raw)
+                            .map_err(::autumn_harvest::error::HarvestError::Serialization)?;
+                        ::autumn_harvest::HarvestResult::Ok((outcome, typed))
+                    }
                 }
             }
         }
@@ -264,6 +362,93 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ).await?;
                             ::autumn_harvest::serde_json::from_value(raw)
                                 .map_err(::autumn_harvest::error::HarvestError::Serialization)
+                        }
+
+                        /// Atomically start-or-attach the workflow and admit this update, then
+                        /// poll until the handler resolves and return the typed result.
+                        ///
+                        /// See the same-module variant for full documentation.
+                        pub async fn #method_name_uws(
+                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+                            client: &::autumn_harvest::WorkflowHandleClient,
+                            workflow_id: impl Into<::std::string::String>,
+                            start_input: ::autumn_harvest::serde_json::Value,
+                            #(#params,)*
+                            opts: ::autumn_harvest::TypedUpdateWithStartOptions,
+                        ) -> ::autumn_harvest::HarvestResult<(::autumn_harvest::UpdateWithStartOutcome, #ok_type)>
+                        {
+                            let workflow_id = workflow_id.into();
+                            let update_args = #serialize_payload;
+                            let update_id = if let ::std::option::Option::Some(ref key) = opts.idempotency_key {
+                                let ns = ::autumn_harvest::uuid::Uuid::parse_str(
+                                    "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                                ).expect("static namespace UUID is valid");
+                                ::autumn_harvest::types::UpdateId::from_uuid(
+                                    ::autumn_harvest::uuid::Uuid::new_v5(&ns, key.as_bytes())
+                                )
+                            } else {
+                                ::autumn_harvest::types::UpdateId::new()
+                            };
+                            let exec_id = opts.exec_id.unwrap_or_else(|| {
+                                let shard = client.pick_shard_for_new_workflow(#workflow_simple_name, &workflow_id);
+                                ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
+                            });
+                            let execution_timeout = match opts.execution_timeout {
+                                ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                                    ::autumn_harvest::chrono::Duration::from_std(d)
+                                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                            "execution_timeout exceeds chrono duration range".to_string()
+                                        ))?
+                                ),
+                                ::std::option::Option::None => ::std::option::Option::None,
+                            };
+                            let max_execution_timeout_ceiling = match client.max_workflow_execution_timeout() {
+                                ::std::option::Option::Some(d) => ::std::option::Option::Some(
+                                    ::autumn_harvest::chrono::Duration::from_std(d)
+                                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
+                                            "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
+                                        ))?
+                                ),
+                                ::std::option::Option::None => ::std::option::Option::None,
+                            };
+                            let params = ::autumn_harvest::UpdateWithStartParams {
+                                workflow_name: #workflow_simple_name,
+                                workflow_id: &workflow_id,
+                                exec_id,
+                                input: start_input,
+                                parent_id: opts.parent_id,
+                                queue_name: opts.queue_name.as_deref().unwrap_or("default"),
+                                execution_timeout,
+                                memo: opts.memo,
+                                search_attrs: opts.search_attrs,
+                                reuse_policy: opts.reuse_policy.unwrap_or(
+                                    ::autumn_harvest::types::WorkflowIdReusePolicy::AllowDuplicate
+                                ),
+                                trace_context: opts.trace_context,
+                                max_execution_timeout_ceiling,
+                                concurrency_key: ::std::option::Option::None,
+                                concurrency_limit: ::std::option::Option::None,
+                                update_id,
+                                update_name: #fn_name_str.to_string(),
+                                update_args,
+                                idempotency_key: opts.idempotency_key,
+                                max_workflow_input_bytes: client.max_workflow_input_bytes(::std::option::Option::None),
+                                owner: ::std::option::Option::None,
+                                runbook_url: ::std::option::Option::None,
+                                severity: ::std::option::Option::None,
+                            };
+                            let outcome = ::autumn_harvest::update_with_start_workflow_execution(conn, params).await?;
+                            let handle = client.handle(outcome.exec_id);
+                            let raw = handle.execute_update_in_process(
+                                conn,
+                                #workflow_simple_name,
+                                #fn_name_str,
+                                serde_json::Value::Null,
+                                ::std::time::Duration::from_secs(30),
+                            ).await?;
+                            let typed = ::autumn_harvest::serde_json::from_value(raw)
+                                .map_err(::autumn_harvest::error::HarvestError::Serialization)?;
+                            ::autumn_harvest::HarvestResult::Ok((outcome, typed))
                         }
                     }
                 }
