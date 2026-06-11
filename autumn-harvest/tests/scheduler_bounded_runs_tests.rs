@@ -5,10 +5,10 @@
 //! correctly terminate schedules after the configured boundary, and that skipped
 //! firings (overlap policy, calendar) do NOT consume the `max_runs` budget.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use autumn_harvest::info::WorkflowInfo;
-use autumn_harvest::schema::harvest_schedules;
+use autumn_harvest::schema::{harvest_schedule_decisions, harvest_schedules};
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::{DagCatalog, SchedulerMonitor, WorkflowContext, tick_once};
 use chrono::Utc;
@@ -706,7 +706,6 @@ async fn decision_log_records_end_at_reached() {
         .await
         .expect("check conn");
 
-    use autumn_harvest::schema::harvest_schedule_decisions;
     let (decision, reason_code): (String, String) = harvest_schedule_decisions::table
         .filter(harvest_schedule_decisions::dsl::schedule_id.eq(Some(sched_id)))
         .select((
@@ -763,7 +762,6 @@ async fn decision_log_records_max_runs_exhausted() {
         .await
         .expect("check conn");
 
-    use autumn_harvest::schema::harvest_schedule_decisions;
     let (decision, reason_code): (String, String) = harvest_schedule_decisions::table
         .filter(harvest_schedule_decisions::dsl::schedule_id.eq(Some(sched_id)))
         .select((
