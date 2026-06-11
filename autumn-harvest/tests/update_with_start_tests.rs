@@ -119,7 +119,7 @@ use autumn_harvest::TypedUpdateWithStartOptions;
 #[cfg(feature = "db")]
 #[test]
 fn typed_update_with_start_options_default_is_safe() {
-    let opts: TypedUpdateWithStartOptions = Default::default();
+    let opts = TypedUpdateWithStartOptions::default();
     assert!(opts.exec_id.is_none(), "exec_id should be None by default");
     assert!(
         opts.idempotency_key.is_none(),
@@ -142,8 +142,8 @@ mod db_tests {
     use autumn_harvest::store;
     use autumn_harvest::types::{ExecutionId, Priority, UpdateId, WorkflowIdReusePolicy};
     use testcontainers_modules::postgres::Postgres;
+    use autumn_harvest::replay::{HistoryMatch, HistoryMatcher};
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
-    use uuid;
 
     const INIT_SQL: &str = concat!(
         include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
@@ -275,8 +275,6 @@ mod db_tests {
         assert_eq!(outcome.workflow_name, "cart");
 
         // Verify UpdateAdmitted event exists in history.
-        use autumn_harvest::replay::HistoryMatch;
-        use autumn_harvest::replay::HistoryMatcher;
         let history = store::load_history(&mut conn, outcome.exec_id)
             .await
             .expect("load history");
