@@ -9234,7 +9234,11 @@ async fn trigger_schedule_now(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let runtime = api_state.runtime().map_err(map_error)?;
 
-    let schedule = load_schedule_by_id(&api_state, schedule_id).await?;
+    // Load the schedule AND which shard it lives on. Budget accounting writes must
+    // target the same shard — the schedule row may not be on the default shard for
+    // unified-DAG schedules (issue #478).
+    let (schedule, schedule_shard) =
+        load_schedule_by_id_with_shard(&api_state, schedule_id).await?;
 
     let schedule_display_name = schedule
         .workflow_name
@@ -9432,6 +9436,11 @@ async fn trigger_schedule_now(
     // Acquire the DB connection early so it is available for both the overlap-skip
     // audit record and the normal start call.
     let mut conn = acquire_conn(pool.default_pool()).await?;
+    // Acquire a separate connection on the schedule's own shard for budget accounting.
+    // Schedule rows for unified-DAG schedules may live on a non-default shard; using
+    // pool.default_pool() here would target zero rows (issue #478).
+    let sched_pool = pool.pool_for(schedule_shard);
+    let mut sched_conn = acquire_conn(sched_pool).await?;
 
     // For Skip policy, fail closed: if the running-count query fails on any shard,
     // treat it as saturated rather than silently firing through.
@@ -9467,6 +9476,48 @@ async fn trigger_schedule_now(
                 triggered_at,
                 outcome: "skipped_overlap".to_string(),
             }));
+        }
+    }
+
+    // Atomically reserve one run slot against the max_runs budget before starting
+    // the workflow (issue #478). The WHERE guard prevents concurrent manual triggers
+    // from racing past the earlier in-memory admission check: only one of them
+    // increments successfully when runs_started is at the limit.
+    //
+    // For unlimited schedules (max_runs IS NULL) the WHERE always matches, so
+    // runs_started is incremented for observability and rows_affected = 1.
+    //
+    // If rows_affected = 0, either exhausted_at was set by a concurrent scheduler
+    // tick/trigger between our admission check and this point, or a concurrent
+    // trigger already consumed the last slot.
+    {
+        use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+        let reserved = diesel::update(
+            sdsl::harvest_schedules
+                .find(schedule.id)
+                .filter(sdsl::exhausted_at.is_null())
+                .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    "max_runs IS NULL OR runs_started < max_runs",
+                )),
+        )
+        .set((
+            sdsl::runs_started.eq(sdsl::runs_started + 1),
+            sdsl::updated_at.eq(triggered_at),
+        ))
+        .execute(&mut sched_conn)
+        .await
+        .map_err(database_error)
+        .map_err(map_error)?;
+        if reserved == 0 {
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_schedule_manual_trigger(&schedule_display_name, "rejected_exhausted");
+            return Err(AutumnError::bad_request_msg(format!(
+                "schedule {schedule_id} run budget exhausted (concurrent trigger or tick)"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT));
         }
     }
 
@@ -9533,6 +9584,18 @@ async fn trigger_schedule_now(
     let (exec_id_out, outcome) = match result {
         Ok(exec_result) => (Some(exec_result.exec_id.as_uuid()), "fired"),
         Err(e) => {
+            // Undo the pre-increment so the budget reflects actual started workflows.
+            {
+                use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+                let _ = diesel::update(sdsl::harvest_schedules.find(schedule.id))
+                    .filter(sdsl::exhausted_at.is_null())
+                    .set((
+                        sdsl::runs_started.eq(sdsl::runs_started - 1),
+                        sdsl::updated_at.eq(triggered_at),
+                    ))
+                    .execute(&mut sched_conn)
+                    .await;
+            }
             let ar = NewAuditRecord {
                 actor: &actor,
                 operation: OP_SCHEDULE_TRIGGER,
@@ -9573,40 +9636,29 @@ async fn trigger_schedule_now(
         .await
         .map_err(map_error)?;
 
-    // Issue #478: count this manual trigger against the max_runs budget so that
-    // repeated POST /trigger calls cannot bypass the advertised run limit.
+    // The pre-increment above already wrote runs_started = runs_started + 1.
+    // If that new value reaches max_runs, transition to exhausted now so the
+    // schedule immediately disappears from the due-list. The guard on
+    // exhausted_at IS NULL prevents a double-exhaustion race with the tick.
     {
-        use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+        use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
         let new_runs_started = schedule.runs_started.saturating_add(1);
-        let now_budget_exhausted = schedule
+        if schedule
             .max_runs
-            .is_some_and(|max| max > 0 && new_runs_started >= max);
-        if now_budget_exhausted {
+            .is_some_and(|max| max > 0 && new_runs_started >= max)
+        {
             let _ = diesel::update(
-                sched_dsl::harvest_schedules
+                sdsl::harvest_schedules
                     .find(schedule.id)
-                    .filter(sched_dsl::exhausted_at.is_null()),
+                    .filter(sdsl::exhausted_at.is_null()),
             )
             .set((
-                sched_dsl::runs_started.eq(new_runs_started),
-                sched_dsl::exhausted_at.eq(Some(triggered_at)),
-                sched_dsl::exhausted_reason.eq(Some("max_runs_exhausted")),
-                sched_dsl::next_run_at.eq(None::<chrono::DateTime<chrono::Utc>>),
-                sched_dsl::updated_at.eq(triggered_at),
+                sdsl::exhausted_at.eq(Some(triggered_at)),
+                sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
+                sdsl::next_run_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                sdsl::updated_at.eq(triggered_at),
             ))
-            .execute(&mut conn)
-            .await;
-        } else {
-            let _ = diesel::update(
-                sched_dsl::harvest_schedules
-                    .find(schedule.id)
-                    .filter(sched_dsl::exhausted_at.is_null()),
-            )
-            .set((
-                sched_dsl::runs_started.eq(new_runs_started),
-                sched_dsl::updated_at.eq(triggered_at),
-            ))
-            .execute(&mut conn)
+            .execute(&mut sched_conn)
             .await;
         }
     }
@@ -10548,10 +10600,20 @@ async fn load_schedule_by_id(
     api_state: &HarvestApiState,
     schedule_id: uuid::Uuid,
 ) -> Result<HarvestSchedule, AutumnError> {
+    let (schedule, _shard) = load_schedule_by_id_with_shard(api_state, schedule_id).await?;
+    Ok(schedule)
+}
+
+/// Like [`load_schedule_by_id`] but also returns the [`ShardId`] of the shard
+/// the schedule was found on, so callers can route subsequent writes correctly.
+async fn load_schedule_by_id_with_shard(
+    api_state: &HarvestApiState,
+    schedule_id: uuid::Uuid,
+) -> Result<(HarvestSchedule, ShardId), AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
-    for (_shard, shard_pool) in pool.iter_shards() {
+    for (shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
         let row = dsl::harvest_schedules
             .find(schedule_id)
@@ -10562,7 +10624,7 @@ async fn load_schedule_by_id(
             .map_err(database_error)
             .map_err(map_error)?;
         if let Some(r) = row {
-            return Ok(r);
+            return Ok((r, shard));
         }
     }
     Err(AutumnError::not_found_msg(format!(
