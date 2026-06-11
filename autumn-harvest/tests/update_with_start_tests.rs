@@ -139,10 +139,10 @@ mod db_tests {
         StartWorkflowParams, UpdateWithStartParams, start_or_load_workflow_execution,
         update_with_start_workflow_execution,
     };
+    use autumn_harvest::replay::{HistoryMatch, HistoryMatcher};
     use autumn_harvest::store;
     use autumn_harvest::types::{ExecutionId, Priority, UpdateId, WorkflowIdReusePolicy};
     use testcontainers_modules::postgres::Postgres;
-    use autumn_harvest::replay::{HistoryMatch, HistoryMatcher};
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
     const INIT_SQL: &str = concat!(
