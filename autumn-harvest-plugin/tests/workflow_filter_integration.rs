@@ -551,3 +551,41 @@ async fn workflow_search_attr_predicate_uses_gin_index() {
         "expected EXPLAIN plan to use idx_harvest_we_search, got:\n{plan_text}"
     );
 }
+
+#[tokio::test]
+async fn workflow_list_filter_failure_cause() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let _nd_wf = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "onboarding",
+        "wf-failed-nd",
+        Some(json!({
+            "failure_cause": "non_determinism",
+            "event_index": 3,
+            "expected": "ActivityScheduled",
+            "actual": "TimerStarted"
+        })),
+    )
+    .await;
+
+    let _other_wf = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "onboarding",
+        "wf-failed-other",
+        Some(json!({ "tenant": "acme" })),
+    )
+    .await;
+
+    // Filter by failure_cause=non_determinism.
+    let (status, json) = get_json(&app, "/workflows?failure_cause=non_determinism").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = workflow_ids(&json);
+    assert_eq!(ids, vec!["wf-failed-nd".to_string()]);
+}

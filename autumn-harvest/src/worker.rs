@@ -1678,7 +1678,7 @@ fn find_pending_scheduled_activity(
             && !terminal_ids.contains(activity_id)
         {
             if pending.is_some() {
-                return Err(HarvestError::NonDeterministic(format!(
+                return Err(HarvestError::non_deterministic_simple(format!(
                     "multiple pending scheduled activities named '{activity_name}' found in history"
                 )));
             }
@@ -1707,7 +1707,7 @@ fn find_pending_scheduled_activity_by_id(
                 activity_id, name, ..
             } if *activity_id == requested_activity_id => {
                 if name != activity_name {
-                    return Err(HarvestError::NonDeterministic(format!(
+                    return Err(HarvestError::non_deterministic_simple(format!(
                         "activity task id '{}' was scheduled for '{name}', not '{activity_name}'",
                         requested_activity_id.as_uuid()
                     )));
@@ -1934,6 +1934,7 @@ async fn update_workflow_execution_failed(
     exec_id: ExecutionId,
     worker_id: &str,
     error: &str,
+    nd_details: Option<&crate::error::NonDeterministicDetails>,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
@@ -1955,6 +1956,33 @@ async fn update_workflow_execution_failed(
 
     if updated == 0 {
         return Err(workflow_execution_transition_error(conn, exec_id).await?);
+    }
+
+    if let Some(details) = nd_details {
+        let mut patch = std::collections::HashMap::new();
+        patch.insert(
+            "failure_cause".to_string(),
+            Some(serde_json::json!("non_determinism")),
+        );
+        if let Some(idx) = details.event_index {
+            patch.insert("event_index".to_string(), Some(serde_json::json!(idx)));
+        }
+        if let Some(ref exp) = details.expected {
+            patch.insert("expected".to_string(), Some(serde_json::json!(exp)));
+        }
+        if let Some(ref act) = details.actual {
+            patch.insert("actual".to_string(), Some(serde_json::json!(act)));
+        }
+        if let Some(ref wf_type) = details.workflow_type {
+            patch.insert(
+                "workflow_type".to_string(),
+                Some(serde_json::json!(wf_type)),
+            );
+        }
+        if let Some(ref bid) = details.build_id {
+            patch.insert("build_id".to_string(), Some(serde_json::json!(bid)));
+        }
+        crate::store::update_search_attrs(conn, exec_id, &patch).await?;
     }
 
     Ok(())
@@ -2016,6 +2044,7 @@ async fn persist_workflow_completion(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_workflow_failure(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -2023,6 +2052,7 @@ async fn persist_workflow_failure(
     next_event_id: i32,
     worker_id: &str,
     error: &str,
+    nd_details: Option<&crate::error::NonDeterministicDetails>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
     let error = error.to_string();
@@ -2039,7 +2069,8 @@ async fn persist_workflow_failure(
                         next_event_id,
                     )
                     .await?;
-                    update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
+                    update_workflow_execution_failed(conn, exec_id, worker_id, &error, nd_details)
+                        .await?;
                     queue::fail_task(conn, task_id, &error).await?;
                     let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
                     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
@@ -3063,7 +3094,7 @@ async fn fail_task_and_execution(
                 error = %history_error,
                 "failed to load workflow history while persisting task failure; updating rows without event append"
             );
-            update_workflow_execution_failed(conn, exec_id, worker_id, error).await?;
+            update_workflow_execution_failed(conn, exec_id, worker_id, error, None).await?;
             return queue::fail_task(conn, task.id, error).await;
         }
     };
@@ -3075,6 +3106,7 @@ async fn fail_task_and_execution(
         history.next_event_id,
         worker_id,
         error,
+        None,
         None,
     )
     .await
@@ -3270,6 +3302,7 @@ async fn persist_child_workflow_failure(
     worker_id: &str,
     parent_exec_id: ExecutionId,
     error: &str,
+    nd_details: Option<&crate::error::NonDeterministicDetails>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
     let workflow_failure = WorkflowEvent::WorkflowFailed {
@@ -3282,7 +3315,8 @@ async fn persist_child_workflow_failure(
                 let error = error.to_string();
                 async move {
                     store::append_events(conn, exec_id, &[workflow_failure], next_event_id).await?;
-                    update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
+                    update_workflow_execution_failed(conn, exec_id, worker_id, &error, nd_details)
+                        .await?;
                     queue::fail_task(conn, task_id, &error).await?;
                     let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
                     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
@@ -4296,6 +4330,7 @@ async fn handle_suspended_workflow(
             context.persistence.worker_id,
             &error,
             None,
+            None,
         )
         .await
     };
@@ -4484,6 +4519,7 @@ async fn reject_child_continue_as_new(
             persistence.worker_id,
             error,
             None,
+            None,
         )
         .await?;
     } else {
@@ -4495,6 +4531,7 @@ async fn reject_child_continue_as_new(
             persistence.worker_id,
             parent_exec_id,
             error,
+            None,
             None,
         )
         .await?;
@@ -4679,7 +4716,13 @@ async fn persist_workflow_outcome(
             }
             result
         }
-        (WorkflowOutcome::Failed { error }, Some(parent_id)) if !is_detached_child => {
+        (
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details,
+            },
+            Some(parent_id),
+        ) if !is_detached_child => {
             let result = persist_child_workflow_failure(
                 conn,
                 persistence.task.id,
@@ -4688,6 +4731,7 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 parent_id,
                 &error,
+                non_deterministic_details.as_ref(),
                 Some(registry.telemetry().metrics.as_ref()),
             )
             .await;
@@ -4702,7 +4746,13 @@ async fn persist_workflow_outcome(
             }
             result
         }
-        (WorkflowOutcome::Failed { error }, _) => {
+        (
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details,
+            },
+            _,
+        ) => {
             // Root workflow or detached child failing — no parent wake.
             let result = persist_workflow_failure(
                 conn,
@@ -4711,6 +4761,7 @@ async fn persist_workflow_outcome(
                 persistence.next_event_id,
                 persistence.worker_id,
                 &error,
+                non_deterministic_details.as_ref(),
                 Some(registry.telemetry().metrics.as_ref()),
             )
             .await;
@@ -5047,7 +5098,8 @@ async fn move_workflow_to_dlq_for_history_cap(
                         next_event_id,
                     )
                     .await?;
-                    update_workflow_execution_failed(conn, exec_id, worker_id, &reason).await?;
+                    update_workflow_execution_failed(conn, exec_id, worker_id, &reason, None)
+                        .await?;
                     queue::fail_task(conn, task.id, &reason).await?;
                     let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
                     let failed_triggers =
@@ -5119,12 +5171,13 @@ async fn fail_workflow_for_history_cap(
     .await
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn process_workflow_task(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
     task: &TaskQueueItem,
     worker_id: &str,
+    build_id: &str,
     sticky_timeout: Duration,
     max_local_activity_start_to_close: Duration,
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
@@ -5252,6 +5305,7 @@ async fn process_workflow_task(
                 .as_ref()
                 .filter(|_| is_replay)
                 .and_then(|c| c.link_traceparent.clone().or_else(|| c.traceparent.clone())),
+            build_id: Some(build_id.to_string()),
         };
 
         // Filter declarative handlers to those that target this workflow type.
@@ -5821,11 +5875,21 @@ async fn process_workflow_task(
             &task.queue_name,
             WorkflowStatus::Completed,
         ),
-        WorkflowOutcome::Failed { .. } => telemetry.metrics.record_workflow_terminal(
-            &prepared.execution.workflow_name,
-            &task.queue_name,
-            WorkflowStatus::Failed,
-        ),
+        WorkflowOutcome::Failed {
+            non_deterministic_details,
+            ..
+        } => {
+            if non_deterministic_details.is_some() {
+                telemetry
+                    .metrics
+                    .record_workflow_non_determinism(&prepared.execution.workflow_name, build_id);
+            }
+            telemetry.metrics.record_workflow_terminal(
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                WorkflowStatus::Failed,
+            );
+        }
         WorkflowOutcome::ContinuedAsNew { .. } => telemetry.metrics.record_workflow_terminal(
             &prepared.execution.workflow_name,
             &task.queue_name,
@@ -5986,6 +6050,7 @@ async fn process_task(
     registry: Arc<HandlerRegistry>,
     task: TaskQueueItem,
     worker_id: &str,
+    build_id: &str,
     cancellation_grace_period: Duration,
     sticky_timeout: Duration,
     max_local_activity_start_to_close: Duration,
@@ -6000,6 +6065,7 @@ async fn process_task(
                 registry.as_ref(),
                 &task,
                 worker_id,
+                build_id,
                 sticky_timeout,
                 max_local_activity_start_to_close,
                 workflow_cache,
@@ -6953,6 +7019,7 @@ impl Worker {
         let task_id = task.id;
         let task_type = task.task_type.clone();
         let worker_id = self.config.worker_id.clone();
+        let build_id = self.config.build_id.clone();
         let cancellation_grace_period = self.config.cancellation_grace_period;
         let sticky_timeout = self.config.sticky_timeout;
         let max_local_activity_start_to_close = self.config.max_local_activity_start_to_close;
@@ -6977,6 +7044,7 @@ impl Worker {
                 registry,
                 task,
                 &worker_id,
+                &build_id,
                 cancellation_grace_period,
                 sticky_timeout,
                 max_local_activity_start_to_close,

@@ -434,6 +434,37 @@
         "GET /api/harvest/dlq"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_failure_rate"
+    },
+    {
+      "id": "harvest_workflow_non_determinism",
+      "status": "enforceable",
+      "signal_source": "ADR-0001/#138 counter harvest.workflow.non_determinism plus management API failure_cause query.",
+      "default_threshold": "Page immediately on any non-zero rate of non-deterministic replay failures. This indicates a replay-breaking deploy has been shipped to production.",
+      "severity": "page",
+      "owner_persona": "release on-call",
+      "description": "Workflow executions are failing during replay due to non-deterministic divergence (different history generated than previously recorded). This usually happens when a new code version changes workflow logic without proper version gating or routing protection.",
+      "first_action": "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism",
+      "dependencies": [
+        {
+          "ref": "#480",
+          "status": "shipped",
+          "surface": "METRIC_WORKFLOW_NON_DETERMINISM / harvest.workflow.non_determinism"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "Non-determinism signals a logic mismatch. Labels include workflow and build_id. Keep build_id low-cardinality.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow, build_id) (increase(harvest_workflow_non_determinism_total[5m])) > 0"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_non_determinism"
     }
   ]
 }

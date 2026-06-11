@@ -198,6 +198,11 @@ pub const ATTR_SIGNAL_ID: &str = "harvest.signal.id";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 
+/// Counter: incremented when a replay non-determinism (divergence) failure occurs.
+///
+/// Labeled by `workflow` (workflow name) and `build_id`.
+pub const METRIC_WORKFLOW_NON_DETERMINISM: &str = "harvest.workflow.non_determinism";
+
 /// Counter: incremented each time a workflow execution is paused by an operator
 /// or the bounded-pause auto-resume scanner (issue #383).
 ///
@@ -347,6 +352,8 @@ pub const METRIC_LABEL_REASON_CODE: &str = "reason_code";
 pub const METRIC_LABEL_TRIGGER: &str = "trigger";
 /// Metric label: admission gate scope kind (issue #377).
 pub const METRIC_LABEL_SCOPE: &str = "scope";
+/// Metric label: the build ID of the worker.
+pub const METRIC_LABEL_BUILD_ID: &str = "build_id";
 
 // ---------------------------------------------------------------------------
 // TraceContextCarrier
@@ -655,6 +662,11 @@ pub trait MetricsRecorder: Send + Sync {
     /// A workflow execution rotated using continue-as-new.
     fn record_workflow_continue_as_new(&self, workflow_name: &str) {
         let _ = workflow_name;
+    }
+
+    /// A workflow replay non-determinism (divergence) failure was detected.
+    fn record_workflow_non_determinism(&self, workflow_name: &str, build_id: &str) {
+        let _ = (workflow_name, build_id);
     }
 
     /// An activity invocation finished.
@@ -1128,6 +1140,10 @@ mod tests {
         assert_eq!(METRIC_RETENTION_DELETED, "harvest.retention.deleted");
         assert_eq!(METRIC_WORKFLOW_TIMEOUT, "harvest.workflow.timeout");
         assert_eq!(METRIC_TASK_QUARANTINED, "harvest.task.quarantined");
+        assert_eq!(
+            METRIC_WORKFLOW_NON_DETERMINISM,
+            "harvest.workflow.non_determinism"
+        );
     }
 
     #[test]
@@ -1136,6 +1152,7 @@ mod tests {
         assert_eq!(METRIC_LABEL_WORKFLOW_TYPE, "workflow.type");
         assert_eq!(METRIC_LABEL_ACTIVITY, "activity");
         assert_eq!(METRIC_LABEL_QUEUE, "queue");
+        assert_eq!(METRIC_LABEL_BUILD_ID, "build_id");
     }
 
     // -----------------------------------------------------------------------
@@ -1398,6 +1415,7 @@ mod tests {
         rec.record_schedule_run("workflow", "daily_digest");
         rec.record_schedule_skipped("workflow", "daily_digest", "paused");
         rec.record_retention_tick(0, 100, 50, 0.02);
+        rec.record_workflow_non_determinism("onboarding", "v1.0.0");
         // If any method silently accepted execution.id we'd see it here.
     }
 

@@ -14,6 +14,7 @@ const REQUIRED_ALERTS: &[&str] = &[
     "harvest_retention_lag",
     "harvest_shard_unready",
     "harvest_no_compatible_worker",
+    "harvest_workflow_non_determinism",
 ];
 
 const REQUIRED_DRILLS: &[&str] = &[
@@ -48,6 +49,7 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_retention_deleted_total",
     "harvest_schedule_fire_attempts_total",
     "harvest_workflow_terminal_total",
+    "harvest_workflow_non_determinism_total",
 ];
 
 #[test]

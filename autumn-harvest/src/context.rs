@@ -20,7 +20,7 @@ use crate::builder::{
     DEFAULT_MAX_ACTIVITY_INPUT_BYTES, DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
     DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
 };
-use crate::error::{HarvestError, HarvestResult, PayloadKind};
+use crate::error::{HarvestError, HarvestResult, NonDeterministicDetails, PayloadKind};
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
@@ -732,6 +732,10 @@ pub struct WorkflowContext {
     /// Empty when not known (legacy contexts, testing, update handlers).
     /// Set by the worker via `with_workflow_id` before executing the handler.
     workflow_id: String,
+    /// The build ID of the worker executing this workflow.
+    build_id: Option<String>,
+    /// In-memory holder of structured non-determinism details.
+    nd_details: Mutex<Option<NonDeterministicDetails>>,
     /// Global cap on activity input payloads (bytes). Checked at schedule time.
     payload_max_activity_input: u64,
     /// Global cap on workflow/child-workflow input payloads (bytes).
@@ -762,12 +766,41 @@ pub struct WorkflowContext {
 impl WorkflowContext {
     // ── Internal Helpers ──────────────────────────────────────────────────
 
+    fn nd_error(
+        &self,
+        reason: String,
+        event_index: Option<i32>,
+        expected: Option<String>,
+        actual: Option<String>,
+    ) -> HarvestError {
+        let details = NonDeterministicDetails {
+            event_index,
+            expected: expected.clone(),
+            actual: actual.clone(),
+            workflow_type: Some(self.workflow_name.clone()),
+            build_id: self.build_id.clone(),
+        };
+        if let Ok(mut slot) = self.nd_details.lock() {
+            slot.get_or_insert(details);
+        }
+        HarvestError::non_deterministic(
+            reason,
+            event_index,
+            expected,
+            actual,
+            Some(self.workflow_name.clone()),
+            self.build_id.clone(),
+        )
+    }
+
     fn check_strict_replay_no_match(&self, actual_event: &str) -> HarvestResult<()> {
         if self.strict_replay {
-            return Err(HarvestError::NonDeterministic(format!(
-                "early completion mismatch: expected <end of history>, \
-                 got {actual_event}"
-            )));
+            return Err(self.nd_error(
+                format!("early completion mismatch: expected <end of history>, got {actual_event}"),
+                self.match_history(|m| i32::try_from(m.position()).ok()),
+                None,
+                None,
+            ));
         }
         Ok(())
     }
@@ -865,6 +898,8 @@ impl WorkflowContext {
             strict_replay: false,
             workflow_name: String::new(),
             workflow_id: String::new(),
+            build_id: None,
+            nd_details: Mutex::new(None),
             payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
@@ -950,6 +985,8 @@ impl WorkflowContext {
             strict_replay: false,
             workflow_name: String::new(),
             workflow_id: String::new(),
+            build_id: None,
+            nd_details: Mutex::new(None),
             payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
@@ -985,6 +1022,8 @@ impl WorkflowContext {
             strict_replay: false,
             workflow_name: String::new(),
             workflow_id: String::new(),
+            build_id: None,
+            nd_details: Mutex::new(None),
             payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
@@ -1061,6 +1100,13 @@ impl WorkflowContext {
         self
     }
 
+    /// Set the worker build ID.
+    #[must_use]
+    pub fn with_build_id(mut self, build_id: Option<String>) -> Self {
+        self.build_id = build_id;
+        self
+    }
+
     // ── Accessors ─────────────────────────────────────────────────────
 
     /// Deterministic "wall clock" -- returns the `WorkflowStarted` timestamp
@@ -1091,6 +1137,24 @@ impl WorkflowContext {
     #[must_use]
     pub fn workflow_type(&self) -> &str {
         &self.workflow_name
+    }
+
+    /// The worker build ID of the worker executing this workflow.
+    #[must_use]
+    pub fn build_id(&self) -> Option<&str> {
+        self.build_id.as_deref()
+    }
+
+    /// Retrieve and clear the structured non-determinism details.
+    #[must_use]
+    pub fn take_nd_details(&self) -> Option<NonDeterministicDetails> {
+        self.nd_details.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// The current cursor position in the history events during replay.
+    #[must_use]
+    pub fn replay_position(&self) -> usize {
+        self.match_history(|m| m.position())
     }
 
     /// Number of events currently loaded in this workflow execution history.
@@ -1409,8 +1473,15 @@ impl WorkflowContext {
                 serde_json::from_value(output).map_err(HarvestError::Serialization)
             }
 
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("side effect mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
 
             HistoryMatch::Failed { .. }
@@ -1462,12 +1533,23 @@ impl WorkflowContext {
     /// cycle do not overwrite it. The executor drains this via
     /// [`take_deferred_nd_error`](Self::take_deferred_nd_error).
     fn record_deferred_nd(&self, msg: String) {
-        let mut slot = self
-            .deferred_nd_error
-            .lock()
-            .expect("deferred_nd_error lock poisoned");
-        if slot.is_none() {
-            *slot = Some(msg);
+        {
+            let mut slot = self
+                .deferred_nd_error
+                .lock()
+                .expect("deferred_nd_error lock poisoned");
+            if slot.is_none() {
+                *slot = Some(msg);
+            }
+        }
+        if let Ok(mut details_slot) = self.nd_details.lock() {
+            details_slot.get_or_insert_with(|| NonDeterministicDetails {
+                event_index: i32::try_from(self.match_history(|m| m.position())).ok(),
+                expected: None,
+                actual: None,
+                workflow_type: Some(self.workflow_name.clone()),
+                build_id: self.build_id.clone(),
+            });
         }
     }
 
@@ -1547,7 +1629,9 @@ impl WorkflowContext {
                     f()
                 }
             },
-            HistoryMatch::Diverged { expected, actual } => {
+            HistoryMatch::Diverged {
+                expected, actual, ..
+            } => {
                 self.record_deferred_nd(format!(
                     "side-effect drift mismatch: expected {expected}, got {actual}"
                 ));
@@ -1721,7 +1805,9 @@ impl WorkflowContext {
                     rand::Rng::gen_range(&mut rand::thread_rng(), range)
                 }
             },
-            HistoryMatch::Diverged { expected, actual } => {
+            HistoryMatch::Diverged {
+                expected, actual, ..
+            } => {
                 self.record_deferred_nd(format!(
                     "side-effect drift mismatch: expected {expected}, got {actual}"
                 ));
@@ -1862,8 +1948,15 @@ impl WorkflowContext {
                 task_name: name.to_string(),
             }),
 
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("activity mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
 
             HistoryMatch::ActivityInProgress { activity_id } => {
@@ -1981,8 +2074,15 @@ impl WorkflowContext {
                 timeout_type,
                 task_name: name.to_string(),
             }),
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("activity mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
             HistoryMatch::ActivityInProgress { activity_id } => {
                 let (tx, rx) = oneshot::channel();
@@ -2113,8 +2213,15 @@ impl WorkflowContext {
                 task_name: name.to_string(),
             }),
 
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("local activity mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
 
             HistoryMatch::AwaitingExternalCompletion { .. }
@@ -2139,9 +2246,12 @@ impl WorkflowContext {
                 last_error,
             } => {
                 if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "local activity '{name}' scheduled but terminal not in history"
-                    )));
+                    return Err(self.nd_error(
+                        format!("local activity '{name}' scheduled but terminal not in history"),
+                        self.match_history(|m| i32::try_from(m.position()).ok()),
+                        Some("LocalActivityCompleted".to_string()),
+                        Some("LocalActivityInProgress".to_string()),
+                    ));
                 }
 
                 // If the recorded failure count already covers all retry
@@ -2253,8 +2363,15 @@ impl WorkflowContext {
         match history_match {
             HistoryMatch::Matched { .. } => Ok(()),
 
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("timer mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
 
             HistoryMatch::Failed { .. }
@@ -2304,6 +2421,7 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal replay matcher mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
     pub async fn spawn_child_workflow_raw(
         &self,
         workflow_name: &str,
@@ -2334,8 +2452,15 @@ impl WorkflowContext {
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!("child workflows do not time out in match_child_workflow")
             }
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("child workflow mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
             // The child was already started (its ChildWorkflowStarted event is in
             // history) but its terminal hasn't arrived yet.  This is the normal
@@ -2349,9 +2474,14 @@ impl WorkflowContext {
             // the parent without creating a duplicate child execution.
             HistoryMatch::ChildInProgress { child_id } => {
                 if self.strict_replay {
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "child workflow '{workflow_name}' started but terminal not in history"
-                    )));
+                    return Err(self.nd_error(
+                        format!(
+                            "child workflow '{workflow_name}' started but terminal not in history"
+                        ),
+                        self.match_history(|m| i32::try_from(m.position()).ok()),
+                        Some("ChildWorkflowCompleted".to_string()),
+                        Some("ChildWorkflowInProgress".to_string()),
+                    ));
                 }
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
@@ -2495,8 +2625,15 @@ impl WorkflowContext {
                 });
                 Ok(child_id)
             }
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("detached child workflow mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
             _ => unreachable!(
                 "match_detached_child_spawn only returns DetachedChildSpawned, NoMatch, or Diverged"
@@ -2752,8 +2889,15 @@ impl WorkflowContext {
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("signal mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
@@ -2763,9 +2907,15 @@ impl WorkflowContext {
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
-            | HistoryMatch::DetachedChildSpawned { .. } => Err(HarvestError::NonDeterministic(
-                "signal history contains unexpected failure".into(),
-            )),
+            | HistoryMatch::DetachedChildSpawned { .. } => {
+                let actual = format!("{history_match:?}");
+                Err(self.nd_error(
+                    "signal history contains unexpected failure".to_string(),
+                    self.match_history(|m| i32::try_from(m.position()).ok()),
+                    Some("WaitForSignal".to_string()),
+                    Some(actual),
+                ))
+            }
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("WaitForSignal({signal_name})"))?;
 
@@ -2848,11 +2998,16 @@ impl WorkflowContext {
         match history_match {
             SignalOrTimerMatch::SignalWon { payload } => Ok(Some(payload)),
             SignalOrTimerMatch::TimerWon => Ok(None),
-            SignalOrTimerMatch::Diverged { expected, actual } => {
-                Err(HarvestError::NonDeterministic(format!(
-                    "signal-or-timeout mismatch: expected {expected}, got {actual}"
-                )))
-            }
+            SignalOrTimerMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!("signal-or-timeout mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
             outcome @ (SignalOrTimerMatch::NoMatch | SignalOrTimerMatch::InProgress) => {
                 if matches!(outcome, SignalOrTimerMatch::NoMatch) {
                     self.check_strict_replay_no_match(&format!(
@@ -2861,9 +3016,12 @@ impl WorkflowContext {
                 } else if self.strict_replay {
                     // Strict replay (WorkflowReplayer) always gets complete
                     // histories — an unresolved race is a fixture problem.
-                    return Err(HarvestError::NonDeterministic(format!(
-                        "signal-or-timeout race '{signal_name}' started but unresolved in history"
-                    )));
+                    return Err(self.nd_error(
+                        format!("signal-or-timeout race '{signal_name}' started but unresolved in history"),
+                        self.match_history(|m| i32::try_from(m.position()).ok()),
+                        Some("SignalOrTimerResolved".to_string()),
+                        Some("SignalOrTimerInProgress".to_string()),
+                    ));
                 }
 
                 // First live run (NoMatch) or re-park after a spurious wake
@@ -2994,8 +3152,15 @@ impl WorkflowContext {
                 reason_code,
             }),
 
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("external signal mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
 
             // Crash-recovery: ExternalSignalRequested is already durable; re-attempt delivery
@@ -3115,13 +3280,20 @@ impl WorkflowContext {
                 Ok(())
             }
             HistoryMatch::Matched { .. } => Ok(()),
-            HistoryMatch::Diverged { expected, actual } => {
-                Err(HarvestError::NonDeterministic(format!(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!(
                     "fan_out #{seq}: history has {expected} but current code supplies {actual} — \
-                     the input collection changed size between deploy and replay; \
-                     use ctx.version() to guard this fan-out if the size change is intentional"
-                )))
-            }
+                         the input collection changed size between deploy and replay; \
+                         use ctx.version() to guard this fan-out if the size change is intentional"
+                ),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
             _ => unreachable!("match_fan_out_marker only returns Matched, NoMatch, or Diverged"),
         }
     }
@@ -3440,8 +3612,15 @@ impl WorkflowContext {
                 task_name: name.to_string(),
             }),
 
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("external activity mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
 
             HistoryMatch::AwaitingExternalCompletion { activity_id, token } => {
@@ -3544,8 +3723,15 @@ impl WorkflowContext {
                 self.push_command(WorkflowCommand::ContinueAsNew { input: output });
                 park_until_dropped().await
             }
-            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
                 format!("continue_as_new mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
             )),
             HistoryMatch::Failed { .. }
             | HistoryMatch::TimedOut { .. }
@@ -3555,9 +3741,15 @@ impl WorkflowContext {
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
-            | HistoryMatch::DetachedChildSpawned { .. } => Err(HarvestError::NonDeterministic(
-                "continue_as_new history contains unexpected terminal state".into(),
-            )),
+            | HistoryMatch::DetachedChildSpawned { .. } => {
+                let actual = format!("{history_match:?}");
+                Err(self.nd_error(
+                    "continue_as_new history contains unexpected terminal state".to_string(),
+                    self.match_history(|m| i32::try_from(m.position()).ok()),
+                    Some("ContinueAsNew".to_string()),
+                    Some(actual),
+                ))
+            }
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match("ContinueAsNew")?;
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
@@ -5218,7 +5410,7 @@ mod tests {
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
         let result = ctx.continue_as_new(serde_json::json!({"cycle": 2})).await;
 
-        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(matches!(result, Err(HarvestError::NonDeterministic { .. })));
         assert!(
             ctx.drain_commands().is_empty(),
             "replay divergence must not emit a new continue-as-new command"
@@ -5241,7 +5433,7 @@ mod tests {
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
         let result = ctx.continue_as_new(serde_json::json!({"cycle": 2})).await;
 
-        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(matches!(result, Err(HarvestError::NonDeterministic { .. })));
         assert!(
             ctx.drain_commands().is_empty(),
             "replay input mismatch must not emit a new continue-as-new command"
@@ -5680,7 +5872,7 @@ mod tests {
         let result: Result<i32, _> = ctx.side_effect("random_num", || 99);
 
         assert!(result.is_err());
-        if let Err(HarvestError::NonDeterministic(msg)) = result {
+        if let Err(HarvestError::NonDeterministic { reason: msg, .. }) = result {
             assert!(msg.contains("side effect mismatch"));
         } else {
             panic!("Expected NonDeterministic error");
@@ -6210,7 +6402,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, HarvestError::NonDeterministic(_)));
+        assert!(matches!(err, HarvestError::NonDeterministic { .. }));
         assert!(err.to_string().contains("send_email"));
         assert!(err.to_string().contains("charge_payment"));
     }
@@ -6367,7 +6559,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            HarvestError::NonDeterministic(_)
+            HarvestError::NonDeterministic { .. }
         ));
     }
 
@@ -6515,7 +6707,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            HarvestError::NonDeterministic(_)
+            HarvestError::NonDeterministic { .. }
         ));
 
         let cmds = ctx.drain_commands();
@@ -6546,7 +6738,7 @@ mod tests {
             .spawn_child_workflow_raw("process_order", serde_json::json!({"sku":"magazine"}))
             .await;
 
-        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(matches!(result, Err(HarvestError::NonDeterministic { .. })));
         assert!(
             ctx.drain_commands().is_empty(),
             "replay must not emit new child start command on input mismatch"
@@ -6660,7 +6852,7 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            HarvestError::NonDeterministic(_)
+            HarvestError::NonDeterministic { .. }
         ));
     }
 
@@ -6941,7 +7133,7 @@ mod tests {
             .await;
         assert!(matches!(
             result.unwrap_err(),
-            HarvestError::NonDeterministic(_)
+            HarvestError::NonDeterministic { .. }
         ));
     }
 
@@ -7126,7 +7318,7 @@ mod tests {
         let result = ctx
             .execute_local_activity_raw("format_data", Value::Null, None, None)
             .await;
-        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(matches!(result, Err(HarvestError::NonDeterministic { .. })));
     }
 
     // ── Parallel child workflow tests ────────────────────────────────────────
@@ -7650,7 +7842,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            HarvestError::NonDeterministic(msg) => {
+            HarvestError::NonDeterministic { reason: msg, .. } => {
                 assert!(msg.contains("external signal mismatch"), "msg: {msg}");
             }
             other => panic!("expected NonDeterministic, got {other:?}"),
@@ -7685,7 +7877,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            HarvestError::NonDeterministic(msg) => {
+            HarvestError::NonDeterministic { reason: msg, .. } => {
                 assert!(msg.contains("external signal mismatch"), "msg: {msg}");
             }
             other => panic!("expected NonDeterministic, got {other:?}"),

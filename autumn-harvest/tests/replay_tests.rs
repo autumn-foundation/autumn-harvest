@@ -184,7 +184,7 @@ async fn replay_detects_non_determinism() {
     let outcome = run_workflow(exec_id, history, wrong_name_workflow, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Failed { error } => {
+        WorkflowOutcome::Failed { error, .. } => {
             assert!(
                 error.contains("wrong_name") || error.contains("step_1"),
                 "error should mention activity name mismatch, got: {error}"
@@ -321,7 +321,7 @@ async fn replay_handles_failed_activity() {
     let outcome = run_workflow(exec_id, history, activity_error_workflow, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Failed { error } => {
+        WorkflowOutcome::Failed { error, .. } => {
             assert!(
                 error.contains("flaky_step"),
                 "error should mention activity name, got: {error}"
@@ -570,7 +570,7 @@ async fn local_activity_exhausted_retries_fails_the_workflow() {
     let outcome = run_workflow(exec_id, history, all_local_workflow, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Failed { error } => {
+        WorkflowOutcome::Failed { error, .. } => {
             assert!(
                 error.contains("permanent failure") || error.contains("step_1"),
                 "error should mention failure, got: {error}"
