@@ -3005,9 +3005,10 @@ async fn drain_buffered_schedule_runs(
                 .max_runs
                 .is_some_and(|max| max > 0 && new_runs_started >= max);
         let end_at_exhausted = schedule.end_at.is_some_and(|end| {
-            // The buffer is cleared of past-end_at slots above, so if the remaining
-            // buffer is empty the schedule has no future work left within the window.
-            buffered.is_empty() || buffered.iter().all(|&t| t >= end)
+            // Only exhaust from the drain when *remaining* buffered slots are all
+            // past the cutoff. An empty buffer means capacity opened and the drain
+            // completed normally — the regular tick detects end_at on next_run_at.
+            !buffered.is_empty() && buffered.iter().all(|&t| t >= end)
         });
         let any_drain_exhausted = budget_exhausted || end_at_exhausted;
         let exhausted_reason: Option<&str> = if budget_exhausted {
