@@ -7036,6 +7036,11 @@ mod tests {
             consecutive_failure_limit: None,
             consecutive_failure_count: 0,
             auto_paused_at: None,
+            end_at: None,
+            max_runs: None,
+            runs_started: 0,
+            exhausted_at: None,
+            exhausted_reason: None,
         }
     }
 
