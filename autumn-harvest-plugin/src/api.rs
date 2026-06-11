@@ -9573,6 +9573,44 @@ async fn trigger_schedule_now(
         .await
         .map_err(map_error)?;
 
+    // Issue #478: count this manual trigger against the max_runs budget so that
+    // repeated POST /trigger calls cannot bypass the advertised run limit.
+    {
+        use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+        let new_runs_started = schedule.runs_started.saturating_add(1);
+        let now_budget_exhausted = schedule
+            .max_runs
+            .is_some_and(|max| max > 0 && new_runs_started >= max);
+        if now_budget_exhausted {
+            let _ = diesel::update(
+                sched_dsl::harvest_schedules
+                    .find(schedule.id)
+                    .filter(sched_dsl::exhausted_at.is_null()),
+            )
+            .set((
+                sched_dsl::runs_started.eq(new_runs_started),
+                sched_dsl::exhausted_at.eq(Some(triggered_at)),
+                sched_dsl::exhausted_reason.eq(Some("max_runs_exhausted")),
+                sched_dsl::next_run_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+                sched_dsl::updated_at.eq(triggered_at),
+            ))
+            .execute(&mut conn)
+            .await;
+        } else {
+            let _ = diesel::update(
+                sched_dsl::harvest_schedules
+                    .find(schedule.id)
+                    .filter(sched_dsl::exhausted_at.is_null()),
+            )
+            .set((
+                sched_dsl::runs_started.eq(new_runs_started),
+                sched_dsl::updated_at.eq(triggered_at),
+            ))
+            .execute(&mut conn)
+            .await;
+        }
+    }
+
     runtime
         .registry
         .telemetry()

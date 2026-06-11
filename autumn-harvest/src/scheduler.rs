@@ -2876,6 +2876,10 @@ async fn drain_buffered_schedule_runs(
         }
 
         let mut dispatched: u32 = 0;
+        // Set to true when the whole buffer is cleared because the first slot is already
+        // past end_at. Used below to decide whether to exhaust the schedule even though
+        // `buffered` is empty after the clear (normal empty-after-drain must not exhaust).
+        let mut all_buffered_past_end_at = false;
 
         while dispatched < u32::try_from(available).unwrap_or(u32::MAX) && !buffered.is_empty() {
             let scheduled_for = buffered[0];
@@ -2885,6 +2889,7 @@ async fn drain_buffered_schedule_runs(
                 && scheduled_for >= end_at
             {
                 buffered.clear(); // all remaining buffered slots are also past end_at
+                all_buffered_past_end_at = true;
                 break;
             }
             // Budget cap (issue #478): don't let buffered drains exceed max_runs.
@@ -3032,10 +3037,18 @@ async fn drain_buffered_schedule_runs(
                 .max_runs
                 .is_some_and(|max| max > 0 && new_runs_started >= max);
         let end_at_exhausted = schedule.end_at.is_some_and(|end| {
-            // Only exhaust from the drain when *remaining* buffered slots are all
-            // past the cutoff. An empty buffer means capacity opened and the drain
-            // completed normally — the regular tick detects end_at on next_run_at.
-            !buffered.is_empty() && buffered.iter().all(|&t| t >= end)
+            if all_buffered_past_end_at {
+                // The entire buffer was cleared because every slot was past end_at.
+                // Exhaust only when the schedule's regular next_run_at is also at/past
+                // the cutoff (or absent). If next_run_at is still before end_at, the
+                // regular tick fires inside the window and the drain must not exhaust.
+                schedule.next_run_at.is_none_or(|next| next >= end)
+            } else {
+                // Only exhaust from the drain when *remaining* buffered slots are all
+                // past the cutoff. An empty buffer means capacity opened and the drain
+                // completed normally — the regular tick detects end_at on next_run_at.
+                !buffered.is_empty() && buffered.iter().all(|&t| t >= end)
+            }
         });
         let any_drain_exhausted = budget_exhausted || end_at_exhausted;
         let exhausted_reason: Option<&str> = if budget_exhausted {
@@ -3045,23 +3058,40 @@ async fn drain_buffered_schedule_runs(
         } else {
             None
         };
-        diesel::update(dsl::harvest_schedules.find(schedule.id))
+        // Use two separate UPDATE paths so the non-exhausting path never writes
+        // NULL for exhausted_at/exhausted_reason, which would silently undo a
+        // concurrent exhaustion set by another HA replica (issue #478).
+        if any_drain_exhausted {
+            diesel::update(dsl::harvest_schedules.find(schedule.id))
+                .set((
+                    dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
+                    dsl::runs_started.eq(new_runs_started),
+                    dsl::exhausted_at.eq(Some(now)),
+                    dsl::exhausted_reason.eq(exhausted_reason),
+                    dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        } else {
+            // Guard on exhausted_at IS NULL so a concurrent exhaustion is never
+            // overwritten. The row may have been exhausted by the regular tick or
+            // another drain between the SELECT above and this UPDATE.
+            diesel::update(
+                dsl::harvest_schedules
+                    .find(schedule.id)
+                    .filter(dsl::exhausted_at.is_null()),
+            )
             .set((
                 dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
                 dsl::runs_started.eq(new_runs_started),
-                dsl::exhausted_at.eq(any_drain_exhausted.then_some(now)),
-                dsl::exhausted_reason.eq(exhausted_reason),
-                // Clear next_run_at when exhausted so the schedule never re-appears.
-                dsl::next_run_at.eq(if any_drain_exhausted {
-                    None
-                } else {
-                    schedule.next_run_at
-                }),
                 dsl::updated_at.eq(now),
             ))
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
+        }
     }
 
     Ok(())
