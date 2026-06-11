@@ -691,9 +691,9 @@ pub struct DagInfo {
     /// disables jitter (default — today's behaviour).
     pub jitter: Duration,
     /// What to do when a new firing collides with a still-running execution.
-    /// Defaults to [`OverlapPolicy::Skip`].
+    /// Defaults to [`crate::policy::OverlapPolicy::Skip`].
     pub overlap_policy: crate::policy::OverlapPolicy,
-    /// Maximum buffered slots under [`OverlapPolicy::BufferAll`]. Default 100.
+    /// Maximum buffered slots under [`crate::policy::OverlapPolicy::BufferAll`]. Default 100.
     pub buffer_all_max: u32,
     /// Team owner metadata (issue #372).
     pub owner: Option<&'static str>,
