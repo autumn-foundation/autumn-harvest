@@ -901,7 +901,7 @@ impl WorkflowSchedule {
     /// Composes cleanly with `max_runs`, `OverlapPolicy`, calendar filtering, and
     /// `paused`.  A skipped firing does not trigger exhaustion.
     #[must_use]
-    pub fn with_end_at(mut self, end_at: DateTime<Utc>) -> Self {
+    pub const fn with_end_at(mut self, end_at: DateTime<Utc>) -> Self {
         self.end_at = Some(end_at);
         self
     }
@@ -913,11 +913,11 @@ impl WorkflowSchedule {
     /// When the budget reaches zero the schedule transitions to the terminal exhausted
     /// state.
     ///
-    /// `max_runs = 0` is treated as "no limit" (same as `None`) to avoid a schedule that
-    /// immediately exhausts before a single run can fire.
+    /// `max_runs = 0` is normalised to `None` (no limit) so callers cannot
+    /// accidentally produce a schedule that never fires.
     #[must_use]
     pub const fn with_max_runs(mut self, max: u32) -> Self {
-        self.max_runs = Some(max);
+        self.max_runs = if max == 0 { None } else { Some(max) };
         self
     }
 }

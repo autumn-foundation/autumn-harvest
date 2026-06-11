@@ -8538,7 +8538,8 @@ async fn create_workflow_schedule(
         skip_policy,
         consecutive_failure_limit: request.consecutive_failure_limit,
         end_at: request.end_at,
-        max_runs: request.max_runs,
+        // Normalize 0 → None: callers passing max_runs=0 intend "no limit".
+        max_runs: request.max_runs.filter(|&n| n > 0),
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
