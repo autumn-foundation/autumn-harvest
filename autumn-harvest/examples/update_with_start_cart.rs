@@ -62,8 +62,7 @@ async fn cart(ctx: &WorkflowContext, tenant_id: String) -> Result<CartState, Str
     ctx.register_update_handler_no_validator("add_item", move |input: serde_json::Value| {
         let state = state_for_handler.clone();
         async move {
-            let req: AddItemRequest = serde_json::from_value(input)
-                .map_err(|e| e.to_string())?;
+            let req: AddItemRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
             let mut s = state.lock().unwrap();
             let new_total = s.total_cents + req.price_cents * req.qty as u64;
             s.items.push(CartItem {
@@ -167,16 +166,36 @@ fn main() {
     println!();
     println!("# Reuse-policy × prior-state outcome matrix");
     println!();
-    println!("  Prior state      | AllowDuplicate          | RejectDuplicate    | AllowDuplicateFailedOnly | TerminateIfRunning       ");
-    println!("  -----------------+-------------------------+--------------------+--------------------------+--------------------------");
-    println!("  none             | start + admit update    | start + admit      | start + admit            | start + admit            ");
-    println!("  RUNNING          | admit to existing       | Err(AlreadyExists) | admit to existing        | cancel + start + admit   ");
-    println!("  SUSPENDED        | admit to existing       | Err(AlreadyExists) | admit to existing        | cancel + start + admit   ");
-    println!("  PAUSED           | Err(WorkflowPaused)     | Err(AlreadyExists) | Err(WorkflowPaused)      | Err(WorkflowPaused)      ");
-    println!("  COMPLETED        | start fresh + admit     | Err(AlreadyExists) | start fresh + admit      | start fresh + admit      ");
-    println!("  FAILED           | start fresh + admit     | Err(AlreadyExists) | start fresh + admit      | start fresh + admit      ");
-    println!("  CANCELLED        | start fresh + admit     | Err(AlreadyExists) | start fresh + admit      | start fresh + admit      ");
-    println!("  TERMINATED       | start fresh + admit     | start fresh+admit  | start fresh + admit      | start fresh + admit      ");
+    println!(
+        "  Prior state      | AllowDuplicate          | RejectDuplicate    | AllowDuplicateFailedOnly | TerminateIfRunning       "
+    );
+    println!(
+        "  -----------------+-------------------------+--------------------+--------------------------+--------------------------"
+    );
+    println!(
+        "  none             | start + admit update    | start + admit      | start + admit            | start + admit            "
+    );
+    println!(
+        "  RUNNING          | admit to existing       | Err(AlreadyExists) | admit to existing        | cancel + start + admit   "
+    );
+    println!(
+        "  SUSPENDED        | admit to existing       | Err(AlreadyExists) | admit to existing        | cancel + start + admit   "
+    );
+    println!(
+        "  PAUSED           | Err(WorkflowPaused)     | Err(AlreadyExists) | Err(WorkflowPaused)      | Err(WorkflowPaused)      "
+    );
+    println!(
+        "  COMPLETED        | start fresh + admit     | Err(AlreadyExists) | start fresh + admit      | start fresh + admit      "
+    );
+    println!(
+        "  FAILED           | start fresh + admit     | Err(AlreadyExists) | start fresh + admit      | start fresh + admit      "
+    );
+    println!(
+        "  CANCELLED        | start fresh + admit     | Err(AlreadyExists) | start fresh + admit      | start fresh + admit      "
+    );
+    println!(
+        "  TERMINATED       | start fresh + admit     | start fresh+admit  | start fresh + admit      | start fresh + admit      "
+    );
     println!();
     println!("# Equivalent management API call:");
     println!();
@@ -188,7 +207,9 @@ fn main() {
     println!(r#"             "workflow_id": "cart-acme-session-42","#);
     println!(r#"             "start_input": "acme","#);
     println!(r#"             "update_name": "add_item","#);
-    println!(r#"             "update_args": {{"item_id": "sku-001", "qty": 2, "price_cents": 1999}},"#);
+    println!(
+        r#"             "update_args": {{"item_id": "sku-001", "qty": 2, "price_cents": 1999}},"#
+    );
     println!(r#"             "idempotency_key": "req-abc123","#);
     println!(r#"             "id_reuse_policy": "allow_duplicate""#);
     println!(r#"           }}'"#);

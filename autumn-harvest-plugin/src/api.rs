@@ -41,10 +41,9 @@ use autumn_harvest::audit::{
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
     OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
-    OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
-    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT,
-    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH,
+    TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY,
+    TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -7074,7 +7073,10 @@ async fn update_with_start_workflow(
                     ))
                     .into_response();
                 }
-                return (status_code, Json(UpdateWithStartResponse::from_outcome(&outcome)))
+                return (
+                    status_code,
+                    Json(UpdateWithStartResponse::from_outcome(&outcome)),
+                )
                     .into_response();
             }
 
@@ -18463,10 +18465,22 @@ mod tests {
         );
         let (_, _, body_fields) = entry.unwrap();
         let body = body_fields.expect("update-with-start must have a structured body");
-        assert!(body.contains(&"workflow_id"), "must include workflow_id field");
-        assert!(body.contains(&"update_name"), "must include update_name field");
-        assert!(body.contains(&"update_args"), "must include update_args field");
-        assert!(body.contains(&"start_input"), "must include start_input field");
+        assert!(
+            body.contains(&"workflow_id"),
+            "must include workflow_id field"
+        );
+        assert!(
+            body.contains(&"update_name"),
+            "must include update_name field"
+        );
+        assert!(
+            body.contains(&"update_args"),
+            "must include update_args field"
+        );
+        assert!(
+            body.contains(&"start_input"),
+            "must include start_input field"
+        );
     }
 
     #[test]
@@ -18475,7 +18489,8 @@ mod tests {
         assert!(
             fields
                 .iter()
-                .any(|(m, p, _)| *m == "POST" && *p == "/workflows/{workflow_name}/update-with-start"),
+                .any(|(m, p, _)| *m == "POST"
+                    && *p == "/workflows/{workflow_name}/update-with-start"),
             "POST /workflows/{{workflow_name}}/update-with-start must be in management_api_response_fields"
         );
     }

@@ -45,7 +45,10 @@ fn update_with_start_params_is_cloneable_and_debug() {
 
     let _cloned = params.clone();
     let debug_str = format!("{params:?}");
-    assert!(debug_str.contains("cart"), "debug output must contain workflow_name");
+    assert!(
+        debug_str.contains("cart"),
+        "debug output must contain workflow_name"
+    );
 }
 
 #[cfg(feature = "db")]
@@ -66,7 +69,10 @@ fn update_with_start_outcome_is_cloneable_and_debug() {
     let cloned = outcome.clone();
     assert_eq!(cloned, outcome, "clone must equal original");
     let debug_str = format!("{outcome:?}");
-    assert!(debug_str.contains("cart"), "debug output must contain workflow_name");
+    assert!(
+        debug_str.contains("cart"),
+        "debug output must contain workflow_name"
+    );
 }
 
 #[cfg(feature = "db")]
@@ -130,8 +136,8 @@ fn typed_update_with_start_options_default_is_safe() {
 #[cfg(feature = "db")]
 mod db_tests {
     use autumn_harvest::execution::{
-        UpdateWithStartParams, update_with_start_workflow_execution,
-        start_or_load_workflow_execution, StartWorkflowParams,
+        StartWorkflowParams, UpdateWithStartParams, start_or_load_workflow_execution,
+        update_with_start_workflow_execution,
     };
     use autumn_harvest::store;
     use autumn_harvest::types::{ExecutionId, Priority, UpdateId, WorkflowIdReusePolicy};
@@ -248,19 +254,28 @@ mod db_tests {
 
         let outcome = update_with_start_workflow_execution(
             &mut conn,
-            make_params("cart", "cart-no-prior", exec_id, update_id, WorkflowIdReusePolicy::AllowDuplicate),
+            make_params(
+                "cart",
+                "cart-no-prior",
+                exec_id,
+                update_id,
+                WorkflowIdReusePolicy::AllowDuplicate,
+            ),
         )
         .await
         .expect("should succeed with no prior execution");
 
-        assert!(outcome.started_fresh, "must report started_fresh when no prior");
+        assert!(
+            outcome.started_fresh,
+            "must report started_fresh when no prior"
+        );
         assert!(outcome.update_admitted, "must report update_admitted");
         assert_eq!(outcome.update_id, update_id, "update_id must match input");
         assert_eq!(outcome.workflow_name, "cart");
 
         // Verify UpdateAdmitted event exists in history.
-        use autumn_harvest::replay::HistoryMatcher;
         use autumn_harvest::replay::HistoryMatch;
+        use autumn_harvest::replay::HistoryMatcher;
         let history = store::load_history(&mut conn, outcome.exec_id)
             .await
             .expect("load history");
@@ -312,13 +327,25 @@ mod db_tests {
         let update_id = UpdateId::new();
         let outcome = update_with_start_workflow_execution(
             &mut conn,
-            make_params("cart", "cart-running", new_exec_id, update_id, WorkflowIdReusePolicy::AllowDuplicate),
+            make_params(
+                "cart",
+                "cart-running",
+                new_exec_id,
+                update_id,
+                WorkflowIdReusePolicy::AllowDuplicate,
+            ),
         )
         .await
         .expect("should attach to running execution");
 
-        assert!(!outcome.started_fresh, "must not start fresh when prior is RUNNING");
-        assert!(outcome.update_admitted, "must admit update to running execution");
+        assert!(
+            !outcome.started_fresh,
+            "must not start fresh when prior is RUNNING"
+        );
+        assert!(
+            outcome.update_admitted,
+            "must admit update to running execution"
+        );
         assert_eq!(outcome.exec_id, exec_id, "must reuse original execution ID");
     }
 
@@ -360,12 +387,21 @@ mod db_tests {
         let update_id = UpdateId::new();
         let result = update_with_start_workflow_execution(
             &mut conn,
-            make_params("cart", "cart-reject", ExecutionId::new(), update_id, WorkflowIdReusePolicy::RejectDuplicate),
+            make_params(
+                "cart",
+                "cart-reject",
+                ExecutionId::new(),
+                update_id,
+                WorkflowIdReusePolicy::RejectDuplicate,
+            ),
         )
         .await;
 
         assert!(
-            matches!(result, Err(autumn_harvest::error::HarvestError::AlreadyExists { .. })),
+            matches!(
+                result,
+                Err(autumn_harvest::error::HarvestError::AlreadyExists { .. })
+            ),
             "RejectDuplicate + RUNNING prior must return AlreadyExists, got: {result:?}"
         );
     }
@@ -378,7 +414,11 @@ mod db_tests {
 
         // Build params with idempotency key.
         let mut params = make_params(
-            "cart", "cart-idem", exec_id, update_id, WorkflowIdReusePolicy::AllowDuplicate
+            "cart",
+            "cart-idem",
+            exec_id,
+            update_id,
+            WorkflowIdReusePolicy::AllowDuplicate,
         );
         params.idempotency_key = Some("idm-key-001".to_string());
 
@@ -391,14 +431,20 @@ mod db_tests {
         // Second call with same idempotency key.
         let mut params2 = params.clone();
         params2.exec_id = ExecutionId::new(); // different exec_id
-        params2.update_id = UpdateId::new();  // different update_id; key drives dedup
+        params2.update_id = UpdateId::new(); // different update_id; key drives dedup
 
         let second = update_with_start_workflow_execution(&mut conn, params2)
             .await
             .expect("second call should succeed (deduplicated)");
 
         // Must not start fresh again.
-        assert!(!second.started_fresh, "idempotent retry must not start fresh");
-        assert!(!second.update_admitted, "idempotent retry must not re-admit update");
+        assert!(
+            !second.started_fresh,
+            "idempotent retry must not start fresh"
+        );
+        assert!(
+            !second.update_admitted,
+            "idempotent retry must not re-admit update"
+        );
     }
 }
