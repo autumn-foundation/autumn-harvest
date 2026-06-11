@@ -2388,8 +2388,9 @@ async fn tick_one_workflow_schedule(
     // tick, then check whether the max_runs budget is now exhausted.
     // The HA claim guarantees single-concurrent processing so this increment is
     // safe to compute in application code rather than via a DB-side expression.
-    let new_runs_started =
-        schedule.runs_started.saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
+    let new_runs_started = schedule
+        .runs_started
+        .saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
     let now_budget_exhausted = schedule
         .max_runs
         .is_some_and(|max| max > 0 && dispatched > 0 && new_runs_started >= max);
@@ -2420,10 +2421,16 @@ async fn tick_one_workflow_schedule(
         )
         .await;
     }
-    let budget_exhausted_at: Option<DateTime<Utc>> =
-        if now_budget_exhausted { Some(now) } else { None };
-    let budget_exhausted_reason: Option<&str> =
-        if now_budget_exhausted { Some("max_runs_exhausted") } else { None };
+    let budget_exhausted_at: Option<DateTime<Utc>> = if now_budget_exhausted {
+        Some(now)
+    } else {
+        None
+    };
+    let budget_exhausted_reason: Option<&str> = if now_budget_exhausted {
+        Some("max_runs_exhausted")
+    } else {
+        None
+    };
 
     // Resolve effective_next_run_at: NULL when the schedule is now exhausted so
     // it never re-appears in the due-list query.

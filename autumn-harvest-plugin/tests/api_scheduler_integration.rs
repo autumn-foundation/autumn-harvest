@@ -5787,8 +5787,8 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             calendar: None,
             skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
             consecutive_failure_limit: None,
-        end_at: None,
-        max_runs: None,
+            end_at: None,
+            max_runs: None,
         };
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
             .await

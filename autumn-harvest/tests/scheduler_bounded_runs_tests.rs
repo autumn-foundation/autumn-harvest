@@ -131,9 +131,12 @@ fn workflow_schedule_with_max_runs_builder() {
 fn workflow_schedule_end_conditions_can_be_chained() {
     use autumn_harvest::policy::{Schedule, WorkflowSchedule};
     let cutoff = Utc::now() + chrono::Duration::days(30);
-    let sched = WorkflowSchedule::new("promo_wf", Schedule::Interval(std::time::Duration::from_secs(86400)))
-        .with_end_at(cutoff)
-        .with_max_runs(10);
+    let sched = WorkflowSchedule::new(
+        "promo_wf",
+        Schedule::Interval(std::time::Duration::from_secs(86400)),
+    )
+    .with_end_at(cutoff)
+    .with_max_runs(10);
     assert_eq!(sched.end_at, Some(cutoff));
     assert_eq!(sched.max_runs, Some(10));
 }
@@ -258,7 +261,9 @@ async fn schedule_exhausted_by_end_at_does_not_fire() {
     .await
     .expect("tick_once must succeed");
 
-    let mut check = AsyncPgConnection::establish(&url).await.expect("check conn");
+    let mut check = AsyncPgConnection::establish(&url)
+        .await
+        .expect("check conn");
 
     // No execution must have been created.
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
@@ -267,7 +272,10 @@ async fn schedule_exhausted_by_end_at_does_not_fire() {
         .get_result(&mut check)
         .await
         .expect("count executions");
-    assert_eq!(exec_count, 0, "no run must be started when end_at is reached");
+    assert_eq!(
+        exec_count, 0,
+        "no run must be started when end_at is reached"
+    );
 
     // Schedule must be exhausted.
     let (exhausted_at, exhausted_reason): (Option<chrono::DateTime<Utc>>, Option<String>) =
@@ -281,7 +289,10 @@ async fn schedule_exhausted_by_end_at_does_not_fire() {
             .await
             .expect("select exhausted fields");
 
-    assert!(exhausted_at.is_some(), "exhausted_at must be set when end_at is reached");
+    assert!(
+        exhausted_at.is_some(),
+        "exhausted_at must be set when end_at is reached"
+    );
     assert_eq!(
         exhausted_reason.as_deref(),
         Some("end_at_reached"),
@@ -314,7 +325,9 @@ async fn schedule_before_end_at_fires_normally() {
     .await
     .expect("tick_once must succeed");
 
-    let mut check = AsyncPgConnection::establish(&url).await.expect("check conn");
+    let mut check = AsyncPgConnection::establish(&url)
+        .await
+        .expect("check conn");
 
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
         .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
@@ -322,7 +335,10 @@ async fn schedule_before_end_at_fires_normally() {
         .get_result(&mut check)
         .await
         .expect("count executions");
-    assert_eq!(exec_count, 1, "exactly one execution must be created when before end_at");
+    assert_eq!(
+        exec_count, 1,
+        "exactly one execution must be created when before end_at"
+    );
 
     let exhausted_at: Option<chrono::DateTime<Utc>> = harvest_schedules::table
         .find(sched_id)
@@ -330,7 +346,10 @@ async fn schedule_before_end_at_fires_normally() {
         .first(&mut check)
         .await
         .expect("select exhausted_at");
-    assert!(exhausted_at.is_none(), "exhausted_at must remain NULL when end_at has not been reached");
+    assert!(
+        exhausted_at.is_none(),
+        "exhausted_at must remain NULL when end_at has not been reached"
+    );
 }
 
 /// When `runs_started >= max_runs`, the scheduler must NOT start a run and must
@@ -365,7 +384,9 @@ async fn schedule_exhausted_by_max_runs_does_not_fire() {
     .await
     .expect("tick_once must succeed");
 
-    let mut check = AsyncPgConnection::establish(&url).await.expect("check conn");
+    let mut check = AsyncPgConnection::establish(&url)
+        .await
+        .expect("check conn");
 
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
         .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
@@ -373,7 +394,10 @@ async fn schedule_exhausted_by_max_runs_does_not_fire() {
         .get_result(&mut check)
         .await
         .expect("count executions");
-    assert_eq!(exec_count, 0, "no run must be started when max_runs budget is exhausted");
+    assert_eq!(
+        exec_count, 0,
+        "no run must be started when max_runs budget is exhausted"
+    );
 
     let (exhausted_at, exhausted_reason): (Option<chrono::DateTime<Utc>>, Option<String>) =
         harvest_schedules::table
@@ -386,7 +410,10 @@ async fn schedule_exhausted_by_max_runs_does_not_fire() {
             .await
             .expect("select exhausted fields");
 
-    assert!(exhausted_at.is_some(), "exhausted_at must be set when max_runs is reached");
+    assert!(
+        exhausted_at.is_some(),
+        "exhausted_at must be set when max_runs is reached"
+    );
     assert_eq!(
         exhausted_reason.as_deref(),
         Some("max_runs_exhausted"),
@@ -418,7 +445,9 @@ async fn max_runs_1_fires_once_then_exhausts() {
     .await
     .expect("first tick must succeed");
 
-    let mut check = AsyncPgConnection::establish(&url).await.expect("check conn");
+    let mut check = AsyncPgConnection::establish(&url)
+        .await
+        .expect("check conn");
 
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
         .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
@@ -426,7 +455,10 @@ async fn max_runs_1_fires_once_then_exhausts() {
         .get_result(&mut check)
         .await
         .expect("count executions after first tick");
-    assert_eq!(exec_count, 1, "exactly one execution must be created on first tick");
+    assert_eq!(
+        exec_count, 1,
+        "exactly one execution must be created on first tick"
+    );
 
     let (exhausted_at, runs_started): (Option<chrono::DateTime<Utc>>, i32) =
         harvest_schedules::table
@@ -438,8 +470,14 @@ async fn max_runs_1_fires_once_then_exhausts() {
             .first(&mut check)
             .await
             .expect("select after first tick");
-    assert!(exhausted_at.is_some(), "schedule must be exhausted after consuming max_runs=1");
-    assert_eq!(runs_started, 1, "runs_started must equal 1 after one dispatch");
+    assert!(
+        exhausted_at.is_some(),
+        "schedule must be exhausted after consuming max_runs=1"
+    );
+    assert_eq!(
+        runs_started, 1,
+        "runs_started must equal 1 after one dispatch"
+    );
 }
 
 /// `runs_started` must be incremented for each dispatched run.
@@ -467,14 +505,19 @@ async fn runs_started_incremented_per_dispatch() {
     .await
     .expect("tick_once");
 
-    let mut check = AsyncPgConnection::establish(&url).await.expect("check conn");
+    let mut check = AsyncPgConnection::establish(&url)
+        .await
+        .expect("check conn");
     let runs_started: i32 = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::runs_started)
         .first(&mut check)
         .await
         .expect("select runs_started");
-    assert_eq!(runs_started, 1, "runs_started must be 1 after one successful dispatch");
+    assert_eq!(
+        runs_started, 1,
+        "runs_started must be 1 after one successful dispatch"
+    );
 
     let exhausted_at: Option<chrono::DateTime<Utc>> = harvest_schedules::table
         .find(sched_id)
@@ -482,7 +525,10 @@ async fn runs_started_incremented_per_dispatch() {
         .first(&mut check)
         .await
         .expect("select exhausted_at");
-    assert!(exhausted_at.is_none(), "schedule must not be exhausted when budget remains");
+    assert!(
+        exhausted_at.is_none(),
+        "schedule must not be exhausted when budget remains"
+    );
 }
 
 /// An already-exhausted schedule must not fire again on subsequent ticks.
@@ -521,7 +567,9 @@ async fn exhausted_schedule_stays_exhausted() {
         .expect("tick must not error");
     }
 
-    let mut check = AsyncPgConnection::establish(&url).await.expect("check conn");
+    let mut check = AsyncPgConnection::establish(&url)
+        .await
+        .expect("check conn");
 
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
         .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
@@ -529,7 +577,10 @@ async fn exhausted_schedule_stays_exhausted() {
         .get_result(&mut check)
         .await
         .expect("count executions");
-    assert_eq!(exec_count, 0, "no execution must be created for an exhausted schedule");
+    assert_eq!(
+        exec_count, 0,
+        "no execution must be created for an exhausted schedule"
+    );
 }
 
 /// A schedule without any end conditions (both `end_at` and `max_runs` NULL)
@@ -556,7 +607,9 @@ async fn schedule_without_bounds_fires_normally() {
     .await
     .expect("tick_once");
 
-    let mut check = AsyncPgConnection::establish(&url).await.expect("check conn");
+    let mut check = AsyncPgConnection::establish(&url)
+        .await
+        .expect("check conn");
     let exec_count: i64 = autumn_harvest::schema::harvest_workflow_executions::table
         .filter(autumn_harvest::schema::harvest_workflow_executions::dsl::workflow_name.eq(wf_name))
         .count()
@@ -571,7 +624,10 @@ async fn schedule_without_bounds_fires_normally() {
         .first(&mut check)
         .await
         .expect("select exhausted_at");
-    assert!(exhausted_at.is_none(), "unbounded schedule must never be exhausted");
+    assert!(
+        exhausted_at.is_none(),
+        "unbounded schedule must never be exhausted"
+    );
 }
 
 /// A skipped run (operator-paused) must NOT consume `max_runs` budget.
@@ -605,14 +661,19 @@ async fn paused_schedule_does_not_consume_budget() {
     .await
     .expect("tick_once");
 
-    let mut check = AsyncPgConnection::establish(&url).await.expect("check conn");
+    let mut check = AsyncPgConnection::establish(&url)
+        .await
+        .expect("check conn");
     let runs_started: i32 = harvest_schedules::table
         .find(sched_id)
         .select(harvest_schedules::dsl::runs_started)
         .first(&mut check)
         .await
         .expect("select runs_started");
-    assert_eq!(runs_started, 0, "paused (skipped) schedule must not consume max_runs budget");
+    assert_eq!(
+        runs_started, 0,
+        "paused (skipped) schedule must not consume max_runs budget"
+    );
 }
 
 /// When a schedule is exhausted by `end_at`, the `harvest_schedule_decisions`
@@ -641,7 +702,9 @@ async fn decision_log_records_end_at_reached() {
     .await
     .expect("tick_once");
 
-    let mut check = AsyncPgConnection::establish(&url).await.expect("check conn");
+    let mut check = AsyncPgConnection::establish(&url)
+        .await
+        .expect("check conn");
 
     use autumn_harvest::schema::harvest_schedule_decisions;
     let (decision, reason_code): (String, String) = harvest_schedule_decisions::table
@@ -654,8 +717,14 @@ async fn decision_log_records_end_at_reached() {
         .await
         .expect("select decision row");
 
-    assert_eq!(decision, "skipped", "decision must be 'skipped' for end_at exhaustion");
-    assert_eq!(reason_code, "end_at_reached", "reason_code must be 'end_at_reached'");
+    assert_eq!(
+        decision, "skipped",
+        "decision must be 'skipped' for end_at exhaustion"
+    );
+    assert_eq!(
+        reason_code, "end_at_reached",
+        "reason_code must be 'end_at_reached'"
+    );
 }
 
 /// When a schedule is exhausted by `max_runs`, the `harvest_schedule_decisions`
@@ -690,7 +759,9 @@ async fn decision_log_records_max_runs_exhausted() {
     .await
     .expect("tick_once");
 
-    let mut check = AsyncPgConnection::establish(&url).await.expect("check conn");
+    let mut check = AsyncPgConnection::establish(&url)
+        .await
+        .expect("check conn");
 
     use autumn_harvest::schema::harvest_schedule_decisions;
     let (decision, reason_code): (String, String) = harvest_schedule_decisions::table
@@ -703,6 +774,12 @@ async fn decision_log_records_max_runs_exhausted() {
         .await
         .expect("select decision row");
 
-    assert_eq!(decision, "skipped", "decision must be 'skipped' for max_runs exhaustion");
-    assert_eq!(reason_code, "max_runs_exhausted", "reason_code must be 'max_runs_exhausted'");
+    assert_eq!(
+        decision, "skipped",
+        "decision must be 'skipped' for max_runs exhaustion"
+    );
+    assert_eq!(
+        reason_code, "max_runs_exhausted",
+        "reason_code must be 'max_runs_exhausted'"
+    );
 }
