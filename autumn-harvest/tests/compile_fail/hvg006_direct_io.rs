@@ -17,6 +17,9 @@ async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
     // std::net::TcpStream connect (blocked)
     let _ = std::net::TcpStream::connect("127.0.0.1:8080");
     
+    // Unrelated connect call (deterministic, allowed)
+    let _ = graph::connect(1, 2);
+
     // Custom Command::new constructor (allowed)
     let _ = Command::new("custom");
     
@@ -40,6 +43,12 @@ mod tonic {
 mod tokio_postgres {
     pub struct NoTls;
     pub fn connect(_: &str, _: NoTls) {}
+}
+
+mod graph {
+    pub fn connect(_a: i32, _b: i32) -> i32 {
+        0
+    }
 }
 
 fn main() {}

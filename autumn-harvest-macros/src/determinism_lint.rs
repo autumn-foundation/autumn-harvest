@@ -102,6 +102,82 @@ fn is_rng_receiver(expr: &syn::Expr) -> bool {
     }
 }
 
+#[allow(clippy::collapsible_if)]
+fn is_io_path(path_str: &str) -> bool {
+    // Filesystem IO
+    if path_str.starts_with("std::fs::")
+        || path_str.starts_with("fs::")
+        || path_str.starts_with("tokio::fs::")
+    {
+        return true;
+    }
+
+    // Databases & SQL
+    if path_str.starts_with("diesel::")
+        || path_str.starts_with("sqlx::")
+        || path_str.starts_with("tokio_postgres::")
+        || path_str.starts_with("redis::")
+    {
+        return true;
+    }
+
+    // HTTP clients (reqwest, hyper)
+    if path_str.starts_with("reqwest::Client")
+        || path_str.starts_with("reqwest::blocking::Client")
+        || path_str.starts_with("reqwest::get")
+        || path_str.starts_with("hyper::client::")
+        || path_str.starts_with("hyper::server::")
+        || path_str.starts_with("hyper::service::")
+        || path_str.starts_with("hyper::rt::")
+    {
+        return true;
+    }
+
+    // gRPC client/transport (tonic)
+    if path_str.starts_with("tonic::transport::") || path_str.starts_with("tonic::client::") {
+        return true;
+    }
+
+    // Process spawning
+    if path_str == "std::process::Command::new" {
+        return true;
+    }
+
+    // Networking (only sockets and connections, not IP address helpers)
+    let is_network_connect_or_bind = path_str.ends_with("::connect")
+        || path_str.ends_with("::connect_lazy")
+        || path_str.ends_with("::from_shared")
+        || path_str.ends_with("::bind");
+
+    if is_network_connect_or_bind {
+        if path_str.starts_with("std::net::")
+            || path_str.starts_with("tokio::net::")
+            || path_str.starts_with("TcpStream::")
+            || path_str.starts_with("TcpListener::")
+            || path_str.starts_with("UdpSocket::")
+            || path_str.starts_with("UnixStream::")
+            || path_str.starts_with("UnixListener::")
+            || path_str.starts_with("UnixDatagram::")
+            || path_str.starts_with("Endpoint::")
+            || path_str.starts_with("Channel::")
+            || path_str == "TcpStream::connect"
+            || path_str == "TcpListener::bind"
+            || path_str == "UdpSocket::bind"
+            || path_str == "UnixStream::connect"
+            || path_str == "UnixListener::bind"
+            || path_str == "UnixDatagram::bind"
+            || path_str == "Endpoint::connect"
+            || path_str == "Channel::connect"
+            || path_str == "Channel::from_shared"
+            || path_str == "Endpoint::from_shared"
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 impl<'ast> Visit<'ast> for DeterminismVisitor {
     #[allow(clippy::too_many_lines)]
     fn visit_expr_call(&mut self, i: &'ast syn::ExprCall) {
@@ -127,6 +203,10 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             // HVG002: Randomness
             if path_str == "rand::random"
                 || path_str == "random"
+                || path_str == "rand::random_range"
+                || path_str == "random_range"
+                || path_str == "rand::random_bool"
+                || path_str == "random_bool"
                 || path_str == "rand::thread_rng"
                 || path_str == "thread_rng"
                 || path_str == "Uuid::new_v4"
@@ -155,8 +235,12 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             // HVG003: ProcessEnv
             if path_str == "std::env::var"
                 || path_str == "env::var"
+                || path_str == "std::env::var_os"
+                || path_str == "env::var_os"
                 || path_str == "std::env::args"
                 || path_str == "env::args"
+                || path_str == "std::env::args_os"
+                || path_str == "env::args_os"
             {
                 self.add_finding(
                     "HVG003",
@@ -191,36 +275,7 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
             }
 
             // HVG006: DirectIo
-            if path_str.starts_with("std::fs::")
-                || path_str.starts_with("fs::")
-                || path_str.starts_with("tokio::fs::")
-                || path_str.starts_with("std::net::TcpStream::")
-                || path_str.starts_with("std::net::TcpListener::")
-                || path_str.starts_with("std::net::UdpSocket::")
-                || path_str.starts_with("tokio::net::TcpStream::")
-                || path_str.starts_with("tokio::net::TcpListener::")
-                || path_str.starts_with("tokio::net::UdpSocket::")
-                || path_str.starts_with("tokio::net::UnixStream::")
-                || path_str.starts_with("tokio::net::UnixListener::")
-                || path_str.starts_with("tokio::net::UnixDatagram::")
-                || path_str.ends_with("::connect")
-                || path_str.ends_with("::connect_lazy")
-                || path_str.ends_with("::from_shared")
-                || path_str.ends_with("::bind")
-                || path_str.starts_with("reqwest::Client")
-                || path_str.starts_with("reqwest::blocking::Client")
-                || path_str.starts_with("reqwest::get")
-                || path_str.starts_with("hyper::client::")
-                || path_str.starts_with("hyper::server::")
-                || path_str.starts_with("hyper::service::")
-                || path_str.starts_with("hyper::rt::")
-                || path_str.starts_with("tonic::transport::")
-                || path_str.starts_with("tonic::client::")
-                || path_str.starts_with("tokio_postgres::connect")
-                || path_str.starts_with("diesel::")
-                || path_str.starts_with("sqlx::")
-                || path_str == "std::process::Command::new"
-            {
+            if is_io_path(&path_str) {
                 self.add_finding(
                     "HVG006",
                     expr_path.path.segments.last().unwrap().ident.span(),

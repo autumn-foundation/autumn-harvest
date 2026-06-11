@@ -28,9 +28,9 @@ error: [HVG006] Workflow determinism violation: Performing network requests (req
 
 error: [HVG006] Workflow determinism violation: Performing network requests (reqwest, hyper, tonic), database queries (sqlx, diesel, tokio-postgres), or filesystem I/O (std::fs, tokio::fs) directly inside a workflow body creates non-idempotent side-effects that are invisible to the event store. On replay the I/O is re-executed, potentially sending duplicate requests, corrupting database state, or failing because external state has changed.
        Alternative: Wrap all I/O in activities (#[activity]). Activities are the unit of durable, retryable side-effect in Harvest. Their inputs and outputs are recorded in harvest_events so the workflow can replay without re-executing I/O. Use ctx.execute_activity_raw(name, input, queue) from the workflow body to schedule the activity.
-  --> tests/compile_fail/hvg006_direct_io.rs:24:36
+  --> tests/compile_fail/hvg006_direct_io.rs:27:36
    |
-24 |     let _ = std::process::Command::new("ls");
+27 |     let _ = std::process::Command::new("ls");
    |                                    ^^^
 
 warning: unused variable: `ctx`

@@ -10,6 +10,10 @@ async fn bad_workflow(ctx: &WorkflowContext) -> Result<(), String> {
     let mut rng = rand::rngs::OsRng;
     let _ = rng.r#gen::<f64>();
     
+    // Rand 0.9 top-level helpers (disallowed)
+    let _ = rand::random_range(0..10);
+    let _ = rand::random_bool(0.5);
+
     // Slices/buffers using .fill() (deterministic, allowed)
     let mut buf = vec![0u8; 10];
     buf.fill(42);
