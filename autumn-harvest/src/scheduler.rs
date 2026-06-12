@@ -1150,6 +1150,7 @@ async fn find_or_insert_workflow_schedule(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn upsert_workflow_schedule(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
@@ -1212,10 +1213,96 @@ async fn upsert_workflow_schedule(
             dsl::consecutive_failure_limit.eq(ws
                 .consecutive_failure_limit
                 .map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
+            dsl::end_at.eq(ws.end_at),
+            dsl::max_runs.eq(ws.max_runs.map(|n| i32::try_from(n).unwrap_or(i32::MAX))),
         ))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+
+    // Clear exhausted state when the operator updates limits so that future runs are
+    // again possible (issue #478). A schedule exhausted by end_at is no longer
+    // exhausted if end_at is extended or removed; similarly for max_runs.
+    // The main UPDATE above already resets next_run_at via the or_else fallback
+    // (existing.next_run_at was NULL → fresh next_run_after computation), so we only
+    // need to nullify exhausted_at / exhausted_reason here.
+    if existing.exhausted_at.is_some() {
+        // For end_at: "limit removed" or "there is a valid next slot strictly before
+        // the new end_at". Checking `end_at > now` is not sufficient — the schedule
+        // can be legitimately exhausted before the cutoff wall-time when its last
+        // valid slot has already been dispatched (next_run_after >= end_at). Only
+        // clear exhaustion when the schedule expression will actually produce a new
+        // firing inside the new window.
+        // Special case: Manual schedules have no automatic next slot (next_run_after
+        // returns None), so treat them as ok when the wall clock hasn't yet reached
+        // the cutoff (manual triggers are still allowed until end_at).
+        let end_at_ok = ws.end_at.is_none_or(|new_end| {
+            if matches!(ws.schedule, crate::policy::Schedule::Manual) {
+                return now < new_end;
+            }
+            next_run_after(Some(&ws.schedule), now).is_some_and(|next| next < new_end)
+        });
+        let max_runs_ok = ws.max_runs.is_none_or(|max| {
+            i64::from(existing.runs_started) < i64::from(i32::try_from(max).unwrap_or(i32::MAX))
+        });
+        if end_at_ok && max_runs_ok {
+            diesel::update(dsl::harvest_schedules.find(existing.id))
+                .set((
+                    dsl::exhausted_at.eq(None::<DateTime<Utc>>),
+                    dsl::exhausted_reason.eq(None::<String>),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        }
+    } else {
+        // Active schedule: if the new limits are already violated, transition to
+        // exhausted immediately rather than waiting for the next due tick (issue #478).
+        // This prevents a schedule whose max_runs was lowered to the current
+        // runs_started (or whose end_at was moved before next_run_at) from lingering
+        // as active-but-never-runnable until the next tick processes it.
+        let max_runs_now_violated = ws.max_runs.is_some_and(|max| {
+            let max_i32 = i32::try_from(max).unwrap_or(i32::MAX);
+            max_i32 > 0 && existing.runs_started >= max_i32
+        });
+        let end_at_now_violated = ws.end_at.is_some_and(|new_end| {
+            // Manual schedules have no automatic next slot; only exhaust when the
+            // wall clock has already reached the cutoff so manual triggers remain
+            // possible until then.
+            if matches!(ws.schedule, crate::policy::Schedule::Manual) {
+                return now >= new_end;
+            }
+            // Preserve any overdue existing next_run_at that is still within the
+            // window (e.g. downtime left next_run_at=10:00, end_at=10:30, now=11:00).
+            // The scheduler must process that slot before we can declare exhaustion.
+            if existing.next_run_at.is_some_and(|t| t < new_end) {
+                return false;
+            }
+            next_run_after(Some(&ws.schedule), now).is_none_or(|next| next >= new_end)
+        });
+        if max_runs_now_violated || end_at_now_violated {
+            let reason: &str = if max_runs_now_violated {
+                "max_runs_exhausted"
+            } else {
+                "end_at_reached"
+            };
+            diesel::update(
+                dsl::harvest_schedules
+                    .find(existing.id)
+                    .filter(dsl::exhausted_at.is_null()),
+            )
+            .set((
+                dsl::exhausted_at.eq(Some(now)),
+                dsl::exhausted_reason.eq(Some(reason)),
+                dsl::next_run_at.eq(None::<DateTime<Utc>>),
+                dsl::updated_at.eq(now),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        }
+    }
 
     // Clear auto_paused_at only when disabling the feature (limit = None or Some(0)).
     // When the limit is positive we deliberately leave the DB value untouched so a
@@ -1387,6 +1474,8 @@ async fn tick_workflow_schedules(
         .filter(dsl::is_paused.eq(false))
         // Auto-paused schedules (issue #360) are excluded from the due list.
         .filter(dsl::auto_paused_at.is_null())
+        // Exhausted schedules (issue #478) are permanently terminal — never re-fire.
+        .filter(dsl::exhausted_at.is_null())
         .filter(dsl::next_run_at.is_not_null())
         .filter(dsl::next_run_at.le(now))
         .order(dsl::next_run_at.asc())
@@ -1900,6 +1989,103 @@ async fn tick_one_workflow_schedule(
         return Ok(());
     }
 
+    // ── Bounded-run checks (issue #478) ───────────────────────────────────────
+    // Both checks run *after* the HA claim so only one replica records the
+    // exhaustion decision and advances next_run_at.
+
+    // Check 1 — absolute end-time cutoff.
+    if let Some(end_at) = schedule.end_at
+        && logical_date >= end_at
+    {
+        tracing::info!(
+            workflow_name = %wf_name,
+            logical_date = %logical_date,
+            end_at = %end_at,
+            "harvest: schedule end_at reached; transitioning to exhausted"
+        );
+        crate::schedule_decision::record_decision_graceful(
+            conn,
+            Some(&**metrics),
+            Some(schedule.id),
+            wf_name,
+            "workflow",
+            "skipped",
+            "end_at_reached",
+            Some(serde_json::json!({
+                "end_at": end_at,
+                "logical_date": logical_date,
+            })),
+            now,
+            now,
+            i16::try_from(current_shard.as_i32()).unwrap_or(0),
+        )
+        .await;
+        diesel::update(
+            dsl::harvest_schedules
+                .find(schedule.id)
+                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+        )
+        .set((
+            dsl::exhausted_at.eq(Some(now)),
+            dsl::exhausted_reason.eq(Some("end_at_reached")),
+            dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+        return Ok(());
+    }
+
+    // Check 2 — max_runs budget exhausted.
+    if let Some(max_runs) = schedule.max_runs
+        && max_runs > 0
+        && schedule.runs_started >= max_runs
+    {
+        tracing::info!(
+            workflow_name = %wf_name,
+            runs_started = schedule.runs_started,
+            max_runs,
+            "harvest: schedule max_runs budget exhausted; transitioning to exhausted"
+        );
+        crate::schedule_decision::record_decision_graceful(
+            conn,
+            Some(&**metrics),
+            Some(schedule.id),
+            wf_name,
+            "workflow",
+            "skipped",
+            "max_runs_exhausted",
+            Some(serde_json::json!({
+                "runs_started": schedule.runs_started,
+                "max_runs": max_runs,
+            })),
+            now,
+            now,
+            i16::try_from(current_shard.as_i32()).unwrap_or(0),
+        )
+        .await;
+        diesel::update(
+            dsl::harvest_schedules
+                .find(schedule.id)
+                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+        )
+        .set((
+            dsl::exhausted_at.eq(Some(now)),
+            dsl::exhausted_reason.eq(Some("max_runs_exhausted")),
+            dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+        return Ok(());
+    }
+
     let mut running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
@@ -2062,6 +2248,19 @@ async fn tick_one_workflow_schedule(
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
     // jitter_window already computed at function entry; reused here.
 
+    // Re-read runs_started from the DB now that we hold the HA claim and have
+    // finished the overlap handling. This captures any concurrent manual trigger
+    // pre-increments that happened between the outer tick query and this point,
+    // giving the dispatch loop a fresh budget baseline so it does not over-dispatch
+    // against a budget that was already partially consumed by a manual trigger.
+    let live_runs_started: i32 = dsl::harvest_schedules
+        .find(schedule.id)
+        .filter(dsl::fire_claim_token.eq(Some(claim_token)))
+        .select(dsl::runs_started)
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
     let mut dispatched: u32 = 0;
     let mut last_dispatched_at: Option<DateTime<Utc>> = None;
     // Tracks the pre-rebase original slot of the last dispatched run. Used to
@@ -2123,6 +2322,32 @@ async fn tick_one_workflow_schedule(
             .await;
             break;
         }
+        // Per-slot end_at guard (issue #478): compare against the calendar-rebased
+        // effective value (effective_scheduled_for), not original_slot. A slot that
+        // was originally before end_at but was rebased to a business day at or past
+        // end_at must also stop. Only defer back to original_slot when it too is
+        // >= end_at (the post-loop end_at_now_exhausted check sees it and exhausts
+        // correctly); when original_slot < end_at, deferring to it creates the same
+        // stuck retry loop as the jitter case — just break.
+        if let Some(end_at) = schedule.end_at
+            && effective_scheduled_for >= end_at
+        {
+            if *original_slot >= end_at {
+                deferred_next_run_at = Some(*original_slot);
+            }
+            break;
+        }
+        // Budget cap (issue #478): use the DB-fresh live_runs_started (re-read after
+        // claim, above) rather than the stale schedule.runs_started so that concurrent
+        // manual trigger pre-increments are visible here and prevent over-dispatch.
+        if let Some(max_runs) = schedule.max_runs {
+            let already =
+                live_runs_started.saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
+            if max_runs > 0 && already >= max_runs {
+                deferred_next_run_at = Some(*original_slot);
+                break;
+            }
+        }
         // Jitter: stall dispatch until the effective fire time has elapsed.
         // effective_fire_time = scheduled_for + hash(schedule_id, scheduled_for) % jitter_window
         let jitter_offset = compute_jitter_offset(schedule.id, *scheduled_for, jitter_window);
@@ -2143,6 +2368,19 @@ async fn tick_one_workflow_schedule(
                 effective_fire_time = %effective_fire_time,
                 "harvest: schedule jitter pending; deferring dispatch"
             );
+            break;
+        }
+        // Secondary end_at guard: jitter may push the effective dispatch time past
+        // the cutoff even when the original slot was before it.
+        // Do NOT set deferred_next_run_at here — original_slot is still < end_at,
+        // so deferring to it would cause every tick to retry the same slot forever
+        // without ever firing or exhausting. Falling through to the post-loop
+        // end_at_now_exhausted check with deferred_next_run_at = None lets it use
+        // next_run_after_plan (which is >= end_at) and correctly mark the schedule
+        // exhausted.
+        if let Some(end_at) = schedule.end_at
+            && effective_fire_time >= end_at
+        {
             break;
         }
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, *original_slot);
@@ -2281,6 +2519,98 @@ async fn tick_one_workflow_schedule(
             next_run_after_plan
         }
     });
+
+    // ── Budget accounting and exhaustion (issue #478) ────────────────────────
+    // Increment runs_started using the DB-fresh live_runs_started baseline (re-read
+    // after claim). Manual trigger pre-increments are NOT serialized under the HA
+    // claim, so the final UPDATE must use a DB-side expression (runs_started +
+    // dispatched) rather than the in-memory computed value, ensuring the tick and
+    // any concurrent manual trigger each add their own delta without overwriting
+    // the other's contribution.
+    let new_runs_started =
+        live_runs_started.saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
+    let now_budget_exhausted = schedule
+        .max_runs
+        .is_some_and(|max| max > 0 && dispatched > 0 && new_runs_started >= max);
+    // Eagerly exhaust on end_at: if the next valid slot is at or past end_at, mark
+    // the schedule exhausted immediately so operators see it as done after the last
+    // valid firing rather than waiting for the next tick to discover it.
+    let end_at_now_exhausted = schedule
+        .end_at
+        .is_some_and(|end| effective_next_run_at.is_none_or(|next| next >= end));
+    if now_budget_exhausted {
+        let max = schedule.max_runs.unwrap_or(0);
+        tracing::info!(
+            workflow_name = %wf_name,
+            runs_started = new_runs_started,
+            max_runs = max,
+            "harvest: schedule max_runs budget exhausted after dispatch; transitioning to exhausted"
+        );
+        crate::schedule_decision::record_decision_graceful(
+            conn,
+            Some(&**metrics),
+            Some(schedule.id),
+            wf_name,
+            "workflow",
+            "skipped",
+            "max_runs_exhausted",
+            Some(serde_json::json!({
+                "runs_started": new_runs_started,
+                "max_runs": max,
+                "exhausted_after_dispatch": true,
+            })),
+            now,
+            now,
+            i16::try_from(current_shard.as_i32()).unwrap_or(0),
+        )
+        .await;
+    } else if end_at_now_exhausted {
+        let end = schedule.end_at.unwrap_or(now);
+        tracing::info!(
+            workflow_name = %wf_name,
+            end_at = %end,
+            "harvest: schedule end_at boundary reached after dispatch; transitioning to exhausted"
+        );
+        crate::schedule_decision::record_decision_graceful(
+            conn,
+            Some(&**metrics),
+            Some(schedule.id),
+            wf_name,
+            "workflow",
+            "skipped",
+            "end_at_reached",
+            Some(serde_json::json!({
+                "end_at": end,
+                "effective_next_run_at": effective_next_run_at,
+            })),
+            now,
+            now,
+            i16::try_from(current_shard.as_i32()).unwrap_or(0),
+        )
+        .await;
+    }
+    let any_exhausted = now_budget_exhausted || end_at_now_exhausted;
+    let budget_exhausted_at: Option<DateTime<Utc>> = any_exhausted.then_some(now);
+    let budget_exhausted_reason: Option<&str> = if now_budget_exhausted {
+        Some("max_runs_exhausted")
+    } else if end_at_now_exhausted {
+        Some("end_at_reached")
+    } else {
+        None
+    };
+
+    // Resolve effective_next_run_at: NULL when the schedule is now exhausted so
+    // it never re-appears in the due-list query.
+    let final_next_run_at = if any_exhausted {
+        None
+    } else {
+        effective_next_run_at
+    };
+
+    // Use a DB-side runs_started + dispatched expression so that concurrent manual
+    // trigger pre-increments (which are not blocked by the HA claim) are preserved
+    // rather than overwritten by this stale in-memory value (issue #478).
+    let dispatched_i32 = i32::try_from(dispatched).unwrap_or(i32::MAX);
     diesel::update(
         dsl::harvest_schedules
             .find(schedule.id)
@@ -2288,7 +2618,10 @@ async fn tick_one_workflow_schedule(
     )
     .set((
         dsl::last_run_at.eq(effective_last_run_at),
-        dsl::next_run_at.eq(effective_next_run_at),
+        dsl::next_run_at.eq(final_next_run_at),
+        dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
+        dsl::exhausted_at.eq(budget_exhausted_at),
+        dsl::exhausted_reason.eq(budget_exhausted_reason),
         // Clear the HA claim so the column stays clean after a successful
         // fire. Guarded by token so a slow late tick cannot overwrite a
         // successor replica's live claim if the 30 s TTL expired.
@@ -2529,11 +2862,14 @@ async fn drain_buffered_schedule_runs(
 
     let now = Utc::now();
 
-    // Query schedules that have buffered runs and are not paused (manually or auto-paused).
+    // Query schedules that have buffered runs and are not paused or exhausted.
     let pending: Vec<HarvestSchedule> = dsl::harvest_schedules
         .filter(dsl::workflow_name.is_not_null())
         .filter(dsl::is_paused.eq(false))
         .filter(dsl::auto_paused_at.is_null())
+        // Exhausted schedules (issue #478) must not drain buffered slots — the
+        // schedule has reached its terminal state and no further runs should start.
+        .filter(dsl::exhausted_at.is_null())
         .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
             "jsonb_array_length(buffered_runs) > 0",
         ))
@@ -2611,9 +2947,33 @@ async fn drain_buffered_schedule_runs(
         }
 
         let mut dispatched: u32 = 0;
+        // Set to true when the whole buffer is cleared because the first slot is already
+        // past end_at. Used below to decide whether to exhaust the schedule even though
+        // `buffered` is empty after the clear (normal empty-after-drain must not exhaust).
+        let mut all_buffered_past_end_at = false;
 
         while dispatched < u32::try_from(available).unwrap_or(u32::MAX) && !buffered.is_empty() {
-            let scheduled_for = buffered.remove(0);
+            let scheduled_for = buffered[0];
+
+            // Per-slot end_at guard (issue #478): skip buffered slots past the cutoff.
+            if let Some(end_at) = schedule.end_at
+                && scheduled_for >= end_at
+            {
+                buffered.clear(); // all remaining buffered slots are also past end_at
+                all_buffered_past_end_at = true;
+                break;
+            }
+            // Budget cap (issue #478): don't let buffered drains exceed max_runs.
+            if let Some(max_runs) = schedule.max_runs {
+                let already = schedule
+                    .runs_started
+                    .saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
+                if max_runs > 0 && already >= max_runs {
+                    break;
+                }
+            }
+
+            buffered.remove(0);
             let workflow_id = scheduled_workflow_id(schedule.id, wf_name, scheduled_for);
             let exec_id = if schedule.dag_name.is_some() {
                 ExecutionId::new_for_shard(current_shard)
@@ -2739,15 +3099,71 @@ async fn drain_buffered_schedule_runs(
             }
         }
 
-        // Persist the updated buffer.
-        diesel::update(dsl::harvest_schedules.find(schedule.id))
+        // Persist the updated buffer and budget accounting (issue #478).
+        let dispatched_i32 = i32::try_from(dispatched).unwrap_or(i32::MAX);
+        let new_runs_started = schedule.runs_started.saturating_add(dispatched_i32);
+        let budget_exhausted = dispatched > 0
+            && schedule
+                .max_runs
+                .is_some_and(|max| max > 0 && new_runs_started >= max);
+        let end_at_exhausted = schedule.end_at.is_some_and(|end| {
+            if all_buffered_past_end_at {
+                // The entire buffer was cleared because every slot was past end_at.
+                // Exhaust only when the schedule's regular next_run_at is also at/past
+                // the cutoff (or absent). If next_run_at is still before end_at, the
+                // regular tick fires inside the window and the drain must not exhaust.
+                schedule.next_run_at.is_none_or(|next| next >= end)
+            } else {
+                // Only exhaust from the drain when *remaining* buffered slots are all
+                // past the cutoff. An empty buffer means capacity opened and the drain
+                // completed normally — the regular tick detects end_at on next_run_at.
+                !buffered.is_empty() && buffered.iter().all(|&t| t >= end)
+            }
+        });
+        let any_drain_exhausted = budget_exhausted || end_at_exhausted;
+        let exhausted_reason: Option<&str> = if budget_exhausted {
+            Some("max_runs_exhausted")
+        } else if end_at_exhausted {
+            Some("end_at_reached")
+        } else {
+            None
+        };
+        // Use two separate UPDATE paths so the non-exhausting path never writes
+        // NULL for exhausted_at/exhausted_reason, which would silently undo a
+        // concurrent exhaustion set by another HA replica (issue #478).
+        if any_drain_exhausted {
+            diesel::update(dsl::harvest_schedules.find(schedule.id))
+                .set((
+                    dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
+                    dsl::runs_started.eq(new_runs_started),
+                    dsl::exhausted_at.eq(Some(now)),
+                    dsl::exhausted_reason.eq(exhausted_reason),
+                    dsl::next_run_at.eq(Option::<DateTime<Utc>>::None),
+                    dsl::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+        } else {
+            // Guard on exhausted_at IS NULL so a concurrent exhaustion is never
+            // overwritten. The row may have been exhausted by the regular tick or
+            // another drain between the SELECT above and this UPDATE.
+            // Use a DB-side increment so concurrent manual trigger pre-increments
+            // are preserved rather than overwritten by this stale in-memory value.
+            diesel::update(
+                dsl::harvest_schedules
+                    .find(schedule.id)
+                    .filter(dsl::exhausted_at.is_null()),
+            )
             .set((
                 dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
+                dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
                 dsl::updated_at.eq(now),
             ))
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
+        }
     }
 
     Ok(())

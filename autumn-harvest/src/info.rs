@@ -743,6 +743,8 @@ impl DagInfo {
             calendar: None,
             skip_policy: crate::policy::SkipPolicy::Skip,
             consecutive_failure_limit: None,
+            end_at: None,
+            max_runs: None,
         })
     }
 

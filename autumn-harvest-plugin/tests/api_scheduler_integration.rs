@@ -155,6 +155,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
     )
 );
 type HarvestApiApp = axum::Router;
@@ -4041,6 +4045,8 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     let registry = Arc::new(HandlerRegistry::new(
         vec![workflow_info_named(dag_name)],
@@ -4525,6 +4531,8 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
 
     {
@@ -4614,6 +4622,8 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
 
     {
@@ -4977,6 +4987,8 @@ async fn register_workflow_schedules_accepts_unified_dag_schedule_rows() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5013,6 +5025,8 @@ async fn register_workflow_schedules_preserves_existing_dag_marker_for_workflow_
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     let workflow_only_update = WorkflowSchedule::new(
         "preserve_dag_marker",
@@ -5067,6 +5081,8 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: "legacy_workflow_only_dag".to_string(),
@@ -5084,6 +5100,8 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5130,6 +5148,8 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     let paused_at = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.123456Z")
         .expect("fixed pause timestamp should parse")
@@ -5248,6 +5268,8 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5319,6 +5341,8 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: dag_name.to_string(),
@@ -5336,6 +5360,8 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5420,6 +5446,8 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: dag_name.to_string(),
@@ -5437,6 +5465,8 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5517,6 +5547,8 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5630,6 +5662,8 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5730,6 +5764,8 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5755,6 +5791,8 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             calendar: None,
             skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
             consecutive_failure_limit: None,
+            end_at: None,
+            max_runs: None,
         };
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
             .await
@@ -5845,6 +5883,8 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5942,6 +5982,8 @@ async fn scheduler_tick_does_not_dispatch_removed_dag_schedule_rows() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
 
     {
@@ -6403,6 +6445,8 @@ async fn scheduler_tick_preserves_dag_metadata() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
 
     let dag_info = DagInfo {

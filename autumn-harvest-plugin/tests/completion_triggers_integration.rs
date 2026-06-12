@@ -147,6 +147,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
     )
 );
 
@@ -1435,6 +1439,8 @@ async fn test_trigger_cross_shard_queue_preservation() {
         calendar: None,
         skip_policy: autumn_harvest::policy::SkipPolicy::Skip,
         consecutive_failure_limit: None,
+        end_at: None,
+        max_runs: None,
     };
     autumn_harvest::register_workflow_schedules(&mut conn0, &[ws])
         .await

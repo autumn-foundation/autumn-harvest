@@ -317,7 +317,9 @@ mod db_tests {
         "\n",
         include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql"),
         "\n",
-        include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql")
+        include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
+        "\n",
+        include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql")
     );
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {

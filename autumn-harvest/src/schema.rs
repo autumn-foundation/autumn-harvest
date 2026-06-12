@@ -187,6 +187,23 @@ diesel::table! {
         /// Set to `NOW()` when `consecutive_failure_count` reaches `consecutive_failure_limit`.
         /// NULL = schedule is not auto-paused.
         auto_paused_at -> Nullable<Timestamptz>,
+        /// Absolute UTC cutoff for this schedule (issue #478).
+        /// When `next_run_at >= end_at`, no further runs are started and the
+        /// schedule is transitioned to the exhausted state. NULL = no cutoff.
+        end_at -> Nullable<Timestamptz>,
+        /// Total run budget (issue #478). Once `runs_started` reaches this value
+        /// the schedule is exhausted and stops firing. NULL = no budget limit.
+        max_runs -> Nullable<Int4>,
+        /// Monotonically-increasing count of executions actually started by this
+        /// schedule (issue #478). Only incremented when a run is truly dispatched —
+        /// skipped firings (overlap, calendar, pause) do NOT increment this counter.
+        runs_started -> Int4,
+        /// Set to `NOW()` when the schedule transitions to the exhausted state
+        /// (issue #478). NULL = schedule is still active (not exhausted).
+        exhausted_at -> Nullable<Timestamptz>,
+        /// Machine-readable reason for exhaustion (issue #478).
+        /// One of: `"end_at_reached"`, `"max_runs_exhausted"`. NULL when not exhausted.
+        exhausted_reason -> Nullable<Text>,
     }
 }
 
