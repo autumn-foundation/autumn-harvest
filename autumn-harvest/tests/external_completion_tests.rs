@@ -622,7 +622,7 @@ async fn context_execute_activity_external_detects_non_determinism() {
         .await;
 
     assert!(
-        matches!(result, Err(HarvestError::NonDeterministic(_))),
+        matches!(result, Err(HarvestError::NonDeterministic { .. })),
         "expected NonDeterministic, got {result:?}"
     );
     assert!(ctx.drain_commands().is_empty());

@@ -36,6 +36,8 @@ pub enum WorkflowOutcome {
     Failed {
         /// The string description of the error encountered.
         error: String,
+        /// Structured details if the error is a non-determinism divergence.
+        non_deterministic_details: Option<crate::error::NonDeterministicDetails>,
     },
     /// The workflow suspended awaiting activity results or timer firings.
     /// The accumulated commands describe what the worker needs to schedule.
@@ -73,6 +75,8 @@ pub struct WorkflowExecuteSpanMeta {
     /// W3C traceparent linking back to the original trace, present only on
     /// replay runs and only when a prior carrier stored a link.
     pub link_traceparent: Option<String>,
+    /// The worker build ID of the worker executing this workflow.
+    pub build_id: Option<String>,
 }
 
 /// Run a workflow function through replay and live execution.
@@ -133,10 +137,20 @@ pub async fn run_workflow_strict(
             Ok(Ok(output)) => ctx.take_deferred_nd_error().map_or_else(
                 || {
                     if ctx.history_has_unconsumed_events() {
+                        let nd = ctx.take_nd_details().or_else(|| {
+                            Some(crate::error::NonDeterministicDetails {
+                                event_index: i32::try_from(ctx.replay_position()).ok(),
+                                expected: Some("<end of history>".to_string()),
+                                actual: Some("<workflow returned early>".to_string()),
+                                workflow_type: Some(ctx.workflow_type().to_string()),
+                                build_id: ctx.build_id().map(String::from),
+                            })
+                        });
                         WorkflowOutcome::Failed {
                             error: "non-deterministic replay: early completion mismatch: \
                                     expected <end of history>, got <workflow returned early>"
                                 .to_string(),
+                            non_deterministic_details: nd,
                         }
                     } else if ctx.drain_commands().into_iter().any(|cmd| {
                         // UpsertSearchAttributes and SetCurrentDetails are pure metadata
@@ -149,28 +163,47 @@ pub async fn run_workflow_strict(
                     }) {
                         // New commands emitted after history was fully consumed (e.g. a
                         // newly-added version() or side_effect() call on an old history).
+                        let nd = ctx.take_nd_details().or_else(|| {
+                            Some(crate::error::NonDeterministicDetails {
+                                event_index: i32::try_from(ctx.replay_position()).ok(),
+                                expected: Some("<no new commands>".to_string()),
+                                actual: Some("<new commands emitted>".to_string()),
+                                workflow_type: Some(ctx.workflow_type().to_string()),
+                                build_id: ctx.build_id().map(String::from),
+                            })
+                        });
                         WorkflowOutcome::Failed {
                             error: "non-deterministic replay: new commands emitted beyond \
                                     recorded history"
                                 .to_string(),
+                            non_deterministic_details: nd,
                         }
                     } else {
                         WorkflowOutcome::Completed { output }
                     }
                 },
-                |nd| WorkflowOutcome::Failed {
-                    error: format!("non-deterministic replay: {nd}"),
+                |nd| {
+                    let details = ctx.take_nd_details();
+                    WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                    }
                 },
             ),
             // A primitive may have drifted before the workflow returned Err from
             // its own logic; prefer the non-determinism error (issue #384).
             Ok(Err(error)) => {
-                ctx.take_deferred_nd_error()
-                    .map_or(WorkflowOutcome::Failed { error }, |nd| {
-                        WorkflowOutcome::Failed {
-                            error: format!("non-deterministic replay: {nd}"),
-                        }
-                    })
+                let details = ctx.take_nd_details();
+                ctx.take_deferred_nd_error().map_or(
+                    WorkflowOutcome::Failed {
+                        error,
+                        non_deterministic_details: details.clone(),
+                    },
+                    |nd| WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                    },
+                )
             }
             Err(_elapsed) => {
                 // A plain-value built-in primitive (system_now/new_uuid/random_*)
@@ -178,8 +211,10 @@ pub async fn run_workflow_strict(
                 // await point. Fail the execution now rather than suspending from
                 // a non-deterministic state (issue #384).
                 if let Some(nd) = ctx.take_deferred_nd_error() {
+                    let details = ctx.take_nd_details();
                     return WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
                     };
                 }
                 let mut commands = ctx.drain_commands();
@@ -294,6 +329,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     )
     .with_workflow_name(workflow_name)
     .with_workflow_id(span_meta.map_or("", |m| m.workflow_id.as_str()))
+    .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
     .with_payload_caps(
         max_activity_input_bytes,
         0,
@@ -362,10 +398,12 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
                 // may have absorbed a replay divergence and recorded it as a
                 // deferred non-determinism error (issue #384). Surface it as a
                 // failure rather than letting the workflow complete silently.
+                let details = ctx.take_nd_details();
                 let outcome = ctx.take_deferred_nd_error().map_or_else(
                     || WorkflowOutcome::Completed { output },
                     |nd| WorkflowOutcome::Failed {
                         error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
                     },
                 );
                 (outcome, ctx.drain_commands())
@@ -373,13 +411,17 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
             // A primitive may have drifted before the workflow returned Err from
             // its own logic; prefer the non-determinism error (issue #384).
             Ok(Err(error)) => {
-                let outcome =
-                    ctx.take_deferred_nd_error()
-                        .map_or(WorkflowOutcome::Failed { error }, |nd| {
-                            WorkflowOutcome::Failed {
-                                error: format!("non-deterministic replay: {nd}"),
-                            }
-                        });
+                let details = ctx.take_nd_details();
+                let outcome = ctx.take_deferred_nd_error().map_or(
+                    WorkflowOutcome::Failed {
+                        error,
+                        non_deterministic_details: details.clone(),
+                    },
+                    |nd| WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                    },
+                );
                 (outcome, ctx.drain_commands())
             }
 
@@ -393,9 +435,11 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
                 // await point. Fail the execution now rather than suspending from
                 // a non-deterministic state (issue #384).
                 if let Some(nd) = ctx.take_deferred_nd_error() {
+                    let details = ctx.take_nd_details();
                     return (
                         WorkflowOutcome::Failed {
                             error: format!("non-deterministic replay: {nd}"),
+                            non_deterministic_details: details,
                         },
                         ctx.drain_commands(),
                     );
@@ -510,7 +554,7 @@ mod tests {
         let outcome = run_workflow(exec_id, history, failing_workflow, Value::Null).await;
 
         match outcome {
-            WorkflowOutcome::Failed { error } => {
+            WorkflowOutcome::Failed { error, .. } => {
                 assert!(error.contains("something went wrong"));
             }
             other => panic!("expected Failed, got {other:?}"),
@@ -541,7 +585,7 @@ mod tests {
         let outcome = run_workflow(exec_id, history, drift_then_error_workflow, Value::Null).await;
 
         match outcome {
-            WorkflowOutcome::Failed { error } => {
+            WorkflowOutcome::Failed { error, .. } => {
                 assert!(
                     error.contains("non-deterministic replay"),
                     "drift must win over the workflow's own error: {error}"

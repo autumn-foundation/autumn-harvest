@@ -129,7 +129,7 @@ impl WorkflowSimulator {
                         history,
                     };
                 }
-                WorkflowOutcome::Failed { error } => {
+                WorkflowOutcome::Failed { error, .. } => {
                     history.push(WorkflowEvent::WorkflowFailed {
                         error: error.clone(),
                     });

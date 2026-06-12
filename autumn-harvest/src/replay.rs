@@ -60,6 +60,8 @@ pub enum HistoryMatch {
         expected: String,
         /// What the workflow actually requested.
         actual: String,
+        /// The event index where the divergence occurred.
+        event_index: Option<i32>,
     },
     /// History shows an external activity was scheduled but no terminal event
     /// (completed/failed/timed-out) exists yet. The workflow should re-emit the
@@ -178,6 +180,8 @@ pub enum SignalOrTimerMatch {
         expected: String,
         /// What the workflow actually requested.
         actual: String,
+        /// The event index where the divergence occurred.
+        event_index: Option<i32>,
     },
 }
 
@@ -1019,6 +1023,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("ActivityScheduled({activity_name})"),
                 actual: Self::actual_event_name(&self.events[self.cursor]),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         };
         let activity_id = *activity_id;
@@ -1028,6 +1034,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("ActivityScheduled({activity_name})"),
                 actual: format!("ActivityScheduled({recorded_name})"),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         }
 
@@ -1058,6 +1066,8 @@ impl HistoryMatcher {
                     return HistoryMatch::Diverged {
                         expected: format!("ActivityScheduled({activity_name})"),
                         actual: format!("ActivityScheduled({recorded_name})"),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
                 if recorded_input != input {
@@ -1066,6 +1076,8 @@ impl HistoryMatcher {
                             "ActivityScheduled({activity_name}, input={recorded_input})"
                         ),
                         actual: format!("ActivityScheduled({activity_name}, input={input})"),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
                 Ok(*activity_id)
@@ -1073,6 +1085,8 @@ impl HistoryMatcher {
             other => Err(HistoryMatch::Diverged {
                 expected: format!("ActivityScheduled({activity_name})"),
                 actual: Self::actual_event_name(other),
+
+                event_index: i32::try_from(self.cursor).ok(),
             }),
         };
         let activity_id = match result {
@@ -1114,6 +1128,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("ActivityAwaitingExternal({activity_name})"),
                 actual: Self::actual_event_name(&self.events[self.cursor]),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         };
 
@@ -1121,6 +1137,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("ActivityAwaitingExternal({activity_name})"),
                 actual: format!("ActivityAwaitingExternal({recorded_name})"),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         }
 
@@ -1347,6 +1365,8 @@ impl HistoryMatcher {
                         "ExternalSignalRequested(target={}, signal={})",
                         actual.target, actual.signal_name
                     ),
+
+                    event_index: i32::try_from(self.cursor).ok(),
                 };
             }
             return HistoryMatch::NoMatch;
@@ -1371,6 +1391,8 @@ impl HistoryMatcher {
                         actual: format!(
                             "ExternalSignalRequested(target={recorded_target}, signal={recorded_name})"
                         ),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
                 if recorded_name != signal_name {
@@ -1381,6 +1403,8 @@ impl HistoryMatcher {
                         actual: format!(
                             "ExternalSignalRequested(target={target}, signal={recorded_name})"
                         ),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
                 Ok((*signal_id, recorded_payload.clone()))
@@ -1388,6 +1412,8 @@ impl HistoryMatcher {
             other => Err(HistoryMatch::Diverged {
                 expected: format!("ExternalSignalRequested(target={target}, signal={signal_name})"),
                 actual: Self::actual_event_name(other),
+
+                event_index: i32::try_from(self.cursor).ok(),
             }),
         };
 
@@ -1519,6 +1545,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("TimerStarted({timer_id})"),
                 actual: Self::actual_event_name(&self.events[self.cursor]),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         };
 
@@ -1526,6 +1554,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("TimerStarted({timer_id})"),
                 actual: format!("TimerStarted({recorded_id})"),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         }
 
@@ -1535,6 +1565,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("TimerStarted({timer_id}, duration={expected}s)"),
                 actual: format!("TimerStarted({recorded_id}, duration={recorded_duration}s)"),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         }
 
@@ -1751,6 +1783,8 @@ impl HistoryMatcher {
                     return HistoryMatch::Diverged {
                         expected: format!("SignalReceived({signal_name})"),
                         actual: Self::actual_event_name(other),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
             }
@@ -1843,6 +1877,8 @@ impl HistoryMatcher {
             return SignalOrTimerMatch::Diverged {
                 expected: format!("TimerStarted({timer_id})"),
                 actual: Self::actual_event_name(&self.events[self.cursor]),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         };
 
@@ -1850,6 +1886,8 @@ impl HistoryMatcher {
             return SignalOrTimerMatch::Diverged {
                 expected: format!("TimerStarted({timer_id})"),
                 actual: format!("TimerStarted({recorded_id})"),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         }
 
@@ -1859,6 +1897,8 @@ impl HistoryMatcher {
             return SignalOrTimerMatch::Diverged {
                 expected: format!("TimerStarted({timer_id}, duration={expected}s)"),
                 actual: format!("TimerStarted({recorded_id}, duration={recorded_duration}s)"),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         }
 
@@ -2037,6 +2077,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("WorkflowContinuedAsNew({input})"),
                 actual: Self::actual_event_name(&self.events[self.cursor]),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         };
 
@@ -2044,6 +2086,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("WorkflowContinuedAsNewInput({input})"),
                 actual: format!("WorkflowContinuedAsNewInput({recorded_input})"),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         }
 
@@ -2073,6 +2117,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("ChildWorkflowStarted({workflow_name})"),
                 actual: Self::actual_event_name(&self.events[self.cursor]),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         };
         let child_id = *child_id;
@@ -2081,12 +2127,16 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("ChildWorkflowStarted({workflow_name})"),
                 actual: format!("ChildWorkflowStarted({recorded_name})"),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         }
         if recorded_input != input {
             return HistoryMatch::Diverged {
                 expected: format!("ChildWorkflowInput({input})"),
                 actual: format!("ChildWorkflowInput({recorded_input})"),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         }
 
@@ -2166,12 +2216,16 @@ impl HistoryMatcher {
                     return HistoryMatch::Diverged {
                         expected: format!("ChildWorkflowSpawnedDetached({workflow_name})"),
                         actual: format!("ChildWorkflowSpawnedDetached({recorded_name})"),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
                 if recorded_input != input {
                     return HistoryMatch::Diverged {
                         expected: format!("DetachedChildWorkflowInput({input})"),
                         actual: format!("DetachedChildWorkflowInput({recorded_input})"),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
                 if *recorded_policy != parent_close_policy {
@@ -2184,6 +2238,8 @@ impl HistoryMatcher {
                             "DetachedChildWorkflowPolicy({})",
                             recorded_policy.as_str()
                         ),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
                 let child_id = *child_id;
@@ -2194,6 +2250,8 @@ impl HistoryMatcher {
             other => HistoryMatch::Diverged {
                 expected: format!("ChildWorkflowSpawnedDetached({workflow_name})"),
                 actual: Self::actual_event_name(other),
+
+                event_index: i32::try_from(self.cursor).ok(),
             },
         }
     }
@@ -2276,6 +2334,8 @@ impl HistoryMatcher {
             other => HistoryMatch::Diverged {
                 expected,
                 actual: Self::actual_event_name(other),
+
+                event_index: i32::try_from(self.cursor).ok(),
             },
         }
     }
@@ -2309,6 +2369,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("LocalActivityScheduled({activity_name})"),
                 actual: Self::actual_event_name(&self.events[self.cursor]),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         };
         let activity_id = *activity_id;
@@ -2317,6 +2379,8 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("LocalActivityScheduled({activity_name})"),
                 actual: format!("LocalActivityScheduled({recorded_name})"),
+
+                event_index: i32::try_from(self.cursor).ok(),
             };
         }
 
@@ -2347,6 +2411,8 @@ impl HistoryMatcher {
                     return HistoryMatch::Diverged {
                         expected: format!("LocalActivityScheduled({activity_name})"),
                         actual: format!("LocalActivityScheduled({recorded_name})"),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
                 if recorded_input != input {
@@ -2355,6 +2421,8 @@ impl HistoryMatcher {
                             "LocalActivityScheduled({activity_name}, input={recorded_input})"
                         ),
                         actual: format!("LocalActivityScheduled({activity_name}, input={input})"),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
                 Ok(*activity_id)
@@ -2362,6 +2430,8 @@ impl HistoryMatcher {
             other => Err(HistoryMatch::Diverged {
                 expected: format!("LocalActivityScheduled({activity_name})"),
                 actual: Self::actual_event_name(other),
+
+                event_index: i32::try_from(self.cursor).ok(),
             }),
         };
         let activity_id = match result {
@@ -2462,12 +2532,16 @@ impl HistoryMatcher {
                     HistoryMatch::Diverged {
                         expected: format!("fan_out:{seq}(count={recorded_count})"),
                         actual: format!("fan_out:{seq}(count={count})"),
+
+                        event_index: i32::try_from(self.cursor).ok(),
                     }
                 }
             }
             other => HistoryMatch::Diverged {
                 expected: format!("MarkerRecorded({marker_name})"),
                 actual: Self::actual_event_name(other),
+
+                event_index: i32::try_from(self.cursor).ok(),
             },
         }
     }
@@ -2690,7 +2764,10 @@ mod tests {
         let result = matcher.match_activity("send_email");
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
 
-        if let HistoryMatch::Diverged { expected, actual } = result {
+        if let HistoryMatch::Diverged {
+            expected, actual, ..
+        } = result
+        {
             assert!(expected.contains("send_email"));
             assert!(actual.contains("TimerStarted"));
         }
@@ -2710,7 +2787,10 @@ mod tests {
         let result = matcher.match_activity("send_email");
 
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
-        if let HistoryMatch::Diverged { expected, actual } = result {
+        if let HistoryMatch::Diverged {
+            expected, actual, ..
+        } = result
+        {
             assert!(expected.contains("send_email"));
             assert!(actual.contains("charge_payment"));
         }
@@ -3920,7 +4000,10 @@ mod tests {
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_local_activity("format_data");
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
-        if let HistoryMatch::Diverged { expected, actual } = result {
+        if let HistoryMatch::Diverged {
+            expected, actual, ..
+        } = result
+        {
             assert!(expected.contains("format_data"));
             assert!(actual.contains("TimerStarted"));
         }
@@ -3937,7 +4020,10 @@ mod tests {
         let mut matcher = HistoryMatcher::new(events);
         let result = matcher.match_local_activity("format_data");
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
-        if let HistoryMatch::Diverged { expected, actual } = result {
+        if let HistoryMatch::Diverged {
+            expected, actual, ..
+        } = result
+        {
             assert!(expected.contains("format_data"));
             assert!(actual.contains("other_activity"));
         }

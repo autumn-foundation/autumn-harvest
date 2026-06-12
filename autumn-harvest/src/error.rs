@@ -91,6 +91,15 @@ impl std::fmt::Display for TimeoutType {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct NonDeterministicDetails {
+    pub event_index: Option<i32>,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+    pub workflow_type: Option<String>,
+    pub build_id: Option<String>,
+}
+
 /// Errors produced by the autumn-harvest workflow engine.
 ///
 /// ## Examples
@@ -134,8 +143,11 @@ pub enum HarvestError {
     },
 
     /// The engine detected non-deterministic behavior during workflow replay.
-    #[error("non-deterministic replay: {0}")]
-    NonDeterministic(String),
+    #[error("non-deterministic replay: {reason}")]
+    NonDeterministic {
+        reason: String,
+        details: Box<NonDeterministicDetails>,
+    },
 
     /// The workflow was explicitly cancelled.
     #[error("workflow cancelled: {0}")]
@@ -372,6 +384,53 @@ pub enum HarvestError {
 }
 
 impl HarvestError {
+    /// Build a [`NonDeterministic`](HarvestError::NonDeterministic) error variant.
+    #[must_use]
+    pub fn non_deterministic(
+        reason: impl Into<String>,
+        event_index: Option<i32>,
+        expected: Option<String>,
+        actual: Option<String>,
+        workflow_type: Option<String>,
+        build_id: Option<String>,
+    ) -> Self {
+        Self::NonDeterministic {
+            reason: reason.into(),
+            details: Box::new(NonDeterministicDetails {
+                event_index,
+                expected,
+                actual,
+                workflow_type,
+                build_id,
+            }),
+        }
+    }
+
+    /// Build a [`NonDeterministic`](HarvestError::NonDeterministic) error variant with reason only.
+    #[must_use]
+    pub fn non_deterministic_simple(reason: impl Into<String>) -> Self {
+        Self::NonDeterministic {
+            reason: reason.into(),
+            details: Box::new(NonDeterministicDetails {
+                event_index: None,
+                expected: None,
+                actual: None,
+                workflow_type: None,
+                build_id: None,
+            }),
+        }
+    }
+
+    /// Retrieve the structured [`NonDeterministicDetails`] if this is a
+    /// [`NonDeterministic`](HarvestError::NonDeterministic) error.
+    #[must_use]
+    pub fn non_deterministic_details(&self) -> Option<NonDeterministicDetails> {
+        match self {
+            Self::NonDeterministic { details, .. } => Some((**details).clone()),
+            _ => None,
+        }
+    }
+
     /// Build an [`ActivityFailed`](HarvestError::ActivityFailed) from a recorded
     /// failure payload, decoding the typed `error_type` / `details` (issue #227
     /// / #369) so workflow code can branch on the failure class without parsing
@@ -491,7 +550,8 @@ mod tests {
 
     #[test]
     fn harvest_error_is_std_error() {
-        let e: &dyn std::error::Error = &HarvestError::NonDeterministic("test".into());
+        let e: &dyn std::error::Error =
+            &HarvestError::non_deterministic("test", None, None, None, None, None);
         assert!(e.to_string().contains("non-deterministic"));
     }
 

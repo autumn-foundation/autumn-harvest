@@ -393,3 +393,44 @@ Fix the database configuration so all replicas share the same shard pools. Do no
 Escalate to the platform owner if:
 - A `fire_claim_token` row has `fire_claimed_until` more than 2 minutes in the past and `next_run_at` has not advanced (indicates the claiming process is alive but wedged without completing the fire or clearing the claim — this should not happen with the current implementation and would indicate a bug).
 - The alert fires on a single-replica deployment (indicates a misconfiguration or metric collection error).
+
+## harvest_workflow_non_determinism
+
+### Triage steps
+
+1. Locate failed executions by querying the management API:
+   ```bash
+   GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism
+   ```
+2. Fetch the detailed search attributes of the failed execution to identify:
+   - `expected` (expected event/command generated during execution)
+   - `actual` (actual event/command recorded in the history)
+   - `event_index` (index where the divergence occurred)
+   - `build_id` (the build ID of the running worker when it failed)
+3. Check recent deployment history to see if a new release was shipped without proper version gating or routing protection.
+4. Run replay tests on the workflow using the exported history to reproduce the non-determinism error.
+
+### Likely causes
+
+- Code deployment that modifies workflow logic (adding, removing, or reordering activities, signals, timers, or child workflows) without updating the version gate.
+- Side effects that are not wrapped in `WorkflowContext::side_effect()`, such as direct system calls, time queries (`Instant::now()`), or random number generation.
+- Iteration order on non-deterministic collections (like `HashMap` or `HashSet`) in the workflow function.
+
+### False positives
+
+None. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible.
+
+### Safe actions
+
+1. Roll back the offending deployment immediately to the last known-good version.
+2. If the deployment must stay, declare build compatibility appropriately or use version gates.
+3. For individual executions blocked in `FAILED` state due to non-determinism, once the code is fixed or rolled back, they can be reset to the pre-divergence event index using the reset API:
+   ```bash
+   POST /api/harvest/workflows/{execution_id}/reset
+   ```
+   Specifying the event index prior to the divergence.
+
+### Escalation criteria
+
+Escalate immediately to the release owner and the team who shipped the latest version. Replay divergence blocks execution progress for all active workflows of that type, risking data inconsistency.
+

@@ -253,7 +253,7 @@ fn find_pending_scheduled_activity(
             && !terminal_ids.contains(activity_id)
         {
             if pending.is_some() {
-                return Err(HarvestError::NonDeterministic(format!(
+                return Err(HarvestError::non_deterministic_simple(format!(
                     "multiple pending scheduled activities named '{activity_name}' found in history"
                 )));
             }
@@ -282,7 +282,7 @@ fn find_pending_scheduled_activity_by_id(
                 activity_id, name, ..
             } if *activity_id == requested_activity_id => {
                 if name != activity_name {
-                    return Err(HarvestError::NonDeterministic(format!(
+                    return Err(HarvestError::non_deterministic_simple(format!(
                         "activity task id '{}' was scheduled for '{name}', not '{activity_name}'",
                         requested_activity_id.as_uuid()
                     )));

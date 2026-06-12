@@ -643,7 +643,7 @@ fn outcome_to_report(
             ),
         },
 
-        WorkflowOutcome::Failed { error } => try_parse_non_determinism(&error, exec_id, events)
+        WorkflowOutcome::Failed { error, .. } => try_parse_non_determinism(&error, exec_id, events)
             .unwrap_or(ReplayReport {
                 execution_id: exec_id,
                 events_replayed: total_events,
@@ -1922,7 +1922,7 @@ impl WorkflowTestEnv {
                 });
                 Ok(output)
             }
-            WorkflowOutcome::Failed { error } => {
+            WorkflowOutcome::Failed { error, .. } => {
                 history.push(WorkflowEvent::WorkflowFailed {
                     error: error.clone(),
                 });

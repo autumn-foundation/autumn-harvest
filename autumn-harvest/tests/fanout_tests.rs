@@ -277,7 +277,7 @@ async fn fan_out_raw_fail_fast_on_first_failure() {
     let outcome = run_workflow(exec_id, history, fan_out_fail_fast, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Failed { error } => {
+        WorkflowOutcome::Failed { error, .. } => {
             assert!(
                 error.contains("boom"),
                 "error should mention 'boom', got: {error}"
@@ -490,7 +490,7 @@ async fn fan_out_count_mismatch_returns_non_deterministic_error() {
     let outcome = run_workflow(exec_id, history, fan_out_count_changed, json!(2u64)).await;
 
     match outcome {
-        WorkflowOutcome::Failed { error } => {
+        WorkflowOutcome::Failed { error, .. } => {
             assert!(
                 error.to_lowercase().contains("non-deterministic")
                     || error.to_lowercase().contains("fan_out")
@@ -596,7 +596,7 @@ async fn fan_out_cancelled_workflow_returns_cancelled_error() {
     let outcome = run_workflow(exec_id, history, fan_out_three_parallel, Value::Null).await;
 
     match outcome {
-        WorkflowOutcome::Failed { error } => {
+        WorkflowOutcome::Failed { error, .. } => {
             assert!(
                 error.contains("cancelled") || error.contains("cancel"),
                 "cancelled workflow fan-out should report cancellation; got: {error}"

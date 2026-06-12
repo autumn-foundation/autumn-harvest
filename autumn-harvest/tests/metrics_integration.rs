@@ -28,9 +28,10 @@ use autumn_harvest::store;
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_STARTED, MetricsRecorder, TelemetryConfig, WorkflowStatus,
+    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_STARTED, MetricsRecorder, TelemetryConfig,
+    WorkflowStatus,
 };
-use autumn_harvest::types::{ExecutionId, ParentClosePolicy, ShardId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, RetryPolicy, WorkflowContext, WorkflowHistoryPolicy};
 use chrono::Utc;
@@ -226,6 +227,16 @@ impl MetricsRecorder for RecordingMetrics {
         self.push(
             METRIC_DLQ_ENTRIES,
             vec![("depth", depth.to_string()), ("shard", shard.to_string())],
+        );
+    }
+
+    fn record_workflow_non_determinism(&self, workflow_name: &str, build_id: &str) {
+        self.push(
+            METRIC_WORKFLOW_NON_DETERMINISM,
+            vec![
+                ("workflow", workflow_name.to_owned()),
+                ("build_id", build_id.to_owned()),
+            ],
         );
     }
 }
@@ -1981,4 +1992,192 @@ async fn dlq_depth_sampler_emits_dlq_entries_metric() {
         .and_then(|v| v.parse().ok())
         .expect("depth label must be a valid u64");
     assert!(depth >= 1, "dlq.entries depth must be >= 1, got {depth}");
+}
+
+fn non_deterministic_test_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("wrong_name", serde_json::Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({"msg": "non-det"});
+
+    let exec_row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "non_deterministic_test_workflow",
+        workflow_id: &format!("non-det-{}", Uuid::new_v4()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: workflow_input.clone(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&exec_row)
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    // Replay history expects "step_1" activity scheduled.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "step_1".into(),
+                input: serde_json::Value::Null,
+                queue: "default".into(),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append events failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    // Wire up RecordingMetrics.
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![WorkflowInfo {
+            name: "non_deterministic_test_workflow",
+            module: "metrics_integration",
+            handler: non_deterministic_test_workflow,
+            execution_timeout: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+
+    // Worker with a build_id
+    let config = WorkerRuntimeConfig {
+        worker_id: "nd-worker-1".to_string(),
+        queues: vec!["default".to_string()],
+        notification_database_url: None,
+        max_concurrent_workflows: 2,
+        max_concurrent_activities: 2,
+        poll_interval: Duration::from_millis(25),
+        shutdown_timeout: Duration::from_secs(2),
+        cancellation_grace_period: Duration::from_secs(1),
+        sticky_timeout: Duration::from_secs(5),
+        max_local_activity_start_to_close: Duration::from_secs(60),
+        shard_assignments: vec![ShardId::new(0)],
+        worker_heartbeat_interval: Duration::from_secs(30),
+        build_id: "test-build-v999".to_string(),
+        deployment_name: None,
+        workflow_cache_size: 1000,
+        priority_aging_secs: None,
+        unknown_target_grace_window: Duration::from_secs(5),
+        poison_pill_threshold: 3,
+        labels: std::collections::HashMap::new(),
+        max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+        sharded_pool: None,
+    };
+    let worker = Arc::new(Worker::new(config, registry).expect("worker should build"));
+    let pool = build_test_pool(&database_url);
+
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Wait for the workflow execution to fail.
+    let ex = wait_for_state(&database_url, exec_id, "FAILED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    // --- assertions ---
+
+    // 1. Metric is recorded.
+    let names = recording.names();
+    assert!(
+        names.contains(&METRIC_WORKFLOW_NON_DETERMINISM),
+        "METRIC_WORKFLOW_NON_DETERMINISM must be emitted; got: {names:?}"
+    );
+
+    let emissions = recording.drain();
+    let nd_emission = emissions
+        .iter()
+        .find(|e| e.name == METRIC_WORKFLOW_NON_DETERMINISM)
+        .expect("non_determinism emission must exist");
+    assert!(
+        nd_emission
+            .labels_debug
+            .contains("workflow=non_deterministic_test_workflow"),
+        "non-determinism label must include workflow name; got: {}",
+        nd_emission.labels_debug
+    );
+    assert!(
+        nd_emission
+            .labels_debug
+            .contains("build_id=test-build-v999"),
+        "non-determinism label must include build_id; got: {}",
+        nd_emission.labels_debug
+    );
+
+    // 2. search_attrs in DB contains the details.
+    let search_attrs = ex.search_attrs.expect("search_attrs should be populated");
+    assert_eq!(search_attrs["failure_cause"], "non_determinism");
+    assert_eq!(search_attrs["event_index"], 1); // Divergence at position 1 (the scheduled activity).
+    assert_eq!(search_attrs["expected"], "ActivityScheduled(wrong_name)");
+    assert_eq!(search_attrs["actual"], "ActivityScheduled(step_1)");
+    assert_eq!(
+        search_attrs["workflow_type"],
+        "non_deterministic_test_workflow"
+    );
+    assert_eq!(search_attrs["build_id"], "test-build-v999");
 }

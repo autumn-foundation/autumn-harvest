@@ -1604,6 +1604,7 @@ pub(crate) struct WorkflowFilters {
     pub(crate) exec_id_prefix: Option<String>,
     pub(crate) owner: Option<String>,
     pub(crate) severity: Option<String>,
+    pub(crate) failure_cause: Option<String>,
 }
 
 impl WorkflowFilters {
@@ -3800,6 +3801,12 @@ pub(crate) fn parse_workflow_filters(
                 let mut object = serde_json::Map::with_capacity(1);
                 object.insert(attr_key.to_string(), Value::String(raw_val.to_string()));
                 filters.search_attrs.push(Value::Object(object));
+            }
+            "failure_cause" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.failure_cause = Some(trimmed.to_string());
+                }
             }
             _ => {
                 // Ignore unknown query parameters so future additions stay non-breaking.
@@ -13159,6 +13166,10 @@ pub(crate) async fn load_workflows(
     for predicate in &filters.search_attrs {
         query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate.clone()));
     }
+    if let Some(cause) = &filters.failure_cause {
+        let predicate = serde_json::json!({ "failure_cause": cause });
+        query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate));
+    }
     query
         .select(WorkflowExecution::as_select())
         .load(conn)
@@ -14110,7 +14121,9 @@ pub(crate) fn map_error(error: HarvestError) -> AutumnError {
         ))
         .with_status(axum::http::StatusCode::REQUEST_TIMEOUT),
         HarvestError::Config(message)
-        | HarvestError::NonDeterministic(message)
+        | HarvestError::NonDeterministic {
+            reason: message, ..
+        }
         | HarvestError::Cancelled(message)
         | HarvestError::WorkflowFailed {
             name: _,
