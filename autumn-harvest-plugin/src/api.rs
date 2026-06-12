@@ -9807,6 +9807,24 @@ async fn schedule_backfill(
         )));
     }
 
+    // Reject exhausted schedules — bounds have been reached and no more runs
+    // should start via any path (issue #478). Also check live bounds in case
+    // the scheduler hasn't yet processed an already-violated row.
+    {
+        let now = chrono::Utc::now();
+        let live_end_at_exceeded = schedule.end_at.is_some_and(|end| now >= end);
+        let live_budget_exhausted = schedule
+            .max_runs
+            .is_some_and(|max| max > 0 && schedule.runs_started >= max);
+        if schedule.exhausted_at.is_some() || live_end_at_exceeded || live_budget_exhausted {
+            return Err(AutumnError::bad_request_msg(format!(
+                "schedule {schedule_id} is exhausted (end_at or max_runs reached); \
+                 extend the limits before backfilling"
+            ))
+            .with_status(axum::http::StatusCode::CONFLICT));
+        }
+    }
+
     let parsed_schedule = schedule
         .schedule_expr
         .as_deref()
@@ -9852,6 +9870,20 @@ async fn schedule_backfill(
         .map(|ts| (ts, ts))
         .collect()
     };
+    // Filter out any timestamp pairs whose effective fire time is at or past
+    // end_at (issue #478). This is a belt-and-suspenders guard: the exhaustion
+    // check above already rejects schedules whose end_at has passed at request
+    // time, but a tight end_at window could still contain some past-cutoff slots
+    // among an otherwise valid batch.
+    let timestamp_pairs: Vec<_> = if let Some(end_at) = schedule.end_at {
+        timestamp_pairs
+            .into_iter()
+            .filter(|(_, ft)| *ft < end_at)
+            .collect()
+    } else {
+        timestamp_pairs
+    };
+
     // fire_times is the calendar-adjusted list used for display and dedup checks.
     let fire_times: Vec<chrono::DateTime<chrono::Utc>> =
         timestamp_pairs.iter().map(|(_, ft)| *ft).collect();

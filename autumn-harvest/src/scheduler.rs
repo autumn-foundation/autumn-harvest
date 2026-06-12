@@ -1233,7 +1233,13 @@ async fn upsert_workflow_schedule(
         // valid slot has already been dispatched (next_run_after >= end_at). Only
         // clear exhaustion when the schedule expression will actually produce a new
         // firing inside the new window.
+        // Special case: Manual schedules have no automatic next slot (next_run_after
+        // returns None), so treat them as ok when the wall clock hasn't yet reached
+        // the cutoff (manual triggers are still allowed until end_at).
         let end_at_ok = ws.end_at.is_none_or(|new_end| {
+            if matches!(ws.schedule, crate::policy::Schedule::Manual) {
+                return now < new_end;
+            }
             next_run_after(Some(&ws.schedule), now).is_some_and(|next| next < new_end)
         });
         let max_runs_ok = ws.max_runs.is_none_or(|max| {
@@ -1261,6 +1267,18 @@ async fn upsert_workflow_schedule(
             max_i32 > 0 && existing.runs_started >= max_i32
         });
         let end_at_now_violated = ws.end_at.is_some_and(|new_end| {
+            // Manual schedules have no automatic next slot; only exhaust when the
+            // wall clock has already reached the cutoff so manual triggers remain
+            // possible until then.
+            if matches!(ws.schedule, crate::policy::Schedule::Manual) {
+                return now >= new_end;
+            }
+            // Preserve any overdue existing next_run_at that is still within the
+            // window (e.g. downtime left next_run_at=10:00, end_at=10:30, now=11:00).
+            // The scheduler must process that slot before we can declare exhaustion.
+            if existing.next_run_at.is_some_and(|t| t < new_end) {
+                return false;
+            }
             next_run_after(Some(&ws.schedule), now).is_none_or(|next| next >= new_end)
         });
         if max_runs_now_violated || end_at_now_violated {
@@ -3082,9 +3100,10 @@ async fn drain_buffered_schedule_runs(
         }
 
         // Persist the updated buffer and budget accounting (issue #478).
+        let dispatched_i32 = i32::try_from(dispatched).unwrap_or(i32::MAX);
         let new_runs_started = schedule
             .runs_started
-            .saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
+            .saturating_add(dispatched_i32);
         let budget_exhausted = dispatched > 0
             && schedule
                 .max_runs
@@ -3131,6 +3150,8 @@ async fn drain_buffered_schedule_runs(
             // Guard on exhausted_at IS NULL so a concurrent exhaustion is never
             // overwritten. The row may have been exhausted by the regular tick or
             // another drain between the SELECT above and this UPDATE.
+            // Use a DB-side increment so concurrent manual trigger pre-increments
+            // are preserved rather than overwritten by this stale in-memory value.
             diesel::update(
                 dsl::harvest_schedules
                     .find(schedule.id)
@@ -3138,7 +3159,7 @@ async fn drain_buffered_schedule_runs(
             )
             .set((
                 dsl::buffered_runs.eq(buffered_runs_to_json(&buffered)),
-                dsl::runs_started.eq(new_runs_started),
+                dsl::runs_started.eq(dsl::runs_started + dispatched_i32),
                 dsl::updated_at.eq(now),
             ))
             .execute(conn)
