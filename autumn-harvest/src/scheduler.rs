@@ -3101,9 +3101,7 @@ async fn drain_buffered_schedule_runs(
 
         // Persist the updated buffer and budget accounting (issue #478).
         let dispatched_i32 = i32::try_from(dispatched).unwrap_or(i32::MAX);
-        let new_runs_started = schedule
-            .runs_started
-            .saturating_add(dispatched_i32);
+        let new_runs_started = schedule.runs_started.saturating_add(dispatched_i32);
         let budget_exhausted = dispatched > 0
             && schedule
                 .max_runs
