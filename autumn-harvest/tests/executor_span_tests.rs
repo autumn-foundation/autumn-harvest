@@ -223,6 +223,7 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
             echo_workflow,
             Value::Null,
             empty_shared_state(),
+            std::collections::HashMap::new(),
         ));
 
     // 1. Span must be named correctly.

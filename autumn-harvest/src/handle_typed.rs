@@ -144,6 +144,8 @@ pub struct TypedStartOptions {
     pub delay: Option<chrono::Duration>,
     /// Maximum allowed delay before starting.
     pub max_workflow_start_delay: Option<chrono::Duration>,
+    /// Per-execution context headers propagated automatically to activities and children.
+    pub context_headers: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Optional configurations when invoking an update and starting a workflow atomically.
@@ -171,6 +173,8 @@ pub struct TypedUpdateWithStartOptions {
     /// (e.g. `UUIDv5` from this key) so that retried calls hit the dedupe lookup
     /// and return without re-starting or re-admitting the update.
     pub idempotency_key: Option<String>,
+    /// Per-execution context headers propagated automatically to activities and children.
+    pub context_headers: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Optional configurations when signaling and starting a workflow atomically.
@@ -196,4 +200,6 @@ pub struct TypedSignalWithStartOptions {
     pub idempotency_key: Option<String>,
     /// Limit the maximum size of the signal payload (defaults to 256 KiB).
     pub max_signal_payload_bytes: Option<u64>,
+    /// Per-execution context headers propagated automatically to activities and children.
+    pub context_headers: Option<std::collections::HashMap<String, String>>,
 }

@@ -109,6 +109,8 @@ pub struct EnqueueParams {
     pub schedule_to_close_at: Option<chrono::DateTime<Utc>>,
     /// Structured capability requirements JSONB payload (issue #382).
     pub required_capabilities: Option<serde_json::Value>,
+    /// Ambient context headers propagated from the parent workflow (issue #481).
+    pub context_headers: Option<serde_json::Value>,
 }
 
 impl EnqueueParams {
@@ -144,6 +146,7 @@ impl EnqueueParams {
             rate_limit_key: None,
             schedule_to_close_at: None,
             required_capabilities: None,
+            context_headers: None,
         }
     }
 
@@ -240,6 +243,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         rate_limit_key: params.rate_limit_key.as_deref(),
         schedule_to_close_at: params.schedule_to_close_at,
         required_capabilities: params.required_capabilities.clone(),
+        context_headers: params.context_headers.clone(),
     };
 
     diesel::insert_into(harvest_task_queue::table)

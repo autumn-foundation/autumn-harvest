@@ -234,6 +234,9 @@ pub struct HistorySnapshot {
     pub execution_id: ExecutionId,
     /// The full ordered event log, as returned by `load_history`.
     pub events: Vec<WorkflowEvent>,
+    /// Per-execution context headers attached at workflow start.
+    #[serde(default)]
+    pub context_headers: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +256,7 @@ pub struct HistorySnapshot {
 pub struct WorkflowReplayer {
     handlers: HashMap<String, WorkflowHandlerFn>,
     state: SharedState,
+    context_headers: HashMap<String, String>,
 }
 
 impl Default for WorkflowReplayer {
@@ -268,7 +272,15 @@ impl WorkflowReplayer {
         Self {
             handlers: HashMap::new(),
             state: empty_shared_state(),
+            context_headers: HashMap::new(),
         }
+    }
+
+    /// Set context headers to propagate into the replayed `WorkflowContext`.
+    #[must_use]
+    pub fn with_context_headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.context_headers = headers;
+        self
     }
 
     /// Inject a typed shared-state value available to workflow handlers via
@@ -374,12 +386,18 @@ impl WorkflowReplayer {
         let total_events = snapshot.events.len();
         let input = extract_input(&snapshot.events);
 
+        let headers = if snapshot.context_headers.is_empty() {
+            self.context_headers.clone()
+        } else {
+            snapshot.context_headers.clone()
+        };
         let outcome = run_workflow_strict(
             exec_id,
             snapshot.events.clone(),
             handler,
             input,
             self.state.clone(),
+            headers,
         )
         .await;
         outcome_to_report(exec_id, total_events, &snapshot.events, outcome)
@@ -451,8 +469,15 @@ impl WorkflowReplayer {
         let total_events = events.len();
         let input = extract_input(&events);
 
-        let outcome =
-            run_workflow_strict(exec_id, events.clone(), handler, input, self.state.clone()).await;
+        let outcome = run_workflow_strict(
+            exec_id,
+            events.clone(),
+            handler,
+            input,
+            self.state.clone(),
+            self.context_headers.clone(),
+        )
+        .await;
         outcome_to_report(exec_id, total_events, &events, outcome)
     }
 
@@ -556,6 +581,7 @@ impl WorkflowReplayer {
             workflow_name,
             execution_id: exec_id,
             events: history.events,
+            context_headers: HashMap::new(),
         };
         Ok(self.replay_from_snapshot(snapshot).await)
     }
@@ -1453,6 +1479,7 @@ async fn replay_fixture_file(
     let replayer = WorkflowReplayer {
         handlers: handlers.clone(),
         state,
+        context_headers: HashMap::new(),
     };
 
     let replay_result =
@@ -1561,6 +1588,7 @@ impl TestRunOutcome {
             workflow_name: "__test__".to_string(),
             execution_id: self.exec_id,
             events: self.events.clone(),
+            context_headers: HashMap::new(),
         };
         WorkflowReplayer::new()
             .with_existing_state(self.state.clone())

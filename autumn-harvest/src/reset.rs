@@ -833,6 +833,7 @@ async fn insert_fork_execution(
         owner: source.owner.as_deref(),
         runbook_url: source.runbook_url.as_deref(),
         severity: source.severity.as_deref(),
+        context_headers: source.context_headers.clone(),
     };
 
     diesel::insert_into(harvest_workflow_executions::table)

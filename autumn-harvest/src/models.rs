@@ -113,6 +113,9 @@ pub struct WorkflowExecution {
     /// Last-write-wins human-readable status string set by the workflow author
     /// via `ctx.set_current_details(...)` (issue #473). `None` = never set.
     pub current_details: Option<String>,
+    /// Ambient string key-value context attached at start and propagated to all
+    /// activities and child workflows (issue #481). `None` = empty map.
+    pub context_headers: Option<serde_json::Value>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -140,6 +143,8 @@ pub struct NewWorkflowExecution<'a> {
     pub owner: Option<&'a str>,
     pub runbook_url: Option<&'a str>,
     pub severity: Option<&'a str>,
+    /// Ambient context headers (issue #481). `None` = no headers.
+    pub context_headers: Option<serde_json::Value>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -239,6 +244,8 @@ pub struct TaskQueueItem {
     pub schedule_to_close_at: Option<DateTime<Utc>>,
     /// Structured capability requirements JSONB payload (issue #382).
     pub required_capabilities: Option<serde_json::Value>,
+    /// Ambient context headers propagated from the parent workflow (issue #481).
+    pub context_headers: Option<serde_json::Value>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -275,6 +282,8 @@ pub struct NewTaskQueueItem<'a> {
     pub schedule_to_close_at: Option<DateTime<Utc>>,
     /// Structured capability requirements JSONB payload (issue #382).
     pub required_capabilities: Option<serde_json::Value>,
+    /// Ambient context headers propagated from the parent workflow (issue #481).
+    pub context_headers: Option<serde_json::Value>,
 }
 
 /// Database representation of a rate limit bucket.

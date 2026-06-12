@@ -41,6 +41,7 @@ fn update_with_start_params_is_cloneable_and_debug() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
 
     let _cloned = params.clone();
@@ -103,6 +104,7 @@ fn update_with_start_outcome_idempotency_key_roundtrip() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     assert_eq!(
         params.idempotency_key.as_deref(),
@@ -244,6 +246,7 @@ mod db_tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }
     }
 

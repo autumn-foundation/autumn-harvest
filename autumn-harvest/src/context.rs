@@ -761,6 +761,10 @@ pub struct WorkflowContext {
     /// longer than this cap are truncated to the cap boundary on a UTF-8
     /// character boundary. Configurable via `HarvestBuilder::with_current_details_cap`.
     current_details_cap: usize,
+    /// Ambient string key-value context attached at workflow start and propagated
+    /// automatically to all activities and child workflows (issue #481).
+    /// Immutable after construction; read via `header()` / `headers()`.
+    context_headers: std::sync::Arc<HashMap<String, String>>,
 }
 
 impl WorkflowContext {
@@ -907,6 +911,7 @@ impl WorkflowContext {
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            context_headers: std::sync::Arc::new(HashMap::new()),
         }
     }
 
@@ -994,6 +999,7 @@ impl WorkflowContext {
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            context_headers: std::sync::Arc::new(HashMap::new()),
         })
     }
 
@@ -1031,6 +1037,7 @@ impl WorkflowContext {
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            context_headers: std::sync::Arc::new(HashMap::new()),
         }
     }
 
@@ -1143,6 +1150,37 @@ impl WorkflowContext {
     #[must_use]
     pub fn build_id(&self) -> Option<&str> {
         self.build_id.as_deref()
+    }
+
+    // ── Context headers (issue #481) ──────────────────────────────────────────
+
+    /// Attach ambient context headers to this workflow context (builder-style).
+    ///
+    /// Headers are fixed at workflow-start time and propagated automatically to
+    /// all activity and child-workflow dispatches without touching input types.
+    /// Typically called by the framework after loading the execution row; author
+    /// code reads headers via [`header`](Self::header) / [`headers`](Self::headers).
+    #[must_use]
+    pub fn with_context_headers(mut self, headers: HashMap<String, String>) -> Self {
+        self.context_headers = std::sync::Arc::new(headers);
+        self
+    }
+
+    /// Return the value of the named context header, or `None` if not set.
+    ///
+    /// Returns `None` (never panics) when `key` was never attached, including
+    /// for executions that were started before this feature was deployed.
+    #[must_use]
+    pub fn header(&self, key: &str) -> Option<&str> {
+        self.context_headers.get(key).map(String::as_str)
+    }
+
+    /// Return the full context header map for this execution.
+    ///
+    /// The map is empty for executions started before this feature shipped.
+    #[must_use]
+    pub fn headers(&self) -> &HashMap<String, String> {
+        &self.context_headers
     }
 
     /// Retrieve and clear the structured non-determinism details.
@@ -4016,6 +4054,7 @@ impl WorkflowContext {
         let name = info.name;
         let workflow_id = self.workflow_id.clone();
         let workflow_name = self.workflow_name.clone();
+        let context_headers = std::sync::Arc::clone(&self.context_headers);
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -4030,6 +4069,7 @@ impl WorkflowContext {
                 let inner = std::sync::Arc::get_mut(&mut ctx).unwrap();
                 inner.workflow_id.clone_from(&workflow_id);
                 inner.workflow_name.clone_from(&workflow_name);
+                inner.context_headers = std::sync::Arc::clone(&context_headers);
             }
             handler_fn(ctx, input)
         });
@@ -4091,6 +4131,7 @@ impl WorkflowContext {
                 let inner = std::sync::Arc::get_mut(&mut ctx).unwrap();
                 inner.workflow_id.clone_from(&self.workflow_id);
                 inner.workflow_name.clone_from(&self.workflow_name);
+                inner.context_headers = std::sync::Arc::clone(&self.context_headers);
             }
             h(ctx, input)
         })
@@ -4505,6 +4546,10 @@ pub struct ActivityContext {
     /// was not constructed by the worker's regular activity dispatch path.
     #[cfg(feature = "db")]
     transactional_state: Option<TransactionalState>,
+    /// Ambient context headers propagated from the parent workflow (issue #481).
+    /// Read via `header()` / `headers()`. Empty for activities dispatched before
+    /// this feature was deployed.
+    context_headers: std::sync::Arc<HashMap<String, String>>,
 }
 
 impl ActivityContext {
@@ -4535,6 +4580,7 @@ impl ActivityContext {
             max_attempts: None,
             #[cfg(feature = "db")]
             transactional_state: None,
+            context_headers: std::sync::Arc::new(HashMap::new()),
         }
     }
 
@@ -4569,6 +4615,7 @@ impl ActivityContext {
             previous_failure: None,
             max_attempts: None,
             transactional_state: None,
+            context_headers: std::sync::Arc::new(HashMap::new()),
         }
     }
 
@@ -4592,6 +4639,7 @@ impl ActivityContext {
             max_attempts: None,
             #[cfg(feature = "db")]
             transactional_state: None,
+            context_headers: std::sync::Arc::new(HashMap::new()),
         }
     }
 
@@ -4613,6 +4661,37 @@ impl ActivityContext {
     #[must_use]
     pub const fn trace_context(&self) -> Option<&crate::telemetry::TraceContextCarrier> {
         self.trace_context.as_ref()
+    }
+
+    // ── Context headers (issue #481) ──────────────────────────────────────────
+
+    /// Attach the parent workflow's context headers to this activity context.
+    ///
+    /// Called automatically by the worker at dispatch time; you only need it
+    /// when constructing an `ActivityContext` manually in tests.
+    #[must_use]
+    pub fn with_context_headers(
+        mut self,
+        headers: std::sync::Arc<HashMap<String, String>>,
+    ) -> Self {
+        self.context_headers = headers;
+        self
+    }
+
+    /// Return the value of the named context header, or `None` if not set.
+    ///
+    /// Returns `None` (never panics) when `key` was never attached.
+    #[must_use]
+    pub fn header(&self, key: &str) -> Option<&str> {
+        self.context_headers.get(key).map(String::as_str)
+    }
+
+    /// Return the full context header map propagated from the parent workflow.
+    ///
+    /// The map is empty for activities dispatched before this feature shipped.
+    #[must_use]
+    pub fn headers(&self) -> &HashMap<String, String> {
+        &self.context_headers
     }
 
     /// Attach a stable idempotency key to this context.
@@ -8243,5 +8322,74 @@ mod tests {
             "stored length {} exceeds cap 5",
             stored.len()
         );
+    }
+
+    // ── Context headers — WorkflowContext ────────────────────────────────────
+
+    #[test]
+    fn workflow_context_header_returns_set_value() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("tenant_id".to_string(), "acme".to_string());
+        let ctx = WorkflowContext::new_test().with_context_headers(headers);
+        assert_eq!(ctx.header("tenant_id"), Some("acme"));
+    }
+
+    #[test]
+    fn workflow_context_header_missing_key_returns_none() {
+        let ctx = WorkflowContext::new_test();
+        assert!(ctx.header("tenant_id").is_none());
+    }
+
+    #[test]
+    fn workflow_context_headers_returns_all() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("a".to_string(), "1".to_string());
+        headers.insert("b".to_string(), "2".to_string());
+        let ctx = WorkflowContext::new_test().with_context_headers(headers);
+        let map = ctx.headers();
+        assert_eq!(map.get("a").map(String::as_str), Some("1"));
+        assert_eq!(map.get("b").map(String::as_str), Some("2"));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn workflow_context_headers_empty_on_default() {
+        let ctx = WorkflowContext::new_test();
+        assert!(ctx.headers().is_empty());
+    }
+
+    // ── Context headers — ActivityContext ────────────────────────────────────
+
+    #[test]
+    fn activity_context_header_returns_set_value() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("tenant_id".to_string(), "acme".to_string());
+        let ctx = ActivityContext::new_test()
+            .with_context_headers(std::sync::Arc::new(headers));
+        assert_eq!(ctx.header("tenant_id"), Some("acme"));
+    }
+
+    #[test]
+    fn activity_context_header_missing_key_returns_none() {
+        let ctx = ActivityContext::new_test();
+        assert!(ctx.header("tenant_id").is_none());
+    }
+
+    #[test]
+    fn activity_context_headers_returns_all() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x".to_string(), "foo".to_string());
+        headers.insert("y".to_string(), "bar".to_string());
+        let ctx = ActivityContext::new_test()
+            .with_context_headers(std::sync::Arc::new(headers));
+        let map = ctx.headers();
+        assert_eq!(map.get("x").map(String::as_str), Some("foo"));
+        assert_eq!(map.get("y").map(String::as_str), Some("bar"));
+    }
+
+    #[test]
+    fn activity_context_headers_empty_on_default() {
+        let ctx = ActivityContext::new_test();
+        assert!(ctx.headers().is_empty());
     }
 }
