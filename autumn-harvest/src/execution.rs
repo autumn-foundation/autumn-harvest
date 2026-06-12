@@ -1548,6 +1548,39 @@ pub struct SignalWithStartParams<'a> {
     pub severity: Option<&'a str>,
 }
 
+impl<'a> SignalWithStartParams<'a> {
+    fn to_start_params(
+        &self,
+        exec_id: ExecutionId,
+        policy: WorkflowIdReusePolicy,
+    ) -> StartWorkflowParams<'a> {
+        StartWorkflowParams {
+            workflow_name: self.workflow_name,
+            workflow_id: self.workflow_id,
+            exec_id,
+            input: self.input.clone(),
+            parent_id: self.parent_id,
+            queue_name: self.queue_name,
+            execution_timeout: self.execution_timeout,
+            memo: self.memo.clone(),
+            search_attrs: self.search_attrs.clone(),
+            reuse_policy: policy,
+            trace_context: self.trace_context.clone(),
+            max_execution_timeout_ceiling: self.max_execution_timeout_ceiling,
+            concurrency_key: self.concurrency_key.clone(),
+            concurrency_limit: self.concurrency_limit,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: self.owner,
+            runbook_url: self.runbook_url,
+            severity: self.severity,
+        }
+    }
+}
+
 /// Result of a [`signal_with_start_workflow_execution`] call.
 ///
 /// `started_fresh` distinguishes a freshly inserted run from one attached to
@@ -1692,35 +1725,9 @@ pub async fn signal_with_start_workflow_execution(
             )
             .await?;
 
-            let build_start_request =
-                |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
-                    workflow_name: request.workflow_name,
-                    workflow_id: request.workflow_id,
-                    exec_id,
-                    input: request.input.clone(),
-                    parent_id: request.parent_id,
-                    queue_name: request.queue_name,
-                    execution_timeout: request.execution_timeout,
-                    memo: request.memo.clone(),
-                    search_attrs: request.search_attrs.clone(),
-                    reuse_policy: policy,
-                    trace_context: request.trace_context.clone(),
-                    max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
-                    concurrency_key: request.concurrency_key.clone(),
-                    concurrency_limit: request.concurrency_limit,
-                    priority: Priority::default(),
-                    max_workflow_input_bytes: 0,
-                    start_at: None,
-                    delay: None,
-                    max_workflow_start_delay: None,
-                    owner: request.owner,
-                    runbook_url: request.runbook_url,
-                    severity: request.severity,
-                };
-
             let started = start_or_load_workflow_execution(
                 conn,
-                build_start_request(request.exec_id, effective_policy),
+                request.to_start_params(request.exec_id, effective_policy),
             )
             .await?;
 
@@ -1750,7 +1757,8 @@ pub async fn signal_with_start_workflow_execution(
                 let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
                 let fresh = start_or_load_workflow_execution(
                     conn,
-                    build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
+                    request
+                        .to_start_params(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
                 )
                 .await?;
                 if fresh.created {
@@ -2009,6 +2017,39 @@ pub struct UpdateWithStartParams<'a> {
     pub severity: Option<&'a str>,
 }
 
+impl<'a> UpdateWithStartParams<'a> {
+    fn to_start_params(
+        &self,
+        exec_id: ExecutionId,
+        policy: WorkflowIdReusePolicy,
+    ) -> StartWorkflowParams<'a> {
+        StartWorkflowParams {
+            workflow_name: self.workflow_name,
+            workflow_id: self.workflow_id,
+            exec_id,
+            input: self.input.clone(),
+            parent_id: self.parent_id,
+            queue_name: self.queue_name,
+            execution_timeout: self.execution_timeout,
+            memo: self.memo.clone(),
+            search_attrs: self.search_attrs.clone(),
+            reuse_policy: policy,
+            trace_context: self.trace_context.clone(),
+            max_execution_timeout_ceiling: self.max_execution_timeout_ceiling,
+            concurrency_key: self.concurrency_key.clone(),
+            concurrency_limit: self.concurrency_limit,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: self.owner,
+            runbook_url: self.runbook_url,
+            severity: self.severity,
+        }
+    }
+}
+
 /// Result of an [`update_with_start_workflow_execution`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateWithStartOutcome {
@@ -2102,35 +2143,9 @@ pub async fn update_with_start_workflow_execution(
             )
             .await?;
 
-            let build_start_request =
-                |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
-                    workflow_name: request.workflow_name,
-                    workflow_id: request.workflow_id,
-                    exec_id,
-                    input: request.input.clone(),
-                    parent_id: request.parent_id,
-                    queue_name: request.queue_name,
-                    execution_timeout: request.execution_timeout,
-                    memo: request.memo.clone(),
-                    search_attrs: request.search_attrs.clone(),
-                    reuse_policy: policy,
-                    trace_context: request.trace_context.clone(),
-                    max_execution_timeout_ceiling: request.max_execution_timeout_ceiling,
-                    concurrency_key: request.concurrency_key.clone(),
-                    concurrency_limit: request.concurrency_limit,
-                    priority: Priority::default(),
-                    max_workflow_input_bytes: 0,
-                    start_at: None,
-                    delay: None,
-                    max_workflow_start_delay: None,
-                    owner: request.owner,
-                    runbook_url: request.runbook_url,
-                    severity: request.severity,
-                };
-
             let started = start_or_load_workflow_execution(
                 conn,
-                build_start_request(request.exec_id, effective_policy),
+                request.to_start_params(request.exec_id, effective_policy),
             )
             .await?;
 
@@ -2158,7 +2173,8 @@ pub async fn update_with_start_workflow_execution(
                 let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
                 let fresh = start_or_load_workflow_execution(
                     conn,
-                    build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
+                    request
+                        .to_start_params(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
                 )
                 .await?;
                 if fresh.created {
