@@ -506,6 +506,45 @@ mod tests {
     }
 
     #[test]
+    fn payload_kind_display_and_serialization() {
+        let kind = PayloadKind::ActivityInput;
+        assert_eq!(kind.to_string(), "ActivityInput");
+
+        let json = serde_json::to_string(&kind).unwrap();
+        let back: PayloadKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, PayloadKind::ActivityInput);
+
+        assert_eq!(PayloadKind::ActivityResult.to_string(), "ActivityResult");
+        assert_eq!(PayloadKind::SignalPayload.to_string(), "SignalPayload");
+        assert_eq!(PayloadKind::WorkflowInput.to_string(), "WorkflowInput");
+        assert_eq!(
+            PayloadKind::ChildWorkflowInput.to_string(),
+            "ChildWorkflowInput"
+        );
+        assert_eq!(
+            PayloadKind::ChildWorkflowResult.to_string(),
+            "ChildWorkflowResult"
+        );
+        assert_eq!(PayloadKind::SideEffectValue.to_string(), "SideEffectValue");
+    }
+
+    #[test]
+    fn harvest_error_payload_too_large_display() {
+        let e = HarvestError::PayloadTooLarge {
+            kind: PayloadKind::ActivityInput,
+            observed_bytes: 2000,
+            cap_bytes: 1000,
+            workflow_type: "my_workflow".into(),
+            activity_name: Some("my_activity".into()),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("ActivityInput"));
+        assert!(msg.contains("my_workflow"));
+        assert!(msg.contains("2000"));
+        assert!(msg.contains("1000"));
+    }
+
+    #[test]
     #[allow(clippy::unnecessary_literal_unwrap)]
     fn harvest_result_ok() -> HarvestResult<()> {
         let r: HarvestResult<i32> = Ok(42);
@@ -576,6 +615,17 @@ mod tests {
         assert!(msg.contains("test_activity"));
         assert!(msg.contains("attempt 3"));
         assert!(msg.contains("io error"));
+    }
+
+    #[test]
+    fn activity_helpers_return_none_for_non_activity_failed_variants() {
+        let e = HarvestError::Timeout {
+            timeout_type: TimeoutType::WorkflowExecution,
+            task_name: "billing_reconciliation".into(),
+        };
+        assert_eq!(e.activity_error_type(), None);
+        assert_eq!(e.activity_details(), None);
+        assert!(!e.is_circuit_open());
     }
 
     #[test]
