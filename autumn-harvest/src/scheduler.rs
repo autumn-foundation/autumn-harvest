@@ -926,6 +926,15 @@ async fn upsert_schedule(
                 dsl::schedule_expr.eq(expr.clone()),
                 dsl::timezone.eq(tz),
                 dsl::catchup.eq(dag.catchup),
+                // DAGs use the legacy `catchup` bool, not the bounded-catchup
+                // policy columns. When this registration reuses a row that was
+                // previously a workflow schedule with a `most_recent` / `window`
+                // policy, clear the stale policy columns: otherwise the
+                // policy-takes-precedence resolver (`CatchupPolicy::from_db`) would
+                // keep driving ticks off the old bounded policy and ignore the
+                // DAG's `catchup` setting (issue #484 / Codex #1552).
+                dsl::catchup_policy.eq(Option::<String>::None),
+                dsl::catchup_window_secs.eq(Option::<i64>::None),
                 dsl::max_active_runs.eq(i32::try_from(dag.max_active_runs).unwrap_or(i32::MAX)),
                 dsl::dag_name.eq(Some(dag.name.as_str())),
                 dsl::updated_at.eq(now),
@@ -1821,21 +1830,13 @@ async fn record_catchup_drops(
 ) {
     use crate::schema::harvest_schedules::dsl;
 
-    // Bound the per-slot counter increments: a long outage on a high-frequency
-    // schedule can drop millions of slots, and looping that many synchronous
-    // recorder calls inside the tick loop would block the scheduler thread and
-    // starve other schedules. The exact drop count is still preserved on the
-    // aggregated decision row and the `last_catchup_dropped` column, so alerting
-    // on `harvest.schedule.skipped` stays meaningful.
-    const MAX_SKIP_METRIC_INCREMENTS: u64 = 1000;
-
     if dropped == 0 {
         return;
     }
-    let metric_increments = dropped.min(MAX_SKIP_METRIC_INCREMENTS);
-    for _ in 0..metric_increments {
-        metrics.record_schedule_skipped("workflow", wf_name, "catchup_window_exceeded");
-    }
+    // Count every dropped slot exactly with a single batched increment — no
+    // O(dropped) loop, so a large recovery never stalls the tick and the counter
+    // does not under-report the outage (issue #484 / Codex #1837).
+    metrics.record_schedule_skipped_n("workflow", wf_name, "catchup_window_exceeded", dropped);
     crate::schedule_decision::record_decision_graceful(
         conn,
         Some(&**metrics),
@@ -1905,20 +1906,26 @@ async fn tick_one_workflow_schedule(
     // is exactly the original `logical_date`, so their behavior is completely
     // unchanged — only the new MostRecent / Window policies shift the anchor.
     // Skip materializing the full overdue backlog for an Unbounded / legacy
-    // `catchup = true` schedule that the bounded-run guards below (end_at /
-    // max_runs, issue #478) will immediately exhaust without firing: a
-    // high-frequency schedule left down past its cutoff or run budget would
-    // otherwise allocate one slot per missed interval only for every slot to be
-    // discarded (Codex #1829). The authoritative exhaustion decision is still
-    // recorded by those guards below — this only avoids the wasted allocation.
-    // The bounded MostRecent / Window policies compute in O(1) (closed-form for
-    // interval schedules), so this short-circuit is scoped to the unbounded path.
+    // `catchup = true` schedule that one of the guards below will immediately
+    // exhaust, auto-pause, or otherwise return on without firing: a high-
+    // frequency schedule left down past its cutoff / run budget (end_at /
+    // max_runs, issue #478) or past its consecutive-failure limit (auto-pause,
+    // issue #360) would otherwise allocate one slot per missed interval only for
+    // every slot to be discarded (Codex #1829 / #1938). The authoritative
+    // exhaustion / auto-pause decision is still made (and re-validated against a
+    // fresh DB read) by those guards below — this only avoids the wasted
+    // allocation. The bounded MostRecent / Window policies compute in O(1)
+    // (closed-form for interval schedules), so this short-circuit is scoped to
+    // the unbounded path.
     let will_exhaust_before_firing =
         matches!(catchup_policy, crate::policy::CatchupPolicy::Unbounded)
             && (schedule.end_at.is_some_and(|end_at| logical_date >= end_at)
                 || schedule
                     .max_runs
-                    .is_some_and(|max_runs| max_runs > 0 && schedule.runs_started >= max_runs));
+                    .is_some_and(|max_runs| max_runs > 0 && schedule.runs_started >= max_runs)
+                || schedule
+                    .consecutive_failure_limit
+                    .is_some_and(|limit| limit > 0 && schedule.consecutive_failure_count >= limit));
     let catchup_plan = if will_exhaust_before_firing {
         // Empty plan: `logical_date` rebinding below keeps the original slot
         // (the `[]` arm), so the calendar / jitter / exhaustion branches see the
@@ -2028,6 +2035,26 @@ async fn tick_one_workflow_schedule(
                     "harvest: workflow schedule firing suppressed by calendar"
                 );
                 metrics.record_schedule_skipped("workflow", wf_name, "calendar");
+                // This branch advances next_run_at past the single policy-approved
+                // slot, so any older slots the bounded policy already dropped are
+                // now durably discarded: record their catchup-drop audit here
+                // (committing path) so a MostRecent / single-slot-Window recovery
+                // whose kept slot lands on an excluded calendar date still emits the
+                // `catchup_window_exceeded` decision + `last_catchup_*` summary
+                // (issue #484 / Codex #2012).
+                record_catchup_drops(
+                    conn,
+                    metrics,
+                    schedule.id,
+                    wf_name,
+                    catchup_policy,
+                    schedule.catchup_window_secs,
+                    catchup_plan.dropped,
+                    now,
+                    current_shard,
+                    claim_token,
+                )
+                .await;
                 let next = if catchup {
                     next_run_after(parsed_schedule, logical_date)
                 } else {
@@ -2989,17 +3016,6 @@ fn due_run_plan(
 
 // ── Bounded catchup planning (issue #484) ────────────────────────────────────
 
-/// Maximum number of cron occurrences a single tick will walk when computing a
-/// bounded-catchup plan (issue #484 / Codex #3069).
-///
-/// Interval schedules use closed-form O(1) arithmetic and never reach this cap.
-/// Cron schedules have no closed form, so a second-resolution cron left down for
-/// days could otherwise issue millions of `next_run_after` calls in one tick and
-/// stall the scheduler thread. When the cap is hit the walk yields a partial
-/// summary and resumes from where it stopped on the next tick, so the schedule
-/// drains a bounded number of slots per tick until it catches up.
-const MAX_CATCHUP_CRON_SCAN: u64 = 100_000;
-
 /// Output of [`catchup_run_plan`].
 pub(crate) struct CatchupPlan {
     /// Slots to actually dispatch, in chronological order.
@@ -3079,20 +3095,13 @@ pub(crate) fn catchup_run_plan(
             let summary = eligible_slot_summary(schedule, first_due, now, end_at);
             let run_dates = window_eligible_slots(schedule, first_due, now, end_at, cutoff);
             let fired = run_dates.len() as u64;
-            // Window fires its whole bounded set in a single tick, so `next_run_at`
-            // must always advance strictly past `now`. For interval schedules the
-            // summary's arithmetic value already does (it never reaches the cron
-            // scan cap); for cron schedules compute the next occurrence directly so
-            // a capped count walk (issue #484 / Codex #3069) can't drag `next_run_at`
-            // back to a `<= now` resume cursor and re-fire the in-window slots.
-            let next_run_at = if interval_period(schedule).is_some() {
-                summary.next_run_at
-            } else {
-                next_run_after(schedule, now)
-            };
+            // `summary.next_run_at` is the first slot strictly after `now` for both
+            // interval (closed-form) and cron (forward walk to the first slot past
+            // `now`) schedules, so the whole bounded in-window set fires this tick
+            // and `next_run_at` advances past `now`.
             CatchupPlan {
                 run_dates,
-                next_run_at,
+                next_run_at: summary.next_run_at,
                 dropped: summary.eligible_count.saturating_sub(fired),
             }
         }
@@ -3178,18 +3187,20 @@ fn eligible_slot_summary(
     // Cron (or sub-second / overflowing interval): walk, retaining only the
     // count and the last eligible slot — never the full slot vector.
     //
-    // The walk is bounded by `MAX_CATCHUP_CRON_SCAN` per tick (issue #484 /
-    // Codex #3069): a second-resolution cron schedule left down for days would
-    // otherwise issue millions of `next_run_after` calls in a single tick and
-    // stall the scheduler thread. When the cap is hit we return the partial
-    // summary; `next_run_at` points at the cursor we stopped on (still `<= now`),
-    // so the next tick resumes the walk from there and the schedule drains a
-    // bounded number of slots per tick until it catches up. Interval schedules
-    // never reach this path (they use the O(1) arithmetic above).
+    // The walk visits every missed occurrence up to `now`, so its cost is
+    // O(missed occurrences) — the same cost as the `Unbounded` policy. This is
+    // unavoidable for cron `MostRecent`: `croner` exposes only a forward
+    // `find_next_occurrence` (no reverse iterator), so the most-recent slot at or
+    // before `now` and the exact dropped count can only be found by walking
+    // forward from `first_due`. A previous, capped version of this walk fired a
+    // *stale* mid-backlog slot instead of the newest one (issue #484 /
+    // Codex #3210), which violated the policy contract; correctness wins.
+    // High-frequency schedules that need O(1) recovery planning should use an
+    // `Interval` schedule (handled by the closed-form arithmetic above) rather
+    // than a sub-minute cron expression.
     let mut cursor = first_due;
     let mut count: u64 = 0;
     let mut last_eligible = None;
-    let mut scanned: u64 = 0;
     loop {
         if cursor > now {
             return EligibleSummary {
@@ -3201,17 +3212,6 @@ fn eligible_slot_summary(
         if end_at.is_none_or(|e| cursor < e) {
             count += 1;
             last_eligible = Some(cursor);
-        }
-        scanned += 1;
-        if scanned >= MAX_CATCHUP_CRON_SCAN {
-            // Cap hit: resume from `cursor` on the next tick rather than walking
-            // the full backlog in one shot.
-            let next = next_run_after(schedule, cursor);
-            return EligibleSummary {
-                eligible_count: count,
-                last_eligible,
-                next_run_at: next,
-            };
         }
         let Some(next) = next_run_after(schedule, cursor) else {
             return EligibleSummary {
