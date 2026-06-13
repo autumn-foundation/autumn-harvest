@@ -126,7 +126,10 @@ impl DagMonteCarlo {
                             start_time = start_time.max(task_end_times[up_idx]);
                         }
 
-                        let (duration, res) = self.activity_mocks.get(&task.activity_name).map_or((self.default_duration, Ok(())), |mock| mock());
+                        let (duration, res) = self
+                            .activity_mocks
+                            .get(&task.activity_name)
+                            .map_or((self.default_duration, Ok(())), |mock| mock());
 
                         task_end_times[task_index] = start_time + duration;
 
@@ -262,7 +265,7 @@ mod tests {
             DagMonteCarlo::new(dag)
                 .with_iterations(1000)
                 .mock_activity("activity_a", move || {
-                let secs = rng.lock().unwrap().gen_range(1..=10);
+                    let secs = rng.lock().unwrap().gen_range(1..=10);
                     (Duration::from_secs(secs), Ok(()))
                 });
 
