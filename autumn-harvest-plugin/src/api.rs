@@ -6042,13 +6042,14 @@ async fn batch_start_workflows(
             )
             .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-            let (owner, runbook_url, severity) = runtime
+            let (owner, runbook_url, severity, info_sla) = runtime
                 .registry
                 .workflows
                 .get(&item.workflow_name)
-                .map_or((None, None, None), |info| {
-                    (info.owner, info.runbook_url, info.severity)
+                .map_or((None, None, None, None), |info| {
+                    (info.owner, info.runbook_url, info.severity, info.sla)
                 });
+            let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
 
             let start_result = start_or_load_workflow_execution(
                 &mut conn,
@@ -6076,8 +6077,7 @@ async fn batch_start_workflows(
                     runbook_url,
                     severity,
                     context_headers: None,
-
-                    sla: None,
+                    sla,
                 },
             )
             .await;
@@ -6598,13 +6598,14 @@ async fn signal_with_start_workflow(
             (key, Some(policy.limit))
         });
 
-    let (owner, runbook_url, severity) = runtime
+    let (owner, runbook_url, severity, info_sla) = runtime
         .registry
         .workflows
         .get(&workflow_name)
-        .map_or((None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity)
+        .map_or((None, None, None, None), |info| {
+            (info.owner, info.runbook_url, info.severity, info.sla)
         });
+    let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
 
     let result = signal_with_start_workflow_execution(
         &mut conn,
@@ -6636,8 +6637,7 @@ async fn signal_with_start_workflow(
             runbook_url,
             severity,
             context_headers: None,
-
-            sla: None,
+            sla,
         },
     )
     .await;
@@ -7051,13 +7051,14 @@ async fn update_with_start_workflow(
             (key, Some(policy.limit))
         });
 
-    let (owner, runbook_url, severity) = runtime
+    let (owner, runbook_url, severity, info_sla) = runtime
         .registry
         .workflows
         .get(&workflow_name)
-        .map_or((None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity)
+        .map_or((None, None, None, None), |info| {
+            (info.owner, info.runbook_url, info.severity, info.sla)
         });
+    let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
 
     let params = UpdateWithStartParams {
         workflow_name: &workflow_name,
@@ -7087,8 +7088,7 @@ async fn update_with_start_workflow(
         runbook_url,
         severity,
         context_headers: None,
-
-        sla: None,
+        sla,
     };
 
     let result = update_with_start_workflow_execution(&mut conn, params).await;
@@ -10922,13 +10922,14 @@ async fn schedule_backfill(
                     }
                 }
 
-                let (owner, runbook_url, severity) = runtime
+                let (owner, runbook_url, severity, info_sla) = runtime
                     .registry
                     .workflows
                     .get(&wf_name)
-                    .map_or((None, None, None), |info| {
-                        (info.owner, info.runbook_url, info.severity)
+                    .map_or((None, None, None, None), |info| {
+                        (info.owner, info.runbook_url, info.severity, info.sla)
                     });
+                let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
 
                 let result = start_or_load_workflow_execution(
                     &mut conn,
@@ -10956,8 +10957,7 @@ async fn schedule_backfill(
                         runbook_url,
                         severity,
                         context_headers: None,
-
-                        sla: None,
+                        sla,
                     },
                 )
                 .await;

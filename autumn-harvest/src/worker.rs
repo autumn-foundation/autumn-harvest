@@ -272,6 +272,7 @@ impl HandlerRegistry {
                             runbook_url: w.runbook_url.map(String::from),
                             severity: w.severity.map(String::from),
                             input_schema: w.input_schema,
+                            sla: w.sla,
                         },
                     )
                 })
@@ -2846,10 +2847,14 @@ async fn persist_all_started_child_workflows(
             // Insert rows and enqueue tasks for new children.
             for child in &new_children {
                 let child_workflow_id = child.child_id.to_string();
-                let (owner, runbook_url, severity) = registry
+                let (owner, runbook_url, severity, child_sla) = registry
                     .workflows
                     .get(child.workflow_name.as_str())
-                    .map_or((None, None, None), |w| (w.owner, w.runbook_url, w.severity));
+                    .map_or((None, None, None, None), |w| {
+                        (w.owner, w.runbook_url, w.severity, w.sla)
+                    });
+                let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+                let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
                 let child_row = NewWorkflowExecution {
                     id: child.child_id.as_uuid(),
                     workflow_name: &child.workflow_name,
@@ -2861,8 +2866,8 @@ async fn persist_all_started_child_workflows(
                     queue_name: &queue_name,
                     execution_timeout: None,
                     deadline_at: None,
-                    sla: None,
-                    sla_deadline_at: None,
+                    sla: child_sla,
+                    sla_deadline_at: child_sla_deadline_at,
                     memo: None,
                     search_attrs: None,
                     assigned_build_id: parent_execution.assigned_build_id.clone(),
@@ -3397,10 +3402,14 @@ async fn create_detached_child_executions(
         }
 
         let child_workflow_id = child_id.to_string();
-        let (owner, runbook_url, severity) = registry
+        let (owner, runbook_url, severity, child_sla) = registry
             .workflows
             .get(workflow_name.as_str())
-            .map_or((None, None, None), |w| (w.owner, w.runbook_url, w.severity));
+            .map_or((None, None, None, None), |w| {
+                (w.owner, w.runbook_url, w.severity, w.sla)
+            });
+        let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+        let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
         let child_row = NewWorkflowExecution {
             id: child_id.as_uuid(),
             workflow_name: workflow_name.as_str(),
@@ -3412,8 +3421,8 @@ async fn create_detached_child_executions(
             queue_name: &parent_execution.queue_name,
             execution_timeout: None,
             deadline_at: None,
-            sla: None,
-            sla_deadline_at: None,
+            sla: child_sla,
+            sla_deadline_at: child_sla_deadline_at,
             memo: None,
             search_attrs: None,
             assigned_build_id: parent_execution.assigned_build_id.clone(),

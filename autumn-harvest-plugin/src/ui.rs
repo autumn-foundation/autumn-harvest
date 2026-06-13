@@ -5827,6 +5827,13 @@ async fn execute_schedule_trigger_ui(
             (None, None) => (None, None, None),
         }
     };
+    // Only registered workflows carry an SLA default; DAGs have no SLA concept.
+    let sla = runtime
+        .registry()
+        .workflows
+        .get(workflow_name)
+        .and_then(|info| info.sla)
+        .and_then(|d| chrono::Duration::from_std(d).ok());
 
     let result = start_or_load_workflow_execution(
         conn,
@@ -5854,8 +5861,7 @@ async fn execute_schedule_trigger_ui(
             runbook_url,
             severity,
             context_headers: None,
-
-            sla: None,
+            sla,
         },
     )
     .await;

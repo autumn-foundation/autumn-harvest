@@ -197,6 +197,9 @@ pub struct WorkflowMetadata {
     pub runbook_url: Option<String>,
     pub severity: Option<String>,
     pub input_schema: Option<fn() -> serde_json::Value>,
+    /// Declared soft-SLA default (issue #487), resolved at completion-trigger
+    /// start time into a fresh `sla_deadline_at`.
+    pub sla: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "db")]
@@ -288,6 +291,8 @@ pub struct DeferredTriggerStart {
     pub owner: Option<String>,
     pub runbook_url: Option<String>,
     pub severity: Option<String>,
+    /// Resolved soft-SLA default (issue #487), converted to a fresh deadline at start.
+    pub sla: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "db")]
@@ -353,8 +358,7 @@ impl DeferredTriggerStart {
                     runbook_url: self.runbook_url.as_deref(),
                     severity: self.severity.as_deref(),
                     context_headers: None,
-
-                    sla: None,
+                    sla: self.sla.and_then(|d| chrono::Duration::from_std(d).ok()),
                 },
             )
             .await;
@@ -527,14 +531,19 @@ pub fn evaluate_triggers_for_execution<'a>(
                     .map_or(global_default, |per_wf| per_wf.max(global_default))
             };
 
-            // Resolve target metadata (owner, runbook_url, severity)
-            let (target_owner, target_runbook_url, target_severity) = {
+            // Resolve target metadata (owner, runbook_url, severity, sla)
+            let (target_owner, target_runbook_url, target_severity, target_sla) = {
                 let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
                 lock.as_ref()
                     .and_then(|guard| guard.as_ref())
                     .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
-                    .map_or((None, None, None), |meta| {
-                        (meta.owner.clone(), meta.runbook_url.clone(), meta.severity.clone())
+                    .map_or((None, None, None, None), |meta| {
+                        (
+                            meta.owner.clone(),
+                            meta.runbook_url.clone(),
+                            meta.severity.clone(),
+                            meta.sla,
+                        )
                     })
             };
 
@@ -572,8 +581,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         runbook_url: target_runbook_url.as_deref(),
                         severity: target_severity.as_deref(),
                         context_headers: None,
-
-                        sla: None,
+                        sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
                     },
                 )
                 .await
@@ -658,6 +666,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                     owner: target_owner,
                     runbook_url: target_runbook_url,
                     severity: target_severity,
+                    sla: target_sla,
                 });
             }
         }
@@ -733,16 +742,17 @@ pub async fn enforce_completion_triggers_outbox(
 
         let priority: Priority = serde_json::from_value(task.priority).unwrap_or_default();
 
-        let (target_owner, target_runbook_url, target_severity) = {
+        let (target_owner, target_runbook_url, target_severity, target_sla) = {
             let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
             lock.as_ref()
                 .and_then(|guard| guard.as_ref())
                 .and_then(|meta_map| meta_map.get(&task.target_workflow_name))
-                .map_or((None, None, None), |meta| {
+                .map_or((None, None, None, None), |meta| {
                     (
                         meta.owner.clone(),
                         meta.runbook_url.clone(),
                         meta.severity.clone(),
+                        meta.sla,
                     )
                 })
         };
@@ -775,8 +785,7 @@ pub async fn enforce_completion_triggers_outbox(
                 runbook_url: target_runbook_url.as_deref(),
                 severity: target_severity.as_deref(),
                 context_headers: None,
-
-                sla: None,
+                sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
             },
         )
         .await;
