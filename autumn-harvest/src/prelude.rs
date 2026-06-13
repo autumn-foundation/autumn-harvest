@@ -14,7 +14,8 @@ pub use crate::circuit_breaker::{
 };
 pub use crate::context::{ActivityContext, WorkflowContext};
 pub use crate::dag::{
-    DagBuildError, DagBuilder, DagDefinition, DagMapTaskRef, DagTask, DagTaskRef,
+    DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
+    DagTask, DagTaskRef,
 };
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
 pub use crate::event::{SideEffectKind, WorkflowEvent};

@@ -2546,6 +2546,76 @@ impl HistoryMatcher {
         }
     }
 
+    /// Match a named `MarkerRecorded` event at the current cursor position.
+    ///
+    /// Used by `WorkflowContext::dag_skip_marker` to record the condition-skip
+    /// decision deterministically so replay always selects the identical branch.
+    ///
+    /// Returns:
+    /// - [`HistoryMatch::Matched`] — the event at cursor is `MarkerRecorded`
+    ///   with the exact `name`, `expected_task` (in `details.task`), and
+    ///   matching `expected_upstreams` (in `details.upstreams`, when present).
+    /// - [`HistoryMatch::Diverged`] — a different event, a marker with a
+    ///   different name, a different task name, or (for new-format markers) a
+    ///   different upstream set is at the cursor — a non-determinism violation.
+    /// - [`HistoryMatch::NoMatch`] — past end of history (live execution).
+    ///
+    /// **Backward compatibility:** old markers without an `upstreams` field (written
+    /// before this field was introduced) pass the upstream check unconditionally,
+    /// so in-flight executions are not broken on upgrade.
+    pub fn match_named_marker(
+        &mut self,
+        marker_name: &str,
+        expected_task: &str,
+        expected_upstreams: &[usize],
+    ) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+        match &self.events[self.cursor] {
+            WorkflowEvent::MarkerRecorded { name, details } if name == marker_name => {
+                let recorded_task = details.get("task").and_then(|v| v.as_str()).unwrap_or("");
+                if recorded_task != expected_task {
+                    return HistoryMatch::Diverged {
+                        expected: format!("MarkerRecorded({marker_name}, task={expected_task})"),
+                        actual: format!("MarkerRecorded({marker_name}, task={recorded_task})"),
+                        event_index: i32::try_from(self.cursor).ok(),
+                    };
+                }
+                // Validate upstream fingerprint only when the stored marker has the
+                // field (new-format markers); old markers without it pass through so
+                // in-flight executions survive an upgrade.
+                if let Some(arr) = details.get("upstreams").and_then(|v| v.as_array()) {
+                    let recorded_upstreams: Vec<usize> = arr
+                        .iter()
+                        .filter_map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()))
+                        .collect();
+                    if recorded_upstreams != expected_upstreams {
+                        return HistoryMatch::Diverged {
+                            expected: format!(
+                                "MarkerRecorded({marker_name}, task={expected_task}, upstreams={expected_upstreams:?})"
+                            ),
+                            actual: format!(
+                                "MarkerRecorded({marker_name}, task={recorded_task}, upstreams={recorded_upstreams:?})"
+                            ),
+                            event_index: i32::try_from(self.cursor).ok(),
+                        };
+                    }
+                }
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                HistoryMatch::Matched {
+                    output: serde_json::Value::Null,
+                }
+            }
+            other => HistoryMatch::Diverged {
+                expected: format!("MarkerRecorded({marker_name})"),
+                actual: Self::actual_event_name(other),
+                event_index: i32::try_from(self.cursor).ok(),
+            },
+        }
+    }
+
     // ── Update primitive (issue #140) ─────────────────────────────────────
 
     /// Look up the recorded result for a specific update by `update_id`.

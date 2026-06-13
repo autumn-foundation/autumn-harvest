@@ -679,7 +679,53 @@ async fn dag_detail_ui(
             .await
             .map_err(database_error)
             .map_err(map_error)?;
-        map_node_states(&dag.definition, &task_rows)
+
+        // Load dag_skip: markers to distinguish condition-skipped nodes (issue #482).
+        let marker_events: Vec<HarvestEvent> = harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq(exec_id))
+            .filter(harvest_events::event_type.eq("MarkerRecorded"))
+            .select(HarvestEvent::as_select())
+            .load(&mut conn)
+            .await
+            .map_err(database_error)
+            .map_err(map_error)?;
+        let condition_skipped: std::collections::HashSet<usize> = marker_events
+            .iter()
+            .filter_map(|e| {
+                // event_data is adjacently-tagged: {"type":"MarkerRecorded","data":{...}}
+                let data = e.event_data.get("data")?;
+                let name = data["name"].as_str()?;
+                let idx = parse_dag_skip_marker_index(name)?;
+                // Guard against task rename/reorder across deploys: only mark
+                // the node as condition-skipped when the recorded activity name
+                // still matches the task at that index in the current definition.
+                // MarkerRecorded serializes as {"type":…,"data":{"name":…,"details":{…}}},
+                // so the task field lives under data.details.task.
+                let recorded_task = data.get("details").and_then(|d| d["task"].as_str())?;
+                let current_task = dag.definition.tasks().get(idx)?;
+                if recorded_task != current_task.activity_name.as_str() {
+                    return None;
+                }
+                // Also validate upstream fingerprint when present (new-format markers).
+                // Old markers without "upstreams" pass through for backward compat.
+                if let Some(arr) = data
+                    .get("details")
+                    .and_then(|d| d.get("upstreams"))
+                    .and_then(|v| v.as_array())
+                {
+                    let recorded: Vec<usize> = arr
+                        .iter()
+                        .filter_map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()))
+                        .collect();
+                    if recorded != current_task.upstreams {
+                        return None;
+                    }
+                }
+                Some(idx)
+            })
+            .collect();
+
+        map_node_states(&dag.definition, &task_rows, &condition_skipped)
     } else {
         HashMap::<usize, DagNodeState>::new()
     };
@@ -4178,8 +4224,32 @@ enum DagNodeState {
     Cancelled,
     Running,
     Queued,
+    /// Skipped because a trigger rule evaluated to false over upstream statuses.
     Skipped,
+    /// Skipped because a data-dependent condition predicate evaluated to false
+    /// (issue #482).  Distinct from [`Skipped`] so the UI can show a different
+    /// label ("Skipped (condition)").
+    SkippedByCondition,
     Unknown,
+}
+
+/// Human-readable label for a [`DagNodeState`] used in the timeline table.
+const fn dag_node_state_label(state: DagNodeState) -> &'static str {
+    match state {
+        DagNodeState::Succeeded => "Succeeded",
+        DagNodeState::Failed => "Failed",
+        DagNodeState::Cancelled => "Cancelled",
+        DagNodeState::Running => "Running",
+        DagNodeState::Queued => "Queued",
+        DagNodeState::Skipped => "Skipped (upstream)",
+        DagNodeState::SkippedByCondition => "Skipped (condition)",
+        DagNodeState::Unknown => "Unknown",
+    }
+}
+
+/// Parse `dag_skip:{idx}` from a marker event name; returns `Some(idx)` on match.
+fn parse_dag_skip_marker_index(name: &str) -> Option<usize> {
+    name.strip_prefix("dag_skip:").and_then(|s| s.parse().ok())
 }
 
 fn render_dag_detail(
@@ -4219,7 +4289,7 @@ fn render_dag_detail(
                             }
                             td { (task.activity_name.as_str()) }
                             td { (format!("{:?}", task.trigger_rule)) }
-                            td { (format!("{:?}", node_states.get(&idx).copied().unwrap_or(DagNodeState::Unknown))) }
+                            td { (dag_node_state_label(node_states.get(&idx).copied().unwrap_or(DagNodeState::Unknown))) }
                             td {
                                 @for (n, upstream) in task.upstreams.iter().enumerate() {
                                     @if n > 0 { ", " }
@@ -4234,7 +4304,7 @@ fn render_dag_detail(
                 h3 { "Node panel" }
                 p { "Activity: " code { (task.activity_name.as_str()) } }
                 p { "Trigger rule: " (format!("{:?}", task.trigger_rule)) }
-                p { "Current state: " (format!("{selected_node_state:?}")) }
+                p { "Current state: " (dag_node_state_label(selected_node_state)) }
             }
         }
         table {
@@ -4294,12 +4364,19 @@ fn layout_dag_detail(title: &str, body: &Markup, base_href: &str, refresh: Optio
 fn map_node_states(
     dag: &autumn_harvest::dag::DagDefinition,
     tasks: &[TaskQueueItem],
+    condition_skipped: &std::collections::HashSet<usize>,
 ) -> HashMap<usize, DagNodeState> {
     let mut out = HashMap::new();
     let mut has_task_row = vec![false; dag.tasks().len()];
 
+    // Seed condition-skipped nodes first (highest-priority: they have a recorded
+    // marker telling us *why* they were skipped).
+    for &idx in condition_skipped {
+        out.insert(idx, DagNodeState::SkippedByCondition);
+    }
+
     for (idx, node) in dag.tasks().iter().enumerate() {
-        let mut state = DagNodeState::Unknown;
+        let mut state = out.get(&idx).copied().unwrap_or(DagNodeState::Unknown);
         for task in tasks
             .iter()
             .filter(|t| t.activity_name.as_deref() == Some(node.activity_name.as_str()))
@@ -4312,6 +4389,8 @@ fn map_node_states(
 
     for level in dag.execution_levels() {
         for idx in level {
+            // Only infer trigger-rule skips for nodes that aren't already
+            // identified as condition-skipped or have task queue rows.
             if !has_task_row[*idx]
                 && out.get(idx).copied() == Some(DagNodeState::Unknown)
                 && let Some(state) = infer_skipped_node_state(dag, *idx, &out)
@@ -4325,6 +4404,12 @@ fn map_node_states(
 }
 
 fn merge_dag_task_state(current: DagNodeState, task_state: &str) -> DagNodeState {
+    // A condition-skip is backed by a recorded marker; task-row inference must
+    // never overwrite it, even when a same-named node at a different index has
+    // a FAILED/RUNNING/etc row (duplicate-activity-name scenario).
+    if current == DagNodeState::SkippedByCondition {
+        return current;
+    }
     match task_state {
         "FAILED" => DagNodeState::Failed,
         "CANCELLED" if !matches!(current, DagNodeState::Failed) => DagNodeState::Cancelled,
@@ -4362,7 +4447,9 @@ const fn dag_node_terminal_status(state: DagNodeState) -> Option<TaskStatus> {
     match state {
         DagNodeState::Succeeded => Some(TaskStatus::Succeeded),
         DagNodeState::Failed | DagNodeState::Cancelled => Some(TaskStatus::Failed),
-        DagNodeState::Skipped => Some(TaskStatus::Skipped),
+        // Both skip variants count as Skipped for trigger-rule propagation so
+        // downstream AllDone/AllSuccess rules see the correct upstream status.
+        DagNodeState::Skipped | DagNodeState::SkippedByCondition => Some(TaskStatus::Skipped),
         DagNodeState::Running | DagNodeState::Queued | DagNodeState::Unknown => None,
     }
 }
@@ -7479,7 +7566,7 @@ mod tests {
             dag.tasks()[upstream_idx].activity_name.as_str(),
             "FAILED",
         )];
-        let states = map_node_states(&dag, &task_rows);
+        let states = map_node_states(&dag, &task_rows, &std::collections::HashSet::new());
 
         assert_eq!(states.get(&downstream_idx), Some(&DagNodeState::Skipped));
     }
@@ -7921,6 +8008,74 @@ mod tests {
         assert!(
             q.contains("build_id=abc123"),
             "query string must include build_id"
+        );
+    }
+
+    // ── Issue #482 — DagNodeState label and condition-skip inference ──────────
+
+    #[test]
+    fn dag_node_state_label_distinguishes_skip_variants() {
+        assert_eq!(
+            dag_node_state_label(DagNodeState::Skipped),
+            "Skipped (upstream)"
+        );
+        assert_eq!(
+            dag_node_state_label(DagNodeState::SkippedByCondition),
+            "Skipped (condition)"
+        );
+        assert_eq!(dag_node_state_label(DagNodeState::Succeeded), "Succeeded");
+        assert_eq!(dag_node_state_label(DagNodeState::Unknown), "Unknown");
+    }
+
+    #[test]
+    fn parse_dag_skip_marker_index_matches_prefix() {
+        assert_eq!(parse_dag_skip_marker_index("dag_skip:3"), Some(3));
+        assert_eq!(parse_dag_skip_marker_index("dag_skip:0"), Some(0));
+        assert_eq!(parse_dag_skip_marker_index("dag_skip:42"), Some(42));
+        assert_eq!(parse_dag_skip_marker_index("fan_out:3"), None);
+        assert_eq!(parse_dag_skip_marker_index("dag_skip:"), None);
+        assert_eq!(parse_dag_skip_marker_index("dag_skip:abc"), None);
+    }
+
+    #[test]
+    fn dag_node_terminal_status_treats_both_skip_variants_as_skipped() {
+        assert_eq!(
+            dag_node_terminal_status(DagNodeState::Skipped),
+            Some(autumn_harvest::policy::TaskStatus::Skipped),
+        );
+        assert_eq!(
+            dag_node_terminal_status(DagNodeState::SkippedByCondition),
+            Some(autumn_harvest::policy::TaskStatus::Skipped),
+        );
+    }
+
+    #[test]
+    fn map_node_states_seeds_condition_skipped_nodes() {
+        use autumn_harvest::DagBuilder;
+
+        fn dummy() {}
+        fn dummy2() {}
+
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy);
+        let _b = builder.activity(dummy2).upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let mut condition_skipped = std::collections::HashSet::new();
+        condition_skipped.insert(1usize); // task idx 1 condition-skipped
+
+        let states = map_node_states(&dag, &[], &condition_skipped);
+        assert_eq!(
+            states.get(&1),
+            Some(&DagNodeState::SkippedByCondition),
+            "condition-skipped node must be SkippedByCondition"
+        );
+        // SkippedByCondition is still Skipped for terminal status → AllSuccess
+        // downstream stays Skipped (trigger-rule inference), not SkippedByCondition.
+        assert_eq!(
+            states.get(&0),
+            Some(&DagNodeState::Unknown),
+            "root with no task rows should remain Unknown"
         );
     }
 }
