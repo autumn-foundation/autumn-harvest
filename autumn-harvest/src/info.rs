@@ -745,6 +745,7 @@ impl DagInfo {
             consecutive_failure_limit: None,
             end_at: None,
             max_runs: None,
+            catchup_policy: None,
         })
     }
 

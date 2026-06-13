@@ -805,8 +805,8 @@ pub trait MetricsRecorder: Send + Sync {
     /// A scheduled run was skipped without dispatching.
     ///
     /// `kind` is `"dag"` or `"workflow"`. `name` is the DAG or workflow name.
-    /// `reason` is one of `"paused"`, `"max_active_runs_reached"`, or
-    /// `"catchup_disabled"`.
+    /// `reason` is one of `"paused"`, `"max_active_runs_reached"`,
+    /// `"catchup_disabled"`, or `"catchup_window_exceeded"`.
     ///
     /// Maps to the metric `harvest_schedule_skipped_total{kind, name, reason}`.
     fn record_schedule_skipped(&self, kind: &str, name: &str, reason: &str) {

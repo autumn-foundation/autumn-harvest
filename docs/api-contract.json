@@ -3035,7 +3035,7 @@
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, and last_backfill."
+        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, last_backfill, catchup_policy_effective (resolved effective policy string: skip_all|most_recent|window|unbounded), catchup_window_secs (null unless policy is window), catchup_dropped_last_recovery (dropped slot count from most recent recovery tick), and last_catchup_at (timestamp of most recent recovery tick)."
       },
       "error_responses": [
         {

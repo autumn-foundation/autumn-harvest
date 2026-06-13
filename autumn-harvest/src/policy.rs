@@ -627,6 +627,131 @@ impl SkipPolicy {
     }
 }
 
+/// How the scheduler handles missed fire slots after scheduler downtime.
+///
+/// This is a three-mode replacement for the binary `catchup: bool` flag.
+/// When a `CatchupPolicy` is set on a [`WorkflowSchedule`] it takes precedence
+/// over the `catchup` bool; unset schedules fall back to the bool semantics
+/// unchanged.
+///
+/// ## Variants
+///
+/// | Policy | Fires | Drops |
+/// |---|---|---|
+/// | `SkipAll` | 1 (the oldest overdue slot) | all others silently counted |
+/// | `MostRecent` | 1 (the **newest** missed slot) | all older slots counted |
+/// | `Window(d)` | all slots whose scheduled time ≥ now − d | all older slots counted |
+/// | `Unbounded` | **all** missed slots | none |
+///
+/// Every dropped slot increments `harvest.schedule.skipped` with reason
+/// `catchup_window_exceeded`.  `SkipAll` never records a drop because it reuses
+/// the existing single-slot path with no history of what was skipped; use
+/// `MostRecent` when you want an audit trail.
+///
+/// ## Examples
+///
+/// ```rust
+/// use std::time::Duration;
+/// use autumn_harvest::policy::{CatchupPolicy, Schedule, WorkflowSchedule};
+///
+/// // Fire only the most recent missed slot (recommended for most schedules).
+/// let sched = WorkflowSchedule::new("billing", Schedule::Cron("*/15 * * * *".to_string()))
+///     .with_catchup_policy(CatchupPolicy::MostRecent);
+///
+/// // Fire all slots that fell within the last 2 hours.
+/// let sched2 = WorkflowSchedule::new("import", Schedule::Cron("0 * * * *".to_string()))
+///     .with_catchup_window(Duration::from_secs(2 * 3600));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatchupPolicy {
+    /// Drop all missed slots after the first (the oldest overdue slot fires).
+    ///
+    /// Identical to `catchup = false` today.  No drops are recorded because
+    /// the existing binary path doesn't enumerate them.
+    SkipAll,
+    /// Fire exactly the **most recent** missed slot; count all others as
+    /// dropped with reason `catchup_window_exceeded`.
+    MostRecent,
+    /// Fire all missed slots whose scheduled time is `≥ now − window`;
+    /// older slots are counted as dropped with reason `catchup_window_exceeded`.
+    Window(Duration),
+    /// Fire every missed slot without limit.
+    ///
+    /// Identical to `catchup = true` today.  Use when you want the original
+    /// thunder-herd behaviour or have a bounded outage window already.
+    Unbounded,
+}
+
+impl CatchupPolicy {
+    /// The `snake_case` mode string used in `harvest_schedules.catchup_policy`.
+    ///
+    /// `Window(d)` serialises to `"window"`; the duration is stored separately
+    /// in `catchup_window_secs`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SkipAll => "skip_all",
+            Self::MostRecent => "most_recent",
+            Self::Window(_) => "window",
+            Self::Unbounded => "unbounded",
+        }
+    }
+
+    /// Resolve the effective policy from the database columns.
+    ///
+    /// `mode` is the `catchup_policy` column value (NULL when the row was
+    /// written by an older binary).  `window_secs` is `catchup_window_secs`.
+    /// `catchup_bool` is the legacy `catchup` column used as a fallback when
+    /// `mode` is NULL or unrecognised.
+    ///
+    /// Unknown mode strings degrade to the bool fallback so a deploy using an
+    /// older binary reading a row written by a newer one never panics.
+    #[must_use]
+    pub fn from_db(mode: Option<&str>, window_secs: Option<i64>, catchup_bool: bool) -> Self {
+        match mode {
+            Some("skip_all") => Self::SkipAll,
+            Some("most_recent") => Self::MostRecent,
+            Some("window") => {
+                let secs = u64::try_from(window_secs.unwrap_or(0).max(0)).unwrap_or(0);
+                Self::Window(Duration::from_secs(secs))
+            }
+            Some("unbounded") => Self::Unbounded,
+            // NULL or unrecognised: fall back to the legacy bool.
+            _ => {
+                if catchup_bool {
+                    Self::Unbounded
+                } else {
+                    Self::SkipAll
+                }
+            }
+        }
+    }
+
+    /// The DB column value pair `(catchup_policy, catchup_window_secs)` for
+    /// this policy. `None` values are written as SQL NULL.
+    #[must_use]
+    pub fn to_db_columns(self) -> (Option<&'static str>, Option<i64>) {
+        match self {
+            Self::SkipAll => (Some("skip_all"), None),
+            Self::MostRecent => (Some("most_recent"), None),
+            Self::Window(d) => (
+                Some("window"),
+                Some(i64::try_from(d.as_secs()).unwrap_or(i64::MAX)),
+            ),
+            Self::Unbounded => (Some("unbounded"), None),
+        }
+    }
+
+    /// `true` when this policy requires enumeration of every missed slot
+    /// (needed for calendar-advance and buffer-advance branch decisions in the
+    /// scheduler tick loop).
+    #[must_use]
+    pub const fn is_catchup_enabled(self) -> bool {
+        !matches!(self, Self::SkipAll)
+    }
+}
+
 /// Per-workflow cron/interval schedule — the lightweight alternative to a
 /// single-node DAG when all you need is "run this workflow on a schedule."
 ///
@@ -748,6 +873,17 @@ pub struct WorkflowSchedule {
     /// slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_runs: Option<u32>,
+    /// Bounded catchup policy for missed fire slots after scheduler downtime (issue #484).
+    ///
+    /// When `Some`, this takes precedence over the `catchup` bool and selects
+    /// one of three modes: `MostRecent` (fire one, drop the rest), `Window(d)`
+    /// (fire slots within the last `d`), or `Unbounded` (fire all — same as
+    /// `catchup = true`).  `SkipAll` is equivalent to `catchup = false`.
+    ///
+    /// `None` (the default) preserves the existing `catchup` bool behaviour with
+    /// no behavior change for unmodified schedules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catchup_policy: Option<CatchupPolicy>,
 }
 
 const fn default_buffer_all_max() -> u32 {
@@ -759,7 +895,8 @@ impl WorkflowSchedule {
     ///
     /// Defaults: `input = null`, `catchup = false`, `max_active_runs = 1`,
     /// `paused = false`, `queue_name = "default"`, `overlap_policy = Skip`,
-    /// `buffer_all_max = 100`, `calendar = None`, `skip_policy = Skip`.
+    /// `buffer_all_max = 100`, `calendar = None`, `skip_policy = Skip`,
+    /// `catchup_policy = None` (falls back to the `catchup` bool).
     #[must_use]
     pub fn new(workflow_name: impl Into<String>, schedule: Schedule) -> Self {
         Self {
@@ -780,6 +917,7 @@ impl WorkflowSchedule {
             consecutive_failure_limit: None,
             end_at: None,
             max_runs: None,
+            catchup_policy: None,
         }
     }
 
@@ -888,6 +1026,52 @@ impl WorkflowSchedule {
     #[must_use]
     pub const fn with_consecutive_failure_limit(mut self, limit: u32) -> Self {
         self.consecutive_failure_limit = Some(limit);
+        self
+    }
+
+    /// Set a bounded catchup policy for missed fire slots after scheduler downtime (issue #484).
+    ///
+    /// When set, this takes precedence over the `catchup` bool.  See
+    /// [`CatchupPolicy`] for the full semantics of each variant.
+    ///
+    /// Calling this is the preferred way to configure catchup behaviour; the
+    /// `with_catchup(bool)` builder is still accepted for backward compatibility
+    /// but `with_catchup_policy` wins when both are set.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::policy::{CatchupPolicy, Schedule, WorkflowSchedule};
+    ///
+    /// let sched = WorkflowSchedule::new("billing", Schedule::Cron("*/15 * * * *".to_string()))
+    ///     .with_catchup_policy(CatchupPolicy::MostRecent);
+    /// ```
+    #[must_use]
+    pub const fn with_catchup_policy(mut self, policy: CatchupPolicy) -> Self {
+        self.catchup_policy = Some(policy);
+        self
+    }
+
+    /// Configure a bounded catchup window for missed fire slots after scheduler
+    /// downtime (issue #484).
+    ///
+    /// Equivalent to `.with_catchup_policy(CatchupPolicy::Window(window))`.
+    /// `window` must be non-negative (enforced by the type; `Duration::ZERO`
+    /// is valid and fires only slots at exactly `now`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+    ///
+    /// // Fire missed slots only from the last 2 hours.
+    /// let sched = WorkflowSchedule::new("import", Schedule::Cron("0 * * * *".to_string()))
+    ///     .with_catchup_window(Duration::from_secs(2 * 3600));
+    /// ```
+    #[must_use]
+    pub const fn with_catchup_window(mut self, window: Duration) -> Self {
+        self.catchup_policy = Some(CatchupPolicy::Window(window));
         self
     }
 
@@ -1504,6 +1688,125 @@ mod tests {
             6, // would be 60 * 2^5 = 1920s without cap
         );
         assert_eq!(d, Duration::from_secs(120));
+    }
+
+    // ── CatchupPolicy ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn catchup_policy_as_str_round_trips() {
+        assert_eq!(CatchupPolicy::SkipAll.as_str(), "skip_all");
+        assert_eq!(CatchupPolicy::MostRecent.as_str(), "most_recent");
+        assert_eq!(
+            CatchupPolicy::Window(Duration::from_secs(900)).as_str(),
+            "window"
+        );
+        assert_eq!(CatchupPolicy::Unbounded.as_str(), "unbounded");
+    }
+
+    #[test]
+    fn catchup_policy_from_db_explicit_modes() {
+        assert_eq!(
+            CatchupPolicy::from_db(Some("skip_all"), None, false),
+            CatchupPolicy::SkipAll,
+        );
+        assert_eq!(
+            CatchupPolicy::from_db(Some("most_recent"), None, false),
+            CatchupPolicy::MostRecent,
+        );
+        assert_eq!(
+            CatchupPolicy::from_db(Some("window"), Some(900), false),
+            CatchupPolicy::Window(Duration::from_secs(900)),
+        );
+        assert_eq!(
+            CatchupPolicy::from_db(Some("unbounded"), None, false),
+            CatchupPolicy::Unbounded,
+        );
+    }
+
+    #[test]
+    fn catchup_policy_from_db_null_falls_back_to_bool() {
+        // NULL mode + catchup=false → SkipAll (legacy "no catchup")
+        assert_eq!(
+            CatchupPolicy::from_db(None, None, false),
+            CatchupPolicy::SkipAll,
+        );
+        // NULL mode + catchup=true → Unbounded (legacy "fire all")
+        assert_eq!(
+            CatchupPolicy::from_db(None, None, true),
+            CatchupPolicy::Unbounded,
+        );
+    }
+
+    #[test]
+    fn catchup_policy_from_db_unknown_mode_falls_back_to_bool() {
+        // An unrecognised mode value (written by a future binary) degrades to
+        // the bool fallback rather than panicking.
+        assert_eq!(
+            CatchupPolicy::from_db(Some("fire_three"), None, false),
+            CatchupPolicy::SkipAll,
+        );
+        assert_eq!(
+            CatchupPolicy::from_db(Some("fire_three"), None, true),
+            CatchupPolicy::Unbounded,
+        );
+    }
+
+    #[test]
+    fn catchup_policy_to_db_columns() {
+        assert_eq!(
+            CatchupPolicy::SkipAll.to_db_columns(),
+            (Some("skip_all"), None)
+        );
+        assert_eq!(
+            CatchupPolicy::MostRecent.to_db_columns(),
+            (Some("most_recent"), None)
+        );
+        assert_eq!(
+            CatchupPolicy::Window(Duration::from_secs(900)).to_db_columns(),
+            (Some("window"), Some(900)),
+        );
+        assert_eq!(
+            CatchupPolicy::Unbounded.to_db_columns(),
+            (Some("unbounded"), None)
+        );
+    }
+
+    #[test]
+    fn catchup_policy_is_catchup_enabled() {
+        assert!(!CatchupPolicy::SkipAll.is_catchup_enabled());
+        assert!(CatchupPolicy::MostRecent.is_catchup_enabled());
+        assert!(CatchupPolicy::Window(Duration::from_secs(60)).is_catchup_enabled());
+        assert!(CatchupPolicy::Unbounded.is_catchup_enabled());
+    }
+
+    #[test]
+    fn workflow_schedule_catchup_policy_defaults_to_none() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual);
+        assert!(sched.catchup_policy.is_none());
+    }
+
+    #[test]
+    fn workflow_schedule_with_catchup_policy_sets_field() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual)
+            .with_catchup_policy(CatchupPolicy::MostRecent);
+        assert_eq!(sched.catchup_policy, Some(CatchupPolicy::MostRecent));
+    }
+
+    #[test]
+    fn workflow_schedule_with_catchup_window_sets_window_variant() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual)
+            .with_catchup_window(Duration::from_secs(3600));
+        assert_eq!(
+            sched.catchup_policy,
+            Some(CatchupPolicy::Window(Duration::from_secs(3600))),
+        );
+    }
+
+    #[test]
+    fn catchup_policy_window_missing_secs_defaults_to_zero() {
+        // window mode with NULL catchup_window_secs is safe: fires slot at exactly now.
+        let p = CatchupPolicy::from_db(Some("window"), None, false);
+        assert_eq!(p, CatchupPolicy::Window(Duration::ZERO));
     }
 }
 
