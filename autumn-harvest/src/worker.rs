@@ -740,7 +740,8 @@ fn extract_single_command<T>(
 fn extract_all_scheduled_activities(
     commands: &[WorkflowCommand],
 ) -> Option<Vec<ScheduledActivityCommand>> {
-    let mut scheduled = Vec::new();
+    // ⚡ Bolt: Pre-allocate vector capacity to avoid intermediate allocations
+    let mut scheduled = Vec::with_capacity(commands.len());
 
     for cmd in commands {
         match cmd {
@@ -780,7 +781,8 @@ fn extract_all_scheduled_activities(
 }
 
 fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<ActivityExecId>> {
-    let mut activity_ids = Vec::new();
+    // ⚡ Bolt: Pre-allocate vector capacity to avoid intermediate allocations
+    let mut activity_ids = Vec::with_capacity(commands.len());
 
     for cmd in commands {
         match cmd {
@@ -1139,8 +1141,9 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
 fn split_mixed_signal_batch(
     commands: Vec<WorkflowCommand>,
 ) -> (Vec<SignalBatchItem>, Vec<WorkflowCommand>) {
-    let mut signal_items = Vec::new();
-    let mut remaining = Vec::new();
+    // ⚡ Bolt: Pre-allocate vector capacity to avoid intermediate allocations
+    let mut signal_items = Vec::with_capacity(commands.len());
+    let mut remaining = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
             WorkflowCommand::SignalExternalWorkflow {
