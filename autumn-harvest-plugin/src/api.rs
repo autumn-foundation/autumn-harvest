@@ -1596,6 +1596,20 @@ struct CreateWorkflowScheduleRequest {
     /// Once `runs_started` reaches `max_runs` the schedule is exhausted. `null` = no limit.
     #[serde(default)]
     max_runs: Option<u32>,
+    /// Bounded catchup policy mode (issue #484): one of `"skip_all"`,
+    /// `"most_recent"`, `"window"`, `"unbounded"`. When omitted the legacy
+    /// `catchup` bool governs catchup behaviour and the policy columns are left
+    /// NULL. `"window"` additionally reads `catchup_window_secs`.
+    ///
+    /// Like every other field on this upsert endpoint, omitting it on an update
+    /// resets the stored policy to "unset" (legacy-bool semantics); send the
+    /// desired mode explicitly to retain a bounded policy.
+    #[serde(default)]
+    catchup_policy: Option<String>,
+    /// Window length in seconds for `catchup_policy = "window"` (issue #484).
+    /// Ignored for every other mode. `null`/omitted defaults to `0`.
+    #[serde(default)]
+    catchup_window_secs: Option<i64>,
 }
 
 fn default_queue_name() -> String {
@@ -9263,6 +9277,35 @@ async fn create_workflow_schedule(
         }
     };
 
+    // Reject unknown catchup_policy modes with 400 before storing (issue #484).
+    // `from_db` is lenient for backward compat; user input is validated strictly.
+    // `None` (omitted) preserves the legacy `catchup` bool and leaves the policy
+    // columns NULL.
+    let catchup_policy = match request.catchup_policy.as_deref() {
+        Some(mode) => match autumn_harvest::CatchupPolicy::from_user_input(
+            mode,
+            request.catchup_window_secs,
+        ) {
+            Ok(p) => Some(p),
+            Err(v) => {
+                let err_summary = format!(
+                    "invalid catchup_policy '{v}'; valid values: skip_all, most_recent, window, unbounded"
+                );
+                schedule_create_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &request.workflow_name,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            }
+        },
+        None => None,
+    };
+
     // Validate calendar name exists before storing. Return 400 for NotFound so
     // clients distinguish invalid input from transient DB failures (503).
     if let Some(cal_name) = &request.calendar {
@@ -9306,7 +9349,7 @@ async fn create_workflow_schedule(
         end_at: request.end_at,
         // Normalize 0 → None: callers passing max_runs=0 intend "no limit".
         max_runs: request.max_runs.filter(|&n| n > 0),
-        catchup_policy: None,
+        catchup_policy,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,

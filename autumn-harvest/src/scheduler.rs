@@ -1826,13 +1826,40 @@ async fn tick_one_workflow_schedule(
     // For SkipAll / Unbounded / legacy `catchup` schedules, `run_dates.first()`
     // is exactly the original `logical_date`, so their behavior is completely
     // unchanged — only the new MostRecent / Window policies shift the anchor.
-    let catchup_plan = catchup_run_plan(
-        parsed_schedule,
-        logical_date,
-        now,
+    // Skip materializing the full overdue backlog for an Unbounded / legacy
+    // `catchup = true` schedule that the bounded-run guards below (end_at /
+    // max_runs, issue #478) will immediately exhaust without firing: a
+    // high-frequency schedule left down past its cutoff or run budget would
+    // otherwise allocate one slot per missed interval only for every slot to be
+    // discarded (Codex #1829). The authoritative exhaustion decision is still
+    // recorded by those guards below — this only avoids the wasted allocation.
+    // The bounded MostRecent / Window policies compute in O(1) (closed-form for
+    // interval schedules), so this short-circuit is scoped to the unbounded path.
+    let will_exhaust_before_firing = matches!(
         catchup_policy,
-        schedule.end_at,
-    );
+        crate::policy::CatchupPolicy::Unbounded
+    ) && (schedule.end_at.is_some_and(|end_at| logical_date >= end_at)
+        || schedule
+            .max_runs
+            .is_some_and(|max_runs| max_runs > 0 && schedule.runs_started >= max_runs));
+    let catchup_plan = if will_exhaust_before_firing {
+        // Empty plan: `logical_date` rebinding below keeps the original slot
+        // (the `[]` arm), so the calendar / jitter / exhaustion branches see the
+        // exact same `logical_date` they would have with the full plan.
+        CatchupPlan {
+            run_dates: Vec::new(),
+            next_run_at: None,
+            dropped: 0,
+        }
+    } else {
+        catchup_run_plan(
+            parsed_schedule,
+            logical_date,
+            now,
+            catchup_policy,
+            schedule.end_at,
+        )
+    };
     // Slice pattern rather than `.first()` to avoid colliding with diesel's
     // `RunQueryDsl::first` brought into scope by the schema `dsl` import.
     let logical_date = match catchup_plan.run_dates.as_slice() {
@@ -2127,6 +2154,75 @@ async fn tick_one_workflow_schedule(
         return Ok(());
     }
 
+    // Reuse the plan computed at the top of the tick (which also rebound
+    // `logical_date`); recomputing here from the rebound anchor would zero the
+    // dropped count.
+    //
+    // This must run *before* the overlap branch below: when a MostRecent /
+    // Window policy drops older missed slots but the schedule is also at
+    // `max_active_runs`, the overlap branch returns early (Drop / Buffer), so
+    // recording the catchup drops after it would silently lose them and the
+    // recovery API would report zero drops for a recovery that did drop
+    // (issue #484 / Codex #2297). Recording the drops is independent of the
+    // overlap decision, so it is correct to emit them here unconditionally.
+    let CatchupPlan {
+        run_dates,
+        next_run_at: next_run_after_plan,
+        dropped: catchup_slots_dropped,
+    } = catchup_plan;
+    // Record a skip metric for each dropped slot and one aggregated decision
+    // row so operators have a full audit trail.
+    if catchup_slots_dropped > 0 {
+        // Bound the per-slot counter increments: a long outage on a
+        // high-frequency schedule can drop millions of slots, and looping that
+        // many synchronous recorder calls inside the tick loop would block the
+        // scheduler thread and starve other schedules. The exact drop count is
+        // still preserved on the aggregated decision row and the
+        // `last_catchup_dropped` column below, so alerting on
+        // `harvest.schedule.skipped` stays meaningful.
+        const MAX_SKIP_METRIC_INCREMENTS: u64 = 1000;
+        let metric_increments = catchup_slots_dropped.min(MAX_SKIP_METRIC_INCREMENTS);
+        for _ in 0..metric_increments {
+            metrics.record_schedule_skipped("workflow", wf_name, "catchup_window_exceeded");
+        }
+        crate::schedule_decision::record_decision_graceful(
+            conn,
+            Some(&**metrics),
+            Some(schedule.id),
+            wf_name,
+            "workflow",
+            "skipped",
+            "catchup_window_exceeded",
+            Some(serde_json::json!({
+                "catchup_policy": catchup_policy.as_str(),
+                "catchup_window_secs": schedule.catchup_window_secs,
+                "dropped": catchup_slots_dropped,
+            })),
+            now,
+            now,
+            i16::try_from(current_shard.as_i32()).unwrap_or(0),
+        )
+        .await;
+
+        // Persist the catchup-drop summary as a separate, conditional update —
+        // NOT part of the main finalize update below — so ordinary (zero-drop)
+        // ticks never reset this recovery audit trail back to 0 / NULL.
+        // Guarded by the HA claim token (like the final update) so a stale tick
+        // that lost its claim cannot stamp obsolete recovery audit fields over a
+        // successor replica's row (issue #484 / Codex #2297).
+        let _ = diesel::update(
+            dsl::harvest_schedules
+                .find(schedule.id)
+                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+        )
+        .set((
+            dsl::last_catchup_dropped.eq(i32::try_from(catchup_slots_dropped).unwrap_or(i32::MAX)),
+            dsl::last_catchup_at.eq(Some(now)),
+        ))
+        .execute(conn)
+        .await;
+    }
+
     let mut running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
@@ -2284,66 +2380,6 @@ async fn tick_one_workflow_schedule(
         }
     }
 
-    // Reuse the plan computed at the top of the tick (which also rebound
-    // `logical_date`); recomputing here from the rebound anchor would zero the
-    // dropped count.
-    let CatchupPlan {
-        run_dates,
-        next_run_at: next_run_after_plan,
-        dropped: catchup_slots_dropped,
-    } = catchup_plan;
-    // Record a skip metric for each dropped slot and one aggregated decision
-    // row so operators have a full audit trail.
-    if catchup_slots_dropped > 0 {
-        // Bound the per-slot counter increments: a long outage on a
-        // high-frequency schedule can drop millions of slots, and looping that
-        // many synchronous recorder calls inside the tick loop would block the
-        // scheduler thread and starve other schedules. The exact drop count is
-        // still preserved on the aggregated decision row and the
-        // `last_catchup_dropped` column below, so alerting on
-        // `harvest.schedule.skipped` stays meaningful.
-        const MAX_SKIP_METRIC_INCREMENTS: u64 = 1000;
-        let metric_increments = catchup_slots_dropped.min(MAX_SKIP_METRIC_INCREMENTS);
-        for _ in 0..metric_increments {
-            metrics.record_schedule_skipped("workflow", wf_name, "catchup_window_exceeded");
-        }
-        crate::schedule_decision::record_decision_graceful(
-            conn,
-            Some(&**metrics),
-            Some(schedule.id),
-            wf_name,
-            "workflow",
-            "skipped",
-            "catchup_window_exceeded",
-            Some(serde_json::json!({
-                "catchup_policy": catchup_policy.as_str(),
-                "catchup_window_secs": schedule.catchup_window_secs,
-                "dropped": catchup_slots_dropped,
-            })),
-            now,
-            now,
-            i16::try_from(current_shard.as_i32()).unwrap_or(0),
-        )
-        .await;
-
-        // Persist the catchup-drop summary as a separate, conditional update —
-        // NOT part of the main finalize update below — so ordinary (zero-drop)
-        // ticks never reset this recovery audit trail back to 0 / NULL.
-        // Guarded by the HA claim token (like the final update) so a stale tick
-        // that lost its claim cannot stamp obsolete recovery audit fields over a
-        // successor replica's row (issue #484 / Codex #2297).
-        let _ = diesel::update(
-            dsl::harvest_schedules
-                .find(schedule.id)
-                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
-        )
-        .set((
-            dsl::last_catchup_dropped.eq(i32::try_from(catchup_slots_dropped).unwrap_or(i32::MAX)),
-            dsl::last_catchup_at.eq(Some(now)),
-        ))
-        .execute(conn)
-        .await;
-    }
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
     // jitter_window already computed at function entry; reused here.
 

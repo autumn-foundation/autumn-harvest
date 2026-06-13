@@ -750,6 +750,30 @@ impl CatchupPolicy {
     pub const fn is_catchup_enabled(self) -> bool {
         !matches!(self, Self::SkipAll)
     }
+
+    /// Strictly parse an operator-supplied catchup policy from API input.
+    ///
+    /// Unlike [`Self::from_db`] (which is lenient for backward compatibility and
+    /// degrades unknown modes to the legacy `catchup` bool), unknown modes are
+    /// rejected so bad API input surfaces as `400` rather than silently picking a
+    /// fallback. `"window"` reads its duration from `window_secs` (defaulting to
+    /// `0`, which fires only the slot at exactly `now`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(mode)` when `mode` is not a recognised variant name.
+    pub fn from_user_input(mode: &str, window_secs: Option<i64>) -> Result<Self, &str> {
+        match mode {
+            "skip_all" => Ok(Self::SkipAll),
+            "most_recent" => Ok(Self::MostRecent),
+            "unbounded" => Ok(Self::Unbounded),
+            "window" => {
+                let secs = u64::try_from(window_secs.unwrap_or(0).max(0)).unwrap_or(0);
+                Ok(Self::Window(Duration::from_secs(secs)))
+            }
+            other => Err(other),
+        }
+    }
 }
 
 /// Per-workflow cron/interval schedule — the lightweight alternative to a
@@ -1769,6 +1793,38 @@ mod tests {
             CatchupPolicy::Unbounded.to_db_columns(),
             (Some("unbounded"), None)
         );
+    }
+
+    #[test]
+    fn catchup_policy_from_user_input_strict() {
+        assert_eq!(
+            CatchupPolicy::from_user_input("skip_all", None),
+            Ok(CatchupPolicy::SkipAll)
+        );
+        assert_eq!(
+            CatchupPolicy::from_user_input("most_recent", None),
+            Ok(CatchupPolicy::MostRecent)
+        );
+        assert_eq!(
+            CatchupPolicy::from_user_input("unbounded", None),
+            Ok(CatchupPolicy::Unbounded)
+        );
+        assert_eq!(
+            CatchupPolicy::from_user_input("window", Some(900)),
+            Ok(CatchupPolicy::Window(Duration::from_secs(900)))
+        );
+        // Window with no/negative secs clamps to 0 rather than erroring.
+        assert_eq!(
+            CatchupPolicy::from_user_input("window", None),
+            Ok(CatchupPolicy::Window(Duration::from_secs(0)))
+        );
+        assert_eq!(
+            CatchupPolicy::from_user_input("window", Some(-5)),
+            Ok(CatchupPolicy::Window(Duration::from_secs(0)))
+        );
+        // Unknown modes are rejected (unlike the lenient `from_db`).
+        assert_eq!(CatchupPolicy::from_user_input("bogus", None), Err("bogus"));
+        assert_eq!(CatchupPolicy::from_user_input("", None), Err(""));
     }
 
     #[test]
