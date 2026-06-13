@@ -109,7 +109,25 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
     include_str!(
         "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
-    )
+    ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
+    ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -266,6 +284,7 @@ async fn insert_execution(database_url: &str, shard: i32, workflow_name: &str) -
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)

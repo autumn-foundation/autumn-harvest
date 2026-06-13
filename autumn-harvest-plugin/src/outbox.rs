@@ -318,6 +318,7 @@ pub(crate) async fn dispatch_workflow_start_request(
             owner,
             runbook_url,
             severity,
+            context_headers: None,
         },
     )
     .await?;

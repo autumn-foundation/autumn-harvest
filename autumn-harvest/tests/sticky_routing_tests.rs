@@ -426,7 +426,9 @@ mod db_tests {
         "\n",
         include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
         "\n",
-        include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql")
+        include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+        "\n",
+        include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
     );
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -463,6 +465,7 @@ mod db_tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         };
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&row)

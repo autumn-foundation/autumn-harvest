@@ -48,6 +48,8 @@ diesel::table! {
         /// Last-write-wins human-readable status string set by the workflow author
         /// via `ctx.set_current_details(...)` (issue #473). NULL = never set.
         current_details -> Nullable<Text>,
+        /// Per-execution ambient context headers (issue #481). NULL = empty map.
+        context_headers -> Nullable<Jsonb>,
     }
 }
 
@@ -110,6 +112,8 @@ diesel::table! {
         schedule_to_close_at -> Nullable<Timestamptz>,
         /// Structured capability requirements JSONB payload (issue #382).
         required_capabilities -> Nullable<Jsonb>,
+        /// Per-execution ambient context headers propagated from the parent workflow (issue #481).
+        context_headers -> Nullable<Jsonb>,
     }
 }
 

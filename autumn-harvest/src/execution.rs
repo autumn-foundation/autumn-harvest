@@ -89,6 +89,9 @@ pub struct StartWorkflowParams<'a> {
     pub owner: Option<&'a str>,
     pub runbook_url: Option<&'a str>,
     pub severity: Option<&'a str>,
+    /// Ambient string key-value context propagated to all activities and child
+    /// workflows without threading through function signatures (issue #481).
+    pub context_headers: Option<std::collections::HashMap<String, String>>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -327,6 +330,10 @@ pub async fn start_or_load_workflow_execution(
         owner: request.owner,
         runbook_url: request.runbook_url,
         severity: request.severity,
+        context_headers: request
+            .context_headers
+            .as_ref()
+            .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -1546,6 +1553,7 @@ pub struct SignalWithStartParams<'a> {
     pub owner: Option<&'a str>,
     pub runbook_url: Option<&'a str>,
     pub severity: Option<&'a str>,
+    pub context_headers: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -1716,6 +1724,7 @@ pub async fn signal_with_start_workflow_execution(
                     owner: request.owner,
                     runbook_url: request.runbook_url,
                     severity: request.severity,
+                    context_headers: request.context_headers.clone(),
                 };
 
             let started = start_or_load_workflow_execution(
@@ -2007,6 +2016,7 @@ pub struct UpdateWithStartParams<'a> {
     pub owner: Option<&'a str>,
     pub runbook_url: Option<&'a str>,
     pub severity: Option<&'a str>,
+    pub context_headers: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Result of an [`update_with_start_workflow_execution`] call.
@@ -2126,6 +2136,7 @@ pub async fn update_with_start_workflow_execution(
                     owner: request.owner,
                     runbook_url: request.runbook_url,
                     severity: request.severity,
+                    context_headers: request.context_headers.clone(),
                 };
 
             let started = start_or_load_workflow_execution(

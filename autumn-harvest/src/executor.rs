@@ -111,14 +111,17 @@ pub async fn run_workflow(
 /// returning a non-determinism error on any mismatch.  This is used by
 /// [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
 /// input-changing code changes before deployment.
+#[allow(clippy::implicit_hasher)]
 pub async fn run_workflow_strict(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
     handler: WorkflowHandlerFn,
     input: Value,
     state: SharedState,
+    context_headers: std::collections::HashMap<String, String>,
 ) -> WorkflowOutcome {
-    let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state);
+    let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
+        .with_context_headers(context_headers);
 
     // ADR-0001 §2.1: strict mode is always a replay cycle.
     let span = tracing::info_span!(
@@ -298,13 +301,14 @@ pub async fn run_workflow_with_state_and_history_policy(
         crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
         crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
         crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+        std::collections::HashMap::new(),
     )
     .await
 }
 
 /// Full executor entry point used by the worker, which injects the workflow name
 /// and payload size caps configured on the `BuiltHarvest` instance.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn run_workflow_with_state_history_policy_and_caps(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -320,6 +324,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     max_signal_payload_bytes: u64,
     max_workflow_input_bytes: u64,
     max_current_details_bytes: usize,
+    context_headers: std::collections::HashMap<String, String>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
@@ -336,7 +341,8 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
         max_signal_payload_bytes,
         max_workflow_input_bytes,
     )
-    .with_current_details_cap(max_current_details_bytes);
+    .with_current_details_cap(max_current_details_bytes)
+    .with_context_headers(context_headers);
 
     // Auto-register declarative handlers before any workflow code runs.
     // This satisfies the AC: "authors do not call ctx.register_*_handler in

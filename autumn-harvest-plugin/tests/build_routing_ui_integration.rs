@@ -137,7 +137,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    )
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -591,6 +593,7 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -880,6 +883,7 @@ async fn two_build_rolling_deploy_full_lifecycle() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                context_headers: None,
             },
         )
         .await

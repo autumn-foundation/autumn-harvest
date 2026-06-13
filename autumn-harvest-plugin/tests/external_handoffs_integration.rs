@@ -145,6 +145,7 @@ async fn seed_external_handoff(
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&execution)

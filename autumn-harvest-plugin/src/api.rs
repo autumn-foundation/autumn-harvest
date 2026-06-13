@@ -5516,6 +5516,7 @@ async fn start_workflow(
             owner,
             runbook_url,
             severity,
+            context_headers: None,
         },
     )
     .await;
@@ -6055,6 +6056,7 @@ async fn batch_start_workflows(
                     owner,
                     runbook_url,
                     severity,
+                    context_headers: None,
                 },
             )
             .await;
@@ -6612,6 +6614,7 @@ async fn signal_with_start_workflow(
             owner,
             runbook_url,
             severity,
+            context_headers: None,
         },
     )
     .await;
@@ -7060,6 +7063,7 @@ async fn update_with_start_workflow(
         owner,
         runbook_url,
         severity,
+        context_headers: None,
     };
 
     let result = update_with_start_workflow_execution(&mut conn, params).await;
@@ -10299,6 +10303,7 @@ async fn trigger_schedule_now(
             owner,
             runbook_url,
             severity,
+            context_headers: None,
         },
     )
     .await;
@@ -10923,6 +10928,7 @@ async fn schedule_backfill(
                         owner,
                         runbook_url,
                         severity,
+                        context_headers: None,
                     },
                 )
                 .await;
@@ -11064,6 +11070,7 @@ async fn schedule_backfill(
                         owner,
                         runbook_url,
                         severity,
+                        context_headers: None,
                     },
                 )
                 .await;
@@ -13546,6 +13553,9 @@ fn export_history_for_execution(
     events: Vec<WorkflowEvent>,
     query: &HistoryExportQuery,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
+    let context_headers = execution.context_headers.as_ref().and_then(|v| {
+        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+    });
     export_history(HistoryExportRequest {
         workflow_name: execution.workflow_name.clone(),
         execution_id: ExecutionId::from_uuid(execution.id),
@@ -13555,6 +13565,7 @@ fn export_history_for_execution(
         exported_at: chrono::Utc::now(),
         payload_policy: query.payload_policy,
         max_bytes: Some(query.max_bytes),
+        context_headers,
     })
 }
 
@@ -13572,6 +13583,7 @@ fn export_history_for_candidate(
         exported_at: chrono::Utc::now(),
         payload_policy: query.payload_policy,
         max_bytes: Some(query.max_bytes),
+        context_headers: None,
     })
 }
 
@@ -18251,6 +18263,7 @@ mod tests {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                context_headers: None,
             },
         )
         .await

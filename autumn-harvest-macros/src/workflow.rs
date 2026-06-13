@@ -473,6 +473,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         owner: info.owner,
                         runbook_url: info.runbook_url,
                         severity: info.severity,
+                        context_headers: opts.context_headers,
                     };
 
                     let started = client.start_or_load(conn, params).await?;
@@ -553,6 +554,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         owner: info.owner,
                         runbook_url: info.runbook_url,
                         severity: info.severity,
+                        context_headers: opts.context_headers,
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

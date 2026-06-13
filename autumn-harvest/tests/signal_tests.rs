@@ -53,7 +53,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
     "\n",
-    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql")
+    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 async fn setup_test_db() -> (
@@ -110,6 +112,7 @@ async fn test_send_and_load_signals() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -160,6 +163,7 @@ async fn test_mark_signals_consumed() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)

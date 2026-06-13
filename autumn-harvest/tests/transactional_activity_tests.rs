@@ -103,7 +103,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
     "\n",
-    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql")
+    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 const CREATE_USER_RECORDS: &str = "
@@ -349,6 +351,7 @@ async fn transactional_activity_happy_path_atomic_commit() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                context_headers: None,
             },
         )
         .await
@@ -426,6 +429,7 @@ async fn transactional_activity_err_rolls_back_user_writes() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                context_headers: None,
             },
         )
         .await

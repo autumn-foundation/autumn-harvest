@@ -159,7 +159,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    )
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
 );
 type HarvestApiApp = axum::Router;
 
@@ -548,6 +550,7 @@ async fn insert_workflow_on_url(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -625,6 +628,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -781,6 +785,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         })
         .execute(&mut conn)
         .await
@@ -1104,6 +1109,7 @@ async fn seed_scheduled_activity_task_from_url(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         })
         .execute(&mut conn)
         .await

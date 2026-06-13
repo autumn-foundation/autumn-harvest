@@ -784,6 +784,7 @@ pub async fn trigger_unified_dag(
             owner,
             runbook_url,
             severity,
+            context_headers: None,
         },
     )
     .await
@@ -2449,6 +2450,7 @@ async fn tick_one_workflow_schedule(
                 owner,
                 runbook_url,
                 severity,
+                context_headers: None,
             },
         )
         .await;
@@ -3044,6 +3046,7 @@ async fn drain_buffered_schedule_runs(
                     owner,
                     runbook_url,
                     severity,
+                    context_headers: None,
                 },
             )
             .await;

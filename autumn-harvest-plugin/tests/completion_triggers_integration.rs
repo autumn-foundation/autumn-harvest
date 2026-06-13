@@ -151,7 +151,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    )
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -449,6 +451,7 @@ async fn test_trigger_evaluations_same_shard() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -542,6 +545,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -613,6 +617,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -706,6 +711,7 @@ async fn test_trigger_state_matching_and_deduplication() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -876,6 +882,7 @@ async fn test_trigger_cross_shard() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -974,6 +981,7 @@ async fn test_completion_trigger_via_worker_run() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -1086,6 +1094,7 @@ async fn test_trigger_with_custom_queue() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -1266,6 +1275,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -1473,6 +1483,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -1893,6 +1904,7 @@ async fn test_trigger_evaluations_schema_validation() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -1959,6 +1971,7 @@ async fn test_trigger_evaluations_schema_validation() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await

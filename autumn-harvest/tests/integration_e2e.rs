@@ -119,7 +119,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
     "\n",
-    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql")
+    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -173,6 +175,8 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS pause_reason TEXT NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS pause_actor TEXT NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS current_details TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS context_headers JSONB NULL;\n",
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS context_headers JSONB NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -531,6 +535,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -586,6 +591,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -3367,6 +3373,7 @@ async fn insert_named_workflow_execution(
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -3902,6 +3909,7 @@ mod reuse_policy_helpers {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }
     }
 
@@ -5153,6 +5161,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -5306,6 +5315,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -6733,6 +6743,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

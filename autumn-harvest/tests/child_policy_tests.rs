@@ -86,7 +86,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
     "\n",
-    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql")
+    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 async fn setup_test_db_url() -> (String, ContainerAsync<Postgres>) {
@@ -178,6 +180,7 @@ async fn start_workflow(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -366,6 +369,7 @@ async fn insert_detached_child_execution(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         })
         .execute(conn)
         .await
@@ -949,6 +953,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         })
         .execute(&mut conn)
         .await

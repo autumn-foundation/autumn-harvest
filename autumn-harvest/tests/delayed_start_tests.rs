@@ -71,7 +71,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
     "\n",
-    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql")
+    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -191,6 +193,7 @@ async fn test_delayed_start_validation() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -234,6 +237,7 @@ async fn test_delayed_start_validation() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -331,6 +335,7 @@ async fn test_delayed_start_no_premature_dispatch() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -405,6 +410,7 @@ async fn test_delayed_start_cancel_before_firing() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -486,6 +492,7 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -535,6 +542,7 @@ async fn test_immediate_start_skew_tolerance() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await

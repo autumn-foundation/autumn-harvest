@@ -41,6 +41,7 @@ fn update_with_start_params_is_cloneable_and_debug() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
 
     let _cloned = params.clone();
@@ -103,6 +104,7 @@ fn update_with_start_outcome_idempotency_key_roundtrip() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     assert_eq!(
         params.idempotency_key.as_deref(),
@@ -192,7 +194,11 @@ mod db_tests {
         "\n",
         include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql"),
         "\n",
-        include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql")
+        include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
+        "\n",
+        include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+        "\n",
+        include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
     );
 
     async fn setup_test_db() -> (
@@ -244,6 +250,7 @@ mod db_tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }
     }
 
@@ -316,6 +323,7 @@ mod db_tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         };
         start_or_load_workflow_execution(&mut conn, first_params)
             .await
@@ -377,6 +385,7 @@ mod db_tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         };
         start_or_load_workflow_execution(&mut conn, start_params)
             .await

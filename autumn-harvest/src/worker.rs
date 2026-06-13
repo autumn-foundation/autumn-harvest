@@ -1276,7 +1276,7 @@ async fn persist_external_signal_inline(
 /// `LocalActivityFailed` event; on success a `LocalActivityCompleted` event is
 /// appended. Returns all newly-appended events so the caller can extend its
 /// in-memory replay history and avoid a DB round-trip.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_local_activity_inline(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -1285,6 +1285,7 @@ async fn run_local_activity_inline(
     detached_spawns: DetachedSpawnPersistence<'_>,
     max_start_to_close: Duration,
     next_event_id: &mut i32,
+    context_headers: std::sync::Arc<std::collections::HashMap<String, String>>,
 ) -> HarvestResult<LocalActivityInlineOutcome> {
     let LocalActivityCommandBatch {
         pre_schedule_events,
@@ -1380,6 +1381,7 @@ async fn run_local_activity_inline(
     for attempt in start_attempt..=max_attempts {
         let ctx =
             ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
+                .with_context_headers(std::sync::Arc::clone(&context_headers))
                 .with_idempotency_key(local_idempotency_key.clone())
                 .with_attempt(attempt)
                 .with_max_attempts(max_attempts)
@@ -2338,6 +2340,7 @@ async fn persist_scheduled_activities(
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
     parent_priority: i32,
+    context_headers: Option<&serde_json::Value>,
 ) -> HarvestResult<()> {
     // activity_events is built in scheduled_activities order (= ScheduleActivity command order).
     // After the loop we interleave them with marker/detached-spawn events in full command order.
@@ -2459,6 +2462,7 @@ async fn persist_scheduled_activities(
             { ATTR_QUEUE } = %queue_name,
         )
         .in_scope(|| registry.telemetry().capture_trace_context());
+        params.context_headers = context_headers.cloned();
         enqueued.push(params);
     }
 
@@ -2864,6 +2868,7 @@ async fn persist_all_started_child_workflows(
                     owner,
                     runbook_url,
                     severity,
+                    context_headers: parent_execution.context_headers.clone(),
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
@@ -3412,6 +3417,7 @@ async fn create_detached_child_executions(
             owner,
             runbook_url,
             severity,
+            context_headers: parent_execution.context_headers.clone(),
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -3841,6 +3847,22 @@ async fn process_activity_task(
         .trace_context
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
+    let activity_context_headers = task
+        .context_headers
+        .as_ref()
+        .and_then(|v| {
+            match serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to deserialize activity context headers; propagating empty map");
+                    None
+                }
+            }
+        })
+        .map_or_else(
+            || std::sync::Arc::new(std::collections::HashMap::new()),
+            std::sync::Arc::new,
+        );
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
         Some(heartbeat_tx),
@@ -3850,6 +3872,7 @@ async fn process_activity_task(
         pool.clone(),
     )
     .with_trace_context(trace_carrier.clone())
+    .with_context_headers(activity_context_headers)
     .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
     .with_attempt(task_attempt(task))
     .with_max_attempts(u32::try_from(task.max_attempts.max(1)).unwrap_or(1))
@@ -4262,6 +4285,7 @@ async fn handle_suspended_workflow(
             context.execute_span,
             context.execution.assigned_build_id.as_deref(),
             context.persistence.task.priority,
+            context.execution.context_headers.as_ref(),
         )
         .await
     } else if let Some(activity_ids) = extract_all_activity_waits(commands) {
@@ -4589,6 +4613,7 @@ async fn persist_workflow_continue_as_new(
         owner: execution.owner.as_deref(),
         runbook_url: execution.runbook_url.as_deref(),
         severity: execution.severity.as_deref(),
+        context_headers: execution.context_headers.clone(),
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
@@ -5321,6 +5346,21 @@ async fn process_workflow_task(
             .filter(|h| h.workflow == wf_name)
             .collect();
 
+        let exec_context_headers = prepared
+            .execution
+            .context_headers
+            .as_ref()
+            .and_then(|v| {
+                match serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to deserialize workflow execution context headers; propagating empty map");
+                        None
+                    }
+                }
+            })
+            .unwrap_or_default();
+
         let (run_outcome, pending_cmds, execute_span) =
             run_workflow_with_state_history_policy_and_caps(
                 prepared.exec_id,
@@ -5341,6 +5381,7 @@ async fn process_workflow_task(
                         per.max(registry.max_workflow_input_bytes)
                     }),
                 registry.max_current_details_bytes,
+                exec_context_headers.clone(),
             )
             .await;
 
@@ -5431,6 +5472,7 @@ async fn process_workflow_task(
                     execute_span: &detached_execute_span,
                 };
                 let local_batch = extract_run_local_activity(commands);
+                let local_context_headers = std::sync::Arc::new(exec_context_headers.clone());
                 let inline_outcome = match run_local_activity_inline(
                     conn,
                     registry,
@@ -5439,6 +5481,7 @@ async fn process_workflow_task(
                     detached_spawns,
                     max_local_activity_start_to_close,
                     &mut next_event_id,
+                    local_context_headers,
                 )
                 .await
                 {

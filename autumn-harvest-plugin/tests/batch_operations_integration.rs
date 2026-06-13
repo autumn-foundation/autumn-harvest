@@ -139,7 +139,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
-    )
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -261,6 +263,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                context_headers: None,
             },
         )
         .await

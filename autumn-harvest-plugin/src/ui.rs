@@ -5853,6 +5853,7 @@ async fn execute_schedule_trigger_ui(
             owner,
             runbook_url,
             severity,
+            context_headers: None,
         },
     )
     .await;
@@ -7450,6 +7451,7 @@ mod tests {
             crash_strikes: 0,
             schedule_to_close_at: None,
             required_capabilities: None,
+            context_headers: None,
         }
     }
 
@@ -7580,6 +7582,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
             paused_at: None,
             pause_reason: None,
             pause_actor: None,

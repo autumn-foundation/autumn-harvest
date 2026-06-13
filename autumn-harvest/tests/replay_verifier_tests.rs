@@ -100,6 +100,7 @@ fn canonical_snapshot_json(workflow_name: &str) -> String {
         workflow_name: workflow_name.to_string(),
         execution_id: exec_id,
         events,
+        context_headers: None,
     };
     serde_json::to_string(&snapshot).unwrap()
 }
@@ -113,6 +114,7 @@ fn unregistered_snapshot_json() -> String {
             input: Value::Null,
             timestamp: Utc::now(),
         }],
+        context_headers: None,
     };
     serde_json::to_string(&snapshot).unwrap()
 }

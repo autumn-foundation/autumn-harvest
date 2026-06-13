@@ -102,7 +102,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
     "\n",
-    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql")
+    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 // -------------------------------------------------------------------------
@@ -367,6 +369,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     owner: None,
                     runbook_url: None,
                     severity: None,
+                    context_headers: None,
                 },
             )
             .await
@@ -559,6 +562,7 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     telemetry_master_workflow,
                     Value::Null,
                     state,
+                    std::collections::HashMap::new(),
                 )
                 .await;
             });
