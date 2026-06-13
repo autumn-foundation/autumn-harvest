@@ -699,7 +699,9 @@ async fn dag_detail_ui(
                 // Guard against task rename/reorder across deploys: only mark
                 // the node as condition-skipped when the recorded activity name
                 // still matches the task at that index in the current definition.
-                let recorded_task = data.get("task").and_then(|v| v.as_str())?;
+                // MarkerRecorded serializes as {"type":…,"data":{"name":…,"details":{…}}},
+                // so the task field lives under data.details.task.
+                let recorded_task = data.get("details").and_then(|d| d["task"].as_str())?;
                 let current_name = dag.definition.tasks().get(idx)?.activity_name.as_str();
                 if recorded_task == current_name {
                     Some(idx)

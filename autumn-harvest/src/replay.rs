@@ -2553,14 +2553,22 @@ impl HistoryMatcher {
     ///
     /// Returns:
     /// - [`HistoryMatch::Matched`] — the event at cursor is `MarkerRecorded`
-    ///   with the exact `name` and `expected_task` (in `details.task`).
+    ///   with the exact `name`, `expected_task` (in `details.task`), and
+    ///   matching `expected_upstreams` (in `details.upstreams`, when present).
     /// - [`HistoryMatch::Diverged`] — a different event, a marker with a
-    ///   different name, or the same marker index recording a different task
-    ///   name is at the cursor; this indicates the condition predicate
-    ///   returned a different value, or tasks were reordered/renamed across a
-    ///   deploy — a non-determinism violation.
+    ///   different name, a different task name, or (for new-format markers) a
+    ///   different upstream set is at the cursor — a non-determinism violation.
     /// - [`HistoryMatch::NoMatch`] — past end of history (live execution).
-    pub fn match_named_marker(&mut self, marker_name: &str, expected_task: &str) -> HistoryMatch {
+    ///
+    /// **Backward compatibility:** old markers without an `upstreams` field (written
+    /// before this field was introduced) pass the upstream check unconditionally,
+    /// so in-flight executions are not broken on upgrade.
+    pub fn match_named_marker(
+        &mut self,
+        marker_name: &str,
+        expected_task: &str,
+        expected_upstreams: &[usize],
+    ) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
@@ -2573,6 +2581,26 @@ impl HistoryMatcher {
                         actual: format!("MarkerRecorded({marker_name}, task={recorded_task})"),
                         event_index: i32::try_from(self.cursor).ok(),
                     };
+                }
+                // Validate upstream fingerprint only when the stored marker has the
+                // field (new-format markers); old markers without it pass through so
+                // in-flight executions survive an upgrade.
+                if let Some(arr) = details.get("upstreams").and_then(|v| v.as_array()) {
+                    let recorded_upstreams: Vec<usize> = arr
+                        .iter()
+                        .filter_map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()))
+                        .collect();
+                    if recorded_upstreams != expected_upstreams {
+                        return HistoryMatch::Diverged {
+                            expected: format!(
+                                "MarkerRecorded({marker_name}, task={expected_task}, upstreams={expected_upstreams:?})"
+                            ),
+                            actual: format!(
+                                "MarkerRecorded({marker_name}, task={recorded_task}, upstreams={recorded_upstreams:?})"
+                            ),
+                            event_index: i32::try_from(self.cursor).ok(),
+                        };
+                    }
                 }
                 self.cursor += 1;
                 self.advance_to_next_unconsumed_event();

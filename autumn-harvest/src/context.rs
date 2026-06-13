@@ -3352,17 +3352,23 @@ impl WorkflowContext {
     /// diverges from the current code — the condition predicate is not a pure
     /// function of upstream outputs, or a code change altered the branch
     /// decision for an in-flight execution.
-    pub fn dag_skip_marker(&self, task_index: usize, activity_name: &str) -> HarvestResult<()> {
+    pub fn dag_skip_marker(
+        &self,
+        task_index: usize,
+        activity_name: &str,
+        upstreams: &[usize],
+    ) -> HarvestResult<()> {
         let marker_name = format!("dag_skip:{task_index}");
         let match_result =
-            self.match_history(|m| m.match_named_marker(&marker_name, activity_name));
+            self.match_history(|m| m.match_named_marker(&marker_name, activity_name, upstreams));
         match match_result {
             HistoryMatch::NoMatch => {
                 self.push_command(WorkflowCommand::RecordMarker {
                     name: marker_name,
                     details: serde_json::json!({
                         "task": activity_name,
-                        "reason": "condition_false"
+                        "reason": "condition_false",
+                        "upstreams": upstreams,
                     }),
                 });
                 Ok(())

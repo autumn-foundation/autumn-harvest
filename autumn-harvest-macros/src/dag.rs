@@ -200,7 +200,7 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     continue;
                                 }
                                 ::autumn_harvest::DagDispatchDecision::SkipByCondition => {
-                                    ctx.dag_skip_marker(__task_idx, &__activity_name)
+                                    ctx.dag_skip_marker(__task_idx, &__activity_name, &__upstreams)
                                         .map_err(|e| e.to_string())?;
                                     __statuses[__task_idx] = ::autumn_harvest::policy::TaskStatus::Skipped;
                                     continue;
@@ -533,7 +533,7 @@ fn emit_workflow_companion(
                                         continue;
                                     }
                                     ::autumn_harvest::DagDispatchDecision::SkipByCondition => {
-                                        ctx.dag_skip_marker(__task_idx, &__activity_name)
+                                        ctx.dag_skip_marker(__task_idx, &__activity_name, &__upstreams)
                                             .map_err(|e| e.to_string())?;
                                         __statuses[__task_idx] = ::autumn_harvest::policy::TaskStatus::Skipped;
                                         continue;
