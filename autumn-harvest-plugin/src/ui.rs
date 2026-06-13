@@ -702,12 +702,26 @@ async fn dag_detail_ui(
                 // MarkerRecorded serializes as {"type":…,"data":{"name":…,"details":{…}}},
                 // so the task field lives under data.details.task.
                 let recorded_task = data.get("details").and_then(|d| d["task"].as_str())?;
-                let current_name = dag.definition.tasks().get(idx)?.activity_name.as_str();
-                if recorded_task == current_name {
-                    Some(idx)
-                } else {
-                    None
+                let current_task = dag.definition.tasks().get(idx)?;
+                if recorded_task != current_task.activity_name.as_str() {
+                    return None;
                 }
+                // Also validate upstream fingerprint when present (new-format markers).
+                // Old markers without "upstreams" pass through for backward compat.
+                if let Some(arr) = data
+                    .get("details")
+                    .and_then(|d| d.get("upstreams"))
+                    .and_then(|v| v.as_array())
+                {
+                    let recorded: Vec<usize> = arr
+                        .iter()
+                        .filter_map(|v| v.as_u64().and_then(|n| usize::try_from(n).ok()))
+                        .collect();
+                    if recorded != current_task.upstreams {
+                        return None;
+                    }
+                }
+                Some(idx)
             })
             .collect();
 
@@ -4390,6 +4404,12 @@ fn map_node_states(
 }
 
 fn merge_dag_task_state(current: DagNodeState, task_state: &str) -> DagNodeState {
+    // A condition-skip is backed by a recorded marker; task-row inference must
+    // never overwrite it, even when a same-named node at a different index has
+    // a FAILED/RUNNING/etc row (duplicate-activity-name scenario).
+    if current == DagNodeState::SkippedByCondition {
+        return current;
+    }
     match task_state {
         "FAILED" => DagNodeState::Failed,
         "CANCELLED" if !matches!(current, DagNodeState::Failed) => DagNodeState::Cancelled,
