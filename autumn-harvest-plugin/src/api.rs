@@ -13470,11 +13470,14 @@ pub(crate) async fn load_stalled_workflows(
     // ensure temporal consistency across both.
     let now = chrono::Utc::now();
 
-    // ── Step 6: future-dated unfired timers ─────────────────────────────────
-    let has_future_timer: HashSet<uuid::Uuid> = harvest_timers::table
+    // ── Step 6: any unfired timer (future-dated OR overdue) ─────────────────
+    // The sleeping-filter SQL already restricts "correctly sleeping" to
+    // fires_at > NOW(), so overdue timers are never excluded from candidates.
+    // Checking fired = false without a fires_at bound ensures those executions
+    // are classified as SleepingTimer rather than falling through to NoPendingWork.
+    let has_unfired_timer: HashSet<uuid::Uuid> = harvest_timers::table
         .filter(harvest_timers::workflow_exec_id.eq_any(&exec_ids))
         .filter(harvest_timers::fired.eq(false))
-        .filter(harvest_timers::fires_at.gt(now))
         .select(harvest_timers::workflow_exec_id)
         .distinct()
         .load::<uuid::Uuid>(conn)
@@ -13496,7 +13499,7 @@ pub(crate) async fn load_stalled_workflows(
                 StallReason::PendingChild
             } else if has_signal.contains(&id) {
                 StallReason::AwaitingSignal
-            } else if has_future_timer.contains(&id) {
+            } else if has_unfired_timer.contains(&id) {
                 StallReason::SleepingTimer
             } else {
                 StallReason::NoPendingWork
