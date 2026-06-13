@@ -160,6 +160,8 @@ const LEGACY_INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
     "\n",
     include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),

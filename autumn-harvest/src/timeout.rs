@@ -876,8 +876,10 @@ pub async fn enforce_workflow_execution_timeouts(
 /// SLA budget (issue #487).
 ///
 /// The scanner atomically flips `sla_breached = true` and sets `sla_breached_at`
-/// for every RUNNING or SUSPENDED execution whose `sla_deadline_at` has elapsed
-/// and that has not yet been marked.  It emits
+/// for every RUNNING execution whose `sla_deadline_at` has elapsed and that has
+/// not yet been marked.  (Only RUNNING is scanned — mirroring the #243
+/// execution-timeout scanner: a PAUSED run must not breach mid-pause, and
+/// SUSPENDED is not a persisted state.)  It emits
 /// `harvest.workflow.sla_breached{workflow, queue}` **exactly once per run**.
 ///
 /// **This function never terminates, cancels, fails, or otherwise alters the
@@ -903,7 +905,7 @@ pub async fn enforce_workflow_sla_breaches(
     let now = Utc::now();
     let breached: Vec<(uuid::Uuid, String, String)> =
         diesel::update(harvest_workflow_executions::table)
-            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "SUSPENDED"]))
+            .filter(harvest_workflow_executions::state.eq("RUNNING"))
             .filter(harvest_workflow_executions::sla_deadline_at.is_not_null())
             .filter(harvest_workflow_executions::sla_deadline_at.lt(Some(now)))
             .filter(harvest_workflow_executions::sla_breached.eq(false))
@@ -1245,8 +1247,12 @@ pub async fn enforce_timeouts_once(
     }
 
     count += enforce_external_task_timeouts(conn).await?;
-    count += enforce_workflow_execution_timeouts(conn, metrics).await?;
+    // Run the soft-SLA scan *before* the hard execution-timeout pass: if a run
+    // crosses both its SLA and hard deadline within one tick, the breach must be
+    // recorded while the row is still RUNNING — the hard-timeout pass then
+    // transitions it to TIMED_OUT and the SLA scan would otherwise skip it.
     count += enforce_workflow_sla_breaches(conn, metrics).await?;
+    count += enforce_workflow_execution_timeouts(conn, metrics).await?;
     count += enforce_external_signals_outbox(
         conn,
         metrics,

@@ -324,11 +324,13 @@ pub async fn start_or_load_workflow_execution(
 
     // Compute effective SLA — clamp down to the hard timeout when sla > deadline
     // (issue #487): the hard timeout fires first so the soft signal can never fire.
-    // A negative programmatic SLA is clamped up to zero so it cannot produce an
-    // `sla_deadline_at` before `started_at`.
+    // A non-positive SLA budget (<= 0) is treated as "no SLA": persisting an
+    // `sla_deadline_at` at or before `started_at` would flag the run as breached
+    // on the very next scan, which is never a meaningful budget.
     let effective_sla = match (request.sla, effective_timeout) {
-        (Some(sla), Some(hard)) => Some(sla.max(chrono::Duration::zero()).min(hard)),
-        (Some(sla), None) => Some(sla.max(chrono::Duration::zero())),
+        (Some(sla), _) if sla <= chrono::Duration::zero() => None,
+        (Some(sla), Some(hard)) => Some(sla.min(hard)),
+        (Some(sla), None) => Some(sla),
         (None, _) => None,
     };
     let sla_deadline_at = effective_sla.map(|d| target_start_time + d);

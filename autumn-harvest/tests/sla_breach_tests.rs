@@ -313,15 +313,19 @@ async fn breach_scan_leaves_harvest_events_untouched() {
     );
 }
 
-// ── Eligibility: SUSPENDED yes; PAUSED / terminal / NULL-sla no ──────────────
+// ── Eligibility: only RUNNING past-deadline; PAUSED / terminal / NULL / future no ──
+//
+// Only RUNNING is scanned (mirrors the #243 execution-timeout scanner). PAUSED
+// is excluded so a parked run never breaches mid-pause; SUSPENDED is not a
+// persisted state (the state CHECK constraint forbids it) so it is not tested.
 
 #[tokio::test]
-async fn suspended_breaches_but_paused_terminal_and_null_sla_do_not() {
+async fn only_running_past_deadline_breaches() {
     let (mut conn, _c) = setup_db().await;
     let past = Utc::now() - ChronoDuration::minutes(5);
     let future = Utc::now() + ChronoDuration::hours(1);
 
-    let suspended = insert_execution(&mut conn, "SUSPENDED", Some(past)).await;
+    let running = insert_execution(&mut conn, "RUNNING", Some(past)).await;
     let paused = insert_execution(&mut conn, "PAUSED", Some(past)).await;
     let completed = insert_execution(&mut conn, "COMPLETED", Some(past)).await;
     let no_sla = insert_execution(&mut conn, "RUNNING", None).await;
@@ -331,12 +335,12 @@ async fn suspended_breaches_but_paused_terminal_and_null_sla_do_not() {
         timeout::enforce_workflow_sla_breaches(&mut conn, &autumn_harvest::telemetry::NoOpMetrics)
             .await
             .expect("scan");
-    assert_eq!(n, 1, "only the SUSPENDED past-deadline row breaches");
+    assert_eq!(n, 1, "only the RUNNING past-deadline row breaches");
 
-    assert!(load_breach_flags(&mut conn, suspended).await.0);
+    assert!(load_breach_flags(&mut conn, running).await.0);
     assert!(
         !load_breach_flags(&mut conn, paused).await.0,
-        "PAUSED excluded"
+        "PAUSED excluded (pause suspends the SLA clock)"
     );
     assert!(
         !load_breach_flags(&mut conn, completed).await.0,
