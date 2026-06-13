@@ -935,6 +935,46 @@ struct WorkflowStackResponse {
     last_event_id: i64,
 }
 
+/// Coarse classification of why a workflow appears stalled (issue #486).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallReason {
+    PendingActivity,
+    PendingChild,
+    AwaitingSignal,
+    SleepingTimer,
+    NoPendingWork,
+}
+
+/// A workflow execution row augmented with stall-discovery fields (issue #486).
+///
+/// The `#[serde(flatten)]` preserves all existing `WorkflowExecution` fields
+/// at the top level of the JSON object. The three new optional fields are
+/// omitted when `None` (via `skip_serializing_if`) so callers not using the
+/// stalled filter receive an identical response to the pre-#486 format.
+#[derive(Debug, Clone, Serialize)]
+pub struct StalledWorkflowRow {
+    #[serde(flatten)]
+    pub execution: WorkflowExecution,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_age_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stall_reason: Option<StallReason>,
+}
+
+impl From<WorkflowExecution> for StalledWorkflowRow {
+    fn from(execution: WorkflowExecution) -> Self {
+        Self {
+            execution,
+            last_event_at: None,
+            last_event_age_seconds: None,
+            stall_reason: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct PendingActivity {
     activity_exec_id: String,
@@ -1605,6 +1645,11 @@ pub(crate) struct WorkflowFilters {
     pub(crate) owner: Option<String>,
     pub(crate) severity: Option<String>,
     pub(crate) failure_cause: Option<String>,
+    /// Only return executions with no event progress for this many minutes (issue #486).
+    pub(crate) no_progress_minutes: Option<i64>,
+    /// When true, include executions whose sole pending work is a future-dated
+    /// durable timer (correctly sleeping). Default false = exclude sleepers.
+    pub(crate) include_sleeping: bool,
 }
 
 impl WorkflowFilters {
@@ -3677,10 +3722,18 @@ mod stack_state_tests {
 async fn list_workflows(
     Extension(api_state): Extension<HarvestApiState>,
     Query(pairs): Query<Vec<(String, String)>>,
-) -> Result<Json<Vec<WorkflowExecution>>, AutumnError> {
+) -> Result<Json<Vec<StalledWorkflowRow>>, AutumnError> {
     let filters = parse_workflow_filters(&pairs)?;
-    let workflows = load_workflows_from_shards(&api_state, &filters).await?;
-    Ok(Json(workflows))
+    let rows = if filters.no_progress_minutes.is_some() {
+        load_stalled_workflows_from_shards(&api_state, &filters).await?
+    } else {
+        load_workflows_from_shards(&api_state, &filters)
+            .await?
+            .into_iter()
+            .map(StalledWorkflowRow::from)
+            .collect()
+    };
+    Ok(Json(rows))
 }
 
 /// `GET /workflows/registered` — list all registered workflow types with
@@ -3807,6 +3860,22 @@ pub(crate) fn parse_workflow_filters(
                 if !trimmed.is_empty() {
                     filters.failure_cause = Some(trimmed.to_string());
                 }
+            }
+            "no_progress_minutes" => {
+                let parsed = value.parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid no_progress_minutes '{value}'; expected a positive integer"
+                    ))
+                })?;
+                if parsed < 1 {
+                    return Err(AutumnError::bad_request_msg(
+                        "no_progress_minutes must be >= 1".to_string(),
+                    ));
+                }
+                filters.no_progress_minutes = Some(parsed);
+            }
+            "include_sleeping" => {
+                filters.include_sleeping = value.trim().eq_ignore_ascii_case("true");
             }
             _ => {
                 // Ignore unknown query parameters so future additions stay non-breaking.
@@ -13200,6 +13269,276 @@ pub(crate) async fn load_workflows_from_shards(
     });
     workflows.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
     Ok(workflows)
+}
+
+/// Per-shard stall-discovery query (issue #486).
+///
+/// Returns executions in a non-terminal state whose most recent
+/// `harvest_events` row is older than `no_progress_minutes`. By default,
+/// executions whose only pending work is a future-dated durable timer are
+/// excluded (correctly sleeping ≠ stalled); `include_sleeping = true` opts
+/// them back in. Executions with overdue unfired timers are always included
+/// regardless of `include_sleeping`.
+///
+/// Implementation uses five queries per shard:
+/// 1. Stalled candidates — Diesel boxed query with a raw `NOT EXISTS` filter
+///    for the age check (efficient via `idx_harvest_events_exec_last`)
+/// 2. Batch last-event-at via `GROUP BY MAX(timestamp)`
+/// 3. Pending activity, child, signal, and future-timer sets via `.eq_any`
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn load_stalled_workflows(
+    conn: &mut AsyncPgConnection,
+    filters: &WorkflowFilters,
+) -> HarvestResult<Vec<StalledWorkflowRow>> {
+    use diesel::dsl::{max, sql};
+    use diesel::sql_types::{BigInt, Bool};
+    use std::collections::{HashMap, HashSet};
+
+    let Some(minutes) = filters.no_progress_minutes else {
+        return Ok(vec![]);
+    };
+
+    // PAUSED executions are intentionally blocked from making progress at the
+    // claim layer, so after N minutes they are always "stalled" — a guaranteed
+    // false positive.  Exclude them from the default scan; callers that want to
+    // surface long-running pauses can filter explicitly with state=PAUSED.
+    let active_states: Vec<&str> = if filters.states.is_empty() {
+        vec!["RUNNING", "SUSPENDED"]
+    } else {
+        filters
+            .states
+            .iter()
+            .map(String::as_str)
+            .filter(|s| matches!(*s, "RUNNING" | "SUSPENDED" | "PAUSED"))
+            .collect()
+    };
+    if active_states.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // ── Step 1: find stalled candidate executions ──────────────────────────
+    // No per-shard limit here; the global limit is applied after cross-shard
+    // sorting in load_stalled_workflows_from_shards, so oldest stalls are
+    // never dropped by a premature per-shard truncation.
+    let mut query = harvest_workflow_executions::table
+        .into_boxed()
+        .filter(harvest_workflow_executions::state.eq_any(active_states))
+        // No event newer than N minutes — O(1) per candidate with the covering index.
+        // Qualify the outer table's id to avoid ambiguity with harvest_events.id (Int8).
+        .filter(
+            sql::<Bool>(
+                "NOT EXISTS (\
+                    SELECT 1 FROM harvest_events \
+                    WHERE workflow_exec_id = harvest_workflow_executions.id \
+                    AND timestamp >= NOW() - ",
+            )
+            .bind::<BigInt, _>(minutes)
+            .sql(" * INTERVAL '1 minute')"),
+        )
+        .order(harvest_workflow_executions::created_at.desc());
+
+    if let Some(name) = &filters.workflow_name {
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.as_str()));
+    }
+    if let Some(owner) = &filters.owner {
+        query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
+    }
+    if let Some(severity) = &filters.severity {
+        query = query.filter(harvest_workflow_executions::severity.eq(severity.as_str()));
+    }
+
+    if !filters.include_sleeping {
+        // Include an execution if it has any non-timer pending work, OR has no
+        // future-dated unfired timer (nothing to sleep on), OR has an overdue
+        // unfired timer (should have progressed).  The only excluded case is
+        // "correctly sleeping": a future-dated timer is the sole pending item
+        // and no timers are overdue.
+        query = query.filter(sql::<Bool>(
+            "(\
+                EXISTS(\
+                    SELECT 1 FROM harvest_task_queue \
+                    WHERE workflow_exec_id = harvest_workflow_executions.id \
+                    AND state IN ('PENDING','CLAIMED','RUNNING','BACKOFF')\
+                ) \
+             OR EXISTS(\
+                    SELECT 1 FROM harvest_workflow_executions c \
+                    WHERE c.parent_id = harvest_workflow_executions.id \
+                    AND c.state NOT IN (\
+                        'COMPLETED','FAILED','CANCELLED',\
+                        'TIMED_OUT','CONTINUED_AS_NEW','TERMINATED'\
+                    )\
+                ) \
+             OR EXISTS(\
+                    SELECT 1 FROM harvest_signals \
+                    WHERE workflow_exec_id = harvest_workflow_executions.id AND consumed = false\
+                ) \
+             OR NOT EXISTS(\
+                    SELECT 1 FROM harvest_timers \
+                    WHERE workflow_exec_id = harvest_workflow_executions.id \
+                    AND fired = false AND fires_at > NOW()\
+                )\
+             OR EXISTS(\
+                    SELECT 1 FROM harvest_timers \
+                    WHERE workflow_exec_id = harvest_workflow_executions.id \
+                    AND fired = false AND fires_at <= NOW()\
+                )\
+            )",
+        ));
+    }
+
+    let candidates: Vec<WorkflowExecution> = query
+        .select(WorkflowExecution::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)?;
+
+    if candidates.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let exec_ids: Vec<uuid::Uuid> = candidates.iter().map(|e| e.id).collect();
+
+    // ── Step 2: batch-fetch last_event_at per execution ────────────────────
+    let last_event_ats: HashMap<uuid::Uuid, chrono::DateTime<chrono::Utc>> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq_any(&exec_ids))
+        .group_by(harvest_events::workflow_exec_id)
+        .select((
+            harvest_events::workflow_exec_id,
+            max(harvest_events::timestamp),
+        ))
+        .load::<(uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)>(conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .filter_map(|(id, ts)| ts.map(|t| (id, t)))
+        .collect();
+
+    // ── Step 3: any runnable task queue row (activity or workflow type) ────────
+    // Checking all task_type values mirrors the sleeping-filter predicate so that
+    // an execution with a stuck workflow task is not mislabelled no_pending_work.
+    let has_activity: HashSet<uuid::Uuid> = harvest_task_queue::table
+        .filter(
+            harvest_task_queue::workflow_exec_id
+                .eq_any(exec_ids.iter().map(|id| Some(*id)).collect::<Vec<_>>()),
+        )
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
+        .select(harvest_task_queue::workflow_exec_id)
+        .distinct()
+        .load::<Option<uuid::Uuid>>(conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    // ── Step 4: non-terminal child workflows ────────────────────────────────
+    let has_child: HashSet<uuid::Uuid> = harvest_workflow_executions::table
+        .filter(
+            harvest_workflow_executions::parent_id
+                .eq_any(exec_ids.iter().map(|id| Some(*id)).collect::<Vec<_>>()),
+        )
+        .filter(harvest_workflow_executions::state.ne_all([
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+            "TERMINATED",
+        ]))
+        .select(harvest_workflow_executions::parent_id)
+        .distinct()
+        .load::<Option<uuid::Uuid>>(conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    // ── Step 5: unconsumed (buffered) signals ───────────────────────────────
+    let has_signal: HashSet<uuid::Uuid> = harvest_signals::table
+        .filter(harvest_signals::workflow_exec_id.eq_any(&exec_ids))
+        .filter(harvest_signals::consumed.eq(false))
+        .select(harvest_signals::workflow_exec_id)
+        .distinct()
+        .load::<uuid::Uuid>(conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .collect();
+
+    // Capture now once — reused for timer comparison and age calculation to
+    // ensure temporal consistency across both.
+    let now = chrono::Utc::now();
+
+    // ── Step 6: any unfired timer (future-dated OR overdue) ─────────────────
+    // The sleeping-filter SQL already restricts "correctly sleeping" to
+    // fires_at > NOW(), so overdue timers are never excluded from candidates.
+    // Checking fired = false without a fires_at bound ensures those executions
+    // are classified as SleepingTimer rather than falling through to NoPendingWork.
+    let has_unfired_timer: HashSet<uuid::Uuid> = harvest_timers::table
+        .filter(harvest_timers::workflow_exec_id.eq_any(&exec_ids))
+        .filter(harvest_timers::fired.eq(false))
+        .select(harvest_timers::workflow_exec_id)
+        .distinct()
+        .load::<uuid::Uuid>(conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .collect();
+
+    Ok(candidates
+        .into_iter()
+        .map(|execution| {
+            let id = execution.id;
+            let last_event_at = last_event_ats.get(&id).copied();
+            let last_event_age_seconds =
+                last_event_at.map(|ts| (now - ts).to_std().map_or(0.0, |d| d.as_secs_f64()));
+            let stall_reason = Some(if has_activity.contains(&id) {
+                StallReason::PendingActivity
+            } else if has_child.contains(&id) {
+                StallReason::PendingChild
+            } else if has_signal.contains(&id) {
+                StallReason::AwaitingSignal
+            } else if has_unfired_timer.contains(&id) {
+                StallReason::SleepingTimer
+            } else {
+                StallReason::NoPendingWork
+            });
+            StalledWorkflowRow {
+                execution,
+                last_event_at,
+                last_event_age_seconds,
+                stall_reason,
+            }
+        })
+        .collect())
+}
+
+/// Fan-out `load_stalled_workflows` across all configured shards and merge
+/// results sorted oldest-stall-first, truncated to `filters.limit`.
+pub(crate) async fn load_stalled_workflows_from_shards(
+    api_state: &HarvestApiState,
+    filters: &WorkflowFilters,
+) -> Result<Vec<StalledWorkflowRow>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let mut rows: Vec<StalledWorkflowRow> = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut shard_rows = load_stalled_workflows(&mut conn, filters)
+            .await
+            .map_err(map_error)?;
+        rows.append(&mut shard_rows);
+    }
+
+    // Sort oldest-stall-first: the most actionable workflows appear at the top.
+    rows.sort_by(|a, b| {
+        a.last_event_at
+            .cmp(&b.last_event_at)
+            .then_with(|| a.execution.id.cmp(&b.execution.id))
+    });
+    rows.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
+    Ok(rows)
 }
 
 fn export_history_for_execution(

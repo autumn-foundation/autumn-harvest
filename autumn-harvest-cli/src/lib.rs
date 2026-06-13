@@ -615,6 +615,15 @@ enum WorkflowCommand {
         /// Filter by owner (exact match).
         #[arg(long)]
         owner: Option<String>,
+        /// Only return executions that have made no event progress for at
+        /// least this many minutes. Excludes workflows correctly sleeping on
+        /// a future-dated durable timer unless --include-sleeping is also set.
+        #[arg(long)]
+        no_progress_minutes: Option<i64>,
+        /// Include executions sleeping on a future-dated durable timer in the
+        /// stalled-workflow results. Only meaningful with --no-progress-minutes.
+        #[arg(long)]
+        include_sleeping: bool,
     },
     /// Get one workflow execution and event history.
     Get {
@@ -2709,12 +2718,16 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             workflow_name,
             search_attr,
             owner,
+            no_progress_minutes,
+            include_sleeping,
         } => Ok(ApiRequest::get(build_workflow_list_path(
             *limit,
             state,
             workflow_name.as_deref(),
             search_attr,
             owner.as_deref(),
+            *no_progress_minutes,
+            *include_sleeping,
         )?)),
         WorkflowCommand::Get { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}",
@@ -3812,6 +3825,8 @@ fn build_workflow_list_path(
     workflow_name: Option<&str>,
     search_attrs: &[String],
     owner: Option<&str>,
+    no_progress_minutes: Option<i64>,
+    include_sleeping: bool,
 ) -> Result<String, CliError> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
     if let Some(value) = limit {
@@ -3833,6 +3848,12 @@ fn build_workflow_list_path(
     }
     if let Some(o) = owner {
         params.push(("owner", o.to_string()));
+    }
+    if let Some(minutes) = no_progress_minutes {
+        params.push(("no_progress_minutes", minutes.to_string()));
+    }
+    if include_sleeping {
+        params.push(("include_sleeping", "true".to_string()));
     }
 
     if params.is_empty() {
