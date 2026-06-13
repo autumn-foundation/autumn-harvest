@@ -301,7 +301,6 @@ async fn insert_dlq_rows(
                 attempts: 3,
                 owner: None,
                 severity: None,
-                context_headers: None,
             },
         )
         .await

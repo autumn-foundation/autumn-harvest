@@ -270,7 +270,6 @@ async fn insert_dlq_row(database_url: &str, activity_name: &str, task_type: &str
 
             owner: None,
             severity: None,
-            context_headers: None,
         },
     )
     .await

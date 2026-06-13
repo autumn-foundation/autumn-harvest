@@ -243,7 +243,6 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
-                context_headers: None,
             },
             WorkflowInfo {
                 name: "target_wf",
@@ -259,7 +258,6 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
-                context_headers: None,
             },
             WorkflowInfo {
                 name: "target_with_schema_wf",
@@ -275,7 +273,6 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 owner: None,
                 runbook_url: None,
                 severity: None,
-                context_headers: None,
             },
         ],
         vec![],
