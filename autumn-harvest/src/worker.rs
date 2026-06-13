@@ -5379,7 +5379,7 @@ async fn process_workflow_task(
                         per.max(registry.max_workflow_input_bytes)
                     }),
                 registry.max_current_details_bytes,
-                exec_context_headers,
+                exec_context_headers.clone(),
             )
             .await;
 
