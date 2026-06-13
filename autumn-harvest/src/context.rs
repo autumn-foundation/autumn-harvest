@@ -3834,10 +3834,14 @@ impl WorkflowContext {
             );
             // Propagate correlation fields for logger. Arc was just created;
             // no other reference exists yet so get_mut always succeeds.
-            {
-                let inner = std::sync::Arc::get_mut(&mut ctx).unwrap();
+            if let Some(inner) = std::sync::Arc::get_mut(&mut ctx) {
                 inner.workflow_id.clone_from(&workflow_id);
                 inner.workflow_name.clone_from(&workflow_name);
+            } else {
+                let err: crate::update::UpdateHandlerFuture = Box::pin(async {
+                    Err("Internal Error: Update handler context was unexpectedly shared".into())
+                });
+                return err;
             }
             handler_fn(ctx, input)
         });
@@ -3895,10 +3899,14 @@ impl WorkflowContext {
                 self.cancellation_reason.clone(),
                 std::sync::Arc::clone(&self.state),
             );
-            {
-                let inner = std::sync::Arc::get_mut(&mut ctx).unwrap();
+            if let Some(inner) = std::sync::Arc::get_mut(&mut ctx) {
                 inner.workflow_id.clone_from(&self.workflow_id);
                 inner.workflow_name.clone_from(&self.workflow_name);
+            } else {
+                let err: crate::update::UpdateHandlerFuture = Box::pin(async {
+                    Err("Internal Error: Update handler context was unexpectedly shared".into())
+                });
+                return err;
             }
             h(ctx, input)
         })

@@ -555,6 +555,37 @@ mod tests {
     }
 
     #[test]
+    fn harvest_error_payload_too_large_display() {
+        let e = HarvestError::PayloadTooLarge {
+            kind: PayloadKind::SideEffectValue,
+            observed_bytes: 2000,
+            cap_bytes: 1000,
+            workflow_type: "my_workflow".into(),
+            activity_name: None,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("payload too large"));
+        assert!(msg.contains("SideEffectValue"));
+        assert!(msg.contains("my_workflow"));
+        assert!(msg.contains("2000"));
+        assert!(msg.contains("1000"));
+    }
+
+    #[test]
+    fn harvest_error_admission_blocked_display() {
+        use uuid::Uuid;
+        let gate_id = Uuid::new_v4();
+        let e = HarvestError::AdmissionBlocked {
+            gate_id,
+            reason: "too many requests".into(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("admission blocked"));
+        assert!(msg.contains(&gate_id.to_string()));
+        assert!(msg.contains("too many requests"));
+    }
+
+    #[test]
     fn database_error_conversion() {
         let err = database_error("connection refused");
         match err {
