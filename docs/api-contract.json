@@ -3144,6 +3144,16 @@
             "name": "skip_policy",
             "required": false,
             "description": "What to do when the fire date is calendar-excluded (issue #337)."
+          },
+          {
+            "name": "catchup_policy",
+            "required": false,
+            "description": "Bounded catchup policy after downtime: one of skip_all, most_recent, window, unbounded. Omitted falls back to the legacy catchup bool (issue #484)."
+          },
+          {
+            "name": "catchup_window_secs",
+            "required": false,
+            "description": "Window length in seconds when catchup_policy = window; ignored otherwise (issue #484)."
           }
         ]
       },

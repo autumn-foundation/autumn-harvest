@@ -1160,6 +1160,13 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
                 .map(|_| ())
                 .map_err(|e| format!("invalid cron expression '{expr}': {e}"))
         }
+        // A zero (or non-positive) interval never advances, so a due catchup tick
+        // would spin forever (issue #484 / Codex #3223). Reject it at registration
+        // time; the runtime `next_run_after` also treats it as non-firing as a
+        // belt-and-braces guard.
+        Schedule::Interval(period) if period.is_zero() => {
+            Err("interval schedule period must be greater than zero".to_string())
+        }
         Schedule::Interval(_) | Schedule::Manual => Ok(()),
     }
 }
@@ -1661,6 +1668,19 @@ mod tests {
             tz: "UTC".to_string(),
         };
         assert!(validate_schedule(&sched).is_err());
+    }
+
+    #[test]
+    fn zero_interval_schedule_rejected() {
+        // A zero interval never advances and would spin a catchup tick forever
+        // (issue #484 / Codex #3223); reject it at validation time.
+        let err = validate_schedule(&Schedule::Interval(Duration::ZERO)).unwrap_err();
+        assert!(
+            err.contains("greater than zero"),
+            "error should explain the zero-interval rejection: {err}"
+        );
+        // A positive interval remains valid.
+        assert!(validate_schedule(&Schedule::Interval(Duration::from_secs(1))).is_ok());
     }
 
     #[test]

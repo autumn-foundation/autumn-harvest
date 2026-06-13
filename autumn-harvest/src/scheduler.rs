@@ -2292,6 +2292,45 @@ async fn tick_one_workflow_schedule(
         dropped: catchup_slots_dropped,
     } = catchup_plan;
 
+    // A bounded plan with nothing to fire (e.g. a Window where every eligible
+    // slot fell outside the window, so they were all dropped) must still advance
+    // next_run_at past the dropped backlog and record the drops exactly once.
+    // Otherwise the overlap branch below would treat the stale rebound
+    // `logical_date` (still pinned to the oldest overdue slot by the `[]` rebind
+    // arm) as a runnable slot and — under Skip + catchup — retain
+    // `next_run_at = logical_date`, re-auditing the same backlog on every tick
+    // until capacity opens (issue #484 / Codex #1952).
+    if run_dates.is_empty() {
+        record_catchup_drops(
+            conn,
+            metrics,
+            schedule.id,
+            wf_name,
+            catchup_policy,
+            schedule.catchup_window_secs,
+            catchup_slots_dropped,
+            now,
+            current_shard,
+            claim_token,
+        )
+        .await;
+        diesel::update(
+            dsl::harvest_schedules
+                .find(schedule.id)
+                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+        )
+        .set((
+            dsl::next_run_at.eq(next_run_after_plan),
+            dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
+            dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
+            dsl::updated_at.eq(now),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+        return Ok(());
+    }
+
     let mut running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
@@ -2976,6 +3015,13 @@ fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Opti
         }
         Some(Schedule::Interval(interval)) => chrono::Duration::from_std(*interval)
             .ok()
+            // A zero (or non-positive) interval would return `reference` unchanged,
+            // which spins any catchup walk forever and makes a due tick loop
+            // indefinitely (issue #484 / Codex #3223). Treat a non-advancing
+            // interval as "no next occurrence" so every caller terminates; such a
+            // schedule simply never fires. (`validate_schedule` also rejects it at
+            // registration time.)
+            .filter(|duration| *duration > chrono::Duration::zero())
             .map(|duration| reference + duration),
         Some(Schedule::Manual) | None => None,
     }

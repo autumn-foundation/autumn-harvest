@@ -2690,6 +2690,8 @@ pub const fn management_api_request_fields()
                 "queue_name",
                 "calendar",
                 "skip_policy",
+                "catchup_policy",
+                "catchup_window_secs",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["reason"])),
