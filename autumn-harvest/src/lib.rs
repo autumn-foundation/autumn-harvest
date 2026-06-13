@@ -67,6 +67,8 @@ pub mod dag;
 pub mod dag_export;
 pub mod dag_linter;
 #[cfg(feature = "testing")]
+pub mod dag_monte_carlo;
+#[cfg(feature = "testing")]
 pub mod dag_profiler;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
@@ -202,6 +204,8 @@ pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
     MissingTimeoutRule,
 };
+#[cfg(feature = "testing")]
+pub use dag_monte_carlo::{DagMonteCarlo, MonteCarloResult, StochasticActivityMock};
 #[cfg(feature = "testing")]
 pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};
 #[cfg(any(test, feature = "testing"))]
