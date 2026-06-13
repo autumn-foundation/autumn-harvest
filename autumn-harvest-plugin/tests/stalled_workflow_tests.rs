@@ -158,7 +158,7 @@ async fn get_json(app: &HarvestApiApp, uri: impl Into<String>) -> (StatusCode, V
     (status, json)
 }
 
-/// Seed a RUNNING workflow and insert a single WorkflowStarted event backdated
+/// Seed a RUNNING workflow and insert a single `WorkflowStarted` event backdated
 /// by `hours_ago` hours so it appears as "stalled" to the filter.
 async fn seed_stalled_workflow(
     database_url: &str,
@@ -278,7 +278,7 @@ fn workflow_ids_of(arr: &Value) -> Vec<String> {
 // They will FAIL (compile or runtime) until the feature is implemented.
 
 /// AC: A RUNNING workflow with no event progress for > N minutes and zero
-/// pending work is returned with stall_reason=no_pending_work.
+/// pending work is returned with `stall_reason=no_pending_work`.
 #[tokio::test]
 async fn test_no_pending_work_workflow_is_returned() {
     let (database_url, _container) = setup_database().await;
@@ -336,8 +336,8 @@ async fn test_sleeping_workflow_excluded_by_default() {
     );
 }
 
-/// AC: With include_sleeping=true the sleeping workflow IS returned with
-/// stall_reason=sleeping_timer.
+/// AC: With `include_sleeping=true` the sleeping workflow IS returned with
+/// `stall_reason=sleeping_timer`.
 #[tokio::test]
 async fn test_sleeping_workflow_included_with_flag() {
     let (database_url, _container) = setup_database().await;
@@ -390,7 +390,7 @@ async fn test_healthy_workflow_excluded() {
 }
 
 /// AC: A RUNNING workflow with no event progress and an active pending activity
-/// task is returned with stall_reason=pending_activity.
+/// task is returned with `stall_reason=pending_activity`.
 #[tokio::test]
 async fn test_stuck_pending_activity_returned() {
     let (database_url, _container) = setup_database().await;
@@ -417,7 +417,7 @@ async fn test_stuck_pending_activity_returned() {
     assert_eq!(stall_reason_of(row), "pending_activity");
 }
 
-/// Unit-style check: the stall_reason field serialises as snake_case strings.
+/// Unit-style check: the `stall_reason` field serialises as `snake_case` strings.
 #[test]
 fn test_stall_reason_serializes_as_snake_case() {
     use autumn_harvest_plugin::api::StallReason;
@@ -444,8 +444,8 @@ fn test_stall_reason_serializes_as_snake_case() {
     );
 }
 
-/// AC: `no_pending_work` is always surfaced regardless of include_sleeping — even
-/// if we pass include_sleeping=false, a workflow with no pending work at all
+/// AC: `no_pending_work` is always surfaced regardless of `include_sleeping` — even
+/// if we pass `include_sleeping=false`, a workflow with no pending work at all
 /// must still be returned (since it cannot be a sleeping-timer case).
 #[tokio::test]
 async fn test_no_pending_work_always_returned_regardless_of_include_sleeping() {
@@ -469,7 +469,7 @@ async fn test_no_pending_work_always_returned_regardless_of_include_sleeping() {
     );
 }
 
-/// AC: Caller gets a 400 for a non-positive no_progress_minutes.
+/// AC: Caller gets a 400 for a non-positive `no_progress_minutes`.
 #[tokio::test]
 async fn test_invalid_no_progress_minutes_returns_400() {
     let (database_url, _container) = setup_database().await;
