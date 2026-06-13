@@ -9282,27 +9282,27 @@ async fn create_workflow_schedule(
     // `None` (omitted) preserves the legacy `catchup` bool and leaves the policy
     // columns NULL.
     let catchup_policy = match request.catchup_policy.as_deref() {
-        Some(mode) => match autumn_harvest::CatchupPolicy::from_user_input(
-            mode,
-            request.catchup_window_secs,
-        ) {
-            Ok(p) => Some(p),
-            Err(v) => {
-                let err_summary = format!(
-                    "invalid catchup_policy '{v}'; valid values: skip_all, most_recent, window, unbounded"
-                );
-                schedule_create_audit_failed(
-                    &api_state,
-                    &actor,
-                    &source,
-                    request_id.as_deref(),
-                    &request.workflow_name,
-                    &err_summary,
-                )
-                .await;
-                return Err(AutumnError::bad_request_msg(err_summary));
+        Some(mode) => {
+            match autumn_harvest::CatchupPolicy::from_user_input(mode, request.catchup_window_secs)
+            {
+                Ok(p) => Some(p),
+                Err(v) => {
+                    let err_summary = format!(
+                        "invalid catchup_policy '{v}'; valid values: skip_all, most_recent, window, unbounded"
+                    );
+                    schedule_create_audit_failed(
+                        &api_state,
+                        &actor,
+                        &source,
+                        request_id.as_deref(),
+                        &request.workflow_name,
+                        &err_summary,
+                    )
+                    .await;
+                    return Err(AutumnError::bad_request_msg(err_summary));
+                }
             }
-        },
+        }
         None => None,
     };
 

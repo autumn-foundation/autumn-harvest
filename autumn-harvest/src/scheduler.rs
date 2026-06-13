@@ -1835,13 +1835,12 @@ async fn tick_one_workflow_schedule(
     // recorded by those guards below — this only avoids the wasted allocation.
     // The bounded MostRecent / Window policies compute in O(1) (closed-form for
     // interval schedules), so this short-circuit is scoped to the unbounded path.
-    let will_exhaust_before_firing = matches!(
-        catchup_policy,
-        crate::policy::CatchupPolicy::Unbounded
-    ) && (schedule.end_at.is_some_and(|end_at| logical_date >= end_at)
-        || schedule
-            .max_runs
-            .is_some_and(|max_runs| max_runs > 0 && schedule.runs_started >= max_runs));
+    let will_exhaust_before_firing =
+        matches!(catchup_policy, crate::policy::CatchupPolicy::Unbounded)
+            && (schedule.end_at.is_some_and(|end_at| logical_date >= end_at)
+                || schedule
+                    .max_runs
+                    .is_some_and(|max_runs| max_runs > 0 && schedule.runs_started >= max_runs));
     let catchup_plan = if will_exhaust_before_firing {
         // Empty plan: `logical_date` rebinding below keeps the original slot
         // (the `[]` arm), so the calendar / jitter / exhaustion branches see the
