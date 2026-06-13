@@ -13488,7 +13488,7 @@ pub(crate) async fn load_stalled_workflows(
             let id = execution.id;
             let last_event_at = last_event_ats.get(&id).copied();
             let last_event_age_seconds =
-                last_event_at.map(|ts| (now - ts).to_std().map(|d| d.as_secs_f64()).unwrap_or(0.0));
+                last_event_at.map(|ts| (now - ts).to_std().map_or(0.0, |d| d.as_secs_f64()));
             let stall_reason = Some(if has_activity.contains(&id) {
                 StallReason::PendingActivity
             } else if has_child.contains(&id) {
