@@ -87,17 +87,14 @@ pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
     Ok(requirements)
 }
 
-fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
+fn find_operator_indices(token: &str) -> (Option<usize>, Option<(usize, usize)>) {
     let mut eq_idx = None;
-    let mut in_idx = None;
+    let mut in_match = None;
     let mut in_quotes = None;
-    let token_chars: Vec<char> = token.chars().collect();
-    let token_lower = token.to_lowercase();
-    let token_lower_chars: Vec<char> = token_lower.chars().collect();
-
     let mut i = 0;
-    while i < token_chars.len() {
-        let c = token_chars[i];
+
+    while i < token.len() {
+        let c = token[i..].chars().next().unwrap();
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -110,21 +107,26 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
                 eq_idx = Some(i);
             }
             _ => {
-                if in_quotes.is_none()
-                    && in_idx.is_none()
-                    && i + 3 < token_chars.len()
-                    && token_lower_chars[i] == ' '
-                    && token_lower_chars[i + 1] == 'i'
-                    && token_lower_chars[i + 2] == 'n'
-                    && token_lower_chars[i + 3] == ' '
-                {
-                    in_idx = Some(i);
+                if in_quotes.is_none() && in_match.is_none() {
+                    let rest = &token[i..];
+                    if rest.len() >= 4
+                        && rest.is_char_boundary(4)
+                        && rest[0..4].eq_ignore_ascii_case(" in ")
+                    {
+                        in_match = Some((i, 4));
+                    } else if i == 0
+                        && rest.len() >= 3
+                        && rest.is_char_boundary(3)
+                        && rest[0..3].eq_ignore_ascii_case("in ")
+                    {
+                        in_match = Some((0, 3));
+                    }
                 }
             }
         }
-        i += 1;
+        i += c.len_utf8();
     }
-    (eq_idx, in_idx)
+    (eq_idx, in_match)
 }
 
 fn parse_exact(token: &str, idx: usize) -> Result<Requirement, String> {
@@ -143,9 +145,9 @@ fn parse_exact(token: &str, idx: usize) -> Result<Requirement, String> {
     Ok(Requirement::Exact { key, value })
 }
 
-fn parse_in(token: &str, idx: usize) -> Result<Requirement, String> {
-    let key_raw = &token[..idx];
-    let val_raw = &token[idx + 4..];
+fn parse_in(token: &str, in_idx: usize, in_len: usize) -> Result<Requirement, String> {
+    let key_raw = &token[..in_idx];
+    let val_raw = &token[in_idx + in_len..];
 
     let key = strip_quotes(key_raw).to_string();
     if key.is_empty() {
@@ -172,14 +174,14 @@ fn parse_in(token: &str, idx: usize) -> Result<Requirement, String> {
 }
 
 fn parse_single_requirement(token: &str) -> Result<Requirement, String> {
-    let (eq_idx, in_idx) = find_operator_indices(token);
+    let (eq_idx, in_match) = find_operator_indices(token);
 
-    match (eq_idx, in_idx) {
+    match (eq_idx, in_match) {
         (Some(idx), None) => parse_exact(token, idx),
-        (None, Some(idx)) => parse_in(token, idx),
-        (Some(eq_i), Some(in_i)) => {
+        (None, Some((idx, len))) => parse_in(token, idx, len),
+        (Some(eq_i), Some((in_i, in_len))) => {
             if in_i < eq_i {
-                parse_in(token, in_i)
+                parse_in(token, in_i, in_len)
             } else {
                 parse_exact(token, eq_i)
             }
@@ -381,5 +383,25 @@ mod tests {
 
         // Empty requirements always match
         assert!(matches_requirements(&[], &labels));
+    }
+
+    #[test]
+    fn test_parse_requirements_havoc_multibyte() {
+        // Havoc: Ensure multibyte unicode characters don't panic the parser
+        // 🧨 The Trigger: "¡¡="
+        let parsed = parse_requirements("¡¡=");
+        assert!(parsed.is_err() || parsed.is_ok());
+
+        let parsed_in = parse_requirements("¡¡ in [a]");
+        assert!(parsed_in.is_ok());
+
+        let reqs = parse_requirements("¡¡ in [a]").unwrap();
+        assert_eq!(reqs.len(), 1);
+        if let Requirement::In { key, values } = &reqs[0] {
+            assert_eq!(key, "¡¡");
+            assert_eq!(values, &["a"]);
+        } else {
+            panic!("Expected In requirement");
+        }
     }
 }
