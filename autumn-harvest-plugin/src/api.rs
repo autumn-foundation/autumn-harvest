@@ -13298,11 +13298,12 @@ pub(crate) async fn load_stalled_workflows(
         return Ok(vec![]);
     };
 
-    // Respect any caller-supplied state restriction; intersect with the
-    // stall-eligible set.  If the caller restricts to non-active states
-    // (e.g. state=COMPLETED), return empty immediately.
+    // PAUSED executions are intentionally blocked from making progress at the
+    // claim layer, so after N minutes they are always "stalled" — a guaranteed
+    // false positive.  Exclude them from the default scan; callers that want to
+    // surface long-running pauses can filter explicitly with state=PAUSED.
     let active_states: Vec<&str> = if filters.states.is_empty() {
-        vec!["RUNNING", "SUSPENDED", "PAUSED"]
+        vec!["RUNNING", "SUSPENDED"]
     } else {
         filters
             .states
@@ -13412,13 +13413,14 @@ pub(crate) async fn load_stalled_workflows(
         .filter_map(|(id, ts)| ts.map(|t| (id, t)))
         .collect();
 
-    // ── Step 3: pending activity tasks ─────────────────────────────────────
+    // ── Step 3: any runnable task queue row (activity or workflow type) ────────
+    // Checking all task_type values mirrors the sleeping-filter predicate so that
+    // an execution with a stuck workflow task is not mislabelled no_pending_work.
     let has_activity: HashSet<uuid::Uuid> = harvest_task_queue::table
         .filter(
             harvest_task_queue::workflow_exec_id
                 .eq_any(exec_ids.iter().map(|id| Some(*id)).collect::<Vec<_>>()),
         )
-        .filter(harvest_task_queue::task_type.eq("activity"))
         .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
         .select(harvest_task_queue::workflow_exec_id)
         .distinct()

@@ -304,7 +304,10 @@ async fn test_no_pending_work_workflow_is_returned() {
     let app = build_app(&database_url);
 
     // Seed a workflow whose only event is 2 hours old with no pending work.
+    // Mark the initial workflow task COMPLETED to simulate a workflow that was
+    // processed by a worker and then wedged with no further pending items.
     let exec_id = seed_stalled_workflow(&database_url, "wf-no-pending", 2).await;
+    complete_workflow_tasks(&database_url, exec_id).await;
 
     let (status, body) = get_json(&app, "/workflows?no_progress_minutes=30").await;
     assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
@@ -476,7 +479,8 @@ async fn test_no_pending_work_always_returned_regardless_of_include_sleeping() {
     let (database_url, _container) = setup_database().await;
     let app = build_app(&database_url);
 
-    let _exec_id = seed_stalled_workflow(&database_url, "wf-always-no-pending", 2).await;
+    let exec_id = seed_stalled_workflow(&database_url, "wf-always-no-pending", 2).await;
+    complete_workflow_tasks(&database_url, exec_id).await;
 
     // include_sleeping=false is the DEFAULT, but let's be explicit.
     let (status, body) = get_json(
