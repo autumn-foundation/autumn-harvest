@@ -5,6 +5,7 @@ use crate::types::ExecutionId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::str::FromStr;
 
@@ -113,6 +114,12 @@ pub struct HistoryExportDocument {
     /// JSON. Redacted exports preserve event shape but summarize sensitive
     /// payload-bearing fields.
     pub events: Vec<Value>,
+    /// Per-execution context headers from the original run. `None` means the
+    /// export was produced before this field was introduced (legacy) or no
+    /// headers were attached. Used by `WorkflowReplayer::replay_from_json` to
+    /// restore the same ambient headers the workflow saw during live execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_headers: Option<HashMap<String, String>>,
 }
 
 /// Input needed to export one workflow execution history.
@@ -135,6 +142,10 @@ pub struct HistoryExportRequest {
     /// Optional serialized byte limit. Defaults to
     /// [`DEFAULT_HISTORY_EXPORT_MAX_BYTES`].
     pub max_bytes: Option<usize>,
+    /// Per-execution context headers attached at workflow start. When `Some`,
+    /// the headers are embedded in the export document so replaying the export
+    /// restores the same ambient headers the original execution saw.
+    pub context_headers: Option<HashMap<String, String>>,
 }
 
 /// History export failure modes.
@@ -187,6 +198,7 @@ pub fn export_history(
             truncation_behavior: "fail".to_string(),
         },
         events,
+        context_headers: request.context_headers,
     };
 
     let actual_bytes = measure_export_bytes(&mut document)?;
@@ -871,6 +883,7 @@ mod tests {
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(64 * 1024),
+            context_headers: None,
         })
         .expect("full export should fit under the limit");
 
@@ -936,6 +949,7 @@ mod tests {
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
+            context_headers: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -989,6 +1003,7 @@ mod tests {
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
+            context_headers: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -1020,6 +1035,7 @@ mod tests {
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(128),
+            context_headers: None,
         })
         .expect_err("oversized full export must fail unless limit is raised");
 

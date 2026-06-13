@@ -59,6 +59,7 @@ fn build_fixture_json(activity_count: usize) -> String {
         workflow_name: "sequential".to_string(),
         execution_id: exec_id,
         events,
+        context_headers: None,
     };
     serde_json::to_string(&snapshot).unwrap()
 }

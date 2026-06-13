@@ -724,6 +724,7 @@ async fn run_shard_tick(
                             exported_at: chrono::Utc::now(),
                             payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
                             max_bytes: Some(usize::MAX),
+                            context_headers: None,
                         };
                         match crate::history_export::export_history(req) {
                             Ok(document) => {

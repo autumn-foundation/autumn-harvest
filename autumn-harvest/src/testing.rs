@@ -222,6 +222,7 @@ impl std::fmt::Display for ReplayReport {
 ///     events: vec![
 ///         WorkflowEvent::WorkflowStarted { input: Value::Null, timestamp: Utc::now() },
 ///     ],
+///     context_headers: None,
 /// };
 /// let json = serde_json::to_string(&snapshot).unwrap();
 /// // Store `json` as a fixture file.

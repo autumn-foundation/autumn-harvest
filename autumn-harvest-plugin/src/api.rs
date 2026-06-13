@@ -13214,6 +13214,9 @@ fn export_history_for_execution(
     events: Vec<WorkflowEvent>,
     query: &HistoryExportQuery,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
+    let context_headers = execution.context_headers.as_ref().and_then(|v| {
+        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+    });
     export_history(HistoryExportRequest {
         workflow_name: execution.workflow_name.clone(),
         execution_id: ExecutionId::from_uuid(execution.id),
@@ -13223,6 +13226,7 @@ fn export_history_for_execution(
         exported_at: chrono::Utc::now(),
         payload_policy: query.payload_policy,
         max_bytes: Some(query.max_bytes),
+        context_headers,
     })
 }
 
@@ -13240,6 +13244,7 @@ fn export_history_for_candidate(
         exported_at: chrono::Utc::now(),
         payload_policy: query.payload_policy,
         max_bytes: Some(query.max_bytes),
+        context_headers: None,
     })
 }
 
