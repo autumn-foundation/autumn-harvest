@@ -115,6 +115,9 @@ pub struct WorkflowExecution {
     pub current_details: Option<String>,
     /// Ambient string key-value context attached at start and propagated to all
     /// activities and child workflows (issue #481). `None` = empty map.
+    /// Skipped in serde output: raw header values may contain auth tokens or
+    /// tenant secrets and must not be exposed via management API responses.
+    #[serde(skip)]
     pub context_headers: Option<serde_json::Value>,
 }
 
@@ -245,6 +248,7 @@ pub struct TaskQueueItem {
     /// Structured capability requirements JSONB payload (issue #382).
     pub required_capabilities: Option<serde_json::Value>,
     /// Ambient context headers propagated from the parent workflow (issue #481).
+    #[serde(skip)]
     pub context_headers: Option<serde_json::Value>,
 }
 

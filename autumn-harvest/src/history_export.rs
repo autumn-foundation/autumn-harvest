@@ -198,7 +198,13 @@ pub fn export_history(
             truncation_behavior: "fail".to_string(),
         },
         events,
-        context_headers: request.context_headers,
+        // Omit header values under Redacted policy — they may contain auth
+        // tokens or tenant secrets that should not appear in shared exports.
+        context_headers: if request.payload_policy == HistoryPayloadPolicy::Redacted {
+            None
+        } else {
+            request.context_headers
+        },
     };
 
     let actual_bytes = measure_export_bytes(&mut document)?;

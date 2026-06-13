@@ -499,6 +499,8 @@ struct CandidateExecution {
     workflow_id: String,
     #[diesel(sql_type = Text)]
     state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+    context_headers: Option<serde_json::Value>,
     #[diesel(sql_type = Nullable<Timestamptz>) ]
     completed_at: Option<DateTime<Utc>>,
 }
@@ -591,7 +593,7 @@ async fn run_shard_tick(
         let candidates = conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(|conn| {
             Box::pin(async move {
                 let rows = diesel::sql_query(
-                    "SELECT id, workflow_name, workflow_id, state, completed_at
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers
                      FROM harvest_workflow_executions
                      WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
                        AND completed_at IS NOT NULL
@@ -724,7 +726,10 @@ async fn run_shard_tick(
                             exported_at: chrono::Utc::now(),
                             payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
                             max_bytes: Some(usize::MAX),
-                            context_headers: None,
+                            context_headers: candidate
+                                .context_headers
+                                .as_ref()
+                                .and_then(|v| serde_json::from_value(v.clone()).ok()),
                         };
                         match crate::history_export::export_history(req) {
                             Ok(document) => {
@@ -1070,6 +1075,7 @@ mod tests {
             workflow_id: "ok".to_string(),
             state: "COMPLETED".to_string(),
             completed_at: Some(Utc::now() - chrono::Duration::days(10)),
+            context_headers: None,
         };
         let candidate_skip = CandidateExecution {
             id: uuid::Uuid::new_v4(),
@@ -1077,6 +1083,7 @@ mod tests {
             workflow_id: "skip".to_string(),
             state: "COMPLETED".to_string(),
             completed_at: Some(Utc::now() - chrono::Duration::days(9)),
+            context_headers: None,
         };
 
         // When evaluating outcome next_cursor logic, if the first candidate completes,

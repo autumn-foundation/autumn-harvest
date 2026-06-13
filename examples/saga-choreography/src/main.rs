@@ -252,6 +252,7 @@ mod tests {
             workflow_name: workflow_name.to_string(),
             execution_id: exec_id,
             events,
+            context_headers: None,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         WorkflowReplayer::new()
