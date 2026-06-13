@@ -108,6 +108,7 @@ async fn handle_webhook_after(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await?;

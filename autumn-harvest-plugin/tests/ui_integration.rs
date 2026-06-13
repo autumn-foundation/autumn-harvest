@@ -374,6 +374,7 @@ async fn insert_workflow_on_url(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -434,6 +435,7 @@ async fn insert_dead_letter_on_url(
             attempts: i32::try_from(ordinal + 1).expect("ordinal fits i32"),
             owner: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -2129,6 +2131,7 @@ async fn insert_child_workflow_on_url(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -2787,6 +2790,7 @@ async fn ui_trigger_preserves_dag_metadata() {
         owner: Some("ui-team"),
         runbook_url: Some("http://ui-runbook"),
         severity: Some("sev3"),
+        context_headers: None,
     };
 
     let dag_catalog =

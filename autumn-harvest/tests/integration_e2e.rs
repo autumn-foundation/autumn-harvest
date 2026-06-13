@@ -531,6 +531,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -586,6 +587,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -3367,6 +3369,7 @@ async fn insert_named_workflow_execution(
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -3902,6 +3905,7 @@ mod reuse_policy_helpers {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }
     }
 
@@ -5153,6 +5157,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -5306,6 +5311,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -6733,6 +6739,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

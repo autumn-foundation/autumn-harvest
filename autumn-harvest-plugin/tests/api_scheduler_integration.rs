@@ -548,6 +548,7 @@ async fn insert_workflow_on_url(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -625,6 +626,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -672,6 +674,7 @@ async fn insert_dead_letter_on_url(
 
             owner: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -698,6 +701,7 @@ fn manual_pipeline_info_named(name: &'static str) -> DagInfo {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     }
 }
 
@@ -781,6 +785,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         })
         .execute(&mut conn)
         .await
@@ -1104,6 +1109,7 @@ async fn seed_scheduled_activity_task_from_url(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         })
         .execute(&mut conn)
         .await
@@ -1854,6 +1860,7 @@ fn manual_pipeline_info() -> DagInfo {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     }
 }
 
@@ -1873,6 +1880,7 @@ fn interval_pipeline_info() -> DagInfo {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     }
 }
 
@@ -1892,6 +1900,7 @@ fn classic_interval_pipeline_info() -> DagInfo {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     }
 }
 
@@ -1929,6 +1938,7 @@ fn unified_manual_dag_info_named(name: &'static str, default_queue: &'static str
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     }
 }
 
@@ -1948,6 +1958,7 @@ fn manual_interval_pipeline_info() -> DagInfo {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     }
 }
 
@@ -3625,6 +3636,7 @@ async fn harvest_api_lists_and_replays_dead_letters() {
 
                 owner: None,
                 severity: None,
+                context_headers: None,
             },
         )
         .await
@@ -4026,6 +4038,7 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }])
         .expect("manual unified DAG should compile"),
     );
@@ -4327,6 +4340,7 @@ async fn harvest_api_rejects_non_dry_run_backfill_for_paused_dag_schedule() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     let workflow_schedule = dag_info
         .as_workflow_schedule()
@@ -4418,6 +4432,7 @@ async fn harvest_api_backfills_legacy_dag_schedule_null_queue_on_dag_default_que
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -4507,6 +4522,7 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     let dag_catalog = Arc::new(
         compile_dag_catalog(vec![dag_info]).expect("scheduled unified DAG should compile"),
@@ -5172,6 +5188,7 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }])
         .expect("unified DAG should compile"),
     );
@@ -5238,6 +5255,7 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -5316,6 +5334,7 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -5421,6 +5440,7 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     }])
     .expect("classic scheduled DAG should compile");
     register_test_schedules(
@@ -5528,6 +5548,7 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5643,6 +5664,7 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5745,6 +5767,7 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5864,6 +5887,7 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }])
         .expect("scheduled unified dag should compile"),
     );
@@ -5911,6 +5935,7 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         }])
         .expect("classic DAG schedule should compile");
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
@@ -6464,6 +6489,7 @@ async fn scheduler_tick_preserves_dag_metadata() {
         owner: Some("ops-team"),
         runbook_url: Some("http://ops-runbook"),
         severity: Some("sev2"),
+        context_headers: None,
     };
     let dag_catalog = Arc::new(compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
 
@@ -6527,6 +6553,7 @@ async fn api_trigger_preserves_dag_metadata() {
         owner: Some("dev-team"),
         runbook_url: Some("http://dev-runbook"),
         severity: Some("sev1"),
+        context_headers: None,
     };
     let dag_catalog = Arc::new(compile_dag_catalog(vec![dag_info]).expect("dag compiles"));
     let registry = Arc::new(HandlerRegistry::new(

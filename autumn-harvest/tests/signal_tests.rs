@@ -110,6 +110,7 @@ async fn test_send_and_load_signals() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -160,6 +161,7 @@ async fn test_mark_signals_consumed() {
         owner: None,
         runbook_url: None,
         severity: None,
+        context_headers: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)

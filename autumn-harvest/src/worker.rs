@@ -1276,7 +1276,7 @@ async fn persist_external_signal_inline(
 /// `LocalActivityFailed` event; on success a `LocalActivityCompleted` event is
 /// appended. Returns all newly-appended events so the caller can extend its
 /// in-memory replay history and avoid a DB round-trip.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_local_activity_inline(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -3859,8 +3859,10 @@ async fn process_activity_task(
                 }
             }
         })
-        .map(std::sync::Arc::new)
-        .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+        .map_or_else(
+            || std::sync::Arc::new(std::collections::HashMap::new()),
+            std::sync::Arc::new,
+        );
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
         Some(heartbeat_tx),

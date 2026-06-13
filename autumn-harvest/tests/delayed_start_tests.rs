@@ -191,6 +191,7 @@ async fn test_delayed_start_validation() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -234,6 +235,7 @@ async fn test_delayed_start_validation() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -331,6 +333,7 @@ async fn test_delayed_start_no_premature_dispatch() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -405,6 +408,7 @@ async fn test_delayed_start_cancel_before_firing() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -486,6 +490,7 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -535,6 +540,7 @@ async fn test_immediate_start_skew_tolerance() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await

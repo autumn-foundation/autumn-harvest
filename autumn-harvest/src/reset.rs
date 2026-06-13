@@ -1076,6 +1076,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
             paused_at: Some(Utc::now()),
             pause_reason: Some("operator pause".into()),
             pause_actor: Some("oncall".into()),

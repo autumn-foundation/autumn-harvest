@@ -267,6 +267,7 @@ async fn seed_execution(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await

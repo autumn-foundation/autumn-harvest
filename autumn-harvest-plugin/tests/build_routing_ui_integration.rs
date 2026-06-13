@@ -591,6 +591,7 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await
@@ -880,6 +881,7 @@ async fn two_build_rolling_deploy_full_lifecycle() {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                context_headers: None,
             },
         )
         .await

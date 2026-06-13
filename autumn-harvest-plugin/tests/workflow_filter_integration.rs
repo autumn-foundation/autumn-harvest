@@ -230,6 +230,7 @@ async fn seed_workflow(
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         },
     )
     .await

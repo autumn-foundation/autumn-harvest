@@ -463,6 +463,7 @@ mod db_tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            context_headers: None,
         };
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&row)

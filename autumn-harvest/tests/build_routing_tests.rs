@@ -485,6 +485,7 @@ mod db_tests {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                context_headers: None,
             })
             .execute(conn)
             .await

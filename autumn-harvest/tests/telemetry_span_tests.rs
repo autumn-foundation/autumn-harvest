@@ -367,6 +367,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     owner: None,
                     runbook_url: None,
                     severity: None,
+                    context_headers: None,
                 },
             )
             .await
@@ -559,6 +560,7 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     telemetry_master_workflow,
                     Value::Null,
                     state,
+                    std::collections::HashMap::new(),
                 )
                 .await;
             });
