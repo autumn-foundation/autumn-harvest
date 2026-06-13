@@ -13357,7 +13357,6 @@ pub(crate) async fn load_stalled_workflows(
                 EXISTS(\
                     SELECT 1 FROM harvest_task_queue \
                     WHERE workflow_exec_id = harvest_workflow_executions.id \
-                    AND task_type = 'activity' \
                     AND state IN ('PENDING','CLAIMED','RUNNING','BACKOFF')\
                 ) \
              OR EXISTS(\

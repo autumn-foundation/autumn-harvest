@@ -244,6 +244,25 @@ async fn add_future_timer(database_url: &str, exec_id: ExecutionId) {
     .expect("insert future timer");
 }
 
+/// Mark any pending `workflow`-type task queue rows as COMPLETED, simulating a worker
+/// having run the workflow function, scheduled a timer, and successfully suspended.
+/// A correctly-sleeping workflow has no runnable tasks in the queue; only the
+/// future-dated timer row keeps it alive.
+async fn complete_workflow_tasks(database_url: &str, exec_id: ExecutionId) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue \
+         SET state = 'COMPLETED' \
+         WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("complete workflow tasks");
+}
+
 /// Add a workflow-started event with the current timestamp (simulates healthy progress).
 async fn touch_workflow(database_url: &str, exec_id: ExecutionId) {
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
@@ -324,6 +343,10 @@ async fn test_sleeping_workflow_excluded_by_default() {
     let app = build_app(&database_url);
 
     let exec_id = seed_stalled_workflow(&database_url, "wf-sleeping", 2).await;
+    // Mark the initial workflow task COMPLETED — simulates the worker having run the
+    // workflow function, scheduled the timer, and suspended cleanly.  A correctly-sleeping
+    // workflow has no runnable tasks in the queue.
+    complete_workflow_tasks(&database_url, exec_id).await;
     add_future_timer(&database_url, exec_id).await;
 
     let (status, body) = get_json(&app, "/workflows?no_progress_minutes=30").await;
@@ -344,6 +367,7 @@ async fn test_sleeping_workflow_included_with_flag() {
     let app = build_app(&database_url);
 
     let exec_id = seed_stalled_workflow(&database_url, "wf-sleeping-inc", 2).await;
+    complete_workflow_tasks(&database_url, exec_id).await;
     add_future_timer(&database_url, exec_id).await;
 
     let (status, body) = get_json(
