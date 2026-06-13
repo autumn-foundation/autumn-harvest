@@ -1796,6 +1796,84 @@ async fn terminate_in_flight_runs(
     Ok(count)
 }
 
+/// Emit the bounded-catchup drop audit (skip metrics + one aggregated decision
+/// row + the `last_catchup_dropped`/`last_catchup_at` recovery columns) for a
+/// recovery tick that dropped `dropped` missed slots.
+///
+/// Call this **only** on a path that commits an advanced `next_run_at` past the
+/// dropped slots (overlap Drop/Buffer early-returns and the dispatch finalize),
+/// never before a fallible dispatch — otherwise a transient failure that leaves
+/// `next_run_at` unchanged would record drops that are then re-recorded when the
+/// same slots are retried (issue #484 / Codex #2174). No-op when `dropped == 0`,
+/// so ordinary (non-recovery) ticks never touch the recovery audit columns.
+#[allow(clippy::too_many_arguments)]
+async fn record_catchup_drops(
+    conn: &mut AsyncPgConnection,
+    metrics: &Arc<dyn crate::telemetry::MetricsRecorder>,
+    schedule_id: uuid::Uuid,
+    wf_name: &str,
+    catchup_policy: crate::policy::CatchupPolicy,
+    catchup_window_secs: Option<i64>,
+    dropped: u64,
+    now: DateTime<Utc>,
+    current_shard: ShardId,
+    claim_token: uuid::Uuid,
+) {
+    use crate::schema::harvest_schedules::dsl;
+
+    // Bound the per-slot counter increments: a long outage on a high-frequency
+    // schedule can drop millions of slots, and looping that many synchronous
+    // recorder calls inside the tick loop would block the scheduler thread and
+    // starve other schedules. The exact drop count is still preserved on the
+    // aggregated decision row and the `last_catchup_dropped` column, so alerting
+    // on `harvest.schedule.skipped` stays meaningful.
+    const MAX_SKIP_METRIC_INCREMENTS: u64 = 1000;
+
+    if dropped == 0 {
+        return;
+    }
+    let metric_increments = dropped.min(MAX_SKIP_METRIC_INCREMENTS);
+    for _ in 0..metric_increments {
+        metrics.record_schedule_skipped("workflow", wf_name, "catchup_window_exceeded");
+    }
+    crate::schedule_decision::record_decision_graceful(
+        conn,
+        Some(&**metrics),
+        Some(schedule_id),
+        wf_name,
+        "workflow",
+        "skipped",
+        "catchup_window_exceeded",
+        Some(serde_json::json!({
+            "catchup_policy": catchup_policy.as_str(),
+            "catchup_window_secs": catchup_window_secs,
+            "dropped": dropped,
+        })),
+        now,
+        now,
+        i16::try_from(current_shard.as_i32()).unwrap_or(0),
+    )
+    .await;
+
+    // Persist the catchup-drop summary as a separate, conditional update — NOT
+    // part of the main finalize update — so ordinary (zero-drop) ticks never
+    // reset this recovery audit trail back to 0 / NULL. Guarded by the HA claim
+    // token (like the final update) so a stale tick that lost its claim cannot
+    // stamp obsolete recovery audit fields over a successor replica's row
+    // (issue #484 / Codex #2297).
+    let _ = diesel::update(
+        dsl::harvest_schedules
+            .find(schedule_id)
+            .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+    )
+    .set((
+        dsl::last_catchup_dropped.eq(i32::try_from(dropped).unwrap_or(i32::MAX)),
+        dsl::last_catchup_at.eq(Some(now)),
+    ))
+    .execute(conn)
+    .await;
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn tick_one_workflow_schedule(
     conn: &mut AsyncPgConnection,
@@ -1931,10 +2009,18 @@ async fn tick_one_workflow_schedule(
             &excluded,
             exclude_weekends,
         ) {
-            None => {
-                // Firing is suppressed. For catchup schedules advance to the next
-                // slot after the excluded date so overdue non-excluded slots are
-                // not dropped; for non-catchup schedules advance from now.
+            None if catchup_plan.run_dates.len() <= 1 => {
+                // The earliest (and only) planned slot is calendar-excluded, so
+                // there is nothing else to fire this tick: suppress and advance.
+                // For catchup schedules advance to the next slot after the
+                // excluded date so overdue non-excluded slots are not dropped; for
+                // non-catchup schedules advance from now.
+                //
+                // A *multi-slot* catchup plan (Window, or Unbounded) is handled by
+                // the `None` fall-through arm below instead: aborting the whole
+                // tick here would strand the later in-window allowed slots, so the
+                // per-slot calendar filter in the dispatch loop skips the excluded
+                // slot(s) and fires the allowed ones (issue #484 / Codex #1867).
                 tracing::info!(
                     workflow_name = %wf_name,
                     calendar = %cal_name,
@@ -1979,6 +2065,12 @@ async fn tick_one_workflow_schedule(
                 .await
                 .map_err(crate::error::database_error)?;
                 return Ok(());
+            }
+            None => {
+                // Multi-slot catchup plan whose earliest slot is calendar-excluded:
+                // do not abort the tick. Fall through so the dispatch loop applies
+                // per-slot calendar filtering (skipping excluded slots and firing
+                // the later allowed ones in the same bounded window).
             }
             Some(_adjusted) => {
                 // Firing proceeds on `_adjusted` day. Do NOT rebase `logical_date`
@@ -2157,70 +2249,21 @@ async fn tick_one_workflow_schedule(
     // `logical_date`); recomputing here from the rebound anchor would zero the
     // dropped count.
     //
-    // This must run *before* the overlap branch below: when a MostRecent /
-    // Window policy drops older missed slots but the schedule is also at
-    // `max_active_runs`, the overlap branch returns early (Drop / Buffer), so
-    // recording the catchup drops after it would silently lose them and the
-    // recovery API would report zero drops for a recovery that did drop
-    // (issue #484 / Codex #2297). Recording the drops is independent of the
-    // overlap decision, so it is correct to emit them here unconditionally.
+    // The catchup-drop audit (skip metrics + decision row + `last_catchup_*`
+    // columns) is NOT emitted here. It is emitted via `record_catchup_drops`
+    // only on the paths that actually *commit* an advanced `next_run_at` past
+    // the dropped slots — the overlap Drop/Buffer early-returns (issue #484 /
+    // Codex #2297) and the dispatch finalize below. A transient
+    // `start_or_load_workflow_execution` failure returns `Err` before the
+    // finalize and leaves `next_run_at` unchanged, so those slots are retried on
+    // the next tick; emitting the audit here (before the fallible dispatch) would
+    // produce false/duplicated recovery data for slots that were not durably
+    // dropped (issue #484 / Codex #2174).
     let CatchupPlan {
         run_dates,
         next_run_at: next_run_after_plan,
         dropped: catchup_slots_dropped,
     } = catchup_plan;
-    // Record a skip metric for each dropped slot and one aggregated decision
-    // row so operators have a full audit trail.
-    if catchup_slots_dropped > 0 {
-        // Bound the per-slot counter increments: a long outage on a
-        // high-frequency schedule can drop millions of slots, and looping that
-        // many synchronous recorder calls inside the tick loop would block the
-        // scheduler thread and starve other schedules. The exact drop count is
-        // still preserved on the aggregated decision row and the
-        // `last_catchup_dropped` column below, so alerting on
-        // `harvest.schedule.skipped` stays meaningful.
-        const MAX_SKIP_METRIC_INCREMENTS: u64 = 1000;
-        let metric_increments = catchup_slots_dropped.min(MAX_SKIP_METRIC_INCREMENTS);
-        for _ in 0..metric_increments {
-            metrics.record_schedule_skipped("workflow", wf_name, "catchup_window_exceeded");
-        }
-        crate::schedule_decision::record_decision_graceful(
-            conn,
-            Some(&**metrics),
-            Some(schedule.id),
-            wf_name,
-            "workflow",
-            "skipped",
-            "catchup_window_exceeded",
-            Some(serde_json::json!({
-                "catchup_policy": catchup_policy.as_str(),
-                "catchup_window_secs": schedule.catchup_window_secs,
-                "dropped": catchup_slots_dropped,
-            })),
-            now,
-            now,
-            i16::try_from(current_shard.as_i32()).unwrap_or(0),
-        )
-        .await;
-
-        // Persist the catchup-drop summary as a separate, conditional update —
-        // NOT part of the main finalize update below — so ordinary (zero-drop)
-        // ticks never reset this recovery audit trail back to 0 / NULL.
-        // Guarded by the HA claim token (like the final update) so a stale tick
-        // that lost its claim cannot stamp obsolete recovery audit fields over a
-        // successor replica's row (issue #484 / Codex #2297).
-        let _ = diesel::update(
-            dsl::harvest_schedules
-                .find(schedule.id)
-                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
-        )
-        .set((
-            dsl::last_catchup_dropped.eq(i32::try_from(catchup_slots_dropped).unwrap_or(i32::MAX)),
-            dsl::last_catchup_at.eq(Some(now)),
-        ))
-        .execute(conn)
-        .await;
-    }
 
     let mut running: i64 = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(wf_name))
@@ -2239,6 +2282,22 @@ async fn tick_one_workflow_schedule(
 
         match action {
             OverlapAction::Drop { reason } => {
+                // Committing path (next_run_at advances past — or is retained at
+                // the policy-approved slot beyond — the dropped slots), so emit
+                // the catchup-drop audit here (issue #484 / Codex #2297).
+                record_catchup_drops(
+                    conn,
+                    metrics,
+                    schedule.id,
+                    wf_name,
+                    catchup_policy,
+                    schedule.catchup_window_secs,
+                    catchup_slots_dropped,
+                    now,
+                    current_shard,
+                    claim_token,
+                )
+                .await;
                 tracing::info!(
                     workflow_name = %wf_name,
                     running,
@@ -2294,6 +2353,21 @@ async fn tick_one_workflow_schedule(
                 return Ok(());
             }
             OverlapAction::Buffer { fire_time } => {
+                // Committing path (next_run_at advances past the dropped slots),
+                // so emit the catchup-drop audit here (issue #484 / Codex #2297).
+                record_catchup_drops(
+                    conn,
+                    metrics,
+                    schedule.id,
+                    wf_name,
+                    catchup_policy,
+                    schedule.catchup_window_secs,
+                    catchup_slots_dropped,
+                    now,
+                    current_shard,
+                    claim_token,
+                )
+                .await;
                 buffered.push(fire_time);
                 tracing::info!(
                     workflow_name = %wf_name,
@@ -2742,6 +2816,24 @@ async fn tick_one_workflow_schedule(
         effective_next_run_at
     };
 
+    // Dispatch reached the commit point without a `start_or_load` error: the
+    // dropped slots are now durably past `next_run_at`, so emit the catchup-drop
+    // audit here (and only here on the dispatch path) — never before the fallible
+    // dispatch loop above (issue #484 / Codex #2174).
+    record_catchup_drops(
+        conn,
+        metrics,
+        schedule.id,
+        wf_name,
+        catchup_policy,
+        schedule.catchup_window_secs,
+        catchup_slots_dropped,
+        now,
+        current_shard,
+        claim_token,
+    )
+    .await;
+
     // Use a DB-side runs_started + dispatched expression so that concurrent manual
     // trigger pre-increments (which are not blocked by the HA claim) are preserved
     // rather than overwritten by this stale in-memory value (issue #478).
@@ -2897,6 +2989,17 @@ fn due_run_plan(
 
 // ── Bounded catchup planning (issue #484) ────────────────────────────────────
 
+/// Maximum number of cron occurrences a single tick will walk when computing a
+/// bounded-catchup plan (issue #484 / Codex #3069).
+///
+/// Interval schedules use closed-form O(1) arithmetic and never reach this cap.
+/// Cron schedules have no closed form, so a second-resolution cron left down for
+/// days could otherwise issue millions of `next_run_after` calls in one tick and
+/// stall the scheduler thread. When the cap is hit the walk yields a partial
+/// summary and resumes from where it stopped on the next tick, so the schedule
+/// drains a bounded number of slots per tick until it catches up.
+const MAX_CATCHUP_CRON_SCAN: u64 = 100_000;
+
 /// Output of [`catchup_run_plan`].
 pub(crate) struct CatchupPlan {
     /// Slots to actually dispatch, in chronological order.
@@ -2976,9 +3079,20 @@ pub(crate) fn catchup_run_plan(
             let summary = eligible_slot_summary(schedule, first_due, now, end_at);
             let run_dates = window_eligible_slots(schedule, first_due, now, end_at, cutoff);
             let fired = run_dates.len() as u64;
+            // Window fires its whole bounded set in a single tick, so `next_run_at`
+            // must always advance strictly past `now`. For interval schedules the
+            // summary's arithmetic value already does (it never reaches the cron
+            // scan cap); for cron schedules compute the next occurrence directly so
+            // a capped count walk (issue #484 / Codex #3069) can't drag `next_run_at`
+            // back to a `<= now` resume cursor and re-fire the in-window slots.
+            let next_run_at = if interval_period(schedule).is_some() {
+                summary.next_run_at
+            } else {
+                next_run_after(schedule, now)
+            };
             CatchupPlan {
                 run_dates,
-                next_run_at: summary.next_run_at,
+                next_run_at,
                 dropped: summary.eligible_count.saturating_sub(fired),
             }
         }
@@ -3063,9 +3177,19 @@ fn eligible_slot_summary(
 
     // Cron (or sub-second / overflowing interval): walk, retaining only the
     // count and the last eligible slot — never the full slot vector.
+    //
+    // The walk is bounded by `MAX_CATCHUP_CRON_SCAN` per tick (issue #484 /
+    // Codex #3069): a second-resolution cron schedule left down for days would
+    // otherwise issue millions of `next_run_after` calls in a single tick and
+    // stall the scheduler thread. When the cap is hit we return the partial
+    // summary; `next_run_at` points at the cursor we stopped on (still `<= now`),
+    // so the next tick resumes the walk from there and the schedule drains a
+    // bounded number of slots per tick until it catches up. Interval schedules
+    // never reach this path (they use the O(1) arithmetic above).
     let mut cursor = first_due;
     let mut count: u64 = 0;
     let mut last_eligible = None;
+    let mut scanned: u64 = 0;
     loop {
         if cursor > now {
             return EligibleSummary {
@@ -3077,6 +3201,17 @@ fn eligible_slot_summary(
         if end_at.is_none_or(|e| cursor < e) {
             count += 1;
             last_eligible = Some(cursor);
+        }
+        scanned += 1;
+        if scanned >= MAX_CATCHUP_CRON_SCAN {
+            // Cap hit: resume from `cursor` on the next tick rather than walking
+            // the full backlog in one shot.
+            let next = next_run_after(schedule, cursor);
+            return EligibleSummary {
+                eligible_count: count,
+                last_eligible,
+                next_run_at: next,
+            };
         }
         let Some(next) = next_run_after(schedule, cursor) else {
             return EligibleSummary {
@@ -3125,8 +3260,17 @@ fn window_eligible_slots(
         }
     }
 
-    // Cron fallback: walk and keep only the in-window, eligible slots.
-    let mut cursor = first_due;
+    // Cron fallback: walk and keep only the in-window, eligible slots. Jump
+    // straight to the first occurrence at/after the window cutoff so a long
+    // pre-window backlog is not walked one slot at a time (issue #484 /
+    // Codex #3069); the in-window set itself is bounded by the operator-chosen
+    // window, so collecting it is intentional. Using `cutoff - 1ns` makes the
+    // jump inclusive of an occurrence landing exactly on the cutoff.
+    let mut cursor = if cutoff > first_due {
+        next_run_after(schedule, cutoff - chrono::Duration::nanoseconds(1)).unwrap_or(first_due)
+    } else {
+        first_due
+    };
     let mut slots = Vec::new();
     loop {
         if cursor > now {
@@ -4007,6 +4151,46 @@ mod tests {
 
         // A zero window fires the slot at exactly `first_due = now`.
         assert!(!plan.run_dates.is_empty(), "slot at now should still fire");
+    }
+
+    #[test]
+    fn catchup_run_plan_window_cron_jump_starts_at_cutoff() {
+        use crate::policy::CatchupPolicy;
+        // Hourly cron, down for 7 days. A 2-hour window must fire only the in-
+        // window slots; the long pre-window backlog must NOT block the bounded
+        // result (issue #484 / Codex #3069 — `window_eligible_slots` jump-starts
+        // the cron walk at the window cutoff instead of walking from first_due).
+        let schedule = Schedule::Cron("0 * * * *".to_string()); // top of every hour
+        let now = parse_utc("2026-04-08T00:00:00Z");
+        let first_due = now - chrono::Duration::days(7);
+        let window = Duration::from_secs(2 * 3600); // 2 hours
+
+        let plan = catchup_run_plan(
+            Some(&schedule),
+            first_due,
+            now,
+            CatchupPolicy::Window(window),
+            None,
+        );
+
+        // Cutoff = now - 2h = 2026-04-07T22:00:00Z (inclusive): 22:00, 23:00, 00:00.
+        assert_eq!(
+            plan.run_dates,
+            vec![
+                parse_utc("2026-04-07T22:00:00Z"),
+                parse_utc("2026-04-07T23:00:00Z"),
+                parse_utc("2026-04-08T00:00:00Z"),
+            ],
+            "Window must fire exactly the in-window hourly slots"
+        );
+        // The whole bounded set fires this tick, so next_run_at advances past now.
+        assert_eq!(
+            plan.next_run_at,
+            Some(parse_utc("2026-04-08T01:00:00Z")),
+            "cron Window next_run_at must be the next occurrence strictly after now"
+        );
+        // 7d hourly + slot at now = 169 eligible; 3 fired ⇒ 166 dropped.
+        assert_eq!(plan.dropped, 166, "older out-of-window slots are dropped");
     }
 
     #[test]
