@@ -191,21 +191,21 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .unwrap_or_default();
                             let __upstreams: ::std::vec::Vec<usize> =
                                 __tasks[__task_idx].upstreams.clone();
-                            let __trigger_rule = __tasks[__task_idx].trigger_rule.clone();
                             let __retry_override = __tasks[__task_idx].retry_policy.clone();
                             let __stc_override = __tasks[__task_idx].start_to_close;
 
-                            let __ups: ::std::vec::Vec<
-                                ::autumn_harvest::policy::TaskStatus,
-                            > = __upstreams
-                                .iter()
-                                .map(|&__i| __statuses[__i])
-                                .collect();
-                            let __should_run: bool = __trigger_rule.should_run(&__ups);
-
-                            if !__should_run {
-                                __statuses[__task_idx] = ::autumn_harvest::policy::TaskStatus::Skipped;
-                                continue;
+                            match __tasks[__task_idx].dispatch_decision(&__statuses, &__outputs) {
+                                ::autumn_harvest::DagDispatchDecision::SkipByTriggerRule => {
+                                    __statuses[__task_idx] = ::autumn_harvest::policy::TaskStatus::Skipped;
+                                    continue;
+                                }
+                                ::autumn_harvest::DagDispatchDecision::SkipByCondition => {
+                                    ctx.dag_skip_marker(__task_idx, &__activity_name)
+                                        .map_err(|e| e.to_string())?;
+                                    __statuses[__task_idx] = ::autumn_harvest::policy::TaskStatus::Skipped;
+                                    continue;
+                                }
+                                ::autumn_harvest::DagDispatchDecision::Run => {}
                             }
 
                             let __map_upstream_opt = __tasks[__task_idx].map_upstream;
@@ -522,24 +522,23 @@ fn emit_workflow_companion(
                                     .unwrap_or_default();
                                 let __upstreams: ::std::vec::Vec<usize> =
                                     __tasks[__task_idx].upstreams.clone();
-                                let __trigger_rule =
-                                    __tasks[__task_idx].trigger_rule.clone();
                                 let __retry_override =
                                     __tasks[__task_idx].retry_policy.clone();
                                 let __stc_override =
                                     __tasks[__task_idx].start_to_close;
 
-                                let __ups: ::std::vec::Vec<
-                                    ::autumn_harvest::policy::TaskStatus,
-                                > = __upstreams
-                                    .iter()
-                                    .map(|&__i| __statuses[__i])
-                                    .collect();
-                                let __should_run: bool = __trigger_rule.should_run(&__ups);
-
-                                if !__should_run {
-                                    __statuses[__task_idx] = ::autumn_harvest::policy::TaskStatus::Skipped;
-                                    continue; // skip to next task in this level
+                                match __tasks[__task_idx].dispatch_decision(&__statuses, &__outputs) {
+                                    ::autumn_harvest::DagDispatchDecision::SkipByTriggerRule => {
+                                        __statuses[__task_idx] = ::autumn_harvest::policy::TaskStatus::Skipped;
+                                        continue;
+                                    }
+                                    ::autumn_harvest::DagDispatchDecision::SkipByCondition => {
+                                        ctx.dag_skip_marker(__task_idx, &__activity_name)
+                                            .map_err(|e| e.to_string())?;
+                                        __statuses[__task_idx] = ::autumn_harvest::policy::TaskStatus::Skipped;
+                                        continue;
+                                    }
+                                    ::autumn_harvest::DagDispatchDecision::Run => {}
                                 }
 
                                 let __map_upstream_opt = __tasks[__task_idx].map_upstream;

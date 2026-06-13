@@ -3336,6 +3336,57 @@ impl WorkflowContext {
         }
     }
 
+    /// Record or verify a condition-skip decision for a DAG node in event history.
+    ///
+    /// Called by the unified-DAG dispatch loop when a node's condition predicate
+    /// returns `false`.  On **live execution** (past end of history) it pushes a
+    /// `RecordMarker` command so future replays know the branch decision.  On
+    /// **replay** it matches the existing `MarkerRecorded` event; if the event
+    /// at the cursor position is something else (the condition returned a
+    /// different value than during the first run), a `NonDeterministic` error is
+    /// returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NonDeterministic`] when the recorded history
+    /// diverges from the current code — the condition predicate is not a pure
+    /// function of upstream outputs, or a code change altered the branch
+    /// decision for an in-flight execution.
+    pub fn dag_skip_marker(&self, task_index: usize, activity_name: &str) -> HarvestResult<()> {
+        let marker_name = format!("dag_skip:{task_index}");
+        let match_result = self.match_history(|m| m.match_named_marker(&marker_name));
+        match match_result {
+            HistoryMatch::NoMatch => {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: marker_name,
+                    details: serde_json::json!({
+                        "task": activity_name,
+                        "reason": "condition_false"
+                    }),
+                });
+                Ok(())
+            }
+            HistoryMatch::Matched { .. } => Ok(()),
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!(
+                    "dag condition skip for task {task_index} ({activity_name}) diverged from \
+                     history — the condition predicate must be a pure function of upstream outputs \
+                     and must not change across deploys for in-flight executions; \
+                     use ctx.version() to guard branch changes: \
+                     expected {expected}, got {actual}"
+                ),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+            _ => unreachable!("match_named_marker only returns Matched, NoMatch, or Diverged"),
+        }
+    }
+
     /// Execute N activities **in parallel** (fail-fast variant).
     ///
     /// Dispatches every `(name, input, queue)` tuple concurrently and returns

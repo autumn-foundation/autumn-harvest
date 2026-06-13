@@ -193,7 +193,10 @@ pub use context::{
     WorkflowHistoryPolicy,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
-pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagMapTaskRef, DagTask, DagTaskRef};
+pub use dag::{
+    DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
+    DagTask, DagTaskRef,
+};
 pub use dag_export::{export_dot, export_mermaid};
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,

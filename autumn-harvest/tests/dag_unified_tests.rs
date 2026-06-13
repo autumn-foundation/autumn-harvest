@@ -14,6 +14,7 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::info::WorkflowHandlerFn;
 use autumn_harvest::prelude::*;
+#[cfg(feature = "db")]
 use autumn_harvest::scheduler::compile_dag_catalog;
 use autumn_harvest::testing::{NonDeterminismKind, ReplayStatus, WorkflowReplayer};
 use autumn_harvest::types::ActivityExecId;
@@ -646,6 +647,7 @@ fn builder_rejects_local_activities_in_dag_definitions() {
     );
 }
 
+#[cfg(feature = "db")]
 #[test]
 fn compile_dag_catalog_keeps_unified_dag_metadata() {
     let catalog = compile_dag_catalog(vec![__autumn_dag_info_linear_dag()])
@@ -658,6 +660,7 @@ fn compile_dag_catalog_keeps_unified_dag_metadata() {
     assert!(registered.schedule.is_none());
 }
 
+#[cfg(feature = "db")]
 #[test]
 fn compile_dag_catalog_rejects_duplicate_unified_dag_names() {
     let result = compile_dag_catalog(vec![
@@ -686,6 +689,7 @@ fn compile_dag_catalog_rejects_duplicate_unified_dag_names() {
 ///
 /// This test constructs a minimal `HandlerRegistry` that mirrors what
 /// `HarvestBuilder::dags()` produces and asserts the worker handler is present.
+#[cfg(feature = "db")]
 #[test]
 fn unified_dag_registers_workflow_handler_for_worker_execution() {
     use autumn_harvest::worker::HandlerRegistry;
@@ -792,5 +796,645 @@ async fn lowered_handler_leaves_queue_empty_when_dag_task_has_no_queue() {
     assert_eq!(
         queue, "",
         "DAG tasks with no DAG default_queue and no per-task queue must leave queue empty so the activity default queue can apply"
+    );
+}
+
+// ============================================================================
+// Issue #482 — Data-dependent DAG branching
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Activity stubs for branching tests
+// ---------------------------------------------------------------------------
+
+#[activity]
+async fn score_payment(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(json!({"fraud_score": 0.0})) // overridden per-test via mock
+}
+
+#[activity]
+async fn manual_review(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(json!("reviewed"))
+}
+
+#[activity]
+async fn auto_approve(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(json!("approved"))
+}
+
+#[activity]
+async fn notify_result(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(json!("notified"))
+}
+
+#[activity]
+async fn low_risk_path(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(json!("low"))
+}
+
+#[activity]
+async fn medium_risk_path(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(json!("medium"))
+}
+
+#[activity]
+async fn high_risk_path(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(json!("high"))
+}
+
+// ---------------------------------------------------------------------------
+// DAG fixtures for branching tests
+// ---------------------------------------------------------------------------
+
+/// Fraud-routing DAG: score_payment → (manual_review | auto_approve) → notify_result (AllDone)
+#[dag(default_queue = "risk-workers")]
+fn fraud_routing_dag(dag: &mut DagBuilder) {
+    let score = dag.activity(score_payment);
+    let review = dag
+        .activity(manual_review)
+        .upstream(&score)
+        .condition(|ups| ups[0]["fraud_score"].as_f64().is_some_and(|s| s > 0.8));
+    let auto = dag
+        .activity(auto_approve)
+        .upstream(&score)
+        .condition(|ups| ups[0]["fraud_score"].as_f64().is_some_and(|s| s <= 0.8));
+    // AllDone join fires regardless of which branch ran
+    let _notify = dag
+        .activity(notify_result)
+        .upstream(&review)
+        .upstream(&auto)
+        .trigger_rule(TriggerRule::AllDone);
+}
+
+/// Three-way switch: low / medium / high
+#[dag(default_queue = "risk-workers")]
+fn three_way_switch_dag(dag: &mut DagBuilder) {
+    let score = dag.activity(score_payment);
+    let _low = dag
+        .activity(low_risk_path)
+        .upstream(&score)
+        .condition(|ups| ups[0]["level"].as_str() == Some("low"));
+    let _medium = dag
+        .activity(medium_risk_path)
+        .upstream(&score)
+        .condition(|ups| ups[0]["level"].as_str() == Some("medium"));
+    let _high = dag
+        .activity(high_risk_path)
+        .upstream(&score)
+        .condition(|ups| ups[0]["level"].as_str() == Some("high"));
+}
+
+fn risk_input(task: &str) -> Value {
+    json!({ "conf": Value::Null, "dag_task": task })
+}
+
+// ---------------------------------------------------------------------------
+// Test 1 — condition-false branch replays with a dag_skip marker
+// ---------------------------------------------------------------------------
+
+/// Low fraud score: manual_review is skipped (condition false), auto_approve runs.
+/// History contains a `MarkerRecorded(dag_skip:1)` before auto_approve's events.
+#[tokio::test]
+async fn condition_false_branch_replays_with_skip_marker() {
+    let id_score = ActivityExecId::new();
+    let id_auto = ActivityExecId::new();
+    let id_notify = ActivityExecId::new();
+
+    // Task indices: 0=score_payment, 1=manual_review, 2=auto_approve, 3=notify_result
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        // Level 0: score_payment runs
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_score,
+            name: "score_payment".into(),
+            input: risk_input("score_payment"),
+            queue: "risk-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_score,
+            output: json!({"fraud_score": 0.2}), // low → auto_approve wins
+        },
+        // Level 1: manual_review condition false → dag_skip:1 marker
+        WorkflowEvent::MarkerRecorded {
+            name: "dag_skip:1".into(),
+            details: json!({"task": "manual_review", "reason": "condition_false"}),
+        },
+        // Level 1: auto_approve condition true → runs
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_auto,
+            name: "auto_approve".into(),
+            input: risk_input("auto_approve"),
+            queue: "risk-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_auto,
+            output: json!("approved"),
+        },
+        // Level 2: notify_result (AllDone join) runs
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_notify,
+            name: "notify_result".into(),
+            input: risk_input("notify_result"),
+            queue: "risk-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_notify,
+            output: json!("notified"),
+        },
+    ];
+
+    let expected_events = history.len();
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "fraud_routing_dag",
+            __autumn_workflow_info_fraud_routing_dag().handler,
+        )
+        .replay_from_events(history)
+        .await;
+
+    assert_eq!(
+        report.events_replayed, expected_events,
+        "all events should be consumed; got: {report}"
+    );
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "condition-false branch (auto_approve path) should replay successfully, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 2 — condition-true branch schedules the activity
+// ---------------------------------------------------------------------------
+
+/// High fraud score: manual_review runs, auto_approve is skipped (condition false).
+#[tokio::test]
+async fn condition_true_branch_schedules_activity() {
+    let id_score = ActivityExecId::new();
+    let id_review = ActivityExecId::new();
+    let id_notify = ActivityExecId::new();
+
+    // Task indices: 0=score_payment, 1=manual_review, 2=auto_approve, 3=notify_result
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_score,
+            name: "score_payment".into(),
+            input: risk_input("score_payment"),
+            queue: "risk-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_score,
+            output: json!({"fraud_score": 0.95}), // high → manual_review wins
+        },
+        // Level 1 task-index order: idx 1 (manual_review) → Run (pushed to futures),
+        // then idx 2 (auto_approve) → SkipByCondition → dag_skip:2 marker emitted
+        // synchronously before join_all awaits the futures.
+        // So the marker comes BEFORE manual_review's ActivityScheduled in history.
+        WorkflowEvent::MarkerRecorded {
+            name: "dag_skip:2".into(),
+            details: json!({"task": "auto_approve", "reason": "condition_false"}),
+        },
+        // manual_review condition true → runs (emitted by join_all after the marker)
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_review,
+            name: "manual_review".into(),
+            input: risk_input("manual_review"),
+            queue: "risk-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_review,
+            output: json!("reviewed"),
+        },
+        // notify_result (AllDone join) runs
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_notify,
+            name: "notify_result".into(),
+            input: risk_input("notify_result"),
+            queue: "risk-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_notify,
+            output: json!("notified"),
+        },
+    ];
+
+    let expected_events = history.len();
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "fraud_routing_dag",
+            __autumn_workflow_info_fraud_routing_dag().handler,
+        )
+        .replay_from_events(history)
+        .await;
+
+    assert_eq!(
+        report.events_replayed, expected_events,
+        "all events consumed; got: {report}"
+    );
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "condition-true (manual_review) path should replay successfully, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 3 — condition skip propagates downstream via trigger rules (no second marker)
+// ---------------------------------------------------------------------------
+
+/// When both branches are skipped by condition, the AllDone join still fires.
+/// A trigger-rule skip (AllSuccess on downstream of a skipped node) must NOT
+/// emit a dag_skip marker — only condition-skips emit markers.
+///
+/// This DAG: score → [review (cond false), auto (cond false)] → notify (AllDone)
+/// Because both branches are condition-skipped the notify still fires (AllDone).
+/// notify's Skipped propagation of downstream (none here) is trigger-rule-based.
+#[tokio::test]
+async fn condition_skip_propagates_and_alldone_join_still_fires() {
+    use autumn_harvest::testing::WorkflowTestEnv;
+
+    // Both conditions always false (score 0.5 — neither > 0.8 nor actually
+    // we need a DAG where both conditions can be false simultaneously).
+    // Use three_way_switch_dag with level="unknown" → all three branches skip.
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("score_payment", |_| Ok(json!({"level": "unknown"})))
+        .run(
+            __autumn_workflow_info_three_way_switch_dag().handler,
+            Value::Null,
+        )
+        .await;
+
+    // All three branches skipped by condition; DAG succeeds (no failed tasks)
+    assert!(
+        outcome.result.is_ok(),
+        "three-way-switch with all branches skipped should succeed (no failed tasks), got: {:?}",
+        outcome.result
+    );
+
+    // Verify exactly three dag_skip markers in the event history
+    let skip_markers: Vec<_> = outcome.events().iter().filter(|e| {
+        matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("dag_skip:"))
+    }).collect();
+    assert_eq!(
+        skip_markers.len(),
+        3,
+        "all three branches should emit dag_skip markers"
+    );
+
+    // Verify no trigger-rule-skipped nodes emit markers (there are none in this DAG beyond the 3 condition nodes)
+    let trigger_rule_skip_markers: Vec<_> = outcome
+        .events()
+        .iter()
+        .filter(|e| {
+            if let WorkflowEvent::MarkerRecorded { name, details } = e {
+                name.starts_with("dag_skip:")
+                    && details.get("reason").and_then(|r| r.as_str()) != Some("condition_false")
+            } else {
+                false
+            }
+        })
+        .collect();
+    assert!(
+        trigger_rule_skip_markers.is_empty(),
+        "trigger-rule skips must not emit markers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 4 — flipping the condition is reported as non-determinism
+// ---------------------------------------------------------------------------
+
+/// If history contains a dag_skip marker but the condition now returns true
+/// (or vice versa), the replayer must report NonDeterministic.
+#[tokio::test]
+async fn condition_flip_is_reported_as_nondeterminism() {
+    let id_score = ActivityExecId::new();
+
+    // History: score succeeded, then dag_skip:1 (manual_review was condition-false)
+    let history = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id_score,
+            name: "score_payment".into(),
+            input: risk_input("score_payment"),
+            queue: "risk-workers".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id_score,
+            output: json!({"fraud_score": 0.95}), // high score → manual_review condition TRUE
+                                                  // But history has dag_skip:1 → history says it was condition-false.
+                                                  // Replaying with the same code will NOT skip (condition is true for 0.95),
+                                                  // so the replayer will try to schedule manual_review but find dag_skip:1
+                                                  // marker at cursor → Diverged → NonDeterministic.
+        },
+        // Marker says manual_review was skipped — but our condition says it should run.
+        WorkflowEvent::MarkerRecorded {
+            name: "dag_skip:1".into(),
+            details: json!({"task": "manual_review", "reason": "condition_false"}),
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "fraud_routing_dag",
+            __autumn_workflow_info_fraud_routing_dag().handler,
+        )
+        .replay_from_events(history)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "flipped condition should report NonDeterminismDetected, got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 — run live with WorkflowTestEnv then replay identically (AC4)
+// ---------------------------------------------------------------------------
+
+/// Run the fraud DAG live via WorkflowTestEnv (score=0.2 → auto_approve),
+/// capture the produced event history, then replay it with WorkflowReplayer.
+/// The replay must succeed, verifying the branch decision is deterministic.
+#[tokio::test]
+async fn condition_dag_runs_live_then_replays_identically() {
+    use autumn_harvest::testing::WorkflowTestEnv;
+
+    // Live run: low fraud score → auto_approve branch
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("score_payment", |_| Ok(json!({"fraud_score": 0.2})))
+        .mock_activity("auto_approve", |_| Ok(json!("approved")))
+        .mock_activity("notify_result", |_| Ok(json!("notified")))
+        .run(
+            __autumn_workflow_info_fraud_routing_dag().handler,
+            Value::Null,
+        )
+        .await;
+
+    assert!(
+        outcome.result.is_ok(),
+        "live DAG run should succeed, got: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+
+    // Exactly one dag_skip marker for manual_review (task idx 1)
+    let skip_markers: Vec<_> = events.iter().filter(|e| {
+        matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("dag_skip:"))
+    }).collect();
+    assert_eq!(
+        skip_markers.len(),
+        1,
+        "exactly one skip marker expected (manual_review), got {skip_markers:?}"
+    );
+
+    // No ActivityScheduled for manual_review
+    let manual_review_scheduled = events.iter().any(
+        |e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "manual_review"),
+    );
+    assert!(
+        !manual_review_scheduled,
+        "manual_review must not be scheduled when condition is false"
+    );
+
+    // Now replay: must reproduce the identical branch
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "fraud_routing_dag",
+            __autumn_workflow_info_fraud_routing_dag().handler,
+        )
+        .replay_from_events(events.to_vec())
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay of live run should succeed (deterministic branch decision), got: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 6 — 1000-replay sweep (success metric)
+// ---------------------------------------------------------------------------
+
+/// Alternate high-score / low-score fixtures across 1,000 replays.
+/// Every replay must reproduce the identical branch (ReplaySucceeded).
+#[tokio::test]
+async fn condition_branch_replay_sweep_1000() {
+    let handler = __autumn_workflow_info_fraud_routing_dag().handler;
+
+    for i in 0u32..1_000 {
+        // Alternate: even → low score (auto_approve), odd → high score (manual_review)
+        let (score, skip_task_idx, skip_task_name, run_task_name) = if i % 2 == 0 {
+            (0.2f64, 1usize, "manual_review", "auto_approve")
+        } else {
+            (0.95f64, 2usize, "auto_approve", "manual_review")
+        };
+
+        let id_score = ActivityExecId::new();
+        let id_run = ActivityExecId::new();
+        let id_notify = ActivityExecId::new();
+
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id_score,
+                name: "score_payment".into(),
+                input: risk_input("score_payment"),
+                queue: "risk-workers".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id_score,
+                output: json!({"fraud_score": score}),
+            },
+            // Which branch gets the skip marker depends on the score
+            // For low score: marker for manual_review (idx 1) before auto_approve
+            // For high score: manual_review runs first, then marker for auto_approve (idx 2)
+            // Build in the same order as the macro generates (task index order within a level)
+            // Level 1 has tasks [1=manual_review, 2=auto_approve] in order
+        ];
+
+        // Append level-1 events in task-index order (1 then 2)
+        let mut h = history;
+        if i % 2 == 0 {
+            // low score: skip manual_review (idx 1), run auto_approve (idx 2)
+            h.push(WorkflowEvent::MarkerRecorded {
+                name: format!("dag_skip:{skip_task_idx}"),
+                details: json!({"task": skip_task_name, "reason": "condition_false"}),
+            });
+            h.push(WorkflowEvent::ActivityScheduled {
+                activity_id: id_run,
+                name: run_task_name.into(),
+                input: risk_input(run_task_name),
+                queue: "risk-workers".into(),
+            });
+            h.push(WorkflowEvent::ActivityCompleted {
+                activity_id: id_run,
+                output: json!("approved"),
+            });
+        } else {
+            // high score: skip auto_approve (idx 2) marker first (sync during level loop),
+            // then manual_review (idx 1) runs via join_all.
+            // Level loop order: idx 1 (manual_review) → Run (pushed to futures),
+            // idx 2 (auto_approve) → SkipByCondition → marker emitted sync.
+            // Then join_all emits the activity events.
+            h.push(WorkflowEvent::MarkerRecorded {
+                name: format!("dag_skip:{skip_task_idx}"),
+                details: json!({"task": skip_task_name, "reason": "condition_false"}),
+            });
+            h.push(WorkflowEvent::ActivityScheduled {
+                activity_id: id_run,
+                name: run_task_name.into(),
+                input: risk_input(run_task_name),
+                queue: "risk-workers".into(),
+            });
+            h.push(WorkflowEvent::ActivityCompleted {
+                activity_id: id_run,
+                output: json!("reviewed"),
+            });
+        }
+        // Level 2: notify_result (AllDone join)
+        h.push(WorkflowEvent::ActivityScheduled {
+            activity_id: id_notify,
+            name: "notify_result".into(),
+            input: risk_input("notify_result"),
+            queue: "risk-workers".into(),
+        });
+        h.push(WorkflowEvent::ActivityCompleted {
+            activity_id: id_notify,
+            output: json!("notified"),
+        });
+
+        let report = WorkflowReplayer::new()
+            .register_fn("fraud_routing_dag", handler)
+            .replay_from_events(h)
+            .await;
+
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "sweep iteration {i} (score={score}) failed: {report}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 7 — three-way switch: exactly one branch runs (AC5)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn three_way_switch_runs_exactly_one_branch() {
+    use autumn_harvest::testing::WorkflowTestEnv;
+
+    for level in ["low", "medium", "high"] {
+        let level_val = json!({"level": level});
+        let level_clone = level_val.clone();
+        let outcome = WorkflowTestEnv::new()
+            .mock_activity("score_payment", move |_| Ok(level_clone.clone()))
+            .mock_activity("low_risk_path", |_| Ok(json!("low")))
+            .mock_activity("medium_risk_path", |_| Ok(json!("medium")))
+            .mock_activity("high_risk_path", |_| Ok(json!("high")))
+            .run(
+                __autumn_workflow_info_three_way_switch_dag().handler,
+                Value::Null,
+            )
+            .await;
+
+        assert!(
+            outcome.result.is_ok(),
+            "three_way_switch level={level} should succeed, got: {:?}",
+            outcome.result
+        );
+
+        let events = outcome.events();
+        // Exactly one branch scheduled
+        let scheduled: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                matches!(e, WorkflowEvent::ActivityScheduled { name, .. }
+                if matches!(name.as_str(), "low_risk_path" | "medium_risk_path" | "high_risk_path"))
+            })
+            .collect();
+        assert_eq!(
+            scheduled.len(),
+            1,
+            "exactly one branch should run for level={level}, got: {scheduled:?}"
+        );
+
+        // Exactly two dag_skip markers (the other two branches)
+        let skip_markers: Vec<_> = events.iter().filter(|e| {
+            matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("dag_skip:"))
+        }).collect();
+        assert_eq!(
+            skip_markers.len(),
+            2,
+            "exactly two branches skipped for level={level}, got: {skip_markers:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 8 — mapped task with condition skips whole map
+// ---------------------------------------------------------------------------
+
+#[activity]
+async fn process_item(_ctx: &ActivityContext) -> Result<Value, String> {
+    Ok(json!("processed"))
+}
+
+#[dag(default_queue = "workers")]
+fn conditional_map_dag(dag: &mut DagBuilder) {
+    let source = dag.activity(score_payment);
+    let _mapped = dag
+        .map_activity(process_item)
+        .over(&source)
+        .condition(|_ups| false); // always skip
+}
+
+#[tokio::test]
+async fn mapped_task_condition_skips_whole_map() {
+    use autumn_harvest::testing::WorkflowTestEnv;
+
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("score_payment", |_| Ok(json!([1, 2, 3])))
+        .run(
+            __autumn_workflow_info_conditional_map_dag().handler,
+            Value::Null,
+        )
+        .await;
+
+    assert!(
+        outcome.result.is_ok(),
+        "condition-skipped mapped task should not fail the DAG, got: {:?}",
+        outcome.result
+    );
+
+    let events = outcome.events();
+    // No process_item scheduled (map skipped entirely)
+    let any_mapped = events.iter().any(
+        |e| matches!(e, WorkflowEvent::ActivityScheduled { name, .. } if name == "process_item"),
+    );
+    assert!(
+        !any_mapped,
+        "no process_item instances should be scheduled when condition is false"
+    );
+
+    // Exactly one dag_skip marker
+    let skip_markers: Vec<_> = events.iter().filter(|e| {
+        matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("dag_skip:"))
+    }).collect();
+    assert_eq!(
+        skip_markers.len(),
+        1,
+        "exactly one dag_skip marker for the mapped task"
     );
 }

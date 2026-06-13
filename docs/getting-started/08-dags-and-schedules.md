@@ -185,6 +185,148 @@ states of its upstream tasks:
 tasks. `OneSuccess` is the "fan-in for any successful branch" shape.
 `OneFailed` is the "alert on first failure" shape.
 
+## Data-dependent branching
+
+Trigger rules gate a node on the *state* of its upstreams (succeeded,
+failed, skipped). Sometimes you need to route on the upstream's *output
+value* — "if `fraud_score > 0.8`, run manual review; otherwise
+auto-approve." That's what **condition predicates** do.
+
+Call `.condition(|outputs| …)` on a `DagTaskRef`. The closure receives a
+slice of `serde_json::Value` — one element per upstream output, in the
+order the upstreams were declared. If it returns `false`, the node is
+skipped; the skip propagates downstream through the normal trigger-rule
+inference (so an `AllSuccess` child of a skipped node is also skipped, and
+an `AllDone` join that receives all skips still fires).
+
+### Fraud-routing example
+
+```rust
+use serde_json::Value;
+use autumn_harvest::prelude::*;
+
+#[activity(start_to_close = "30s")]
+async fn score_payment(ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    // Returns {"score": 0.0–1.0}
+    Ok(serde_json::json!({ "score": 0.92 }))
+}
+
+#[activity(start_to_close = "5m")]
+async fn manual_review(ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    Ok(Value::Null)
+}
+
+#[activity(start_to_close = "5s")]
+async fn auto_approve(ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    Ok(Value::Null)
+}
+
+#[activity(start_to_close = "30s")]
+async fn notify_result(ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    Ok(Value::Null)
+}
+
+#[dag(schedule = "*/5 * * * *")]
+pub fn fraud_routing(dag: &mut DagBuilder) {
+    // Step 1: score the payment.
+    let score = dag.activity(score_payment);
+
+    // Step 2a: manual review only when score is high.
+    let review = dag
+        .activity(manual_review)
+        .upstream(&score)
+        .condition(|outputs| {
+            outputs[0]["score"].as_f64().unwrap_or(0.0) > 0.8
+        });
+
+    // Step 2b: auto-approve only when score is low.
+    let approve = dag
+        .activity(auto_approve)
+        .upstream(&score)
+        .condition(|outputs| {
+            outputs[0]["score"].as_f64().unwrap_or(0.0) <= 0.8
+        });
+
+    // Step 3: join — AllDone so it fires regardless of which branch ran.
+    let _notify = dag
+        .activity(notify_result)
+        .upstream(&review)
+        .upstream(&approve)
+        .trigger_rule(TriggerRule::AllDone);
+}
+```
+
+At each run exactly one of `manual_review` / `auto_approve` executes; the
+other is skipped. `notify_result` sees two upstreams — one succeeded, one
+skipped — so `AllDone` fires. If you use `AllSuccess` there instead,
+`notify_result` would also be skipped (skipped is not succeeded).
+
+### N-way switch
+
+Conditions are plain Rust closures, so multi-way routing is just multiple
+tasks with mutually-exclusive predicates:
+
+```rust
+#[dag]
+pub fn risk_triage(dag: &mut DagBuilder) {
+    let score = dag.activity(score_payment);
+
+    let _low = dag.activity(low_risk_path).upstream(&score)
+        .condition(|o| o[0]["score"].as_f64().unwrap_or(0.0) < 0.3);
+
+    let _medium = dag.activity(medium_risk_path).upstream(&score)
+        .condition(|o| {
+            let s = o[0]["score"].as_f64().unwrap_or(0.0);
+            (0.3..0.8).contains(&s)
+        });
+
+    let _high = dag.activity(high_risk_path).upstream(&score)
+        .condition(|o| o[0]["score"].as_f64().unwrap_or(0.0) >= 0.8);
+}
+```
+
+Exactly one branch runs per execution. The engine evaluates each condition
+independently — a task is skipped when *its* condition returns `false`,
+regardless of what any sibling condition returned.
+
+### Conditions on mapped tasks
+
+`.condition(…)` is available on `DagMapTaskRef` (returned by
+`dag.map_activity(…).over(&upstream)`) and works the same way: if the
+condition is false, the entire mapped fan-out is skipped as a unit.
+
+### Determinism rule
+
+The predicate is a **pure function of upstream outputs**. Those outputs are
+already frozen in `harvest_events` when the condition runs, so the same
+closure call produces the same result on every replay — as long as the
+closure only reads the `outputs` slice and nothing else. Do not read
+process state, the system clock, or random values inside a condition
+closure; use [`ctx.side_effect`](07-reliability-knobs.md) in an upstream
+activity instead and read the recorded value through its output.
+
+### Vantage UI and observability
+
+The Vantage DAG detail page distinguishes two skip reasons:
+
+| Display text | Meaning |
+|---|---|
+| *Skipped (upstream)* | Node skipped because a trigger rule was not satisfied. |
+| *Skipped (condition)* | Node skipped because its condition predicate returned `false`. |
+
+A `MarkerRecorded` event named `dag_skip:{N}` (where *N* is the zero-based
+task index) is appended to the execution history for every condition-skip.
+This event appears on the execution timeline page and can be queried
+directly from `harvest_events`. Trigger-rule skips emit no marker, so
+pre-existing DAG histories replay unchanged.
+
+### Simulator note
+
+The offline DAG simulator (`autumn_harvest::dag_simulator`) treats all
+nodes as runnable for the purpose of structure validation — it does not
+evaluate condition closures. Use `WorkflowTestEnv` or a real run to verify
+routing behaviour.
+
 ## Registering DAGs with the plugin
 
 ```rust

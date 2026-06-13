@@ -110,3 +110,47 @@ fn dag_metadata_attributes() {
     assert_eq!(info.runbook_url, Some("https://wiki.acme.com/etl-runbook"));
     assert_eq!(info.severity, Some("sev3"));
 }
+
+// ── Issue #482 — condition macro + builder parity (AC2) ──────────────────────
+
+#[activity]
+async fn score_payment(_ctx: &ActivityContext) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({"fraud_score": 0.0}))
+}
+
+#[activity]
+async fn manual_review(_ctx: &ActivityContext) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!("reviewed"))
+}
+
+/// DAG using `.condition(...)` via the `#[dag]` macro — same DagTaskRef builder
+/// method as a hand-written DagBuilder call, so macro and builder produce
+/// identical DagDefinitions (AC2).
+#[cfg(feature = "unified-dag-execution")]
+#[dag(default_queue = "risk-workers")]
+fn conditional_dag_macro(dag: &mut DagBuilder) {
+    let score = dag.activity(score_payment);
+    let _review = dag
+        .activity(manual_review)
+        .upstream(&score)
+        .condition(|ups| ups[0]["fraud_score"].as_f64().is_some_and(|s| s > 0.8));
+}
+
+/// Verify that a `#[dag]` using `.condition(...)` compiles and produces a
+/// `DagDefinition` where the conditioned task has `condition.is_some()`.
+#[cfg(feature = "unified-dag-execution")]
+#[test]
+fn dag_macro_condition_compiles_and_is_stored_on_task() {
+    let info = __autumn_dag_info_conditional_dag_macro();
+    let definition = info.build_definition().expect("definition should build");
+    let tasks = definition.tasks();
+    assert_eq!(tasks.len(), 2, "two tasks expected");
+    assert!(
+        tasks[0].condition.is_none(),
+        "root task should have no condition"
+    );
+    assert!(
+        tasks[1].condition.is_some(),
+        "conditioned task should have condition set (AC2: macro parity with builder)"
+    );
+}

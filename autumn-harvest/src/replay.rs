@@ -2546,6 +2546,39 @@ impl HistoryMatcher {
         }
     }
 
+    /// Match a named `MarkerRecorded` event at the current cursor position.
+    ///
+    /// Used by `WorkflowContext::dag_skip_marker` to record the condition-skip
+    /// decision deterministically so replay always selects the identical branch.
+    ///
+    /// Returns:
+    /// - [`HistoryMatch::Matched`] — the event at cursor is `MarkerRecorded`
+    ///   with the exact `name`.
+    /// - [`HistoryMatch::Diverged`] — a different event (or a marker with a
+    ///   different name) is at the cursor; this indicates the condition predicate
+    ///   returned a different value than during the original run — a
+    ///   non-determinism violation.
+    /// - [`HistoryMatch::NoMatch`] — past end of history (live execution).
+    pub fn match_named_marker(&mut self, marker_name: &str) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+        match &self.events[self.cursor] {
+            WorkflowEvent::MarkerRecorded { name, .. } if name == marker_name => {
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                HistoryMatch::Matched {
+                    output: serde_json::Value::Null,
+                }
+            }
+            other => HistoryMatch::Diverged {
+                expected: format!("MarkerRecorded({marker_name})"),
+                actual: Self::actual_event_name(other),
+                event_index: i32::try_from(self.cursor).ok(),
+            },
+        }
+    }
+
     // ── Update primitive (issue #140) ─────────────────────────────────────
 
     /// Look up the recorded result for a specific update by `update_id`.
