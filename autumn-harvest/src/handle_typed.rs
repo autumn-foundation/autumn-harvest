@@ -146,6 +146,9 @@ pub struct TypedStartOptions {
     pub max_workflow_start_delay: Option<chrono::Duration>,
     /// Per-execution context headers propagated automatically to activities and children.
     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Soft SLA duration: emits `harvest.workflow.sla_breached` once when the run exceeds this
+    /// without terminating it. Overrides `WorkflowInfo::sla`; clamped to `execution_timeout`.
+    pub sla: Option<Duration>,
 }
 
 /// Optional configurations when invoking an update and starting a workflow atomically.
@@ -175,6 +178,9 @@ pub struct TypedUpdateWithStartOptions {
     pub idempotency_key: Option<String>,
     /// Per-execution context headers propagated automatically to activities and children.
     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Soft SLA duration: emits `harvest.workflow.sla_breached` once when the run exceeds this
+    /// without terminating it. Overrides `WorkflowInfo::sla`; clamped to `execution_timeout`.
+    pub sla: Option<std::time::Duration>,
 }
 
 /// Optional configurations when signaling and starting a workflow atomically.
@@ -202,4 +208,7 @@ pub struct TypedSignalWithStartOptions {
     pub max_signal_payload_bytes: Option<u64>,
     /// Per-execution context headers propagated automatically to activities and children.
     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Soft SLA duration: emits `harvest.workflow.sla_breached` once when the run exceeds this
+    /// without terminating it. Overrides `WorkflowInfo::sla`; clamped to `execution_timeout`.
+    pub sla: Option<Duration>,
 }

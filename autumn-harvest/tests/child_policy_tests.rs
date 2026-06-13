@@ -60,6 +60,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
     "\n",
     include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
@@ -181,6 +183,8 @@ async fn start_workflow(
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -253,6 +257,7 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
         module: "child_policy_tests",
         handler,
         execution_timeout: None,
+        sla: None,
         concurrency: None,
         max_input_bytes: None,
         owner: None,
@@ -275,6 +280,7 @@ fn wf_info_with_concurrency(
         module: "child_policy_tests",
         handler,
         execution_timeout: None,
+        sla: None,
         concurrency: Some(concurrency),
         max_input_bytes: None,
         owner: None,
@@ -370,6 +376,10 @@ async fn insert_detached_child_execution(
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
         })
         .execute(conn)
         .await
@@ -954,6 +964,10 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
         })
         .execute(&mut conn)
         .await

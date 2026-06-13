@@ -119,6 +119,18 @@ pub struct WorkflowExecution {
     /// tenant secrets and must not be exposed via management API responses.
     #[serde(skip)]
     pub context_headers: Option<serde_json::Value>,
+    /// Optional declared SLA budget for soft breach signal (issue #487).
+    /// Stored so continue-as-new / reset can re-anchor per run. `None` = no SLA.
+    pub sla: Option<chrono::Duration>,
+    /// Absolute UTC deadline for soft SLA enforcement (issue #487).
+    /// Computed at start as `started_at + sla`. `None` = no SLA declared.
+    pub sla_deadline_at: Option<DateTime<Utc>>,
+    /// Whether the soft SLA deadline has been breached (issue #487).
+    /// Set exactly once by the scanner; never by the workflow engine.
+    pub sla_breached: bool,
+    /// Wall-clock instant the SLA was first detected as breached (issue #487).
+    /// `None` when `sla_breached = false`.
+    pub sla_breached_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -148,6 +160,10 @@ pub struct NewWorkflowExecution<'a> {
     pub severity: Option<&'a str>,
     /// Ambient context headers (issue #481). `None` = no headers.
     pub context_headers: Option<serde_json::Value>,
+    /// Optional declared SLA budget (issue #487). NULL = no SLA.
+    pub sla: Option<chrono::Duration>,
+    /// Absolute UTC SLA deadline (issue #487). NULL = no SLA.
+    pub sla_deadline_at: Option<DateTime<Utc>>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────

@@ -27,6 +27,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
     "\n",
     include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
@@ -113,6 +115,10 @@ async fn test_send_and_load_signals() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -164,6 +170,10 @@ async fn test_mark_signals_consumed() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)

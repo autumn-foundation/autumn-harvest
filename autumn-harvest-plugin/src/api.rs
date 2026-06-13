@@ -1270,6 +1270,9 @@ struct StartWorkflowRequest {
     memo: Option<Value>,
     search_attrs: Option<Value>,
     execution_timeout_secs: Option<i64>,
+    /// Soft SLA in seconds. Emits `harvest.workflow.sla_breached` once when exceeded;
+    /// never terminates the run. Falls back to `WorkflowInfo::sla` when omitted.
+    sla_secs: Option<i64>,
     /// How to handle a duplicate `(workflow_name, workflow_id)` collision.
     /// Omitted or `null` → `AllowDuplicate` (preserves existing wire behaviour).
     /// An unknown string value returns `400 Bad Request` with the offending value
@@ -1650,6 +1653,8 @@ pub(crate) struct WorkflowFilters {
     /// When true, include executions whose sole pending work is a future-dated
     /// durable timer (correctly sleeping). Default false = exclude sleepers.
     pub(crate) include_sleeping: bool,
+    /// When true, return only executions whose soft SLA has been breached (#487).
+    pub(crate) sla_breached: bool,
 }
 
 impl WorkflowFilters {
@@ -2501,6 +2506,7 @@ pub const fn management_api_request_fields()
                 "memo",
                 "search_attrs",
                 "execution_timeout_secs",
+                "sla_secs",
                 "reuse_policy",
                 "start_at",
                 "delay",
@@ -3876,6 +3882,9 @@ pub(crate) fn parse_workflow_filters(
             }
             "include_sleeping" => {
                 filters.include_sleeping = value.trim().eq_ignore_ascii_case("true");
+            }
+            "sla_breached" => {
+                filters.sla_breached = value.trim().eq_ignore_ascii_case("true");
             }
             _ => {
                 // Ignore unknown query parameters so future additions stay non-breaking.
@@ -5479,13 +5488,19 @@ async fn start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (owner, runbook_url, severity) = runtime
+    let (owner, runbook_url, severity, info_sla) = runtime
         .registry
         .workflows
         .get(&workflow_name)
-        .map_or((None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity)
+        .map_or((None, None, None, None), |info| {
+            (info.owner, info.runbook_url, info.severity, info.sla)
         });
+
+    // Resolve effective SLA: request override → WorkflowInfo default → None.
+    let effective_sla = request
+        .sla_secs
+        .map(chrono::Duration::seconds)
+        .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()));
 
     let result = start_or_load_workflow_execution(
         &mut conn,
@@ -5517,6 +5532,7 @@ async fn start_workflow(
             runbook_url,
             severity,
             context_headers: None,
+            sla: effective_sla,
         },
     )
     .await;
@@ -6057,6 +6073,8 @@ async fn batch_start_workflows(
                     runbook_url,
                     severity,
                     context_headers: None,
+
+                    sla: None,
                 },
             )
             .await;
@@ -6615,6 +6633,8 @@ async fn signal_with_start_workflow(
             runbook_url,
             severity,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await;
@@ -7064,6 +7084,8 @@ async fn update_with_start_workflow(
         runbook_url,
         severity,
         context_headers: None,
+
+        sla: None,
     };
 
     let result = update_with_start_workflow_execution(&mut conn, params).await;
@@ -10304,6 +10326,8 @@ async fn trigger_schedule_now(
             runbook_url,
             severity,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await;
@@ -10929,6 +10953,8 @@ async fn schedule_backfill(
                         runbook_url,
                         severity,
                         context_headers: None,
+
+                        sla: None,
                     },
                 )
                 .await;
@@ -11071,6 +11097,8 @@ async fn schedule_backfill(
                         runbook_url,
                         severity,
                         context_headers: None,
+
+                        sla: None,
                     },
                 )
                 .await;
@@ -13245,6 +13273,9 @@ pub(crate) async fn load_workflows(
     if let Some(cause) = &filters.failure_cause {
         let predicate = serde_json::json!({ "failure_cause": cause });
         query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate));
+    }
+    if filters.sla_breached {
+        query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
     }
     query
         .select(WorkflowExecution::as_select())
@@ -17719,7 +17750,7 @@ mod tests {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
-
+                sla: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -17894,6 +17925,28 @@ mod tests {
             .expect("unknown keys should be skipped");
         assert!(filters.states.is_empty());
         assert!(filters.workflow_name.is_none());
+    }
+
+    #[test]
+    fn parse_workflow_filters_parses_sla_breached_flag() {
+        // Absent → false (issue #487).
+        let absent = parse_workflow_filters(&pairs(&[])).expect("empty filters parse");
+        assert!(!absent.sla_breached);
+
+        // Explicit true (case-insensitive).
+        let on = parse_workflow_filters(&pairs(&[("sla_breached", "TRUE")]))
+            .expect("sla_breached=true parses");
+        assert!(on.sla_breached);
+
+        // Explicit false.
+        let off = parse_workflow_filters(&pairs(&[("sla_breached", "false")]))
+            .expect("sla_breached=false parses");
+        assert!(!off.sla_breached);
+
+        // Any non-"true" value is treated as false, never an error.
+        let other = parse_workflow_filters(&pairs(&[("sla_breached", "1")]))
+            .expect("sla_breached=1 parses without error");
+        assert!(!other.sla_breached);
     }
 
     #[test]
@@ -18264,6 +18317,8 @@ mod tests {
                 runbook_url: None,
                 severity: None,
                 context_headers: None,
+
+                sla: None,
             },
         )
         .await
@@ -18950,6 +19005,7 @@ mod tests {
                     execution_timeout: None,
                     concurrency: None,
                     max_input_bytes: None,
+                    sla: None,
                     owner: None,
                     runbook_url: None,
                     severity: None,
@@ -18965,6 +19021,7 @@ mod tests {
                     execution_timeout: None,
                     concurrency: None,
                     max_input_bytes: None,
+                    sla: None,
                     owner: None,
                     runbook_url: None,
                     severity: None,

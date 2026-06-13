@@ -151,6 +151,20 @@ pub struct WorkflowInfo {
     /// (issue #243). `None` means no deadline enforced unless overridden at the
     /// `start_workflow` call site. Per-call overrides always win over this default.
     pub execution_timeout: Option<Duration>,
+    /// Soft SLA budget for executions of this workflow type (issue #487).
+    ///
+    /// When set, `sla_deadline_at = started_at + sla` is persisted on the row.
+    /// A background scanner detects when `now > sla_deadline_at` while the run
+    /// is still RUNNING/SUSPENDED and emits `harvest.workflow.sla_breached`
+    /// **without** altering the run's lifecycle. A breaching run that later
+    /// succeeds still reaches COMPLETED with its normal result.
+    ///
+    /// If both `sla` and `execution_timeout` are set and `sla > execution_timeout`,
+    /// `sla` is clamped down to `execution_timeout` at start time (the hard
+    /// timeout would fire first, so a later soft signal could never fire).
+    ///
+    /// `None` means no SLA is declared; the run can never breach.
+    pub sla: Option<Duration>,
     /// Optional per-key concurrency constraint declared via
     /// `#[workflow(concurrency(key = "input.tenant_id", limit = 10))]`.
     ///
@@ -760,6 +774,7 @@ impl DagInfo {
             module: self.module,
             handler,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: self.owner,
@@ -780,6 +795,7 @@ impl std::fmt::Debug for WorkflowInfo {
             .field("module", &self.module)
             .field("handler", &"<fn>")
             .field("execution_timeout", &self.execution_timeout)
+            .field("sla", &self.sla)
             .field("concurrency", &self.concurrency)
             .field("max_input_bytes", &self.max_input_bytes)
             .field("owner", &self.owner)
@@ -880,6 +896,7 @@ mod tests {
             module: "my_app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -892,7 +909,50 @@ mod tests {
         };
         assert_eq!(info.name, "test_workflow");
         assert!(info.execution_timeout.is_none());
+        assert!(info.sla.is_none());
         assert!(info.concurrency.is_none());
+    }
+
+    #[test]
+    fn workflow_info_sla_field_is_accessible_and_defaults_none() {
+        let info = WorkflowInfo {
+            name: "sla_test_wf",
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        };
+        assert!(info.sla.is_none());
+    }
+
+    #[test]
+    fn workflow_info_sla_field_can_be_set() {
+        let info = WorkflowInfo {
+            name: "sla_test_wf",
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            sla: Some(std::time::Duration::from_secs(7_200)),
+            concurrency: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        };
+        assert_eq!(info.sla, Some(std::time::Duration::from_secs(7_200)));
     }
 
     #[test]
@@ -902,6 +962,7 @@ mod tests {
             module: "my_app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: Some(std::time::Duration::from_secs(86_400)),
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -927,6 +988,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -950,6 +1012,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -990,6 +1053,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -1022,6 +1086,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -1051,6 +1116,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -1088,6 +1154,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -1118,6 +1185,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -1143,6 +1211,7 @@ mod tests {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -1362,6 +1431,7 @@ mod tests {
             module: "test_mod",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,

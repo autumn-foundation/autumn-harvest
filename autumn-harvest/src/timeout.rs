@@ -872,6 +872,73 @@ pub async fn enforce_workflow_execution_timeouts(
     Ok(count)
 }
 
+/// Detect and mark workflow executions that have exceeded their declared soft
+/// SLA budget (issue #487).
+///
+/// The scanner atomically flips `sla_breached = true` and sets `sla_breached_at`
+/// for every RUNNING or SUSPENDED execution whose `sla_deadline_at` has elapsed
+/// and that has not yet been marked.  It emits
+/// `harvest.workflow.sla_breached{workflow, queue}` **exactly once per run**.
+///
+/// **This function never terminates, cancels, fails, or otherwise alters the
+/// lifecycle of the run.**  A breaching run that later completes still reaches
+/// COMPLETED with its normal result.  No `WorkflowEvent` is appended and
+/// `harvest_events` is left untouched (zero replay footprint, same posture as
+/// query handlers).
+///
+/// Idempotency is guaranteed by the `WHERE sla_breached = false` guard combined
+/// with the `RETURNING` clause: repeated scans and concurrent workers on the
+/// same shard cannot double-count a breach.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn enforce_workflow_sla_breaches(
+    conn: &mut AsyncPgConnection,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> HarvestResult<usize> {
+    use crate::schema::harvest_workflow_executions;
+
+    let now = Utc::now();
+    let breached: Vec<(uuid::Uuid, String, String)> =
+        diesel::update(harvest_workflow_executions::table)
+            .filter(
+                harvest_workflow_executions::state
+                    .eq("RUNNING")
+                    .or(harvest_workflow_executions::state.eq("SUSPENDED")),
+            )
+            .filter(harvest_workflow_executions::sla_deadline_at.is_not_null())
+            .filter(harvest_workflow_executions::sla_deadline_at.lt(Some(now)))
+            .filter(harvest_workflow_executions::sla_breached.eq(false))
+            .set((
+                harvest_workflow_executions::sla_breached.eq(true),
+                harvest_workflow_executions::sla_breached_at.eq(Some(now)),
+            ))
+            .returning((
+                harvest_workflow_executions::id,
+                harvest_workflow_executions::workflow_name,
+                harvest_workflow_executions::queue_name,
+            ))
+            .get_results(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+    let count = breached.len();
+
+    for (exec_uuid, workflow_name, queue_name) in &breached {
+        tracing::warn!(
+            exec_id = %exec_uuid,
+            workflow_name = %workflow_name,
+            queue = %queue_name,
+            "soft SLA deadline exceeded — run continues to completion"
+        );
+        metrics.record_workflow_sla_breach(workflow_name, queue_name);
+    }
+
+    Ok(count)
+}
+
 /// Enforce all currently expired task timeouts against the database state.
 ///
 /// This mutates queue rows and workflow history so timed-out tasks are not
@@ -1183,6 +1250,7 @@ pub async fn enforce_timeouts_once(
 
     count += enforce_external_task_timeouts(conn).await?;
     count += enforce_workflow_execution_timeouts(conn, metrics).await?;
+    count += enforce_workflow_sla_breaches(conn, metrics).await?;
     count += enforce_external_signals_outbox(
         conn,
         metrics,
@@ -1393,5 +1461,53 @@ mod tests {
             "must reference deadline_at column"
         );
         assert!(sql.contains("NOW()"), "must compare against NOW()");
+    }
+
+    // ── Soft SLA breach scanner tests (issue #487) ────────────────────────────
+
+    #[test]
+    fn sla_breached_metric_has_correct_name() {
+        assert_eq!(
+            crate::telemetry::METRIC_WORKFLOW_SLA_BREACHED,
+            "harvest.workflow.sla_breached"
+        );
+    }
+
+    #[test]
+    fn record_workflow_sla_breach_is_callable_on_no_op_recorder() {
+        use crate::telemetry::MetricsRecorder;
+        struct NoOp;
+        impl MetricsRecorder for NoOp {}
+        // Must not panic; default no-op implementation.
+        NoOp.record_workflow_sla_breach("my_workflow", "default");
+    }
+
+    #[test]
+    fn sla_breach_spy_records_one_call_per_breach() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct SpyRecorder {
+            breaches: Mutex<Vec<(String, String)>>,
+        }
+        impl crate::telemetry::MetricsRecorder for SpyRecorder {
+            fn record_workflow_sla_breach(&self, workflow_name: &str, queue: &str) {
+                self.breaches
+                    .lock()
+                    .unwrap()
+                    .push((workflow_name.to_owned(), queue.to_owned()));
+            }
+        }
+
+        let spy = SpyRecorder::default();
+        spy.record_workflow_sla_breach("slow_workflow", "priority-queue");
+        spy.record_workflow_sla_breach("slow_workflow", "priority-queue");
+
+        let b = spy.breaches.lock().unwrap().clone();
+        assert_eq!(b.len(), 2, "spy records every call; idempotency is DB-side");
+        assert_eq!(
+            b[0],
+            ("slow_workflow".to_owned(), "priority-queue".to_owned())
+        );
     }
 }

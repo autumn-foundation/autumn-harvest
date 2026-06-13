@@ -156,6 +156,7 @@ fn workflow_info() -> WorkflowInfo {
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        sla: None,
         concurrency: None,
         max_input_bytes: None,
         owner: None,

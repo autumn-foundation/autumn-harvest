@@ -91,6 +91,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
     "\n",
     include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
@@ -536,6 +538,10 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -592,6 +598,8 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -756,6 +764,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_with_child,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -772,6 +781,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: child_echo_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -796,6 +806,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_with_continue_as_new_child,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -812,6 +823,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: continue_as_new_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -1283,6 +1295,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
             module: "integration_e2e",
             handler: echo_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -1398,6 +1411,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             module: "integration_e2e",
             handler: failing_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -1526,6 +1540,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -1671,6 +1686,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             module: "integration_e2e",
             handler: workflow_with_checkpointed_activity,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -2040,6 +2056,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     module: "integration_e2e",
                     handler: workflow_with_slow_activity,
                     execution_timeout: None,
+                    sla: None,
                     concurrency: None,
                     max_input_bytes: None,
 
@@ -2189,6 +2206,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                     module: "integration_e2e",
                     handler: workflow_with_timer,
                     execution_timeout: None,
+                    sla: None,
                     concurrency: None,
                     max_input_bytes: None,
 
@@ -2453,6 +2471,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: parent_workflow_parallel_children,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -2469,6 +2488,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: child_alpha_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -2485,6 +2505,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 module: "integration_e2e",
                 handler: child_beta_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -2611,6 +2632,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             module: "integration_e2e",
             handler: workflow_with_builder_state,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -3115,6 +3137,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
             module: "integration_e2e",
             handler: signal_waiting_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -3234,6 +3257,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             module: "integration_e2e",
             handler: activity_then_signal_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -3374,6 +3398,10 @@ async fn insert_named_workflow_execution(
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -3665,6 +3693,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             module: "integration_e2e",
             handler: continue_as_new_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -3773,6 +3802,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             module: "integration_e2e",
             handler: continue_as_new_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -3910,6 +3940,8 @@ mod reuse_policy_helpers {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         }
     }
 
@@ -4683,6 +4715,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             module: "integration_e2e",
             handler: instant_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -4797,6 +4830,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -4898,6 +4932,7 @@ async fn workflow_schedule_pause_and_resume() {
             module: "integration_e2e",
             handler: instant_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -5162,6 +5197,8 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -5174,6 +5211,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             module: "integration_e2e",
             handler: approval_search_attrs_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -5316,6 +5354,8 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -5328,6 +5368,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 module: "integration_e2e",
                 handler: approval_search_attrs_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -5426,6 +5467,7 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             module: "integration_e2e",
             handler: echo_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -5780,6 +5822,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -5926,6 +5969,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -6054,6 +6098,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             module: "integration_e2e",
             handler: workflow_with_activity,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -6201,6 +6246,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -6271,6 +6317,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -6350,6 +6397,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -6433,6 +6481,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -6511,6 +6560,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -6592,6 +6642,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
             module: "integration_e2e",
             handler: slow_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -6744,6 +6795,10 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -7186,6 +7241,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             module: "integration_e2e",
             handler: workflow_calling_retry_activity,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,

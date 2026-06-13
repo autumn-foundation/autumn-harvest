@@ -102,6 +102,8 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
     ),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
     ),
@@ -236,6 +238,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 module: "tests",
                 handler: test_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
                 description: None,
@@ -251,6 +254,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 module: "tests",
                 handler: test_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
                 description: None,
@@ -266,6 +270,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 module: "tests",
                 handler: test_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
                 description: None,
@@ -452,6 +457,8 @@ async fn test_trigger_evaluations_same_shard() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -546,6 +553,8 @@ async fn test_trigger_input_mapping_static_and_projection() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -618,6 +627,8 @@ async fn test_trigger_input_mapping_static_and_projection() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -712,6 +723,8 @@ async fn test_trigger_state_matching_and_deduplication() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -883,6 +896,8 @@ async fn test_trigger_cross_shard() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -982,6 +997,8 @@ async fn test_completion_trigger_via_worker_run() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -1095,6 +1112,8 @@ async fn test_trigger_with_custom_queue() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -1276,6 +1295,8 @@ async fn test_trigger_outbox_retry_and_sweep() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -1484,6 +1505,8 @@ async fn test_trigger_cross_shard_queue_preservation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -1905,6 +1928,8 @@ async fn test_trigger_evaluations_schema_validation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -1972,6 +1997,8 @@ async fn test_trigger_evaluations_schema_validation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await

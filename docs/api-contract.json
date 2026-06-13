@@ -63,6 +63,12 @@
           "in": "query",
           "required": false,
           "description": "Opaque pagination cursor from a previous response."
+        },
+        {
+          "name": "sla_breached",
+          "in": "query",
+          "required": false,
+          "description": "When 'true', return only executions whose soft SLA has been breached (issue #487)."
         }
       ],
       "request_body": null,
@@ -364,6 +370,11 @@
             "name": "execution_timeout_secs",
             "required": false,
             "description": "Overall execution timeout in seconds."
+          },
+          {
+            "name": "sla_secs",
+            "required": false,
+            "description": "Soft SLA in seconds (issue #487). Emits harvest.workflow.sla_breached once when exceeded; never terminates the run. Falls back to the workflow's #[workflow(sla = ...)] default. Clamped down to execution_timeout_secs when larger."
           },
           {
             "name": "reuse_policy",

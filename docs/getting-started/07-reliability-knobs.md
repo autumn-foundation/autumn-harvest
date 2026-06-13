@@ -70,6 +70,42 @@ rather than an exhausted-retry failure.
 time with a clear error). Local activities are fast in-process work; use
 `start_to_close` + a low retry count instead.
 
+**Soft SLA — page before the customer notices (`#[workflow(sla = "…")]`).**
+Every knob above is a *hard* deadline: when it fires it terminates, fails, or
+skips the work. But the most common production question is softer — *"this run
+is healthy and still making progress, but it's far slower than it should be —
+alert me **before** it's a problem."* That's the soft SLA:
+
+```rust
+#[workflow(sla = "2h", execution_timeout = "6h")]
+async fn nightly_reconciliation(ctx: &WorkflowContext, input: Input)
+    -> Result<(), String> { /* … */ }
+```
+
+When the run passes its `sla` deadline, Harvest emits the
+`harvest.workflow.sla_breached{workflow, queue}` counter **exactly once** and
+sets the server-side `sla_breached` / `sla_breached_at` fields — and **does
+nothing else**. The run keeps executing; if it later succeeds it reaches
+`COMPLETED` normally. The signal carries **zero `harvest_events` footprint** (no
+new event variant, replay-neutral, like query handlers). Override per-run at
+start with `sla_secs` in the HTTP start body; omit the attribute and a run has
+no SLA. Find breached-but-still-running work with
+`GET /workflows?sla_breached=true`.
+
+**SLA vs `execution_timeout` — they answer different questions:**
+
+| Goal | Use | On deadline |
+|---|---|---|
+| Alert on a slow-but-healthy run | `sla` | metric + flag, run continues |
+| Kill a runaway / hung run | `execution_timeout` | run is **terminated** (`TIMED_OUT`) |
+
+Pair them: `sla` < `execution_timeout` gives you a page first, then a hard cap.
+If you set `sla` **larger** than `execution_timeout`, the hard timeout would
+fire first and the soft signal could never fire — so Harvest **clamps `sla`
+down to `execution_timeout`** at start time. Pause suspends the SLA clock
+(resume pushes `sla_deadline_at` forward by the paused span), so a deliberately
+parked run never false-breaches.
+
 **Workflow versioning.** When you change an in-flight workflow's logic,
 fence the divergence with `ctx.version()` so old executions replay their
 recorded path while new executions take the new branch:

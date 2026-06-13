@@ -423,6 +423,8 @@ async fn start_harvest_runtime(
                         runbook_url,
                         severity,
                         context_headers: None,
+
+                        sla: None,
                     };
 
                     let Some(harvest_db) = harvest_db else {
@@ -711,6 +713,7 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            sla: None,
             owner: None,
             runbook_url: None,
             severity: None,

@@ -5854,6 +5854,8 @@ async fn execute_schedule_trigger_ui(
             runbook_url,
             severity,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await;
@@ -7583,6 +7585,10 @@ mod tests {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            sla_breached: false,
+            sla_breached_at: None,
             paused_at: None,
             pause_reason: None,
             pause_actor: None,

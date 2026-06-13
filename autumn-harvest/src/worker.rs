@@ -2861,6 +2861,8 @@ async fn persist_all_started_child_workflows(
                     queue_name: &queue_name,
                     execution_timeout: None,
                     deadline_at: None,
+                    sla: None,
+                    sla_deadline_at: None,
                     memo: None,
                     search_attrs: None,
                     assigned_build_id: parent_execution.assigned_build_id.clone(),
@@ -3410,6 +3412,8 @@ async fn create_detached_child_executions(
             queue_name: &parent_execution.queue_name,
             execution_timeout: None,
             deadline_at: None,
+            sla: None,
+            sla_deadline_at: None,
             memo: None,
             search_attrs: None,
             assigned_build_id: parent_execution.assigned_build_id.clone(),
@@ -4594,6 +4598,8 @@ async fn persist_workflow_continue_as_new(
     };
     // Re-anchor deadline to the new execution's start time (issue #243).
     let new_deadline_at = execution.execution_timeout.map(|d| chrono::Utc::now() + d);
+    // Re-anchor soft SLA deadline per-run (issue #487).
+    let new_sla_deadline_at = execution.sla.map(|d| chrono::Utc::now() + d);
 
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
@@ -4606,6 +4612,8 @@ async fn persist_workflow_continue_as_new(
         queue_name: &execution.queue_name,
         execution_timeout: execution.execution_timeout,
         deadline_at: new_deadline_at,
+        sla: execution.sla,
+        sla_deadline_at: new_sla_deadline_at,
         memo: execution.memo.clone(),
         search_attrs: execution.search_attrs.clone(),
         assigned_build_id: execution.assigned_build_id.clone(),
@@ -7424,6 +7432,7 @@ mod tests {
             module: "app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,

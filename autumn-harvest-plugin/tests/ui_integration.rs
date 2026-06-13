@@ -92,6 +92,8 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
     ),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
     ),
@@ -264,6 +266,7 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -377,6 +380,8 @@ async fn insert_workflow_on_url(
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -2133,6 +2138,8 @@ async fn insert_child_workflow_on_url(
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -2670,6 +2677,7 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
                 module: "tests",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -2802,6 +2810,7 @@ async fn ui_trigger_preserves_dag_metadata() {
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
