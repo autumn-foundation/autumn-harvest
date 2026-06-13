@@ -100,15 +100,18 @@ async fn history_snapshot_context_headers_round_trips() {
         workflow_name: "echo_headers_workflow".to_string(),
         execution_id: exec_id,
         events: make_started_history(Value::Null),
-        context_headers: headers.clone(),
+        context_headers: Some(headers.clone()),
     };
 
     let json = serde_json::to_string(&snapshot).expect("serialize snapshot");
-    let recovered: HistorySnapshot =
-        serde_json::from_str(&json).expect("deserialize snapshot");
+    let recovered: HistorySnapshot = serde_json::from_str(&json).expect("deserialize snapshot");
 
     assert_eq!(
-        recovered.context_headers.get("tenant_id").map(String::as_str),
+        recovered
+            .context_headers
+            .as_ref()
+            .and_then(|m| m.get("tenant_id"))
+            .map(String::as_str),
         Some("round-trip-tenant")
     );
 }
@@ -126,7 +129,7 @@ async fn history_snapshot_without_context_headers_deserializes_to_empty() {
         serde_json::from_str(json).expect("old snapshot must still deserialize");
 
     assert!(
-        snapshot.context_headers.is_empty(),
-        "missing context_headers field must deserialize to empty map"
+        snapshot.context_headers.is_none(),
+        "missing context_headers field must deserialize to None"
     );
 }

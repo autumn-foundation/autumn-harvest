@@ -829,7 +829,7 @@ async fn replay_await_condition_non_deterministic_divergence_fails() {
             workflow_name: "non_deterministic".to_string(),
             execution_id: exec_id,
             events: history,
-            context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         })
         .await;
 

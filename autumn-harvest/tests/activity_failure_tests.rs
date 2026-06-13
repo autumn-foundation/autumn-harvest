@@ -282,7 +282,7 @@ mod replay_tests {
             workflow_name: "test_wf".into(),
             execution_id: exec_id,
             events,
-            context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         };
 
         let report = WorkflowReplayer::new()

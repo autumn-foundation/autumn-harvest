@@ -235,8 +235,14 @@ pub struct HistorySnapshot {
     /// The full ordered event log, as returned by `load_history`.
     pub events: Vec<WorkflowEvent>,
     /// Per-execution context headers attached at workflow start.
+    ///
+    /// `None` means the field was absent in the JSON (legacy snapshot or not
+    /// set by the caller) — `replay_from_snapshot` falls back to any headers
+    /// configured on the [`WorkflowReplayer`] itself.  `Some(map)` (including
+    /// `Some(HashMap::new())`) is used verbatim, so an explicitly-empty header
+    /// map is not overridden by the replayer's ambient headers.
     #[serde(default)]
-    pub context_headers: HashMap<String, String>,
+    pub context_headers: Option<HashMap<String, String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -386,11 +392,9 @@ impl WorkflowReplayer {
         let total_events = snapshot.events.len();
         let input = extract_input(&snapshot.events);
 
-        let headers = if snapshot.context_headers.is_empty() {
-            self.context_headers.clone()
-        } else {
-            snapshot.context_headers.clone()
-        };
+        let headers = snapshot
+            .context_headers
+            .unwrap_or_else(|| self.context_headers.clone());
         let outcome = run_workflow_strict(
             exec_id,
             snapshot.events.clone(),
@@ -574,14 +578,15 @@ impl WorkflowReplayer {
         // Load event history.
         let history = load_history(conn, exec_id).await?;
 
-        // Load workflow name from executions table.
-        let workflow_name = load_workflow_name(conn, exec_id).await?;
+        // Load workflow name and context headers from executions table.
+        let (workflow_name, context_headers) =
+            load_workflow_name_and_headers(conn, exec_id).await?;
 
         let snapshot = HistorySnapshot {
             workflow_name,
             execution_id: exec_id,
             events: history.events,
-            context_headers: HashMap::new(),
+            context_headers: Some(context_headers),
         };
         Ok(self.replay_from_snapshot(snapshot).await)
     }
@@ -592,22 +597,23 @@ impl WorkflowReplayer {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "db")]
-async fn load_workflow_name(
+async fn load_workflow_name_and_headers(
     conn: &mut diesel_async::AsyncPgConnection,
     exec_id: ExecutionId,
-) -> crate::error::HarvestResult<String> {
+) -> crate::error::HarvestResult<(String, HashMap<String, String>)> {
     use crate::error::{HarvestError, database_error};
     use crate::schema::harvest_workflow_executions::dsl::{
-        harvest_workflow_executions, id as id_col, workflow_name,
+        context_headers as context_headers_col, harvest_workflow_executions, id as id_col,
+        workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
     let exec_uuid = exec_id.as_uuid();
 
-    let name: String = harvest_workflow_executions
+    let (name, raw_headers): (String, Option<serde_json::Value>) = harvest_workflow_executions
         .filter(id_col.eq(exec_uuid))
-        .select(workflow_name)
+        .select((workflow_name, context_headers_col))
         .first(conn)
         .await
         .map_err(|e| match e {
@@ -615,7 +621,18 @@ async fn load_workflow_name(
             other => database_error(other),
         })?;
 
-    Ok(name)
+    let headers = raw_headers
+        .and_then(|v| {
+            serde_json::from_value::<HashMap<String, String>>(v)
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "replay_from_db: failed to deserialize context headers");
+                    e
+                })
+                .ok()
+        })
+        .unwrap_or_default();
+
+    Ok((name, headers))
 }
 
 // ---------------------------------------------------------------------------
@@ -1588,7 +1605,7 @@ impl TestRunOutcome {
             workflow_name: "__test__".to_string(),
             execution_id: self.exec_id,
             events: self.events.clone(),
-            context_headers: HashMap::new(),
+            context_headers: None,
         };
         WorkflowReplayer::new()
             .with_existing_state(self.state.clone())

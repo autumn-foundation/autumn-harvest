@@ -309,6 +309,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             owner: ::std::option::Option::None,
                             runbook_url: ::std::option::Option::None,
                             severity: ::std::option::Option::None,
+                            context_headers: opts.context_headers,
                         };
                         let _ = client;
                         ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
@@ -428,6 +429,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 owner: ::std::option::Option::None,
                                 runbook_url: ::std::option::Option::None,
                                 severity: ::std::option::Option::None,
+                                context_headers: opts.context_headers,
                             };
                             let _ = client;
                             ::autumn_harvest::update_with_start_workflow_execution(conn, params).await

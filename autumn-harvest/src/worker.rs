@@ -1285,6 +1285,7 @@ async fn run_local_activity_inline(
     detached_spawns: DetachedSpawnPersistence<'_>,
     max_start_to_close: Duration,
     next_event_id: &mut i32,
+    context_headers: std::sync::Arc<std::collections::HashMap<String, String>>,
 ) -> HarvestResult<LocalActivityInlineOutcome> {
     let LocalActivityCommandBatch {
         pre_schedule_events,
@@ -1380,6 +1381,7 @@ async fn run_local_activity_inline(
     for attempt in start_attempt..=max_attempts {
         let ctx =
             ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
+                .with_context_headers(std::sync::Arc::clone(&context_headers))
                 .with_idempotency_key(local_idempotency_key.clone())
                 .with_attempt(attempt)
                 .with_max_attempts(max_attempts)
@@ -3848,7 +3850,15 @@ async fn process_activity_task(
     let activity_context_headers = task
         .context_headers
         .as_ref()
-        .and_then(|v| serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok())
+        .and_then(|v| {
+            match serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to deserialize activity context headers; propagating empty map");
+                    None
+                }
+            }
+        })
         .map(std::sync::Arc::new)
         .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
     let ctx = ActivityContext::new_with_cancellation_check(
@@ -5339,7 +5349,13 @@ async fn process_workflow_task(
             .context_headers
             .as_ref()
             .and_then(|v| {
-                serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+                match serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to deserialize workflow execution context headers; propagating empty map");
+                        None
+                    }
+                }
             })
             .unwrap_or_default();
 
@@ -5454,6 +5470,7 @@ async fn process_workflow_task(
                     execute_span: &detached_execute_span,
                 };
                 let local_batch = extract_run_local_activity(commands);
+                let local_context_headers = std::sync::Arc::new(exec_context_headers.clone());
                 let inline_outcome = match run_local_activity_inline(
                     conn,
                     registry,
@@ -5462,6 +5479,7 @@ async fn process_workflow_task(
                     detached_spawns,
                     max_local_activity_start_to_close,
                     &mut next_event_id,
+                    local_context_headers,
                 )
                 .await
                 {

@@ -8364,8 +8364,7 @@ mod tests {
     fn activity_context_header_returns_set_value() {
         let mut headers = std::collections::HashMap::new();
         headers.insert("tenant_id".to_string(), "acme".to_string());
-        let ctx = ActivityContext::new_test()
-            .with_context_headers(std::sync::Arc::new(headers));
+        let ctx = ActivityContext::new_test().with_context_headers(std::sync::Arc::new(headers));
         assert_eq!(ctx.header("tenant_id"), Some("acme"));
     }
 
@@ -8380,8 +8379,7 @@ mod tests {
         let mut headers = std::collections::HashMap::new();
         headers.insert("x".to_string(), "foo".to_string());
         headers.insert("y".to_string(), "bar".to_string());
-        let ctx = ActivityContext::new_test()
-            .with_context_headers(std::sync::Arc::new(headers));
+        let ctx = ActivityContext::new_test().with_context_headers(std::sync::Arc::new(headers));
         let map = ctx.headers();
         assert_eq!(map.get("x").map(String::as_str), Some("foo"));
         assert_eq!(map.get("y").map(String::as_str), Some("bar"));

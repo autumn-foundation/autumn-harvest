@@ -208,7 +208,7 @@ fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -
         workflow_name: name.to_string(),
         execution_id: exec_id,
         events,
-        context_headers: std::collections::HashMap::new(),
+        context_headers: None,
     }
 }
 
@@ -398,7 +398,7 @@ async fn replay_from_json_succeeds_with_unchanged_workflow() {
         workflow_name: "canonical_workflow".to_string(),
         execution_id: exec_id,
         events,
-        context_headers: std::collections::HashMap::new(),
+        context_headers: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -423,7 +423,7 @@ async fn replay_from_json_detects_non_determinism() {
         workflow_name: "reordered_workflow".to_string(),
         execution_id: exec_id,
         events,
-        context_headers: std::collections::HashMap::new(),
+        context_headers: None,
     };
     let json = serde_json::to_string(&snapshot).expect("serialization must succeed");
 
@@ -607,7 +607,7 @@ async fn replay_activity_with_changed_input_detects_non_determinism() {
             workflow_name: "changed".to_string(),
             execution_id: exec_id,
             events,
-        context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         })
         .await;
 
@@ -1461,7 +1461,7 @@ async fn replay_detached_spawn_returns_recorded_child_id() {
             workflow_name: "detached_spawn_abandon_workflow".to_string(),
             execution_id: exec_id,
             events,
-        context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         })
         .await;
 
@@ -1491,7 +1491,7 @@ async fn replay_detached_spawn_request_cancel_policy_succeeds() {
             workflow_name: "detached_spawn_request_cancel_workflow".to_string(),
             execution_id: exec_id,
             events,
-        context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         })
         .await;
 
@@ -1514,7 +1514,7 @@ async fn replay_detached_spawn_policy_mismatch_detects_non_determinism() {
             workflow_name: "detached_spawn_abandon_workflow".to_string(),
             execution_id: exec_id,
             events,
-        context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         })
         .await;
 
@@ -1539,7 +1539,7 @@ async fn replay_detached_spawn_then_activity_succeeds() {
             workflow_name: "detached_spawn_then_activity_workflow".to_string(),
             execution_id: exec_id,
             events,
-        context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         })
         .await;
 
@@ -1581,7 +1581,7 @@ async fn replay_reordered_detached_spawn_detects_non_determinism() {
             workflow_name: "reordered_detached_spawn_workflow".to_string(),
             execution_id: exec_id,
             events,
-        context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         })
         .await;
 
@@ -1640,7 +1640,7 @@ async fn replay_backwards_compat_awaited_child_workflow() {
             workflow_name: "awaited_child_workflow".to_string(),
             execution_id: exec_id,
             events,
-        context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         })
         .await;
 
@@ -1712,7 +1712,7 @@ async fn replay_succeeds_for_recorded_side_effect() {
             workflow_name: "now_then_activity".to_string(),
             execution_id: exec_id,
             events,
-        context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         })
         .await;
 
@@ -1753,7 +1753,7 @@ async fn replay_detects_side_effect_drift() {
             workflow_name: "now_then_activity".to_string(),
             execution_id: exec_id,
             events,
-        context_headers: std::collections::HashMap::new(),
+            context_headers: None,
         })
         .await;
 
