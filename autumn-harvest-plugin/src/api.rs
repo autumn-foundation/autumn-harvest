@@ -5497,9 +5497,12 @@ async fn start_workflow(
         });
 
     // Resolve effective SLA: request override → WorkflowInfo default → None.
+    // `try_seconds` avoids a panic on an out-of-range untrusted `i64`, and the
+    // non-negative filter rejects negative inputs (which would breach immediately).
     let effective_sla = request
         .sla_secs
-        .map(chrono::Duration::seconds)
+        .filter(|&secs| secs >= 0)
+        .and_then(chrono::Duration::try_seconds)
         .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()));
 
     let result = start_or_load_workflow_execution(

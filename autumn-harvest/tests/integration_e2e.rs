@@ -2597,6 +2597,7 @@ async fn worker_completes_parent_workflow_with_parallel_child_workflows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_builder_state_is_visible_to_workflow_and_activity() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -7198,6 +7199,7 @@ fn retry_context_activity<'a>(
 /// `ctx.attempt() == 1, 2, 3` and `ctx.previous_failure() == None,
 /// Some("…"), Some("…")`".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)

@@ -490,9 +490,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         runbook_url: info.runbook_url,
                         severity: info.severity,
                         context_headers: opts.context_headers,
-                        sla: opts.sla.or(info.sla).map(|d|
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .unwrap_or(::autumn_harvest::chrono::Duration::zero())
+                        sla: opts.sla.or(info.sla).and_then(|d|
+                            ::autumn_harvest::chrono::Duration::from_std(d).ok()
                         ),
                     };
 
@@ -575,9 +574,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         runbook_url: info.runbook_url,
                         severity: info.severity,
                         context_headers: opts.context_headers,
-                        sla: opts.sla.or(info.sla).map(|d|
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .unwrap_or(::autumn_harvest::chrono::Duration::zero())
+                        sla: opts.sla.or(info.sla).and_then(|d|
+                            ::autumn_harvest::chrono::Duration::from_std(d).ok()
                         ),
                     };
 

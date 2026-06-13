@@ -310,9 +310,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             runbook_url: ::std::option::Option::None,
                             severity: ::std::option::Option::None,
                             context_headers: opts.context_headers,
-                            sla: opts.sla.map(|d|
-                                ::autumn_harvest::chrono::Duration::from_std(d)
-                                    .unwrap_or(::autumn_harvest::chrono::Duration::zero())
+                            sla: opts.sla.and_then(|d|
+                                ::autumn_harvest::chrono::Duration::from_std(d).ok()
                             ),
                         };
                         let _ = client;
@@ -434,9 +433,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 runbook_url: ::std::option::Option::None,
                                 severity: ::std::option::Option::None,
                                 context_headers: opts.context_headers,
-                                sla: opts.sla.map(|d|
-                                    ::autumn_harvest::chrono::Duration::from_std(d)
-                                        .unwrap_or(::autumn_harvest::chrono::Duration::zero())
+                                sla: opts.sla.and_then(|d|
+                                    ::autumn_harvest::chrono::Duration::from_std(d).ok()
                                 ),
                             };
                             let _ = client;

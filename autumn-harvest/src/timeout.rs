@@ -903,11 +903,7 @@ pub async fn enforce_workflow_sla_breaches(
     let now = Utc::now();
     let breached: Vec<(uuid::Uuid, String, String)> =
         diesel::update(harvest_workflow_executions::table)
-            .filter(
-                harvest_workflow_executions::state
-                    .eq("RUNNING")
-                    .or(harvest_workflow_executions::state.eq("SUSPENDED")),
-            )
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "SUSPENDED"]))
             .filter(harvest_workflow_executions::sla_deadline_at.is_not_null())
             .filter(harvest_workflow_executions::sla_deadline_at.lt(Some(now)))
             .filter(harvest_workflow_executions::sla_breached.eq(false))
