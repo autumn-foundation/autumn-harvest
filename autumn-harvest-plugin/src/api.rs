@@ -13277,13 +13277,15 @@ pub(crate) async fn load_workflows_from_shards(
 /// `harvest_events` row is older than `no_progress_minutes`. By default,
 /// executions whose only pending work is a future-dated durable timer are
 /// excluded (correctly sleeping ≠ stalled); `include_sleeping = true` opts
-/// them back in.
+/// them back in. Executions with overdue unfired timers are always included
+/// regardless of `include_sleeping`.
 ///
 /// Implementation uses five queries per shard:
-///   1. Stalled candidates — Diesel boxed query with a raw NOT EXISTS filter
-///      for the age check (efficient via idx_harvest_events_exec_last)
-///   2. Batch last-event-at via GROUP BY MAX(timestamp)
-///   3–6. Four `.eq_any` batch queries to classify pending work
+/// 1. Stalled candidates — Diesel boxed query with a raw `NOT EXISTS` filter
+///    for the age check (efficient via `idx_harvest_events_exec_last`)
+/// 2. Batch last-event-at via `GROUP BY MAX(timestamp)`
+/// 3. Pending activity, child, signal, and future-timer sets via `.eq_any`
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn load_stalled_workflows(
     conn: &mut AsyncPgConnection,
     filters: &WorkflowFilters,
@@ -13292,15 +13294,34 @@ pub(crate) async fn load_stalled_workflows(
     use diesel::sql_types::{BigInt, Bool};
     use std::collections::{HashMap, HashSet};
 
-    let minutes = match filters.no_progress_minutes {
-        Some(m) => m,
-        None => return Ok(vec![]),
+    let Some(minutes) = filters.no_progress_minutes else {
+        return Ok(vec![]);
     };
 
+    // Respect any caller-supplied state restriction; intersect with the
+    // stall-eligible set.  If the caller restricts to non-active states
+    // (e.g. state=COMPLETED), return empty immediately.
+    let active_states: Vec<&str> = if filters.states.is_empty() {
+        vec!["RUNNING", "SUSPENDED", "PAUSED"]
+    } else {
+        filters
+            .states
+            .iter()
+            .map(String::as_str)
+            .filter(|s| matches!(*s, "RUNNING" | "SUSPENDED" | "PAUSED"))
+            .collect()
+    };
+    if active_states.is_empty() {
+        return Ok(vec![]);
+    }
+
     // ── Step 1: find stalled candidate executions ──────────────────────────
+    // No per-shard limit here; the global limit is applied after cross-shard
+    // sorting in load_stalled_workflows_from_shards, so oldest stalls are
+    // never dropped by a premature per-shard truncation.
     let mut query = harvest_workflow_executions::table
         .into_boxed()
-        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "SUSPENDED", "PAUSED"]))
+        .filter(harvest_workflow_executions::state.eq_any(active_states))
         // No event newer than N minutes — O(1) per candidate with the covering index.
         // Qualify the outer table's id to avoid ambiguity with harvest_events.id (Int8).
         .filter(
@@ -13313,23 +13334,24 @@ pub(crate) async fn load_stalled_workflows(
             .bind::<BigInt, _>(minutes)
             .sql(" * INTERVAL '1 minute')"),
         )
-        .order(harvest_workflow_executions::created_at.desc())
-        .limit(filters.limit);
+        .order(harvest_workflow_executions::created_at.desc());
 
     if let Some(name) = &filters.workflow_name {
-        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
+        query = query.filter(harvest_workflow_executions::workflow_name.eq(name.as_str()));
     }
     if let Some(owner) = &filters.owner {
-        query = query.filter(harvest_workflow_executions::owner.eq(owner.clone()));
+        query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }
     if let Some(severity) = &filters.severity {
-        query = query.filter(harvest_workflow_executions::severity.eq(severity.clone()));
+        query = query.filter(harvest_workflow_executions::severity.eq(severity.as_str()));
     }
 
     if !filters.include_sleeping {
-        // Include an execution if it has any non-timer pending work OR has no
-        // future timer at all.  The only excluded case is "correctly sleeping":
-        // a future-dated timer is the sole pending item.
+        // Include an execution if it has any non-timer pending work, OR has no
+        // future-dated unfired timer (nothing to sleep on), OR has an overdue
+        // unfired timer (should have progressed).  The only excluded case is
+        // "correctly sleeping": a future-dated timer is the sole pending item
+        // and no timers are overdue.
         query = query.filter(sql::<Bool>(
             "(\
                 EXISTS(\
@@ -13352,7 +13374,13 @@ pub(crate) async fn load_stalled_workflows(
                 ) \
              OR NOT EXISTS(\
                     SELECT 1 FROM harvest_timers \
-                    WHERE workflow_exec_id = harvest_workflow_executions.id AND fired = false AND fires_at > NOW()\
+                    WHERE workflow_exec_id = harvest_workflow_executions.id \
+                    AND fired = false AND fires_at > NOW()\
+                )\
+             OR EXISTS(\
+                    SELECT 1 FROM harvest_timers \
+                    WHERE workflow_exec_id = harvest_workflow_executions.id \
+                    AND fired = false AND fires_at <= NOW()\
                 )\
             )",
         ));
@@ -13371,20 +13399,19 @@ pub(crate) async fn load_stalled_workflows(
     let exec_ids: Vec<uuid::Uuid> = candidates.iter().map(|e| e.id).collect();
 
     // ── Step 2: batch-fetch last_event_at per execution ────────────────────
-    let last_event_ats: HashMap<uuid::Uuid, chrono::DateTime<chrono::Utc>> =
-        harvest_events::table
-            .filter(harvest_events::workflow_exec_id.eq_any(&exec_ids))
-            .group_by(harvest_events::workflow_exec_id)
-            .select((
-                harvest_events::workflow_exec_id,
-                max(harvest_events::timestamp),
-            ))
-            .load::<(uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)>(conn)
-            .await
-            .map_err(database_error)?
-            .into_iter()
-            .filter_map(|(id, ts)| ts.map(|t| (id, t)))
-            .collect();
+    let last_event_ats: HashMap<uuid::Uuid, chrono::DateTime<chrono::Utc>> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq_any(&exec_ids))
+        .group_by(harvest_events::workflow_exec_id)
+        .select((
+            harvest_events::workflow_exec_id,
+            max(harvest_events::timestamp),
+        ))
+        .load::<(uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)>(conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .filter_map(|(id, ts)| ts.map(|t| (id, t)))
+        .collect();
 
     // ── Step 3: pending activity tasks ─────────────────────────────────────
     let has_activity: HashSet<uuid::Uuid> = harvest_task_queue::table
@@ -13393,9 +13420,7 @@ pub(crate) async fn load_stalled_workflows(
                 .eq_any(exec_ids.iter().map(|id| Some(*id)).collect::<Vec<_>>()),
         )
         .filter(harvest_task_queue::task_type.eq("activity"))
-        .filter(
-            harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]),
-        )
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
         .select(harvest_task_queue::workflow_exec_id)
         .distinct()
         .load::<Option<uuid::Uuid>>(conn)
@@ -13440,11 +13465,15 @@ pub(crate) async fn load_stalled_workflows(
         .into_iter()
         .collect();
 
+    // Capture now once — reused for timer comparison and age calculation to
+    // ensure temporal consistency across both.
+    let now = chrono::Utc::now();
+
     // ── Step 6: future-dated unfired timers ─────────────────────────────────
     let has_future_timer: HashSet<uuid::Uuid> = harvest_timers::table
         .filter(harvest_timers::workflow_exec_id.eq_any(&exec_ids))
         .filter(harvest_timers::fired.eq(false))
-        .filter(harvest_timers::fires_at.gt(chrono::Utc::now()))
+        .filter(harvest_timers::fires_at.gt(now))
         .select(harvest_timers::workflow_exec_id)
         .distinct()
         .load::<uuid::Uuid>(conn)
@@ -13453,15 +13482,13 @@ pub(crate) async fn load_stalled_workflows(
         .into_iter()
         .collect();
 
-    let now = chrono::Utc::now();
-
     Ok(candidates
         .into_iter()
         .map(|execution| {
             let id = execution.id;
             let last_event_at = last_event_ats.get(&id).copied();
-            let last_event_age_seconds = last_event_at
-                .map(|ts| (now - ts).num_milliseconds() as f64 / 1000.0);
+            let last_event_age_seconds =
+                last_event_at.map(|ts| (now - ts).to_std().map(|d| d.as_secs_f64()).unwrap_or(0.0));
             let stall_reason = Some(if has_activity.contains(&id) {
                 StallReason::PendingActivity
             } else if has_child.contains(&id) {

@@ -63,9 +63,7 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
     ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"
-    ),
+    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
@@ -82,9 +80,7 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
     ),
-    include_str!(
-        "../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"
-    ),
+    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
     include_str!(
         "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
     ),
@@ -95,9 +91,7 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
     ),
     "\n",
-    include_str!(
-        "../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"
-    ),
+    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
@@ -266,7 +260,9 @@ async fn touch_workflow(database_url: &str, exec_id: ExecutionId) {
 }
 
 fn stall_reason_of(row: &Value) -> &str {
-    row["stall_reason"].as_str().expect("stall_reason must be present and a string")
+    row["stall_reason"]
+        .as_str()
+        .expect("stall_reason must be present and a string")
 }
 
 fn workflow_ids_of(arr: &Value) -> Vec<String> {
@@ -350,8 +346,11 @@ async fn test_sleeping_workflow_included_with_flag() {
     let exec_id = seed_stalled_workflow(&database_url, "wf-sleeping-inc", 2).await;
     add_future_timer(&database_url, exec_id).await;
 
-    let (status, body) =
-        get_json(&app, "/workflows?no_progress_minutes=30&include_sleeping=true").await;
+    let (status, body) = get_json(
+        &app,
+        "/workflows?no_progress_minutes=30&include_sleeping=true",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "expected 200; body={body}");
 
     let rows = body.as_array().expect("array");
@@ -456,8 +455,11 @@ async fn test_no_pending_work_always_returned_regardless_of_include_sleeping() {
     let _exec_id = seed_stalled_workflow(&database_url, "wf-always-no-pending", 2).await;
 
     // include_sleeping=false is the DEFAULT, but let's be explicit.
-    let (status, body) =
-        get_json(&app, "/workflows?no_progress_minutes=30&include_sleeping=false").await;
+    let (status, body) = get_json(
+        &app,
+        "/workflows?no_progress_minutes=30&include_sleeping=false",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     let ids = workflow_ids_of(&body);
@@ -474,8 +476,16 @@ async fn test_invalid_no_progress_minutes_returns_400() {
     let app = build_app(&database_url);
 
     let (status, _body) = get_json(&app, "/workflows?no_progress_minutes=0").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "0 minutes must be rejected");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "0 minutes must be rejected"
+    );
 
     let (status, _body) = get_json(&app, "/workflows?no_progress_minutes=-5").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "negative minutes must be rejected");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "negative minutes must be rejected"
+    );
 }
