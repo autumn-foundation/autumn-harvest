@@ -1197,7 +1197,14 @@ async fn upsert_workflow_schedule(
         .set((
             dsl::schedule_expr.eq(expr),
             dsl::timezone.eq(ws.schedule.timezone_str()),
-            dsl::catchup.eq(ws.catchup),
+            // Mirror the effective catchup policy into the legacy `catchup`
+            // bool so API responses and any rollback/older reader that only
+            // honors the legacy column see the same enabled/disabled decision
+            // the policy columns encode (issue #484 / Codex #1220). When no
+            // policy is set the caller's explicit `catchup` bool is preserved.
+            dsl::catchup.eq(ws
+                .catchup_policy
+                .map_or(ws.catchup, crate::policy::CatchupPolicy::is_catchup_enabled)),
             dsl::max_active_runs.eq(i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)),
             dsl::dag_name.eq(dag_name),
             dsl::workflow_name.eq(Some(ws.workflow_name.as_str())),
@@ -1809,6 +1816,30 @@ async fn tick_one_workflow_schedule(
 
     let catchup = catchup_policy.is_catchup_enabled();
 
+    // Compute the bounded catchup plan up front from the *original* oldest
+    // overdue slot, then rebind `logical_date` to the earliest slot the policy
+    // actually intends to fire. This makes the calendar suppression, overlap
+    // buffering, jitter window, and dispatch logic below all operate on a
+    // policy-approved slot rather than the oldest missed one (issue #484:
+    // bounded policies must be applied *before* those branches, not after).
+    //
+    // For SkipAll / Unbounded / legacy `catchup` schedules, `run_dates.first()`
+    // is exactly the original `logical_date`, so their behavior is completely
+    // unchanged — only the new MostRecent / Window policies shift the anchor.
+    let catchup_plan = catchup_run_plan(
+        parsed_schedule,
+        logical_date,
+        now,
+        catchup_policy,
+        schedule.end_at,
+    );
+    // Slice pattern rather than `.first()` to avoid colliding with diesel's
+    // `RunQueryDsl::first` brought into scope by the schema `dsl` import.
+    let logical_date = match catchup_plan.run_dates.as_slice() {
+        [earliest, ..] => *earliest,
+        [] => logical_date,
+    };
+
     // Compute jitter window once so it can be reused in the dispatch loop below.
     let jitter_window =
         std::time::Duration::from_secs(u64::try_from(schedule.jitter_secs.max(0)).unwrap_or(0));
@@ -2253,10 +2284,14 @@ async fn tick_one_workflow_schedule(
         }
     }
 
-    let catchup_plan = catchup_run_plan(parsed_schedule, logical_date, now, catchup_policy);
-    let run_dates = catchup_plan.run_dates;
-    let next_run_after_plan = catchup_plan.next_run_at;
-    let catchup_slots_dropped = catchup_plan.dropped;
+    // Reuse the plan computed at the top of the tick (which also rebound
+    // `logical_date`); recomputing here from the rebound anchor would zero the
+    // dropped count.
+    let CatchupPlan {
+        run_dates,
+        next_run_at: next_run_after_plan,
+        dropped: catchup_slots_dropped,
+    } = catchup_plan;
     // Record a skip metric for each dropped slot and one aggregated decision
     // row so operators have a full audit trail.
     if catchup_slots_dropped > 0 {
@@ -2294,14 +2329,20 @@ async fn tick_one_workflow_schedule(
         // Persist the catchup-drop summary as a separate, conditional update —
         // NOT part of the main finalize update below — so ordinary (zero-drop)
         // ticks never reset this recovery audit trail back to 0 / NULL.
-        let _ = diesel::update(dsl::harvest_schedules.find(schedule.id))
-            .set((
-                dsl::last_catchup_dropped
-                    .eq(i32::try_from(catchup_slots_dropped).unwrap_or(i32::MAX)),
-                dsl::last_catchup_at.eq(Some(now)),
-            ))
-            .execute(conn)
-            .await;
+        // Guarded by the HA claim token (like the final update) so a stale tick
+        // that lost its claim cannot stamp obsolete recovery audit fields over a
+        // successor replica's row (issue #484 / Codex #2297).
+        let _ = diesel::update(
+            dsl::harvest_schedules
+                .find(schedule.id)
+                .filter(dsl::fire_claim_token.eq(Some(claim_token))),
+        )
+        .set((
+            dsl::last_catchup_dropped.eq(i32::try_from(catchup_slots_dropped).unwrap_or(i32::MAX)),
+            dsl::last_catchup_at.eq(Some(now)),
+        ))
+        .execute(conn)
+        .await;
     }
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
     // jitter_window already computed at function entry; reused here.
@@ -2840,11 +2881,25 @@ pub(crate) struct CatchupPlan {
 /// This is the policy-aware replacement for the internal `due_run_plan` helper.
 /// The old function is preserved as a thin wrapper for backward-compat so that
 /// its unit tests continue to serve as regression evidence.
+///
+/// `end_at` is the schedule's hard cut-off (issue #478). For the bounded
+/// policies (`MostRecent`/`Window`) a slot is only eligible if it is strictly
+/// before `end_at`, so the planner never selects a slot at/after `end_at` and
+/// thereby exhausts the schedule before firing the newest *valid* missed slot
+/// (issue #484 / Codex #2861). `SkipAll`/`Unbounded` leave `end_at` enforcement
+/// to the dispatch loop, unchanged.
+///
+/// The bounded policies compute their result **without materializing every
+/// missed slot**: interval schedules use closed-form arithmetic (so a
+/// high-frequency schedule down for a long period costs O(1), not O(n)), and
+/// cron schedules walk but retain only the slots the policy actually keeps
+/// (issue #484 / Codex #2859).
 pub(crate) fn catchup_run_plan(
     schedule: Option<&Schedule>,
     first_due: DateTime<Utc>,
     now: DateTime<Utc>,
     policy: crate::policy::CatchupPolicy,
+    end_at: Option<DateTime<Utc>>,
 ) -> CatchupPlan {
     use crate::policy::CatchupPolicy;
 
@@ -2871,31 +2926,184 @@ pub(crate) fn catchup_run_plan(
             }
         }
         CatchupPolicy::MostRecent => {
-            // Enumerate all missed slots but keep only the last one.
-            let (all_slots, next_run_at) = due_run_plan(schedule, first_due, now, true);
-            let total = all_slots.len() as u64;
-            let run_dates = all_slots.into_iter().last().into_iter().collect::<Vec<_>>();
+            let summary = eligible_slot_summary(schedule, first_due, now, end_at);
+            let run_dates = summary.last_eligible.into_iter().collect::<Vec<_>>();
             let fired = run_dates.len() as u64;
             CatchupPlan {
                 run_dates,
-                next_run_at,
-                dropped: total.saturating_sub(fired),
+                next_run_at: summary.next_run_at,
+                dropped: summary.eligible_count.saturating_sub(fired),
             }
         }
         CatchupPolicy::Window(window) => {
-            // Keep only slots whose scheduled time is >= now − window.
-            let cutoff =
-                now - chrono::Duration::from_std(window).unwrap_or(chrono::Duration::zero());
-            let (all_slots, next_run_at) = due_run_plan(schedule, first_due, now, true);
-            let total = all_slots.len() as u64;
-            let run_dates: Vec<_> = all_slots.into_iter().filter(|&t| t >= cutoff).collect();
+            let cutoff = now
+                - chrono::Duration::from_std(window).unwrap_or_else(|_| chrono::Duration::zero());
+            let summary = eligible_slot_summary(schedule, first_due, now, end_at);
+            let run_dates = window_eligible_slots(schedule, first_due, now, end_at, cutoff);
             let fired = run_dates.len() as u64;
             CatchupPlan {
                 run_dates,
-                next_run_at,
-                dropped: total.saturating_sub(fired),
+                next_run_at: summary.next_run_at,
+                dropped: summary.eligible_count.saturating_sub(fired),
             }
         }
+    }
+}
+
+/// Summary of the eligible missed slots for a bounded catchup policy.
+///
+/// "Eligible" = a slot `s` with `first_due <= s <= now` and, when `end_at` is
+/// set, `s < end_at`.
+struct EligibleSummary {
+    /// Total number of eligible missed slots.
+    eligible_count: u64,
+    /// The most recent eligible slot (`None` when there are none).
+    last_eligible: Option<DateTime<Utc>>,
+    /// The first scheduled slot strictly after `now` (the natural next run).
+    /// Independent of `end_at`; the dispatch/budget logic handles exhaustion.
+    next_run_at: Option<DateTime<Utc>>,
+}
+
+/// Extract a strictly-positive interval period as a `chrono::Duration`.
+fn interval_period(schedule: Option<&Schedule>) -> Option<chrono::Duration> {
+    match schedule {
+        Some(Schedule::Interval(d)) => {
+            let cd = chrono::Duration::from_std(*d).ok()?;
+            (cd > chrono::Duration::zero()).then_some(cd)
+        }
+        _ => None,
+    }
+}
+
+/// Largest step index `k >= 0` such that `first_due + k*period` is eligible, i.e.
+/// `<= now` and (when set) `< end_at`. Returns `None` when no slot is eligible.
+fn last_eligible_step(span_now: i64, period: i64, end_span: Option<i64>) -> Option<i64> {
+    if span_now < 0 {
+        return None;
+    }
+    let k_now = span_now / period; // floor; largest k with k*period <= span_now
+    let k = match end_span {
+        // largest k with k*period < end_span  <=>  k*period <= end_span - 1
+        Some(es) if es >= 1 => k_now.min((es - 1) / period),
+        Some(_) => return None, // end_at <= first_due: nothing eligible
+        None => k_now,
+    };
+    (k >= 0).then_some(k)
+}
+
+/// Compute the eligible-slot summary, using closed-form arithmetic for interval
+/// schedules and a bounded walk for cron schedules.
+fn eligible_slot_summary(
+    schedule: Option<&Schedule>,
+    first_due: DateTime<Utc>,
+    now: DateTime<Utc>,
+    end_at: Option<DateTime<Utc>>,
+) -> EligibleSummary {
+    if let Some(period) = interval_period(schedule)
+        && let (Some(p), Some(span_now)) = (
+            period.num_nanoseconds(),
+            (now - first_due).num_nanoseconds(),
+        )
+    {
+        let end_span = end_at.and_then(|e| (e - first_due).num_nanoseconds());
+        // Proceed with arithmetic only when end_at is unset or its offset fits in
+        // nanoseconds; otherwise fall through to the walk path (avoids a wrong cap).
+        if end_at.is_none() || end_span.is_some() {
+            let next_run_at = (span_now >= 0)
+                .then(|| first_due + chrono::Duration::nanoseconds((span_now / p + 1) * p));
+            return last_eligible_step(span_now, p, end_span).map_or(
+                EligibleSummary {
+                    eligible_count: 0,
+                    last_eligible: None,
+                    next_run_at,
+                },
+                |k| EligibleSummary {
+                    eligible_count: u64::try_from(k + 1).unwrap_or(0),
+                    last_eligible: Some(first_due + chrono::Duration::nanoseconds(k * p)),
+                    next_run_at,
+                },
+            );
+        }
+    }
+
+    // Cron (or sub-second / overflowing interval): walk, retaining only the
+    // count and the last eligible slot — never the full slot vector.
+    let mut cursor = first_due;
+    let mut count: u64 = 0;
+    let mut last_eligible = None;
+    loop {
+        if cursor > now {
+            return EligibleSummary {
+                eligible_count: count,
+                last_eligible,
+                next_run_at: Some(cursor),
+            };
+        }
+        if end_at.is_none_or(|e| cursor < e) {
+            count += 1;
+            last_eligible = Some(cursor);
+        }
+        let Some(next) = next_run_after(schedule, cursor) else {
+            return EligibleSummary {
+                eligible_count: count,
+                last_eligible,
+                next_run_at: None,
+            };
+        };
+        cursor = next;
+    }
+}
+
+/// Collect the eligible slots within the catchup window `[cutoff, now]`
+/// (and `< end_at`). The fired set is bounded by the operator-chosen window, so
+/// materializing it is intentional; the dropped count is derived separately by
+/// the caller from [`eligible_slot_summary`].
+fn window_eligible_slots(
+    schedule: Option<&Schedule>,
+    first_due: DateTime<Utc>,
+    now: DateTime<Utc>,
+    end_at: Option<DateTime<Utc>>,
+    cutoff: DateTime<Utc>,
+) -> Vec<DateTime<Utc>> {
+    if let Some(period) = interval_period(schedule)
+        && let (Some(p), Some(span_now)) = (
+            period.num_nanoseconds(),
+            (now - first_due).num_nanoseconds(),
+        )
+    {
+        let end_span = end_at.and_then(|e| (e - first_due).num_nanoseconds());
+        if end_at.is_none() || end_span.is_some() {
+            let Some(k_hi) = last_eligible_step(span_now, p, end_span) else {
+                return vec![];
+            };
+            // Smallest k with first_due + k*period >= cutoff.
+            let k_lo = match (cutoff - first_due).num_nanoseconds() {
+                Some(cs) if cs > 0 => (cs + p - 1) / p, // ceil
+                _ => 0,
+            };
+            if k_lo > k_hi {
+                return vec![];
+            }
+            return (k_lo..=k_hi)
+                .map(|k| first_due + chrono::Duration::nanoseconds(k * p))
+                .collect();
+        }
+    }
+
+    // Cron fallback: walk and keep only the in-window, eligible slots.
+    let mut cursor = first_due;
+    let mut slots = Vec::new();
+    loop {
+        if cursor > now {
+            return slots;
+        }
+        if cursor >= cutoff && end_at.is_none_or(|e| cursor < e) {
+            slots.push(cursor);
+        }
+        let Some(next) = next_run_after(schedule, cursor) else {
+            return slots;
+        };
+        cursor = next;
     }
 }
 
@@ -3614,7 +3822,13 @@ mod tests {
         let first_due = parse_utc("2026-04-06T12:00:00Z");
         let now = parse_utc("2026-04-06T12:05:00Z"); // 5 missed slots
 
-        let plan = catchup_run_plan(Some(&schedule), first_due, now, CatchupPolicy::SkipAll);
+        let plan = catchup_run_plan(
+            Some(&schedule),
+            first_due,
+            now,
+            CatchupPolicy::SkipAll,
+            None,
+        );
 
         // Identical to due_run_plan(false): one slot, zero drops. next_run_at
         // is anchored to first_due + period (12:01), but since that is already
@@ -3631,7 +3845,13 @@ mod tests {
         let first_due = parse_utc("2026-04-06T12:00:00Z");
         let now = parse_utc("2026-04-06T12:02:30Z");
 
-        let plan = catchup_run_plan(Some(&schedule), first_due, now, CatchupPolicy::Unbounded);
+        let plan = catchup_run_plan(
+            Some(&schedule),
+            first_due,
+            now,
+            CatchupPolicy::Unbounded,
+            None,
+        );
 
         assert_eq!(
             plan.run_dates,
@@ -3653,7 +3873,13 @@ mod tests {
         // Simulate 24-hour outage: first_due = 24h ago.
         let first_due = now - chrono::Duration::hours(24);
 
-        let plan = catchup_run_plan(Some(&schedule), first_due, now, CatchupPolicy::MostRecent);
+        let plan = catchup_run_plan(
+            Some(&schedule),
+            first_due,
+            now,
+            CatchupPolicy::MostRecent,
+            None,
+        );
 
         // 24h / 15m = 96 intervals; the slot at exactly `now` is also due, so
         // 97 total missed slots. Fire exactly 1 (the most recent).
@@ -3677,7 +3903,13 @@ mod tests {
         let first_due = parse_utc("2026-04-06T12:00:00Z");
         let now = parse_utc("2026-04-06T12:30:00Z"); // only one slot due
 
-        let plan = catchup_run_plan(Some(&schedule), first_due, now, CatchupPolicy::MostRecent);
+        let plan = catchup_run_plan(
+            Some(&schedule),
+            first_due,
+            now,
+            CatchupPolicy::MostRecent,
+            None,
+        );
 
         assert_eq!(plan.run_dates, vec![first_due]);
         assert_eq!(plan.dropped, 0, "single slot ⇒ no drops");
@@ -3697,6 +3929,7 @@ mod tests {
             first_due,
             now,
             CatchupPolicy::Window(window),
+            None,
         );
 
         // All fired slots must be >= now - window.
@@ -3734,10 +3967,147 @@ mod tests {
             first_due,
             now,
             CatchupPolicy::Window(Duration::ZERO),
+            None,
         );
 
         // A zero window fires the slot at exactly `first_due = now`.
         assert!(!plan.run_dates.is_empty(), "slot at now should still fire");
+    }
+
+    #[test]
+    fn catchup_run_plan_most_recent_high_frequency_is_bounded() {
+        use crate::policy::CatchupPolicy;
+        // 1-second interval down for 30 days = ~2.6M missed slots. The arithmetic
+        // fast-path must return in O(1) without materializing the slot vector.
+        let schedule = Schedule::Interval(Duration::from_secs(1));
+        let now = parse_utc("2026-04-06T00:00:00Z");
+        let first_due = now - chrono::Duration::days(30);
+
+        let plan = catchup_run_plan(
+            Some(&schedule),
+            first_due,
+            now,
+            CatchupPolicy::MostRecent,
+            None,
+        );
+
+        let total = 30 * 24 * 3600_u64; // intervals
+        assert_eq!(plan.run_dates.len(), 1, "MostRecent fires exactly one slot");
+        assert_eq!(plan.run_dates[0], now, "fires the slot at exactly now");
+        // total slots = intervals + 1 (slot at now); dropped = total - 1.
+        assert_eq!(plan.dropped, total, "dropped = (intervals + 1) - 1");
+        assert_eq!(plan.next_run_at, Some(now + chrono::Duration::seconds(1)));
+    }
+
+    #[test]
+    fn catchup_run_plan_most_recent_respects_end_at() {
+        use crate::policy::CatchupPolicy;
+        // 15-min interval; end_at sits between older slots and the newest slot.
+        // MostRecent must pick the newest slot STRICTLY BEFORE end_at, not the
+        // newest overdue slot (which is at/after end_at).
+        let schedule = Schedule::Interval(Duration::from_secs(60 * 15));
+        let first_due = parse_utc("2026-04-06T00:00:00Z");
+        let now = parse_utc("2026-04-06T02:00:00Z"); // 8 missed slots + slot at now = 9
+        // end_at at 01:00: eligible slots are 00:00,00:15,00:30,00:45 (4 slots,
+        // since 01:00 itself is == end_at and excluded).
+        let end_at = parse_utc("2026-04-06T01:00:00Z");
+
+        let plan = catchup_run_plan(
+            Some(&schedule),
+            first_due,
+            now,
+            CatchupPolicy::MostRecent,
+            Some(end_at),
+        );
+
+        assert_eq!(plan.run_dates.len(), 1, "fires exactly one eligible slot");
+        assert_eq!(
+            plan.run_dates[0],
+            parse_utc("2026-04-06T00:45:00Z"),
+            "fires the newest slot strictly before end_at"
+        );
+        // 4 eligible slots (00:00..00:45), 1 fired, 3 dropped.
+        assert_eq!(plan.dropped, 3, "drops the 3 older eligible slots");
+        // next_run_at is the natural next slot after now, ignoring end_at.
+        assert_eq!(plan.next_run_at, Some(parse_utc("2026-04-06T02:15:00Z")));
+    }
+
+    #[test]
+    fn catchup_run_plan_most_recent_all_slots_after_end_at_fires_nothing() {
+        use crate::policy::CatchupPolicy;
+        let schedule = Schedule::Interval(Duration::from_secs(60 * 15));
+        let first_due = parse_utc("2026-04-06T05:00:00Z");
+        let now = parse_utc("2026-04-06T06:00:00Z");
+        // end_at before first_due: no eligible slots at all.
+        let end_at = parse_utc("2026-04-06T04:00:00Z");
+
+        let plan = catchup_run_plan(
+            Some(&schedule),
+            first_due,
+            now,
+            CatchupPolicy::MostRecent,
+            Some(end_at),
+        );
+
+        assert!(
+            plan.run_dates.is_empty(),
+            "no slot before end_at => fire nothing"
+        );
+        assert_eq!(plan.dropped, 0, "no eligible slots => no catchup drops");
+    }
+
+    #[test]
+    fn catchup_run_plan_window_respects_end_at() {
+        use crate::policy::CatchupPolicy;
+        let schedule = Schedule::Interval(Duration::from_secs(60 * 15));
+        let first_due = parse_utc("2026-04-06T00:00:00Z");
+        let now = parse_utc("2026-04-06T03:00:00Z");
+        // 2-hour window keeps slots >= 01:00; end_at at 02:00 caps the top.
+        // Eligible (< 02:00): 00:00..01:45 (8 slots). In-window (>=01:00 and
+        // <02:00): 01:00,01:15,01:30,01:45 = 4 fired; dropped = 8 - 4 = 4.
+        let end_at = parse_utc("2026-04-06T02:00:00Z");
+
+        let plan = catchup_run_plan(
+            Some(&schedule),
+            first_due,
+            now,
+            CatchupPolicy::Window(Duration::from_secs(2 * 3600)),
+            Some(end_at),
+        );
+
+        for slot in &plan.run_dates {
+            assert!(*slot < end_at, "no slot at/after end_at may fire");
+            assert!(
+                *slot >= parse_utc("2026-04-06T01:00:00Z"),
+                "no slot before the window may fire"
+            );
+        }
+        assert_eq!(plan.run_dates.len(), 4, "4 in-window slots before end_at");
+        assert_eq!(
+            plan.dropped, 4,
+            "4 eligible-but-out-of-window slots dropped"
+        );
+    }
+
+    #[test]
+    fn catchup_run_plan_most_recent_cron_walk_matches_arithmetic() {
+        use crate::policy::CatchupPolicy;
+        // Exercise the cron walk fallback (non-interval schedule).
+        let schedule = Schedule::Cron("0 * * * *".to_string()); // hourly
+        let now = parse_utc("2026-04-06T05:00:00Z");
+        let first_due = parse_utc("2026-04-06T00:00:00Z"); // 00:00..05:00 = 6 slots
+
+        let plan = catchup_run_plan(
+            Some(&schedule),
+            first_due,
+            now,
+            CatchupPolicy::MostRecent,
+            None,
+        );
+
+        assert_eq!(plan.run_dates.len(), 1, "cron MostRecent fires one slot");
+        assert_eq!(plan.run_dates[0], now, "fires the most recent hourly slot");
+        assert_eq!(plan.dropped, 5, "6 slots total, 1 fired, 5 dropped");
     }
 
     #[test]
