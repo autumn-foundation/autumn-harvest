@@ -7042,6 +7042,10 @@ mod tests {
             runs_started: 0,
             exhausted_at: None,
             exhausted_reason: None,
+            catchup_policy: None,
+            catchup_window_secs: None,
+            last_catchup_dropped: 0,
+            last_catchup_at: None,
         }
     }
 
