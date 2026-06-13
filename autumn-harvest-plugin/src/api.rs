@@ -5447,6 +5447,7 @@ async fn start_workflow(
             owner,
             runbook_url,
             severity,
+            context_headers: None,
         },
     )
     .await;
@@ -5986,6 +5987,7 @@ async fn batch_start_workflows(
                     owner,
                     runbook_url,
                     severity,
+                    context_headers: None,
                 },
             )
             .await;
@@ -6543,6 +6545,7 @@ async fn signal_with_start_workflow(
             owner,
             runbook_url,
             severity,
+            context_headers: None,
         },
     )
     .await;
@@ -6991,6 +6994,7 @@ async fn update_with_start_workflow(
         owner,
         runbook_url,
         severity,
+        context_headers: None,
     };
 
     let result = update_with_start_workflow_execution(&mut conn, params).await;
@@ -10230,6 +10234,7 @@ async fn trigger_schedule_now(
             owner,
             runbook_url,
             severity,
+            context_headers: None,
         },
     )
     .await;
@@ -10854,6 +10859,7 @@ async fn schedule_backfill(
                         owner,
                         runbook_url,
                         severity,
+                        context_headers: None,
                     },
                 )
                 .await;
@@ -10995,6 +11001,7 @@ async fn schedule_backfill(
                         owner,
                         runbook_url,
                         severity,
+                        context_headers: None,
                     },
                 )
                 .await;
@@ -17912,6 +17919,7 @@ mod tests {
                 owner: None,
                 runbook_url: None,
                 severity: None,
+                context_headers: None,
             },
         )
         .await

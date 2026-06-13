@@ -5853,6 +5853,7 @@ async fn execute_schedule_trigger_ui(
             owner,
             runbook_url,
             severity,
+            context_headers: None,
         },
     )
     .await;

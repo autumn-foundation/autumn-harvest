@@ -422,6 +422,7 @@ async fn start_harvest_runtime(
                         owner,
                         runbook_url,
                         severity,
+                        context_headers: None,
                     };
 
                     let Some(harvest_db) = harvest_db else {
