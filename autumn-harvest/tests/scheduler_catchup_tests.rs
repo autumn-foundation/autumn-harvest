@@ -244,7 +244,7 @@ async fn insert_catchup_schedule(
 
 /// `MostRecent` policy: 24 h of 60-second slots = ~1440 missed slots.
 /// After one tick exactly 1 execution must be created; `last_catchup_dropped`
-/// must be 1439 (= total_missed - 1).
+/// must be 1439 (= `total_missed` - 1).
 #[tokio::test]
 async fn most_recent_policy_fires_one_and_records_drops() {
     let (mut conn, url, _c) = setup_db().await;
@@ -269,8 +269,8 @@ async fn most_recent_policy_fires_one_and_records_drops() {
 
     tick_once(
         pool.clone(),
-        registry,
-        dags,
+        registry.clone(),
+        dags.clone(),
         Arc::new(vec![]),
         SchedulerMonitor::offline(),
     )
@@ -308,6 +308,38 @@ async fn most_recent_policy_fires_one_and_records_drops() {
     assert!(
         last_catchup_at.is_some(),
         "MostRecent: last_catchup_at must be set after a recovery tick"
+    );
+
+    // A subsequent ordinary tick (no slots are due now) must NOT reset the
+    // recovery audit trail back to 0 / NULL (issue #484 regression guard).
+    tick_once(
+        pool.clone(),
+        registry,
+        dags,
+        Arc::new(vec![]),
+        SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("second tick_once must succeed");
+
+    let (dropped_after, last_catchup_at_after): (i32, Option<chrono::DateTime<Utc>>) =
+        harvest_schedules::table
+            .find(sched_id)
+            .select((
+                harvest_schedules::dsl::last_catchup_dropped,
+                harvest_schedules::dsl::last_catchup_at,
+            ))
+            .first(&mut check)
+            .await
+            .expect("select catchup fields after second tick");
+
+    assert_eq!(
+        dropped_after, dropped,
+        "second tick must not reset last_catchup_dropped"
+    );
+    assert_eq!(
+        last_catchup_at_after, last_catchup_at,
+        "second tick must not reset last_catchup_at"
     );
 }
 

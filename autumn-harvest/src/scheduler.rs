@@ -2260,7 +2260,16 @@ async fn tick_one_workflow_schedule(
     // Record a skip metric for each dropped slot and one aggregated decision
     // row so operators have a full audit trail.
     if catchup_slots_dropped > 0 {
-        for _ in 0..catchup_slots_dropped {
+        // Bound the per-slot counter increments: a long outage on a
+        // high-frequency schedule can drop millions of slots, and looping that
+        // many synchronous recorder calls inside the tick loop would block the
+        // scheduler thread and starve other schedules. The exact drop count is
+        // still preserved on the aggregated decision row and the
+        // `last_catchup_dropped` column below, so alerting on
+        // `harvest.schedule.skipped` stays meaningful.
+        const MAX_SKIP_METRIC_INCREMENTS: u64 = 1000;
+        let metric_increments = catchup_slots_dropped.min(MAX_SKIP_METRIC_INCREMENTS);
+        for _ in 0..metric_increments {
             metrics.record_schedule_skipped("workflow", wf_name, "catchup_window_exceeded");
         }
         crate::schedule_decision::record_decision_graceful(
@@ -2281,6 +2290,18 @@ async fn tick_one_workflow_schedule(
             i16::try_from(current_shard.as_i32()).unwrap_or(0),
         )
         .await;
+
+        // Persist the catchup-drop summary as a separate, conditional update —
+        // NOT part of the main finalize update below — so ordinary (zero-drop)
+        // ticks never reset this recovery audit trail back to 0 / NULL.
+        let _ = diesel::update(dsl::harvest_schedules.find(schedule.id))
+            .set((
+                dsl::last_catchup_dropped
+                    .eq(i32::try_from(catchup_slots_dropped).unwrap_or(i32::MAX)),
+                dsl::last_catchup_at.eq(Some(now)),
+            ))
+            .execute(conn)
+            .await;
     }
     let dispatch_queue = schedule.queue_name.as_deref().unwrap_or("default");
     // jitter_window already computed at function entry; reused here.
@@ -2665,15 +2686,10 @@ async fn tick_one_workflow_schedule(
         // successor replica's live claim if the 30 s TTL expired.
         dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
         dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
-        // Persist the catchup-drop summary from this recovery tick (issue #484).
-        // Only update when there were actual drops so the column reflects the
-        // most recent recovery event and is not reset by ordinary (zero-drop) ticks.
-        dsl::last_catchup_dropped.eq(i32::try_from(catchup_slots_dropped).unwrap_or(i32::MAX)),
-        dsl::last_catchup_at.eq(if catchup_slots_dropped > 0 {
-            Some(now)
-        } else {
-            None
-        }),
+        // NOTE: last_catchup_dropped / last_catchup_at are intentionally NOT set
+        // here. They are persisted by a separate conditional update in the
+        // `catchup_slots_dropped > 0` block above so that ordinary zero-drop
+        // ticks do not wipe the most-recent recovery audit trail (issue #484).
         dsl::updated_at.eq(now),
     ))
     .execute(conn)
@@ -3600,10 +3616,12 @@ mod tests {
 
         let plan = catchup_run_plan(Some(&schedule), first_due, now, CatchupPolicy::SkipAll);
 
-        // Identical to due_run_plan(false): one slot, zero drops.
+        // Identical to due_run_plan(false): one slot, zero drops. next_run_at
+        // is anchored to first_due + period (12:01), but since that is already
+        // behind `now` (12:05) it advances to the first future slot (12:06).
         assert_eq!(plan.run_dates, vec![first_due]);
         assert_eq!(plan.dropped, 0, "SkipAll should not record drops");
-        assert_eq!(plan.next_run_at, Some(parse_utc("2026-04-06T12:01:00Z")));
+        assert_eq!(plan.next_run_at, Some(parse_utc("2026-04-06T12:06:00Z")));
     }
 
     #[test]
@@ -3637,7 +3655,8 @@ mod tests {
 
         let plan = catchup_run_plan(Some(&schedule), first_due, now, CatchupPolicy::MostRecent);
 
-        // 24h / 15m = 96 missed slots; fire exactly 1 (the most recent).
+        // 24h / 15m = 96 intervals; the slot at exactly `now` is also due, so
+        // 97 total missed slots. Fire exactly 1 (the most recent).
         assert_eq!(plan.run_dates.len(), 1, "MostRecent fires exactly one slot");
         // The fired slot must be the most recent (the one closest to now).
         let fired = plan.run_dates[0];
@@ -3646,9 +3665,9 @@ mod tests {
             next_after_fired > now || (now - fired) < chrono::Duration::minutes(15),
             "fired slot {fired} should be the most recent: next={next_after_fired} now={now}"
         );
-        // 96 slots total, 1 fired, 95 dropped.
-        assert_eq!(plan.dropped, 95, "MostRecent should drop 95 of 96 slots");
-        assert!(plan.next_run_at.map_or(false, |t| t > now));
+        // 97 slots total, 1 fired, 96 dropped.
+        assert_eq!(plan.dropped, 96, "MostRecent should drop 96 of 97 slots");
+        assert!(plan.next_run_at.is_some_and(|t| t > now));
     }
 
     #[test]
@@ -3688,17 +3707,18 @@ mod tests {
                 "slot {slot} is before the catchup cutoff {cutoff}"
             );
         }
-        // Total missed = 96; slots in window ≈ 4 (at :45, :00 + 15m * k >= cutoff).
-        // Exactly fired + dropped = 96.
+        // Total missed = 97 (96 intervals + the slot at exactly now). Slots in
+        // the 1-hour window (>= 11:00): 11:00, 11:15, 11:30, 11:45, 12:00 = 5.
+        // Exactly fired + dropped = 97.
         let total = plan.run_dates.len() as u64 + plan.dropped;
-        assert_eq!(total, 96, "fired + dropped must equal total missed slots");
+        assert_eq!(total, 97, "fired + dropped must equal total missed slots");
         assert!(
             plan.dropped > 0,
             "Window(1h) should drop the older 92 slots"
         );
         assert!(
-            plan.run_dates.len() <= 4,
-            "Window(1h) fires at most 4 of 96 slots"
+            plan.run_dates.len() <= 5,
+            "Window(1h) fires at most 5 of 97 slots"
         );
     }
 
