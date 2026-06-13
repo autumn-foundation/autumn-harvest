@@ -4209,7 +4209,7 @@ enum DagNodeState {
 }
 
 /// Human-readable label for a [`DagNodeState`] used in the timeline table.
-fn dag_node_state_label(state: DagNodeState) -> &'static str {
+const fn dag_node_state_label(state: DagNodeState) -> &'static str {
     match state {
         DagNodeState::Succeeded => "Succeeded",
         DagNodeState::Failed => "Failed",
@@ -8020,7 +8020,7 @@ mod tests {
 
     #[test]
     fn map_node_states_seeds_condition_skipped_nodes() {
-        use autumn_harvest::{DagBuilder, DagDefinition};
+        use autumn_harvest::DagBuilder;
 
         fn dummy() {}
         fn dummy2() {}
