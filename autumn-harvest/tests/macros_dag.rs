@@ -123,9 +123,9 @@ async fn manual_review(_ctx: &ActivityContext) -> Result<serde_json::Value, Stri
     Ok(serde_json::json!("reviewed"))
 }
 
-/// DAG using `.condition(...)` via the `#[dag]` macro — same DagTaskRef builder
-/// method as a hand-written DagBuilder call, so macro and builder produce
-/// identical DagDefinitions (AC2).
+/// DAG using `.condition(...)` via the `#[dag]` macro — same `DagTaskRef` builder
+/// method as a hand-written `DagBuilder` call, so macro and builder produce
+/// identical `DagDefinitions` (AC2).
 #[cfg(feature = "unified-dag-execution")]
 #[dag(default_queue = "risk-workers")]
 fn conditional_dag_macro(dag: &mut DagBuilder) {

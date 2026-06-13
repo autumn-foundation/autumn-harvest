@@ -142,15 +142,21 @@ impl DagTask {
         outputs: &[Value],
     ) -> DagDispatchDecision {
         // Collect upstream statuses for the trigger rule.
-        let upstream_statuses: Vec<TaskStatus> =
-            self.upstreams.iter().map(|&i| statuses[i]).collect();
+        let upstream_statuses: Vec<TaskStatus> = self
+            .upstreams
+            .iter()
+            .map(|&i| statuses.get(i).copied().unwrap_or(TaskStatus::Skipped))
+            .collect();
         if !self.trigger_rule.should_run(&upstream_statuses) {
             return DagDispatchDecision::SkipByTriggerRule;
         }
         // Trigger rule passed — evaluate the condition if present.
         if let Some(cond) = &self.condition {
-            let upstream_outputs: Vec<Value> =
-                self.upstreams.iter().map(|&i| outputs[i].clone()).collect();
+            let upstream_outputs: Vec<Value> = self
+                .upstreams
+                .iter()
+                .map(|&i| outputs.get(i).cloned().unwrap_or(Value::Null))
+                .collect();
             if !cond.evaluate(&upstream_outputs) {
                 return DagDispatchDecision::SkipByCondition;
             }

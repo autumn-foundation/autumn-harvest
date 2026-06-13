@@ -846,7 +846,7 @@ async fn high_risk_path(_ctx: &ActivityContext) -> Result<Value, String> {
 // DAG fixtures for branching tests
 // ---------------------------------------------------------------------------
 
-/// Fraud-routing DAG: score_payment → (manual_review | auto_approve) → notify_result (AllDone)
+/// Fraud-routing DAG: `score_payment` → (`manual_review` | `auto_approve`) → `notify_result` (`AllDone`)
 #[dag(default_queue = "risk-workers")]
 fn fraud_routing_dag(dag: &mut DagBuilder) {
     let score = dag.activity(score_payment);
@@ -892,8 +892,8 @@ fn risk_input(task: &str) -> Value {
 // Test 1 — condition-false branch replays with a dag_skip marker
 // ---------------------------------------------------------------------------
 
-/// Low fraud score: manual_review is skipped (condition false), auto_approve runs.
-/// History contains a `MarkerRecorded(dag_skip:1)` before auto_approve's events.
+/// Low fraud score: `manual_review` is skipped (condition false), `auto_approve` runs.
+/// History contains a `MarkerRecorded(dag_skip:1)` before `auto_approve`'s events.
 #[tokio::test]
 async fn condition_false_branch_replays_with_skip_marker() {
     let id_score = ActivityExecId::new();
@@ -969,7 +969,7 @@ async fn condition_false_branch_replays_with_skip_marker() {
 // Test 2 — condition-true branch schedules the activity
 // ---------------------------------------------------------------------------
 
-/// High fraud score: manual_review runs, auto_approve is skipped (condition false).
+/// High fraud score: `manual_review` runs, `auto_approve` is skipped (condition false).
 #[tokio::test]
 async fn condition_true_branch_schedules_activity() {
     let id_score = ActivityExecId::new();
@@ -1047,12 +1047,12 @@ async fn condition_true_branch_schedules_activity() {
 // Test 3 — condition skip propagates downstream via trigger rules (no second marker)
 // ---------------------------------------------------------------------------
 
-/// When both branches are skipped by condition, the AllDone join still fires.
-/// A trigger-rule skip (AllSuccess on downstream of a skipped node) must NOT
-/// emit a dag_skip marker — only condition-skips emit markers.
+/// When both branches are skipped by condition, the `AllDone` join still fires.
+/// A trigger-rule skip (`AllSuccess` on downstream of a skipped node) must NOT
+/// emit a `dag_skip` marker — only condition-skips emit markers.
 ///
-/// This DAG: score → [review (cond false), auto (cond false)] → notify (AllDone)
-/// Because both branches are condition-skipped the notify still fires (AllDone).
+/// This DAG: score → [review (cond false), auto (cond false)] → notify (`AllDone`)
+/// Because both branches are condition-skipped the notify still fires (`AllDone`).
 /// notify's Skipped propagation of downstream (none here) is trigger-rule-based.
 #[tokio::test]
 async fn condition_skip_propagates_and_alldone_join_still_fires() {
@@ -1077,30 +1077,25 @@ async fn condition_skip_propagates_and_alldone_join_still_fires() {
     );
 
     // Verify exactly three dag_skip markers in the event history
-    let skip_markers: Vec<_> = outcome.events().iter().filter(|e| {
+    let skip_marker_count = outcome.events().iter().filter(|e| {
         matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("dag_skip:"))
-    }).collect();
+    }).count();
     assert_eq!(
-        skip_markers.len(),
-        3,
+        skip_marker_count, 3,
         "all three branches should emit dag_skip markers"
     );
 
     // Verify no trigger-rule-skipped nodes emit markers (there are none in this DAG beyond the 3 condition nodes)
-    let trigger_rule_skip_markers: Vec<_> = outcome
-        .events()
-        .iter()
-        .filter(|e| {
-            if let WorkflowEvent::MarkerRecorded { name, details } = e {
-                name.starts_with("dag_skip:")
-                    && details.get("reason").and_then(|r| r.as_str()) != Some("condition_false")
-            } else {
-                false
-            }
-        })
-        .collect();
+    let has_trigger_rule_skip_marker = outcome.events().iter().any(|e| {
+        if let WorkflowEvent::MarkerRecorded { name, details } = e {
+            name.starts_with("dag_skip:")
+                && details.get("reason").and_then(|r| r.as_str()) != Some("condition_false")
+        } else {
+            false
+        }
+    });
     assert!(
-        trigger_rule_skip_markers.is_empty(),
+        !has_trigger_rule_skip_marker,
         "trigger-rule skips must not emit markers"
     );
 }
@@ -1109,8 +1104,8 @@ async fn condition_skip_propagates_and_alldone_join_still_fires() {
 // Test 4 — flipping the condition is reported as non-determinism
 // ---------------------------------------------------------------------------
 
-/// If history contains a dag_skip marker but the condition now returns true
-/// (or vice versa), the replayer must report NonDeterministic.
+/// If history contains a `dag_skip` marker but the condition now returns true
+/// (or vice versa), the replayer must report `NonDeterministic`.
 #[tokio::test]
 async fn condition_flip_is_reported_as_nondeterminism() {
     let id_score = ActivityExecId::new();
@@ -1160,8 +1155,8 @@ async fn condition_flip_is_reported_as_nondeterminism() {
 // Test 5 — run live with WorkflowTestEnv then replay identically (AC4)
 // ---------------------------------------------------------------------------
 
-/// Run the fraud DAG live via WorkflowTestEnv (score=0.2 → auto_approve),
-/// capture the produced event history, then replay it with WorkflowReplayer.
+/// Run the fraud DAG live via `WorkflowTestEnv` (score=0.2 → `auto_approve`),
+/// capture the produced event history, then replay it with `WorkflowReplayer`.
 /// The replay must succeed, verifying the branch decision is deterministic.
 #[tokio::test]
 async fn condition_dag_runs_live_then_replays_identically() {
@@ -1225,7 +1220,7 @@ async fn condition_dag_runs_live_then_replays_identically() {
 // ---------------------------------------------------------------------------
 
 /// Alternate high-score / low-score fixtures across 1,000 replays.
-/// Every replay must reproduce the identical branch (ReplaySucceeded).
+/// Every replay must reproduce the identical branch (`ReplaySucceeded`).
 #[tokio::test]
 async fn condition_branch_replay_sweep_1000() {
     let handler = __autumn_workflow_info_fraud_routing_dag().handler;
@@ -1264,45 +1259,31 @@ async fn condition_branch_replay_sweep_1000() {
             // Level 1 has tasks [1=manual_review, 2=auto_approve] in order
         ];
 
-        // Append level-1 events in task-index order (1 then 2)
+        // Append level-1 events in task-index order (1 then 2).
+        // The marker and ActivityScheduled are the same for both branches; only the
+        // completed output differs (auto_approve → "approved", manual_review → "reviewed").
         let mut h = history;
-        if i % 2 == 0 {
-            // low score: skip manual_review (idx 1), run auto_approve (idx 2)
-            h.push(WorkflowEvent::MarkerRecorded {
-                name: format!("dag_skip:{skip_task_idx}"),
-                details: json!({"task": skip_task_name, "reason": "condition_false"}),
-            });
-            h.push(WorkflowEvent::ActivityScheduled {
-                activity_id: id_run,
-                name: run_task_name.into(),
-                input: risk_input(run_task_name),
-                queue: "risk-workers".into(),
-            });
-            h.push(WorkflowEvent::ActivityCompleted {
-                activity_id: id_run,
-                output: json!("approved"),
-            });
+        h.push(WorkflowEvent::MarkerRecorded {
+            name: format!("dag_skip:{skip_task_idx}"),
+            details: json!({"task": skip_task_name, "reason": "condition_false"}),
+        });
+        h.push(WorkflowEvent::ActivityScheduled {
+            activity_id: id_run,
+            name: run_task_name.into(),
+            input: risk_input(run_task_name),
+            queue: "risk-workers".into(),
+        });
+        // low score (even i): auto_approve outputs "approved"
+        // high score (odd i):  manual_review outputs "reviewed"
+        let run_output = if i % 2 == 0 {
+            json!("approved")
         } else {
-            // high score: skip auto_approve (idx 2) marker first (sync during level loop),
-            // then manual_review (idx 1) runs via join_all.
-            // Level loop order: idx 1 (manual_review) → Run (pushed to futures),
-            // idx 2 (auto_approve) → SkipByCondition → marker emitted sync.
-            // Then join_all emits the activity events.
-            h.push(WorkflowEvent::MarkerRecorded {
-                name: format!("dag_skip:{skip_task_idx}"),
-                details: json!({"task": skip_task_name, "reason": "condition_false"}),
-            });
-            h.push(WorkflowEvent::ActivityScheduled {
-                activity_id: id_run,
-                name: run_task_name.into(),
-                input: risk_input(run_task_name),
-                queue: "risk-workers".into(),
-            });
-            h.push(WorkflowEvent::ActivityCompleted {
-                activity_id: id_run,
-                output: json!("reviewed"),
-            });
-        }
+            json!("reviewed")
+        };
+        h.push(WorkflowEvent::ActivityCompleted {
+            activity_id: id_run,
+            output: run_output,
+        });
         // Level 2: notify_result (AllDone join)
         h.push(WorkflowEvent::ActivityScheduled {
             activity_id: id_notify,
@@ -1429,12 +1410,11 @@ async fn mapped_task_condition_skips_whole_map() {
     );
 
     // Exactly one dag_skip marker
-    let skip_markers: Vec<_> = events.iter().filter(|e| {
+    let skip_marker_count = events.iter().filter(|e| {
         matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("dag_skip:"))
-    }).collect();
+    }).count();
     assert_eq!(
-        skip_markers.len(),
-        1,
+        skip_marker_count, 1,
         "exactly one dag_skip marker for the mapped task"
     );
 }

@@ -2553,18 +2553,27 @@ impl HistoryMatcher {
     ///
     /// Returns:
     /// - [`HistoryMatch::Matched`] — the event at cursor is `MarkerRecorded`
-    ///   with the exact `name`.
-    /// - [`HistoryMatch::Diverged`] — a different event (or a marker with a
-    ///   different name) is at the cursor; this indicates the condition predicate
-    ///   returned a different value than during the original run — a
-    ///   non-determinism violation.
+    ///   with the exact `name` and `expected_task` (in `details.task`).
+    /// - [`HistoryMatch::Diverged`] — a different event, a marker with a
+    ///   different name, or the same marker index recording a different task
+    ///   name is at the cursor; this indicates the condition predicate
+    ///   returned a different value, or tasks were reordered/renamed across a
+    ///   deploy — a non-determinism violation.
     /// - [`HistoryMatch::NoMatch`] — past end of history (live execution).
-    pub fn match_named_marker(&mut self, marker_name: &str) -> HistoryMatch {
+    pub fn match_named_marker(&mut self, marker_name: &str, expected_task: &str) -> HistoryMatch {
         if !self.prepare_match() {
             return HistoryMatch::NoMatch;
         }
         match &self.events[self.cursor] {
-            WorkflowEvent::MarkerRecorded { name, .. } if name == marker_name => {
+            WorkflowEvent::MarkerRecorded { name, details } if name == marker_name => {
+                let recorded_task = details.get("task").and_then(|v| v.as_str()).unwrap_or("");
+                if recorded_task != expected_task {
+                    return HistoryMatch::Diverged {
+                        expected: format!("MarkerRecorded({marker_name}, task={expected_task})"),
+                        actual: format!("MarkerRecorded({marker_name}, task={recorded_task})"),
+                        event_index: i32::try_from(self.cursor).ok(),
+                    };
+                }
                 self.cursor += 1;
                 self.advance_to_next_unconsumed_event();
                 HistoryMatch::Matched {

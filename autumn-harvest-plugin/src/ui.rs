@@ -692,8 +692,10 @@ async fn dag_detail_ui(
         let condition_skipped: std::collections::HashSet<usize> = marker_events
             .iter()
             .filter_map(|e| {
-                e.event_data["name"]
-                    .as_str()
+                // event_data is adjacently-tagged: {"type":"MarkerRecorded","data":{...}}
+                e.event_data
+                    .get("data")
+                    .and_then(|d| d["name"].as_str())
                     .and_then(parse_dag_skip_marker_index)
             })
             .collect();

@@ -3354,7 +3354,8 @@ impl WorkflowContext {
     /// decision for an in-flight execution.
     pub fn dag_skip_marker(&self, task_index: usize, activity_name: &str) -> HarvestResult<()> {
         let marker_name = format!("dag_skip:{task_index}");
-        let match_result = self.match_history(|m| m.match_named_marker(&marker_name));
+        let match_result =
+            self.match_history(|m| m.match_named_marker(&marker_name, activity_name));
         match match_result {
             HistoryMatch::NoMatch => {
                 self.push_command(WorkflowCommand::RecordMarker {
