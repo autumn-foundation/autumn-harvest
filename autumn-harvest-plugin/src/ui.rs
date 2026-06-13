@@ -693,10 +693,19 @@ async fn dag_detail_ui(
             .iter()
             .filter_map(|e| {
                 // event_data is adjacently-tagged: {"type":"MarkerRecorded","data":{...}}
-                e.event_data
-                    .get("data")
-                    .and_then(|d| d["name"].as_str())
-                    .and_then(parse_dag_skip_marker_index)
+                let data = e.event_data.get("data")?;
+                let name = data["name"].as_str()?;
+                let idx = parse_dag_skip_marker_index(name)?;
+                // Guard against task rename/reorder across deploys: only mark
+                // the node as condition-skipped when the recorded activity name
+                // still matches the task at that index in the current definition.
+                let recorded_task = data.get("task").and_then(|v| v.as_str())?;
+                let current_name = dag.definition.tasks().get(idx)?.activity_name.as_str();
+                if recorded_task == current_name {
+                    Some(idx)
+                } else {
+                    None
+                }
             })
             .collect();
 
