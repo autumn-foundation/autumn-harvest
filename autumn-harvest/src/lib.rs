@@ -105,6 +105,8 @@ pub mod poison_pill;
 pub mod policy;
 pub mod pool;
 pub mod prelude;
+#[cfg(feature = "testing")]
+pub mod profile_export;
 /// Types and definitions for querying workflow state and metadata.
 pub mod query;
 pub mod replay;
@@ -253,6 +255,8 @@ pub use policy::{
     TriggerRule, WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
+#[cfg(feature = "testing")]
+pub use profile_export::export_profile_gantt;
 pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher, SignalOrTimerMatch};
 #[cfg(feature = "db")]
