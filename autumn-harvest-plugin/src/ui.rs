@@ -5941,9 +5941,12 @@ async fn execute_schedule_trigger_ui(
             runbook_url,
             severity,
             context_headers: None,
-            // Trigger-now participates in the schedule's carryover lineage (issue #488).
-            schedule_id: Some(row.id),
-            scheduled_for: Some(triggered_at),
+            // Manual trigger-now is a manual fire and does NOT participate in scheduled
+            // carryover (issue #488) — matches the API trigger path and avoids the
+            // cross-shard resolve / budget-bypass issues. Scheduled fires and backfills
+            // carry the lineage; ad-hoc operator fires do not.
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await;

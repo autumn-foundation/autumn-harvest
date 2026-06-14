@@ -2788,7 +2788,14 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/workflows/{id}",
-            Some(&["parent_id", "execution", "history", "external_handoffs"]),
+            Some(&[
+                "parent_id",
+                "execution",
+                "history",
+                "external_handoffs",
+                "last_completion_result",
+                "last_error",
+            ]),
         ),
         (
             "GET",
@@ -10424,11 +10431,15 @@ async fn trigger_schedule_now(
             runbook_url,
             severity,
             context_headers: None,
-            // Trigger-now is budgeted/overlap-checked against this schedule and is the
-            // documented path for re-running missed scheduled work, so it participates
-            // in carryover: tag it with the schedule and its fire-time slot (issue #488).
-            schedule_id: Some(schedule_id),
-            scheduled_for: Some(triggered_at),
+            // Manual trigger-now is treated as a manual fire and deliberately does NOT
+            // participate in scheduled carryover (issue #488). Tagging it with the
+            // schedule would make resolve_carryover run on this default-pool connection
+            // even when the schedule's prior runs live on another shard (multi-shard
+            // schedule routing is issue #171 follow-up), and the UI trigger path lacks
+            // the budget/exhaustion checks the automated lineage relies on. Scheduled
+            // fires and backfills carry the lineage; ad-hoc operator fires do not.
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await;
