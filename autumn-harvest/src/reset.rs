@@ -466,6 +466,17 @@ fn apply_event_to_pending(
         | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
             remove_pending(pending, "ExternalSignalRequested", &signal_id.to_string());
         }
+        WorkflowEvent::ExternalCancelRequested { cancel_id, .. } => insert_pending(
+            pending,
+            "ExternalCancelRequested",
+            cancel_id.to_string(),
+            None,
+            event_id,
+        ),
+        WorkflowEvent::ExternalCancelDelivered { cancel_id }
+        | WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
+            remove_pending(pending, "ExternalCancelRequested", &cancel_id.to_string());
+        }
         _ => {}
     }
 }
@@ -1043,7 +1054,7 @@ mod tests {
     use serde_json::Value;
 
     use crate::event::WorkflowEvent;
-    use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, TimerId};
+    use crate::types::{ActivityExecId, ExecutionId, ExternalCancelId, ParentClosePolicy, TimerId};
 
     use super::{
         ResetSignalReapplyPolicy, WorkflowResetError, validate_reset_point,
@@ -1168,6 +1179,56 @@ mod tests {
             err.unresolved_side_effects[0].side_effect_id,
             activity_id.to_string()
         );
+    }
+
+    #[test]
+    fn reset_point_rejects_unresolved_external_cancel() {
+        // An unresolved external cancel (ExternalCancelRequested with no terminal)
+        // is an in-flight side effect: forking there would re-issue the cancel
+        // from the new execution. Mirrors the external-signal handling (issue #492).
+        let cancel_id = ExternalCancelId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::MarkerRecorded {
+                name: "after-cancel".into(),
+                details: Value::Null,
+            },
+        ];
+
+        let err = validate_reset_point(&events, 1).expect_err("cancel is still unresolved");
+        assert_eq!(err.reset_to_event_id, 1);
+        assert_eq!(err.unresolved_side_effects.len(), 1);
+        assert_eq!(
+            err.unresolved_side_effects[0].kind,
+            "ExternalCancelRequested"
+        );
+        assert_eq!(
+            err.unresolved_side_effects[0].side_effect_id,
+            cancel_id.to_string()
+        );
+    }
+
+    #[test]
+    fn reset_point_allows_resolved_external_cancel() {
+        // Once the cancel has a terminal, the boundary after it is valid.
+        let cancel_id = ExternalCancelId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        ];
+
+        let plan = validate_reset_point(&events, 2).expect("resolved cancel is a valid boundary");
+        assert!(plan.unresolved_side_effects.is_empty());
     }
 
     #[test]
