@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TimeoutType;
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalSignalId, TimerId, UpdateId,
-    WorkerId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
+    TimerId, UpdateId, WorkerId,
 };
 
 fn default_error_type() -> String {
@@ -545,6 +545,36 @@ pub enum WorkflowEvent {
         /// bounded-pause scanner resumed an over-long pause.
         actor: String,
     },
+
+    // ── External workflow cancellation (issue #492) ───────────────────────────
+    /// A workflow requested cancellation of another running workflow by `ExecutionId`.
+    ///
+    /// The `cancel_id` correlates this request with its terminal outcome event
+    /// (`ExternalCancelDelivered` or `ExternalCancelFailed`). On replay the
+    /// caller's context returns the recorded outcome without re-issuing the
+    /// side effect. Unlike signal, no payload is carried — the cancel is
+    /// target-only.
+    ExternalCancelRequested {
+        /// Correlation ID linking this event to its terminal outcome.
+        cancel_id: ExternalCancelId,
+        /// The execution ID of the workflow to cancel.
+        target: ExecutionId,
+    },
+    /// The cancel was successfully applied to the target workflow (or the
+    /// target was already in a terminal state — no-op success).
+    ExternalCancelDelivered {
+        /// Correlation ID matching the corresponding `ExternalCancelRequested`.
+        cancel_id: ExternalCancelId,
+    },
+    /// The cancel could not be delivered. The `reason_code` is one of:
+    /// - `"target_unknown"` — no execution with the given ID was found after
+    ///   the configured grace window.
+    ExternalCancelFailed {
+        /// Correlation ID matching the corresponding `ExternalCancelRequested`.
+        cancel_id: ExternalCancelId,
+        /// Machine-readable reason code (`"target_unknown"`).
+        reason_code: String,
+    },
 }
 
 impl WorkflowEvent {
@@ -593,6 +623,9 @@ impl WorkflowEvent {
             Self::SideEffectRecorded { .. } => "SideEffectRecorded",
             Self::WorkflowExecutionPaused { .. } => "WorkflowExecutionPaused",
             Self::WorkflowExecutionResumed { .. } => "WorkflowExecutionResumed",
+            Self::ExternalCancelRequested { .. } => "ExternalCancelRequested",
+            Self::ExternalCancelDelivered { .. } => "ExternalCancelDelivered",
+            Self::ExternalCancelFailed { .. } => "ExternalCancelFailed",
         }
     }
 

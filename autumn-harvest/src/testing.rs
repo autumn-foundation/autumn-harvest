@@ -2249,6 +2249,22 @@ impl WorkflowTestEnv {
                 Ok(true)
             }
 
+            // Cancel always succeeds in the test harness (no DB, target always
+            // treated as reachable and alive).
+            WorkflowCommand::RequestCancelExternalWorkflow {
+                cancel_id,
+                target,
+                result_tx,
+                already_requested,
+            } => {
+                if !already_requested {
+                    history.push(WorkflowEvent::ExternalCancelRequested { cancel_id, target });
+                }
+                history.push(WorkflowEvent::ExternalCancelDelivered { cancel_id });
+                let _ = result_tx.send(Ok(()));
+                Ok(true)
+            }
+
             // Detached child spawn: record the event in history so replay can return
             // the same child_id. The simulator does not create actual child executions
             // — it just simulates the parent's history as if the child was spawned.

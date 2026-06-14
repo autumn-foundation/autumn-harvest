@@ -408,6 +408,11 @@ impl MermaidExporter {
                 | WorkflowEvent::ExternalSignalFailed { .. } => {
                     self.handle_external_signal_event(event)?;
                 }
+                WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. } => {
+                    self.handle_external_cancel_event(event)?;
+                }
             }
         }
         Ok(())
@@ -808,6 +813,37 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note over WF: Signal Failed ({reason_code}) (id: {signal_id})"
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn handle_external_cancel_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Cancel Requested → {target} (id: {cancel_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Cancel Delivered (id: {cancel_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalCancelFailed {
+                cancel_id,
+                reason_code,
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Cancel Failed ({reason_code}) (id: {cancel_id})"
                 )?;
             }
             _ => unreachable!(),

@@ -25,8 +25,8 @@ use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalSignalId, IdempotencyKey, TimerId,
-    UpdateId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
+    IdempotencyKey, TimerId, UpdateId,
 };
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
@@ -395,6 +395,19 @@ pub enum WorkflowCommand {
         /// not be appended again (crash-recovery path).
         already_requested: bool,
     },
+    /// Request cancellation of a sibling workflow execution (issue #492).
+    RequestCancelExternalWorkflow {
+        /// Correlation ID shared across all three history events.
+        cancel_id: ExternalCancelId,
+        /// Target workflow execution to cancel.
+        target: ExecutionId,
+        /// Outcome channel: `Ok(())` on delivery (including already-terminal),
+        /// `Err(reason_code)` on failure (target unknown after grace window).
+        result_tx: oneshot::Sender<Result<(), String>>,
+        /// When `true`, `ExternalCancelRequested` is already in history and must
+        /// not be appended again (crash-recovery path).
+        already_requested: bool,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -511,6 +524,17 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("signal_id", signal_id)
                 .field("target", target)
                 .field("signal_name", signal_name)
+                .field("already_requested", already_requested)
+                .finish_non_exhaustive(),
+            Self::RequestCancelExternalWorkflow {
+                cancel_id,
+                target,
+                already_requested,
+                ..
+            } => f
+                .debug_struct("RequestCancelExternalWorkflow")
+                .field("cancel_id", cancel_id)
+                .field("target", target)
                 .field("already_requested", already_requested)
                 .finish_non_exhaustive(),
             Self::SpawnDetachedChildWorkflow {
@@ -1530,6 +1554,8 @@ impl WorkflowContext {
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!("match_side_effect only returns Matched, Diverged or NoMatch")
             }
@@ -1952,6 +1978,7 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
     pub async fn execute_activity_raw(
         &self,
         name: &str,
@@ -2017,6 +2044,8 @@ impl WorkflowContext {
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_activity never returns AwaitingExternalCompletion, ChildInProgress, \
@@ -2080,6 +2109,7 @@ impl WorkflowContext {
     /// Used by the DAG unified handler to honour task-level `.retry()` and
     /// `.start_to_close()` settings from the `DagBuilder`.
     #[doc(hidden)]
+    #[allow(clippy::too_many_lines)]
     pub async fn execute_activity_raw_with_opts(
         &self,
         name: &str,
@@ -2141,6 +2171,8 @@ impl WorkflowContext {
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_activity never returns AwaitingExternalCompletion, \
@@ -2267,6 +2299,8 @@ impl WorkflowContext {
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_local_activity never returns AwaitingExternalCompletion, \
@@ -2420,6 +2454,8 @@ impl WorkflowContext {
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!("timers do not fail or time out in history matching")
             }
@@ -2487,6 +2523,8 @@ impl WorkflowContext {
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!("child workflows do not time out in match_child_workflow")
             }
@@ -2945,6 +2983,8 @@ impl WorkflowContext {
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 let actual = format!("{history_match:?}");
                 Err(self.nd_error(
@@ -3244,6 +3284,8 @@ impl WorkflowContext {
             | HistoryMatch::ChildInProgress { .. }
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_external_signal never returns Failed, ActivityInProgress, \
@@ -3286,6 +3328,142 @@ impl WorkflowContext {
             }),
             Err(_) => Err(HarvestError::Cancelled(format!(
                 "signal '{signal_name}' to {target}: result channel dropped"
+            ))),
+        }
+    }
+
+    /// Request cancellation of a sibling workflow execution (issue #492).
+    ///
+    /// Deterministic, replay-safe primitive. On the first live call the worker
+    /// appends `ExternalCancelRequested`, attempts to cancel the target via
+    /// `execution::cancel_workflow_execution`, and appends either
+    /// `ExternalCancelDelivered` or `ExternalCancelFailed`. On replay the recorded
+    /// outcome is returned immediately without re-contacting the target.
+    ///
+    /// # Cancel semantics vs signal
+    ///
+    /// Unlike `signal_external_workflow`, an already-terminal target is a
+    /// **no-op success** (`ExternalCancelDelivered`): the goal (target not running)
+    /// is already met. Only a target that cannot be found within the grace window
+    /// resolves as `ExternalCancelFailed { reason_code: "target_unknown" }`.
+    ///
+    /// # Self-cancel
+    ///
+    /// Passing `self.exec_id()` as `target` returns `HarvestError::ExternalCancelFailed`
+    /// with `reason_code = "self_cancel"` immediately (deterministic, same every replay).
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::ExternalCancelFailed`] with `reason_code = "self_cancel"` when
+    ///   `target == self.exec_id()`.
+    /// - [`HarvestError::ExternalCancelFailed`] with `reason_code = "target_unknown"`
+    ///   if no execution with `target` is found within the grace window.
+    /// - [`HarvestError::NonDeterministic`] if the history at this position does not
+    ///   match the requested target.
+    /// - [`HarvestError::Cancelled`] if the result channel is dropped before the worker
+    ///   resolves this command.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn request_cancel_external_workflow(&self, target: ExecutionId) -> HarvestResult<()> {
+        use crate::replay::HistoryMatch;
+
+        // Self-cancel is always an immediate deterministic error. This path records
+        // no history, so the `cancel_id` must be a stable sentinel (nil UUID) rather
+        // than a fresh v4 — otherwise a workflow that surfaces the error (e.g.
+        // `e.to_string()` into its output) would diverge on replay.
+        if target == self.exec_id {
+            return Err(HarvestError::ExternalCancelFailed {
+                cancel_id: ExternalCancelId::from_uuid(uuid::Uuid::nil()),
+                target,
+                reason_code: "self_cancel".to_string(),
+            });
+        }
+
+        let history_match = self.match_history(|m| m.match_external_cancel(target));
+
+        match history_match {
+            HistoryMatch::Matched { .. } => Ok(()),
+
+            HistoryMatch::ExternalCancelFailed {
+                cancel_id,
+                reason_code,
+            } => Err(HarvestError::ExternalCancelFailed {
+                cancel_id,
+                target,
+                reason_code,
+            }),
+
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!("external cancel mismatch: expected {expected}, got {actual}"),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+
+            // Crash-recovery: ExternalCancelRequested is already durable; re-attempt delivery.
+            HistoryMatch::ExternalCancelInProgress { cancel_id } => {
+                self.dispatch_cancel_command(target, cancel_id, true).await
+            }
+
+            // First live call: generate a new cancel_id and dispatch.
+            HistoryMatch::NoMatch => {
+                self.check_strict_replay_no_match(&format!(
+                    "ExternalCancelRequested(target={target})"
+                ))?;
+                self.dispatch_cancel_command(target, ExternalCancelId::new(), false)
+                    .await
+            }
+
+            HistoryMatch::Failed { .. }
+            | HistoryMatch::ActivityInProgress { .. }
+            | HistoryMatch::AwaitingExternalCompletion { .. }
+            | HistoryMatch::ChildInProgress { .. }
+            | HistoryMatch::LocalActivityInProgress { .. }
+            | HistoryMatch::TimedOut { .. }
+            | HistoryMatch::DetachedChildSpawned { .. }
+            | HistoryMatch::ExternalSignalInProgress { .. }
+            | HistoryMatch::ExternalSignalFailed { .. } => {
+                unreachable!(
+                    "match_external_cancel never returns Failed, ActivityInProgress, \
+                     AwaitingExternalCompletion, ChildInProgress, LocalActivityInProgress, \
+                     TimedOut, DetachedChildSpawned, ExternalSignalInProgress, or ExternalSignalFailed"
+                )
+            }
+        }
+    }
+
+    /// Push a `RequestCancelExternalWorkflow` command and await its resolution.
+    ///
+    /// Shared by the crash-recovery (`already_requested = true`) and first-call
+    /// (`already_requested = false`) dispatch paths.
+    async fn dispatch_cancel_command(
+        &self,
+        target: ExecutionId,
+        cancel_id: ExternalCancelId,
+        already_requested: bool,
+    ) -> HarvestResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.push_command(WorkflowCommand::RequestCancelExternalWorkflow {
+            cancel_id,
+            target,
+            result_tx: tx,
+            already_requested,
+        });
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason_code)) => Err(HarvestError::ExternalCancelFailed {
+                cancel_id,
+                target,
+                reason_code,
+            }),
+            Err(_) => Err(HarvestError::Cancelled(format!(
+                "cancel of {target}: result channel dropped"
             ))),
         }
     }
@@ -3772,6 +3950,8 @@ impl WorkflowContext {
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 unreachable!(
                     "match_external_activity never returns ChildInProgress, \
@@ -3837,6 +4017,8 @@ impl WorkflowContext {
             | HistoryMatch::LocalActivityInProgress { .. }
             | HistoryMatch::ExternalSignalInProgress { .. }
             | HistoryMatch::ExternalSignalFailed { .. }
+            | HistoryMatch::ExternalCancelInProgress { .. }
+            | HistoryMatch::ExternalCancelFailed { .. }
             | HistoryMatch::DetachedChildSpawned { .. } => {
                 let actual = format!("{history_match:?}");
                 Err(self.nd_error(
@@ -8062,6 +8244,225 @@ mod tests {
             .signal_external_workflow(target, "cancel", serde_json::Value::Null)
             .await;
         assert!(sig_result.is_ok(), "signal after activity should replay Ok");
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no live commands after full replay"
+        );
+    }
+
+    // ── request_cancel_external_workflow tests (issue #492) ──────────────────
+
+    #[tokio::test]
+    async fn cancel_external_workflow_live_mode_emits_command() {
+        let target = ExecutionId::new();
+        let ctx = WorkflowContext::new_test();
+        let ctx_ref = &ctx;
+        let target_clone = target;
+        let cmd_fut = ctx_ref.request_cancel_external_workflow(target_clone);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+        let cmds = ctx.drain_commands();
+
+        assert_eq!(
+            cmds.len(),
+            1,
+            "one RequestCancelExternalWorkflow command expected"
+        );
+        match &cmds[0] {
+            WorkflowCommand::RequestCancelExternalWorkflow {
+                target: t,
+                already_requested,
+                ..
+            } => {
+                assert_eq!(*t, target_clone);
+                assert!(
+                    !already_requested,
+                    "first call should not be already_requested"
+                );
+            }
+            other => panic!("expected RequestCancelExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_replays_delivered_outcome() {
+        let cancel_id = crate::types::ExternalCancelId::new();
+        let target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.request_cancel_external_workflow(target).await;
+
+        assert!(result.is_ok(), "delivered history should return Ok(())");
+        assert!(ctx.drain_commands().is_empty(), "replay emits no commands");
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_replays_failed_outcome_target_unknown() {
+        let cancel_id = crate::types::ExternalCancelId::new();
+        let target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelFailed {
+                cancel_id,
+                reason_code: "target_unknown".into(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.request_cancel_external_workflow(target).await;
+
+        assert!(result.is_err(), "failed history should return Err");
+        match result.unwrap_err() {
+            HarvestError::ExternalCancelFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "target_unknown");
+            }
+            other => panic!("expected ExternalCancelFailed, got {other:?}"),
+        }
+        assert!(ctx.drain_commands().is_empty(), "replay emits no commands");
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_nondeterminism_wrong_target() {
+        let cancel_id = crate::types::ExternalCancelId::new();
+        let target = ExecutionId::new();
+        let other_target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.request_cancel_external_workflow(other_target).await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            HarvestError::NonDeterministic { reason: msg, .. } => {
+                assert!(msg.contains("external cancel mismatch"), "msg: {msg}");
+            }
+            other => panic!("expected NonDeterministic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_self_cancel_rejected() {
+        let own_id = ExecutionId::new();
+        let ctx = WorkflowContext::for_replay(
+            own_id,
+            vec![WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            }],
+        );
+        let result = ctx.request_cancel_external_workflow(own_id).await;
+        assert!(result.is_err(), "self-cancel should be rejected");
+        match result.unwrap_err() {
+            HarvestError::ExternalCancelFailed {
+                reason_code,
+                target,
+                ..
+            } => {
+                assert_eq!(reason_code, "self_cancel");
+                assert_eq!(target, own_id);
+            }
+            other => panic!("expected ExternalCancelFailed(self_cancel), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_after_activity_replays_correctly() {
+        let cancel_id = crate::types::ExternalCancelId::new();
+        let activity_id = ActivityExecId::new();
+        let target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "step_one".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("done"),
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let r = ctx
+            .execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .expect("activity replay ok");
+        assert_eq!(r, "done");
+
+        let cancel_result = ctx.request_cancel_external_workflow(target).await;
+        assert!(
+            cancel_result.is_ok(),
+            "cancel after activity should replay Ok"
+        );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no live commands after full replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_stashes_interleaved_signal() {
+        // Regression: a SignalReceived recorded between ExternalCancelRequested and
+        // ExternalCancelDelivered must still be observable by a later receive_signal.
+        // Previously match_external_cancel skipped the signal transparently, jumping
+        // the cursor past it on settle and losing it.
+        let cancel_id = crate::types::ExternalCancelId::new();
+        let target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let cancel_result = ctx.request_cancel_external_workflow(target).await;
+        assert!(cancel_result.is_ok(), "cancel should replay Ok");
+
+        // The interleaved signal must still be observable, not lost to the cursor jump.
+        let sig = ctx
+            .wait_for_signal("approved")
+            .await
+            .expect("interleaved signal must be observable after cancel replay");
+        assert_eq!(sig, serde_json::json!({"ok": true}));
+
         assert!(
             ctx.drain_commands().is_empty(),
             "no live commands after full replay"
