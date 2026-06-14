@@ -9,14 +9,16 @@
 -- sla_breached_at: Wall-clock instant the breach was first detected (UTC).
 --
 -- The scanner query is:
---   WHERE state = 'RUNNING'
+--   WHERE state <> 'PAUSED'
 --     AND sla_deadline_at IS NOT NULL
---     AND sla_deadline_at < NOW()
 --     AND sla_breached = FALSE
+--     AND sla_deadline_at < COALESCE(completed_at, NOW())
 -- which is served by the partial index below without a sequential scan.
--- Only RUNNING is scanned (mirrors the #243 execution-timeout scanner): a
--- PAUSED run must not breach mid-pause, and SUSPENDED is not a persisted state
--- (the harvest_workflow_executions state CHECK constraint forbids it).
+-- RUNNING rows (completed_at NULL) compare against NOW(); already-terminal rows
+-- compare against their actual completion instant, so a run that finished before
+-- its deadline never breaches, while a run that crossed the deadline just before
+-- going terminal is still caught. PAUSED rows are excluded: pause suspends the
+-- SLA clock.
 
 ALTER TABLE harvest_workflow_executions
     ADD COLUMN IF NOT EXISTS sla              INTERVAL    NULL,
@@ -24,9 +26,12 @@ ALTER TABLE harvest_workflow_executions
     ADD COLUMN IF NOT EXISTS sla_breached     BOOLEAN     NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS sla_breached_at  TIMESTAMPTZ NULL;
 
--- Partial index: only indexes rows the scanner will actually visit.
+-- Partial index: only indexes rows the scanner can still flip. On-time terminal
+-- rows (completed_at <= sla_deadline_at) and PAUSED rows are excluded so the
+-- index does not accumulate every SLA-bearing completed run.
 CREATE INDEX IF NOT EXISTS idx_harvest_executions_sla_deadline
     ON harvest_workflow_executions (sla_deadline_at)
-    WHERE state = 'RUNNING'
-      AND sla_deadline_at IS NOT NULL
-      AND sla_breached = FALSE;
+    WHERE sla_deadline_at IS NOT NULL
+      AND sla_breached = FALSE
+      AND state <> 'PAUSED'
+      AND (completed_at IS NULL OR completed_at > sla_deadline_at);

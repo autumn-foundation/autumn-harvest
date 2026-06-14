@@ -1046,8 +1046,19 @@ pub async fn resume_workflow_execution(
                 // `execution_timeout`. `None` (no deadline) stays `None`.
                 let new_deadline_at = execution.deadline_at.map(|d| d + pause_span);
                 // Also push the soft SLA deadline forward (issue #487): a workflow
-                // paused mid-flight should not breach its SLA while paused.
-                let new_sla_deadline_at = execution.sla_deadline_at.map(|d| d + pause_span);
+                // paused mid-flight should not breach its SLA while paused — BUT
+                // only suspend a deadline that was still ahead when the pause
+                // began. A deadline already passed before the pause stays in the
+                // past so the breach (which occurred while RUNNING) is still
+                // observed by the scanner on the next tick after resume, rather
+                // than being silently pushed into the future.
+                let new_sla_deadline_at =
+                    execution
+                        .sla_deadline_at
+                        .map(|d| match execution.paused_at {
+                            Some(p) if d > p => d + pause_span,
+                            _ => d,
+                        });
 
                 let history = store::load_history(conn, exec_id).await?;
                 store::append_events(

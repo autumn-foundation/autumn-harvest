@@ -5132,6 +5132,23 @@ fn parse_delay_duration(raw: &str) -> Result<std::time::Duration, AutumnError> {
     parse_duration_amount(value, "delay", std::time::Duration::from_secs)
 }
 
+/// Resolve a workflow's declared default SLA, clamped against its declared
+/// `execution_timeout` (issue #487). An SLA softer than the hard timeout could
+/// never fire (the timeout kills the run first), so cap it. Returns the
+/// effective chrono SLA, or `None` when the workflow declares no SLA.
+pub(crate) fn clamp_info_default_sla(
+    info_sla: Option<std::time::Duration>,
+    info_execution_timeout: Option<std::time::Duration>,
+) -> Option<chrono::Duration> {
+    info_sla
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .map(|sla| {
+            info_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map_or(sla, |hard| sla.min(hard))
+        })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
@@ -6094,14 +6111,20 @@ async fn batch_start_workflows(
             )
             .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-            let (owner, runbook_url, severity, info_sla) = runtime
+            let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
                 .registry
                 .workflows
                 .get(&item.workflow_name)
-                .map_or((None, None, None, None), |info| {
-                    (info.owner, info.runbook_url, info.severity, info.sla)
+                .map_or((None, None, None, None, None), |info| {
+                    (
+                        info.owner,
+                        info.runbook_url,
+                        info.severity,
+                        info.sla,
+                        info.execution_timeout,
+                    )
                 });
-            let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+            let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
             let start_result = start_or_load_workflow_execution(
                 &mut conn,
@@ -6650,14 +6673,20 @@ async fn signal_with_start_workflow(
             (key, Some(policy.limit))
         });
 
-    let (owner, runbook_url, severity, info_sla) = runtime
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
         .registry
         .workflows
         .get(&workflow_name)
-        .map_or((None, None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity, info.sla)
+        .map_or((None, None, None, None, None), |info| {
+            (
+                info.owner,
+                info.runbook_url,
+                info.severity,
+                info.sla,
+                info.execution_timeout,
+            )
         });
-    let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
     let result = signal_with_start_workflow_execution(
         &mut conn,
@@ -7103,14 +7132,20 @@ async fn update_with_start_workflow(
             (key, Some(policy.limit))
         });
 
-    let (owner, runbook_url, severity, info_sla) = runtime
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
         .registry
         .workflows
         .get(&workflow_name)
-        .map_or((None, None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity, info.sla)
+        .map_or((None, None, None, None, None), |info| {
+            (
+                info.owner,
+                info.runbook_url,
+                info.severity,
+                info.sla,
+                info.execution_timeout,
+            )
         });
-    let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+    let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
     let params = UpdateWithStartParams {
         workflow_name: &workflow_name,
@@ -10416,8 +10451,7 @@ async fn trigger_schedule_now(
         .registry
         .workflows
         .get(&workflow_name)
-        .and_then(|info| info.sla)
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+        .and_then(|info| clamp_info_default_sla(info.sla, info.execution_timeout));
 
     let result = start_or_load_workflow_execution(
         &mut conn,
@@ -11037,14 +11071,20 @@ async fn schedule_backfill(
                     }
                 }
 
-                let (owner, runbook_url, severity, info_sla) = runtime
+                let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
                     .registry
                     .workflows
                     .get(&wf_name)
-                    .map_or((None, None, None, None), |info| {
-                        (info.owner, info.runbook_url, info.severity, info.sla)
+                    .map_or((None, None, None, None, None), |info| {
+                        (
+                            info.owner,
+                            info.runbook_url,
+                            info.severity,
+                            info.sla,
+                            info.execution_timeout,
+                        )
                     });
-                let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+                let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
                 let result = start_or_load_workflow_execution(
                     &mut conn,

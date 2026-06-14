@@ -876,11 +876,23 @@ pub async fn enforce_workflow_execution_timeouts(
 /// SLA budget (issue #487).
 ///
 /// The scanner atomically flips `sla_breached = true` and sets `sla_breached_at`
-/// for every RUNNING execution whose `sla_deadline_at` has elapsed and that has
-/// not yet been marked.  (Only RUNNING is scanned — mirroring the #243
-/// execution-timeout scanner: a PAUSED run must not breach mid-pause, and
-/// SUSPENDED is not a persisted state.)  It emits
-/// `harvest.workflow.sla_breached{workflow, queue}` **exactly once per run**.
+/// for every non-PAUSED execution whose `sla_deadline_at` has elapsed — measured
+/// against `COALESCE(completed_at, NOW())` — and that has not yet been marked.
+///
+/// - RUNNING rows (no `completed_at`) are compared against the current time, as
+///   before.
+/// - Already-terminal rows (`COMPLETED` / `FAILED` / `CANCELLED` / `TIMED_OUT` /
+///   `TERMINATED` / `CONTINUED_AS_NEW`) are compared against their **actual
+///   terminal timestamp** (`completed_at`). This means a run that finished
+///   *before* its
+///   deadline never breaches (no false positive), while a run that crossed the
+///   deadline and then went terminal within one scan interval is still caught
+///   after the fact — covering completion, failure, cancel, terminate, timeout,
+///   and continue-as-new uniformly without a separate per-path marker.
+/// - PAUSED rows are excluded: pause suspends the SLA clock.
+///
+/// It emits `harvest.workflow.sla_breached{workflow, queue}` **exactly once per
+/// run**.
 ///
 /// **This function never terminates, cancels, fails, or otherwise alters the
 /// lifecycle of the run.**  A breaching run that later completes still reaches
@@ -901,14 +913,23 @@ pub async fn enforce_workflow_sla_breaches(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<usize> {
     use crate::schema::harvest_workflow_executions;
+    use diesel::dsl::sql;
+    use diesel::sql_types::Bool;
 
     let now = Utc::now();
     let breached: Vec<(uuid::Uuid, String, String)> =
         diesel::update(harvest_workflow_executions::table)
-            .filter(harvest_workflow_executions::state.eq("RUNNING"))
+            // Exclude only PAUSED (pause suspends the SLA clock); RUNNING and all
+            // terminal states are eligible.
+            .filter(harvest_workflow_executions::state.ne("PAUSED"))
             .filter(harvest_workflow_executions::sla_deadline_at.is_not_null())
-            .filter(harvest_workflow_executions::sla_deadline_at.lt(Some(now)))
             .filter(harvest_workflow_executions::sla_breached.eq(false))
+            // RUNNING rows compare against NOW(); terminal rows against their
+            // actual completion instant, so finishing before the deadline never
+            // counts as a breach.
+            .filter(sql::<Bool>(
+                "sla_deadline_at < COALESCE(completed_at, NOW())",
+            ))
             .set((
                 harvest_workflow_executions::sla_breached.eq(true),
                 harvest_workflow_executions::sla_breached_at.eq(Some(now)),
@@ -935,55 +956,6 @@ pub async fn enforce_workflow_sla_breaches(
     }
 
     Ok(count)
-}
-
-/// Mark a single execution's soft-SLA breach at its terminal transition
-/// (issue #487).
-///
-/// The scanner [`enforce_workflow_sla_breaches`] only matches RUNNING rows, so a
-/// run that crosses `sla_deadline_at` and then completes or fails within one
-/// scan interval would otherwise never be marked or counted. This helper closes
-/// that window: it runs the same guarded, exactly-once update as the scanner but
-/// keyed by the execution's primary key and **state-agnostic**, so it fires from
-/// inside the terminal-transition transaction (the PK lookup uses the
-/// primary-key index, so no new index is required).
-///
-/// Returns `Some((workflow_name, queue_name))` when this call is the one that
-/// flipped `sla_breached` false→true — the caller should then emit
-/// `harvest.workflow.sla_breached` exactly once, **after the transaction
-/// commits**, so a rolled-back terminal transition never over-counts. Returns
-/// `None` when the row had no elapsed SLA deadline or was already marked (e.g.
-/// the scanner caught it while still RUNNING), so a breach is never
-/// double-counted between the two paths.
-///
-/// # Errors
-///
-/// Returns [`HarvestError::Database`] on query failure.
-#[cfg(feature = "db")]
-pub async fn mark_terminal_sla_breach(
-    conn: &mut AsyncPgConnection,
-    exec_id: crate::types::ExecutionId,
-) -> HarvestResult<Option<(String, String)>> {
-    use crate::schema::harvest_workflow_executions;
-
-    let now = Utc::now();
-    diesel::update(harvest_workflow_executions::table)
-        .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
-        .filter(harvest_workflow_executions::sla_deadline_at.is_not_null())
-        .filter(harvest_workflow_executions::sla_deadline_at.lt(Some(now)))
-        .filter(harvest_workflow_executions::sla_breached.eq(false))
-        .set((
-            harvest_workflow_executions::sla_breached.eq(true),
-            harvest_workflow_executions::sla_breached_at.eq(Some(now)),
-        ))
-        .returning((
-            harvest_workflow_executions::workflow_name,
-            harvest_workflow_executions::queue_name,
-        ))
-        .get_result(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)
 }
 
 /// Enforce all currently expired task timeouts against the database state.

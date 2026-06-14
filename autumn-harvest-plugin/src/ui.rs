@@ -5919,8 +5919,7 @@ async fn execute_schedule_trigger_ui(
         .registry()
         .workflows
         .get(workflow_name)
-        .and_then(|info| info.sla)
-        .and_then(|d| chrono::Duration::from_std(d).ok());
+        .and_then(|info| crate::api::clamp_info_default_sla(info.sla, info.execution_timeout));
 
     let result = start_or_load_workflow_execution(
         conn,
