@@ -4179,6 +4179,11 @@ impl WorkflowContext {
         let workflow_id = self.workflow_id.clone();
         let workflow_name = self.workflow_name.clone();
         let context_headers = std::sync::Arc::clone(&self.context_headers);
+        // Carryover is frozen in WorkflowStarted, so a handler on a scheduled workflow
+        // must observe the same last_completion_result/last_error as the workflow body
+        // (issue #488).
+        let last_completion_result = self.last_completion_result.clone();
+        let last_error = self.last_error.clone();
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -4194,6 +4199,10 @@ impl WorkflowContext {
                 inner.workflow_id.clone_from(&workflow_id);
                 inner.workflow_name.clone_from(&workflow_name);
                 inner.context_headers = std::sync::Arc::clone(&context_headers);
+                inner
+                    .last_completion_result
+                    .clone_from(&last_completion_result);
+                inner.last_error.clone_from(&last_error);
             }
             handler_fn(ctx, input)
         });
@@ -4256,6 +4265,12 @@ impl WorkflowContext {
                 inner.workflow_id.clone_from(&self.workflow_id);
                 inner.workflow_name.clone_from(&self.workflow_name);
                 inner.context_headers = std::sync::Arc::clone(&self.context_headers);
+                // Carryover is frozen in WorkflowStarted; handlers see the same values
+                // as the workflow body (issue #488).
+                inner
+                    .last_completion_result
+                    .clone_from(&self.last_completion_result);
+                inner.last_error.clone_from(&self.last_error);
             }
             h(ctx, input)
         })
