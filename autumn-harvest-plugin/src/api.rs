@@ -10743,7 +10743,8 @@ async fn schedule_backfill(
     }
 
     // Load the schedule row (fan out across shards; schedule rows are not shard-assigned).
-    let schedule = load_schedule_by_id(&api_state, schedule_id).await?;
+    let (schedule, schedule_shard) =
+        load_schedule_by_id_with_shard(&api_state, schedule_id).await?;
 
     // Respect paused state unless the caller explicitly opts in.
     if schedule.is_paused && !request.include_paused {
@@ -11375,6 +11376,52 @@ async fn schedule_backfill(
                         failed += 1;
                     }
                 }
+            }
+        }
+    }
+
+    // Persist the consumed max_runs budget (issue #478) so a later backfill or
+    // scheduler tick sees it: without this, a tagged backfill that participates in
+    // carryover (#488) would leave harvest_schedules.runs_started unchanged and a
+    // subsequent out-of-budget run could still be started. Mirror the scheduler's
+    // DB-side atomic increment (runs_started + dispatched) on the schedule's own shard,
+    // transitioning to exhausted when the cap is reached. Best-effort: a failure here
+    // must not fail an already-dispatched backfill (the gate above still bounds a single
+    // request), so errors are logged-and-ignored.
+    if dispatched_this_call > 0 {
+        let dispatched_i32 = i32::try_from(dispatched_this_call).unwrap_or(i32::MAX);
+        let new_runs_started = schedule.runs_started.saturating_add(dispatched_i32);
+        let budget_exhausted = schedule
+            .max_runs
+            .is_some_and(|max| max > 0 && new_runs_started >= max);
+        if let Ok(mut budget_conn) = acquire_conn(pool.pool_for(schedule_shard)).await {
+            use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+            let now = chrono::Utc::now();
+            let res = if budget_exhausted {
+                diesel::update(
+                    sdsl::harvest_schedules
+                        .find(schedule_id)
+                        .filter(sdsl::exhausted_at.is_null()),
+                )
+                .set((
+                    sdsl::runs_started.eq(sdsl::runs_started + dispatched_i32),
+                    sdsl::exhausted_at.eq(Some(now)),
+                    sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
+                ))
+                .execute(&mut budget_conn)
+                .await
+            } else {
+                diesel::update(sdsl::harvest_schedules.find(schedule_id))
+                    .set(sdsl::runs_started.eq(sdsl::runs_started + dispatched_i32))
+                    .execute(&mut budget_conn)
+                    .await
+            };
+            if let Err(e) = res {
+                tracing::warn!(
+                    schedule_id = %schedule_id,
+                    error = %e,
+                    "failed to persist backfill max_runs budget consumption"
+                );
             }
         }
     }
