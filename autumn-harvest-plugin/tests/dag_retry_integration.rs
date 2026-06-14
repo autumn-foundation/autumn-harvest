@@ -366,6 +366,7 @@ async fn seed_run(
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await

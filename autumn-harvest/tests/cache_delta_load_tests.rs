@@ -143,6 +143,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection, name: &str) -> Execution
         severity: None,
         context_headers: None,
         schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

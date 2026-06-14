@@ -320,6 +320,7 @@ pub(crate) async fn dispatch_workflow_start_request(
             severity,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await?;

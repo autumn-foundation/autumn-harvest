@@ -5577,6 +5577,7 @@ async fn start_workflow(
             severity,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await;
@@ -6118,6 +6119,7 @@ async fn batch_start_workflows(
                     severity,
                     context_headers: None,
                     schedule_id: None,
+                    scheduled_for: None,
                 },
             )
             .await;
@@ -10422,7 +10424,11 @@ async fn trigger_schedule_now(
             runbook_url,
             severity,
             context_headers: None,
-            schedule_id: None,
+            // Trigger-now is budgeted/overlap-checked against this schedule and is the
+            // documented path for re-running missed scheduled work, so it participates
+            // in carryover: tag it with the schedule and its fire-time slot (issue #488).
+            schedule_id: Some(schedule_id),
+            scheduled_for: Some(triggered_at),
         },
     )
     .await;
@@ -11050,6 +11056,7 @@ async fn schedule_backfill(
                         context_headers: None,
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
+                        scheduled_for: Some(*original_slot),
                     },
                 )
                 .await;
@@ -11194,6 +11201,7 @@ async fn schedule_backfill(
                         context_headers: None,
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
+                        scheduled_for: Some(*original_slot),
                     },
                 )
                 .await;
@@ -18388,6 +18396,7 @@ mod tests {
                 severity: None,
                 context_headers: None,
                 schedule_id: None,
+                scheduled_for: None,
             },
         )
         .await

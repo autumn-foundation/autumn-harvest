@@ -5941,7 +5941,9 @@ async fn execute_schedule_trigger_ui(
             runbook_url,
             severity,
             context_headers: None,
-            schedule_id: None,
+            // Trigger-now participates in the schedule's carryover lineage (issue #488).
+            schedule_id: Some(row.id),
+            scheduled_for: Some(triggered_at),
         },
     )
     .await;
@@ -7680,6 +7682,7 @@ mod tests {
             pause_actor: None,
             current_details: None,
             schedule_id: None,
+            scheduled_for: None,
         }
     }
 

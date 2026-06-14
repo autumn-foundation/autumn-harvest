@@ -461,6 +461,7 @@ async fn test_trigger_evaluations_same_shard() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -556,6 +557,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -629,6 +631,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -724,6 +727,7 @@ async fn test_trigger_state_matching_and_deduplication() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -896,6 +900,7 @@ async fn test_trigger_cross_shard() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -996,6 +1001,7 @@ async fn test_completion_trigger_via_worker_run() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -1110,6 +1116,7 @@ async fn test_trigger_with_custom_queue() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -1292,6 +1299,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -1502,6 +1510,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -1924,6 +1933,7 @@ async fn test_trigger_evaluations_schema_validation() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -1992,6 +2002,7 @@ async fn test_trigger_evaluations_schema_validation() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await

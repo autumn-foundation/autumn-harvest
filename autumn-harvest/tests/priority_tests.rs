@@ -249,6 +249,7 @@ fn start_workflow_params_has_priority_field() {
         severity: None,
         context_headers: None,
         schedule_id: None,
+        scheduled_for: None,
     };
 
     assert_eq!(params.priority, Priority::High);
@@ -286,6 +287,7 @@ fn start_workflow_params_default_priority_is_normal() {
         severity: None,
         context_headers: None,
         schedule_id: None,
+        scheduled_for: None,
     };
 
     assert_eq!(params.priority, Priority::Normal);

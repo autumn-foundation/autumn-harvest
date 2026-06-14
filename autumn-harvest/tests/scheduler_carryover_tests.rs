@@ -420,6 +420,7 @@ async fn manual_start_has_no_carryover() {
             severity: None,
             context_headers: None,
             schedule_id: None, // explicitly None for manual start
+            scheduled_for: None,
         },
     )
     .await

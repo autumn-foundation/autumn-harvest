@@ -118,6 +118,7 @@ async fn test_send_and_load_signals() {
         severity: None,
         context_headers: None,
         schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -170,6 +171,7 @@ async fn test_mark_signals_consumed() {
         severity: None,
         context_headers: None,
         schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)

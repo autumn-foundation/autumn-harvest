@@ -279,6 +279,7 @@ async fn seed_execution(
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await

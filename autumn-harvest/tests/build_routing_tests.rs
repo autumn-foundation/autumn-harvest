@@ -493,6 +493,7 @@ mod db_tests {
                 severity: None,
                 context_headers: None,
                 schedule_id: None,
+                scheduled_for: None,
             })
             .execute(conn)
             .await

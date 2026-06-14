@@ -199,6 +199,7 @@ async fn test_delayed_start_validation() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -244,6 +245,7 @@ async fn test_delayed_start_validation() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -343,6 +345,7 @@ async fn test_delayed_start_no_premature_dispatch() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -419,6 +422,7 @@ async fn test_delayed_start_cancel_before_firing() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -502,6 +506,7 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -553,6 +558,7 @@ async fn test_immediate_start_skew_tolerance() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await

@@ -186,6 +186,7 @@ async fn start_workflow(
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -376,6 +377,7 @@ async fn insert_detached_child_execution(
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         })
         .execute(conn)
         .await
@@ -963,6 +965,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         })
         .execute(&mut conn)
         .await

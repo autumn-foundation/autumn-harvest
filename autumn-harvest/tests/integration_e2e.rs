@@ -181,6 +181,9 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS current_details TEXT NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS context_headers JSONB NULL;\n",
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS context_headers JSONB NULL;\n",
+    // issue #488: the modern start path inserts schedule_id / scheduled_for.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS schedule_id UUID NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -541,6 +544,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         severity: None,
         context_headers: None,
         schedule_id: None,
+        scheduled_for: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -598,6 +602,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         severity: None,
         context_headers: None,
         schedule_id: None,
+        scheduled_for: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -3412,6 +3417,7 @@ async fn insert_named_workflow_execution(
         severity: None,
         context_headers: None,
         schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -3949,6 +3955,7 @@ mod reuse_policy_helpers {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         }
     }
 
@@ -5202,6 +5209,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -5357,6 +5365,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -6792,6 +6801,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         severity: None,
         context_headers: None,
         schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

@@ -838,6 +838,7 @@ async fn insert_fork_execution(
         // schedule_id NULL keeps their (re-)completion out of scheduled carryover so a
         // reset of an old slot can't roll a later run's incremental cursor backward (#488).
         schedule_id: None,
+        scheduled_for: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -1086,6 +1087,7 @@ mod tests {
             pause_actor: Some("oncall".into()),
             current_details: None,
             schedule_id: None,
+            scheduled_for: None,
         }
     }
 

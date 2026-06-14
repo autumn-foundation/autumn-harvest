@@ -329,6 +329,7 @@ mod db_tests {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         };
         start_or_load_workflow_execution(&mut conn, first_params)
             .await
@@ -392,6 +393,7 @@ mod db_tests {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         };
         start_or_load_workflow_execution(&mut conn, start_params)
             .await

@@ -1184,6 +1184,12 @@ impl WorkflowContext {
     /// The value is frozen into the `WorkflowStarted` event at start time, so replay
     /// always returns the same result regardless of which worker processes the task.
     ///
+    /// # Limitation
+    /// A prior COMPLETED run whose output serializes to JSON `null` (e.g. a workflow
+    /// returning `()` or `Option::None`) is reported here as `None` (indistinguishable
+    /// from "no prior run"). Incremental/cursor jobs — the intended use case — return a
+    /// structured cursor, never `null`, so this does not affect them.
+    ///
     /// # Errors
     /// Returns `HarvestError::Deserialize` if the stored JSON cannot be deserialized into `T`.
     pub fn last_completion_result<T>(&self) -> crate::error::HarvestResult<Option<T>>

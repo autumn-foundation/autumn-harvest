@@ -424,6 +424,7 @@ async fn start_harvest_runtime(
                         severity,
                         context_headers: None,
                         schedule_id: None,
+                        scheduled_for: None,
                     };
 
                     let Some(harvest_db) = harvest_db else {

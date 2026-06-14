@@ -2877,6 +2877,7 @@ async fn persist_all_started_child_workflows(
                     severity,
                     context_headers: parent_execution.context_headers.clone(),
                     schedule_id: None, // child workflows are not scheduled fires
+                    scheduled_for: None,
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
@@ -3429,6 +3430,7 @@ async fn create_detached_child_executions(
             severity,
             context_headers: parent_execution.context_headers.clone(),
             schedule_id: None, // detached child workflows are not scheduled fires
+            scheduled_for: None,
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -4633,6 +4635,9 @@ async fn persist_workflow_continue_as_new(
         severity: execution.severity.as_deref(),
         context_headers: execution.context_headers.clone(),
         schedule_id: execution.schedule_id, // preserve schedule lineage through continue-as-new
+        // Same logical slot as the predecessor: keep carryover ordering stable so the
+        // continuation isn't treated as a brand-new fire (issue #488).
+        scheduled_for: execution.scheduled_for,
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);

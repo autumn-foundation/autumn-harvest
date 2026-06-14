@@ -213,6 +213,7 @@ async fn start(conn: &mut AsyncPgConnection, name: &str, id: &str) -> ExecutionI
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await

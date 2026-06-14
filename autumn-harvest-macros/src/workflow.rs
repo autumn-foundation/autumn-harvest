@@ -475,6 +475,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         severity: info.severity,
                         context_headers: opts.context_headers,
                         schedule_id: ::std::option::Option::None,
+                        scheduled_for: ::std::option::Option::None,
                     };
 
                     let started = client.start_or_load(conn, params).await?;

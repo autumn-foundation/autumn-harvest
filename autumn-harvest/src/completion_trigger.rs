@@ -354,6 +354,7 @@ impl DeferredTriggerStart {
                     severity: self.severity.as_deref(),
                     context_headers: None,
                     schedule_id: None,
+                    scheduled_for: None,
                 },
             )
             .await;
@@ -572,6 +573,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         severity: target_severity.as_deref(),
                         context_headers: None,
                         schedule_id: None,
+                        scheduled_for: None,
                     },
                 )
                 .await
@@ -774,6 +776,7 @@ pub async fn enforce_completion_triggers_outbox(
                 severity: target_severity.as_deref(),
                 context_headers: None,
                 schedule_id: None,
+                scheduled_for: None,
             },
         )
         .await;

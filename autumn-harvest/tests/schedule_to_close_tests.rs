@@ -136,6 +136,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         })
         .execute(conn)
         .await

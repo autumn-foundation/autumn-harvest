@@ -432,8 +432,13 @@ See `autumn-harvest/examples/incremental_etl_schedule.rs` for the full pattern.
 - **continue-as-new**: a continuation inherits the predecessor's frozen
   carryover (the continuation is the same logical scheduled run), so cursors and
   recovery state survive the fork.
+- **Slot ordering**: carryover selects the *previous logical fire* by the
+  schedule slot (`scheduled_for`), not by completion time. Overlapping,
+  catch-up, or backfilled fires that finish out of order therefore can't hand a
+  later run an older slot's output and roll its cursor backward.
 - **Backfills**: backfilled runs participate in the schedule's carryover lineage
-  (they share the schedule's `schedule_id`).
+  (they share the schedule's `schedule_id` and carry their own `scheduled_for`
+  slot, so they slot into the lineage at the correct position).
 - **Reset**: reset forks are operator interventions and are *excluded* from
   carryover (their `schedule_id` is left `None`) so resetting an old slot cannot
   roll a later run's incremental cursor backward.

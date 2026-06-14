@@ -560,6 +560,7 @@ async fn insert_workflow_on_url(
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -639,6 +640,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -797,6 +799,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         })
         .execute(&mut conn)
         .await
@@ -1122,6 +1125,7 @@ async fn seed_scheduled_activity_task_from_url(
             severity: None,
             context_headers: None,
             schedule_id: None,
+            scheduled_for: None,
         })
         .execute(&mut conn)
         .await
