@@ -232,6 +232,18 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_schedule_skipped_n(&self, kind: &str, name: &str, reason: &str, count: u64) {
+        // Exact, single batched increment — no per-slot loop, so a large
+        // bounded-catchup recovery is counted exactly without stalling the tick.
+        counter!(
+            METRIC_SCHEDULE_SKIPPED,
+            METRIC_LABEL_KIND => kind.to_owned(),
+            METRIC_LABEL_NAME => name.to_owned(),
+            METRIC_LABEL_REASON => reason.to_owned(),
+        )
+        .increment(count);
+    }
+
     fn record_schedule_decision_write_failed(&self) {
         counter!(METRIC_SCHEDULE_DECISION_WRITE_FAILED).increment(1);
     }

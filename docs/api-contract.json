@@ -3046,7 +3046,7 @@
       "success_response": {
         "status": 200,
         "free_form": true,
-        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, and last_backfill."
+        "description": "Returns an array of schedule entries. Each item includes id, kind, name, schedule_expr, is_paused, paused_at, paused_by, pause_reason, next_run_at, last_run_at, max_active_runs, catchup, last_backfill, catchup_policy_effective (resolved effective policy string: skip_all|most_recent|window|unbounded), catchup_window_secs (null unless policy is window), catchup_dropped_last_recovery (dropped slot count from most recent recovery tick), and last_catchup_at (timestamp of most recent recovery tick)."
       },
       "error_responses": [
         {
@@ -3085,7 +3085,11 @@
           "last_run_at",
           "max_active_runs",
           "catchup",
-          "last_backfill"
+          "last_backfill",
+          "catchup_policy_effective",
+          "catchup_window_secs",
+          "catchup_dropped_last_recovery",
+          "last_catchup_at"
         ]
       },
       "error_responses": [
@@ -3155,6 +3159,16 @@
             "name": "skip_policy",
             "required": false,
             "description": "What to do when the fire date is calendar-excluded (issue #337)."
+          },
+          {
+            "name": "catchup_policy",
+            "required": false,
+            "description": "Bounded catchup policy after downtime: one of skip_all, most_recent, window, unbounded. Omitted falls back to the legacy catchup bool (issue #484)."
+          },
+          {
+            "name": "catchup_window_secs",
+            "required": false,
+            "description": "Window length in seconds when catchup_policy = window; ignored otherwise (issue #484)."
           }
         ]
       },
@@ -3173,7 +3187,11 @@
           "last_run_at",
           "max_active_runs",
           "catchup",
-          "last_backfill"
+          "last_backfill",
+          "catchup_policy_effective",
+          "catchup_window_secs",
+          "catchup_dropped_last_recovery",
+          "last_catchup_at"
         ]
       },
       "error_responses": [

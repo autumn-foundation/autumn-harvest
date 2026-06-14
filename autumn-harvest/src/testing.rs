@@ -2279,10 +2279,17 @@ impl WorkflowTestEnv {
                 Ok(false)
             }
 
+            // Markers (fan-out count guards, dag condition skips, etc.) must be
+            // persisted to history so the next replay iteration finds them in the
+            // same position as the real worker would.  Mirrors RecordSideEffect above.
+            WorkflowCommand::RecordMarker { name, details } => {
+                history.push(WorkflowEvent::MarkerRecorded { name, details });
+                Ok(false)
+            }
+
             // WaitForActivity: activity was scheduled in a previous iteration;
             // its terminal event is already in history and will be matched on replay.
             WorkflowCommand::WaitForActivity { .. }
-            | WorkflowCommand::RecordMarker { .. }
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }

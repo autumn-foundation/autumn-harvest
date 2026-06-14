@@ -23,6 +23,10 @@ pub fn activities() -> Vec<ActivityInfo> {
         export_billing_events,
         reconcile_gateway,
         notify_finance,
+        scan_discrepancies,
+        flag_for_audit,
+        auto_close_run,
+        send_reconciliation_summary,
     ]
 }
 
@@ -180,4 +184,35 @@ pub async fn reconcile_gateway(_ctx: &ActivityContext, input: Value) -> HarvestR
 #[activity(start_to_close = "30s", queue = "ops")]
 pub async fn notify_finance(_ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
     Ok(json!({ "notified": input }))
+}
+
+// Activities for the data-dependent branching example (anomaly_routing DAG).
+
+#[activity(start_to_close = "2m", queue = "ops")]
+pub async fn scan_discrepancies(_ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    // Returns the count of billing discrepancies found in the reconciliation window.
+    Ok(json!({ "discrepancy_count": 0, "window": input }))
+}
+
+// Runs only when scan_discrepancies reported at least one discrepancy.
+#[activity(start_to_close = "5m", queue = "ops")]
+pub async fn flag_for_audit(_ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    tracing::warn!(report = ?input, "discrepancies detected — flagging for finance audit");
+    Ok(json!({ "flagged": true }))
+}
+
+// Runs only when scan_discrepancies reported zero discrepancies.
+#[activity(start_to_close = "30s", queue = "ops")]
+pub async fn auto_close_run(_ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    tracing::info!(report = ?input, "reconciliation clean — auto-closing run");
+    Ok(json!({ "closed": true }))
+}
+
+#[activity(start_to_close = "30s", queue = "ops")]
+pub async fn send_reconciliation_summary(
+    _ctx: &ActivityContext,
+    input: Value,
+) -> HarvestResult<Value> {
+    tracing::info!(summary = ?input, "sent reconciliation summary");
+    Ok(json!({ "sent": true }))
 }
