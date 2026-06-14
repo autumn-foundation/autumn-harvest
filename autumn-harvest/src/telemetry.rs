@@ -991,6 +991,11 @@ pub trait MetricsRecorder: Send + Sync {
     fn record_external_signal_sent(&self, outcome: &str, reason_code: Option<&str>) {
         let _ = (outcome, reason_code);
     }
+
+    /// Record one external cancel dispatch outcome (`outcome`: `"delivered"` / `"failed"`).
+    fn record_external_cancel_sent(&self, outcome: &str, reason_code: Option<&str>) {
+        let _ = (outcome, reason_code);
+    }
 }
 
 /// Default metrics recorder that discards every sample.

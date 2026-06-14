@@ -509,6 +509,54 @@ impl FromStr for ExternalSignalId {
     }
 }
 
+/// Unique identifier for a single `request_cancel_external_workflow` invocation.
+///
+/// Generated when the workflow calls `ctx.request_cancel_external_workflow(...)` and
+/// embedded in the `ExternalCancelRequested`, `ExternalCancelDelivered`, and
+/// `ExternalCancelFailed` events so the request can be correlated with its
+/// outcome during replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExternalCancelId(Uuid);
+
+impl ExternalCancelId {
+    /// Creates a new, random `ExternalCancelId` using a v4 UUID.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Returns the underlying `Uuid`.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Wraps an existing `Uuid` as an `ExternalCancelId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for ExternalCancelId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ExternalCancelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for ExternalCancelId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
 /// Durable timer handle within a workflow.
 ///
 /// ## Examples
