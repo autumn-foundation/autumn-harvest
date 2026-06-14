@@ -155,6 +155,8 @@ async fn add_item_atomic(
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await?;

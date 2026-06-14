@@ -5914,6 +5914,12 @@ async fn execute_schedule_trigger_ui(
             (None, None) => (None, None, None),
         }
     };
+    // Only registered workflows carry an SLA default; DAGs have no SLA concept.
+    let sla = runtime
+        .registry()
+        .workflows
+        .get(workflow_name)
+        .and_then(|info| crate::api::clamp_info_default_sla(info.sla, info.execution_timeout));
 
     let result = start_or_load_workflow_execution(
         conn,
@@ -5941,6 +5947,7 @@ async fn execute_schedule_trigger_ui(
             runbook_url,
             severity,
             context_headers: None,
+            sla,
         },
     )
     .await;
@@ -7674,6 +7681,10 @@ mod tests {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            sla_breached: false,
+            sla_breached_at: None,
             paused_at: None,
             pause_reason: None,
             pause_actor: None,

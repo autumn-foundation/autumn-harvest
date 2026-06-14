@@ -198,6 +198,16 @@ pub const ATTR_SIGNAL_ID: &str = "harvest.signal.id";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 
+/// Counter: incremented exactly once per run when a workflow execution exceeds its
+/// declared soft SLA budget (`sla_deadline_at`) while still RUNNING/SUSPENDED.
+///
+/// This is a **soft, non-fatal signal** (issue #487): the run is never terminated.
+/// A breaching run that later completes still reaches COMPLETED with its normal result.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_SLA_BREACHED: &str = "harvest.workflow.sla_breached";
+
 /// Counter: incremented when a replay non-determinism (divergence) failure occurs.
 ///
 /// Labeled by `workflow` (workflow name) and `build_id`.
@@ -914,6 +924,18 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Maps to the counter `harvest.workflow.timeout{workflow, queue}`.
     fn record_workflow_timeout(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A workflow execution has exceeded its declared soft SLA budget while
+    /// still RUNNING/SUSPENDED (issue #487).
+    ///
+    /// Emitted **exactly once per run** by the SLA breach scanner.  The run is
+    /// never terminated; a breaching run that later completes still reaches
+    /// COMPLETED with its normal result.
+    ///
+    /// Maps to the counter `harvest.workflow.sla_breached{workflow, queue}`.
+    fn record_workflow_sla_breach(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
     }
 

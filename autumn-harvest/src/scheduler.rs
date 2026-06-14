@@ -785,6 +785,8 @@ pub async fn trigger_unified_dag(
             runbook_url,
             severity,
             context_headers: None,
+
+            sla: None,
         },
     )
     .await
@@ -2737,6 +2739,10 @@ async fn tick_one_workflow_schedule(
                 (None, None) => (None, None, None),
             }
         };
+        // Only workflows carry an SLA default; DAGs have no SLA concept.
+        let sla = wf_info
+            .and_then(|info| info.sla)
+            .and_then(|d| chrono::Duration::from_std(d).ok());
         tracing::info!(
             workflow_name = %wf_name, workflow_id = %workflow_id,
             scheduled_for = %scheduled_for, "harvest: dispatching scheduled workflow run"
@@ -2767,6 +2773,7 @@ async fn tick_one_workflow_schedule(
                 runbook_url,
                 severity,
                 context_headers: None,
+                sla,
             },
         )
         .await;
@@ -3630,6 +3637,10 @@ async fn drain_buffered_schedule_runs(
                     (None, None) => (None, None, None),
                 }
             };
+            // Only workflows carry an SLA default; DAGs have no SLA concept.
+            let sla = wf_info
+                .and_then(|info| info.sla)
+                .and_then(|d| chrono::Duration::from_std(d).ok());
 
             tracing::info!(
                 workflow_name = %wf_name,
@@ -3664,6 +3675,7 @@ async fn drain_buffered_schedule_runs(
                     runbook_url,
                     severity,
                     context_headers: None,
+                    sla,
                 },
             )
             .await;

@@ -274,6 +274,7 @@ impl HandlerRegistry {
                             runbook_url: w.runbook_url.map(String::from),
                             severity: w.severity.map(String::from),
                             input_schema: w.input_schema,
+                            sla: w.sla,
                         },
                     )
                 })
@@ -3072,10 +3073,14 @@ async fn persist_all_started_child_workflows(
             // Insert rows and enqueue tasks for new children.
             for child in &new_children {
                 let child_workflow_id = child.child_id.to_string();
-                let (owner, runbook_url, severity) = registry
+                let (owner, runbook_url, severity, child_sla) = registry
                     .workflows
                     .get(child.workflow_name.as_str())
-                    .map_or((None, None, None), |w| (w.owner, w.runbook_url, w.severity));
+                    .map_or((None, None, None, None), |w| {
+                        (w.owner, w.runbook_url, w.severity, w.sla)
+                    });
+                let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+                let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
                 let child_row = NewWorkflowExecution {
                     id: child.child_id.as_uuid(),
                     workflow_name: &child.workflow_name,
@@ -3087,6 +3092,8 @@ async fn persist_all_started_child_workflows(
                     queue_name: &queue_name,
                     execution_timeout: None,
                     deadline_at: None,
+                    sla: child_sla,
+                    sla_deadline_at: child_sla_deadline_at,
                     memo: None,
                     search_attrs: None,
                     assigned_build_id: parent_execution.assigned_build_id.clone(),
@@ -3621,10 +3628,14 @@ async fn create_detached_child_executions(
         }
 
         let child_workflow_id = child_id.to_string();
-        let (owner, runbook_url, severity) = registry
+        let (owner, runbook_url, severity, child_sla) = registry
             .workflows
             .get(workflow_name.as_str())
-            .map_or((None, None, None), |w| (w.owner, w.runbook_url, w.severity));
+            .map_or((None, None, None, None), |w| {
+                (w.owner, w.runbook_url, w.severity, w.sla)
+            });
+        let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+        let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
         let child_row = NewWorkflowExecution {
             id: child_id.as_uuid(),
             workflow_name: workflow_name.as_str(),
@@ -3636,6 +3647,8 @@ async fn create_detached_child_executions(
             queue_name: &parent_execution.queue_name,
             execution_timeout: None,
             deadline_at: None,
+            sla: child_sla,
+            sla_deadline_at: child_sla_deadline_at,
             memo: None,
             search_attrs: None,
             assigned_build_id: parent_execution.assigned_build_id.clone(),
@@ -4820,6 +4833,8 @@ async fn persist_workflow_continue_as_new(
     };
     // Re-anchor deadline to the new execution's start time (issue #243).
     let new_deadline_at = execution.execution_timeout.map(|d| chrono::Utc::now() + d);
+    // Re-anchor soft SLA deadline per-run (issue #487).
+    let new_sla_deadline_at = execution.sla.map(|d| chrono::Utc::now() + d);
 
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
@@ -4832,6 +4847,8 @@ async fn persist_workflow_continue_as_new(
         queue_name: &execution.queue_name,
         execution_timeout: execution.execution_timeout,
         deadline_at: new_deadline_at,
+        sla: execution.sla,
+        sla_deadline_at: new_sla_deadline_at,
         memo: execution.memo.clone(),
         search_attrs: execution.search_attrs.clone(),
         assigned_build_id: execution.assigned_build_id.clone(),
@@ -7691,6 +7708,7 @@ mod tests {
             module: "app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,

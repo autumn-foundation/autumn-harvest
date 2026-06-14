@@ -825,6 +825,8 @@ async fn insert_fork_execution(
     // Re-compute deadline_at from the source execution's timeout so the fork
     // gets a fresh deadline anchored to its own start time (issue #243).
     let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
+    // Re-anchor the soft SLA deadline per-fork (issue #487).
+    let sla_deadline_at = source.sla.map(|d| chrono::Utc::now() + d);
 
     let row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
@@ -837,6 +839,8 @@ async fn insert_fork_execution(
         queue_name: &source.queue_name,
         execution_timeout: source.execution_timeout,
         deadline_at,
+        sla: source.sla,
+        sla_deadline_at,
         memo: source.memo.clone(),
         search_attrs: source.search_attrs.clone(),
         assigned_build_id: source.assigned_build_id.clone(),
@@ -1088,6 +1092,10 @@ mod tests {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            sla_breached: false,
+            sla_breached_at: None,
             paused_at: Some(Utc::now()),
             pause_reason: Some("operator pause".into()),
             pause_actor: Some("oncall".into()),
