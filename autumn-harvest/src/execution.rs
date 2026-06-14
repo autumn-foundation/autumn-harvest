@@ -415,7 +415,13 @@ pub async fn start_or_load_workflow_execution(
                         // can never match, but the explicit exclusion is defensive.
                         let (carryover_result, carryover_error) =
                             if let Some(sched_id) = request.schedule_id {
-                                resolve_carryover(conn, sched_id, exec_id.as_uuid()).await?
+                                resolve_carryover(
+                                    conn,
+                                    sched_id,
+                                    exec_id.as_uuid(),
+                                    request.scheduled_for,
+                                )
+                                .await?
                             } else {
                                 (None, None)
                             };
@@ -2352,33 +2358,43 @@ async fn lookup_idempotent_update_dedupe(
 /// and exclude the just-inserted execution by `current_exec_id`.
 ///
 /// Selection is by the **scheduled slot** (`scheduled_for`), not completion time:
-/// the carryover source is the fire with the **greatest `scheduled_for`** (the
-/// previous logical fire under normal forward execution). Because an out-of-order
-/// completion — an older slot finishing late (overlap / catch-up / backfill) — has a
-/// *lower* `scheduled_for`, it can never outrank a newer slot, so it cannot roll an
-/// incremental cursor backward (the bug a `completed_at` ordering would have). Rows
-/// without a slot (`scheduled_for IS NULL`) are excluded; post-migration every
-/// scheduled run carries a slot.
+/// Selection is by the **scheduled slot** (`scheduled_for`), not completion time:
+/// the carryover source is the COMPLETED fire with the **greatest `scheduled_for`
+/// strictly before this run's own slot** (`current_scheduled_for`) — i.e. the
+/// previous logical fire. Bounding the lookup to earlier slots means a backfill or
+/// trigger-now run that starts an *older* logical slot after a newer slot already
+/// completed sees the cursor as of its own slot, never a future fire's output; and
+/// an older slot finishing late can never roll a newer run's cursor backward (the bug
+/// a `completed_at` ordering would have). Rows without a slot (`scheduled_for IS NULL`)
+/// are excluded; post-migration every scheduled run carries a slot. When the current
+/// run itself has no slot (`current_scheduled_for == None`, defensive — scheduled
+/// starts always set it) no carryover is resolved.
 ///
 /// Returns `(last_completion_result, last_error)` where:
-/// - `last_completion_result` = `output` of the highest-slot prior COMPLETED fire.
-/// - `last_error` = `error` of the highest-slot prior terminal fire if it was
+/// - `last_completion_result` = `output` of the highest earlier-slot COMPLETED fire.
+/// - `last_error` = `error` of the highest earlier-slot terminal fire if it was
 ///   `FAILED`/`TIMED_OUT`; `None` if that fire `COMPLETED`/`CANCELLED`/`TERMINATED`.
 async fn resolve_carryover(
     conn: &mut AsyncPgConnection,
     schedule_id: uuid::Uuid,
     current_exec_id: uuid::Uuid,
+    current_scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
 ) -> HarvestResult<(Option<serde_json::Value>, Option<String>)> {
     use crate::schema::harvest_workflow_executions::dsl;
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
-    // Highest-slot COMPLETED fire for this schedule.
+    // No slot on the current run → can't bound to earlier slots; resolve nothing.
+    let Some(current_slot) = current_scheduled_for else {
+        return Ok((None, None));
+    };
+
+    // Highest earlier-slot COMPLETED fire for this schedule.
     let last_completion_result: Option<serde_json::Value> = harvest_workflow_executions::table
         .filter(dsl::schedule_id.eq(schedule_id))
         .filter(dsl::state.eq("COMPLETED"))
         .filter(dsl::completed_at.is_not_null())
-        .filter(dsl::scheduled_for.is_not_null())
+        .filter(dsl::scheduled_for.lt(current_slot))
         .filter(dsl::id.ne(current_exec_id))
         .order(dsl::scheduled_for.desc())
         .limit(1)
@@ -2389,7 +2405,7 @@ async fn resolve_carryover(
         .map_err(database_error)?
         .flatten();
 
-    // Highest-slot terminal fire for this schedule, across *all* terminal states
+    // Highest earlier-slot terminal fire for this schedule, across *all* terminal states
     // (COMPLETED, FAILED, TIMED_OUT, CANCELLED, TERMINATED). Surfacing an error only
     // when it is FAILED/TIMED_OUT means a more recent CANCELLED/TERMINATED fire (e.g.
     // via OverlapPolicy::CancelOther / TerminateOther) masks an older failure.
@@ -2403,7 +2419,7 @@ async fn resolve_carryover(
             "TERMINATED",
         ]))
         .filter(dsl::completed_at.is_not_null())
-        .filter(dsl::scheduled_for.is_not_null())
+        .filter(dsl::scheduled_for.lt(current_slot))
         .filter(dsl::id.ne(current_exec_id))
         .order(dsl::scheduled_for.desc())
         .limit(1)

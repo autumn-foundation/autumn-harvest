@@ -178,6 +178,20 @@ async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
     (conn, url, container)
 }
 
+/// Force the schedule's `next_run_at` to `secs_ago` seconds in the past so the next
+/// `tick_once` fires a slot at exactly that (past) logical time. Carryover selects the
+/// previous fire by `scheduled_for`, so successive ticks must use *strictly
+/// decreasing* `secs_ago` values to give the fires strictly-increasing slots.
+async fn arm_slot(conn: &mut AsyncPgConnection, wf_name: &str, secs_ago: i64) {
+    use autumn_harvest::schema::harvest_schedules::dsl;
+    diesel::update(dsl::harvest_schedules)
+        .filter(dsl::workflow_name.eq(wf_name))
+        .set(dsl::next_run_at.eq(Utc::now() - chrono::Duration::seconds(secs_ago)))
+        .execute(conn)
+        .await
+        .expect("arm next_run_at slot");
+}
+
 fn make_pool(url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     deadpool::managed::Pool::builder(manager)
@@ -284,7 +298,8 @@ async fn two_scheduled_runs_carry_cursor_forward() {
         .expect("register schedules");
 
     // ── Run 1 ────────────────────────────────────────────────────────────────
-    // Tick the scheduler — fires slot #1.
+    // Arm slot #1 well in the past, then tick — fires the earliest slot.
+    arm_slot(&mut conn, wf_name, 300).await;
     tick_once(
         pool.clone(),
         registry.clone(),
@@ -319,16 +334,8 @@ async fn two_scheduled_runs_carry_cursor_forward() {
     );
 
     // ── Run 2 ────────────────────────────────────────────────────────────────
-    // Force another tick by directly advancing next_run_at into the past.
-    diesel::update(autumn_harvest::schema::harvest_schedules::table)
-        .filter(autumn_harvest::schema::harvest_schedules::dsl::workflow_name.eq(wf_name))
-        .set(
-            autumn_harvest::schema::harvest_schedules::dsl::next_run_at
-                .eq(Utc::now() - chrono::Duration::seconds(10)),
-        )
-        .execute(&mut check)
-        .await
-        .expect("advance next_run_at");
+    // Arm slot #2 — later than slot #1 (now-300s) but still in the past so it fires.
+    arm_slot(&mut conn, wf_name, 200).await;
 
     tick_once(
         pool.clone(),
@@ -500,6 +507,7 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     let _h = tokio::spawn(async move { wc.run(&pool_c).await });
 
     // ── Tick 1: fires run 1 (completes with cursor=1) ───────────────────────
+    arm_slot(&mut conn, wf_name, 400).await;
     tick_once(
         pool.clone(),
         registry.clone(),
@@ -512,17 +520,7 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     wait_for_state(&url, wf_name, "COMPLETED", 1).await;
 
     // ── Tick 2: fires run 2 (fails) ──────────────────────────────────────────
-    let mut check = AsyncPgConnection::establish(&url).await.unwrap();
-    diesel::update(autumn_harvest::schema::harvest_schedules::table)
-        .filter(autumn_harvest::schema::harvest_schedules::dsl::workflow_name.eq(wf_name))
-        .set(
-            autumn_harvest::schema::harvest_schedules::dsl::next_run_at
-                .eq(Utc::now() - chrono::Duration::seconds(5)),
-        )
-        .execute(&mut check)
-        .await
-        .unwrap();
-    drop(check);
+    arm_slot(&mut conn, wf_name, 300).await;
 
     tick_once(
         pool.clone(),
@@ -536,17 +534,7 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     wait_for_state(&url, wf_name, "FAILED", 1).await;
 
     // ── Tick 3: fires run 3 (recovery; reads last_error and last_completion_result) ─
-    let mut check = AsyncPgConnection::establish(&url).await.unwrap();
-    diesel::update(autumn_harvest::schema::harvest_schedules::table)
-        .filter(autumn_harvest::schema::harvest_schedules::dsl::workflow_name.eq(wf_name))
-        .set(
-            autumn_harvest::schema::harvest_schedules::dsl::next_run_at
-                .eq(Utc::now() - chrono::Duration::seconds(5)),
-        )
-        .execute(&mut check)
-        .await
-        .unwrap();
-    drop(check);
+    arm_slot(&mut conn, wf_name, 200).await;
 
     tick_once(
         pool.clone(),
@@ -593,17 +581,7 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     );
 
     // ── Tick 4: fires run 4; after a COMPLETED run 3, last_error should be None ─
-    let mut check = AsyncPgConnection::establish(&url).await.unwrap();
-    diesel::update(autumn_harvest::schema::harvest_schedules::table)
-        .filter(autumn_harvest::schema::harvest_schedules::dsl::workflow_name.eq(wf_name))
-        .set(
-            autumn_harvest::schema::harvest_schedules::dsl::next_run_at
-                .eq(Utc::now() - chrono::Duration::seconds(5)),
-        )
-        .execute(&mut check)
-        .await
-        .unwrap();
-    drop(check);
+    arm_slot(&mut conn, wf_name, 100).await;
 
     tick_once(
         pool.clone(),
@@ -697,6 +675,7 @@ async fn skip_policy_does_not_advance_carryover() {
     let _h = tokio::spawn(async move { wc.run(&pool_c).await });
 
     // Tick 1: run 1 fires
+    arm_slot(&mut conn, wf_name, 300).await;
     tick_once(
         pool.clone(),
         registry.clone(),
@@ -708,18 +687,8 @@ async fn skip_policy_does_not_advance_carryover() {
     .expect("tick1");
     wait_for_state(&url, wf_name, "COMPLETED", 1).await;
 
-    // Advance clock and tick again; run 2 should see cursor=42 from run 1.
-    let mut check = AsyncPgConnection::establish(&url).await.unwrap();
-    diesel::update(autumn_harvest::schema::harvest_schedules::table)
-        .filter(autumn_harvest::schema::harvest_schedules::dsl::workflow_name.eq(wf_name))
-        .set(
-            autumn_harvest::schema::harvest_schedules::dsl::next_run_at
-                .eq(Utc::now() - chrono::Duration::seconds(5)),
-        )
-        .execute(&mut check)
-        .await
-        .unwrap();
-    drop(check);
+    // Arm a later (still past) slot and tick again; run 2 should see cursor=42 from run 1.
+    arm_slot(&mut conn, wf_name, 200).await;
 
     tick_once(
         pool.clone(),
