@@ -11035,6 +11035,22 @@ async fn schedule_backfill(
             // creating a second run for the same timestamp after the backfill window.
             let wf_shard_pool = pool.default_pool();
             for (original_slot, _fire_time) in &timestamp_pairs {
+                // Respect the max_runs total budget (issue #478): a backfill must not
+                // dispatch past the schedule's remaining run budget, otherwise an
+                // out-of-budget run would advance scheduled carryover (#488). Mirrors
+                // the max_active gate below (computed once, tracked via
+                // dispatched_this_call); like that gate it is best-effort against a
+                // concurrent tick, but never dispatches beyond the budget seen here.
+                if schedule.max_runs.is_some_and(|max| {
+                    max > 0
+                        && i64::from(schedule.runs_started) + dispatched_this_call >= i64::from(max)
+                }) {
+                    skipped += 1;
+                    *skipped_reasons
+                        .entry("max_runs_exhausted".to_string())
+                        .or_insert(0) += 1;
+                    continue;
+                }
                 // Respect max_active_runs: skip if we've already saturated the limit.
                 if running_at_start + dispatched_this_call >= max_active {
                     skipped += 1;
@@ -11188,6 +11204,17 @@ async fn schedule_backfill(
             let shard_pool = pool.pool_for(shard_id);
 
             for (original_slot, _fire_time) in &timestamp_pairs {
+                // Respect the max_runs total budget (issue #478) — see the workflow loop.
+                if schedule.max_runs.is_some_and(|max| {
+                    max > 0
+                        && i64::from(schedule.runs_started) + dispatched_this_call >= i64::from(max)
+                }) {
+                    skipped += 1;
+                    *skipped_reasons
+                        .entry("max_runs_exhausted".to_string())
+                        .or_insert(0) += 1;
+                    continue;
+                }
                 // Respect max_active_runs for DAGs (now counted via workflow executions).
                 if running_at_start + dispatched_this_call >= max_active {
                     skipped += 1;
