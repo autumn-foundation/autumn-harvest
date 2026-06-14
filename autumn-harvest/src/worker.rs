@@ -2696,12 +2696,22 @@ async fn persist_started_timer(
                 let unresolved_exists: Result<Vec<DummyRow>, diesel::result::Error> = diesel::sql_query(
                     "SELECT 1 AS dummy FROM harvest_events e \
                      WHERE e.workflow_exec_id = $1 \
-                       AND e.event_type = 'ExternalSignalRequested' \
-                       AND NOT EXISTS ( \
-                           SELECT 1 FROM harvest_events res \
-                           WHERE res.workflow_exec_id = e.workflow_exec_id \
-                             AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
-                             AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
+                       AND ( \
+                         ( e.event_type = 'ExternalSignalRequested' \
+                           AND NOT EXISTS ( \
+                               SELECT 1 FROM harvest_events res \
+                               WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                 AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
+                                 AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
+                           ) ) \
+                         OR \
+                         ( e.event_type = 'ExternalCancelRequested' \
+                           AND NOT EXISTS ( \
+                               SELECT 1 FROM harvest_events res \
+                               WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                 AND res.event_type IN ('ExternalCancelDelivered', 'ExternalCancelFailed') \
+                                 AND res.event_data->'data'->>'cancel_id' = e.event_data->'data'->>'cancel_id' \
+                           ) ) \
                        ) \
                      LIMIT 1"
                 )

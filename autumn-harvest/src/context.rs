@@ -3369,10 +3369,13 @@ impl WorkflowContext {
     pub async fn request_cancel_external_workflow(&self, target: ExecutionId) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
-        // Self-cancel is always an immediate deterministic error.
+        // Self-cancel is always an immediate deterministic error. This path records
+        // no history, so the `cancel_id` must be a stable sentinel (nil UUID) rather
+        // than a fresh v4 — otherwise a workflow that surfaces the error (e.g.
+        // `e.to_string()` into its output) would diverge on replay.
         if target == self.exec_id {
             return Err(HarvestError::ExternalCancelFailed {
-                cancel_id: ExternalCancelId::new(),
+                cancel_id: ExternalCancelId::from_uuid(uuid::Uuid::nil()),
                 target,
                 reason_code: "self_cancel".to_string(),
             });
@@ -8420,6 +8423,46 @@ mod tests {
             cancel_result.is_ok(),
             "cancel after activity should replay Ok"
         );
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no live commands after full replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_external_workflow_stashes_interleaved_signal() {
+        // Regression: a SignalReceived recorded between ExternalCancelRequested and
+        // ExternalCancelDelivered must still be observable by a later receive_signal.
+        // Previously match_external_cancel skipped the signal transparently, jumping
+        // the cursor past it on settle and losing it.
+        let cancel_id = crate::types::ExternalCancelId::new();
+        let target = ExecutionId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let cancel_result = ctx.request_cancel_external_workflow(target).await;
+        assert!(cancel_result.is_ok(), "cancel should replay Ok");
+
+        // The interleaved signal must still be observable, not lost to the cursor jump.
+        let sig = ctx
+            .wait_for_signal("approved")
+            .await
+            .expect("interleaved signal must be observable after cancel replay");
+        assert_eq!(sig, serde_json::json!({"ok": true}));
+
         assert!(
             ctx.drain_commands().is_empty(),
             "no live commands after full replay"

@@ -1863,14 +1863,28 @@ impl HistoryMatcher {
                     return self.settle_terminal(scan_cursor, first_interleaved_command, result);
                 }
 
-                // Interleaved lifecycle / signal events — skip transparently.
+                // Interleaved lifecycle / update events — skip transparently.
                 WorkflowEvent::WorkflowStarted { .. }
-                | WorkflowEvent::SignalReceived { .. }
                 | WorkflowEvent::UpdateAdmitted { .. }
                 | WorkflowEvent::UpdateCompleted { .. }
                 | WorkflowEvent::UpdateFailed { .. }
                 | WorkflowEvent::WorkflowExecutionPaused { .. }
                 | WorkflowEvent::WorkflowExecutionResumed { .. } => {
+                    scan_cursor += 1;
+                }
+
+                // Signals can arrive while the external cancel is in-flight — stash
+                // them so a later `receive_signal` still observes them (mirrors
+                // `match_external_signal`; without this the cursor would jump past
+                // the signal when the cancel terminal settles and the signal would
+                // be lost).
+                WorkflowEvent::SignalReceived {
+                    signal_name: sn,
+                    payload,
+                } => {
+                    let sn = sn.clone();
+                    let payload = payload.clone();
+                    self.stash_signal(scan_cursor, sn, payload);
                     scan_cursor += 1;
                 }
 

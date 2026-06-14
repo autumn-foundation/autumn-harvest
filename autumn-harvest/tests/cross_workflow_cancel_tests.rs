@@ -169,6 +169,31 @@ fn long_running_target_workflow<'a>(
     })
 }
 
+// Target workflow that completes immediately.
+fn instant_complete_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!({"status": "done"})) })
+}
+
+// Canceller that surfaces the cancel outcome (delivered/failed) in its output.
+fn canceller_expecting_failure<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let target_uuid_str = input["target"].as_str().ok_or("missing target")?;
+        let target = ExecutionId::from_uuid(
+            uuid::Uuid::parse_str(target_uuid_str).map_err(|e| e.to_string())?,
+        );
+        match ctx.request_cancel_external_workflow(target).await {
+            Ok(()) => Ok(serde_json::json!({"result": "delivered"})),
+            Err(e) => Ok(serde_json::json!({"result": "failed", "reason": e.to_string()})),
+        }
+    })
+}
+
 fn default_start_params(
     exec_id: ExecutionId,
     workflow_name: &'static str,
@@ -213,8 +238,8 @@ fn assert_has_event(events: &[WorkflowEvent], name: &str) {
     );
 }
 
-/// Same-shard live cancel: caller cancels a running target that is waiting for a signal.
-/// Expected: caller reaches COMPLETED with ExternalCancelDelivered; target reaches CANCELLED.
+// Same-shard live cancel: caller cancels a running target that is waiting for a signal.
+// Expected: caller reaches COMPLETED with ExternalCancelDelivered; target reaches CANCELLED.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_same_shard_live_cancel() {
@@ -341,7 +366,7 @@ async fn test_same_shard_live_cancel() {
     let _ = handle.await;
 }
 
-/// Cancel of an already-terminal target is a no-op success (ExternalCancelDelivered).
+// Cancel of an already-terminal target is a no-op success (ExternalCancelDelivered).
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_already_terminal_target_is_no_op_success() {
@@ -352,15 +377,6 @@ async fn test_already_terminal_target_is_no_op_success() {
 
     let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-
-    // Target workflow completes immediately.
-    fn instant_complete_workflow<'a>(
-        _ctx: &'a WorkflowContext,
-        _input: serde_json::Value,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>
-    {
-        Box::pin(async move { Ok(serde_json::json!({"status": "done"})) })
-    }
 
     let built = HarvestBuilder::new()
         .workflows(vec![
@@ -490,7 +506,7 @@ async fn test_already_terminal_target_is_no_op_success() {
     let _ = handle.await;
 }
 
-/// Grace-window expiry for an unknown target resolves as ExternalCancelFailed{target_unknown}.
+// Grace-window expiry for an unknown target resolves as ExternalCancelFailed{target_unknown}.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_grace_window_expiry_unknown_target() {
@@ -502,23 +518,6 @@ async fn test_grace_window_expiry_unknown_target() {
     // Target does not exist at all.
     let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
-
-    fn canceller_expecting_failure<'a>(
-        ctx: &'a WorkflowContext,
-        input: serde_json::Value,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let target_uuid_str = input["target"].as_str().ok_or("missing target")?;
-            let target = ExecutionId::from_uuid(
-                uuid::Uuid::parse_str(target_uuid_str).map_err(|e| e.to_string())?,
-            );
-            match ctx.request_cancel_external_workflow(target).await {
-                Ok(()) => Ok(serde_json::json!({"result": "delivered"})),
-                Err(e) => Ok(serde_json::json!({"result": "failed", "reason": e.to_string()})),
-            }
-        })
-    }
 
     let built = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
@@ -607,7 +606,7 @@ async fn test_grace_window_expiry_unknown_target() {
     let _ = handle.await;
 }
 
-/// Cross-shard cancel via outbox: caller on Shard 0, target on Shard 1.
+// Cross-shard cancel via outbox: caller on Shard 0, target on Shard 1.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn test_cross_shard_cancel_via_outbox() {
