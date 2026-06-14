@@ -5525,22 +5525,37 @@ async fn start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (owner, runbook_url, severity, info_sla) = runtime
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
         .registry
         .workflows
         .get(&workflow_name)
-        .map_or((None, None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity, info.sla)
+        .map_or((None, None, None, None, None), |info| {
+            (
+                info.owner,
+                info.runbook_url,
+                info.severity,
+                info.sla,
+                info.execution_timeout,
+            )
         });
 
     // Resolve effective SLA: request override → WorkflowInfo default → None.
     // `try_seconds` avoids a panic on an out-of-range untrusted `i64`, and the
     // non-negative filter rejects negative inputs (which would breach immediately).
+    // The resolved SLA is clamped against the workflow's declared
+    // `execution_timeout` default so an API-started run can't get a softer SLA
+    // deadline than its declared hard timeout (the core also clamps against any
+    // request-supplied execution_timeout).
     let effective_sla = request
         .sla_secs
         .filter(|&secs| secs >= 0)
         .and_then(chrono::Duration::try_seconds)
-        .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()));
+        .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()))
+        .map(|sla| {
+            info_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map_or(sla, |hard| sla.min(hard))
+        });
 
     let result = start_or_load_workflow_execution(
         &mut conn,
@@ -13486,6 +13501,12 @@ pub(crate) async fn load_stalled_workflows(
     }
     if let Some(severity) = &filters.severity {
         query = query.filter(harvest_workflow_executions::severity.eq(severity.as_str()));
+    }
+    // Honor the soft-SLA filter on the stalled path too (issue #487): without
+    // this, `?sla_breached=true&no_progress_minutes=N` would return unbreached
+    // stalled rows because this loader bypasses `load_workflows`.
+    if filters.sla_breached {
+        query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
     }
 
     if !filters.include_sleeping {

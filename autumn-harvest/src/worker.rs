@@ -2015,31 +2015,43 @@ async fn persist_workflow_completion(
     output: serde_json::Value,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
+    type CompletionTxnResult = (
+        Vec<crate::completion_trigger::DeferredTriggerStart>,
+        Option<(String, String)>,
+    );
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
     };
-    let deferred = conn
-        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
-            |conn| {
-                async move {
-                    store::append_events(conn, exec_id, &[event], next_event_id).await?;
-                    update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
-                    queue::complete_task(conn, task_id, output).await?;
-                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
-                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                        conn,
-                        exec_id,
-                        crate::completion_trigger::TerminalState::Completed,
-                        metrics,
-                    )
-                    .await?;
-                    deferred.extend(triggers);
-                    Ok(deferred)
-                }
-                .scope_boxed()
-            },
-        )
+    let (deferred, sla_breach) = conn
+        .transaction::<CompletionTxnResult, HarvestError, _>(|conn| {
+            async move {
+                store::append_events(conn, exec_id, &[event], next_event_id).await?;
+                update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
+                // Catch a run that crossed its soft-SLA deadline and completed
+                // within one scan interval, which the RUNNING-only scanner would
+                // miss (issue #487). Guarded + PK-scoped, so it is exactly-once
+                // with the scanner.
+                let sla_breach = crate::timeout::mark_terminal_sla_breach(conn, exec_id).await?;
+                queue::complete_task(conn, task_id, output).await?;
+                let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Completed,
+                    metrics,
+                )
+                .await?;
+                deferred.extend(triggers);
+                Ok((deferred, sla_breach))
+            }
+            .scope_boxed()
+        })
         .await?;
+
+    // Emit the breach counter only after the terminal transaction commits.
+    if let (Some(metrics), Some((workflow_name, queue_name))) = (metrics, sla_breach) {
+        metrics.record_workflow_sla_breach(&workflow_name, &queue_name);
+    }
 
     for start in deferred {
         start.spawn();
@@ -2058,38 +2070,48 @@ async fn persist_workflow_failure(
     nd_details: Option<&crate::error::NonDeterministicDetails>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<()> {
+    type FailureTxnResult = (
+        Vec<crate::completion_trigger::DeferredTriggerStart>,
+        Option<(String, String)>,
+    );
     let error = error.to_string();
-    let deferred = conn
-        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
-            |conn| {
-                async move {
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        &[WorkflowEvent::WorkflowFailed {
-                            error: error.clone(),
-                        }],
-                        next_event_id,
-                    )
+    let (deferred, sla_breach) = conn
+        .transaction::<FailureTxnResult, HarvestError, _>(|conn| {
+            async move {
+                store::append_events(
+                    conn,
+                    exec_id,
+                    &[WorkflowEvent::WorkflowFailed {
+                        error: error.clone(),
+                    }],
+                    next_event_id,
+                )
+                .await?;
+                update_workflow_execution_failed(conn, exec_id, worker_id, &error, nd_details)
                     .await?;
-                    update_workflow_execution_failed(conn, exec_id, worker_id, &error, nd_details)
-                        .await?;
-                    queue::fail_task(conn, task_id, &error).await?;
-                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
-                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                        conn,
-                        exec_id,
-                        crate::completion_trigger::TerminalState::Failed,
-                        metrics,
-                    )
-                    .await?;
-                    deferred.extend(triggers);
-                    Ok(deferred)
-                }
-                .scope_boxed()
-            },
-        )
+                // See persist_workflow_completion: close the terminal-transition
+                // window for the soft-SLA breach counter (issue #487).
+                let sla_breach = crate::timeout::mark_terminal_sla_breach(conn, exec_id).await?;
+                queue::fail_task(conn, task_id, &error).await?;
+                let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Failed,
+                    metrics,
+                )
+                .await?;
+                deferred.extend(triggers);
+                Ok((deferred, sla_breach))
+            }
+            .scope_boxed()
+        })
         .await?;
+
+    // Emit the breach counter only after the terminal transaction commits.
+    if let (Some(metrics), Some((workflow_name, queue_name))) = (metrics, sla_breach) {
+        metrics.record_workflow_sla_breach(&workflow_name, &queue_name);
+    }
 
     for start in deferred {
         start.spawn();

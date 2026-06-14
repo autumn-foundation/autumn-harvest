@@ -937,6 +937,55 @@ pub async fn enforce_workflow_sla_breaches(
     Ok(count)
 }
 
+/// Mark a single execution's soft-SLA breach at its terminal transition
+/// (issue #487).
+///
+/// The scanner [`enforce_workflow_sla_breaches`] only matches RUNNING rows, so a
+/// run that crosses `sla_deadline_at` and then completes or fails within one
+/// scan interval would otherwise never be marked or counted. This helper closes
+/// that window: it runs the same guarded, exactly-once update as the scanner but
+/// keyed by the execution's primary key and **state-agnostic**, so it fires from
+/// inside the terminal-transition transaction (the PK lookup uses the
+/// primary-key index, so no new index is required).
+///
+/// Returns `Some((workflow_name, queue_name))` when this call is the one that
+/// flipped `sla_breached` false→true — the caller should then emit
+/// `harvest.workflow.sla_breached` exactly once, **after the transaction
+/// commits**, so a rolled-back terminal transition never over-counts. Returns
+/// `None` when the row had no elapsed SLA deadline or was already marked (e.g.
+/// the scanner caught it while still RUNNING), so a breach is never
+/// double-counted between the two paths.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn mark_terminal_sla_breach(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+) -> HarvestResult<Option<(String, String)>> {
+    use crate::schema::harvest_workflow_executions;
+
+    let now = Utc::now();
+    diesel::update(harvest_workflow_executions::table)
+        .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
+        .filter(harvest_workflow_executions::sla_deadline_at.is_not_null())
+        .filter(harvest_workflow_executions::sla_deadline_at.lt(Some(now)))
+        .filter(harvest_workflow_executions::sla_breached.eq(false))
+        .set((
+            harvest_workflow_executions::sla_breached.eq(true),
+            harvest_workflow_executions::sla_breached_at.eq(Some(now)),
+        ))
+        .returning((
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::queue_name,
+        ))
+        .get_result(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
 /// Enforce all currently expired task timeouts against the database state.
 ///
 /// This mutates queue rows and workflow history so timed-out tasks are not

@@ -355,3 +355,82 @@ async fn only_running_past_deadline_breaches() {
         "future deadline not yet breached"
     );
 }
+
+// ── Terminal-transition mark: close the scan-interval window (issue #487, B) ──
+
+#[tokio::test]
+async fn terminal_mark_flips_breach_once_and_skips_non_overdue() {
+    let (mut conn, _container) = setup_db().await;
+    let past = Utc::now() - ChronoDuration::minutes(5);
+
+    // A run that crossed its SLA deadline: the terminal-transition mark flips the
+    // flag and returns its (workflow, queue) so the caller emits the counter once.
+    let overdue = insert_execution(&mut conn, "RUNNING", Some(past)).await;
+    let first = timeout::mark_terminal_sla_breach(&mut conn, overdue)
+        .await
+        .expect("mark terminal sla breach");
+    assert_eq!(
+        first,
+        Some(("slow_workflow".to_owned(), "priority-queue".to_owned())),
+        "first terminal mark reports the breach for one-time counter emission"
+    );
+    assert!(load_breach_flags(&mut conn, overdue).await.0);
+
+    // Idempotent: a second call (e.g. the scanner already counted it) returns
+    // None, so the breach is never double-counted across the two paths.
+    let second = timeout::mark_terminal_sla_breach(&mut conn, overdue)
+        .await
+        .expect("second terminal mark");
+    assert_eq!(second, None, "already-marked run is not re-counted");
+
+    // A run with no elapsed SLA deadline is never marked.
+    let future = insert_execution(
+        &mut conn,
+        "RUNNING",
+        Some(Utc::now() + ChronoDuration::hours(1)),
+    )
+    .await;
+    assert_eq!(
+        timeout::mark_terminal_sla_breach(&mut conn, future)
+            .await
+            .expect("mark future"),
+        None,
+        "future deadline is not breached at terminal transition"
+    );
+    let no_sla = insert_execution(&mut conn, "RUNNING", None).await;
+    assert_eq!(
+        timeout::mark_terminal_sla_breach(&mut conn, no_sla)
+            .await
+            .expect("mark no-sla"),
+        None,
+        "run without an SLA deadline is never marked"
+    );
+}
+
+#[tokio::test]
+async fn scanner_then_terminal_mark_does_not_double_count() {
+    let (mut conn, _container) = setup_db().await;
+    let past = Utc::now() - ChronoDuration::minutes(5);
+    let exec = insert_execution(&mut conn, "RUNNING", Some(past)).await;
+
+    // Scanner catches it while RUNNING and counts it once.
+    let spy = SpyRecorder::default();
+    let n = timeout::enforce_workflow_sla_breaches(&mut conn, &spy)
+        .await
+        .expect("scan");
+    assert_eq!(n, 1);
+
+    // The subsequent terminal transition must not count it a second time.
+    let terminal = timeout::mark_terminal_sla_breach(&mut conn, exec)
+        .await
+        .expect("terminal mark after scan");
+    assert_eq!(
+        terminal, None,
+        "a run already marked by the scanner is not re-counted at terminal transition"
+    );
+    assert_eq!(
+        spy.breaches.lock().unwrap().len(),
+        1,
+        "counted exactly once"
+    );
+}
