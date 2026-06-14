@@ -599,11 +599,21 @@ async fn replace_execution(
     } else {
         Utc::now()
     };
+    // Resolve scheduled carryover on the replacement path too (issue #488): a reuse
+    // policy that replaces a prior row (e.g. AllowDuplicateFailedOnly retrying a failed
+    // scheduled slot, or TerminateIfRunning) still carries schedule_id/scheduled_for, so
+    // the rerun (and any continue-as-new fork from it) must see the previous fire's
+    // carryover rather than behaving like a first scheduled run.
+    let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
+        resolve_carryover(conn, sched_id, new_exec_id.as_uuid(), request.scheduled_for).await?
+    } else {
+        (None, None)
+    };
     let started_event = WorkflowEvent::WorkflowStarted {
         input: request.input.clone(),
         timestamp: start_timestamp,
-        last_completion_result: None,
-        last_error: None,
+        last_completion_result: carryover_result,
+        last_error: carryover_error,
     };
     store::append_events(conn, new_exec_id, &[started_event], 0).await?;
     queue::enqueue(conn, enqueue).await?;
@@ -2453,6 +2463,11 @@ async fn lookup_idempotent_update_dedupe(
 /// run itself has no slot (`current_scheduled_for == None`, defensive — scheduled
 /// starts always set it) no carryover is resolved.
 ///
+/// Within a slot, ties are broken by `completed_at DESC, id DESC` so that when the
+/// same slot was run more than once (a `TERMINATED` row is released from the active
+/// uniqueness index and the slot can be re-run), the **latest** attempt of that slot
+/// wins rather than an arbitrary older terminated row.
+///
 /// Returns `(last_completion_result, last_error)` where:
 /// - `last_completion_result` = `output` of the highest earlier-slot COMPLETED fire.
 /// - `last_error` = `error` of the highest earlier-slot terminal fire if it was
@@ -2479,7 +2494,11 @@ async fn resolve_carryover(
         .filter(dsl::completed_at.is_not_null())
         .filter(dsl::scheduled_for.lt(current_slot))
         .filter(dsl::id.ne(current_exec_id))
-        .order(dsl::scheduled_for.desc())
+        .order((
+            dsl::scheduled_for.desc(),
+            dsl::completed_at.desc(),
+            dsl::id.desc(),
+        ))
         .limit(1)
         .select(dsl::output)
         .get_result::<Option<serde_json::Value>>(conn)
@@ -2504,7 +2523,11 @@ async fn resolve_carryover(
         .filter(dsl::completed_at.is_not_null())
         .filter(dsl::scheduled_for.lt(current_slot))
         .filter(dsl::id.ne(current_exec_id))
-        .order(dsl::scheduled_for.desc())
+        .order((
+            dsl::scheduled_for.desc(),
+            dsl::completed_at.desc(),
+            dsl::id.desc(),
+        ))
         .limit(1)
         .select((dsl::state, dsl::error))
         .get_result::<(String, Option<String>)>(conn)
