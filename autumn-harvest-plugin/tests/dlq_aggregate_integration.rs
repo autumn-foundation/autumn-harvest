@@ -289,6 +289,7 @@ async fn insert_execution(database_url: &str, shard: i32, workflow_name: &str) -
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)

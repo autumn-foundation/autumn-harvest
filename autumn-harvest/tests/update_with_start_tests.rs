@@ -326,6 +326,7 @@ mod db_tests {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         };
         start_or_load_workflow_execution(&mut conn, first_params)
             .await
@@ -388,6 +389,7 @@ mod db_tests {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         };
         start_or_load_workflow_execution(&mut conn, start_params)
             .await

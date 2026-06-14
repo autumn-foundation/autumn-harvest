@@ -2371,16 +2371,20 @@ async fn resolve_carryover(
         .map_err(database_error)?
         .flatten();
 
-    // Most recent terminal run for this schedule (COMPLETED, FAILED, or TIMED_OUT).
-    // If it ended FAILED/TIMED_OUT, carry its error; if it COMPLETED, return None.
+    // Most recent terminal run for this schedule, across *all* terminal states
+    // (COMPLETED, FAILED, TIMED_OUT, CANCELLED, TERMINATED). Selecting the single
+    // latest terminal row — then surfacing an error only when it is FAILED/TIMED_OUT —
+    // means a more recent CANCELLED/TERMINATED run (e.g. via OverlapPolicy::CancelOther
+    // / TerminateOther) correctly masks an older failure rather than resurrecting it.
     let last_terminal: Option<(String, Option<String>)> = harvest_workflow_executions::table
         .filter(dsl::schedule_id.eq(schedule_id))
-        .filter(
-            dsl::state
-                .eq("COMPLETED")
-                .or(dsl::state.eq("FAILED"))
-                .or(dsl::state.eq("TIMED_OUT")),
-        )
+        .filter(dsl::state.eq_any([
+            "COMPLETED",
+            "FAILED",
+            "TIMED_OUT",
+            "CANCELLED",
+            "TERMINATED",
+        ]))
         .filter(dsl::completed_at.is_not_null())
         .filter(dsl::id.ne(current_exec_id))
         .order(dsl::completed_at.desc())

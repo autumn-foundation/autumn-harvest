@@ -499,6 +499,8 @@ mod tests {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }
     }
 

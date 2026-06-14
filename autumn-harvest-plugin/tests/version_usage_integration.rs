@@ -195,6 +195,7 @@ async fn insert_version_execution_with_markers(
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -221,6 +222,8 @@ async fn insert_version_execution_with_markers(
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     events.extend(markers.iter().map(|(change_id, recorded_version)| {
         WorkflowEvent::MarkerRecorded {

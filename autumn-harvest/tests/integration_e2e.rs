@@ -538,6 +538,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -594,6 +595,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -2598,6 +2600,7 @@ async fn worker_completes_parent_workflow_with_parallel_child_workflows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_builder_state_is_visible_to_workflow_and_activity() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -3406,6 +3409,7 @@ async fn insert_named_workflow_execution(
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -3942,6 +3946,7 @@ mod reuse_policy_helpers {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         }
     }
 
@@ -5194,6 +5199,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -5348,6 +5354,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -6782,6 +6789,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -7183,6 +7191,7 @@ fn retry_context_activity<'a>(
 /// `ctx.attempt() == 1, 2, 3` and `ctx.previous_failure() == None,
 /// Some("…"), Some("…")`".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)

@@ -268,6 +268,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 runbook_url: None,
                 severity: None,
                 context_headers: None,
+                schedule_id: None,
             },
         )
         .await

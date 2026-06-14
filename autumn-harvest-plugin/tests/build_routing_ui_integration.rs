@@ -598,6 +598,7 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -888,6 +889,7 @@ async fn two_build_rolling_deploy_full_lifecycle() {
                 runbook_url: None,
                 severity: None,
                 context_headers: None,
+                schedule_id: None,
             },
         )
         .await

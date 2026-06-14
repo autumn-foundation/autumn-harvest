@@ -307,6 +307,7 @@ async fn test_same_shard_not_found_retry() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -345,6 +346,7 @@ async fn test_same_shard_not_found_retry() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -469,6 +471,7 @@ async fn test_cross_shard_outbox_delivery() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -500,6 +503,7 @@ async fn test_cross_shard_outbox_delivery() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -602,6 +606,7 @@ async fn test_grace_window_expiration() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -737,6 +742,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -775,6 +781,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await

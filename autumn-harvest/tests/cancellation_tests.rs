@@ -164,6 +164,7 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -555,6 +556,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -754,6 +756,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -896,6 +899,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -1035,6 +1039,7 @@ async fn activity_without_cancellation_check_completes_normally() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await

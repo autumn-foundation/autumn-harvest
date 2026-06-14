@@ -148,6 +148,7 @@ async fn greet(
                 runbook_url: None,
                 severity: None,
                 context_headers: None,
+                schedule_id: None,
             },
         )
         .await

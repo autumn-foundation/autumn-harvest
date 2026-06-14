@@ -555,6 +555,7 @@ async fn insert_workflow_on_url(
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -633,6 +634,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -790,6 +792,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         })
         .execute(&mut conn)
         .await
@@ -1114,6 +1117,7 @@ async fn seed_scheduled_activity_task_from_url(
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         })
         .execute(&mut conn)
         .await
@@ -1125,6 +1129,8 @@ async fn seed_scheduled_activity_task_from_url(
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,

@@ -354,6 +354,7 @@ async fn transactional_activity_happy_path_atomic_commit() {
                 runbook_url: None,
                 severity: None,
                 context_headers: None,
+                schedule_id: None,
             },
         )
         .await
@@ -432,6 +433,7 @@ async fn transactional_activity_err_rolls_back_user_writes() {
                 runbook_url: None,
                 severity: None,
                 context_headers: None,
+                schedule_id: None,
             },
         )
         .await

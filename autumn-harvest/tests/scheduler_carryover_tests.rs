@@ -1,4 +1,11 @@
 #![cfg(feature = "db")]
+#![allow(
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::doc_markdown,
+    clippy::cast_possible_wrap,
+    clippy::literal_string_with_formatting_args
+)]
 //! Last-completion-result carryover tests — issue #488.
 //!
 //! Verifies that a scheduled workflow can read the output of the previous
@@ -362,9 +369,8 @@ async fn two_scheduled_runs_carry_cursor_forward() {
 
     let report = WorkflowReplayer::new()
         .register_fn(wf_name, incremental_etl_handler)
-        .replay_from_events(history)
-        .await
-        .expect("replay parse");
+        .replay_from_events(history.events)
+        .await;
 
     assert!(
         matches!(

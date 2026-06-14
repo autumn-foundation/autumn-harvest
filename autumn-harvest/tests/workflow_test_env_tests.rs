@@ -1129,7 +1129,7 @@ async fn test_last_completion_result_none_on_first_run() {
     );
 }
 
-/// Seeded carryover is returned by last_completion_result and last_error returns None.
+/// Seeded carryover is returned by `last_completion_result` and `last_error` returns None.
 #[tokio::test]
 async fn test_last_completion_result_seeded_value() {
     let cursor = json!({"processed_at": "2026-06-14T00:00:00Z", "cursor": 42});
@@ -1143,7 +1143,7 @@ async fn test_last_completion_result_seeded_value() {
     );
 }
 
-/// Seeded last_error is returned; last_completion_result still shows the prior value.
+/// Seeded `last_error` is returned; `last_completion_result` still shows the prior value.
 #[tokio::test]
 async fn test_last_error_seeded_value() {
     let prior_result = json!({"cursor": 10});

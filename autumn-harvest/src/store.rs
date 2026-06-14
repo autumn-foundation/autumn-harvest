@@ -712,6 +712,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -796,6 +798,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::Value::Null,
@@ -822,6 +826,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({"user": "alice"}),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),

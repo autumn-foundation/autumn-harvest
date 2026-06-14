@@ -248,6 +248,7 @@ fn start_workflow_params_has_priority_field() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
 
     assert_eq!(params.priority, Priority::High);
@@ -284,6 +285,7 @@ fn start_workflow_params_default_priority_is_normal() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
 
     assert_eq!(params.priority, Priority::Normal);

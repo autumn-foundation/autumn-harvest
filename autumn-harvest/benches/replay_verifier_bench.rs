@@ -41,6 +41,8 @@ fn build_fixture_json(activity_count: usize) -> String {
     events.push(WorkflowEvent::WorkflowStarted {
         input: Value::from(activity_count as u64),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     });
     for i in 0..activity_count {
         let activity_id = ActivityExecId::new();

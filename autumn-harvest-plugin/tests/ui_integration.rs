@@ -381,6 +381,7 @@ async fn insert_workflow_on_url(
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -2137,6 +2138,7 @@ async fn insert_child_workflow_on_url(
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await

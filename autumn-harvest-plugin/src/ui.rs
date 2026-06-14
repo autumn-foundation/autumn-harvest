@@ -7679,6 +7679,7 @@ mod tests {
             pause_reason: None,
             pause_actor: None,
             current_details: None,
+            schedule_id: None,
         }
     }
 

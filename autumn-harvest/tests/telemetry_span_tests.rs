@@ -372,6 +372,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     runbook_url: None,
                     severity: None,
                     context_headers: None,
+                    schedule_id: None,
                 },
             )
             .await

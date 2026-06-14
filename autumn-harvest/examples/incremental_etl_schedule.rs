@@ -108,6 +108,7 @@ struct Cursor {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)] // referenced from the module-level doc example
 struct EtlResult {
     cursor: Cursor,
     batch_rows: u64,

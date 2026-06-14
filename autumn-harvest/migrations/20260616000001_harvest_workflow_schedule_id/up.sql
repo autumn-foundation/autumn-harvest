@@ -14,7 +14,9 @@ ALTER TABLE harvest_workflow_executions
 --   ORDER BY completed_at DESC LIMIT 1;
 --
 -- Also serves the last_error query (adds state IN filter, same sort key).
--- Per-schedule cardinality is small; one index covers both queries.
+-- Per-schedule cardinality is small; one index covers both queries. Both queries
+-- additionally filter completed_at IS NOT NULL, so excluding still-running rows
+-- (completed_at NULL) from the index keeps it compact without losing coverage.
 CREATE INDEX IF NOT EXISTS idx_harvest_wfx_schedule_carryover
     ON harvest_workflow_executions (schedule_id, completed_at DESC)
-    WHERE schedule_id IS NOT NULL;
+    WHERE schedule_id IS NOT NULL AND completed_at IS NOT NULL;

@@ -626,6 +626,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -837,6 +838,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         })
         .execute(&mut conn)
         .await
@@ -957,6 +959,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         })
         .execute(&mut conn)
         .await
@@ -1090,6 +1093,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         })
         .execute(&mut conn)
         .await
@@ -1222,6 +1226,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 runbook_url: None,
                 severity: None,
                 context_headers: None,
+                schedule_id: None,
             })
             .execute(&mut conn)
             .await
@@ -1426,6 +1431,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         })
         .execute(&mut conn)
         .await
@@ -1593,6 +1599,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         })
         .execute(&mut conn)
         .await
@@ -1763,6 +1770,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         })
         .execute(&mut conn)
         .await
@@ -2064,6 +2072,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+        schedule_id: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)

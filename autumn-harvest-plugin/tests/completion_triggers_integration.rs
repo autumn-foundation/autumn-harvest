@@ -456,6 +456,7 @@ async fn test_trigger_evaluations_same_shard() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -550,6 +551,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -622,6 +624,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -716,6 +719,7 @@ async fn test_trigger_state_matching_and_deduplication() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -887,6 +891,7 @@ async fn test_trigger_cross_shard() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -986,6 +991,7 @@ async fn test_completion_trigger_via_worker_run() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -1099,6 +1105,7 @@ async fn test_trigger_with_custom_queue() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -1280,6 +1287,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -1489,6 +1497,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -1910,6 +1919,7 @@ async fn test_trigger_evaluations_schema_validation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
@@ -1977,6 +1987,7 @@ async fn test_trigger_evaluations_schema_validation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await
