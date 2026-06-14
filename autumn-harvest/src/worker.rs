@@ -585,7 +585,7 @@ struct PreparedWorkflowTask {
     was_cache_hit: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct WorkflowTaskPersistence<'a> {
     task: &'a TaskQueueItem,
     worker_id: &'a str,
@@ -594,6 +594,13 @@ struct WorkflowTaskPersistence<'a> {
     /// Grace window for pinning follow-up tasks to this worker's LRU cache.
     /// Zero disables sticky routing entirely.
     sticky_timeout: Duration,
+    /// Decoded scheduled-carryover values frozen in this execution's `WorkflowStarted`
+    /// event (issue #488). Propagated verbatim to a `continue_as_new` continuation so
+    /// `ctx.last_completion_result()` / `ctx.last_error()` survive the fork (the
+    /// continuation is the same logical scheduled run). `None`/`None` for non-scheduled
+    /// runs. Plaintext here because it comes from the already-decoded replay history.
+    carryover_result: Option<serde_json::Value>,
+    carryover_error: Option<String>,
 }
 
 impl<'a> WorkflowTaskPersistence<'a> {
@@ -608,7 +615,7 @@ impl<'a> WorkflowTaskPersistence<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SuspendedWorkflowContext<'a> {
     execution: &'a WorkflowExecution,
     persistence: WorkflowTaskPersistence<'a>,
@@ -4593,8 +4600,11 @@ async fn persist_workflow_continue_as_new(
     let started_event = WorkflowEvent::WorkflowStarted {
         input: input.clone(),
         timestamp: chrono::Utc::now(),
-        last_completion_result: None,
-        last_error: None,
+        // Preserve scheduled carryover across the fork (issue #488): the continuation is
+        // the same logical scheduled run, so it must see the same frozen values rather
+        // than re-resolving (which could pick up a newer sibling fire's output).
+        last_completion_result: persistence.carryover_result.clone(),
+        last_error: persistence.carryover_error.clone(),
     };
     let continued_event = WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id,
@@ -4824,9 +4834,12 @@ async fn persist_workflow_outcome(
             .await
         }
         (WorkflowOutcome::ContinuedAsNew { input }, _) => {
+            // task/worker_id are Copy references; capture before persistence is moved.
+            let task = persistence.task;
+            let worker_id = persistence.worker_id;
             let result =
                 persist_workflow_continue_as_new(conn, persistence, execution, input).await;
-            fail_execution_on_error(conn, persistence.task, persistence.worker_id, result).await
+            fail_execution_on_error(conn, task, worker_id, result).await
         }
     }
 }
@@ -5979,12 +5992,30 @@ async fn process_workflow_task(
         Some(None) // terminal — evict
     };
 
+    // Extract this run's frozen carryover (issue #488) from the decoded WorkflowStarted
+    // (history_events[0]) so a continue_as_new continuation can inherit it.
+    // Slice pattern (not .first()) avoids the in-scope Diesel RunQueryDsl::first ambiguity.
+    let (carryover_result, carryover_error) = if let [
+        WorkflowEvent::WorkflowStarted {
+            last_completion_result,
+            last_error,
+            ..
+        },
+        ..,
+    ] = history_events.as_slice()
+    {
+        (last_completion_result.clone(), last_error.clone())
+    } else {
+        (None, None)
+    };
     let persistence = WorkflowTaskPersistence {
         task,
         worker_id,
         exec_id: prepared.exec_id,
         next_event_id,
         sticky_timeout,
+        carryover_result,
+        carryover_error,
     };
 
     // Issue #383: authoritatively enforce pause across the persistence path.

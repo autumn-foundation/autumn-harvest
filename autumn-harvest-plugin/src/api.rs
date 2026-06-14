@@ -916,10 +916,10 @@ struct WorkflowDetailsResponse {
     execution: WorkflowExecution,
     history: Vec<Value>,
     external_handoffs: Vec<ExternalHandoffResponse>,
-    /// Output of the most recent prior COMPLETED run of the same schedule, if any (issue #488).
+    /// Output of the most recent prior `COMPLETED` run of the same schedule, if any (issue #488).
     #[serde(skip_serializing_if = "Option::is_none")]
     last_completion_result: Option<Value>,
-    /// Error from the most recent terminal run if it ended FAILED or TIMED_OUT (issue #488).
+    /// Error from the most recent terminal run if it ended `FAILED` or `TIMED_OUT` (issue #488).
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
 }
@@ -11048,7 +11048,8 @@ async fn schedule_backfill(
                         runbook_url,
                         severity,
                         context_headers: None,
-                        schedule_id: None,
+                        // Backfilled runs share the schedule's carryover lineage (issue #488).
+                        schedule_id: Some(schedule_id),
                     },
                 )
                 .await;
@@ -11191,7 +11192,8 @@ async fn schedule_backfill(
                         runbook_url,
                         severity,
                         context_headers: None,
-                        schedule_id: None,
+                        // Backfilled runs share the schedule's carryover lineage (issue #488).
+                        schedule_id: Some(schedule_id),
                     },
                 )
                 .await;

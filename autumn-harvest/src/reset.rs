@@ -834,7 +834,10 @@ async fn insert_fork_execution(
         runbook_url: source.runbook_url.as_deref(),
         severity: source.severity.as_deref(),
         context_headers: source.context_headers.clone(),
-        schedule_id: source.schedule_id, // preserve schedule lineage through a reset fork
+        // Reset forks are operator interventions, not scheduled fires: leaving
+        // schedule_id NULL keeps their (re-)completion out of scheduled carryover so a
+        // reset of an old slot can't roll a later run's incremental cursor backward (#488).
+        schedule_id: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)

@@ -206,7 +206,18 @@ impl PayloadCodecs {
         // compresses any secret or PII the closure captured. `value` is unique
         // to SideEffectRecorded among event variants, so no other event is
         // affected.
-        let keys = ["input", "output", "payload", "details", "value"];
+        // `last_completion_result` is a copy of a prior run's output frozen into the
+        // WorkflowStarted event for scheduled carryover (issue #488). It must be encoded
+        // too so a configured codec encrypts/compresses any secret or PII the prior
+        // output carried; it is unique to WorkflowStarted among event variants.
+        let keys = [
+            "input",
+            "output",
+            "payload",
+            "details",
+            "value",
+            "last_completion_result",
+        ];
         for key in keys {
             if let Some(payload) = data.get_mut(key) {
                 if encode {

@@ -8,6 +8,17 @@
 ALTER TABLE harvest_workflow_executions
     ADD COLUMN IF NOT EXISTS schedule_id UUID NULL;
 
+-- Backfill schedule_id for already-fired scheduled runs so the first post-upgrade
+-- fire sees prior COMPLETED output instead of resetting to None. Scheduled runs use
+-- workflow_id 'sched:{schedule_uuid}:{workflow_name}:{slot}' (see scheduled_workflow_id),
+-- so the schedule UUID is the 2nd colon-delimited segment. The regex guard skips any
+-- malformed id so the ::uuid cast can never error.
+UPDATE harvest_workflow_executions
+SET schedule_id = split_part(workflow_id, ':', 2)::uuid
+WHERE schedule_id IS NULL
+  AND workflow_id LIKE 'sched:%'
+  AND split_part(workflow_id, ':', 2) ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
+
 -- Partial index for the carryover lookup:
 --   SELECT output FROM harvest_workflow_executions
 --   WHERE schedule_id = $1 AND state = 'COMPLETED' AND completed_at IS NOT NULL

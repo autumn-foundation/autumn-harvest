@@ -269,7 +269,12 @@ fn is_payload_field(key: &str) -> bool {
     // were stored under `MarkerRecorded.details` and redacted via "details"; the
     // new field must be redacted too so secrets/PII captured by the closure are
     // not leaked in a redacted export.
-    matches!(key, "input" | "output" | "payload" | "details" | "value")
+    // `last_completion_result` is the prior run's output frozen into WorkflowStarted
+    // for scheduled carryover (issue #488); redact it like any other payload copy.
+    matches!(
+        key,
+        "input" | "output" | "payload" | "details" | "value" | "last_completion_result"
+    )
 }
 
 fn is_token_field(key: &str) -> bool {

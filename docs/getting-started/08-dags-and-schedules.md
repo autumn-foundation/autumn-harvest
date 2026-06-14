@@ -424,10 +424,22 @@ See `autumn-harvest/examples/incremental_etl_schedule.rs` for the full pattern.
   still refers to the last non-skipped COMPLETED run. Skips do not reset or
   advance the cursor.
 - **Recovery branch**: `last_completion_result` is the last *COMPLETED* output
-  (may be several runs old); `last_error` is `None` once a COMPLETED run lands.
-  Check `last_error()` to know whether the job is still recovering.
-- **Reset**: `ctx.continue_as_new` and workflow reset preserve `schedule_id` so
-  the next fire can still see the lineage.
+  (may be several runs old); `last_error` reflects the single most recent
+  *terminal* run and is `None` once that run COMPLETED — or was CANCELLED /
+  TERMINATED (a later cancellation masks an older failure rather than
+  resurrecting it). Check `last_error()` to know whether the job is still
+  recovering.
+- **continue-as-new**: a continuation inherits the predecessor's frozen
+  carryover (the continuation is the same logical scheduled run), so cursors and
+  recovery state survive the fork.
+- **Backfills**: backfilled runs participate in the schedule's carryover lineage
+  (they share the schedule's `schedule_id`).
+- **Reset**: reset forks are operator interventions and are *excluded* from
+  carryover (their `schedule_id` is left `None`) so resetting an old slot cannot
+  roll a later run's incremental cursor backward.
+- **PII / payload codecs**: the carried-over output copy frozen in
+  `WorkflowStarted` is routed through the same payload codec and redacted-history
+  allowlist as any other payload, so a configured codec encrypts/redacts it.
 
 ## Workflow schedule vs DAG — which one?
 
