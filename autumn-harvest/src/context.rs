@@ -971,6 +971,9 @@ impl WorkflowContext {
         start_time: chrono::DateTime<chrono::Utc>,
         cancellation_reason: Option<String>,
         state: SharedState,
+        workflow_id: String,
+        workflow_name: String,
+        context_headers: std::sync::Arc<HashMap<String, String>>,
     ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             exec_id,
@@ -988,8 +991,8 @@ impl WorkflowContext {
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             cancellation_reason,
             strict_replay: false,
-            workflow_name: String::new(),
-            workflow_id: String::new(),
+            workflow_name,
+            workflow_id,
             build_id: None,
             nd_details: Mutex::new(None),
             payload_max_activity_input: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
@@ -999,7 +1002,7 @@ impl WorkflowContext {
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
-            context_headers: std::sync::Arc::new(HashMap::new()),
+            context_headers,
         })
     }
 
@@ -4115,20 +4118,15 @@ impl WorkflowContext {
         let context_headers = std::sync::Arc::clone(&self.context_headers);
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
-            let mut ctx = Self::new_for_handler(
+            let ctx = Self::new_for_handler(
                 exec_id,
                 start_time,
                 cancellation_reason.clone(),
                 std::sync::Arc::clone(&state),
+                workflow_id.clone(),
+                workflow_name.clone(),
+                std::sync::Arc::clone(&context_headers),
             );
-            // Propagate correlation fields for logger. Arc was just created;
-            // no other reference exists yet so get_mut always succeeds.
-            {
-                let inner = std::sync::Arc::get_mut(&mut ctx).unwrap();
-                inner.workflow_id.clone_from(&workflow_id);
-                inner.workflow_name.clone_from(&workflow_name);
-                inner.context_headers = std::sync::Arc::clone(&context_headers);
-            }
             handler_fn(ctx, input)
         });
 
@@ -4179,18 +4177,15 @@ impl WorkflowContext {
             .get(name)
             .copied();
         handler.map(|h| {
-            let mut ctx = Self::new_for_handler(
+            let ctx = Self::new_for_handler(
                 self.exec_id,
                 self.start_time,
                 self.cancellation_reason.clone(),
                 std::sync::Arc::clone(&self.state),
+                self.workflow_id.clone(),
+                self.workflow_name.clone(),
+                std::sync::Arc::clone(&self.context_headers),
             );
-            {
-                let inner = std::sync::Arc::get_mut(&mut ctx).unwrap();
-                inner.workflow_id.clone_from(&self.workflow_id);
-                inner.workflow_name.clone_from(&self.workflow_name);
-                inner.context_headers = std::sync::Arc::clone(&self.context_headers);
-            }
             h(ctx, input)
         })
     }

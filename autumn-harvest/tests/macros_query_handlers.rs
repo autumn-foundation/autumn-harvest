@@ -256,7 +256,7 @@ async fn update_handler_dispatches_without_validator() {
         ExecutionId::new(),
         chrono::Utc::now(),
         None,
-        empty_shared_state(),
+        empty_shared_state(), String::new(), String::new(), std::sync::Arc::new(std::collections::HashMap::new()),
     );
     let result = (info.handler)(ctx, serde_json::json!({"approved": true}))
         .await
@@ -278,7 +278,7 @@ async fn update_handler_with_validator_accept() {
         ExecutionId::new(),
         chrono::Utc::now(),
         None,
-        empty_shared_state(),
+        empty_shared_state(), String::new(), String::new(), std::sync::Arc::new(std::collections::HashMap::new()),
     );
     let result = (info.handler)(ctx, serde_json::json!({"approved": true}))
         .await
@@ -380,7 +380,7 @@ fn query_ctx_can_access_shared_state() {
     let state = std::sync::Arc::new(map);
 
     let info = __autumn_query_handler_info_read_counter();
-    let ctx = WorkflowContext::new_for_handler(ExecutionId::new(), chrono::Utc::now(), None, state);
+    let ctx = WorkflowContext::new_for_handler(ExecutionId::new(), chrono::Utc::now(), None, state, String::new(), String::new(), std::sync::Arc::new(std::collections::HashMap::new()));
     let result = (info.handler)(ctx.as_ref(), serde_json::Value::Null).unwrap();
     assert_eq!(result, serde_json::json!(77));
 }
