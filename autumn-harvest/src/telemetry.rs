@@ -805,12 +805,30 @@ pub trait MetricsRecorder: Send + Sync {
     /// A scheduled run was skipped without dispatching.
     ///
     /// `kind` is `"dag"` or `"workflow"`. `name` is the DAG or workflow name.
-    /// `reason` is one of `"paused"`, `"max_active_runs_reached"`, or
-    /// `"catchup_disabled"`.
+    /// `reason` is one of `"paused"`, `"max_active_runs_reached"`,
+    /// `"catchup_disabled"`, or `"catchup_window_exceeded"`.
     ///
     /// Maps to the metric `harvest_schedule_skipped_total{kind, name, reason}`.
     fn record_schedule_skipped(&self, kind: &str, name: &str, reason: &str) {
         let _ = (kind, name, reason);
+    }
+
+    /// Record `count` skips of the same `(kind, name, reason)` at once.
+    ///
+    /// Used when a single bounded-catchup recovery drops many missed slots: the
+    /// counter contract is "one increment per dropped slot", but looping that
+    /// many synchronous calls inside the scheduler tick would stall the thread on
+    /// a large recovery. Recorders that back a real counter should override this
+    /// with a single batched increment (the metrics-rs adapter does). The default
+    /// delegates to [`Self::record_schedule_skipped`], bounded so a custom
+    /// recorder cannot be forced into an unbounded loop by a huge backlog.
+    ///
+    /// Maps to the metric `harvest_schedule_skipped_total{kind, name, reason}`
+    /// incremented by `count`.
+    fn record_schedule_skipped_n(&self, kind: &str, name: &str, reason: &str, count: u64) {
+        for _ in 0..count.min(10_000) {
+            self.record_schedule_skipped(kind, name, reason);
+        }
     }
 
     /// A scheduler decision write failed due to a database error.

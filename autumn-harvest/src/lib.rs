@@ -249,8 +249,8 @@ pub use info::{
 pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
 pub use policy::validate_schedule;
 pub use policy::{
-    MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus, TriggerRule,
-    WorkflowSchedule,
+    CatchupPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus,
+    TriggerRule, WorkflowSchedule,
 };
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;

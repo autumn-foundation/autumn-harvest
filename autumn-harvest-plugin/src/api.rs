@@ -1522,6 +1522,19 @@ struct ScheduleEntry {
     /// Machine-readable exhaustion reason (issue #478). One of `"end_at_reached"` or
     /// `"max_runs_exhausted"`. `null` when not exhausted.
     exhausted_reason: Option<String>,
+    /// Effective catchup policy for this schedule (issue #484).
+    /// One of `"skip_all"`, `"most_recent"`, `"window"`, `"unbounded"`.
+    /// Derived from `catchup_policy` column when set, falling back to the `catchup` bool.
+    catchup_policy_effective: String,
+    /// Window duration in seconds for the `"window"` catchup policy (issue #484).
+    /// `null` for all other policies.
+    catchup_window_secs: Option<i64>,
+    /// Number of missed slots dropped on the most recent recovery tick (issue #484).
+    /// 0 when no recovery has occurred or the policy is `skip_all`/`unbounded`.
+    catchup_dropped_last_recovery: i32,
+    /// Timestamp of the most recent recovery tick that produced drops (issue #484).
+    /// `null` when `catchup_dropped_last_recovery` is 0.
+    last_catchup_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -1583,6 +1596,20 @@ struct CreateWorkflowScheduleRequest {
     /// Once `runs_started` reaches `max_runs` the schedule is exhausted. `null` = no limit.
     #[serde(default)]
     max_runs: Option<u32>,
+    /// Bounded catchup policy mode (issue #484): one of `"skip_all"`,
+    /// `"most_recent"`, `"window"`, `"unbounded"`. When omitted the legacy
+    /// `catchup` bool governs catchup behaviour and the policy columns are left
+    /// NULL. `"window"` additionally reads `catchup_window_secs`.
+    ///
+    /// Like every other field on this upsert endpoint, omitting it on an update
+    /// resets the stored policy to "unset" (legacy-bool semantics); send the
+    /// desired mode explicitly to retain a bounded policy.
+    #[serde(default)]
+    catchup_policy: Option<String>,
+    /// Window length in seconds for `catchup_policy = "window"` (issue #484).
+    /// Ignored for every other mode. `null`/omitted defaults to `0`.
+    #[serde(default)]
+    catchup_window_secs: Option<i64>,
 }
 
 fn default_queue_name() -> String {
@@ -2663,6 +2690,8 @@ pub const fn management_api_request_fields()
                 "queue_name",
                 "calendar",
                 "skip_policy",
+                "catchup_policy",
+                "catchup_window_secs",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["reason"])),
@@ -3135,6 +3164,10 @@ pub const fn management_api_response_fields()
                 "max_active_runs",
                 "catchup",
                 "last_backfill",
+                "catchup_policy_effective",
+                "catchup_window_secs",
+                "catchup_dropped_last_recovery",
+                "last_catchup_at",
             ]),
         ),
         (
@@ -3154,6 +3187,10 @@ pub const fn management_api_response_fields()
                 "max_active_runs",
                 "catchup",
                 "last_backfill",
+                "catchup_policy_effective",
+                "catchup_window_secs",
+                "catchup_dropped_last_recovery",
+                "last_catchup_at",
             ]),
         ),
         ("POST", "/admin/schedules/{id}/pause", Some(&["ok"])),
@@ -8710,6 +8747,11 @@ async fn list_schedules(
             let buffered_count =
                 autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
             let remaining_runs = s.max_runs.map(|max| (max - s.runs_started).max(0));
+            let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
+                s.catchup_policy.as_deref(),
+                s.catchup_window_secs,
+                s.catchup,
+            );
             ScheduleEntry {
                 id: s.id,
                 kind,
@@ -8741,6 +8783,10 @@ async fn list_schedules(
                 remaining_runs,
                 exhausted_at: s.exhausted_at,
                 exhausted_reason: s.exhausted_reason,
+                catchup_policy_effective: effective_policy.as_str().to_string(),
+                catchup_window_secs: s.catchup_window_secs,
+                catchup_dropped_last_recovery: s.last_catchup_dropped,
+                last_catchup_at: s.last_catchup_at,
             }
         })
         .collect();
@@ -8790,6 +8836,11 @@ async fn get_schedule(
 
     let buffered_count = autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
     let remaining_runs = s.max_runs.map(|max| (max - s.runs_started).max(0));
+    let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
+        s.catchup_policy.as_deref(),
+        s.catchup_window_secs,
+        s.catchup,
+    );
     Ok(Json(ScheduleEntry {
         effective_fire_time: effective_fire_time(s.id, s.next_run_at, s.jitter_secs),
         jitter_secs: s.jitter_secs,
@@ -8821,6 +8872,10 @@ async fn get_schedule(
         remaining_runs,
         exhausted_at: s.exhausted_at,
         exhausted_reason: s.exhausted_reason,
+        catchup_policy_effective: effective_policy.as_str().to_string(),
+        catchup_window_secs: s.catchup_window_secs,
+        catchup_dropped_last_recovery: s.last_catchup_dropped,
+        last_catchup_at: s.last_catchup_at,
     }))
 }
 
@@ -9098,6 +9153,11 @@ async fn upsert_workflow_schedule_and_read_back(
     let buffered_count =
         autumn_harvest::scheduler::parse_buffered_runs_pub(&row.buffered_runs).len();
     let remaining_runs = row.max_runs.map(|max| (max - row.runs_started).max(0));
+    let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
+        row.catchup_policy.as_deref(),
+        row.catchup_window_secs,
+        row.catchup,
+    );
     Ok(ScheduleEntry {
         effective_fire_time: effective_fire_time(row.id, row.next_run_at, row.jitter_secs),
         jitter_secs: row.jitter_secs,
@@ -9129,6 +9189,10 @@ async fn upsert_workflow_schedule_and_read_back(
         remaining_runs,
         exhausted_at: row.exhausted_at,
         exhausted_reason: row.exhausted_reason,
+        catchup_policy_effective: effective_policy.as_str().to_string(),
+        catchup_window_secs: row.catchup_window_secs,
+        catchup_dropped_last_recovery: row.last_catchup_dropped,
+        last_catchup_at: row.last_catchup_at,
     })
 }
 
@@ -9223,6 +9287,35 @@ async fn create_workflow_schedule(
         }
     };
 
+    // Reject unknown catchup_policy modes with 400 before storing (issue #484).
+    // `from_db` is lenient for backward compat; user input is validated strictly.
+    // `None` (omitted) preserves the legacy `catchup` bool and leaves the policy
+    // columns NULL.
+    let catchup_policy = match request.catchup_policy.as_deref() {
+        Some(mode) => {
+            match autumn_harvest::CatchupPolicy::from_user_input(mode, request.catchup_window_secs)
+            {
+                Ok(p) => Some(p),
+                Err(v) => {
+                    let err_summary = format!(
+                        "invalid catchup_policy '{v}'; valid values: skip_all, most_recent, window, unbounded"
+                    );
+                    schedule_create_audit_failed(
+                        &api_state,
+                        &actor,
+                        &source,
+                        request_id.as_deref(),
+                        &request.workflow_name,
+                        &err_summary,
+                    )
+                    .await;
+                    return Err(AutumnError::bad_request_msg(err_summary));
+                }
+            }
+        }
+        None => None,
+    };
+
     // Validate calendar name exists before storing. Return 400 for NotFound so
     // clients distinguish invalid input from transient DB failures (503).
     if let Some(cal_name) = &request.calendar {
@@ -9266,6 +9359,7 @@ async fn create_workflow_schedule(
         end_at: request.end_at,
         // Normalize 0 → None: callers passing max_runs=0 intend "no limit".
         max_runs: request.max_runs.filter(|&n| n > 0),
+        catchup_policy,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
@@ -18542,6 +18636,10 @@ mod tests {
             remaining_runs: None,
             exhausted_at: None,
             exhausted_reason: None,
+            catchup_policy_effective: "skip_all".to_string(),
+            catchup_window_secs: None,
+            catchup_dropped_last_recovery: 0,
+            last_catchup_at: None,
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(

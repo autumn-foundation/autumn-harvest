@@ -208,6 +208,19 @@ diesel::table! {
         /// Machine-readable reason for exhaustion (issue #478).
         /// One of: `"end_at_reached"`, `"max_runs_exhausted"`. NULL when not exhausted.
         exhausted_reason -> Nullable<Text>,
+        /// Catchup policy discriminator for missed fire slots (issue #484).
+        /// One of: `"skip_all"`, `"most_recent"`, `"window"`, `"unbounded"`.
+        /// NULL means the legacy `catchup` bool drives behaviour (zero backfill).
+        catchup_policy -> Nullable<Text>,
+        /// Window duration in seconds for the `"window"` catchup policy (issue #484).
+        /// NULL for all other policies.
+        catchup_window_secs -> Nullable<Int8>,
+        /// Count of missed slots dropped on the most recent recovery tick (issue #484).
+        /// 0 when no recovery has occurred or the policy is SkipAll/Unbounded.
+        last_catchup_dropped -> Int4,
+        /// Timestamp of the most recent recovery tick that produced drops (issue #484).
+        /// NULL when `last_catchup_dropped` = 0.
+        last_catchup_at -> Nullable<Timestamptz>,
     }
 }
 

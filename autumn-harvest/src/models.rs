@@ -393,6 +393,15 @@ pub struct HarvestSchedule {
     pub exhausted_at: Option<DateTime<Utc>>,
     /// Machine-readable reason for exhaustion: `"end_at_reached"` or `"max_runs_exhausted"` (issue #478).
     pub exhausted_reason: Option<String>,
+    /// Catchup policy discriminator for missed fire slots (issue #484).
+    /// One of `"skip_all"`, `"most_recent"`, `"window"`, `"unbounded"`. NULL = legacy bool fallback.
+    pub catchup_policy: Option<String>,
+    /// Window duration in seconds for the `"window"` catchup policy (issue #484). NULL = unused.
+    pub catchup_window_secs: Option<i64>,
+    /// Number of missed slots dropped on the most recent recovery tick (issue #484).
+    pub last_catchup_dropped: i32,
+    /// Timestamp of the most recent recovery tick that produced drops (issue #484). NULL = none yet.
+    pub last_catchup_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
