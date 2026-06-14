@@ -10869,12 +10869,26 @@ async fn schedule_backfill(
             count_existing_in_window(&pool, &kind, schedule_id, &name, &original_slots).await;
         let remaining = total.saturating_sub(already_exists);
         let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
-        let would_dispatch = remaining.min(available_slots);
-        let would_skip_max = remaining - would_dispatch;
+        // Mirror the dispatch loop's gates so the preview matches the real path: the
+        // max_runs budget is checked first (#478), then max_active_runs concurrency.
+        let budget_remaining: Option<usize> = schedule.max_runs.and_then(|max| {
+            (max > 0)
+                .then(|| {
+                    usize::try_from((i64::from(max) - i64::from(schedule.runs_started)).max(0)).ok()
+                })
+                .flatten()
+        });
+        let budget_passed = budget_remaining.map_or(remaining, |b| remaining.min(b));
+        let would_dispatch = budget_passed.min(available_slots);
+        let would_skip_budget = remaining - budget_passed;
+        let would_skip_max = budget_passed - would_dispatch;
 
         let mut skipped_reasons = std::collections::HashMap::new();
         if already_exists > 0 {
             skipped_reasons.insert("already_exists".to_string(), already_exists);
+        }
+        if would_skip_budget > 0 {
+            skipped_reasons.insert("max_runs_exhausted".to_string(), would_skip_budget);
         }
         if would_skip_max > 0 {
             skipped_reasons.insert("max_active_runs".to_string(), would_skip_max);
@@ -10889,7 +10903,7 @@ async fn schedule_backfill(
                     .to_string()
             });
 
-        let would_skip = already_exists + would_skip_max;
+        let would_skip = already_exists + would_skip_budget + would_skip_max;
         write_backfill_log(
             &pool,
             schedule_id,

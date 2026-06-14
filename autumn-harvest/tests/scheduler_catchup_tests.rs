@@ -93,6 +93,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260611000001_harvest_stalled_workflow_index/up.sql"),
     "\n",
     // Catchup window (issue #484)
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
     "\n",
     include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
