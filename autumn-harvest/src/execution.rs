@@ -92,6 +92,16 @@ pub struct StartWorkflowParams<'a> {
     /// Ambient string key-value context propagated to all activities and child
     /// workflows without threading through function signatures (issue #481).
     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Soft SLA budget for this workflow run (issue #487).
+    ///
+    /// When set, `sla_deadline_at = started_at + sla` is persisted.  A scanner
+    /// detects breach (`now > sla_deadline_at` while RUNNING/SUSPENDED) and
+    /// emits `harvest.workflow.sla_breached` exactly once — without altering the
+    /// run's lifecycle.
+    ///
+    /// If `sla > effective_timeout` (the hard deadline), `sla` is clamped down
+    /// to `effective_timeout` at start time.  `None` = no SLA enforced.
+    pub sla: Option<chrono::Duration>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -312,6 +322,19 @@ pub async fn start_or_load_workflow_execution(
     // Compute deadline_at relative to target_start_time (issue #322).
     let deadline_at = effective_timeout.map(|d| target_start_time + d);
 
+    // Compute effective SLA — clamp down to the hard timeout when sla > deadline
+    // (issue #487): the hard timeout fires first so the soft signal can never fire.
+    // A non-positive SLA budget (<= 0) is treated as "no SLA": persisting an
+    // `sla_deadline_at` at or before `started_at` would flag the run as breached
+    // on the very next scan, which is never a meaningful budget.
+    let effective_sla = match (request.sla, effective_timeout) {
+        (Some(sla), _) if sla <= chrono::Duration::zero() => None,
+        (Some(sla), Some(hard)) => Some(sla.min(hard)),
+        (Some(sla), None) => Some(sla),
+        (None, _) => None,
+    };
+    let sla_deadline_at = effective_sla.map(|d| target_start_time + d);
+
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: request.workflow_name,
@@ -323,6 +346,8 @@ pub async fn start_or_load_workflow_execution(
         queue_name: request.queue_name,
         execution_timeout: effective_timeout,
         deadline_at,
+        sla: effective_sla,
+        sla_deadline_at,
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
         assigned_build_id: assigned_build.clone(),
@@ -1020,6 +1045,20 @@ pub async fn resume_workflow_execution(
                 // paused wall-clock does not count against the workflow's
                 // `execution_timeout`. `None` (no deadline) stays `None`.
                 let new_deadline_at = execution.deadline_at.map(|d| d + pause_span);
+                // Also push the soft SLA deadline forward (issue #487): a workflow
+                // paused mid-flight should not breach its SLA while paused — BUT
+                // only suspend a deadline that was still ahead when the pause
+                // began. A deadline already passed before the pause stays in the
+                // past so the breach (which occurred while RUNNING) is still
+                // observed by the scanner on the next tick after resume, rather
+                // than being silently pushed into the future.
+                let new_sla_deadline_at =
+                    execution
+                        .sla_deadline_at
+                        .map(|d| match execution.paused_at {
+                            Some(p) if d > p => d + pause_span,
+                            _ => d,
+                        });
 
                 let history = store::load_history(conn, exec_id).await?;
                 store::append_events(
@@ -1043,6 +1082,7 @@ pub async fn resume_workflow_execution(
                             harvest_workflow_executions::pause_reason.eq(None::<String>),
                             harvest_workflow_executions::pause_actor.eq(None::<String>),
                             harvest_workflow_executions::deadline_at.eq(new_deadline_at),
+                            harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
                         ))
                         .execute(conn)
                         .await
@@ -1554,6 +1594,8 @@ pub struct SignalWithStartParams<'a> {
     pub runbook_url: Option<&'a str>,
     pub severity: Option<&'a str>,
     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Soft SLA budget forwarded to [`StartWorkflowParams::sla`] (issue #487).
+    pub sla: Option<chrono::Duration>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -1725,6 +1767,7 @@ pub async fn signal_with_start_workflow_execution(
                     runbook_url: request.runbook_url,
                     severity: request.severity,
                     context_headers: request.context_headers.clone(),
+                    sla: request.sla,
                 };
 
             let started = start_or_load_workflow_execution(
@@ -2017,6 +2060,8 @@ pub struct UpdateWithStartParams<'a> {
     pub runbook_url: Option<&'a str>,
     pub severity: Option<&'a str>,
     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Soft SLA budget forwarded to [`StartWorkflowParams::sla`] (issue #487).
+    pub sla: Option<chrono::Duration>,
 }
 
 /// Result of an [`update_with_start_workflow_execution`] call.
@@ -2137,6 +2182,7 @@ pub async fn update_with_start_workflow_execution(
                     runbook_url: request.runbook_url,
                     severity: request.severity,
                     context_headers: request.context_headers.clone(),
+                    sla: request.sla,
                 };
 
             let started = start_or_load_workflow_execution(

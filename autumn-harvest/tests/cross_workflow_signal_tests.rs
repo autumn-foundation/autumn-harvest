@@ -62,6 +62,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
     "\n",
     include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
@@ -235,6 +237,7 @@ async fn test_same_shard_not_found_retry() {
                 module: "cross_workflow_signal_tests",
                 handler: caller_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -251,6 +254,7 @@ async fn test_same_shard_not_found_retry() {
                 module: "cross_workflow_signal_tests",
                 handler: target_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -307,6 +311,8 @@ async fn test_same_shard_not_found_retry() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -345,6 +351,8 @@ async fn test_same_shard_not_found_retry() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -396,6 +404,7 @@ async fn test_cross_shard_outbox_delivery() {
                 module: "cross_workflow_signal_tests",
                 handler: caller_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -412,6 +421,7 @@ async fn test_cross_shard_outbox_delivery() {
                 module: "cross_workflow_signal_tests",
                 handler: target_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -469,6 +479,8 @@ async fn test_cross_shard_outbox_delivery() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -500,6 +512,8 @@ async fn test_cross_shard_outbox_delivery() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -546,6 +560,7 @@ async fn test_grace_window_expiration() {
             module: "cross_workflow_signal_tests",
             handler: caller_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -602,6 +617,8 @@ async fn test_grace_window_expiration() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -665,6 +682,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 module: "cross_workflow_signal_tests",
                 handler: mixed_suspension_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -681,6 +699,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 module: "cross_workflow_signal_tests",
                 handler: target_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -737,6 +756,8 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -775,6 +796,8 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
