@@ -436,6 +436,12 @@ See `autumn-harvest/examples/incremental_etl_schedule.rs` for the full pattern.
   schedule slot (`scheduled_for`), not by completion time. Overlapping,
   catch-up, or backfilled fires that finish out of order therefore can't hand a
   later run an older slot's output and roll its cursor backward.
+- **Non-overlapping assumption**: carryover is designed for the default
+  `max_active_runs = 1` / `OverlapPolicy::Skip`. The source is the highest
+  *earlier* slot that has reached a terminal state, so if you set
+  `max_active_runs > 1` a later slot can start while an earlier slot is still
+  running and observe a stale cursor (re-processing that slot's range). Keep
+  cursor-style incremental jobs at `max_active_runs = 1`.
 - **Backfills**: backfilled runs participate in the schedule's carryover lineage
   (they share the schedule's `schedule_id` and carry their own `scheduled_for`
   slot, so they slot into the lineage at the correct position).

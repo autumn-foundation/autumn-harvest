@@ -1184,11 +1184,18 @@ impl WorkflowContext {
     /// The value is frozen into the `WorkflowStarted` event at start time, so replay
     /// always returns the same result regardless of which worker processes the task.
     ///
-    /// # Limitation
-    /// A prior COMPLETED run whose output serializes to JSON `null` (e.g. a workflow
-    /// returning `()` or `Option::None`) is reported here as `None` (indistinguishable
-    /// from "no prior run"). Incremental/cursor jobs — the intended use case — return a
-    /// structured cursor, never `null`, so this does not affect them.
+    /// # Limitations
+    /// - A prior COMPLETED run whose output serializes to JSON `null` (e.g. a workflow
+    ///   returning `()` or `Option::None`) is reported here as `None` (indistinguishable
+    ///   from "no prior run"). Incremental/cursor jobs — the intended use case — return a
+    ///   structured cursor, never `null`, so this does not affect them.
+    /// - Carryover assumes **non-overlapping** execution (the default
+    ///   `max_active_runs = 1` / `OverlapPolicy::Skip`). The carryover source is the
+    ///   highest *earlier* slot that has reached a terminal state; if a schedule is
+    ///   configured with `max_active_runs > 1` so a later slot can start while an earlier
+    ///   slot is still RUNNING, the later run observes the most recent *terminal* earlier
+    ///   slot and may re-process the in-flight slot's range. Use `max_active_runs = 1` for
+    ///   cursor-style incremental jobs.
     ///
     /// # Errors
     /// Returns `HarvestError::Deserialize` if the stored JSON cannot be deserialized into `T`.
