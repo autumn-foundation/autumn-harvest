@@ -1080,9 +1080,9 @@ pub fn merge_dlq_aggregates(
         filtered_total += partial.filtered_total;
         for group in partial.groups {
             let entry = merged
-                .entry(group.key.clone())
-                .or_insert_with(|| DlqRawGroup {
-                    key: group.key.clone(),
+                .entry(group.key)
+                .or_insert_with_key(|key| DlqRawGroup {
+                    key: key.clone(),
                     count: 0,
                     first_seen: None,
                     last_seen: None,
@@ -1256,8 +1256,8 @@ pub async fn aggregate_dead_letters(
             })
             .collect();
 
-        let entry = groups.entry(key.clone()).or_insert_with(|| DlqRawGroup {
-            key,
+        let entry = groups.entry(key).or_insert_with_key(|key| DlqRawGroup {
+            key: key.clone(),
             count: 0,
             first_seen: None,
             last_seen: None,
