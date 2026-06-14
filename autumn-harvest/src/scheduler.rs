@@ -3811,40 +3811,29 @@ async fn drain_buffered_schedule_runs(
 // Only executions whose `workflow_id` starts with `"sched:"` are considered
 // schedule-triggered.  All other executions are ignored.
 
-/// Increment the consecutive failure counter for the schedule associated with
-/// `workflow_name` when a schedule-triggered execution reaches `FAILED` or
-/// `TIMED_OUT`.  If the counter now equals or exceeds the configured limit,
-/// auto-pause the schedule and emit the `harvest.schedule.auto_paused` metric.
-#[cfg(feature = "db")]
-pub(crate) async fn maybe_increment_schedule_failure_counter(
-    conn: &mut diesel_async::AsyncPgConnection,
-    workflow_id: &str,
-    workflow_name: &str,
-    metrics: &dyn crate::telemetry::MetricsRecorder,
-) {
-    use crate::schema::harvest_schedules::dsl;
-
-    if !workflow_id.starts_with("sched:") {
-        return;
-    }
-
-    // Extract the schedule UUID embedded in the workflow_id by `scheduled_workflow_id`.
-    // Format: "sched:{schedule_uuid}:{workflow_name}:{timestamp}[.{micros}]"
-    // If the UUID cannot be parsed (e.g. executions created before this format was
-    // introduced) we fall back to a workflow_name-scoped update.
-    let schedule_uuid: Option<uuid::Uuid> = workflow_id
+/// Extract the schedule UUID embedded in the `workflow_id` by `scheduled_workflow_id`.
+/// Format: `"sched:{schedule_uuid}:{workflow_name}:{timestamp}[.{micros}]"`
+fn extract_schedule_uuid(workflow_id: &str) -> Option<uuid::Uuid> {
+    workflow_id
         .strip_prefix("sched:")
         .and_then(|s| s.split(':').next())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+}
 
-    let now = Utc::now();
+#[cfg(feature = "db")]
+async fn resolve_schedule_ids_for_increment(
+    conn: &mut diesel_async::AsyncPgConnection,
+    schedule_uuid: Option<uuid::Uuid>,
+    workflow_name: &str,
+) -> Vec<uuid::Uuid> {
+    use crate::schema::harvest_schedules::dsl;
 
-    // Resolve the schedule IDs to update.  When the workflow_id encodes a schedule
-    // UUID (new format) we target that row directly.  For legacy workflow_ids we fall
-    // back to a workflow_name scan so old in-flight executions are still counted.
-    let ids_to_update: Vec<uuid::Uuid> = if let Some(sid) = schedule_uuid {
+    if let Some(sid) = schedule_uuid {
         vec![sid]
     } else {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+
         match dsl::harvest_schedules
             .filter(dsl::workflow_name.eq(workflow_name))
             .filter(dsl::consecutive_failure_limit.is_not_null())
@@ -3862,80 +3851,120 @@ pub(crate) async fn maybe_increment_schedule_failure_counter(
                     workflow_name,
                     "harvest: failed to load schedule ids for failure counter increment"
                 );
-                return;
+                vec![]
             }
         }
+    }
+}
+
+#[cfg(feature = "db")]
+async fn increment_and_pause_single_schedule(
+    conn: &mut diesel_async::AsyncPgConnection,
+    id: uuid::Uuid,
+    workflow_name: &str,
+    now: DateTime<Utc>,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+) {
+    use crate::schema::harvest_schedules::dsl;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    // Atomic SQL increment — avoids the read-modify-write race when two scheduled
+    // executions for the same schedule fail concurrently.
+    let incremented: Option<(i32, Option<i32>)> = diesel::update(
+        dsl::harvest_schedules
+            .find(id)
+            .filter(dsl::consecutive_failure_limit.is_not_null())
+            .filter(dsl::consecutive_failure_limit.gt(0))
+            .filter(dsl::auto_paused_at.is_null()),
+    )
+    .set((
+        dsl::consecutive_failure_count.eq(dsl::consecutive_failure_count + 1),
+        dsl::updated_at.eq(now),
+    ))
+    .returning((
+        dsl::consecutive_failure_count,
+        dsl::consecutive_failure_limit,
+    ))
+    .get_result(conn)
+    .await
+    .optional()
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            workflow_name,
+            schedule_id = %id,
+            "harvest: failed to increment schedule failure counter"
+        );
+        None
+    });
+
+    let Some((new_count, Some(limit))) = incremented else {
+        return;
     };
 
-    for id in ids_to_update {
-        // Atomic SQL increment — avoids the read-modify-write race when two scheduled
-        // executions for the same schedule fail concurrently.
-        let incremented: Option<(i32, Option<i32>)> = diesel::update(
+    if limit > 0 && new_count >= limit {
+        // Transition to auto-paused.  The filter guards against a double-set when
+        // two concurrent failures both cross the threshold at the same time.
+        let pause_result = diesel::update(
             dsl::harvest_schedules
                 .find(id)
-                .filter(dsl::consecutive_failure_limit.is_not_null())
-                .filter(dsl::consecutive_failure_limit.gt(0))
                 .filter(dsl::auto_paused_at.is_null()),
         )
-        .set((
-            dsl::consecutive_failure_count.eq(dsl::consecutive_failure_count + 1),
-            dsl::updated_at.eq(now),
-        ))
-        .returning((
-            dsl::consecutive_failure_count,
-            dsl::consecutive_failure_limit,
-        ))
-        .get_result(conn)
-        .await
-        .optional()
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                error = %e,
-                workflow_name,
-                schedule_id = %id,
-                "harvest: failed to increment schedule failure counter"
-            );
-            None
-        });
+        .set(dsl::auto_paused_at.eq(Some(now)))
+        .execute(conn)
+        .await;
 
-        let Some((new_count, Some(limit))) = incremented else {
-            continue;
-        };
-
-        if limit > 0 && new_count >= limit {
-            // Transition to auto-paused.  The filter guards against a double-set when
-            // two concurrent failures both cross the threshold at the same time.
-            let pause_result = diesel::update(
-                dsl::harvest_schedules
-                    .find(id)
-                    .filter(dsl::auto_paused_at.is_null()),
-            )
-            .set(dsl::auto_paused_at.eq(Some(now)))
-            .execute(conn)
-            .await;
-
-            match pause_result {
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        workflow_name,
-                        schedule_id = %id,
-                        "harvest: failed to set auto_paused_at on schedule"
-                    );
-                }
-                Ok(rows_set) if rows_set > 0 => {
-                    tracing::info!(
-                        workflow_name,
-                        schedule_id = %id,
-                        consecutive_failure_count = new_count,
-                        consecutive_failure_limit = limit,
-                        "harvest: schedule auto-paused after consecutive execution failures"
-                    );
-                    metrics.record_schedule_auto_paused(workflow_name);
-                }
-                Ok(_) => {}
+        match pause_result {
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    workflow_name,
+                    schedule_id = %id,
+                    "harvest: failed to set auto_paused_at on schedule"
+                );
             }
+            Ok(rows_set) if rows_set > 0 => {
+                tracing::info!(
+                    workflow_name,
+                    schedule_id = %id,
+                    consecutive_failure_count = new_count,
+                    consecutive_failure_limit = limit,
+                    "harvest: schedule auto-paused after consecutive execution failures"
+                );
+                metrics.record_schedule_auto_paused(workflow_name);
+            }
+            Ok(_) => {}
         }
+    }
+}
+
+/// Increment the consecutive failure counter for the schedule associated with
+/// `workflow_name` when a schedule-triggered execution reaches `FAILED` or
+/// `TIMED_OUT`.  If the counter now equals or exceeds the configured limit,
+/// auto-pause the schedule and emit the `harvest.schedule.auto_paused` metric.
+#[cfg(feature = "db")]
+pub(crate) async fn maybe_increment_schedule_failure_counter(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_id: &str,
+    workflow_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+) {
+    if !workflow_id.starts_with("sched:") {
+        return;
+    }
+
+    let schedule_uuid = extract_schedule_uuid(workflow_id);
+    let ids_to_update =
+        resolve_schedule_ids_for_increment(conn, schedule_uuid, workflow_name).await;
+
+    if ids_to_update.is_empty() {
+        return;
+    }
+
+    let now = Utc::now();
+    for id in ids_to_update {
+        increment_and_pause_single_schedule(conn, id, workflow_name, now, metrics).await;
     }
 }
 
@@ -3954,10 +3983,7 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
         return;
     }
 
-    let schedule_uuid: Option<uuid::Uuid> = workflow_id
-        .strip_prefix("sched:")
-        .and_then(|s| s.split(':').next())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let schedule_uuid = extract_schedule_uuid(workflow_id);
 
     let now = Utc::now();
     let result = if let Some(sid) = schedule_uuid {
