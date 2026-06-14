@@ -1895,6 +1895,22 @@ async fn tick_one_workflow_schedule(
 
     let catchup = catchup_policy.is_catchup_enabled();
 
+    // Re-read the auto-pause inputs (consecutive_failure_count, auto_paused_at)
+    // under the HA claim up front. A concurrent worker completion can reset the
+    // failure counter or set auto_paused_at after this tick loaded the schedule
+    // row, so the pre-plan short-circuit below and the auto-pause guard further
+    // down MUST consult the same *fresh* values — otherwise the short-circuit
+    // could empty the plan off a stale "at limit" snapshot while the guard (using
+    // the reset count) declines to auto-pause, silently stopping the schedule
+    // with next_run_at = NULL (issue #360 / Codex #1928).
+    let (db_failure_count, db_auto_paused_at): (i32, Option<DateTime<Utc>>) =
+        dsl::harvest_schedules
+            .find(schedule.id)
+            .select((dsl::consecutive_failure_count, dsl::auto_paused_at))
+            .first(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
     // Compute the bounded catchup plan up front from the *original* oldest
     // overdue slot, then rebind `logical_date` to the earliest slot the policy
     // actually intends to fire. This makes the calendar suppression, overlap
@@ -1923,9 +1939,10 @@ async fn tick_one_workflow_schedule(
                 || schedule
                     .max_runs
                     .is_some_and(|max_runs| max_runs > 0 && schedule.runs_started >= max_runs)
+                || db_auto_paused_at.is_some()
                 || schedule
                     .consecutive_failure_limit
-                    .is_some_and(|limit| limit > 0 && schedule.consecutive_failure_count >= limit));
+                    .is_some_and(|limit| limit > 0 && db_failure_count >= limit));
     let catchup_plan = if will_exhaust_before_firing {
         // Empty plan: `logical_date` rebinding below keeps the original slot
         // (the `[]` arm), so the calendar / jitter / exhaustion branches see the
@@ -2113,19 +2130,10 @@ async fn tick_one_workflow_schedule(
     };
 
     // ── Auto-pause check (issue #360) ─────────────────────────────────────────
-    // Re-read auto_paused_at and consecutive_failure_count from DB to guard
-    // against a concurrent worker completion that set auto_paused_at after this
-    // tick loaded the schedule row.  This is the only field that can be written
-    // by a racing path while the HA claim is held; the single SELECT is cheaper
-    // than reloading the full row.
-    let (db_failure_count, db_auto_paused_at): (i32, Option<DateTime<Utc>>) =
-        dsl::harvest_schedules
-            .find(schedule.id)
-            .select((dsl::consecutive_failure_count, dsl::auto_paused_at))
-            .first(conn)
-            .await
-            .map_err(crate::error::database_error)?;
-
+    // Uses `db_auto_paused_at` / `db_failure_count` read under the HA claim at the
+    // top of the tick (the same fresh values the pre-plan short-circuit consulted),
+    // so a concurrent worker completion that set auto_paused_at or reset the
+    // failure counter cannot make the two disagree (issue #360 / Codex #1928).
     if db_auto_paused_at.is_some() {
         // Already auto-paused by a concurrent worker; release the claim and stop.
         diesel::update(
@@ -2314,13 +2322,48 @@ async fn tick_one_workflow_schedule(
             claim_token,
         )
         .await;
+        // Mirror the dispatch finalize's end_at exhaustion: if the next planned
+        // slot is at/after end_at (or there is none), no future fire can ever be
+        // legal, so mark the schedule terminal here instead of leaving it active
+        // until a future due tick that can never fire — or indefinitely when
+        // next_run_after_plan is None (issue #478 / Codex #2323).
+        let exhausted = schedule
+            .end_at
+            .is_some_and(|end| next_run_after_plan.is_none_or(|next| next >= end));
+        if exhausted {
+            crate::schedule_decision::record_decision_graceful(
+                conn,
+                Some(&**metrics),
+                Some(schedule.id),
+                wf_name,
+                "workflow",
+                "skipped",
+                "end_at_reached",
+                Some(serde_json::json!({
+                    "end_at": schedule.end_at,
+                    "next_run_after_plan": next_run_after_plan,
+                    "empty_catchup_plan": true,
+                })),
+                now,
+                now,
+                i16::try_from(current_shard.as_i32()).unwrap_or(0),
+            )
+            .await;
+        }
+        let (final_next, exhausted_at, exhausted_reason) = if exhausted {
+            (None, Some(now), Some("end_at_reached"))
+        } else {
+            (next_run_after_plan, None, None)
+        };
         diesel::update(
             dsl::harvest_schedules
                 .find(schedule.id)
                 .filter(dsl::fire_claim_token.eq(Some(claim_token))),
         )
         .set((
-            dsl::next_run_at.eq(next_run_after_plan),
+            dsl::next_run_at.eq(final_next),
+            dsl::exhausted_at.eq(exhausted_at),
+            dsl::exhausted_reason.eq(exhausted_reason),
             dsl::fire_claim_token.eq(Option::<uuid::Uuid>::None),
             dsl::fire_claimed_until.eq(Option::<DateTime<Utc>>::None),
             dsl::updated_at.eq(now),
