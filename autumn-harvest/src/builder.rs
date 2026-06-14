@@ -1845,6 +1845,7 @@ mod tests {
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -2295,6 +2296,7 @@ mod tests {
                 module: "test",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
+                sla: None,
                 concurrency: Some(ConcurrencyPolicy {
                     key_expr: "input.tenant_id",
                     limit: 0,
@@ -2330,6 +2332,7 @@ mod tests {
                 module: "test",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
+                sla: None,
                 concurrency: Some(ConcurrencyPolicy {
                     key_expr: "input.tenant_id",
                     limit: 5,

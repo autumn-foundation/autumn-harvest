@@ -76,6 +76,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
     "\n",
     include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
@@ -628,6 +630,10 @@ async fn workflow_and_activity_metrics_are_recorded() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
     };
@@ -673,6 +679,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
             module: "metrics_integration",
             handler: metrics_test_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -841,6 +848,10 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
         })
@@ -882,6 +893,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             module: "metrics_integration",
             handler: continue_metric_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -963,6 +975,10 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
         })
@@ -1011,6 +1027,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             module: "metrics_integration",
             handler: history_cap_violator,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -1098,6 +1115,10 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
         })
@@ -1147,6 +1168,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
                 module: "metrics_integration",
                 handler: history_cap_violator,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -1232,6 +1254,10 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 runbook_url: None,
                 severity: None,
                 context_headers: None,
+
+                sla: None,
+
+                sla_deadline_at: None,
                 schedule_id: None,
                 scheduled_for: None,
             })
@@ -1284,6 +1310,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 module: "metrics_integration",
                 handler: suspended_command_reaches_history_cap,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -1300,6 +1327,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 module: "metrics_integration",
                 handler: history_cap_never_finishing_child,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -1438,6 +1466,10 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
         })
@@ -1486,6 +1518,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             module: "metrics_integration",
             handler: local_activity_retry_reaches_history_cap,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -1607,6 +1640,10 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
         })
@@ -1650,6 +1687,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
                 module: "metrics_integration",
                 handler: detached_cascade_reaches_history_cap,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -1666,6 +1704,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
                 module: "metrics_integration",
                 handler: history_cap_never_finishing_child,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -1779,6 +1818,10 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
         })
@@ -1822,6 +1865,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
                 module: "metrics_integration",
                 handler: parent_with_history_capped_child,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -1838,6 +1882,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
                 module: "metrics_integration",
                 handler: child_breaches_history_cap_inline,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -2082,6 +2127,10 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
     };
@@ -2136,6 +2185,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
             module: "metrics_integration",
             handler: non_deterministic_test_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 

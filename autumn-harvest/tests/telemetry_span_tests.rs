@@ -76,6 +76,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
     "\n",
     include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
@@ -222,6 +224,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 module: "telemetry_span_tests",
                 handler: telemetry_master_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -238,6 +241,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 module: "telemetry_span_tests",
                 handler: telem_child_wf,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -374,6 +378,8 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     runbook_url: None,
                     severity: None,
                     context_headers: None,
+
+                    sla: None,
                     schedule_id: None,
                     scheduled_for: None,
                 },

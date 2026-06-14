@@ -45,6 +45,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
     "\n",
     include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
@@ -126,6 +128,7 @@ fn delay_registry() -> Arc<HandlerRegistry> {
             module: "delayed_start_tests",
             handler: delay_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -198,6 +201,8 @@ async fn test_delayed_start_validation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -244,6 +249,8 @@ async fn test_delayed_start_validation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -344,6 +351,8 @@ async fn test_delayed_start_no_premature_dispatch() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -421,6 +430,8 @@ async fn test_delayed_start_cancel_before_firing() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -505,6 +516,8 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -557,6 +570,8 @@ async fn test_immediate_start_skew_tolerance() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },

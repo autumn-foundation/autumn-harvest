@@ -202,6 +202,10 @@ async fn insert_execution(
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
     };

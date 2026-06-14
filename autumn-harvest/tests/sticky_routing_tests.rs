@@ -402,6 +402,8 @@ mod db_tests {
         "\n",
         include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
         "\n",
+        include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+        "\n",
         include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
         "\n",
         include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
@@ -472,6 +474,10 @@ mod db_tests {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
         };

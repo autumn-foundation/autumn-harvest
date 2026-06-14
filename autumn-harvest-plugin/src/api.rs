@@ -1276,6 +1276,9 @@ struct StartWorkflowRequest {
     memo: Option<Value>,
     search_attrs: Option<Value>,
     execution_timeout_secs: Option<i64>,
+    /// Soft SLA in seconds. Emits `harvest.workflow.sla_breached` once when exceeded;
+    /// never terminates the run. Falls back to `WorkflowInfo::sla` when omitted.
+    sla_secs: Option<i64>,
     /// How to handle a duplicate `(workflow_name, workflow_id)` collision.
     /// Omitted or `null` → `AllowDuplicate` (preserves existing wire behaviour).
     /// An unknown string value returns `400 Bad Request` with the offending value
@@ -1683,6 +1686,8 @@ pub(crate) struct WorkflowFilters {
     /// When true, include executions whose sole pending work is a future-dated
     /// durable timer (correctly sleeping). Default false = exclude sleepers.
     pub(crate) include_sleeping: bool,
+    /// When true, return only executions whose soft SLA has been breached (#487).
+    pub(crate) sla_breached: bool,
 }
 
 impl WorkflowFilters {
@@ -2534,6 +2539,7 @@ pub const fn management_api_request_fields()
                 "memo",
                 "search_attrs",
                 "execution_timeout_secs",
+                "sla_secs",
                 "reuse_policy",
                 "start_at",
                 "delay",
@@ -3927,6 +3933,9 @@ pub(crate) fn parse_workflow_filters(
             "include_sleeping" => {
                 filters.include_sleeping = value.trim().eq_ignore_ascii_case("true");
             }
+            "sla_breached" => {
+                filters.sla_breached = value.trim().eq_ignore_ascii_case("true");
+            }
             _ => {
                 // Ignore unknown query parameters so future additions stay non-breaking.
             }
@@ -5152,6 +5161,23 @@ fn parse_delay_duration(raw: &str) -> Result<std::time::Duration, AutumnError> {
     parse_duration_amount(value, "delay", std::time::Duration::from_secs)
 }
 
+/// Resolve a workflow's declared default SLA, clamped against its declared
+/// `execution_timeout` (issue #487). An SLA softer than the hard timeout could
+/// never fire (the timeout kills the run first), so cap it. Returns the
+/// effective chrono SLA, or `None` when the workflow declares no SLA.
+pub(crate) fn clamp_info_default_sla(
+    info_sla: Option<std::time::Duration>,
+    info_execution_timeout: Option<std::time::Duration>,
+) -> Option<chrono::Duration> {
+    info_sla
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .map(|sla| {
+            info_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map_or(sla, |hard| sla.min(hard))
+        })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
@@ -5545,12 +5571,36 @@ async fn start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (owner, runbook_url, severity) = runtime
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
         .registry
         .workflows
         .get(&workflow_name)
-        .map_or((None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity)
+        .map_or((None, None, None, None, None), |info| {
+            (
+                info.owner,
+                info.runbook_url,
+                info.severity,
+                info.sla,
+                info.execution_timeout,
+            )
+        });
+
+    // Resolve effective SLA: request override → WorkflowInfo default → None.
+    // `try_seconds` avoids a panic on an out-of-range untrusted `i64`, and the
+    // non-negative filter rejects negative inputs (which would breach immediately).
+    // The resolved SLA is clamped against the workflow's declared
+    // `execution_timeout` default so an API-started run can't get a softer SLA
+    // deadline than its declared hard timeout (the core also clamps against any
+    // request-supplied execution_timeout).
+    let effective_sla = request
+        .sla_secs
+        .filter(|&secs| secs >= 0)
+        .and_then(chrono::Duration::try_seconds)
+        .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()))
+        .map(|sla| {
+            info_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map_or(sla, |hard| sla.min(hard))
         });
 
     let result = start_or_load_workflow_execution(
@@ -5583,6 +5633,7 @@ async fn start_workflow(
             runbook_url,
             severity,
             context_headers: None,
+            sla: effective_sla,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -6091,13 +6142,20 @@ async fn batch_start_workflows(
             )
             .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-            let (owner, runbook_url, severity) = runtime
+            let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
                 .registry
                 .workflows
                 .get(&item.workflow_name)
-                .map_or((None, None, None), |info| {
-                    (info.owner, info.runbook_url, info.severity)
+                .map_or((None, None, None, None, None), |info| {
+                    (
+                        info.owner,
+                        info.runbook_url,
+                        info.severity,
+                        info.sla,
+                        info.execution_timeout,
+                    )
                 });
+            let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
             let start_result = start_or_load_workflow_execution(
                 &mut conn,
@@ -6125,6 +6183,7 @@ async fn batch_start_workflows(
                     runbook_url,
                     severity,
                     context_headers: None,
+                    sla,
                     schedule_id: None,
                     scheduled_for: None,
                 },
@@ -6647,13 +6706,20 @@ async fn signal_with_start_workflow(
             (key, Some(policy.limit))
         });
 
-    let (owner, runbook_url, severity) = runtime
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
         .registry
         .workflows
         .get(&workflow_name)
-        .map_or((None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity)
+        .map_or((None, None, None, None, None), |info| {
+            (
+                info.owner,
+                info.runbook_url,
+                info.severity,
+                info.sla,
+                info.execution_timeout,
+            )
         });
+    let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
     let result = signal_with_start_workflow_execution(
         &mut conn,
@@ -6685,6 +6751,7 @@ async fn signal_with_start_workflow(
             runbook_url,
             severity,
             context_headers: None,
+            sla,
         },
     )
     .await;
@@ -7098,13 +7165,20 @@ async fn update_with_start_workflow(
             (key, Some(policy.limit))
         });
 
-    let (owner, runbook_url, severity) = runtime
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
         .registry
         .workflows
         .get(&workflow_name)
-        .map_or((None, None, None), |info| {
-            (info.owner, info.runbook_url, info.severity)
+        .map_or((None, None, None, None, None), |info| {
+            (
+                info.owner,
+                info.runbook_url,
+                info.severity,
+                info.sla,
+                info.execution_timeout,
+            )
         });
+    let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
     let params = UpdateWithStartParams {
         workflow_name: &workflow_name,
@@ -7134,6 +7208,7 @@ async fn update_with_start_workflow(
         runbook_url,
         severity,
         context_headers: None,
+        sla,
     };
 
     let result = update_with_start_workflow_execution(&mut conn, params).await;
@@ -10404,6 +10479,12 @@ async fn trigger_schedule_now(
             (None, None) => (None, None, None),
         }
     };
+    // Only registered workflows carry an SLA default; DAGs have no SLA concept.
+    let sla = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| clamp_info_default_sla(info.sla, info.execution_timeout));
 
     let result = start_or_load_workflow_execution(
         &mut conn,
@@ -10431,6 +10512,7 @@ async fn trigger_schedule_now(
             runbook_url,
             severity,
             context_headers: None,
+            sla,
             // Manual trigger-now is treated as a manual fire and deliberately does NOT
             // participate in scheduled carryover (issue #488). Tagging it with the
             // schedule would make resolve_carryover run on this default-pool connection
@@ -11031,13 +11113,20 @@ async fn schedule_backfill(
                     }
                 }
 
-                let (owner, runbook_url, severity) = runtime
+                let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
                     .registry
                     .workflows
                     .get(&wf_name)
-                    .map_or((None, None, None), |info| {
-                        (info.owner, info.runbook_url, info.severity)
+                    .map_or((None, None, None, None, None), |info| {
+                        (
+                            info.owner,
+                            info.runbook_url,
+                            info.severity,
+                            info.sla,
+                            info.execution_timeout,
+                        )
                     });
+                let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
                 let result = start_or_load_workflow_execution(
                     &mut conn,
@@ -11065,6 +11154,7 @@ async fn schedule_backfill(
                         runbook_url,
                         severity,
                         context_headers: None,
+                        sla,
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
@@ -11210,6 +11300,8 @@ async fn schedule_backfill(
                         runbook_url,
                         severity,
                         context_headers: None,
+
+                        sla: None,
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
@@ -13388,6 +13480,9 @@ pub(crate) async fn load_workflows(
         let predicate = serde_json::json!({ "failure_cause": cause });
         query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate));
     }
+    if filters.sla_breached {
+        query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+    }
     query
         .select(WorkflowExecution::as_select())
         .load(conn)
@@ -13494,6 +13589,12 @@ pub(crate) async fn load_stalled_workflows(
     }
     if let Some(severity) = &filters.severity {
         query = query.filter(harvest_workflow_executions::severity.eq(severity.as_str()));
+    }
+    // Honor the soft-SLA filter on the stalled path too (issue #487): without
+    // this, `?sla_breached=true&no_progress_minutes=N` would return unbreached
+    // stalled rows because this loader bypasses `load_workflows`.
+    if filters.sla_breached {
+        query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
     }
 
     if !filters.include_sleeping {
@@ -17861,7 +17962,7 @@ mod tests {
                 execution_timeout: None,
                 concurrency: None,
                 max_input_bytes: None,
-
+                sla: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -18036,6 +18137,28 @@ mod tests {
             .expect("unknown keys should be skipped");
         assert!(filters.states.is_empty());
         assert!(filters.workflow_name.is_none());
+    }
+
+    #[test]
+    fn parse_workflow_filters_parses_sla_breached_flag() {
+        // Absent → false (issue #487).
+        let absent = parse_workflow_filters(&pairs(&[])).expect("empty filters parse");
+        assert!(!absent.sla_breached);
+
+        // Explicit true (case-insensitive).
+        let on = parse_workflow_filters(&pairs(&[("sla_breached", "TRUE")]))
+            .expect("sla_breached=true parses");
+        assert!(on.sla_breached);
+
+        // Explicit false.
+        let off = parse_workflow_filters(&pairs(&[("sla_breached", "false")]))
+            .expect("sla_breached=false parses");
+        assert!(!off.sla_breached);
+
+        // Any non-"true" value is treated as false, never an error.
+        let other = parse_workflow_filters(&pairs(&[("sla_breached", "1")]))
+            .expect("sla_breached=1 parses without error");
+        assert!(!other.sla_breached);
     }
 
     #[test]
@@ -18406,6 +18529,8 @@ mod tests {
                 runbook_url: None,
                 severity: None,
                 context_headers: None,
+
+                sla: None,
                 schedule_id: None,
                 scheduled_for: None,
             },
@@ -19098,6 +19223,7 @@ mod tests {
                     execution_timeout: None,
                     concurrency: None,
                     max_input_bytes: None,
+                    sla: None,
                     owner: None,
                     runbook_url: None,
                     severity: None,
@@ -19113,6 +19239,7 @@ mod tests {
                     execution_timeout: None,
                     concurrency: None,
                     max_input_bytes: None,
+                    sla: None,
                     owner: None,
                     runbook_url: None,
                     severity: None,

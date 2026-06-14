@@ -379,15 +379,16 @@ async fn start_harvest_runtime(
                 let client = client.clone();
                 let harvest_db = state.extension::<crate::state::HarvestDbPool>();
 
-                let (owner, runbook_url, severity) = state
+                let (owner, runbook_url, severity, info_sla) = state
                     .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
                     .and_then(|registry| {
                         registry
                             .workflows
                             .get("webhook_delivery")
-                            .map(|wf| (wf.owner, wf.runbook_url, wf.severity))
+                            .map(|wf| (wf.owner, wf.runbook_url, wf.severity, wf.sla))
                     })
-                    .unwrap_or((None, None, None));
+                    .unwrap_or((None, None, None, None));
+                let sla = info_sla.and_then(|d| autumn_harvest::chrono::Duration::from_std(d).ok());
 
                 Box::pin(async move {
                     let workflow_id = format!("webhook-delivery-{}", log.id);
@@ -423,6 +424,7 @@ async fn start_harvest_runtime(
                         runbook_url,
                         severity,
                         context_headers: None,
+                        sla,
                         schedule_id: None,
                         scheduled_for: None,
                     };
@@ -713,6 +715,7 @@ mod tests {
             execution_timeout: None,
             concurrency: None,
             max_input_bytes: None,
+            sla: None,
             owner: None,
             runbook_url: None,
             severity: None,

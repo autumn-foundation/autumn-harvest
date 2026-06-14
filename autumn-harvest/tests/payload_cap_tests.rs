@@ -50,6 +50,7 @@ fn fake_workflow_info(name: &'static str) -> WorkflowInfo {
         module: "test",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        sla: None,
         concurrency: None,
         max_input_bytes: None,
         owner: None,
@@ -229,6 +230,7 @@ fn workflow_info_has_max_input_bytes_field() {
         module: "test",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        sla: None,
         concurrency: None,
         max_input_bytes: None,
 
@@ -247,6 +249,7 @@ fn workflow_info_has_max_input_bytes_field() {
         module: "test",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         execution_timeout: None,
+        sla: None,
         concurrency: None,
         max_input_bytes: Some(8 * 1024 * 1024),
 

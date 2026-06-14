@@ -92,6 +92,16 @@ pub struct StartWorkflowParams<'a> {
     /// Ambient string key-value context propagated to all activities and child
     /// workflows without threading through function signatures (issue #481).
     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Soft SLA budget for this workflow run (issue #487).
+    ///
+    /// When set, `sla_deadline_at = started_at + sla` is persisted.  A scanner
+    /// detects breach (`now > sla_deadline_at` while RUNNING/SUSPENDED) and
+    /// emits `harvest.workflow.sla_breached` exactly once — without altering the
+    /// run's lifecycle.
+    ///
+    /// If `sla > effective_timeout` (the hard deadline), `sla` is clamped down
+    /// to `effective_timeout` at start time.  `None` = no SLA enforced.
+    pub sla: Option<chrono::Duration>,
     /// The `harvest_schedules.id` that triggered this execution (issue #488).
     /// `None` for manually-started (non-scheduled) workflows. When `Some`, the
     /// start path resolves the prior COMPLETED output and most-recent terminal
@@ -322,6 +332,19 @@ pub async fn start_or_load_workflow_execution(
     // Compute deadline_at relative to target_start_time (issue #322).
     let deadline_at = effective_timeout.map(|d| target_start_time + d);
 
+    // Compute effective SLA — clamp down to the hard timeout when sla > deadline
+    // (issue #487): the hard timeout fires first so the soft signal can never fire.
+    // A non-positive SLA budget (<= 0) is treated as "no SLA": persisting an
+    // `sla_deadline_at` at or before `started_at` would flag the run as breached
+    // on the very next scan, which is never a meaningful budget.
+    let effective_sla = match (request.sla, effective_timeout) {
+        (Some(sla), _) if sla <= chrono::Duration::zero() => None,
+        (Some(sla), Some(hard)) => Some(sla.min(hard)),
+        (Some(sla), None) => Some(sla),
+        (None, _) => None,
+    };
+    let sla_deadline_at = effective_sla.map(|d| target_start_time + d);
+
     let row = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: request.workflow_name,
@@ -333,6 +356,8 @@ pub async fn start_or_load_workflow_execution(
         queue_name: request.queue_name,
         execution_timeout: effective_timeout,
         deadline_at,
+        sla: effective_sla,
+        sla_deadline_at,
         memo: request.memo.clone(),
         search_attrs: request.search_attrs.clone(),
         assigned_build_id: assigned_build.clone(),
@@ -649,13 +674,27 @@ async fn inline_cancel(
 /// Returns [`HarvestError::NotFound`] when the execution does not exist,
 /// [`HarvestError::Config`] when the execution is already terminal for another
 /// reason, and [`HarvestError::Database`] for persistence failures.
+/// Cancel a running workflow execution, returning the deferred completion-trigger
+/// starts to the caller **without spawning them** (and without recording the
+/// terminal metric).
+///
+/// This is the building block for callers that run the cancellation inside a
+/// larger outer transaction (the external-cancel inline persist and outbox
+/// paths): the `DeferredTriggerStart`s must only be spawned *after* that outer
+/// transaction commits, otherwise trigger workflows could start for a
+/// cancellation that later rolls back (issue #492). The plain
+/// [`cancel_workflow_execution`] wrapper spawns them and records the metric
+/// itself for the common standalone case.
+///
+/// # Errors
+///
+/// Same as [`cancel_workflow_execution`].
 #[allow(clippy::too_many_lines)]
-pub async fn cancel_workflow_execution(
+pub async fn cancel_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
-    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-) -> HarvestResult<CancelledWorkflowExecution> {
+) -> HarvestResult<(CancelledWorkflowExecution, Vec<DeferredTriggerStart>)> {
     let reason = reason.trim();
     let reason = if reason.is_empty() {
         "workflow cancellation requested".to_string()
@@ -663,126 +702,149 @@ pub async fn cancel_workflow_execution(
         reason.to_string()
     };
 
-    let (cancel_result, deferred_starts) = conn
-        .transaction::<(CancelledWorkflowExecution, Vec<DeferredTriggerStart>), HarvestError, _>(
-            |conn| {
-                async move {
-                    let execution = harvest_workflow_executions::table
-                        .find(exec_id.as_uuid())
-                        .select(WorkflowExecution::as_select())
-                        .for_update()
-                        .first(conn)
-                        .await
-                        .optional()
-                        .map_err(database_error)?
-                        .ok_or_else(|| {
-                            HarvestError::NotFound(format!("workflow execution {exec_id}"))
-                        })?;
-
-                    // Cancellation beats pause (issue #383): a PAUSED execution
-                    // is cancellable just like a RUNNING one; the transition to
-                    // CANCELLED clears the pending pause record below.
-                    let prior_state = execution.state.clone();
-                    match execution.state.as_str() {
-                        "RUNNING" | "PAUSED" => {}
-                        "CANCELLED" => {
-                            return Ok((
-                                CancelledWorkflowExecution::idempotent(exec_id, execution),
-                                Vec::new(),
-                            ));
-                        }
-                        state => {
-                            return Err(HarvestError::Config(format!(
-                                "workflow execution {exec_id} is already terminal ({state})"
-                            )));
-                        }
-                    }
-
-                    let deleted_pending = diesel::delete(
-                        crate::schema::harvest_task_queue::table
-                            .filter(
-                                crate::schema::harvest_task_queue::workflow_exec_id
-                                    .eq(Some(exec_id.as_uuid())),
-                            )
-                            .filter(crate::schema::harvest_task_queue::task_type.eq("workflow"))
-                            .filter(crate::schema::harvest_task_queue::state.eq("PENDING"))
-                            .filter(crate::schema::harvest_task_queue::scheduled_at.gt(Utc::now())),
-                    )
-                    .execute(conn)
+    conn.transaction::<(CancelledWorkflowExecution, Vec<DeferredTriggerStart>), HarvestError, _>(
+        |conn| {
+            async move {
+                let execution = harvest_workflow_executions::table
+                    .find(exec_id.as_uuid())
+                    .select(WorkflowExecution::as_select())
+                    .for_update()
+                    .first(conn)
                     .await
-                    .map_err(database_error)?;
+                    .optional()
+                    .map_err(database_error)?
+                    .ok_or_else(|| {
+                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
+                    })?;
 
-                    let history = store::load_history(conn, exec_id).await?;
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        &[WorkflowEvent::WorkflowCancelled {
-                            reason: reason.clone(),
-                        }],
-                        history.next_event_id,
-                    )
-                    .await?;
-
-                    let updated =
-                        diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
-                            .filter(
-                                harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]),
-                            )
-                            .set((
-                                harvest_workflow_executions::state.eq("CANCELLED"),
-                                harvest_workflow_executions::output.eq(None::<serde_json::Value>),
-                                harvest_workflow_executions::error.eq(Some(reason.clone())),
-                                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-                                // Cancellation wins: clear the pending pause record.
-                                harvest_workflow_executions::paused_at
-                                    .eq(None::<chrono::DateTime<Utc>>),
-                                harvest_workflow_executions::pause_reason.eq(None::<String>),
-                                harvest_workflow_executions::pause_actor.eq(None::<String>),
-                            ))
-                            .execute(conn)
-                            .await
-                            .map_err(database_error)?;
-
-                    if updated == 0 {
+                // Cancellation beats pause (issue #383): a PAUSED execution
+                // is cancellable just like a RUNNING one; the transition to
+                // CANCELLED clears the pending pause record below.
+                let prior_state = execution.state.clone();
+                match execution.state.as_str() {
+                    "RUNNING" | "PAUSED" => {}
+                    "CANCELLED" => {
+                        return Ok((
+                            CancelledWorkflowExecution::idempotent(exec_id, execution),
+                            Vec::new(),
+                        ));
+                    }
+                    state => {
                         return Err(HarvestError::Config(format!(
-                            "workflow execution {exec_id} is no longer running"
+                            "workflow execution {exec_id} is already terminal ({state})"
                         )));
                     }
-
-                    let failed_task_count = queue::fail_open_tasks_for_execution(
-                        conn,
-                        exec_id,
-                        &format!("workflow cancelled: {reason}"),
-                    )
-                    .await?;
-
-                    let total_failed_or_deleted = deleted_pending + failed_task_count;
-                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
-                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                        conn,
-                        exec_id,
-                        crate::completion_trigger::TerminalState::Cancelled,
-                        None,
-                    )
-                    .await?;
-                    deferred.extend(triggers);
-
-                    Ok((
-                        CancelledWorkflowExecution::newly_cancelled(
-                            exec_id,
-                            reason,
-                            total_failed_or_deleted,
-                            execution.workflow_name.clone(),
-                            execution.queue_name.clone(),
-                            prior_state,
-                        ),
-                        deferred,
-                    ))
                 }
-                .scope_boxed()
-            },
-        )
-        .await?;
+
+                let deleted_pending = diesel::delete(
+                    crate::schema::harvest_task_queue::table
+                        .filter(
+                            crate::schema::harvest_task_queue::workflow_exec_id
+                                .eq(Some(exec_id.as_uuid())),
+                        )
+                        .filter(crate::schema::harvest_task_queue::task_type.eq("workflow"))
+                        .filter(crate::schema::harvest_task_queue::state.eq("PENDING"))
+                        .filter(crate::schema::harvest_task_queue::scheduled_at.gt(Utc::now())),
+                )
+                .execute(conn)
+                .await
+                .map_err(database_error)?;
+
+                let history = store::load_history(conn, exec_id).await?;
+                store::append_events(
+                    conn,
+                    exec_id,
+                    &[WorkflowEvent::WorkflowCancelled {
+                        reason: reason.clone(),
+                    }],
+                    history.next_event_id,
+                )
+                .await?;
+
+                let updated =
+                    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+                        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+                        .set((
+                            harvest_workflow_executions::state.eq("CANCELLED"),
+                            harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                            harvest_workflow_executions::error.eq(Some(reason.clone())),
+                            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                            // Cancellation wins: clear the pending pause record.
+                            harvest_workflow_executions::paused_at
+                                .eq(None::<chrono::DateTime<Utc>>),
+                            harvest_workflow_executions::pause_reason.eq(None::<String>),
+                            harvest_workflow_executions::pause_actor.eq(None::<String>),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(database_error)?;
+
+                if updated == 0 {
+                    return Err(HarvestError::Config(format!(
+                        "workflow execution {exec_id} is no longer running"
+                    )));
+                }
+
+                let failed_task_count = queue::fail_open_tasks_for_execution(
+                    conn,
+                    exec_id,
+                    &format!("workflow cancelled: {reason}"),
+                )
+                .await?;
+
+                let total_failed_or_deleted = deleted_pending + failed_task_count;
+                let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::Cancelled,
+                    None,
+                )
+                .await?;
+                deferred.extend(triggers);
+
+                Ok((
+                    CancelledWorkflowExecution::newly_cancelled(
+                        exec_id,
+                        reason,
+                        total_failed_or_deleted,
+                        execution.workflow_name.clone(),
+                        execution.queue_name.clone(),
+                        prior_state,
+                    ),
+                    deferred,
+                ))
+            }
+            .scope_boxed()
+        },
+    )
+    .await
+}
+
+/// Cancel a running workflow execution.
+///
+/// Cancellation is a durable terminal transition: this appends a
+/// `WorkflowCancelled` event, marks the execution `CANCELLED`, and fails every
+/// pending or running task associated with the execution. Repeating the same
+/// operation against an already-cancelled execution is idempotent and does not
+/// append another event.
+///
+/// Completion-trigger / parent-close-cascade follow-up starts are spawned after
+/// the cancellation transaction commits, and the terminal metric is recorded.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] when the execution does not exist,
+/// [`HarvestError::Config`] when the execution is already terminal for another
+/// reason, and [`HarvestError::Database`] for persistence failures.
+pub async fn cancel_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    reason: &str,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> HarvestResult<CancelledWorkflowExecution> {
+    let (cancel_result, deferred_starts) =
+        cancel_workflow_execution_collect(conn, exec_id, reason).await?;
 
     for start in deferred_starts {
         start.spawn();
@@ -1054,6 +1116,20 @@ pub async fn resume_workflow_execution(
                 // paused wall-clock does not count against the workflow's
                 // `execution_timeout`. `None` (no deadline) stays `None`.
                 let new_deadline_at = execution.deadline_at.map(|d| d + pause_span);
+                // Also push the soft SLA deadline forward (issue #487): a workflow
+                // paused mid-flight should not breach its SLA while paused — BUT
+                // only suspend a deadline that was still ahead when the pause
+                // began. A deadline already passed before the pause stays in the
+                // past so the breach (which occurred while RUNNING) is still
+                // observed by the scanner on the next tick after resume, rather
+                // than being silently pushed into the future.
+                let new_sla_deadline_at =
+                    execution
+                        .sla_deadline_at
+                        .map(|d| match execution.paused_at {
+                            Some(p) if d > p => d + pause_span,
+                            _ => d,
+                        });
 
                 let history = store::load_history(conn, exec_id).await?;
                 store::append_events(
@@ -1077,6 +1153,7 @@ pub async fn resume_workflow_execution(
                             harvest_workflow_executions::pause_reason.eq(None::<String>),
                             harvest_workflow_executions::pause_actor.eq(None::<String>),
                             harvest_workflow_executions::deadline_at.eq(new_deadline_at),
+                            harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
                         ))
                         .execute(conn)
                         .await
@@ -1588,6 +1665,8 @@ pub struct SignalWithStartParams<'a> {
     pub runbook_url: Option<&'a str>,
     pub severity: Option<&'a str>,
     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Soft SLA budget forwarded to [`StartWorkflowParams::sla`] (issue #487).
+    pub sla: Option<chrono::Duration>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -1759,6 +1838,7 @@ pub async fn signal_with_start_workflow_execution(
                     runbook_url: request.runbook_url,
                     severity: request.severity,
                     context_headers: request.context_headers.clone(),
+                    sla: request.sla,
                     schedule_id: None,
                     scheduled_for: None,
                 };
@@ -2053,6 +2133,8 @@ pub struct UpdateWithStartParams<'a> {
     pub runbook_url: Option<&'a str>,
     pub severity: Option<&'a str>,
     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    /// Soft SLA budget forwarded to [`StartWorkflowParams::sla`] (issue #487).
+    pub sla: Option<chrono::Duration>,
 }
 
 /// Result of an [`update_with_start_workflow_execution`] call.
@@ -2173,6 +2255,7 @@ pub async fn update_with_start_workflow_execution(
                     runbook_url: request.runbook_url,
                     severity: request.severity,
                     context_headers: request.context_headers.clone(),
+                    sla: request.sla,
                     schedule_id: None,
                     scheduled_for: None,
                 };

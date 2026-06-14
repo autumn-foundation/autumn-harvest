@@ -20,6 +20,9 @@ struct ConcurrencyArgs {
 
 struct WorkflowAttrs {
     execution_timeout: Option<String>,
+    /// Soft SLA budget (issue #487). Parsed from `#[workflow(sla = "2h")]`.
+    /// Stored as `WorkflowInfo::sla: Option<Duration>`.
+    sla: Option<String>,
     concurrency: Option<ConcurrencyArgs>,
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
@@ -33,9 +36,11 @@ struct WorkflowAttrs {
     allow_nondeterministic_apis: bool,
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
     let mut result = WorkflowAttrs {
         execution_timeout: None,
+        sla: None,
         concurrency: None,
         max_input_bytes: None,
         owner: None,
@@ -49,6 +54,10 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         if meta.path.is_ident("execution_timeout") {
             let value: LitStr = meta.value()?.parse()?;
             result.execution_timeout = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("sla") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.sla = Some(value.value());
             Ok(())
         } else if meta.path.is_ident("concurrency") {
             let mut key_expr: Option<String> = None;
@@ -126,7 +135,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `concurrency`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, or `allow_nondeterministic_apis`",
+                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -283,6 +292,12 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         |s| quote! { ::autumn_harvest::task_duration(#s) },
     );
 
+    // Emit sla as Option<Duration> (issue #487).
+    let sla_expr = attrs.sla.as_deref().map_or_else(
+        || quote! { None },
+        |s| quote! { ::autumn_harvest::task_duration(#s) },
+    );
+
     // Emit concurrency as Option<ConcurrencyPolicy>.
     let concurrency_expr = match attrs.concurrency {
         None => quote! { ::std::option::Option::None },
@@ -348,6 +363,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                 },
                 execution_timeout: #execution_timeout_expr,
+                sla: #sla_expr,
                 concurrency: #concurrency_expr,
                 max_input_bytes: #max_input_bytes_expr,
                 owner: #owner_expr,
@@ -474,6 +490,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         runbook_url: info.runbook_url,
                         severity: info.severity,
                         context_headers: opts.context_headers,
+                        sla: opts.sla.or(info.sla).and_then(|d|
+                            ::autumn_harvest::chrono::Duration::from_std(d).ok()
+                        ),
                         schedule_id: ::std::option::Option::None,
                         scheduled_for: ::std::option::Option::None,
                     };
@@ -557,6 +576,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         runbook_url: info.runbook_url,
                         severity: info.severity,
                         context_headers: opts.context_headers,
+                        sla: opts.sla.or(info.sla).and_then(|d|
+                            ::autumn_harvest::chrono::Duration::from_std(d).ok()
+                        ),
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

@@ -51,6 +51,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
     "\n",
     include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
@@ -166,6 +168,8 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -250,6 +254,7 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             module: "cancellation_tests",
             handler: heartbeat_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -559,6 +564,8 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -646,6 +653,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             module: "cancellation_tests",
             handler: uncooperative_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -760,6 +768,8 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -904,6 +914,8 @@ async fn activity_exits_early_on_workflow_cancellation() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -1045,6 +1057,8 @@ async fn activity_without_cancellation_check_completes_normally() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },

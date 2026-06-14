@@ -10,7 +10,7 @@
 
 use uuid::Uuid;
 
-use crate::types::{ExecutionId, ExternalSignalId};
+use crate::types::{ExecutionId, ExternalCancelId, ExternalSignalId};
 
 // ---------------------------------------------------------------------------
 // PayloadKind
@@ -379,6 +379,22 @@ pub enum HarvestError {
         /// The signal channel name.
         signal_name: String,
         /// Machine-readable failure reason (`"target_terminal"` or `"target_unknown"`).
+        reason_code: String,
+    },
+
+    /// Delivery of a `request_cancel_external_workflow` call failed permanently.
+    ///
+    /// `reason_code` is one of:
+    /// - `"target_unknown"` — no execution matching `target` was found within
+    ///   the configured grace window.
+    /// - `"self_cancel"` — the target is the calling workflow's own `ExecutionId`.
+    #[error("external cancel of {target} failed: {reason_code} (cancel_id={cancel_id})")]
+    ExternalCancelFailed {
+        /// The `ExternalCancelId` recorded in the initiating event.
+        cancel_id: ExternalCancelId,
+        /// The target workflow execution ID.
+        target: ExecutionId,
+        /// Machine-readable failure reason (`"target_unknown"` or `"self_cancel"`).
         reason_code: String,
     },
 }

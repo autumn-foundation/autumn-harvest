@@ -42,6 +42,8 @@ fn update_with_start_params_is_cloneable_and_debug() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
     };
 
     let _cloned = params.clone();
@@ -105,6 +107,8 @@ fn update_with_start_outcome_idempotency_key_roundtrip() {
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
     };
     assert_eq!(
         params.idempotency_key.as_deref(),
@@ -169,6 +173,8 @@ mod db_tests {
         include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
         "\n",
         include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+        "\n",
+        include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
         "\n",
         include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
         "\n",
@@ -255,6 +261,8 @@ mod db_tests {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
         }
     }
 
@@ -328,6 +336,8 @@ mod db_tests {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         };
@@ -392,6 +402,8 @@ mod db_tests {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         };

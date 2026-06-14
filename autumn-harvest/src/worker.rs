@@ -31,7 +31,9 @@ use crate::context::{
 use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
-use crate::execution::{apply_parent_close_cascade, parent_close_cascade_event_count};
+use crate::execution::{
+    apply_parent_close_cascade, cancel_workflow_execution_collect, parent_close_cascade_event_count,
+};
 use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_history_policy_and_caps,
 };
@@ -272,6 +274,7 @@ impl HandlerRegistry {
                             runbook_url: w.runbook_url.map(String::from),
                             severity: w.severity.map(String::from),
                             input_schema: w.input_schema,
+                            sla: w.sla,
                         },
                     )
                 })
@@ -466,6 +469,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::UpsertSearchAttributes { .. } => "UpsertSearchAttributes",
         WorkflowCommand::SetCurrentDetails { .. } => "SetCurrentDetails",
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
+        WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
         WorkflowCommand::SpawnDetachedChildWorkflow { .. } => "SpawnDetachedChildWorkflow",
     }
 }
@@ -502,7 +506,9 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
     let has_wait = commands.iter().any(|cmd| {
         matches!(
             cmd,
-            WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::SignalExternalWorkflow { .. }
+            WorkflowCommand::WaitForSignal { .. }
+                | WorkflowCommand::SignalExternalWorkflow { .. }
+                | WorkflowCommand::RequestCancelExternalWorkflow { .. }
         )
     });
 
@@ -511,6 +517,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
             cmd,
             WorkflowCommand::WaitForSignal { .. }
                 | WorkflowCommand::SignalExternalWorkflow { .. }
+                | WorkflowCommand::RequestCancelExternalWorkflow { .. }
                 | WorkflowCommand::RecordMarker { .. }
                 | WorkflowCommand::RecordSideEffect { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
@@ -843,6 +850,7 @@ fn extract_started_timer_for_suspension(
             WorkflowCommand::StartTimer { .. }
                 | WorkflowCommand::WaitForSignal { .. }
                 | WorkflowCommand::SignalExternalWorkflow { .. }
+                | WorkflowCommand::RequestCancelExternalWorkflow { .. }
                 | WorkflowCommand::RecordMarker { .. }
                 | WorkflowCommand::RecordSideEffect { .. }
                 | WorkflowCommand::RecordUpdateResult { .. }
@@ -1077,14 +1085,22 @@ struct SignalExternalWorkflowRun {
     already_requested: bool,
 }
 
-/// An item in the ordered inline-dispatch batch: either a marker event or a
-/// signal run. Preserving the original command-emission order is required so
-/// that the replay cursor sees events in the exact same sequence as during the
-/// live execution that produced them.
+#[derive(Clone)]
+struct CancelExternalWorkflowRun {
+    cancel_id: crate::types::ExternalCancelId,
+    target: ExecutionId,
+    already_requested: bool,
+}
+
+/// An item in the ordered inline-dispatch batch: either a marker event, a
+/// signal run, or a cancel run. Preserving the original command-emission order
+/// is required so that the replay cursor sees events in the exact same sequence
+/// as during the live execution that produced them.
 #[derive(Clone)]
 enum SignalBatchItem {
     Marker(WorkflowEvent),
     Signal(SignalExternalWorkflowRun),
+    Cancel(CancelExternalWorkflowRun),
 }
 
 /// Extract `SignalExternalWorkflow` and `RecordMarker` commands in emission
@@ -1128,6 +1144,19 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
                     already_requested,
                 }));
             }
+            WorkflowCommand::RequestCancelExternalWorkflow {
+                cancel_id,
+                target,
+                result_tx,
+                already_requested,
+            } => {
+                drop(result_tx);
+                items.push(SignalBatchItem::Cancel(CancelExternalWorkflowRun {
+                    cancel_id,
+                    target,
+                    already_requested,
+                }));
+            }
             _ => {}
         }
     }
@@ -1167,6 +1196,19 @@ fn split_mixed_signal_batch(
                     already_requested,
                 }));
             }
+            WorkflowCommand::RequestCancelExternalWorkflow {
+                cancel_id,
+                target,
+                result_tx,
+                already_requested,
+            } => {
+                drop(result_tx);
+                signal_items.push(SignalBatchItem::Cancel(CancelExternalWorkflowRun {
+                    cancel_id,
+                    target,
+                    already_requested,
+                }));
+            }
             WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. } => {}
@@ -1195,84 +1237,215 @@ fn split_mixed_signal_batch(
 /// original insert committed before the crash. Exact-once delivery requires
 /// storing the `signal_id` as a unique key on `harvest_signals`; that schema
 /// change is deferred to a follow-up migration.
+///
+/// Returned tuple: (new history events, next event id, deferred trigger starts
+/// to spawn after commit, (`workflow_name`, `queue_name`) of targets newly
+/// cancelled inline for terminal metrics).
+type InlinePersistResult = (
+    Vec<WorkflowEvent>,
+    i32,
+    Vec<crate::completion_trigger::DeferredTriggerStart>,
+    Vec<(String, String)>,
+);
+
+#[allow(clippy::too_many_lines)]
 async fn persist_external_signal_inline(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     items: Vec<SignalBatchItem>,
     next_event_id: &mut i32,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<Vec<WorkflowEvent>> {
-    let mut new_events: Vec<WorkflowEvent> = Vec::new();
+    let start_next = *next_event_id;
 
-    for item in items {
-        match item {
-            SignalBatchItem::Marker(event) => {
-                store::append_events(conn, exec_id, std::slice::from_ref(&event), *next_event_id)
-                    .await?;
-                *next_event_id += 1;
-                new_events.push(event);
-            }
-            SignalBatchItem::Signal(run) => {
-                if !run.already_requested {
-                    let requested = WorkflowEvent::ExternalSignalRequested {
-                        signal_id: run.signal_id,
-                        target: run.target,
-                        signal_name: run.signal_name.clone(),
-                        payload: run.payload.clone(),
-                    };
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        std::slice::from_ref(&requested),
-                        *next_event_id,
-                    )
-                    .await?;
-                    *next_event_id += 1;
-                    new_events.push(requested);
-                }
+    // Persist the whole inline batch (request + delivery + terminal appends) in a
+    // single transaction so a concurrently-running outbox sweep (on another
+    // connection/worker) never observes an `External{Signal,Cancel}Requested`
+    // event without its terminal: after commit both are visible, before commit
+    // neither is. Without this the outbox could see the half-written request,
+    // deliver it, and append the terminal first, leaving the inline path to
+    // append the same terminal at a now-stale `next_event_id` — a history write
+    // conflict that fails the caller even though delivery succeeded (issue #492).
+    let (new_events, final_next, deferred_starts, cancel_metrics): InlinePersistResult = conn
+        .transaction::<InlinePersistResult, HarvestError, _>(|conn| {
+            async move {
+                let mut new_events: Vec<WorkflowEvent> = Vec::new();
+                let mut next = start_next;
+                // Completion-trigger / cascade follow-up starts produced by
+                // same-shard cancellations. These must be spawned only *after*
+                // this outer transaction commits, otherwise a later rollback
+                // would leave trigger workflows started for a cancellation that
+                // never became durable (issue #492).
+                let mut deferred_starts: Vec<crate::completion_trigger::DeferredTriggerStart> =
+                    Vec::new();
+                // (workflow_name, queue_name) of targets newly cancelled inline,
+                // so the terminal metric is recorded after commit.
+                let mut cancel_metrics: Vec<(String, String)> = Vec::new();
 
-                // If cross-shard, skip inline delivery entirely and let the background outbox handle it.
-                if run.target.shard() != exec_id.shard() {
-                    continue;
-                }
+                for item in items {
+                    match item {
+                        SignalBatchItem::Marker(event) => {
+                            store::append_events(conn, exec_id, std::slice::from_ref(&event), next)
+                                .await?;
+                            next += 1;
+                            new_events.push(event);
+                        }
+                        SignalBatchItem::Signal(run) => {
+                            if !run.already_requested {
+                                let requested = WorkflowEvent::ExternalSignalRequested {
+                                    signal_id: run.signal_id,
+                                    target: run.target,
+                                    signal_name: run.signal_name.clone(),
+                                    payload: run.payload.clone(),
+                                };
+                                store::append_events(
+                                    conn,
+                                    exec_id,
+                                    std::slice::from_ref(&requested),
+                                    next,
+                                )
+                                .await?;
+                                next += 1;
+                                new_events.push(requested);
+                            }
 
-                // Same-shard delivery attempt
-                let terminal_opt = match signal::send_signal(
-                    conn,
-                    run.target,
-                    &run.signal_name,
-                    run.payload,
-                )
-                .await
-                {
-                    Ok(()) => Some(WorkflowEvent::ExternalSignalDelivered {
-                        signal_id: run.signal_id,
-                    }),
-                    Err(HarvestError::NotFound(_)) => {
-                        // Same-shard target not found: suspend inline delivery and leave resolution to outbox.
-                        None
+                            // If cross-shard, skip inline delivery entirely and let
+                            // the background outbox handle it.
+                            if run.target.shard() != exec_id.shard() {
+                                continue;
+                            }
+
+                            // Same-shard delivery attempt
+                            let terminal_opt = match signal::send_signal(
+                                conn,
+                                run.target,
+                                &run.signal_name,
+                                run.payload,
+                            )
+                            .await
+                            {
+                                Ok(()) => Some(WorkflowEvent::ExternalSignalDelivered {
+                                    signal_id: run.signal_id,
+                                }),
+                                Err(HarvestError::NotFound(_)) => {
+                                    // Same-shard target not found: suspend inline
+                                    // delivery and leave resolution to outbox.
+                                    None
+                                }
+                                Err(HarvestError::Database(e)) => {
+                                    return Err(HarvestError::Database(e));
+                                }
+                                Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                                    signal_id: run.signal_id,
+                                    reason_code: "target_terminal".to_string(),
+                                }),
+                            };
+
+                            if let Some(terminal) = terminal_opt {
+                                store::append_events(
+                                    conn,
+                                    exec_id,
+                                    std::slice::from_ref(&terminal),
+                                    next,
+                                )
+                                .await?;
+                                next += 1;
+                                new_events.push(terminal);
+                            }
+                        }
+                        SignalBatchItem::Cancel(run) => {
+                            if !run.already_requested {
+                                let requested = WorkflowEvent::ExternalCancelRequested {
+                                    cancel_id: run.cancel_id,
+                                    target: run.target,
+                                };
+                                store::append_events(
+                                    conn,
+                                    exec_id,
+                                    std::slice::from_ref(&requested),
+                                    next,
+                                )
+                                .await?;
+                                next += 1;
+                                new_events.push(requested);
+                            }
+
+                            // Cross-shard: leave for the outbox scanner.
+                            if run.target.shard() != exec_id.shard() {
+                                continue;
+                            }
+
+                            // Same-shard cancel attempt.
+                            // Already-CANCELLED and already-terminal targets are
+                            // no-op success (goal "target not running" already met).
+                            // Use the collect variant so the target's
+                            // completion-trigger starts are spawned only after this
+                            // outer transaction commits (issue #492).
+                            let terminal_opt = match cancel_workflow_execution_collect(
+                                conn,
+                                run.target,
+                                "cancelled by external request",
+                            )
+                            .await
+                            {
+                                Err(HarvestError::NotFound(_)) => {
+                                    // Target not found: leave for outbox grace window.
+                                    None
+                                }
+                                Err(HarvestError::Database(e)) => {
+                                    return Err(HarvestError::Database(e));
+                                }
+                                Ok((cancelled, deferred)) => {
+                                    deferred_starts.extend(deferred);
+                                    if cancelled.newly_cancelled {
+                                        cancel_metrics
+                                            .push((cancelled.workflow_name, cancelled.queue_name));
+                                    }
+                                    Some(WorkflowEvent::ExternalCancelDelivered {
+                                        cancel_id: run.cancel_id,
+                                    })
+                                }
+                                // Other Err (already terminal) = no-op success.
+                                Err(_) => Some(WorkflowEvent::ExternalCancelDelivered {
+                                    cancel_id: run.cancel_id,
+                                }),
+                            };
+
+                            if let Some(terminal) = terminal_opt {
+                                store::append_events(
+                                    conn,
+                                    exec_id,
+                                    std::slice::from_ref(&terminal),
+                                    next,
+                                )
+                                .await?;
+                                next += 1;
+                                new_events.push(terminal);
+                            }
+                        }
                     }
-                    Err(HarvestError::Database(e)) => return Err(HarvestError::Database(e)),
-                    Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                        signal_id: run.signal_id,
-                        reason_code: "target_terminal".to_string(),
-                    }),
-                };
-
-                if let Some(terminal) = terminal_opt {
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        std::slice::from_ref(&terminal),
-                        *next_event_id,
-                    )
-                    .await?;
-                    *next_event_id += 1;
-                    new_events.push(terminal);
                 }
+
+                Ok((new_events, next, deferred_starts, cancel_metrics))
             }
-        }
+            .scope_boxed()
+        })
+        .await?;
+
+    // The inline batch is durably committed: now spawn trigger/cascade follow-up
+    // starts and record terminal metrics for any targets cancelled above.
+    for start in deferred_starts {
+        start.spawn();
+    }
+    for (workflow_name, queue_name) in cancel_metrics {
+        metrics.record_workflow_terminal(
+            &workflow_name,
+            &queue_name,
+            crate::telemetry::WorkflowStatus::Cancelled,
+        );
     }
 
+    *next_event_id = final_next;
     Ok(new_events)
 }
 
@@ -2285,6 +2458,48 @@ async fn persist_signal_wait_park(
     let pending = signal::load_pending_signals(conn, exec_id).await?;
     if !pending.is_empty() {
         queue::wake_workflow_task(conn, exec_id).await?;
+        return Ok(());
+    }
+
+    // An external signal/cancel wait may have been resolved by the outbox
+    // (External{Signal,Cancel}Delivered/Failed appended on another connection)
+    // in the gap between the `*Requested` event committing and this park
+    // committing. `wake_workflow_task` is a no-op when it fires before the task
+    // is parked, so a cross-shard / NotFound caller could otherwise stay parked
+    // until an unrelated wake. Re-check now that we are parked: if any in-flight
+    // external request this wait depends on already has a terminal in history,
+    // self-wake so the workflow re-runs and observes it (issue #492).
+    let waited_signal_ids: Vec<crate::types::ExternalSignalId> = commands
+        .iter()
+        .filter_map(|c| match c {
+            WorkflowCommand::SignalExternalWorkflow { signal_id, .. } => Some(*signal_id),
+            _ => None,
+        })
+        .collect();
+    let waited_cancel_ids: Vec<crate::types::ExternalCancelId> = commands
+        .iter()
+        .filter_map(|c| match c {
+            WorkflowCommand::RequestCancelExternalWorkflow { cancel_id, .. } => Some(*cancel_id),
+            _ => None,
+        })
+        .collect();
+
+    if !waited_signal_ids.is_empty() || !waited_cancel_ids.is_empty() {
+        let history = store::load_history(conn, exec_id).await?;
+        let resolved = history.events.iter().any(|ev| match ev {
+            WorkflowEvent::ExternalSignalDelivered { signal_id }
+            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                waited_signal_ids.contains(signal_id)
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id }
+            | WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
+                waited_cancel_ids.contains(cancel_id)
+            }
+            _ => false,
+        });
+        if resolved {
+            queue::wake_workflow_task(conn, exec_id).await?;
+        }
     }
     Ok(())
 }
@@ -2589,7 +2804,9 @@ async fn persist_started_timer(
             let mut is_mixed = commands.iter().any(|cmd| {
                 matches!(
                     cmd,
-                    WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::SignalExternalWorkflow { .. }
+                    WorkflowCommand::WaitForSignal { .. }
+                        | WorkflowCommand::SignalExternalWorkflow { .. }
+                        | WorkflowCommand::RequestCancelExternalWorkflow { .. }
                 )
             });
             if !is_mixed {
@@ -2602,12 +2819,22 @@ async fn persist_started_timer(
                 let unresolved_exists: Result<Vec<DummyRow>, diesel::result::Error> = diesel::sql_query(
                     "SELECT 1 AS dummy FROM harvest_events e \
                      WHERE e.workflow_exec_id = $1 \
-                       AND e.event_type = 'ExternalSignalRequested' \
-                       AND NOT EXISTS ( \
-                           SELECT 1 FROM harvest_events res \
-                           WHERE res.workflow_exec_id = e.workflow_exec_id \
-                             AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
-                             AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
+                       AND ( \
+                         ( e.event_type = 'ExternalSignalRequested' \
+                           AND NOT EXISTS ( \
+                               SELECT 1 FROM harvest_events res \
+                               WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                 AND res.event_type IN ('ExternalSignalDelivered', 'ExternalSignalFailed') \
+                                 AND res.event_data->'data'->>'signal_id' = e.event_data->'data'->>'signal_id' \
+                           ) ) \
+                         OR \
+                         ( e.event_type = 'ExternalCancelRequested' \
+                           AND NOT EXISTS ( \
+                               SELECT 1 FROM harvest_events res \
+                               WHERE res.workflow_exec_id = e.workflow_exec_id \
+                                 AND res.event_type IN ('ExternalCancelDelivered', 'ExternalCancelFailed') \
+                                 AND res.event_data->'data'->>'cancel_id' = e.event_data->'data'->>'cancel_id' \
+                           ) ) \
                        ) \
                      LIMIT 1"
                 )
@@ -2853,10 +3080,14 @@ async fn persist_all_started_child_workflows(
             // Insert rows and enqueue tasks for new children.
             for child in &new_children {
                 let child_workflow_id = child.child_id.to_string();
-                let (owner, runbook_url, severity) = registry
+                let (owner, runbook_url, severity, child_sla) = registry
                     .workflows
                     .get(child.workflow_name.as_str())
-                    .map_or((None, None, None), |w| (w.owner, w.runbook_url, w.severity));
+                    .map_or((None, None, None, None), |w| {
+                        (w.owner, w.runbook_url, w.severity, w.sla)
+                    });
+                let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+                let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
                 let child_row = NewWorkflowExecution {
                     id: child.child_id.as_uuid(),
                     workflow_name: &child.workflow_name,
@@ -2868,6 +3099,8 @@ async fn persist_all_started_child_workflows(
                     queue_name: &queue_name,
                     execution_timeout: None,
                     deadline_at: None,
+                    sla: child_sla,
+                    sla_deadline_at: child_sla_deadline_at,
                     memo: None,
                     search_attrs: None,
                     assigned_build_id: parent_execution.assigned_build_id.clone(),
@@ -3406,10 +3639,14 @@ async fn create_detached_child_executions(
         }
 
         let child_workflow_id = child_id.to_string();
-        let (owner, runbook_url, severity) = registry
+        let (owner, runbook_url, severity, child_sla) = registry
             .workflows
             .get(workflow_name.as_str())
-            .map_or((None, None, None), |w| (w.owner, w.runbook_url, w.severity));
+            .map_or((None, None, None, None), |w| {
+                (w.owner, w.runbook_url, w.severity, w.sla)
+            });
+        let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+        let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
         let child_row = NewWorkflowExecution {
             id: child_id.as_uuid(),
             workflow_name: workflow_name.as_str(),
@@ -3421,6 +3658,8 @@ async fn create_detached_child_executions(
             queue_name: &parent_execution.queue_name,
             execution_timeout: None,
             deadline_at: None,
+            sla: child_sla,
+            sla_deadline_at: child_sla_deadline_at,
             memo: None,
             search_attrs: None,
             assigned_build_id: parent_execution.assigned_build_id.clone(),
@@ -4614,6 +4853,8 @@ async fn persist_workflow_continue_as_new(
     };
     // Re-anchor deadline to the new execution's start time (issue #243).
     let new_deadline_at = execution.execution_timeout.map(|d| chrono::Utc::now() + d);
+    // Re-anchor soft SLA deadline per-run (issue #487).
+    let new_sla_deadline_at = execution.sla.map(|d| chrono::Utc::now() + d);
 
     let new_row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
@@ -4626,6 +4867,8 @@ async fn persist_workflow_continue_as_new(
         queue_name: &execution.queue_name,
         execution_timeout: execution.execution_timeout,
         deadline_at: new_deadline_at,
+        sla: execution.sla,
+        sla_deadline_at: new_sla_deadline_at,
         memo: execution.memo.clone(),
         search_attrs: execution.search_attrs.clone(),
         assigned_build_id: execution.assigned_build_id.clone(),
@@ -5434,15 +5677,18 @@ async fn process_workflow_task(
                 // Local-activity re-run: drop this iteration's execute span
                 // so the OTel span closes before we start inline execution.
                 drop(execute_span);
-                // If the batch also contains SignalExternalWorkflow commands,
-                // write their history events BEFORE the local-activity events.
-                // This preserves correct replay ordering: on the next run
-                // drain_early_signals stashes the signal events so
-                // match_external_signal sees them before LocalActivityScheduled.
-                let commands = if commands
-                    .iter()
-                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. }))
-                {
+                // If the batch also contains SignalExternalWorkflow or
+                // RequestCancelExternalWorkflow commands, write their history events BEFORE
+                // the local-activity events. This preserves correct replay ordering: on the
+                // next run drain_early_signals stashes the external events so the matchers
+                // see them before LocalActivityScheduled.
+                let commands = if commands.iter().any(|c| {
+                    matches!(
+                        c,
+                        WorkflowCommand::SignalExternalWorkflow { .. }
+                            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+                    )
+                }) {
                     let (signal_items, remaining) = split_mixed_signal_batch(commands);
                     if !signal_items.is_empty() {
                         let new_events = match persist_external_signal_inline(
@@ -5450,6 +5696,7 @@ async fn process_workflow_task(
                             prepared.exec_id,
                             signal_items,
                             &mut next_event_id,
+                            &*telemetry.metrics,
                         )
                         .await
                         {
@@ -5573,20 +5820,24 @@ async fn process_workflow_task(
                 }
             }
             WorkflowOutcome::Suspended { commands }
-                if commands
-                    .iter()
-                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. }))
-                    && commands.iter().all(|c| {
-                        matches!(
-                            c,
-                            WorkflowCommand::SignalExternalWorkflow { .. }
-                                | WorkflowCommand::RecordMarker { .. }
-                                | WorkflowCommand::RecordSideEffect { .. }
-                                | WorkflowCommand::RecordUpdateResult { .. }
-                                | WorkflowCommand::UpsertSearchAttributes { .. }
-                                | WorkflowCommand::SetCurrentDetails { .. }
-                        )
-                    }) =>
+                if commands.iter().any(|c| {
+                    matches!(
+                        c,
+                        WorkflowCommand::SignalExternalWorkflow { .. }
+                            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+                    )
+                }) && commands.iter().all(|c| {
+                    matches!(
+                        c,
+                        WorkflowCommand::SignalExternalWorkflow { .. }
+                            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+                            | WorkflowCommand::RecordMarker { .. }
+                            | WorkflowCommand::RecordSideEffect { .. }
+                            | WorkflowCommand::RecordUpdateResult { .. }
+                            | WorkflowCommand::UpsertSearchAttributes { .. }
+                            | WorkflowCommand::SetCurrentDetails { .. }
+                    )
+                }) =>
             {
                 // Only enters this path when every non-bookkeeping command in the
                 // batch is a SignalExternalWorkflow (or RecordMarker). Mixed batches
@@ -5627,6 +5878,7 @@ async fn process_workflow_task(
                     prepared.exec_id,
                     items,
                     &mut next_event_id,
+                    &*telemetry.metrics,
                 )
                 .await
                 {
@@ -5661,22 +5913,38 @@ async fn process_workflow_task(
                     return Ok(());
                 }
 
-                // If any signal in the batch was not resolved inline (remains pending/suspended),
-                // we must break the loop and suspend the workflow task.
+                // If any signal or cancel in the batch was not resolved inline (remains
+                // pending/suspended), we must break the loop and suspend the workflow task.
                 let mut all_resolved = true;
                 for item in &items_clone {
-                    if let SignalBatchItem::Signal(run) = item {
-                        let resolved = new_events.iter().any(|e| match e {
-                            WorkflowEvent::ExternalSignalDelivered { signal_id }
-                            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
-                                *signal_id == run.signal_id
+                    match item {
+                        SignalBatchItem::Signal(run) => {
+                            let resolved = new_events.iter().any(|e| match e {
+                                WorkflowEvent::ExternalSignalDelivered { signal_id }
+                                | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                                    *signal_id == run.signal_id
+                                }
+                                _ => false,
+                            });
+                            if !resolved {
+                                all_resolved = false;
+                                break;
                             }
-                            _ => false,
-                        });
-                        if !resolved {
-                            all_resolved = false;
-                            break;
                         }
+                        SignalBatchItem::Cancel(run) => {
+                            let resolved = new_events.iter().any(|e| match e {
+                                WorkflowEvent::ExternalCancelDelivered { cancel_id }
+                                | WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
+                                    *cancel_id == run.cancel_id
+                                }
+                                _ => false,
+                            });
+                            if !resolved {
+                                all_resolved = false;
+                                break;
+                            }
+                        }
+                        SignalBatchItem::Marker(_) => {}
                     }
                 }
 
@@ -5701,6 +5969,17 @@ async fn process_workflow_task(
                                     },
                                 );
                             }
+                            SignalBatchItem::Cancel(run) => {
+                                let (dummy_tx, _) = tokio::sync::oneshot::channel();
+                                reconstructed_commands.push(
+                                    WorkflowCommand::RequestCancelExternalWorkflow {
+                                        cancel_id: run.cancel_id,
+                                        target: run.target,
+                                        result_tx: dummy_tx,
+                                        already_requested: run.already_requested,
+                                    },
+                                );
+                            }
                         }
                     }
 
@@ -5716,15 +5995,19 @@ async fn process_workflow_task(
                     );
                 }
             }
-            // Mixed batch: contains SignalExternalWorkflow AND other durable commands
-            // (ScheduleActivity, StartTimer, etc.). The "all signals" guard above did
-            // not match because not all commands are signals/markers. Write signal events
-            // to history FIRST (so drain_early_signals stashes them on the next replay
-            // pass), then break with the remaining commands for handle_suspended_workflow.
+            // Mixed batch: contains SignalExternalWorkflow or RequestCancelExternalWorkflow
+            // AND other durable commands (ScheduleActivity, StartTimer, etc.). The "all
+            // signals/cancels" guard above did not match. Write external-command events to
+            // history FIRST (so drain_early_signals stashes them on the next replay pass),
+            // then break with the remaining commands for handle_suspended_workflow.
             WorkflowOutcome::Suspended { commands }
-                if commands
-                    .iter()
-                    .any(|c| matches!(c, WorkflowCommand::SignalExternalWorkflow { .. })) =>
+                if commands.iter().any(|c| {
+                    matches!(
+                        c,
+                        WorkflowCommand::SignalExternalWorkflow { .. }
+                            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+                    )
+                }) =>
             {
                 if let Err(e) = persist_update_result_commands(
                     conn,
@@ -5757,6 +6040,7 @@ async fn process_workflow_task(
                     prepared.exec_id,
                     signal_items,
                     &mut next_event_id,
+                    &*telemetry.metrics,
                 )
                 .await
                 {
@@ -7469,6 +7753,7 @@ mod tests {
             module: "app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,

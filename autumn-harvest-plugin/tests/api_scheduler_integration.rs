@@ -113,6 +113,8 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
     ),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
     ),
@@ -389,6 +391,7 @@ fn approval_registry() -> Arc<HandlerRegistry> {
             module: "tests",
             handler: approval_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -412,6 +415,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 module: "tests",
                 handler: approval_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -428,6 +432,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 module: "tests",
                 handler: timer_then_signal_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -559,6 +564,8 @@ async fn insert_workflow_on_url(
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -639,6 +646,8 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -798,6 +807,10 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
         })
@@ -1124,6 +1137,10 @@ async fn seed_scheduled_activity_task_from_url(
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
         })
@@ -1925,6 +1942,7 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
         module: "tests",
         handler: approval_workflow,
         execution_timeout: None,
+        sla: None,
         concurrency: None,
         max_input_bytes: None,
         owner: None,
@@ -2827,6 +2845,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 module: "tests",
                 handler: approval_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -2862,6 +2881,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 module: "tests",
                 handler: approval_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
 
@@ -2940,6 +2960,7 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
             module: "tests",
             handler: parallel_activities_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -2994,6 +3015,7 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
             module: "tests",
             handler: staggered_parallel_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -3057,6 +3079,7 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
             module: "tests",
             handler: parallel_same_activity_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -3107,6 +3130,7 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
             module: "tests",
             handler: barrier_parallel_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -3166,6 +3190,7 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
             module: "tests",
             handler: timeout_completion_race_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -3789,6 +3814,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
             module: "tests",
             handler: manual_pipeline_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -4716,6 +4742,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             module: "tests",
             handler: interval_pipeline_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 
@@ -4824,6 +4851,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
             module: "tests",
             handler: interval_pipeline_workflow,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 

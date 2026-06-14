@@ -66,6 +66,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
     "\n",
     include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
@@ -160,6 +162,7 @@ fn make_registry(workflow_name: &'static str) -> Arc<HandlerRegistry> {
             module: "scheduler_ha_tests",
             handler: noop_handler,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 

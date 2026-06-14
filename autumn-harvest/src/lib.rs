@@ -294,8 +294,9 @@ pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
 };
 pub use types::{
-    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ParentClosePolicy,
-    Priority, ShardId, TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
+    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalCancelId,
+    ExternalSignalId, ParentClosePolicy, Priority, ShardId, TimerId, UpdateId, WorkerId,
+    WorkflowId, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]

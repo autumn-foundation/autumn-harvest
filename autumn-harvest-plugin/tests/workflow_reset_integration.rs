@@ -89,6 +89,8 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
     ),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
     ),
@@ -278,6 +280,8 @@ async fn seed_execution(
             runbook_url: None,
             severity: None,
             context_headers: None,
+
+            sla: None,
             schedule_id: None,
             scheduled_for: None,
         },
@@ -509,6 +513,7 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
             module: "workflow_reset_integration",
             handler: replay_checkpoints_then_signal,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
 

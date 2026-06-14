@@ -219,6 +219,7 @@ fn make_registry_for(
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            sla: None,
         }],
         vec![],
     ))
@@ -426,6 +427,7 @@ async fn manual_start_has_no_carryover() {
             runbook_url: None,
             severity: None,
             context_headers: None,
+            sla: None,
             schedule_id: None, // explicitly None for manual start
             scheduled_for: None,
         },

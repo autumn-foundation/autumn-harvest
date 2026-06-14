@@ -430,6 +430,7 @@ pub mod flows {
                 module: "flows",
                 handler: |_, _| Box::pin(async { Ok(::autumn_harvest::serde_json::Value::Null) }),
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
                 owner: None,
@@ -482,6 +483,7 @@ pub mod relative_test_self {
                         Box::pin(async { Ok(::autumn_harvest::serde_json::Value::Null) })
                     },
                     execution_timeout: None,
+                    sla: None,
                     concurrency: None,
                     max_input_bytes: None,
                     owner: None,
@@ -522,6 +524,7 @@ pub mod relative_test_super {
                         Box::pin(async { Ok(::autumn_harvest::serde_json::Value::Null) })
                     },
                     execution_timeout: None,
+                    sla: None,
                     concurrency: None,
                     max_input_bytes: None,
                     owner: None,
@@ -566,6 +569,7 @@ pub mod relative_test_plain {
                         Box::pin(async { Ok(::autumn_harvest::serde_json::Value::Null) })
                     },
                     execution_timeout: None,
+                    sla: None,
                     concurrency: None,
                     max_input_bytes: None,
                     owner: None,

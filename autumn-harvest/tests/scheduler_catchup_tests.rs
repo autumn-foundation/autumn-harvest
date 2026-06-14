@@ -183,6 +183,7 @@ fn make_registry(workflow_name: &'static str) -> Arc<HandlerRegistry> {
             module: "scheduler_catchup_tests",
             handler: noop_handler,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,

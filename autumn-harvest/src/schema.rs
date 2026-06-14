@@ -50,6 +50,19 @@ diesel::table! {
         current_details -> Nullable<Text>,
         /// Per-execution ambient context headers (issue #481). NULL = empty map.
         context_headers -> Nullable<Jsonb>,
+        /// Optional declared SLA budget for soft breach signal (issue #487).
+        /// Stored so continue-as-new / reset can re-anchor per run. NULL = no SLA.
+        sla -> Nullable<Interval>,
+        /// Absolute UTC deadline for soft SLA enforcement (issue #487).
+        /// Computed at start as `started_at + sla`. NULL = no SLA declared.
+        sla_deadline_at -> Nullable<Timestamptz>,
+        /// Whether the soft SLA deadline has been breached (issue #487).
+        /// Set exactly once by the scanner; never by the workflow engine.
+        /// Leaves `harvest_events` untouched (zero replay footprint).
+        sla_breached -> Bool,
+        /// Wall-clock instant the SLA was first detected as breached (issue #487).
+        /// `NULL` when `sla_breached = false`.
+        sla_breached_at -> Nullable<Timestamptz>,
         /// Schedule that fired this execution (issue #488). NULL for manual starts.
         /// Used to resolve the last-completion-result carryover at workflow start time.
         schedule_id -> Nullable<Uuid>,

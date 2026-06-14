@@ -195,6 +195,10 @@ async fn insert_version_execution_with_markers(
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
     };

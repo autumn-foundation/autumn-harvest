@@ -80,6 +80,8 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
     ),
     "\n",
+    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
     ),
@@ -293,6 +295,10 @@ async fn insert_execution(database_url: &str, shard: i32, workflow_name: &str) -
         runbook_url: None,
         severity: None,
         context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
     };
