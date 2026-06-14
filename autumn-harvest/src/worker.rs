@@ -1237,134 +1237,161 @@ async fn persist_external_signal_inline(
     next_event_id: &mut i32,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<Vec<WorkflowEvent>> {
-    let mut new_events: Vec<WorkflowEvent> = Vec::new();
+    let start_next = *next_event_id;
 
-    for item in items {
-        match item {
-            SignalBatchItem::Marker(event) => {
-                store::append_events(conn, exec_id, std::slice::from_ref(&event), *next_event_id)
-                    .await?;
-                *next_event_id += 1;
-                new_events.push(event);
-            }
-            SignalBatchItem::Signal(run) => {
-                if !run.already_requested {
-                    let requested = WorkflowEvent::ExternalSignalRequested {
-                        signal_id: run.signal_id,
-                        target: run.target,
-                        signal_name: run.signal_name.clone(),
-                        payload: run.payload.clone(),
-                    };
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        std::slice::from_ref(&requested),
-                        *next_event_id,
-                    )
-                    .await?;
-                    *next_event_id += 1;
-                    new_events.push(requested);
-                }
+    // Persist the whole inline batch (request + delivery + terminal appends) in a
+    // single transaction so a concurrently-running outbox sweep (on another
+    // connection/worker) never observes an `External{Signal,Cancel}Requested`
+    // event without its terminal: after commit both are visible, before commit
+    // neither is. Without this the outbox could see the half-written request,
+    // deliver it, and append the terminal first, leaving the inline path to
+    // append the same terminal at a now-stale `next_event_id` — a history write
+    // conflict that fails the caller even though delivery succeeded (issue #492).
+    let (new_events, final_next) = conn
+        .transaction::<(Vec<WorkflowEvent>, i32), HarvestError, _>(|conn| {
+            async move {
+                let mut new_events: Vec<WorkflowEvent> = Vec::new();
+                let mut next = start_next;
 
-                // If cross-shard, skip inline delivery entirely and let the background outbox handle it.
-                if run.target.shard() != exec_id.shard() {
-                    continue;
-                }
+                for item in items {
+                    match item {
+                        SignalBatchItem::Marker(event) => {
+                            store::append_events(conn, exec_id, std::slice::from_ref(&event), next)
+                                .await?;
+                            next += 1;
+                            new_events.push(event);
+                        }
+                        SignalBatchItem::Signal(run) => {
+                            if !run.already_requested {
+                                let requested = WorkflowEvent::ExternalSignalRequested {
+                                    signal_id: run.signal_id,
+                                    target: run.target,
+                                    signal_name: run.signal_name.clone(),
+                                    payload: run.payload.clone(),
+                                };
+                                store::append_events(
+                                    conn,
+                                    exec_id,
+                                    std::slice::from_ref(&requested),
+                                    next,
+                                )
+                                .await?;
+                                next += 1;
+                                new_events.push(requested);
+                            }
 
-                // Same-shard delivery attempt
-                let terminal_opt = match signal::send_signal(
-                    conn,
-                    run.target,
-                    &run.signal_name,
-                    run.payload,
-                )
-                .await
-                {
-                    Ok(()) => Some(WorkflowEvent::ExternalSignalDelivered {
-                        signal_id: run.signal_id,
-                    }),
-                    Err(HarvestError::NotFound(_)) => {
-                        // Same-shard target not found: suspend inline delivery and leave resolution to outbox.
-                        None
+                            // If cross-shard, skip inline delivery entirely and let
+                            // the background outbox handle it.
+                            if run.target.shard() != exec_id.shard() {
+                                continue;
+                            }
+
+                            // Same-shard delivery attempt
+                            let terminal_opt = match signal::send_signal(
+                                conn,
+                                run.target,
+                                &run.signal_name,
+                                run.payload,
+                            )
+                            .await
+                            {
+                                Ok(()) => Some(WorkflowEvent::ExternalSignalDelivered {
+                                    signal_id: run.signal_id,
+                                }),
+                                Err(HarvestError::NotFound(_)) => {
+                                    // Same-shard target not found: suspend inline
+                                    // delivery and leave resolution to outbox.
+                                    None
+                                }
+                                Err(HarvestError::Database(e)) => {
+                                    return Err(HarvestError::Database(e));
+                                }
+                                Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
+                                    signal_id: run.signal_id,
+                                    reason_code: "target_terminal".to_string(),
+                                }),
+                            };
+
+                            if let Some(terminal) = terminal_opt {
+                                store::append_events(
+                                    conn,
+                                    exec_id,
+                                    std::slice::from_ref(&terminal),
+                                    next,
+                                )
+                                .await?;
+                                next += 1;
+                                new_events.push(terminal);
+                            }
+                        }
+                        SignalBatchItem::Cancel(run) => {
+                            if !run.already_requested {
+                                let requested = WorkflowEvent::ExternalCancelRequested {
+                                    cancel_id: run.cancel_id,
+                                    target: run.target,
+                                };
+                                store::append_events(
+                                    conn,
+                                    exec_id,
+                                    std::slice::from_ref(&requested),
+                                    next,
+                                )
+                                .await?;
+                                next += 1;
+                                new_events.push(requested);
+                            }
+
+                            // Cross-shard: leave for the outbox scanner.
+                            if run.target.shard() != exec_id.shard() {
+                                continue;
+                            }
+
+                            // Same-shard cancel attempt.
+                            // Already-CANCELLED and already-terminal targets are
+                            // no-op success (goal "target not running" already met).
+                            let terminal_opt = match cancel_workflow_execution(
+                                conn,
+                                run.target,
+                                "cancelled by external request",
+                                metrics,
+                            )
+                            .await
+                            {
+                                Err(HarvestError::NotFound(_)) => {
+                                    // Target not found: leave for outbox grace window.
+                                    None
+                                }
+                                Err(HarvestError::Database(e)) => {
+                                    return Err(HarvestError::Database(e));
+                                }
+                                // Ok or other Err (already terminal) = no-op success.
+                                Ok(_) | Err(_) => Some(WorkflowEvent::ExternalCancelDelivered {
+                                    cancel_id: run.cancel_id,
+                                }),
+                            };
+
+                            if let Some(terminal) = terminal_opt {
+                                store::append_events(
+                                    conn,
+                                    exec_id,
+                                    std::slice::from_ref(&terminal),
+                                    next,
+                                )
+                                .await?;
+                                next += 1;
+                                new_events.push(terminal);
+                            }
+                        }
                     }
-                    Err(HarvestError::Database(e)) => return Err(HarvestError::Database(e)),
-                    Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
-                        signal_id: run.signal_id,
-                        reason_code: "target_terminal".to_string(),
-                    }),
-                };
-
-                if let Some(terminal) = terminal_opt {
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        std::slice::from_ref(&terminal),
-                        *next_event_id,
-                    )
-                    .await?;
-                    *next_event_id += 1;
-                    new_events.push(terminal);
                 }
+
+                Ok((new_events, next))
             }
-            SignalBatchItem::Cancel(run) => {
-                if !run.already_requested {
-                    let requested = WorkflowEvent::ExternalCancelRequested {
-                        cancel_id: run.cancel_id,
-                        target: run.target,
-                    };
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        std::slice::from_ref(&requested),
-                        *next_event_id,
-                    )
-                    .await?;
-                    *next_event_id += 1;
-                    new_events.push(requested);
-                }
+            .scope_boxed()
+        })
+        .await?;
 
-                // Cross-shard: leave for the outbox scanner.
-                if run.target.shard() != exec_id.shard() {
-                    continue;
-                }
-
-                // Same-shard cancel attempt.
-                // Already-CANCELLED and already-terminal targets are no-op success
-                // (goal "target not running" is already met).
-                let terminal_opt = match cancel_workflow_execution(
-                    conn,
-                    run.target,
-                    "cancelled by external request",
-                    metrics,
-                )
-                .await
-                {
-                    Err(HarvestError::NotFound(_)) => {
-                        // Target not found: leave for outbox grace window.
-                        None
-                    }
-                    Err(HarvestError::Database(e)) => return Err(HarvestError::Database(e)),
-                    // Ok or other Err (already terminal) = no-op success.
-                    Ok(_) | Err(_) => Some(WorkflowEvent::ExternalCancelDelivered {
-                        cancel_id: run.cancel_id,
-                    }),
-                };
-
-                if let Some(terminal) = terminal_opt {
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        std::slice::from_ref(&terminal),
-                        *next_event_id,
-                    )
-                    .await?;
-                    *next_event_id += 1;
-                    new_events.push(terminal);
-                }
-            }
-        }
-    }
-
+    *next_event_id = final_next;
     Ok(new_events)
 }
 

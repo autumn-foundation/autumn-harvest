@@ -966,27 +966,20 @@ pub async fn enforce_external_signals_outbox(
                     let age = Utc::now() - row.timestamp;
                     let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
                         .map_or(chrono::Duration::MAX, |d| d);
+                    let grace_expired = age > grace_chrono;
 
-                    if age > grace_chrono {
-                        // Grace window expired!
-                        let failed_event = WorkflowEvent::ExternalSignalFailed {
+                    // A NotFound delivery attempt only becomes a permanent
+                    // `target_unknown` failure once the grace window has elapsed.
+                    // Within the window we leave the row pending (retried next
+                    // sweep) so a target that starts slightly after the request —
+                    // or that the outbox first sees after worker downtime/backlog —
+                    // is still signalled rather than wrongly reported unknown.
+                    let not_found_terminal = || {
+                        grace_expired.then(|| WorkflowEvent::ExternalSignalFailed {
                             signal_id,
                             reason_code: "target_unknown".to_string(),
-                        };
-
-                        let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
-                        store::append_events(
-                            conn,
-                            caller_exec_id,
-                            &[failed_event],
-                            history.next_event_id,
-                        )
-                        .await?;
-                        queue::wake_workflow_task(conn, caller_exec_id).await?;
-
-                        metrics.record_external_signal_sent("failed", Some("target_unknown"));
-                        return Ok(Some((true, None)));
-                    }
+                        })
+                    };
 
                     // Try to route target using the config's sharded pool if configured
                     let active_sharded_pool = sharded_pool
@@ -1019,9 +1012,7 @@ pub async fn enforce_external_signals_outbox(
                             Ok(()) => {
                                 Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
                             }
-                            Err(HarvestError::NotFound(_)) => {
-                                None
-                            }
+                            Err(HarvestError::NotFound(_)) => not_found_terminal(),
                             Err(HarvestError::Database(e)) => {
                                 tracing::error!(error = %e, "outbox sweep: db error during local signal delivery");
                                 None
@@ -1063,9 +1054,7 @@ pub async fn enforce_external_signals_outbox(
                             Ok(()) => {
                                 Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
                             }
-                            Err(HarvestError::NotFound(_)) => {
-                                None
-                            }
+                            Err(HarvestError::NotFound(_)) => not_found_terminal(),
                             Err(HarvestError::Database(e)) => {
                                 tracing::error!(error = %e, "outbox sweep: db error during remote signal delivery");
                                 None
@@ -1215,24 +1204,21 @@ pub async fn enforce_external_cancels_outbox(
                     let age = Utc::now() - row.timestamp;
                     let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
                         .map_or(chrono::Duration::MAX, |d| d);
+                    let grace_expired = age > grace_chrono;
 
-                    if age > grace_chrono {
-                        let failed_event = WorkflowEvent::ExternalCancelFailed {
+                    // A NotFound delivery attempt only becomes a permanent
+                    // `target_unknown` failure once the grace window has elapsed.
+                    // Within the window we leave the row pending (retried next
+                    // sweep) so a target that starts slightly after the request —
+                    // or that the outbox first sees after worker downtime/backlog —
+                    // is still cancelled rather than wrongly reported unknown.
+                    // (issue #492)
+                    let not_found_terminal = || {
+                        grace_expired.then(|| WorkflowEvent::ExternalCancelFailed {
                             cancel_id,
                             reason_code: "target_unknown".to_string(),
-                        };
-                        let history = lock_workflow_execution_and_load_history(conn, caller_exec_id).await?;
-                        store::append_events(
-                            conn,
-                            caller_exec_id,
-                            &[failed_event],
-                            history.next_event_id,
-                        )
-                        .await?;
-                        queue::wake_workflow_task(conn, caller_exec_id).await?;
-                        metrics.record_external_cancel_sent("failed", Some("target_unknown"));
-                        return Ok(Some((true, None)));
-                    }
+                        })
+                    };
 
                     let active_sharded_pool = sharded_pool
                         .clone()
@@ -1261,7 +1247,7 @@ pub async fn enforce_external_cancels_outbox(
                         )
                         .await
                         {
-                            Err(HarvestError::NotFound(_)) => None,
+                            Err(HarvestError::NotFound(_)) => not_found_terminal(),
                             Err(HarvestError::Database(e)) => {
                                 tracing::error!(error = %e, "cancel outbox sweep: db error");
                                 None
@@ -1299,7 +1285,7 @@ pub async fn enforce_external_cancels_outbox(
                         )
                         .await
                         {
-                            Err(HarvestError::NotFound(_)) => None,
+                            Err(HarvestError::NotFound(_)) => not_found_terminal(),
                             Err(HarvestError::Database(e)) => {
                                 tracing::error!(
                                     error = %e,
