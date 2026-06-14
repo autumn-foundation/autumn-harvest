@@ -92,6 +92,11 @@ pub struct StartWorkflowParams<'a> {
     /// Ambient string key-value context propagated to all activities and child
     /// workflows without threading through function signatures (issue #481).
     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    /// The `harvest_schedules.id` that triggered this execution (issue #488).
+    /// `None` for manually-started (non-scheduled) workflows. When `Some`, the
+    /// start path resolves the prior COMPLETED output and most-recent terminal
+    /// error for this schedule and freezes them into the `WorkflowStarted` event.
+    pub schedule_id: Option<uuid::Uuid>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -334,6 +339,7 @@ pub async fn start_or_load_workflow_execution(
             .context_headers
             .as_ref()
             .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
+        schedule_id: request.schedule_id,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -395,9 +401,23 @@ pub async fn start_or_load_workflow_execution(
                                 });
                             }
                         }
+                        // Resolve last-completion-result carryover (issue #488).
+                        // Runs inside the same transaction on the same shard-local
+                        // connection so the read is consistent with the just-inserted
+                        // row. Excludes the new row (`id != exec_id`) as a safety
+                        // guard — the new row has state RUNNING, not COMPLETED, so it
+                        // can never match, but the explicit exclusion is defensive.
+                        let (carryover_result, carryover_error) =
+                            if let Some(sched_id) = request.schedule_id {
+                                resolve_carryover(conn, sched_id, exec_id.as_uuid()).await?
+                            } else {
+                                (None, None)
+                            };
                         let started_event = WorkflowEvent::WorkflowStarted {
                             input: request.input.clone(),
                             timestamp: target_start_time,
+                            last_completion_result: carryover_result,
+                            last_error: carryover_error,
                         };
                         store::append_events(conn, exec_id, &[started_event], 0).await?;
                         queue::enqueue(conn, &enqueue).await?;
@@ -545,6 +565,8 @@ async fn replace_execution(
     let started_event = WorkflowEvent::WorkflowStarted {
         input: request.input.clone(),
         timestamp: start_timestamp,
+        last_completion_result: None,
+        last_error: None,
     };
     store::append_events(conn, new_exec_id, &[started_event], 0).await?;
     queue::enqueue(conn, enqueue).await?;
@@ -1725,6 +1747,7 @@ pub async fn signal_with_start_workflow_execution(
                     runbook_url: request.runbook_url,
                     severity: request.severity,
                     context_headers: request.context_headers.clone(),
+                    schedule_id: None,
                 };
 
             let started = start_or_load_workflow_execution(
@@ -2137,6 +2160,7 @@ pub async fn update_with_start_workflow_execution(
                     runbook_url: request.runbook_url,
                     severity: request.severity,
                     context_headers: request.context_headers.clone(),
+                    schedule_id: None,
                 };
 
             let started = start_or_load_workflow_execution(
@@ -2312,6 +2336,70 @@ async fn lookup_idempotent_update_dedupe(
         workflow_id: r.workflow_id,
         state: r.state,
     }))
+}
+
+/// Resolve the last-completion-result and last-error carryover for a schedule (issue #488).
+///
+/// Queries are shard-local, run on the same `conn` inside the start transaction,
+/// and exclude the just-inserted execution by `current_exec_id`.
+///
+/// Returns `(last_completion_result, last_error)` where:
+/// - `last_completion_result` = `output` of the most recent prior COMPLETED run.
+/// - `last_error` = `error` of the most recent terminal run if that run was
+///   `FAILED` or `TIMED_OUT`; `None` if the most recent terminal run `COMPLETED`.
+async fn resolve_carryover(
+    conn: &mut AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    current_exec_id: uuid::Uuid,
+) -> HarvestResult<(Option<serde_json::Value>, Option<String>)> {
+    use crate::schema::harvest_workflow_executions::dsl;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    // Most recent COMPLETED run for this schedule.
+    let last_completion_result: Option<serde_json::Value> = harvest_workflow_executions::table
+        .filter(dsl::schedule_id.eq(schedule_id))
+        .filter(dsl::state.eq("COMPLETED"))
+        .filter(dsl::completed_at.is_not_null())
+        .filter(dsl::id.ne(current_exec_id))
+        .order(dsl::completed_at.desc())
+        .limit(1)
+        .select(dsl::output)
+        .get_result::<Option<serde_json::Value>>(conn)
+        .await
+        .optional()
+        .map_err(database_error)?
+        .flatten();
+
+    // Most recent terminal run for this schedule (COMPLETED, FAILED, or TIMED_OUT).
+    // If it ended FAILED/TIMED_OUT, carry its error; if it COMPLETED, return None.
+    let last_terminal: Option<(String, Option<String>)> = harvest_workflow_executions::table
+        .filter(dsl::schedule_id.eq(schedule_id))
+        .filter(
+            dsl::state
+                .eq("COMPLETED")
+                .or(dsl::state.eq("FAILED"))
+                .or(dsl::state.eq("TIMED_OUT")),
+        )
+        .filter(dsl::completed_at.is_not_null())
+        .filter(dsl::id.ne(current_exec_id))
+        .order(dsl::completed_at.desc())
+        .limit(1)
+        .select((dsl::state, dsl::error))
+        .get_result::<(String, Option<String>)>(conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+
+    let last_error = last_terminal.and_then(|(state, error)| {
+        if state == "FAILED" || state == "TIMED_OUT" {
+            error
+        } else {
+            None
+        }
+    });
+
+    Ok((last_completion_result, last_error))
 }
 
 #[cfg(test)]

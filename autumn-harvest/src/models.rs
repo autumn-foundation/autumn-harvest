@@ -119,6 +119,8 @@ pub struct WorkflowExecution {
     /// tenant secrets and must not be exposed via management API responses.
     #[serde(skip)]
     pub context_headers: Option<serde_json::Value>,
+    /// Schedule that fired this execution (issue #488). `None` for manual starts.
+    pub schedule_id: Option<Uuid>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -148,6 +150,8 @@ pub struct NewWorkflowExecution<'a> {
     pub severity: Option<&'a str>,
     /// Ambient context headers (issue #481). `None` = no headers.
     pub context_headers: Option<serde_json::Value>,
+    /// Schedule that fired this execution (issue #488). `None` for manual starts.
+    pub schedule_id: Option<Uuid>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────

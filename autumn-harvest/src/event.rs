@@ -73,6 +73,16 @@ pub enum WorkflowEvent {
         input: serde_json::Value,
         /// Time when the workflow was initiated.
         timestamp: DateTime<Utc>,
+        /// Output of the most recent prior COMPLETED run of the same schedule (issue #488).
+        /// `None` for the first run, for manual (non-scheduled) starts, and when no prior
+        /// run succeeded. Frozen at workflow start time; replay always returns this value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_completion_result: Option<serde_json::Value>,
+        /// Failure summary of the most recent terminal run if it ended `FAILED` or `TIMED_OUT`
+        /// (issue #488). `None` when the most recent terminal run `COMPLETED` (i.e. recovered),
+        /// and `None` for manual starts. Frozen at workflow start time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_error: Option<String>,
     },
     /// The workflow ran to completion without an error.
     WorkflowCompleted {
@@ -703,6 +713,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"user_id": 42}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let json = serde_json::to_string(&event)?;
         let back: WorkflowEvent = serde_json::from_str(&json)?;
@@ -801,6 +813,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::Value::Null,

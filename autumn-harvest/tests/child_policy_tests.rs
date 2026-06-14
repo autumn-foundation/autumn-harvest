@@ -383,6 +383,8 @@ async fn insert_detached_child_execution(
         &[WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -966,6 +968,8 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
         &[WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )

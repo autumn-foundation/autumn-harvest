@@ -204,6 +204,8 @@ async fn persist_canonical_history(
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,

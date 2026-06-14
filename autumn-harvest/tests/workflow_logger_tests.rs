@@ -154,6 +154,8 @@ fn make_full_history() -> Vec<WorkflowEvent> {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: act1,
@@ -196,6 +198,8 @@ fn live_ctx() -> WorkflowContext {
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
 }
@@ -235,6 +239,8 @@ async fn logger_emits_event_in_live_mode() {
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     let outcome = run_workflow(exec_id, history, logging_workflow_via_logger, Value::Null).await;
     assert!(
@@ -259,6 +265,8 @@ async fn logger_suppresses_events_during_full_replay() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: act1,
@@ -294,6 +302,8 @@ async fn direct_log_methods_suppressed_during_replay() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: act1,
@@ -327,6 +337,8 @@ async fn direct_log_methods_emit_in_live_mode() {
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     let outcome = run_workflow(exec_id, history, logging_workflow_direct, Value::Null).await;
     assert!(
@@ -356,6 +368,8 @@ async fn log_events_independent_of_replay_cycle_count() {
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
         let outcome = run_workflow(
             exec_id,
@@ -407,6 +421,8 @@ fn logger_emits_execution_id_field() {
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     );
 
@@ -436,6 +452,8 @@ fn logger_emits_workflow_type_field() {
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .with_workflow_name("my_workflow");
@@ -469,6 +487,8 @@ fn logger_emits_replay_false_field() {
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     );
 
@@ -496,6 +516,8 @@ fn logger_emits_workflow_id_field() {
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .with_workflow_id("order-42");
@@ -529,6 +551,8 @@ fn log_level_matches_method() {
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     );
 
@@ -617,6 +641,8 @@ fn with_workflow_id_sets_id() {
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .with_workflow_id("subscription-99");
@@ -638,6 +664,8 @@ async fn replayer_produces_zero_log_events() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: act1,

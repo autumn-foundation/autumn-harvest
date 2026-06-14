@@ -106,6 +106,8 @@ impl WorkflowSimulator {
         let mut history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
             timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         loop {

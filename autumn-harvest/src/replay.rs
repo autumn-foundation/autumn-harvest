@@ -3013,6 +3013,8 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let mut matcher = HistoryMatcher::new(events);
@@ -3432,6 +3434,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::json!({"done": true}),
@@ -3869,6 +3873,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowExecutionPaused {
                 paused_at: chrono::Utc::now(),

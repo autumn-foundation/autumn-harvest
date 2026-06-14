@@ -168,6 +168,8 @@ async fn fan_out_raw_three_parallel_all_succeed() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "fan_out:1".into(),
@@ -233,6 +235,8 @@ async fn fan_out_raw_fail_fast_on_first_failure() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "fan_out:1".into(),
@@ -300,6 +304,8 @@ async fn fan_out_collect_all_returns_per_slot_results() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "fan_out:1".into(),
@@ -373,6 +379,8 @@ async fn fan_out_empty_activities_returns_empty_vec() {
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
 
     let outcome = run_workflow(exec_id, history, fan_out_empty, Value::Null).await;
@@ -399,6 +407,8 @@ async fn fan_out_raw_live_execution_emits_marker_and_schedule_commands() {
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
 
     let outcome = run_workflow(exec_id, history, fan_out_three_parallel, Value::Null).await;
@@ -449,6 +459,8 @@ async fn fan_out_count_mismatch_returns_non_deterministic_error() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "fan_out:1".into(),
@@ -514,6 +526,8 @@ async fn fan_out_dynamic_from_prior_activity_replays_correctly() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         // Prior activity returns a list of 3 items
         WorkflowEvent::ActivityScheduled {
@@ -587,6 +601,8 @@ async fn fan_out_cancelled_workflow_returns_cancelled_error() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::WorkflowCancelled {
             reason: "user_requested".into(),
@@ -645,6 +661,8 @@ async fn fan_out_typed_single_activity_type_replays_correctly() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "fan_out:1".into(),
@@ -716,6 +734,8 @@ async fn fan_out_typed_collect_all_returns_per_slot_results() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "fan_out:1".into(),
@@ -802,6 +822,8 @@ async fn fan_out_two_groups_in_same_workflow() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         // First fan-out group (seq=1, count=2)
         WorkflowEvent::MarkerRecorded {

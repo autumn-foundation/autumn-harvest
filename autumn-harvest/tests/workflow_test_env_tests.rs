@@ -1101,3 +1101,79 @@ async fn test_receive_signal_timeout_timeout_branch() {
         "timeout branch must replay deterministically:\n{report}"
     );
 }
+
+// ── issue #488: last_completion_result / last_error carryover (unit) ─────────
+
+fn carryover_reader_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let cursor: Option<Value> = ctx
+            .last_completion_result::<Value>()
+            .map_err(|e| e.to_string())?;
+        let err: Option<String> = ctx.last_error();
+        Ok(json!({"cursor": cursor, "last_error": err}))
+    })
+}
+
+/// No carryover seeded → both accessors return None.
+#[tokio::test]
+async fn test_last_completion_result_none_on_first_run() {
+    let outcome = WorkflowTestEnv::new()
+        .run(carryover_reader_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"cursor": null, "last_error": null}))
+    );
+}
+
+/// Seeded carryover is returned by last_completion_result and last_error returns None.
+#[tokio::test]
+async fn test_last_completion_result_seeded_value() {
+    let cursor = json!({"processed_at": "2026-06-14T00:00:00Z", "cursor": 42});
+    let outcome = WorkflowTestEnv::new()
+        .with_last_completion_result(cursor.clone())
+        .run(carryover_reader_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"cursor": cursor, "last_error": null}))
+    );
+}
+
+/// Seeded last_error is returned; last_completion_result still shows the prior value.
+#[tokio::test]
+async fn test_last_error_seeded_value() {
+    let prior_result = json!({"cursor": 10});
+    let outcome = WorkflowTestEnv::new()
+        .with_last_completion_result(prior_result.clone())
+        .with_last_error("upstream timed out")
+        .run(carryover_reader_workflow, json!(null))
+        .await;
+    assert_eq!(
+        outcome.result,
+        Ok(json!({
+            "cursor": prior_result,
+            "last_error": "upstream timed out"
+        }))
+    );
+}
+
+/// Replay determinism: the seeded carryover must replay identically.
+#[tokio::test]
+async fn test_last_completion_result_replays_deterministically() {
+    let cursor = json!({"cursor": 99});
+    let outcome = WorkflowTestEnv::new()
+        .with_last_completion_result(cursor)
+        .run(carryover_reader_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+
+    let report = outcome.replay_check(carryover_reader_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "carryover must replay deterministically:\n{report}"
+    );
+}

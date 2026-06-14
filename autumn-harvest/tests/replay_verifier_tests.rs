@@ -74,6 +74,8 @@ fn canonical_snapshot_json(workflow_name: &str) -> String {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -113,6 +115,8 @@ fn unregistered_snapshot_json() -> String {
         events: vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         context_headers: None,
     };

@@ -353,6 +353,7 @@ impl DeferredTriggerStart {
                     runbook_url: self.runbook_url.as_deref(),
                     severity: self.severity.as_deref(),
                     context_headers: None,
+                    schedule_id: None,
                 },
             )
             .await;
@@ -570,6 +571,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         runbook_url: target_runbook_url.as_deref(),
                         severity: target_severity.as_deref(),
                         context_headers: None,
+                        schedule_id: None,
                     },
                 )
                 .await
@@ -771,6 +773,7 @@ pub async fn enforce_completion_triggers_outbox(
                 runbook_url: target_runbook_url.as_deref(),
                 severity: target_severity.as_deref(),
                 context_headers: None,
+                schedule_id: None,
             },
         )
         .await;

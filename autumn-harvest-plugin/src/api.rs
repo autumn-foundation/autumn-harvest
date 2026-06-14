@@ -916,6 +916,12 @@ struct WorkflowDetailsResponse {
     execution: WorkflowExecution,
     history: Vec<Value>,
     external_handoffs: Vec<ExternalHandoffResponse>,
+    /// Output of the most recent prior COMPLETED run of the same schedule, if any (issue #488).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_completion_result: Option<Value>,
+    /// Error from the most recent terminal run if it ended FAILED or TIMED_OUT (issue #488).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4125,6 +4131,20 @@ async fn get_workflow(
     let history = store::load_history(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
+
+    // Extract carryover from the first (WorkflowStarted) event before consuming the vec.
+    let (last_completion_result, last_error) =
+        if let Some(autumn_harvest::event::WorkflowEvent::WorkflowStarted {
+            last_completion_result,
+            last_error,
+            ..
+        }) = history.events.as_slice().first()
+        {
+            (last_completion_result.clone(), last_error.clone())
+        } else {
+            (None, None)
+        };
+
     let events = history
         .events
         .into_iter()
@@ -4149,6 +4169,8 @@ async fn get_workflow(
         execution,
         history: events,
         external_handoffs,
+        last_completion_result,
+        last_error,
     }))
 }
 
@@ -5554,6 +5576,7 @@ async fn start_workflow(
             runbook_url,
             severity,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await;
@@ -6094,6 +6117,7 @@ async fn batch_start_workflows(
                     runbook_url,
                     severity,
                     context_headers: None,
+                    schedule_id: None,
                 },
             )
             .await;
@@ -10398,6 +10422,7 @@ async fn trigger_schedule_now(
             runbook_url,
             severity,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await;
@@ -11023,6 +11048,7 @@ async fn schedule_backfill(
                         runbook_url,
                         severity,
                         context_headers: None,
+                        schedule_id: None,
                     },
                 )
                 .await;
@@ -11165,6 +11191,7 @@ async fn schedule_backfill(
                         runbook_url,
                         severity,
                         context_headers: None,
+                        schedule_id: None,
                     },
                 )
                 .await;
@@ -18358,6 +18385,7 @@ mod tests {
                 runbook_url: None,
                 severity: None,
                 context_headers: None,
+                schedule_id: None,
             },
         )
         .await

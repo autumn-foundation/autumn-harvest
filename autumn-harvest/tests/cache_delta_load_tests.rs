@@ -183,6 +183,8 @@ async fn cold_path_reads_full_history_every_task() {
     let mut initial: Vec<WorkflowEvent> = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     initial.extend(make_activity_events(24)); // 48 activity events → 49 total
     store::append_events(&mut conn, exec_id, &initial, 0)
@@ -228,6 +230,8 @@ async fn warm_path_delta_load_reads_only_new_events() {
     let mut initial: Vec<WorkflowEvent> = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     initial.extend(make_activity_events(24)); // 48 events → 49 total
     initial.push(WorkflowEvent::TimerStarted {
@@ -320,6 +324,8 @@ async fn sticky_routing_on_vs_off_reload_count() {
     let mut initial: Vec<WorkflowEvent> = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     initial.extend(make_activity_events(24)); // 48 + 1 started = 49
     initial.push(WorkflowEvent::TimerStarted {

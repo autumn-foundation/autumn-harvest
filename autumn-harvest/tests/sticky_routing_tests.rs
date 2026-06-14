@@ -234,6 +234,8 @@ fn first_task_is_cache_miss_subsequent_tasks_on_same_worker_are_hits() {
         vec![WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
             timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         2,
     );

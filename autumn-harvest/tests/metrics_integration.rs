@@ -639,6 +639,8 @@ async fn workflow_and_activity_metrics_are_recorded() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -846,6 +848,8 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -965,6 +969,8 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "already-large".into(),
@@ -1096,6 +1102,8 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "already-large".into(),
@@ -1226,6 +1234,8 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 WorkflowEvent::WorkflowStarted {
                     input: workflow_input.clone(),
                     timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
                 },
                 WorkflowEvent::MarkerRecorded {
                     name: "side_effect:near-cap".into(),
@@ -1428,6 +1438,8 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "side_effect:near-cap-local-retry".into(),
@@ -1592,6 +1604,8 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -1760,6 +1774,8 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -2063,6 +2079,8 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),

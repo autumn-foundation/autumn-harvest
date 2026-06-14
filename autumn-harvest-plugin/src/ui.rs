@@ -5941,6 +5941,7 @@ async fn execute_schedule_trigger_ui(
             runbook_url,
             severity,
             context_headers: None,
+            schedule_id: None,
         },
     )
     .await;

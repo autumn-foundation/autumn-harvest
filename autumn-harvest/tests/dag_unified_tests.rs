@@ -187,6 +187,8 @@ async fn lowered_handler_replays_linear_dag_all_success() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_extract,
@@ -238,6 +240,8 @@ async fn lowered_handler_skips_all_success_downstream_on_upstream_failure() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_extract,
@@ -291,6 +295,8 @@ async fn lowered_handler_runs_alldone_downstream_on_upstream_failure() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_extract,
@@ -343,6 +349,8 @@ async fn lowered_handler_propagates_activity_replay_mismatch() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_extract,
@@ -376,6 +384,8 @@ async fn assert_root_trigger_rule_skips_without_upstreams(
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
 
     let report = WorkflowReplayer::new()
@@ -492,6 +502,8 @@ async fn lowered_handler_merges_dag_task_into_object_workflow_input() {
         WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_extract,
@@ -526,6 +538,8 @@ async fn lowered_handler_wraps_scalar_workflow_input_with_conf_and_dag_task() {
         WorkflowEvent::WorkflowStarted {
             input: json!("manual-run"),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_extract,
@@ -727,6 +741,8 @@ async fn lowered_handler_replays_fanout_dag() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         // Level 0: extract_users
         WorkflowEvent::ActivityScheduled {
@@ -780,6 +796,8 @@ async fn lowered_handler_leaves_queue_empty_when_dag_task_has_no_queue() {
         vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         __autumn_workflow_info_alldone_dag().handler,
         Value::Null,
@@ -905,6 +923,8 @@ async fn condition_false_branch_replays_with_skip_marker() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         // Level 0: score_payment runs
         WorkflowEvent::ActivityScheduled {
@@ -981,6 +1001,8 @@ async fn condition_true_branch_schedules_activity() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_score,
@@ -1115,6 +1137,8 @@ async fn condition_flip_is_reported_as_nondeterminism() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_score,
@@ -1241,6 +1265,8 @@ async fn condition_branch_replay_sweep_1000() {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: id_score,

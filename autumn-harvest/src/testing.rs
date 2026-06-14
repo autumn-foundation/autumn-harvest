@@ -1675,6 +1675,11 @@ pub struct WorkflowTestEnv {
     cancellation_reason: Option<String>,
     /// Shared typed state injected into the `WorkflowContext`.
     state: SharedState,
+    /// Simulated last-completion-result for testing incremental scheduled jobs (issue #488).
+    /// Injected as `last_completion_result` into the seed `WorkflowStarted` event.
+    last_completion_result: Option<serde_json::Value>,
+    /// Simulated last-error for testing incremental scheduled jobs (issue #488).
+    last_error: Option<String>,
 }
 
 impl Default for WorkflowTestEnv {
@@ -1698,6 +1703,8 @@ impl WorkflowTestEnv {
             queued_signals: Vec::new(),
             cancellation_reason: None,
             state: empty_shared_state(),
+            last_completion_result: None,
+            last_error: None,
         }
     }
 
@@ -1836,6 +1843,31 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Seed the test environment with a prior successful run's result, as if the
+    /// same schedule had previously completed with `value` as its output.
+    ///
+    /// The value is frozen into the seed `WorkflowStarted` event, mirroring
+    /// `ctx.last_completion_result::<T>()` in production scheduled runs.
+    ///
+    /// # Panics
+    /// Panics if `value` cannot be serialized (unreachable for well-formed types).
+    #[must_use]
+    pub fn with_last_completion_result<T: serde::Serialize>(mut self, value: T) -> Self {
+        self.last_completion_result =
+            Some(serde_json::to_value(value).expect("last_completion_result must be serializable"));
+        self
+    }
+
+    /// Seed the test environment with a prior run's error, as if the most recent
+    /// terminal run ended with `FAILED` or `TIMED_OUT`.
+    ///
+    /// Mirrors `ctx.last_error()` in production scheduled runs.
+    #[must_use]
+    pub fn with_last_error(mut self, error: impl Into<String>) -> Self {
+        self.last_error = Some(error.into());
+        self
+    }
+
     /// Inject typed shared state accessible via `ctx.state::<T>()` inside the
     /// workflow function.
     ///
@@ -1879,6 +1911,8 @@ impl WorkflowTestEnv {
         let mut history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
             timestamp: self.simulated_now,
+            last_completion_result: self.last_completion_result.clone(),
+            last_error: self.last_error.clone(),
         }];
         if let Some(reason) = &self.cancellation_reason {
             history.push(WorkflowEvent::WorkflowCancelled {
@@ -2500,6 +2534,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: aid,
@@ -2520,6 +2556,8 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: serde_json::json!("hi"),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
         let replayer = WorkflowReplayer::new().register_fn("simple", simple_workflow);
         let report = replayer.replay_from_events(events).await;
@@ -2541,6 +2579,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,

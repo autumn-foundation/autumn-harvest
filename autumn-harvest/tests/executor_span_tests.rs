@@ -115,6 +115,8 @@ fn executor_emits_harvest_workflow_execute_span() {
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
 
     tokio::runtime::Builder::new_current_thread()
@@ -144,6 +146,8 @@ fn executor_no_longer_emits_old_harvest_workflow_run_span() {
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
 
     tokio::runtime::Builder::new_current_thread()
@@ -174,6 +178,8 @@ fn executor_span_has_attr_execution_id_field() {
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
 
     tokio::runtime::Builder::new_current_thread()
@@ -211,6 +217,8 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
 
     tokio::runtime::Builder::new_current_thread()
@@ -267,6 +275,8 @@ fn live_executor_span_has_replay_false() {
     let history = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
 
     tokio::runtime::Builder::new_current_thread()

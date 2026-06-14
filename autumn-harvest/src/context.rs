@@ -765,6 +765,13 @@ pub struct WorkflowContext {
     /// automatically to all activities and child workflows (issue #481).
     /// Immutable after construction; read via `header()` / `headers()`.
     context_headers: std::sync::Arc<HashMap<String, String>>,
+    /// Frozen output of the most recent prior COMPLETED run of the same schedule (issue #488).
+    /// `None` for manual starts, first scheduled run, or when no prior run succeeded.
+    /// Resolved once at workflow start and frozen into the `WorkflowStarted` event.
+    last_completion_result: Option<serde_json::Value>,
+    /// Frozen error from the most recent terminal run if it ended `FAILED` or `TIMED_OUT` (issue #488).
+    /// `None` when the most recent terminal run `COMPLETED` (recovery) or for manual starts.
+    last_error: Option<String>,
 }
 
 impl WorkflowContext {
@@ -857,20 +864,30 @@ impl WorkflowContext {
         )
     }
 
+    #[must_use]
     pub fn for_replay_with_state_and_history_policy(
         exec_id: ExecutionId,
         events: Vec<WorkflowEvent>,
         state: SharedState,
         history_policy: WorkflowHistoryPolicy,
     ) -> Self {
-        // Extract the start_time from WorkflowStarted (first event).
-        let start_time = events
+        // Extract start_time, last_completion_result, and last_error from WorkflowStarted (first event).
+        let (start_time, last_completion_result, last_error) = events
             .first()
             .and_then(|e| match e {
-                WorkflowEvent::WorkflowStarted { timestamp, .. } => Some(*timestamp),
+                WorkflowEvent::WorkflowStarted {
+                    timestamp,
+                    last_completion_result,
+                    last_error,
+                    ..
+                } => Some((
+                    *timestamp,
+                    last_completion_result.clone(),
+                    last_error.clone(),
+                )),
                 _ => None,
             })
-            .unwrap_or_else(Utc::now);
+            .unwrap_or_else(|| (Utc::now(), None, None));
 
         // Capture any terminal cancellation event so workflow code can detect
         // it via `is_cancelled()` / `check_cancellation()` during replay.
@@ -912,6 +929,8 @@ impl WorkflowContext {
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
             context_headers: std::sync::Arc::new(HashMap::new()),
+            last_completion_result,
+            last_error,
         }
     }
 
@@ -1000,6 +1019,8 @@ impl WorkflowContext {
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
             context_headers: std::sync::Arc::new(HashMap::new()),
+            last_completion_result: None,
+            last_error: None,
         })
     }
 
@@ -1038,6 +1059,8 @@ impl WorkflowContext {
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
             context_headers: std::sync::Arc::new(HashMap::new()),
+            last_completion_result: None,
+            last_error: None,
         }
     }
 
@@ -1150,6 +1173,43 @@ impl WorkflowContext {
     #[must_use]
     pub fn build_id(&self) -> Option<&str> {
         self.build_id.as_deref()
+    }
+
+    // ── Last-completion-result carryover (issue #488) ─────────────────────────
+
+    /// Returns the deserialized output of the most recent prior COMPLETED run of the same
+    /// scheduled workflow, or `None` on the first run, when no prior run has succeeded,
+    /// or when this is a manual (non-scheduled) start.
+    ///
+    /// The value is frozen into the `WorkflowStarted` event at start time, so replay
+    /// always returns the same result regardless of which worker processes the task.
+    ///
+    /// # Errors
+    /// Returns `HarvestError::Deserialize` if the stored JSON cannot be deserialized into `T`.
+    pub fn last_completion_result<T>(&self) -> crate::error::HarvestResult<Option<T>>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        self.last_completion_result.as_ref().map_or_else(
+            || Ok(None),
+            |v| {
+                serde_json::from_value(v.clone())
+                    .map(Some)
+                    .map_err(Into::into)
+            },
+        )
+    }
+
+    /// Returns the error message from the most recent terminal run of the same schedule if
+    /// it ended `FAILED` or `TIMED_OUT`, or `None` if that run completed successfully or
+    /// this is a manual (non-scheduled) start.
+    ///
+    /// Mirrors Temporal's `GetLastError()` cron primitive. Use this together with
+    /// [`last_completion_result`](Self::last_completion_result) to implement the
+    /// "did we recover from a failure?" branch in incremental jobs.
+    #[must_use]
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error.clone()
     }
 
     // ── Context headers (issue #481) ──────────────────────────────────────────
@@ -5396,6 +5456,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -5424,6 +5486,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "poll-cycle".into(),
@@ -5453,6 +5517,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "poll-cycle".into(),
@@ -5504,6 +5570,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
@@ -5535,6 +5603,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -5560,6 +5630,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
@@ -5791,6 +5863,8 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: fixed_time,
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
@@ -5810,6 +5884,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -5856,6 +5932,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -5901,6 +5979,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -5940,6 +6020,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -5974,6 +6056,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "version:billing_v2".into(),
@@ -5995,6 +6079,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: crate::types::ActivityExecId::new(),
@@ -6047,6 +6133,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "side_effect:random_num".into(),
@@ -6088,6 +6176,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "side_effect:txn_id".into(),
@@ -6147,6 +6237,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::Now,
@@ -6185,6 +6277,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::Uuid,
@@ -6202,6 +6296,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::Random,
@@ -6229,6 +6325,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::Random,
@@ -6255,6 +6353,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::Random,
@@ -6275,6 +6375,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::Random,
@@ -6300,6 +6402,8 @@ mod tests {
         let mut events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
         for i in 0..1000_i64 {
             events.push(WorkflowEvent::SideEffectRecorded {
@@ -6333,6 +6437,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             // History expects an activity here, but the code calls system_now().
             WorkflowEvent::ActivityScheduled {
@@ -6361,6 +6467,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::Uuid,
@@ -6388,6 +6496,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "side_effect:legacy".into(),
@@ -6476,6 +6586,8 @@ mod tests {
                 WorkflowEvent::WorkflowStarted {
                     input: Value::Null,
                     timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
                 },
                 WorkflowEvent::ActivityScheduled {
                     activity_id,
@@ -6517,6 +6629,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -6556,6 +6670,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: id1,
@@ -6625,6 +6741,8 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
         let ctx = WorkflowContext::for_replay(exec_id, events);
         assert_eq!(ctx.execution_id(), exec_id);
@@ -6644,6 +6762,8 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let ctx =
@@ -6659,6 +6779,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: TimerId::new("cooldown"),
@@ -6682,6 +6804,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -6708,6 +6832,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
@@ -6776,6 +6902,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
@@ -6828,6 +6956,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
@@ -6858,6 +6988,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
@@ -6890,6 +7022,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ChildWorkflowStarted {
                 child_id: child_a,
@@ -6934,6 +7068,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
@@ -6977,6 +7113,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: TimerId::new("timer-1"),
@@ -7000,6 +7138,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::SignalReceived {
                 signal_name: "approved".to_string(),
@@ -7023,6 +7163,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: TimerId::new("__signal_timeout:1:approval"),
@@ -7050,6 +7192,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
@@ -7076,6 +7220,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
@@ -7109,6 +7255,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
@@ -7143,6 +7291,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: TimerId::new("__signal_timeout:1:approval"),
@@ -7169,6 +7319,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
@@ -7193,6 +7345,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::SignalReceived {
                 signal_name: "approval".to_string(),
@@ -7255,6 +7409,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -7279,6 +7435,8 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
 
@@ -7293,6 +7451,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowCancelled {
                 reason: "operator stop".into(),
@@ -7380,6 +7540,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::LocalActivityScheduled {
                 activity_id: id,
@@ -7407,6 +7569,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::LocalActivityScheduled {
                 activity_id: id,
@@ -7443,6 +7607,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -7534,6 +7700,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ChildWorkflowStarted {
                 child_id: child_a,
@@ -7651,6 +7819,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -7856,6 +8026,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
@@ -7888,6 +8060,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
@@ -7925,6 +8099,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
@@ -7961,6 +8137,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
@@ -7996,6 +8174,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
@@ -8031,6 +8211,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -8119,6 +8301,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -8147,6 +8331,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -8189,6 +8375,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::LocalActivityScheduled {
                 activity_id,
@@ -8216,6 +8404,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
@@ -8247,6 +8437,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::SignalReceived {
                 signal_name: "approval".into(),
@@ -8318,6 +8510,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "some-marker".into(),

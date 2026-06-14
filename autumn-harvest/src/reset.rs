@@ -834,6 +834,7 @@ async fn insert_fork_execution(
         runbook_url: source.runbook_url.as_deref(),
         severity: source.severity.as_deref(),
         context_headers: source.context_headers.clone(),
+        schedule_id: source.schedule_id, // preserve schedule lineage through a reset fork
     };
 
     diesel::insert_into(harvest_workflow_executions::table)

@@ -2869,10 +2869,13 @@ async fn persist_all_started_child_workflows(
                     runbook_url,
                     severity,
                     context_headers: parent_execution.context_headers.clone(),
+                    schedule_id: None, // child workflows are not scheduled fires
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
                     timestamp: chrono::Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
                 };
                 let mut params = queue::EnqueueParams::new(
                     queue_name.clone(),
@@ -3418,6 +3421,7 @@ async fn create_detached_child_executions(
             runbook_url,
             severity,
             context_headers: parent_execution.context_headers.clone(),
+            schedule_id: None, // detached child workflows are not scheduled fires
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -3436,6 +3440,8 @@ async fn create_detached_child_executions(
             &[WorkflowEvent::WorkflowStarted {
                 input: input.clone(),
                 timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             }],
             0,
         )
@@ -4587,6 +4593,8 @@ async fn persist_workflow_continue_as_new(
     let started_event = WorkflowEvent::WorkflowStarted {
         input: input.clone(),
         timestamp: chrono::Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     };
     let continued_event = WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id,
@@ -4614,6 +4622,7 @@ async fn persist_workflow_continue_as_new(
         runbook_url: execution.runbook_url.as_deref(),
         severity: execution.severity.as_deref(),
         context_headers: execution.context_headers.clone(),
+        schedule_id: execution.schedule_id, // preserve schedule lineage through continue-as-new
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);

@@ -300,6 +300,8 @@ mod tests {
         let event = crate::event::WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"user":"alice"}),
             timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
 
         let encoded = codecs.encode_event(&event).expect("encode");

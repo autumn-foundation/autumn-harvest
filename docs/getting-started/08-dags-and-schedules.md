@@ -371,6 +371,64 @@ Pausing a DAG keeps the definition registered but stops the scheduler from
 firing it; manual triggers still work. Resume by patching it back to active
 through the same management route.
 
+## Incremental scheduled jobs — last-completion-result carryover
+
+Scheduled workflows can read the previous run's output without an external
+high-water-mark table, using two `WorkflowContext` accessors added in issue #488:
+
+| Accessor | Returns |
+|---|---|
+| `ctx.last_completion_result::<T>()` | Deserialized output of the most recent *COMPLETED* run of the same schedule; `None` on first run or if no prior run succeeded |
+| `ctx.last_error()` | Error string from the most recent *terminal* run if it ended FAILED or TIMED_OUT; `None` when that run COMPLETED (recovery) or for manual starts |
+
+Both values are **resolved once at workflow start** and **frozen into the
+`WorkflowStarted` event**, so replay on any worker always returns the same
+values without re-querying the database.
+
+```rust
+use serde::{Deserialize, Serialize};
+use autumn_harvest::prelude::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Cursor {
+    last_processed_id: i64,
+}
+
+#[workflow]
+async fn incremental_etl(ctx: &WorkflowContext, _: ()) -> Result<Cursor, String> {
+    // Read the cursor written by the previous successful run.
+    let prior: Option<Cursor> = ctx
+        .last_completion_result::<Cursor>()
+        .map_err(|e| e.to_string())?;
+
+    // Log when recovering from a previous failure.
+    if let Some(err) = ctx.last_error() {
+        ctx.logger().warn(&format!("Previous run failed: {err}"));
+    }
+
+    let since_id = prior.as_ref().map(|c| c.last_processed_id).unwrap_or(0);
+    // … fetch_batch and process rows WHERE id > since_id …
+    Ok(Cursor { last_processed_id: since_id + 100 })
+}
+```
+
+See `autumn-harvest/examples/incremental_etl_schedule.rs` for the full pattern.
+
+### Semantic guarantees
+
+- **First run**: both accessors return `None`.
+- **Manual (non-scheduled) start**: both accessors return `None`; the
+  `schedule_id` is `None` on the start params, so no carryover is resolved.
+- **Skipped fires** (`OverlapPolicy::Skip`): a skipped slot never invokes
+  `start_or_load_workflow_execution`, so the next run's `last_completion_result`
+  still refers to the last non-skipped COMPLETED run. Skips do not reset or
+  advance the cursor.
+- **Recovery branch**: `last_completion_result` is the last *COMPLETED* output
+  (may be several runs old); `last_error` is `None` once a COMPLETED run lands.
+  Check `last_error()` to know whether the job is still recovering.
+- **Reset**: `ctx.continue_as_new` and workflow reset preserve `schedule_id` so
+  the next fire can still see the lineage.
+
 ## Workflow schedule vs DAG — which one?
 
 | Use a **workflow schedule** when… | Use a **DAG** when… |

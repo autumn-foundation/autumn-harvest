@@ -50,6 +50,9 @@ diesel::table! {
         current_details -> Nullable<Text>,
         /// Per-execution ambient context headers (issue #481). NULL = empty map.
         context_headers -> Nullable<Jsonb>,
+        /// Schedule that fired this execution (issue #488). NULL for manual starts.
+        /// Used to resolve the last-completion-result carryover at workflow start time.
+        schedule_id -> Nullable<Uuid>,
     }
 }
 

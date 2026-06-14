@@ -785,6 +785,7 @@ pub async fn trigger_unified_dag(
             runbook_url,
             severity,
             context_headers: None,
+            schedule_id: None, // manual/API DAG trigger, not a scheduler-fired slot
         },
     )
     .await
@@ -2767,6 +2768,7 @@ async fn tick_one_workflow_schedule(
                 runbook_url,
                 severity,
                 context_headers: None,
+                schedule_id: Some(schedule.id),
             },
         )
         .await;
@@ -3664,6 +3666,7 @@ async fn drain_buffered_schedule_runs(
                     runbook_url,
                     severity,
                     context_headers: None,
+                    schedule_id: Some(schedule.id),
                 },
             )
             .await;

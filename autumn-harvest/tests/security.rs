@@ -11,6 +11,8 @@ fn test_integer_overflow_in_event_id_returns_error() {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
             timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::WorkflowCompleted {
             output: serde_json::Value::Null,

@@ -673,6 +673,8 @@ async fn enqueue_started_workflow_task(
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -1134,6 +1136,8 @@ async fn full_workflow_lifecycle() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({"user": "alice"}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     let inserted = store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1266,6 +1270,8 @@ async fn worker_completes_workflow_task_and_persists_result() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1381,6 +1387,8 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1509,6 +1517,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1653,6 +1663,8 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -1756,6 +1768,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({"workflow": "activity-only"}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1887,6 +1901,8 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({"timeout": "schedule_to_start"}),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -1997,6 +2013,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -2146,6 +2164,8 @@ async fn worker_completes_workflow_with_timer_round_trip() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -2593,6 +2613,8 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -2999,6 +3021,8 @@ async fn event_store_round_trip() {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"batch": "round_trip"}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: activity_id_1,
@@ -3097,6 +3121,8 @@ async fn worker_completes_workflow_after_signal_delivery() {
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -3201,6 +3227,8 @@ async fn worker_handles_early_ingested_signal_before_activity() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -3299,6 +3327,8 @@ async fn duplicate_event_id_is_rejected() {
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
 
     // First insert succeeds
@@ -5764,6 +5794,8 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -5910,6 +5942,8 @@ async fn circuit_breaker_short_circuits_after_tripping() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -6035,6 +6069,8 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -6760,6 +6796,8 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -7160,6 +7198,8 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
