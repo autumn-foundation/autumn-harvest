@@ -25,7 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
-use crate::execution::{apply_parent_close_cascade, cancel_workflow_execution};
+use crate::execution::{
+    apply_parent_close_cascade, cancel_workflow_execution, cancel_workflow_execution_collect,
+};
 use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
 use crate::schema::{harvest_external_tasks, harvest_task_queue, harvest_workflow_executions};
 use crate::telemetry::MetricsRecorder;
@@ -1127,6 +1129,19 @@ pub async fn enforce_external_signals_outbox(
 /// instead of `signal::send_signal`. Already-terminal targets resolve as
 /// `ExternalCancelDelivered` (no-op success); missing targets after the grace
 /// window resolve as `ExternalCancelFailed { reason_code: "target_unknown" }`.
+///
+/// Per-step outcome: (processed, `skipped_event_id`, deferred trigger starts,
+/// (`workflow_name`, `queue_name`) of targets newly cancelled). The deferred
+/// starts and terminal metrics are spawned/recorded only after the step
+/// transaction commits so trigger workflows never start for a cancellation that
+/// later rolls back (issue #492).
+type CancelStepOutcome = (
+    bool,
+    Option<i64>,
+    Vec<crate::completion_trigger::DeferredTriggerStart>,
+    Vec<(String, String)>,
+);
+
 #[allow(clippy::too_many_lines)]
 pub async fn enforce_external_cancels_outbox(
     conn: &mut AsyncPgConnection,
@@ -1151,8 +1166,8 @@ pub async fn enforce_external_cancels_outbox(
         let codecs_clone = codecs.clone();
         let excluded_clone = excluded_event_ids.clone();
 
-        let step_res: Result<Option<(bool, Option<i64>)>, HarvestError> = conn
-            .transaction::<Option<(bool, Option<i64>)>, HarvestError, _>(|conn| {
+        let step_res: Result<Option<CancelStepOutcome>, HarvestError> = conn
+            .transaction::<Option<CancelStepOutcome>, HarvestError, _>(|conn| {
                 let shards = shards_clone;
                 let codecs = codecs_clone;
                 let excluded = excluded_clone;
@@ -1193,11 +1208,11 @@ pub async fn enforce_external_cancels_outbox(
                         }
                         Ok(other) => {
                             tracing::error!(event = ?other, "cancel outbox sweep: query returned non-ExternalCancelRequested event");
-                            return Ok(Some((false, Some(row.id))));
+                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new())));
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "cancel outbox sweep: failed to decode event_data");
-                            return Ok(Some((false, Some(row.id))));
+                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new())));
                         }
                     };
 
@@ -1238,12 +1253,22 @@ pub async fn enforce_external_cancels_outbox(
                         }
                     });
 
+                    // Completion-trigger / cascade follow-up starts + terminal
+                    // metrics from a same-pool cancellation, spawned/recorded only
+                    // after this step transaction commits (issue #492). The
+                    // cross-shard branch cancels on an independent target
+                    // connection, so its triggers spawn correctly against that
+                    // connection's own committed transaction and need no deferral.
+                    let mut deferred_starts: Vec<
+                        crate::completion_trigger::DeferredTriggerStart,
+                    > = Vec::new();
+                    let mut cancel_metrics: Vec<(String, String)> = Vec::new();
+
                     let terminal_opt = if same_pool {
-                        match cancel_workflow_execution(
+                        match cancel_workflow_execution_collect(
                             conn,
                             target,
                             "cancelled by external request",
-                            metrics,
                         )
                         .await
                         {
@@ -1252,8 +1277,16 @@ pub async fn enforce_external_cancels_outbox(
                                 tracing::error!(error = %e, "cancel outbox sweep: db error");
                                 None
                             }
-                            // Ok or other Err (already terminal) = no-op success.
-                            Ok(_) | Err(_) => {
+                            Ok((cancelled, deferred)) => {
+                                deferred_starts.extend(deferred);
+                                if cancelled.newly_cancelled {
+                                    cancel_metrics
+                                        .push((cancelled.workflow_name, cancelled.queue_name));
+                                }
+                                Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
+                            }
+                            // Other Err (already terminal) = no-op success.
+                            Err(_) => {
                                 Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
                             }
                         }
@@ -1266,14 +1299,14 @@ pub async fn enforce_external_cancels_outbox(
                                 target_shard = %target.shard(),
                                 "cancel outbox sweep: target shard not configured locally; skipping"
                             );
-                            return Ok(Some((false, Some(row.id))));
+                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new())));
                         };
 
                         let mut target_conn = match pool.get().await {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::error!(error = %e, "cancel outbox sweep: failed to acquire target connection");
-                                return Ok(Some((false, Some(row.id))));
+                                return Ok(Some((false, Some(row.id), Vec::new(), Vec::new())));
                             }
                         };
 
@@ -1322,9 +1355,9 @@ pub async fn enforce_external_cancels_outbox(
                         .await?;
                         queue::wake_workflow_task(conn, caller_exec_id).await?;
                         metrics.record_external_cancel_sent(outcome, reason_code.as_deref());
-                        Ok(Some((true, None)))
+                        Ok(Some((true, None, deferred_starts, cancel_metrics)))
                     } else {
-                        Ok(Some((false, Some(row.id))))
+                        Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics)))
                     }
                 }
                 .scope_boxed()
@@ -1332,7 +1365,20 @@ pub async fn enforce_external_cancels_outbox(
             .await;
 
         match step_res {
-            Ok(Some((processed, skipped_id))) => {
+            Ok(Some((processed, skipped_id, deferred_starts, cancel_metrics))) => {
+                // The step transaction has committed: now spawn trigger/cascade
+                // follow-up starts and record terminal metrics for same-pool
+                // cancellations (issue #492).
+                for start in deferred_starts {
+                    start.spawn();
+                }
+                for (workflow_name, queue_name) in cancel_metrics {
+                    metrics.record_workflow_terminal(
+                        &workflow_name,
+                        &queue_name,
+                        crate::telemetry::WorkflowStatus::Cancelled,
+                    );
+                }
                 if processed {
                     count += 1;
                 }

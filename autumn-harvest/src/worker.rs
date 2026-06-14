@@ -32,7 +32,7 @@ use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::execution::{
-    apply_parent_close_cascade, cancel_workflow_execution, parent_close_cascade_event_count,
+    apply_parent_close_cascade, cancel_workflow_execution_collect, parent_close_cascade_event_count,
 };
 use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_history_policy_and_caps,
@@ -1229,6 +1229,17 @@ fn split_mixed_signal_batch(
 /// original insert committed before the crash. Exact-once delivery requires
 /// storing the `signal_id` as a unique key on `harvest_signals`; that schema
 /// change is deferred to a follow-up migration.
+///
+/// Returned tuple: (new history events, next event id, deferred trigger starts
+/// to spawn after commit, (`workflow_name`, `queue_name`) of targets newly
+/// cancelled inline for terminal metrics).
+type InlinePersistResult = (
+    Vec<WorkflowEvent>,
+    i32,
+    Vec<crate::completion_trigger::DeferredTriggerStart>,
+    Vec<(String, String)>,
+);
+
 #[allow(clippy::too_many_lines)]
 async fn persist_external_signal_inline(
     conn: &mut AsyncPgConnection,
@@ -1247,11 +1258,21 @@ async fn persist_external_signal_inline(
     // deliver it, and append the terminal first, leaving the inline path to
     // append the same terminal at a now-stale `next_event_id` — a history write
     // conflict that fails the caller even though delivery succeeded (issue #492).
-    let (new_events, final_next) = conn
-        .transaction::<(Vec<WorkflowEvent>, i32), HarvestError, _>(|conn| {
+    let (new_events, final_next, deferred_starts, cancel_metrics): InlinePersistResult = conn
+        .transaction::<InlinePersistResult, HarvestError, _>(|conn| {
             async move {
                 let mut new_events: Vec<WorkflowEvent> = Vec::new();
                 let mut next = start_next;
+                // Completion-trigger / cascade follow-up starts produced by
+                // same-shard cancellations. These must be spawned only *after*
+                // this outer transaction commits, otherwise a later rollback
+                // would leave trigger workflows started for a cancellation that
+                // never became durable (issue #492).
+                let mut deferred_starts: Vec<crate::completion_trigger::DeferredTriggerStart> =
+                    Vec::new();
+                // (workflow_name, queue_name) of targets newly cancelled inline,
+                // so the terminal metric is recorded after commit.
+                let mut cancel_metrics: Vec<(String, String)> = Vec::new();
 
                 for item in items {
                     match item {
@@ -1349,11 +1370,13 @@ async fn persist_external_signal_inline(
                             // Same-shard cancel attempt.
                             // Already-CANCELLED and already-terminal targets are
                             // no-op success (goal "target not running" already met).
-                            let terminal_opt = match cancel_workflow_execution(
+                            // Use the collect variant so the target's
+                            // completion-trigger starts are spawned only after this
+                            // outer transaction commits (issue #492).
+                            let terminal_opt = match cancel_workflow_execution_collect(
                                 conn,
                                 run.target,
                                 "cancelled by external request",
-                                metrics,
                             )
                             .await
                             {
@@ -1364,8 +1387,18 @@ async fn persist_external_signal_inline(
                                 Err(HarvestError::Database(e)) => {
                                     return Err(HarvestError::Database(e));
                                 }
-                                // Ok or other Err (already terminal) = no-op success.
-                                Ok(_) | Err(_) => Some(WorkflowEvent::ExternalCancelDelivered {
+                                Ok((cancelled, deferred)) => {
+                                    deferred_starts.extend(deferred);
+                                    if cancelled.newly_cancelled {
+                                        cancel_metrics
+                                            .push((cancelled.workflow_name, cancelled.queue_name));
+                                    }
+                                    Some(WorkflowEvent::ExternalCancelDelivered {
+                                        cancel_id: run.cancel_id,
+                                    })
+                                }
+                                // Other Err (already terminal) = no-op success.
+                                Err(_) => Some(WorkflowEvent::ExternalCancelDelivered {
                                     cancel_id: run.cancel_id,
                                 }),
                             };
@@ -1385,11 +1418,24 @@ async fn persist_external_signal_inline(
                     }
                 }
 
-                Ok((new_events, next))
+                Ok((new_events, next, deferred_starts, cancel_metrics))
             }
             .scope_boxed()
         })
         .await?;
+
+    // The inline batch is durably committed: now spawn trigger/cascade follow-up
+    // starts and record terminal metrics for any targets cancelled above.
+    for start in deferred_starts {
+        start.spawn();
+    }
+    for (workflow_name, queue_name) in cancel_metrics {
+        metrics.record_workflow_terminal(
+            &workflow_name,
+            &queue_name,
+            crate::telemetry::WorkflowStatus::Cancelled,
+        );
+    }
 
     *next_event_id = final_next;
     Ok(new_events)
@@ -2404,6 +2450,48 @@ async fn persist_signal_wait_park(
     let pending = signal::load_pending_signals(conn, exec_id).await?;
     if !pending.is_empty() {
         queue::wake_workflow_task(conn, exec_id).await?;
+        return Ok(());
+    }
+
+    // An external signal/cancel wait may have been resolved by the outbox
+    // (External{Signal,Cancel}Delivered/Failed appended on another connection)
+    // in the gap between the `*Requested` event committing and this park
+    // committing. `wake_workflow_task` is a no-op when it fires before the task
+    // is parked, so a cross-shard / NotFound caller could otherwise stay parked
+    // until an unrelated wake. Re-check now that we are parked: if any in-flight
+    // external request this wait depends on already has a terminal in history,
+    // self-wake so the workflow re-runs and observes it (issue #492).
+    let waited_signal_ids: Vec<crate::types::ExternalSignalId> = commands
+        .iter()
+        .filter_map(|c| match c {
+            WorkflowCommand::SignalExternalWorkflow { signal_id, .. } => Some(*signal_id),
+            _ => None,
+        })
+        .collect();
+    let waited_cancel_ids: Vec<crate::types::ExternalCancelId> = commands
+        .iter()
+        .filter_map(|c| match c {
+            WorkflowCommand::RequestCancelExternalWorkflow { cancel_id, .. } => Some(*cancel_id),
+            _ => None,
+        })
+        .collect();
+
+    if !waited_signal_ids.is_empty() || !waited_cancel_ids.is_empty() {
+        let history = store::load_history(conn, exec_id).await?;
+        let resolved = history.events.iter().any(|ev| match ev {
+            WorkflowEvent::ExternalSignalDelivered { signal_id }
+            | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+                waited_signal_ids.contains(signal_id)
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id }
+            | WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
+                waited_cancel_ids.contains(cancel_id)
+            }
+            _ => false,
+        });
+        if resolved {
+            queue::wake_workflow_task(conn, exec_id).await?;
+        }
     }
     Ok(())
 }
