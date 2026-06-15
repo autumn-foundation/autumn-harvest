@@ -30,11 +30,8 @@ pub struct TypedWorkflowResult<T> {
 #[derive(Debug, Clone)]
 pub struct TypedWorkflowHandle<T> {
     inner: WorkflowHandle,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<fn() -> T>,
 }
-
-unsafe impl<T> Send for TypedWorkflowHandle<T> {}
-unsafe impl<T> Sync for TypedWorkflowHandle<T> {}
 
 impl<T> TypedWorkflowHandle<T> {
     /// Wrap an untyped [`WorkflowHandle`] with type parameter `T` representing
@@ -211,4 +208,20 @@ pub struct TypedSignalWithStartOptions {
     /// Soft SLA duration: emits `harvest.workflow.sla_breached` once when the run exceeds this
     /// without terminating it. Overrides `WorkflowInfo::sla`; clamped to `execution_timeout`.
     pub sla: Option<Duration>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    #[test]
+    fn test_typed_workflow_handle_thread_safety() {
+        // Assert that TypedWorkflowHandle is Send and Sync even if T is not
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+
+        assert_send::<TypedWorkflowHandle<Rc<i32>>>();
+        assert_sync::<TypedWorkflowHandle<Rc<i32>>>();
+    }
 }
