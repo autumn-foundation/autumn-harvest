@@ -200,7 +200,7 @@ fn default_start_params(
     workflow_id: &'static str,
     input: serde_json::Value,
 ) -> StartWorkflowParams<'static> {
-    StartWorkflowParams {
+    StartWorkflowParams { sla: None,
         exec_id,
         workflow_name,
         workflow_id,
@@ -251,7 +251,7 @@ async fn test_same_shard_live_cancel() {
     let target_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
     let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
 
-    let canceller_info = WorkflowInfo {
+    let canceller_info = WorkflowInfo { sla: None,
         name: "canceller_workflow",
         module: "cross_workflow_cancel_tests",
         handler: canceller_workflow,
@@ -266,7 +266,7 @@ async fn test_same_shard_live_cancel() {
         output_schema: None,
         error_schema: None,
     };
-    let target_info = WorkflowInfo {
+    let target_info = WorkflowInfo { sla: None,
         name: "long_running_target_workflow",
         module: "cross_workflow_cancel_tests",
         handler: long_running_target_workflow,
@@ -380,7 +380,7 @@ async fn test_already_terminal_target_is_no_op_success() {
 
     let built = HarvestBuilder::new()
         .workflows(vec![
-            WorkflowInfo {
+            WorkflowInfo { sla: None,
                 name: "canceller_workflow",
                 module: "cross_workflow_cancel_tests",
                 handler: canceller_workflow,
@@ -395,7 +395,7 @@ async fn test_already_terminal_target_is_no_op_success() {
                 output_schema: None,
                 error_schema: None,
             },
-            WorkflowInfo {
+            WorkflowInfo { sla: None,
                 name: "instant_complete_workflow",
                 module: "cross_workflow_cancel_tests",
                 handler: instant_complete_workflow,
@@ -520,7 +520,7 @@ async fn test_grace_window_expiry_unknown_target() {
     let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
 
     let built = HarvestBuilder::new()
-        .workflows(vec![WorkflowInfo {
+        .workflows(vec![WorkflowInfo { sla: None,
             name: "canceller_expecting_failure",
             module: "cross_workflow_cancel_tests",
             handler: canceller_expecting_failure,
@@ -626,7 +626,7 @@ async fn test_cross_shard_cancel_via_outbox() {
 
     let built = HarvestBuilder::new()
         .workflows(vec![
-            WorkflowInfo {
+            WorkflowInfo { sla: None,
                 name: "canceller_workflow",
                 module: "cross_workflow_cancel_tests",
                 handler: canceller_workflow,
@@ -641,7 +641,7 @@ async fn test_cross_shard_cancel_via_outbox() {
                 output_schema: None,
                 error_schema: None,
             },
-            WorkflowInfo {
+            WorkflowInfo { sla: None,
                 name: "long_running_target_workflow",
                 module: "cross_workflow_cancel_tests",
                 handler: long_running_target_workflow,
