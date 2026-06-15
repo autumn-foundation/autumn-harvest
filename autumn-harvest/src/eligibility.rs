@@ -91,13 +91,8 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut eq_idx = None;
     let mut in_idx = None;
     let mut in_quotes = None;
-    let token_chars: Vec<char> = token.chars().collect();
-    let token_lower = token.to_lowercase();
-    let token_lower_chars: Vec<char> = token_lower.chars().collect();
 
-    let mut i = 0;
-    while i < token_chars.len() {
-        let c = token_chars[i];
+    for (byte_idx, c) in token.char_indices() {
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -107,22 +102,32 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
                 }
             }
             '=' if in_quotes.is_none() && eq_idx.is_none() => {
-                eq_idx = Some(i);
+                eq_idx = Some(byte_idx);
             }
-            _ => {
-                if in_quotes.is_none()
-                    && in_idx.is_none()
-                    && i + 3 < token_chars.len()
-                    && token_lower_chars[i] == ' '
-                    && token_lower_chars[i + 1] == 'i'
-                    && token_lower_chars[i + 2] == 'n'
-                    && token_lower_chars[i + 3] == ' '
+            ' ' | '\t' | '\n' | '\r' if in_quotes.is_none() && in_idx.is_none() => {
+                // Peek ahead to see if the next chars are 'i', 'n', and another space-like char
+                let rest = &token[byte_idx + c.len_utf8()..];
+                if rest.starts_with("in ")
+                    || rest.starts_with("in\t")
+                    || rest.starts_with("in\n")
+                    || rest.starts_with("in\r")
+                    || rest.starts_with("in[")
                 {
-                    in_idx = Some(i);
+                    in_idx = Some(byte_idx);
+                } else {
+                    let lower_rest = rest.to_lowercase();
+                    if lower_rest.starts_with("in ")
+                        || lower_rest.starts_with("in\t")
+                        || lower_rest.starts_with("in\n")
+                        || lower_rest.starts_with("in\r")
+                        || lower_rest.starts_with("in[")
+                    {
+                         in_idx = Some(byte_idx);
+                    }
                 }
             }
+            _ => {}
         }
-        i += 1;
     }
     (eq_idx, in_idx)
 }
@@ -381,5 +386,13 @@ mod tests {
 
         // Empty requirements always match
         assert!(matches_requirements(&[], &labels));
+    }
+
+    use proptest::prelude::*;
+    proptest! {
+        #[test]
+        fn parses_all_strings(s in "\\PC*") {
+            let _ = parse_requirements(&s);
+        }
     }
 }
