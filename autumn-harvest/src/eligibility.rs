@@ -91,13 +91,9 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut eq_idx = None;
     let mut in_idx = None;
     let mut in_quotes = None;
-    let token_chars: Vec<char> = token.chars().collect();
-    let token_lower = token.to_lowercase();
-    let token_lower_chars: Vec<char> = token_lower.chars().collect();
 
-    let mut i = 0;
-    while i < token_chars.len() {
-        let c = token_chars[i];
+    let mut iter = token.char_indices();
+    while let Some((i, c)) = iter.next() {
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -110,19 +106,18 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
                 eq_idx = Some(i);
             }
             _ => {
-                if in_quotes.is_none()
-                    && in_idx.is_none()
-                    && i + 3 < token_chars.len()
-                    && token_lower_chars[i] == ' '
-                    && token_lower_chars[i + 1] == 'i'
-                    && token_lower_chars[i + 2] == 'n'
-                    && token_lower_chars[i + 3] == ' '
-                {
-                    in_idx = Some(i);
+                if in_quotes.is_none() && in_idx.is_none() {
+                    let rem = &token[i..];
+                    if rem.starts_with(" in ")
+                        || rem.starts_with(" IN ")
+                        || rem.starts_with(" In ")
+                        || rem.starts_with(" iN ")
+                    {
+                        in_idx = Some(i);
+                    }
                 }
             }
         }
-        i += 1;
     }
     (eq_idx, in_idx)
 }
@@ -381,5 +376,18 @@ mod tests {
 
         // Empty requirements always match
         assert!(matches_requirements(&[], &labels));
+    }
+}
+
+#[cfg(test)]
+mod test_fuzz_parse_req {
+    use super::parse_requirements;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn doesn_crash(s in "\\PC*") {
+            let _ = parse_requirements(&s);
+        }
     }
 }
