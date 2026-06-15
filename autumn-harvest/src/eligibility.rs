@@ -92,8 +92,7 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut in_idx = None;
     let mut in_quotes = None;
 
-    let mut iter = token.char_indices();
-    while let Some((i, c)) = iter.next() {
+    for (i, c) in token.char_indices() {
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
