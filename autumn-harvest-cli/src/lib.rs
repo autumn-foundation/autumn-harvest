@@ -1586,13 +1586,31 @@ async fn run_events_tail(
                 ev_data.clear();
             } else if line.starts_with(':') {
                 // SSE comment (keepalive ping) — discard silently.
-            } else if let Some(value) = line.strip_prefix("id: ") {
-                ev_id = value.to_string();
-                let _ = &ev_id; // suppress unused warning; stored for protocol correctness
-            } else if let Some(value) = line.strip_prefix("event: ") {
-                ev_type = value.to_string();
-            } else if let Some(value) = line.strip_prefix("data: ") {
-                ev_data = value.to_string();
+            } else {
+                let (key, value) = line.find(':').map_or((line.as_str(), ""), |colon_idx| {
+                    let (k, mut v) = line.split_at(colon_idx);
+                    v = &v[1..];
+                    if v.starts_with(' ') {
+                        v = &v[1..];
+                    }
+                    (k, v)
+                });
+                match key {
+                    "id" => {
+                        ev_id = value.to_string();
+                        let _ = &ev_id; // suppress unused warning; stored for protocol correctness
+                    }
+                    "event" => {
+                        ev_type = value.to_string();
+                    }
+                    "data" => {
+                        if !ev_data.is_empty() {
+                            ev_data.push('\n');
+                        }
+                        ev_data.push_str(value);
+                    }
+                    _ => {}
+                }
             }
         }
     }
