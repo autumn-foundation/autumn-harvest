@@ -863,7 +863,7 @@ fn extract_started_timer_for_suspension(
 fn extract_all_started_child_workflows(
     commands: &[WorkflowCommand],
 ) -> Option<Vec<StartedChildWorkflowCommand>> {
-    let non_markers: Vec<&WorkflowCommand> = commands
+    let mut non_markers = commands
         .iter()
         .filter(|c| {
             !matches!(
@@ -876,14 +876,11 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
             )
         })
-        .collect();
+        .peekable();
 
-    if non_markers.is_empty() {
-        return None;
-    }
+    non_markers.peek()?;
 
     non_markers
-        .iter()
         .map(|cmd| {
             if let WorkflowCommand::StartChildWorkflow {
                 child_id,
