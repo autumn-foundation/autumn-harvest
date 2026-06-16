@@ -107,7 +107,7 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
                 }
             }
             '=' if in_quotes.is_none() && eq_idx.is_none() => {
-                eq_idx = Some(i);
+                eq_idx = token.char_indices().nth(i).map(|(pos, _)| pos);
             }
             _ => {
                 if in_quotes.is_none()
@@ -117,8 +117,9 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
                     && token_lower_chars[i + 1] == 'i'
                     && token_lower_chars[i + 2] == 'n'
                     && token_lower_chars[i + 3] == ' '
+                    && in_idx.is_none()
                 {
-                    in_idx = Some(i);
+                    in_idx = token.char_indices().nth(i).map(|(pos, _)| pos);
                 }
             }
         }
@@ -381,5 +382,19 @@ mod tests {
 
         // Empty requirements always match
         assert!(matches_requirements(&[], &labels));
+    }
+
+    #[test]
+    fn test_havoc_crash() {
+        // Havoc: Trigger byte boundary panic by putting an emoji before the operator
+        // Fixed: No longer panics because char indices are correctly mapped to byte indices.
+        let parsed = parse_requirements("k😊y=value").unwrap();
+        assert_eq!(
+            parsed,
+            vec![Requirement::Exact {
+                key: "k😊y".to_string(),
+                value: "value".to_string()
+            }]
+        );
     }
 }
