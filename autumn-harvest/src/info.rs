@@ -398,23 +398,7 @@ fn validate_node(
     }
 
     // required fields
-    if let (Some(required), Some(obj)) = (
-        schema_obj.get("required").and_then(|v| v.as_array()),
-        value.as_object(),
-    ) {
-        for req in required {
-            if let Some(field) = req.as_str()
-                && !obj.contains_key(field)
-            {
-                // Escape field name per RFC 6901: ~ → ~0, / → ~1.
-                let escaped = field.replace('~', "~0").replace('/', "~1");
-                out.push(SchemaViolation {
-                    message: format!("missing required field '{field}'"),
-                    field_path: Some(format!("{ptr}/{escaped}")),
-                });
-            }
-        }
-    }
+    validate_required(schema_obj, value, ptr, out);
 
     // properties — recurse
     if let (Some(properties), Some(obj)) = (
@@ -571,6 +555,35 @@ fn validate_node(
                 ),
                 field_path: path(),
             });
+        }
+    }
+}
+
+fn validate_required(
+    schema_obj: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    ptr: &str,
+    out: &mut Vec<SchemaViolation>,
+) {
+    if let (Some(required), Some(obj)) = (
+        schema_obj.get("required").and_then(|v| v.as_array()),
+        value.as_object(),
+    ) {
+        for req in required {
+            if let Some(field) = req.as_str()
+                && !obj.contains_key(field)
+            {
+                // Escape field name per RFC 6901: ~ → ~0, / → ~1.
+                let escaped = field.replace('~', "~0").replace('/', "~1");
+                out.push(SchemaViolation {
+                    message: format!("missing required field '{field}'"),
+                    field_path: if ptr.is_empty() {
+                        Some(format!("/{escaped}"))
+                    } else {
+                        Some(format!("{ptr}/{escaped}"))
+                    },
+                });
+            }
         }
     }
 }
