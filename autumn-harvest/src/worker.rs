@@ -1168,8 +1168,9 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
 fn split_mixed_signal_batch(
     commands: Vec<WorkflowCommand>,
 ) -> (Vec<SignalBatchItem>, Vec<WorkflowCommand>) {
+    // ⚡ Bolt: Pre-allocate vector capacity to avoid intermediate allocations
     let mut signal_items = Vec::new();
-    let mut remaining = Vec::new();
+    let mut remaining = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
             WorkflowCommand::SignalExternalWorkflow {
@@ -1262,7 +1263,8 @@ async fn persist_external_signal_inline(
     let (new_events, final_next, deferred_starts, cancel_metrics): InlinePersistResult = conn
         .transaction::<InlinePersistResult, HarvestError, _>(|conn| {
             async move {
-                let mut new_events: Vec<WorkflowEvent> = Vec::new();
+                // ⚡ Bolt: Pre-allocate vector capacity to avoid intermediate allocations
+                let mut new_events: Vec<WorkflowEvent> = Vec::with_capacity(items.len());
                 let mut next = start_next;
                 // Completion-trigger / cascade follow-up starts produced by
                 // same-shard cancellations. These must be spawned only *after*

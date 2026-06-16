@@ -207,6 +207,7 @@ fn default_start_params(
         input,
         parent_id: None,
         queue_name: "default",
+        sla: None,
         execution_timeout: None,
         memo: None,
         search_attrs: None,
@@ -265,6 +266,7 @@ async fn test_same_shard_live_cancel() {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        sla: None,
     };
     let target_info = WorkflowInfo {
         name: "long_running_target_workflow",
@@ -280,6 +282,7 @@ async fn test_same_shard_live_cancel() {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        sla: None,
     };
 
     let built = HarvestBuilder::new()
@@ -394,6 +397,7 @@ async fn test_already_terminal_target_is_no_op_success() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                sla: None,
             },
             WorkflowInfo {
                 name: "instant_complete_workflow",
@@ -409,6 +413,7 @@ async fn test_already_terminal_target_is_no_op_success() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                sla: None,
             },
         ])
         .worker(WorkerConfig::default())
@@ -534,6 +539,7 @@ async fn test_grace_window_expiry_unknown_target() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            sla: None,
         }])
         .worker(WorkerConfig::default().with_unknown_target_grace_window(Duration::from_secs(1)))
         .build();
@@ -640,6 +646,7 @@ async fn test_cross_shard_cancel_via_outbox() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                sla: None,
             },
             WorkflowInfo {
                 name: "long_running_target_workflow",
@@ -655,6 +662,7 @@ async fn test_cross_shard_cancel_via_outbox() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                sla: None,
             },
         ])
         .worker(WorkerConfig::default())
