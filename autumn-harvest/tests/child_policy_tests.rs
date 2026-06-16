@@ -92,6 +92,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
     "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
@@ -187,6 +189,8 @@ async fn start_workflow(
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -382,6 +386,8 @@ async fn insert_detached_child_execution(
             sla: None,
 
             sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
         })
         .execute(conn)
         .await
@@ -393,6 +399,8 @@ async fn insert_detached_child_execution(
         &[WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -970,6 +978,8 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             sla: None,
 
             sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
         })
         .execute(&mut conn)
         .await
@@ -980,6 +990,8 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
         &[WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )

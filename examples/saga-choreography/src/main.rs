@@ -161,6 +161,8 @@ mod tests {
                     "onboarding_exec_ids": [target_id.to_string()],
                 }),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
@@ -184,6 +186,8 @@ mod tests {
                     "onboarding_exec_ids": [target_id.to_string()],
                 }),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ExternalSignalRequested {
                 signal_id,
@@ -208,6 +212,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: json!({ "tenant_id": tenant_id }),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: act1,

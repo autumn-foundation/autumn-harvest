@@ -94,6 +94,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
     "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
@@ -313,6 +315,8 @@ async fn test_same_shard_not_found_retry() {
         context_headers: None,
 
         sla: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -353,6 +357,8 @@ async fn test_same_shard_not_found_retry() {
         context_headers: None,
 
         sla: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -481,6 +487,8 @@ async fn test_cross_shard_outbox_delivery() {
         context_headers: None,
 
         sla: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -514,6 +522,8 @@ async fn test_cross_shard_outbox_delivery() {
         context_headers: None,
 
         sla: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -541,6 +551,7 @@ async fn test_cross_shard_outbox_delivery() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_grace_window_expiration() {
     let _guard = TEST_MUTEX.lock().await;
     let _ = tracing_subscriber::fmt()
@@ -619,6 +630,8 @@ async fn test_grace_window_expiration() {
         context_headers: None,
 
         sla: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -758,6 +771,8 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         context_headers: None,
 
         sla: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -798,6 +813,8 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         context_headers: None,
 
         sla: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await

@@ -55,6 +55,10 @@ use tower::ServiceExt;
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
+    ),
+    "\n",
     include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
@@ -562,6 +566,8 @@ async fn insert_workflow_on_url(
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -642,6 +648,8 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -803,6 +811,8 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             sla: None,
 
             sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
         })
         .execute(&mut conn)
         .await
@@ -1131,6 +1141,8 @@ async fn seed_scheduled_activity_task_from_url(
             sla: None,
 
             sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
         })
         .execute(&mut conn)
         .await
@@ -1142,6 +1154,8 @@ async fn seed_scheduled_activity_task_from_url(
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,

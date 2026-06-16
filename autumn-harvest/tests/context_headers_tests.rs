@@ -18,6 +18,8 @@ fn make_started_history(input: Value) -> Vec<WorkflowEvent> {
     vec![WorkflowEvent::WorkflowStarted {
         input,
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }]
 }
 

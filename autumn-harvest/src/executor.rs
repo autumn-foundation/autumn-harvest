@@ -537,6 +537,8 @@ mod tests {
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let outcome = run_workflow(exec_id, history, echo_workflow, input.clone()).await;
@@ -555,6 +557,8 @@ mod tests {
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let outcome = run_workflow(exec_id, history, failing_workflow, Value::Null).await;
@@ -577,6 +581,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             // The workflow calls system_now() here, but history recorded an
             // activity — a genuine divergence.
@@ -616,6 +622,8 @@ mod tests {
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let outcome = run_workflow(exec_id, history, activity_workflow, input).await;
@@ -654,6 +662,8 @@ mod tests {
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let outcome = run_workflow(
@@ -684,6 +694,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: input.clone(),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,

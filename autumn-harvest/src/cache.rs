@@ -303,6 +303,8 @@ mod tests {
             events: vec![WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             }],
             next_event_id: 42,
         };

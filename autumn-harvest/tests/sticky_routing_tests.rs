@@ -234,6 +234,8 @@ fn first_task_is_cache_miss_subsequent_tasks_on_same_worker_are_hits() {
         vec![WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
             timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         2,
     );
@@ -432,6 +434,8 @@ mod db_tests {
         "\n",
         include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
         "\n",
+        include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+        "\n",
         include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
     );
 
@@ -474,6 +478,8 @@ mod db_tests {
             sla: None,
 
             sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
         };
         diesel::insert_into(harvest_workflow_executions::table)
             .values(&row)

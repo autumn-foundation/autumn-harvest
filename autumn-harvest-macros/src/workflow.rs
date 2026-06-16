@@ -493,6 +493,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         sla: opts.sla.or(info.sla).and_then(|d|
                             ::autumn_harvest::chrono::Duration::from_std(d).ok()
                         ),
+                        schedule_id: ::std::option::Option::None,
+                        scheduled_for: ::std::option::Option::None,
                     };
 
                     let started = client.start_or_load(conn, params).await?;

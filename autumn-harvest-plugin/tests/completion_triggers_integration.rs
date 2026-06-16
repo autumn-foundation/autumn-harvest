@@ -49,6 +49,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
     include_str!(
+        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
+    ),
+    "\n",
+    include_str!(
         "../../autumn-harvest/migrations/20260410010000_harvest_workflow_start_uniqueness/up.sql"
     ),
     "\n",
@@ -463,6 +467,8 @@ async fn test_trigger_evaluations_same_shard() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -559,6 +565,8 @@ async fn test_trigger_input_mapping_static_and_projection() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -633,6 +641,8 @@ async fn test_trigger_input_mapping_static_and_projection() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -729,6 +739,8 @@ async fn test_trigger_state_matching_and_deduplication() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -902,6 +914,8 @@ async fn test_trigger_cross_shard() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -1003,6 +1017,8 @@ async fn test_completion_trigger_via_worker_run() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -1118,6 +1134,8 @@ async fn test_trigger_with_custom_queue() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -1301,6 +1319,8 @@ async fn test_trigger_outbox_retry_and_sweep() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -1512,6 +1532,8 @@ async fn test_trigger_cross_shard_queue_preservation() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -1935,6 +1957,8 @@ async fn test_trigger_evaluations_schema_validation() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -2004,6 +2028,8 @@ async fn test_trigger_evaluations_schema_validation() {
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await

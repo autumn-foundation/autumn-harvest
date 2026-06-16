@@ -108,7 +108,9 @@
           "parent_id",
           "execution",
           "history",
-          "external_handoffs"
+          "external_handoffs",
+          "last_completion_result",
+          "last_error"
         ]
       },
       "error_responses": [

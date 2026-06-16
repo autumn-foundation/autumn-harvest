@@ -89,6 +89,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::json!({"status": "ok"}),

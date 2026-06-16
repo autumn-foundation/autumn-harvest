@@ -131,6 +131,11 @@ pub struct WorkflowExecution {
     /// Wall-clock instant the SLA was first detected as breached (issue #487).
     /// `None` when `sla_breached = false`.
     pub sla_breached_at: Option<DateTime<Utc>>,
+    /// Schedule that fired this execution (issue #488). `None` for manual starts.
+    pub schedule_id: Option<Uuid>,
+    /// Logical schedule slot this run fires for (issue #488); carryover is ordered by
+    /// this, not `completed_at`. `None` for manual starts.
+    pub scheduled_for: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -164,6 +169,11 @@ pub struct NewWorkflowExecution<'a> {
     pub sla: Option<chrono::Duration>,
     /// Absolute UTC SLA deadline (issue #487). NULL = no SLA.
     pub sla_deadline_at: Option<DateTime<Utc>>,
+    /// Schedule that fired this execution (issue #488). `None` for manual starts.
+    pub schedule_id: Option<Uuid>,
+    /// Logical schedule slot this run fires for (issue #488); carryover is ordered by
+    /// this, not `completed_at`. `None` for manual starts.
+    pub scheduled_for: Option<DateTime<Utc>>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────

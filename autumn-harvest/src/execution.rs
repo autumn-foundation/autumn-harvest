@@ -102,6 +102,16 @@ pub struct StartWorkflowParams<'a> {
     /// If `sla > effective_timeout` (the hard deadline), `sla` is clamped down
     /// to `effective_timeout` at start time.  `None` = no SLA enforced.
     pub sla: Option<chrono::Duration>,
+    /// The `harvest_schedules.id` that triggered this execution (issue #488).
+    /// `None` for manually-started (non-scheduled) workflows. When `Some`, the
+    /// start path resolves the prior COMPLETED output and most-recent terminal
+    /// error for this schedule and freezes them into the `WorkflowStarted` event.
+    pub schedule_id: Option<uuid::Uuid>,
+    /// The logical schedule slot this run fires for (issue #488). Carryover selects the
+    /// previous fire by this slot (not completion time), so out-of-order completions
+    /// (overlap / catch-up / backfill) can't roll an incremental cursor backward.
+    /// `None` for manual starts and any non-scheduled call site.
+    pub scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -359,6 +369,8 @@ pub async fn start_or_load_workflow_execution(
             .context_headers
             .as_ref()
             .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
+        schedule_id: request.schedule_id,
+        scheduled_for: request.scheduled_for,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -420,9 +432,29 @@ pub async fn start_or_load_workflow_execution(
                                 });
                             }
                         }
+                        // Resolve last-completion-result carryover (issue #488).
+                        // Runs inside the same transaction on the same shard-local
+                        // connection so the read is consistent with the just-inserted
+                        // row. Excludes the new row (`id != exec_id`) as a safety
+                        // guard — the new row has state RUNNING, not COMPLETED, so it
+                        // can never match, but the explicit exclusion is defensive.
+                        let (carryover_result, carryover_error) =
+                            if let Some(sched_id) = request.schedule_id {
+                                resolve_carryover(
+                                    conn,
+                                    sched_id,
+                                    exec_id.as_uuid(),
+                                    request.scheduled_for,
+                                )
+                                .await?
+                            } else {
+                                (None, None)
+                            };
                         let started_event = WorkflowEvent::WorkflowStarted {
                             input: request.input.clone(),
                             timestamp: target_start_time,
+                            last_completion_result: carryover_result,
+                            last_error: carryover_error,
                         };
                         store::append_events(conn, exec_id, &[started_event], 0).await?;
                         queue::enqueue(conn, &enqueue).await?;
@@ -567,9 +599,21 @@ async fn replace_execution(
     } else {
         Utc::now()
     };
+    // Resolve scheduled carryover on the replacement path too (issue #488): a reuse
+    // policy that replaces a prior row (e.g. AllowDuplicateFailedOnly retrying a failed
+    // scheduled slot, or TerminateIfRunning) still carries schedule_id/scheduled_for, so
+    // the rerun (and any continue-as-new fork from it) must see the previous fire's
+    // carryover rather than behaving like a first scheduled run.
+    let (carryover_result, carryover_error) = if let Some(sched_id) = request.schedule_id {
+        resolve_carryover(conn, sched_id, new_exec_id.as_uuid(), request.scheduled_for).await?
+    } else {
+        (None, None)
+    };
     let started_event = WorkflowEvent::WorkflowStarted {
         input: request.input.clone(),
         timestamp: start_timestamp,
+        last_completion_result: carryover_result,
+        last_error: carryover_error,
     };
     store::append_events(conn, new_exec_id, &[started_event], 0).await?;
     queue::enqueue(conn, enqueue).await?;
@@ -1805,6 +1849,8 @@ pub async fn signal_with_start_workflow_execution(
                     severity: request.severity,
                     context_headers: request.context_headers.clone(),
                     sla: request.sla,
+                    schedule_id: None,
+                    scheduled_for: None,
                 };
 
             let started = start_or_load_workflow_execution(
@@ -2220,6 +2266,8 @@ pub async fn update_with_start_workflow_execution(
                     severity: request.severity,
                     context_headers: request.context_headers.clone(),
                     sla: request.sla,
+                    schedule_id: None,
+                    scheduled_for: None,
                 };
 
             let started = start_or_load_workflow_execution(
@@ -2395,6 +2443,107 @@ async fn lookup_idempotent_update_dedupe(
         workflow_id: r.workflow_id,
         state: r.state,
     }))
+}
+
+/// Resolve the last-completion-result and last-error carryover for a schedule (issue #488).
+///
+/// Queries are shard-local, run on the same `conn` inside the start transaction,
+/// and exclude the just-inserted execution by `current_exec_id`.
+///
+/// Selection is by the **scheduled slot** (`scheduled_for`), not completion time:
+/// Selection is by the **scheduled slot** (`scheduled_for`), not completion time:
+/// the carryover source is the COMPLETED fire with the **greatest `scheduled_for`
+/// strictly before this run's own slot** (`current_scheduled_for`) — i.e. the
+/// previous logical fire. Bounding the lookup to earlier slots means a backfill or
+/// trigger-now run that starts an *older* logical slot after a newer slot already
+/// completed sees the cursor as of its own slot, never a future fire's output; and
+/// an older slot finishing late can never roll a newer run's cursor backward (the bug
+/// a `completed_at` ordering would have). Rows without a slot (`scheduled_for IS NULL`)
+/// are excluded; post-migration every scheduled run carries a slot. When the current
+/// run itself has no slot (`current_scheduled_for == None`, defensive — scheduled
+/// starts always set it) no carryover is resolved.
+///
+/// Within a slot, ties are broken by `completed_at DESC, id DESC` so that when the
+/// same slot was run more than once (a `TERMINATED` row is released from the active
+/// uniqueness index and the slot can be re-run), the **latest** attempt of that slot
+/// wins rather than an arbitrary older terminated row.
+///
+/// Returns `(last_completion_result, last_error)` where:
+/// - `last_completion_result` = `output` of the highest earlier-slot COMPLETED fire.
+/// - `last_error` = `error` of the highest earlier-slot terminal fire if it was
+///   `FAILED`/`TIMED_OUT`; `None` if that fire `COMPLETED`/`CANCELLED`/`TERMINATED`.
+async fn resolve_carryover(
+    conn: &mut AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    current_exec_id: uuid::Uuid,
+    current_scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
+) -> HarvestResult<(Option<serde_json::Value>, Option<String>)> {
+    use crate::schema::harvest_workflow_executions::dsl;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    // No slot on the current run → can't bound to earlier slots; resolve nothing.
+    let Some(current_slot) = current_scheduled_for else {
+        return Ok((None, None));
+    };
+
+    // Highest earlier-slot COMPLETED fire for this schedule.
+    let last_completion_result: Option<serde_json::Value> = harvest_workflow_executions::table
+        .filter(dsl::schedule_id.eq(schedule_id))
+        .filter(dsl::state.eq("COMPLETED"))
+        .filter(dsl::completed_at.is_not_null())
+        .filter(dsl::scheduled_for.lt(current_slot))
+        .filter(dsl::id.ne(current_exec_id))
+        .order((
+            dsl::scheduled_for.desc(),
+            dsl::completed_at.desc(),
+            dsl::id.desc(),
+        ))
+        .limit(1)
+        .select(dsl::output)
+        .get_result::<Option<serde_json::Value>>(conn)
+        .await
+        .optional()
+        .map_err(database_error)?
+        .flatten();
+
+    // Highest earlier-slot terminal fire for this schedule, across *all* terminal states
+    // (COMPLETED, FAILED, TIMED_OUT, CANCELLED, TERMINATED). Surfacing an error only
+    // when it is FAILED/TIMED_OUT means a more recent CANCELLED/TERMINATED fire (e.g.
+    // via OverlapPolicy::CancelOther / TerminateOther) masks an older failure.
+    let last_terminal: Option<(String, Option<String>)> = harvest_workflow_executions::table
+        .filter(dsl::schedule_id.eq(schedule_id))
+        .filter(dsl::state.eq_any([
+            "COMPLETED",
+            "FAILED",
+            "TIMED_OUT",
+            "CANCELLED",
+            "TERMINATED",
+        ]))
+        .filter(dsl::completed_at.is_not_null())
+        .filter(dsl::scheduled_for.lt(current_slot))
+        .filter(dsl::id.ne(current_exec_id))
+        .order((
+            dsl::scheduled_for.desc(),
+            dsl::completed_at.desc(),
+            dsl::id.desc(),
+        ))
+        .limit(1)
+        .select((dsl::state, dsl::error))
+        .get_result::<(String, Option<String>)>(conn)
+        .await
+        .optional()
+        .map_err(database_error)?;
+
+    let last_error = last_terminal.and_then(|(state, error)| {
+        if state == "FAILED" || state == "TIMED_OUT" {
+            error
+        } else {
+            None
+        }
+    });
+
+    Ok((last_completion_result, last_error))
 }
 
 #[cfg(test)]

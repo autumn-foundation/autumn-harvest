@@ -787,6 +787,8 @@ pub async fn trigger_unified_dag(
             context_headers: None,
 
             sla: None,
+            schedule_id: None, // manual/API DAG trigger, not a scheduler-fired slot
+            scheduled_for: None,
         },
     )
     .await
@@ -2774,6 +2776,10 @@ async fn tick_one_workflow_schedule(
                 severity,
                 context_headers: None,
                 sla,
+                schedule_id: Some(schedule.id),
+                // Logical slot = the slot encoded in workflow_id (original_slot), so
+                // carryover ordering and the migration backfill agree (issue #488).
+                scheduled_for: Some(*original_slot),
             },
         )
         .await;
@@ -3676,6 +3682,8 @@ async fn drain_buffered_schedule_runs(
                     severity,
                     context_headers: None,
                     sla,
+                    schedule_id: Some(schedule.id),
+                    scheduled_for: Some(scheduled_for),
                 },
             )
             .await;

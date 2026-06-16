@@ -916,6 +916,12 @@ struct WorkflowDetailsResponse {
     execution: WorkflowExecution,
     history: Vec<Value>,
     external_handoffs: Vec<ExternalHandoffResponse>,
+    /// Output of the most recent prior `COMPLETED` run of the same schedule, if any (issue #488).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_completion_result: Option<Value>,
+    /// Error from the most recent terminal run if it ended `FAILED` or `TIMED_OUT` (issue #488).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2788,7 +2794,14 @@ pub const fn management_api_response_fields()
         (
             "GET",
             "/workflows/{id}",
-            Some(&["parent_id", "execution", "history", "external_handoffs"]),
+            Some(&[
+                "parent_id",
+                "execution",
+                "history",
+                "external_handoffs",
+                "last_completion_result",
+                "last_error",
+            ]),
         ),
         (
             "GET",
@@ -4134,6 +4147,20 @@ async fn get_workflow(
     let history = store::load_history(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
+
+    // Extract carryover from the first (WorkflowStarted) event before consuming the vec.
+    let (last_completion_result, last_error) =
+        if let Some(autumn_harvest::event::WorkflowEvent::WorkflowStarted {
+            last_completion_result,
+            last_error,
+            ..
+        }) = history.events.as_slice().first()
+        {
+            (last_completion_result.clone(), last_error.clone())
+        } else {
+            (None, None)
+        };
+
     let events = history
         .events
         .into_iter()
@@ -4158,6 +4185,8 @@ async fn get_workflow(
         execution,
         history: events,
         external_handoffs,
+        last_completion_result,
+        last_error,
     }))
 }
 
@@ -5605,6 +5634,8 @@ async fn start_workflow(
             severity,
             context_headers: None,
             sla: effective_sla,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await;
@@ -6153,6 +6184,8 @@ async fn batch_start_workflows(
                     severity,
                     context_headers: None,
                     sla,
+                    schedule_id: None,
+                    scheduled_for: None,
                 },
             )
             .await;
@@ -10480,6 +10513,15 @@ async fn trigger_schedule_now(
             severity,
             context_headers: None,
             sla,
+            // Manual trigger-now is treated as a manual fire and deliberately does NOT
+            // participate in scheduled carryover (issue #488). Tagging it with the
+            // schedule would make resolve_carryover run on this default-pool connection
+            // even when the schedule's prior runs live on another shard (multi-shard
+            // schedule routing is issue #171 follow-up), and the UI trigger path lacks
+            // the budget/exhaustion checks the automated lineage relies on. Scheduled
+            // fires and backfills carry the lineage; ad-hoc operator fires do not.
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await;
@@ -10701,7 +10743,8 @@ async fn schedule_backfill(
     }
 
     // Load the schedule row (fan out across shards; schedule rows are not shard-assigned).
-    let schedule = load_schedule_by_id(&api_state, schedule_id).await?;
+    let (schedule, schedule_shard) =
+        load_schedule_by_id_with_shard(&api_state, schedule_id).await?;
 
     // Respect paused state unless the caller explicitly opts in.
     if schedule.is_paused && !request.include_paused {
@@ -10827,12 +10870,26 @@ async fn schedule_backfill(
             count_existing_in_window(&pool, &kind, schedule_id, &name, &original_slots).await;
         let remaining = total.saturating_sub(already_exists);
         let available_slots = usize::try_from((max_active - running).max(0)).unwrap_or(0);
-        let would_dispatch = remaining.min(available_slots);
-        let would_skip_max = remaining - would_dispatch;
+        // Mirror the dispatch loop's gates so the preview matches the real path: the
+        // max_runs budget is checked first (#478), then max_active_runs concurrency.
+        let budget_remaining: Option<usize> = schedule.max_runs.and_then(|max| {
+            (max > 0)
+                .then(|| {
+                    usize::try_from((i64::from(max) - i64::from(schedule.runs_started)).max(0)).ok()
+                })
+                .flatten()
+        });
+        let budget_passed = budget_remaining.map_or(remaining, |b| remaining.min(b));
+        let would_dispatch = budget_passed.min(available_slots);
+        let would_skip_budget = remaining - budget_passed;
+        let would_skip_max = budget_passed - would_dispatch;
 
         let mut skipped_reasons = std::collections::HashMap::new();
         if already_exists > 0 {
             skipped_reasons.insert("already_exists".to_string(), already_exists);
+        }
+        if would_skip_budget > 0 {
+            skipped_reasons.insert("max_runs_exhausted".to_string(), would_skip_budget);
         }
         if would_skip_max > 0 {
             skipped_reasons.insert("max_active_runs".to_string(), would_skip_max);
@@ -10847,7 +10904,7 @@ async fn schedule_backfill(
                     .to_string()
             });
 
-        let would_skip = already_exists + would_skip_max;
+        let would_skip = already_exists + would_skip_budget + would_skip_max;
         write_backfill_log(
             &pool,
             schedule_id,
@@ -10993,6 +11050,22 @@ async fn schedule_backfill(
             // creating a second run for the same timestamp after the backfill window.
             let wf_shard_pool = pool.default_pool();
             for (original_slot, _fire_time) in &timestamp_pairs {
+                // Respect the max_runs total budget (issue #478): a backfill must not
+                // dispatch past the schedule's remaining run budget, otherwise an
+                // out-of-budget run would advance scheduled carryover (#488). Mirrors
+                // the max_active gate below (computed once, tracked via
+                // dispatched_this_call); like that gate it is best-effort against a
+                // concurrent tick, but never dispatches beyond the budget seen here.
+                if schedule.max_runs.is_some_and(|max| {
+                    max > 0
+                        && i64::from(schedule.runs_started) + dispatched_this_call >= i64::from(max)
+                }) {
+                    skipped += 1;
+                    *skipped_reasons
+                        .entry("max_runs_exhausted".to_string())
+                        .or_insert(0) += 1;
+                    continue;
+                }
                 // Respect max_active_runs: skip if we've already saturated the limit.
                 if running_at_start + dispatched_this_call >= max_active {
                     skipped += 1;
@@ -11113,6 +11186,9 @@ async fn schedule_backfill(
                         severity,
                         context_headers: None,
                         sla,
+                        // Backfilled runs share the schedule's carryover lineage (issue #488).
+                        schedule_id: Some(schedule_id),
+                        scheduled_for: Some(*original_slot),
                     },
                 )
                 .await;
@@ -11143,6 +11219,17 @@ async fn schedule_backfill(
             let shard_pool = pool.pool_for(shard_id);
 
             for (original_slot, _fire_time) in &timestamp_pairs {
+                // Respect the max_runs total budget (issue #478) — see the workflow loop.
+                if schedule.max_runs.is_some_and(|max| {
+                    max > 0
+                        && i64::from(schedule.runs_started) + dispatched_this_call >= i64::from(max)
+                }) {
+                    skipped += 1;
+                    *skipped_reasons
+                        .entry("max_runs_exhausted".to_string())
+                        .or_insert(0) += 1;
+                    continue;
+                }
                 // Respect max_active_runs for DAGs (now counted via workflow executions).
                 if running_at_start + dispatched_this_call >= max_active {
                     skipped += 1;
@@ -11257,6 +11344,9 @@ async fn schedule_backfill(
                         context_headers: None,
 
                         sla: None,
+                        // Backfilled runs share the schedule's carryover lineage (issue #488).
+                        schedule_id: Some(schedule_id),
+                        scheduled_for: Some(*original_slot),
                     },
                 )
                 .await;
@@ -11286,6 +11376,52 @@ async fn schedule_backfill(
                         failed += 1;
                     }
                 }
+            }
+        }
+    }
+
+    // Persist the consumed max_runs budget (issue #478) so a later backfill or
+    // scheduler tick sees it: without this, a tagged backfill that participates in
+    // carryover (#488) would leave harvest_schedules.runs_started unchanged and a
+    // subsequent out-of-budget run could still be started. Mirror the scheduler's
+    // DB-side atomic increment (runs_started + dispatched) on the schedule's own shard,
+    // transitioning to exhausted when the cap is reached. Best-effort: a failure here
+    // must not fail an already-dispatched backfill (the gate above still bounds a single
+    // request), so errors are logged-and-ignored.
+    if dispatched_this_call > 0 {
+        let dispatched_i32 = i32::try_from(dispatched_this_call).unwrap_or(i32::MAX);
+        let new_runs_started = schedule.runs_started.saturating_add(dispatched_i32);
+        let budget_exhausted = schedule
+            .max_runs
+            .is_some_and(|max| max > 0 && new_runs_started >= max);
+        if let Ok(mut budget_conn) = acquire_conn(pool.pool_for(schedule_shard)).await {
+            use autumn_harvest::schema::harvest_schedules::dsl as sdsl;
+            let now = chrono::Utc::now();
+            let res = if budget_exhausted {
+                diesel::update(
+                    sdsl::harvest_schedules
+                        .find(schedule_id)
+                        .filter(sdsl::exhausted_at.is_null()),
+                )
+                .set((
+                    sdsl::runs_started.eq(sdsl::runs_started + dispatched_i32),
+                    sdsl::exhausted_at.eq(Some(now)),
+                    sdsl::exhausted_reason.eq(Some("max_runs_exhausted")),
+                ))
+                .execute(&mut budget_conn)
+                .await
+            } else {
+                diesel::update(sdsl::harvest_schedules.find(schedule_id))
+                    .set(sdsl::runs_started.eq(sdsl::runs_started + dispatched_i32))
+                    .execute(&mut budget_conn)
+                    .await
+            };
+            if let Err(e) = res {
+                tracing::warn!(
+                    schedule_id = %schedule_id,
+                    error = %e,
+                    "failed to persist backfill max_runs budget consumption"
+                );
             }
         }
     }
@@ -18483,6 +18619,8 @@ mod tests {
                 context_headers: None,
 
                 sla: None,
+                schedule_id: None,
+                scheduled_for: None,
             },
         )
         .await

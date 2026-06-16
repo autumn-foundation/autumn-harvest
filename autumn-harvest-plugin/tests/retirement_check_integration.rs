@@ -181,6 +181,8 @@ async fn insert_versioned_execution(
         sla: None,
 
         sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -208,6 +210,8 @@ async fn insert_versioned_execution(
         WorkflowEvent::WorkflowStarted {
             input: json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: format!("version:{change_id}"),
@@ -256,6 +260,8 @@ async fn insert_execution_without_marker(
         sla: None,
 
         sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -283,6 +289,8 @@ async fn insert_execution_without_marker(
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &events, 0)
         .await

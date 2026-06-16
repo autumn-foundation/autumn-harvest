@@ -109,6 +109,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
     "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
@@ -358,6 +360,8 @@ async fn transactional_activity_happy_path_atomic_commit() {
                 context_headers: None,
 
                 sla: None,
+                schedule_id: None,
+                scheduled_for: None,
             },
         )
         .await
@@ -438,6 +442,8 @@ async fn transactional_activity_err_rolls_back_user_writes() {
                 context_headers: None,
 
                 sla: None,
+                schedule_id: None,
+                scheduled_for: None,
             },
         )
         .await

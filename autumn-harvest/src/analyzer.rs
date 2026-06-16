@@ -309,6 +309,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: small_json,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityCompleted {
                 activity_id: ActivityExecId::new(),

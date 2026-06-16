@@ -430,6 +430,8 @@ fn replay_does_not_recheck_cap_on_existing_events() {
         WorkflowEvent::WorkflowStarted {
             input: json!(null),
             timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "side_effect:big_value".to_string(),

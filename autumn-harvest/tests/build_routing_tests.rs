@@ -325,6 +325,8 @@ mod db_tests {
         "\n",
         include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
         "\n",
+        include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+        "\n",
         include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
     );
 
@@ -496,6 +498,8 @@ mod db_tests {
                 sla: None,
 
                 sla_deadline_at: None,
+                schedule_id: None,
+                scheduled_for: None,
             })
             .execute(conn)
             .await

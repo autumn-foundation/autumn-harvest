@@ -849,6 +849,11 @@ async fn insert_fork_execution(
         runbook_url: source.runbook_url.as_deref(),
         severity: source.severity.as_deref(),
         context_headers: source.context_headers.clone(),
+        // Reset forks are operator interventions, not scheduled fires: leaving
+        // schedule_id NULL keeps their (re-)completion out of scheduled carryover so a
+        // reset of an old slot can't roll a later run's incremental cursor backward (#488).
+        schedule_id: None,
+        scheduled_for: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -1100,6 +1105,8 @@ mod tests {
             pause_reason: Some("operator pause".into()),
             pause_actor: Some("oncall".into()),
             current_details: None,
+            schedule_id: None,
+            scheduled_for: None,
         }
     }
 
@@ -1149,6 +1156,8 @@ mod tests {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let plan = validate_reset_point(&events, 0).expect("workflow start is always valid");
@@ -1164,6 +1173,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -1200,6 +1211,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ExternalCancelRequested { cancel_id, target },
             WorkflowEvent::MarkerRecorded {
@@ -1230,6 +1243,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ExternalCancelRequested { cancel_id, target },
             WorkflowEvent::ExternalCancelDelivered { cancel_id },
@@ -1246,6 +1261,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ChildWorkflowSpawnedDetached {
                 child_id,
@@ -1285,6 +1302,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
@@ -1320,6 +1339,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::LocalActivityScheduled {
                 activity_id,
@@ -1351,6 +1372,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::LocalActivityScheduled {
                 activity_id,
@@ -1381,6 +1404,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),

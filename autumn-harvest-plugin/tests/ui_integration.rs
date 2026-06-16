@@ -38,6 +38,10 @@ use tower::ServiceExt;
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
+    ),
+    "\n",
     include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260427000000_harvest_continue_as_new/up.sql"),
@@ -386,6 +390,8 @@ async fn insert_workflow_on_url(
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -2144,6 +2150,8 @@ async fn insert_child_workflow_on_url(
             context_headers: None,
 
             sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await

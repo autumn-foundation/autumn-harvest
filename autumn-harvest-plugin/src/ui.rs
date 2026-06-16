@@ -5948,6 +5948,12 @@ async fn execute_schedule_trigger_ui(
             severity,
             context_headers: None,
             sla,
+            // Manual trigger-now is a manual fire and does NOT participate in scheduled
+            // carryover (issue #488) — matches the API trigger path and avoids the
+            // cross-shard resolve / budget-bypass issues. Scheduled fires and backfills
+            // carry the lineage; ad-hoc operator fires do not.
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await;
@@ -7689,6 +7695,8 @@ mod tests {
             pause_reason: None,
             pause_actor: None,
             current_details: None,
+            schedule_id: None,
+            scheduled_for: None,
         }
     }
 

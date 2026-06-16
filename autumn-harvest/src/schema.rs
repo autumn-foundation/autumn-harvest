@@ -63,6 +63,13 @@ diesel::table! {
         /// Wall-clock instant the SLA was first detected as breached (issue #487).
         /// `NULL` when `sla_breached = false`.
         sla_breached_at -> Nullable<Timestamptz>,
+        /// Schedule that fired this execution (issue #488). NULL for manual starts.
+        /// Used to resolve the last-completion-result carryover at workflow start time.
+        schedule_id -> Nullable<Uuid>,
+        /// The logical schedule slot this run fires for (issue #488). Carryover is
+        /// ordered by this rather than `completed_at` so out-of-order completions can't
+        /// roll an incremental cursor backward. NULL for non-scheduled executions.
+        scheduled_for -> Nullable<Timestamptz>,
     }
 }
 

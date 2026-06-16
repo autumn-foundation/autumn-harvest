@@ -108,6 +108,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
     "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
@@ -378,6 +380,8 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     context_headers: None,
 
                     sla: None,
+                    schedule_id: None,
+                    scheduled_for: None,
                 },
             )
             .await
@@ -547,6 +551,8 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     WorkflowEvent::WorkflowStarted {
                         input: Value::Null,
                         timestamp: Utc::now(),
+                        last_completion_result: None,
+                        last_error: None,
                     },
                     WorkflowEvent::ActivityScheduled {
                         activity_id: act_id,

@@ -59,6 +59,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
     "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
@@ -121,6 +123,8 @@ async fn test_send_and_load_signals() {
         sla: None,
 
         sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -176,6 +180,8 @@ async fn test_mark_signals_consumed() {
         sla: None,
 
         sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)

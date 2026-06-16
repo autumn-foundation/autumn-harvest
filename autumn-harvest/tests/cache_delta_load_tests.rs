@@ -100,6 +100,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
     "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
@@ -146,6 +148,8 @@ async fn insert_execution(conn: &mut AsyncPgConnection, name: &str) -> Execution
         sla: None,
 
         sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -189,6 +193,8 @@ async fn cold_path_reads_full_history_every_task() {
     let mut initial: Vec<WorkflowEvent> = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     initial.extend(make_activity_events(24)); // 48 activity events → 49 total
     store::append_events(&mut conn, exec_id, &initial, 0)
@@ -234,6 +240,8 @@ async fn warm_path_delta_load_reads_only_new_events() {
     let mut initial: Vec<WorkflowEvent> = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     initial.extend(make_activity_events(24)); // 48 events → 49 total
     initial.push(WorkflowEvent::TimerStarted {
@@ -326,6 +334,8 @@ async fn sticky_routing_on_vs_off_reload_count() {
     let mut initial: Vec<WorkflowEvent> = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     initial.extend(make_activity_events(24)); // 48 + 1 started = 49
     initial.push(WorkflowEvent::TimerStarted {

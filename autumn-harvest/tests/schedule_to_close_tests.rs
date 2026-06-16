@@ -100,6 +100,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
     "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
@@ -139,6 +141,8 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
             sla: None,
 
             sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
         })
         .execute(conn)
         .await
@@ -161,6 +165,8 @@ async fn scanner_times_out_pending_task_with_expired_schedule_to_close() {
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -252,6 +258,8 @@ async fn scanner_times_out_running_task_with_expired_schedule_to_close() {
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -336,6 +344,8 @@ async fn scanner_does_not_affect_tasks_without_schedule_to_close() {
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -417,6 +427,8 @@ async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -513,6 +525,8 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )

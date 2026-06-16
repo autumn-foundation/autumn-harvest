@@ -206,6 +206,8 @@ async fn insert_execution(
         sla: None,
 
         sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -315,6 +317,8 @@ async fn single_full_history_export_returns_replay_fixture_shape() {
             WorkflowEvent::WorkflowStarted {
                 input: json!({ "customer": "acme" }),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -389,6 +393,8 @@ async fn batch_redacted_history_export_filters_and_reports_shard_coverage() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "authorization": "Bearer do-not-export" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;
@@ -401,6 +407,8 @@ async fn batch_redacted_history_export_filters_and_reports_shard_coverage() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "not": "selected" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;
@@ -449,6 +457,8 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "older-shard0" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;
@@ -461,6 +471,8 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "newer-shard0" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;
@@ -473,6 +485,8 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "newest-shard1" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;
@@ -532,6 +546,8 @@ async fn batch_updated_window_uses_latest_history_event_timestamp() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "recent-event-old-row" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;

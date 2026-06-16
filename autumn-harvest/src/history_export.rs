@@ -269,7 +269,12 @@ fn is_payload_field(key: &str) -> bool {
     // were stored under `MarkerRecorded.details` and redacted via "details"; the
     // new field must be redacted too so secrets/PII captured by the closure are
     // not leaked in a redacted export.
-    matches!(key, "input" | "output" | "payload" | "details" | "value")
+    // `last_completion_result` is the prior run's output frozen into WorkflowStarted
+    // for scheduled carryover (issue #488); redact it like any other payload copy.
+    matches!(
+        key,
+        "input" | "output" | "payload" | "details" | "value" | "last_completion_result"
+    )
 }
 
 fn is_token_field(key: &str) -> bool {
@@ -872,6 +877,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -917,6 +924,8 @@ mod tests {
                 WorkflowEvent::WorkflowStarted {
                     input: serde_json::json!({ "customer": "acme" }),
                     timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
                 },
                 WorkflowEvent::WorkflowCompleted {
                     output: serde_json::json!({ "ok": true }),
@@ -965,6 +974,8 @@ mod tests {
                         "authorization": "Bearer top-secret"
                     }),
                     timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
                 },
                 WorkflowEvent::ActivityScheduled {
                     activity_id,
@@ -1032,6 +1043,8 @@ mod tests {
                 WorkflowEvent::WorkflowStarted {
                     input: serde_json::json!({}),
                     timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
                 },
                 // A custom side_effect that captured a secret in its closure. Pre
                 // #384 this lived under MarkerRecorded.details and was redacted;
@@ -1073,6 +1086,8 @@ mod tests {
             events: vec![WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({ "large": "x".repeat(512) }),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             }],
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Full,
@@ -1116,6 +1131,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_activity_event(&event);
     }
@@ -1127,6 +1144,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_timer_event(&event);
     }
@@ -1138,6 +1157,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_child_workflow_event(&event);
     }
@@ -1149,6 +1170,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_misc_event(&event);
     }
@@ -1160,6 +1183,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_local_activity_event(&event);
     }
@@ -1171,6 +1196,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_external_activity_event(&event);
     }
@@ -1182,6 +1209,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_update_event(&event);
     }
