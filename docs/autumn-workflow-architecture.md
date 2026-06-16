@@ -5,12 +5,12 @@
 *Version 0.1 — Draft*
 *March 2026*
 
-**Release status note (0.3.0):** DAG scheduling, signals, queries, the
-management API, dead-letter list/replay endpoints, and durable workflow
-cancellation are implemented. Cancellation is currently a terminal workflow
-transition with activity heartbeat checks; workflow-level `ctx.cancelled()`
-cleanup remains an architecture target. First-class Saga compensation is
-implemented through the `Saga` builder.
+**Release status note (0.4.0):** DAG scheduling, signals, queries, the
+management API, dead-letter list/replay endpoints, durable workflow
+cancellation, pause/resume controls, DLQ aggregation, DAG retry from failed
+nodes, timezone-aware cron schedules, scaling signals, and metrics endpoints
+are implemented. First-class Saga compensation is implemented through the
+`Saga` builder.
 
 ---
 
@@ -74,8 +74,8 @@ Workflow orchestration is a heavyweight dependency. Many Autumn users will never
 ```toml
 # Cargo.toml — only when you need workflows
 [dependencies]
-autumn-web = "0.4"
-autumn-harvest = "0.1"
+autumn-web = "0.5"
+autumn-harvest = "0.4"
 ```
 
 The `autumn-harvest-macros` crate is separate from `autumn-macros` because proc-macro crates cannot export non-macro items. Harvest macros generate different companion functions (`__autumn_workflow_info_*`, `__autumn_activity_info_*`) that need their own expansion logic.

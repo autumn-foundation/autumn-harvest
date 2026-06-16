@@ -29,7 +29,7 @@ metrics-rs = ["dep:metrics"]
 schema = ["dep:schemars"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.3.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.4.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }

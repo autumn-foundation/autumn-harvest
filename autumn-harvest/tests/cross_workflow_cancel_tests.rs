@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
@@ -90,6 +91,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
     "\n",
     include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
@@ -106,6 +109,7 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
 
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -212,6 +216,7 @@ fn default_start_params(
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        sla: None,
         memo: None,
         search_attrs: None,
         reuse_policy: autumn_harvest::types::WorkflowIdReusePolicy::default(),
@@ -263,6 +268,7 @@ async fn test_same_shard_live_cancel() {
         module: "cross_workflow_cancel_tests",
         handler: canceller_workflow,
         execution_timeout: None,
+        sla: None,
         concurrency: None,
         max_input_bytes: None,
         owner: None,
@@ -279,6 +285,7 @@ async fn test_same_shard_live_cancel() {
         module: "cross_workflow_cancel_tests",
         handler: long_running_target_workflow,
         execution_timeout: None,
+        sla: None,
         concurrency: None,
         max_input_bytes: None,
         owner: None,
@@ -394,6 +401,7 @@ async fn test_already_terminal_target_is_no_op_success() {
                 module: "cross_workflow_cancel_tests",
                 handler: canceller_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
                 owner: None,
@@ -410,6 +418,7 @@ async fn test_already_terminal_target_is_no_op_success() {
                 module: "cross_workflow_cancel_tests",
                 handler: instant_complete_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
                 owner: None,
@@ -536,6 +545,7 @@ async fn test_grace_window_expiry_unknown_target() {
             module: "cross_workflow_cancel_tests",
             handler: canceller_expecting_failure,
             execution_timeout: None,
+            sla: None,
             concurrency: None,
             max_input_bytes: None,
             owner: None,
@@ -643,6 +653,7 @@ async fn test_cross_shard_cancel_via_outbox() {
                 module: "cross_workflow_cancel_tests",
                 handler: canceller_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
                 owner: None,
@@ -659,6 +670,7 @@ async fn test_cross_shard_cancel_via_outbox() {
                 module: "cross_workflow_cancel_tests",
                 handler: long_running_target_workflow,
                 execution_timeout: None,
+                sla: None,
                 concurrency: None,
                 max_input_bytes: None,
                 owner: None,

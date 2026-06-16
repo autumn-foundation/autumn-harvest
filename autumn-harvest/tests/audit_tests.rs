@@ -17,6 +17,7 @@ use diesel::QueryDsl;
 use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
@@ -98,7 +99,11 @@ async fn make_conn() -> (
     diesel_async::AsyncPgConnection,
     testcontainers::ContainerAsync<Postgres>,
 ) {
-    let container = Postgres::default().start().await.expect("postgres start");
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("postgres start");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
     let mut conn = diesel_async::AsyncPgConnection::establish(&url)
