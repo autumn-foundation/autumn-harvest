@@ -66,6 +66,8 @@ pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
 pub mod dag_export;
 pub mod dag_linter;
+#[cfg(any(test, feature = "testing"))]
+pub mod dag_monte_carlo;
 #[cfg(feature = "testing")]
 pub mod dag_profiler;
 #[cfg(any(test, feature = "testing"))]
