@@ -16,6 +16,7 @@ use autumn_harvest::store;
 use autumn_harvest::types::{ExecutionId, WorkflowIdReusePolicy};
 use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::RunQueryDsl;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
@@ -83,6 +84,7 @@ async fn setup_test_db() -> (
 ) {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_tag("16")
         .start()
         .await
         .expect("postgres container should start");

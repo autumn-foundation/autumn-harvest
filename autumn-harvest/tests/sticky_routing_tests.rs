@@ -373,6 +373,7 @@ mod db_tests {
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
     use std::time::Duration;
     use testcontainers::ContainerAsync;
+    use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
     use uuid::Uuid;
@@ -438,6 +439,7 @@ mod db_tests {
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
         let container = Postgres::default()
             .with_init_sql(INIT_SQL.to_string().into_bytes())
+            .with_tag("16")
             .start()
             .await
             .expect("failed to start Postgres container");

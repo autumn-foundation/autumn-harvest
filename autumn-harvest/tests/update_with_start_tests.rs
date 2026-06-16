@@ -148,6 +148,7 @@ mod db_tests {
     use autumn_harvest::replay::{HistoryMatch, HistoryMatcher};
     use autumn_harvest::store;
     use autumn_harvest::types::{ExecutionId, Priority, UpdateId, WorkflowIdReusePolicy};
+    use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
@@ -215,6 +216,7 @@ mod db_tests {
     ) {
         let container = Postgres::default()
             .with_init_sql(INIT_SQL.to_string().into_bytes())
+            .with_tag("16")
             .start()
             .await
             .expect("postgres container should start");

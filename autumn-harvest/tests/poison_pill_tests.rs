@@ -24,6 +24,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
@@ -116,7 +117,11 @@ impl MetricsRecorder for RecordingMetrics {
 }
 
 async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
-    let container = Postgres::default().start().await.expect("postgres start");
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("postgres start");
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");

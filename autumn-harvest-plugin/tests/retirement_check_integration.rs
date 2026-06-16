@@ -22,6 +22,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
@@ -38,6 +39,7 @@ fn build_test_pool(database_url: &str) -> DbPool {
 
 async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -57,6 +59,7 @@ async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgre
 
 async fn setup_two_shards_with_migrations() -> ((String, String), ContainerAsync<Postgres>) {
     let container = Postgres::default()
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");

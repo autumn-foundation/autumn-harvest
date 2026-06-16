@@ -11,7 +11,7 @@ validate your client against it, and understand what counts as a breaking change
 `docs/api-contract.json` is the single source of truth.  It is checked into the
 repository, so it is always available without running a server or starting a
 worker process.  The file version matches the `autumn-harvest-plugin` crate
-version (e.g. `"version": "0.3.0"`).
+version (e.g. `"version": "0.4.0"`).
 
 ```bash
 # Inspect the full route list

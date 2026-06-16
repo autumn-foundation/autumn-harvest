@@ -17894,6 +17894,7 @@ mod tests {
     use super::*;
     use autumn_harvest::workers::WorkerHealth;
     use testcontainers::ContainerAsync;
+    use testcontainers::ImageExt;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
@@ -18514,7 +18515,7 @@ mod tests {
     }
 
     async fn setup_workflow_result_database() -> Option<(String, ContainerAsync<Postgres>)> {
-        let container = match Postgres::default().start().await {
+        let container = match Postgres::default().with_tag("16").start().await {
             Ok(container) => container,
             Err(error) => {
                 eprintln!(

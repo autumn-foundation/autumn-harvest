@@ -11,6 +11,7 @@ use std::time::Duration;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
@@ -139,6 +140,7 @@ async fn setup_db() -> (String, DbHandle) {
 
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");

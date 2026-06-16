@@ -11,6 +11,7 @@ use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::SimpleAsyncConnection;
 use std::sync::{Arc, Mutex};
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
@@ -63,6 +64,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
     "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
     include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
     "\n",
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
@@ -84,7 +87,11 @@ async fn make_conn() -> (
     diesel_async::AsyncPgConnection,
     testcontainers::ContainerAsync<Postgres>,
 ) {
-    let container = Postgres::default().start().await.expect("postgres start");
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("postgres start");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
     let mut conn = diesel_async::AsyncPgConnection::establish(&url)
