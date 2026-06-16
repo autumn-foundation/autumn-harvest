@@ -203,7 +203,9 @@ pub use dag_linter::{
     MissingTimeoutRule,
 };
 #[cfg(feature = "testing")]
-pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};
+pub use dag_profiler::{
+    DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind, export_chrome_trace,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
 pub use det_check::{

@@ -167,6 +167,91 @@ impl DagProfiler {
     }
 }
 
+/// Exports a `DagProfile` to the Chrome Trace Event Format (JSON).
+///
+/// This generates a JSON array of events that can be loaded into profiling
+/// tools like `chrome://tracing` or Perfetto.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_harvest::dag::DagBuilder;
+/// use autumn_harvest::dag_profiler::{DagProfiler, export_chrome_trace};
+/// use std::time::Duration;
+///
+/// fn my_activity() {}
+/// fn my_other_activity() {}
+///
+/// let mut builder = DagBuilder::new();
+/// let a = builder.activity(my_activity);
+/// let b = builder.activity(my_other_activity).upstream(&a);
+/// let dag = builder.build().unwrap();
+///
+/// let profiler = DagProfiler::new(dag).mock_duration("my_activity", Duration::from_secs(1));
+/// let profile = profiler.profile();
+///
+/// let trace = export_chrome_trace(&profile).unwrap();
+/// assert!(trace.contains("my_activity"));
+/// assert!(trace.contains("my_other_activity"));
+/// ```
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[allow(clippy::cast_possible_truncation)]
+pub fn export_chrome_trace(profile: &DagProfile) -> Result<String, std::fmt::Error> {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    writeln!(out, "[")?;
+
+    let mut active_tasks = HashMap::new();
+    let mut free_tids = Vec::new();
+    let mut next_tid = 1;
+
+    let mut first = true;
+
+    for event in &profile.timeline {
+        let ts_micros = event.time.as_micros() as u64;
+
+        if first {
+            first = false;
+        } else {
+            writeln!(out, ",")?;
+        }
+
+        match &event.kind {
+            ProfilerEventKind::TaskStarted(idx, name) => {
+                let tid = free_tids.pop().unwrap_or_else(|| {
+                    let t = next_tid;
+                    next_tid += 1;
+                    t
+                });
+                active_tasks.insert(*idx, tid);
+
+                write!(
+                    out,
+                    r#"  {{"name":"{name}","ph":"B","ts":{ts_micros},"pid":1,"tid":{tid}}}"#
+                )?;
+            }
+            ProfilerEventKind::TaskCompleted(idx, name) => {
+                if let Some(tid) = active_tasks.remove(idx) {
+                    write!(
+                        out,
+                        r#"  {{"name":"{name}","ph":"E","ts":{ts_micros},"pid":1,"tid":{tid}}}"#
+                    )?;
+                    free_tids.push(tid);
+                    free_tids.sort_unstable_by(|a, b| b.cmp(a));
+                }
+            }
+        }
+    }
+
+    writeln!(out)?;
+    writeln!(out, "]")?;
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +320,43 @@ mod tests {
         assert_eq!(profile.total_duration, Duration::from_secs(6));
         // max concurrency is 2 because B and C run at the same time.
         assert_eq!(profile.peak_concurrency, 2);
+    }
+
+    #[test]
+    fn test_export_chrome_trace_empty() {
+        let profile = DagProfile {
+            total_duration: Duration::ZERO,
+            peak_concurrency: 0,
+            timeline: vec![],
+        };
+        let trace = export_chrome_trace(&profile).unwrap();
+        assert_eq!(trace, "[\n\n]\n");
+    }
+
+    #[test]
+    fn test_export_chrome_trace_valid_json() {
+        let profile = DagProfile {
+            total_duration: Duration::from_secs(2),
+            peak_concurrency: 1,
+            timeline: vec![
+                ProfilerEvent {
+                    time: Duration::from_secs(0),
+                    kind: ProfilerEventKind::TaskStarted(0, "task_a".to_string()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(2),
+                    kind: ProfilerEventKind::TaskCompleted(0, "task_a".to_string()),
+                },
+            ],
+        };
+        let trace = export_chrome_trace(&profile).unwrap();
+
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&trace).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["name"], "task_a");
+        assert_eq!(parsed[0]["ph"], "B");
+        assert_eq!(parsed[1]["name"], "task_a");
+        assert_eq!(parsed[1]["ph"], "E");
+        assert_eq!(parsed[0]["tid"], parsed[1]["tid"]);
     }
 }
