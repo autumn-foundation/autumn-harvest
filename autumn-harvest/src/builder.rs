@@ -1626,6 +1626,23 @@ pub struct WorkerConfig {
     /// poison pills are re-queued indefinitely — the legacy retry-loop
     /// behaviour).
     pub poison_pill_threshold: i32,
+    /// Maximum wall-clock time a single workflow-task dispatch may run before
+    /// the worker reclaims the concurrency slot (issue #494).
+    ///
+    /// When a `#[workflow]` body does not reach a suspension point or complete
+    /// within this budget, the dispatch is abandoned: its semaphore permit is
+    /// released so other tasks can proceed and the task row is reset to
+    /// `PENDING` for a subsequent attempt. Deterministic replay means a
+    /// transient slow dispatch recovers safely on retry.
+    ///
+    /// After `poison_pill_threshold` consecutive timeouts for the same
+    /// execution the task is escalated to the dead-letter queue rather than
+    /// re-queued, so a permanently stuck workflow body never loops forever.
+    ///
+    /// Defaults to **10 seconds**. Set to [`Duration::ZERO`] to disable
+    /// (workflow tasks run without a wall-clock budget — the behaviour before
+    /// this field was added). Protection is **on by default**.
+    pub workflow_task_timeout: Duration,
     /// Maximum wall-clock time a workflow execution may stay paused before the
     /// bounded-pause auto-resume scanner force-resumes it with
     /// `actor = "auto-resume(timeout)"` (issue #383).
@@ -1672,6 +1689,7 @@ impl Default for WorkerConfig {
             max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            workflow_task_timeout: Duration::from_secs(10),
             max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,
@@ -1819,6 +1837,42 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_poison_pill_threshold(mut self, threshold: i32) -> Self {
         self.poison_pill_threshold = threshold;
+        self
+    }
+
+    /// Override the per-workflow-task dispatch timeout (default 10 s, issue #494).
+    ///
+    /// A workflow-task dispatch that does not complete or suspend within this
+    /// budget has its concurrency permit reclaimed immediately, allowing other
+    /// tasks to proceed. The hung future is cancelled and the task row is reset
+    /// to `PENDING` so any worker can re-claim it on the next poll.
+    ///
+    /// After `poison_pill_threshold` consecutive timeouts for the same
+    /// execution the task is escalated to the DLQ rather than re-queued
+    /// indefinitely (see [`with_poison_pill_threshold`]).
+    ///
+    /// Set to [`Duration::ZERO`] to disable (no wall-clock budget on workflow
+    /// tasks — the behaviour before this setting was added).
+    ///
+    /// [`with_poison_pill_threshold`]: Self::with_poison_pill_threshold
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use std::time::Duration;
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// // Tighten to 5 s for a latency-sensitive deployment.
+    /// let config = WorkerConfig::default().with_workflow_task_timeout(Duration::from_secs(5));
+    /// assert_eq!(config.workflow_task_timeout, Duration::from_secs(5));
+    ///
+    /// // Disable the guard entirely.
+    /// let config = WorkerConfig::default().with_workflow_task_timeout(Duration::ZERO);
+    /// assert!(config.workflow_task_timeout.is_zero());
+    /// ```
+    #[must_use]
+    pub const fn with_workflow_task_timeout(mut self, timeout: Duration) -> Self {
+        self.workflow_task_timeout = timeout;
         self
     }
 
@@ -2446,6 +2500,28 @@ mod tests {
             config.max_local_activity_start_to_close,
             Duration::from_secs(60)
         );
+    }
+
+    // ── Workflow-task timeout tests (issue #494) ──────────────────────────
+
+    #[test]
+    fn worker_config_workflow_task_timeout_defaults_to_10s() {
+        assert_eq!(
+            WorkerConfig::default().workflow_task_timeout,
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn worker_config_with_workflow_task_timeout_overrides() {
+        let config = WorkerConfig::default().with_workflow_task_timeout(Duration::from_secs(30));
+        assert_eq!(config.workflow_task_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn worker_config_workflow_task_timeout_zero_disables() {
+        let config = WorkerConfig::default().with_workflow_task_timeout(Duration::ZERO);
+        assert_eq!(config.workflow_task_timeout, Duration::ZERO);
     }
 
     #[test]

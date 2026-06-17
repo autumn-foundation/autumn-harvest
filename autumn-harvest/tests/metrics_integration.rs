@@ -373,6 +373,8 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+
+                workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
@@ -2225,6 +2227,8 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         priority_aging_secs: None,
         unknown_target_grace_window: Duration::from_secs(5),
         poison_pill_threshold: 3,
+
+        workflow_task_timeout: std::time::Duration::from_secs(10),
         labels: std::collections::HashMap::new(),
         max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
         max_workflow_history_events: None,

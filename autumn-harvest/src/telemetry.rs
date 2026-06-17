@@ -198,6 +198,19 @@ pub const ATTR_SIGNAL_ID: &str = "harvest.signal.id";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_TIMEOUT: &str = "harvest.workflow.timeout";
 
+/// Counter: incremented each time a workflow-task dispatch is abandoned because
+/// it did not complete or suspend within `WorkerConfig::workflow_task_timeout`
+/// (issue #494).
+///
+/// Each increment signals one reclamation of a worker concurrency slot from a
+/// hung or blocking workflow body. After `poison_pill_threshold` consecutive
+/// increments for the same execution the task is quarantined to the DLQ with
+/// [`DeadLetterReason::WorkflowTaskTimeout`](crate::dlq::DeadLetterReason).
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_TASK_TIMEOUT: &str = "harvest.workflow.task_timeout";
+
 /// Counter: incremented exactly once per run when a workflow execution exceeds its
 /// declared soft SLA budget (`sla_deadline_at`) while still RUNNING/SUSPENDED.
 ///
@@ -956,6 +969,18 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
+    /// A workflow-task dispatch was abandoned because it did not complete or
+    /// suspend within `WorkerConfig::workflow_task_timeout` (issue #494).
+    ///
+    /// Each call represents one reclaimed worker concurrency slot. After
+    /// `poison_pill_threshold` consecutive calls for the same execution the
+    /// task is escalated to the DLQ.
+    ///
+    /// Maps to the counter `harvest.workflow.task_timeout{workflow, queue}`.
+    fn record_workflow_task_timeout(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
     /// A workflow execution has exceeded its declared soft SLA budget while
     /// still RUNNING/SUSPENDED (issue #487).
     ///
@@ -1218,6 +1243,10 @@ mod tests {
             METRIC_WORKFLOW_NON_DETERMINISM,
             "harvest.workflow.non_determinism"
         );
+        assert_eq!(
+            METRIC_WORKFLOW_TASK_TIMEOUT,
+            "harvest.workflow.task_timeout"
+        );
     }
 
     #[test]
@@ -1331,6 +1360,23 @@ mod tests {
         rec.record_workflow_terminal("billing", "default", WorkflowStatus::Completed);
         // If execution.id were a parameter the call above would require an
         // extra UUID argument and this test would fail to compile.
+    }
+
+    // ── Workflow-task timeout metric tests (issue #494) ───────────────────
+
+    #[test]
+    fn record_workflow_task_timeout_has_noop_default() {
+        // MetricsRecorder::record_workflow_task_timeout must exist with a
+        // no-op default so existing implementations compile without changes.
+        let rec = NoOpMetrics;
+        rec.record_workflow_task_timeout("onboarding", "default");
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_workflow_task_timeout() {
+        // ADR-0001 §7 cardinality rule: execution.id is span-only.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_workflow_task_timeout("billing", "default");
     }
 
     #[test]

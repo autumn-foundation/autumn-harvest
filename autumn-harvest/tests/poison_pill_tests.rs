@@ -353,6 +353,9 @@ async fn orphan_at_threshold_is_quarantined() {
         DeadLetterReason::HistoryCapExceeded { .. } => {
             panic!("expected PoisonPill reason, got HistoryCapExceeded")
         }
+        DeadLetterReason::WorkflowTaskTimeout { .. } => {
+            panic!("expected PoisonPill reason, got WorkflowTaskTimeout")
+        }
     }
 
     // Metric emitted with queue + reason labels (AC6).

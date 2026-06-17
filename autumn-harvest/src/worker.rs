@@ -119,6 +119,10 @@ pub struct WorkerRuntimeConfig {
     /// Consecutive worker crashes a task may cause before quarantine (issue #367).
     /// `0` disables quarantine (reclaimed poison pills are re-queued forever).
     pub poison_pill_threshold: i32,
+    /// Maximum wall-clock time a single workflow-task dispatch may run before
+    /// the worker reclaims the concurrency slot (issue #494).
+    /// `Duration::ZERO` disables the timeout (unbounded dispatch time).
+    pub workflow_task_timeout: Duration,
     /// Bounded-pause ceiling before the auto-resume scanner force-resumes a
     /// paused execution (issue #383). Default 24 hours.
     pub max_workflow_pause_duration: Duration,
@@ -174,6 +178,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             priority_aging_secs: cfg.priority_aging_secs,
             unknown_target_grace_window: cfg.unknown_target_grace_window,
             poison_pill_threshold: cfg.poison_pill_threshold,
+            workflow_task_timeout: cfg.workflow_task_timeout,
             max_workflow_pause_duration: cfg.max_workflow_pause_duration,
             labels: cfg.labels,
             #[cfg(feature = "db")]
@@ -6762,6 +6767,19 @@ pub struct Worker {
     /// Wrapped in `Arc<tokio::sync::Mutex<_>>` so it can be shared across
     /// concurrently-running task handler futures without cloning the events.
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    /// In-process consecutive-timeout strike counter per workflow execution
+    /// (issue #494).
+    ///
+    /// Each time a workflow-task dispatch exceeds `workflow_task_timeout` the
+    /// counter for that execution ID is incremented. Once it reaches
+    /// `poison_pill_threshold` the task is quarantined to the DLQ rather than
+    /// re-queued. The counter is cleared when a dispatch completes (either
+    /// successfully or with an error) so only **consecutive** timeouts count.
+    ///
+    /// Keyed by `workflow_exec_id` (not `task.id`) so re-queued tasks from
+    /// the same execution accumulate toward the same threshold.
+    workflow_task_timeout_strikes:
+        Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, i32>>>,
 }
 
 struct WorkerMonitoringHandles {
@@ -6979,6 +6997,9 @@ impl Worker {
             shutdown: CancellationToken::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
             workflow_cache,
+            workflow_task_timeout_strikes: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
@@ -7513,6 +7534,7 @@ impl Worker {
     }
 
     /// Spawn a bounded Tokio task for the claimed work item.
+    #[allow(clippy::too_many_lines)]
     fn dispatch_task(&self, task: TaskQueueItem, pool: &DbPool) {
         let kind = match ClaimedTaskKind::from_db(&task.task_type) {
             Ok(kind) => kind,
@@ -7542,6 +7564,16 @@ impl Worker {
         let max_local_activity_start_to_close = self.config.max_local_activity_start_to_close;
         let workflow_cache = Arc::clone(&self.workflow_cache);
 
+        // Workflow-task timeout (issue #494): only apply to workflow tasks.
+        let workflow_task_timeout = match kind {
+            ClaimedTaskKind::Workflow => self.config.workflow_task_timeout,
+            ClaimedTaskKind::Activity => Duration::ZERO,
+        };
+        let poison_pill_threshold = self.config.poison_pill_threshold;
+        let timeout_strikes = Arc::clone(&self.workflow_task_timeout_strikes);
+        let exec_id_for_timeout = task.workflow_exec_id;
+        let telemetry = Arc::clone(&self.registry);
+
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
             let Ok(_permit) = semaphore.acquire().await else {
@@ -7556,26 +7588,162 @@ impl Worker {
                 "executing task"
             );
 
-            if let Err(error) = process_task(
-                &pool,
-                registry,
-                task,
-                &worker_id,
-                &build_id,
-                cancellation_grace_period,
-                sticky_timeout,
-                max_local_activity_start_to_close,
-                workflow_cache,
-            )
-            .await
-            {
-                tracing::error!(
-                    task_id = %task_id,
-                    task_type = %task_type,
-                    worker_id = %worker_id,
-                    error = %error,
-                    "task execution failed"
-                );
+            // Apply per-workflow-task wall-clock budget when configured and
+            // this is a workflow task with a non-zero timeout.
+            if !workflow_task_timeout.is_zero() && task_type == "workflow" {
+                match tokio::time::timeout(
+                    workflow_task_timeout,
+                    process_task(
+                        &pool,
+                        Arc::clone(&registry),
+                        task,
+                        &worker_id,
+                        &build_id,
+                        cancellation_grace_period,
+                        sticky_timeout,
+                        max_local_activity_start_to_close,
+                        workflow_cache,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        // Success: clear the consecutive-timeout counter for
+                        // this execution so a later transient timeout doesn't
+                        // inherit previous strikes.
+                        if let Some(exec_id) = exec_id_for_timeout {
+                            timeout_strikes
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&exec_id);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        // Task returned a clean error (not a timeout): clear
+                        // the strike counter and log the error normally.
+                        if let Some(exec_id) = exec_id_for_timeout {
+                            timeout_strikes
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&exec_id);
+                        }
+                        tracing::error!(
+                            task_id = %task_id,
+                            task_type = %task_type,
+                            worker_id = %worker_id,
+                            error = %error,
+                            "task execution failed"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        // The dispatch did not complete or suspend within the
+                        // budget. The permit is dropped automatically (the
+                        // task future was cancelled), freeing the concurrency
+                        // slot for new tasks.
+                        let timeout_secs = workflow_task_timeout.as_secs();
+                        let new_strikes = exec_id_for_timeout.map_or(1, |exec_id| {
+                            let mut guard = timeout_strikes
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let count = guard.entry(exec_id).or_insert(0);
+                            *count += 1;
+                            let result = *count;
+                            drop(guard);
+                            result
+                        });
+
+                        // Emit metric tagged by workflow+queue. We attempt a
+                        // best-effort DB lookup for the workflow name; the
+                        // metric is still emitted with "unknown" on failure
+                        // rather than being dropped.
+                        #[cfg(feature = "db")]
+                        let (workflow_name_str, queue_name_str) = {
+                            workflow_task_timeout_metric_names(&pool, exec_id_for_timeout).await
+                        };
+                        #[cfg(not(feature = "db"))]
+                        let (workflow_name_str, queue_name_str) =
+                            ("unknown".to_string(), "default".to_string());
+
+                        telemetry
+                            .telemetry()
+                            .metrics
+                            .record_workflow_task_timeout(&workflow_name_str, &queue_name_str);
+
+                        tracing::warn!(
+                            task_id = %task_id,
+                            exec_id = ?exec_id_for_timeout,
+                            strikes = new_strikes,
+                            threshold = poison_pill_threshold,
+                            timeout_secs = timeout_secs,
+                            workflow = %workflow_name_str,
+                            queue = %queue_name_str,
+                            "workflow task timed out; concurrency slot reclaimed"
+                        );
+
+                        let decision = crate::poison_pill::quarantine_decision(
+                            new_strikes,
+                            poison_pill_threshold,
+                        );
+
+                        #[cfg(feature = "db")]
+                        match decision {
+                            crate::poison_pill::ReclaimAction::Quarantine => {
+                                // Clear the in-process counter before the
+                                // async DB call so a concurrent reclaim
+                                // doesn't double-quarantine.
+                                if let Some(exec_id) = exec_id_for_timeout {
+                                    timeout_strikes
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .remove(&exec_id);
+                                }
+                                quarantine_workflow_task_timeout(
+                                    &pool,
+                                    task_id,
+                                    exec_id_for_timeout,
+                                    &worker_id,
+                                    new_strikes,
+                                    timeout_secs,
+                                    &workflow_name_str,
+                                    &queue_name_str,
+                                    &*telemetry.telemetry().metrics,
+                                )
+                                .await;
+                            }
+                            crate::poison_pill::ReclaimAction::Requeue => {
+                                // Reset the task to PENDING so any worker can
+                                // re-claim it on the next poll, without waiting
+                                // for the orphan-reclaim staleness window.
+                                reset_timed_out_workflow_task(&pool, task_id, &worker_id).await;
+                            }
+                        }
+                        #[cfg(not(feature = "db"))]
+                        let _ = decision;
+                    }
+                }
+            } else {
+                // No timeout configured, or not a workflow task: run unbounded.
+                if let Err(error) = process_task(
+                    &pool,
+                    registry,
+                    task,
+                    &worker_id,
+                    &build_id,
+                    cancellation_grace_period,
+                    sticky_timeout,
+                    max_local_activity_start_to_close,
+                    workflow_cache,
+                )
+                .await
+                {
+                    tracing::error!(
+                        task_id = %task_id,
+                        task_type = %task_type,
+                        worker_id = %worker_id,
+                        error = %error,
+                        "task execution failed"
+                    );
+                }
             }
         });
     }
@@ -7665,6 +7833,248 @@ impl Worker {
 }
 
 // ---------------------------------------------------------------------------
+// Workflow-task timeout helpers (issue #494)
+// ---------------------------------------------------------------------------
+
+/// Look up the workflow name and queue name for timeout metric labels.
+///
+/// Falls back to `("unknown", "default")` on any DB or pool failure so the
+/// metric is always emitted even when the execution row is gone.
+async fn workflow_task_timeout_metric_names(
+    pool: &DbPool,
+    exec_id: Option<uuid::Uuid>,
+) -> (String, String) {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    let Some(exec_uuid) = exec_id else {
+        return ("unknown".to_string(), "default".to_string());
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return ("unknown".to_string(), "default".to_string());
+    };
+    dsl::harvest_workflow_executions
+        .find(exec_uuid)
+        .select((dsl::workflow_name, dsl::queue_name))
+        .first::<(String, String)>(&mut conn)
+        .await
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| ("unknown".to_string(), "default".to_string()))
+}
+
+/// Move a timed-out workflow task to the DLQ and fail the owning execution.
+///
+/// Called when the consecutive in-memory timeout counter reaches
+/// `poison_pill_threshold` (issue #494). Errors are logged and swallowed.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn quarantine_workflow_task_timeout(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    exec_id_opt: Option<uuid::Uuid>,
+    worker_id: &str,
+    new_strikes: i32,
+    timeout_secs: u64,
+    workflow_name: &str,
+    queue_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+) {
+    use crate::schema::harvest_task_queue::dsl as task_dsl;
+    use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+
+    let mut conn = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                task_id = %task_id,
+                error = %e,
+                "workflow task timeout quarantine: pool exhausted"
+            );
+            return;
+        }
+    };
+
+    let reason = crate::dlq::DeadLetterReason::WorkflowTaskTimeout {
+        task_timeout_strikes: new_strikes,
+        timeout_secs,
+    };
+    let error_msg = reason.to_string();
+
+    // Fetch the task row's input + attempt for the DLQ entry.
+    let (input, attempts) = task_dsl::harvest_task_queue
+        .find(task_id)
+        .select((task_dsl::input, task_dsl::attempt))
+        .first::<(serde_json::Value, i32)>(&mut conn)
+        .await
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or((serde_json::Value::Null, 1));
+
+    // Fetch owner/severity from the execution row for the DLQ entry.
+    let (owner, severity) = match exec_id_opt {
+        Some(exec_uuid) => exec_dsl::harvest_workflow_executions
+            .find(exec_uuid)
+            .select((exec_dsl::owner, exec_dsl::severity))
+            .first::<(Option<String>, Option<String>)>(&mut conn)
+            .await
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or((None, None)),
+        None => (None, None),
+    };
+
+    let entry = crate::dlq::NewDeadLetterEntry {
+        original_task_id: task_id,
+        queue_name: queue_name.to_string(),
+        task_type: "workflow".to_string(),
+        workflow_exec_id: exec_id_opt,
+        activity_name: None,
+        input,
+        error: error_msg.clone(),
+        attempts,
+        owner,
+        severity,
+    };
+
+    let result = conn
+        .transaction::<(
+            Vec<crate::completion_trigger::DeferredTriggerStart>,
+            Option<String>,
+        ), HarvestError, _>(|conn| {
+            let error_msg = error_msg.clone();
+            let entry = entry.clone();
+            let worker_id = worker_id.to_string();
+            async move {
+                dlq::dead_letter(conn, &entry).await?;
+                queue::fail_task(conn, task_id, &error_msg).await?;
+
+                let (deferred, queue_used) = if let Some(exec_uuid) = exec_id_opt {
+                    let exec_id = execution_id_from_uuid(exec_uuid);
+                    let history = crate::store::load_history(conn, exec_id).await?;
+                    crate::store::append_events(
+                        conn,
+                        exec_id,
+                        &[WorkflowEvent::WorkflowFailed {
+                            error: error_msg.clone(),
+                        }],
+                        history.next_event_id,
+                    )
+                    .await?;
+                    // update_workflow_execution_failed returns an error when the
+                    // execution is already terminal; ignore it — the DLQ entry
+                    // and event append are the durable record.
+                    let _ = update_workflow_execution_failed(
+                        conn, exec_id, &worker_id, &error_msg, None,
+                    )
+                    .await;
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Failed,
+                        None,
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+                    (deferred, Some(entry.queue_name.clone()))
+                } else {
+                    (Vec::new(), None)
+                };
+
+                Ok((deferred, queue_used))
+            }
+            .scope_boxed()
+        })
+        .await;
+
+    match result {
+        Ok((deferred_starts, queue_used)) => {
+            if let Some(q) = queue_used {
+                metrics.record_workflow_terminal(
+                    workflow_name,
+                    &q,
+                    crate::telemetry::WorkflowStatus::Failed,
+                );
+            }
+            for start in deferred_starts {
+                start.spawn();
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                task_id = %task_id,
+                error = %e,
+                "workflow task timeout quarantine: transaction failed"
+            );
+        }
+    }
+}
+
+/// Reset a timed-out RUNNING workflow task back to PENDING so any worker can
+/// re-claim it on the next poll cycle without waiting for the orphan-reclaim
+/// staleness window (issue #494).
+///
+/// Uses an optimistic `WHERE state = 'RUNNING' AND worker_id = …` guard so a
+/// concurrent reclaim or a different worker that somehow picked it up does not
+/// get its state overwritten.
+pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, worker_id: &str) {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let mut conn = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                task_id = %task_id,
+                worker_id = %worker_id,
+                error = %e,
+                "workflow task timeout reset: pool exhausted"
+            );
+            return;
+        }
+    };
+    match diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::worker_id.eq(worker_id)),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+    ))
+    .execute(&mut conn)
+    .await
+    {
+        Ok(n) if n > 0 => {
+            tracing::debug!(
+                task_id = %task_id,
+                worker_id = %worker_id,
+                "reset timed-out workflow task to PENDING"
+            );
+        }
+        Ok(_) => {
+            tracing::debug!(
+                task_id = %task_id,
+                worker_id = %worker_id,
+                "timed-out workflow task already reclaimed or transitioned"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                task_id = %task_id,
+                worker_id = %worker_id,
+                error = %e,
+                "failed to reset timed-out workflow task to PENDING"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests (unit, no DB)
 // ---------------------------------------------------------------------------
 
@@ -7695,6 +8105,7 @@ mod tests {
             priority_aging_secs: None,
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            workflow_task_timeout: Duration::from_secs(10),
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             max_workflow_history_events: None,
             labels: std::collections::HashMap::new(),
@@ -7707,6 +8118,107 @@ mod tests {
     fn worker_config_validates() {
         let cfg = default_runtime_config();
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── Workflow-task timeout tests (issue #494) ──────────────────────────
+
+    #[test]
+    fn runtime_config_workflow_task_timeout_propagated() {
+        // WorkerRuntimeConfig must expose workflow_task_timeout so dispatch_task
+        // can apply the bounded budget.
+        let cfg = default_runtime_config();
+        assert_eq!(cfg.workflow_task_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn runtime_config_workflow_task_timeout_zero_disables() {
+        let mut cfg = default_runtime_config();
+        cfg.workflow_task_timeout = Duration::ZERO;
+        assert!(cfg.workflow_task_timeout.is_zero());
+    }
+
+    #[test]
+    fn workflow_task_timeout_threshold_decision_under_threshold() {
+        // A consecutive-timeout count strictly below the threshold → Requeue.
+        assert_eq!(
+            crate::poison_pill::quarantine_decision(1, 3),
+            crate::poison_pill::ReclaimAction::Requeue
+        );
+        assert_eq!(
+            crate::poison_pill::quarantine_decision(2, 3),
+            crate::poison_pill::ReclaimAction::Requeue
+        );
+    }
+
+    #[test]
+    fn workflow_task_timeout_threshold_decision_at_threshold() {
+        // Exactly at or above threshold → Quarantine.
+        assert_eq!(
+            crate::poison_pill::quarantine_decision(3, 3),
+            crate::poison_pill::ReclaimAction::Quarantine
+        );
+        assert_eq!(
+            crate::poison_pill::quarantine_decision(4, 3),
+            crate::poison_pill::ReclaimAction::Quarantine
+        );
+    }
+
+    #[test]
+    fn workflow_task_timeout_zero_threshold_always_requeues() {
+        // threshold = 0 disables quarantine (backward compat).
+        assert_eq!(
+            crate::poison_pill::quarantine_decision(100, 0),
+            crate::poison_pill::ReclaimAction::Requeue
+        );
+    }
+
+    /// AC #7a — a `tokio::time::timeout` on a dispatch releases the semaphore
+    /// permit when the budget expires, so the slot is not permanently consumed.
+    #[tokio::test]
+    async fn timeout_releases_semaphore_permit() {
+        use tokio::sync::Semaphore;
+        let sem = std::sync::Arc::new(Semaphore::new(1));
+        let sem2 = sem.clone();
+        let hung = async move {
+            let _permit = sem2.acquire().await.expect("acquire");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        };
+        let result = tokio::time::timeout(Duration::from_millis(20), hung).await;
+        assert!(result.is_err(), "timeout must fire");
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "permit must be released after dispatch timeout"
+        );
+    }
+
+    /// AC #7b — while one slot is stuck, a second concurrent dispatch still
+    /// makes progress (does not block on the wedged future).
+    #[tokio::test]
+    async fn healthy_dispatch_proceeds_while_slot_is_timed_out() {
+        use tokio::sync::{Semaphore, oneshot};
+        let sem = std::sync::Arc::new(Semaphore::new(2));
+        let (tx, rx) = oneshot::channel::<()>();
+        let sem_hung = sem.clone();
+        let hung = async move {
+            let _permit = sem_hung.acquire().await.expect("acquire");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        };
+        let sem_ok = sem.clone();
+        let healthy = async move {
+            let _permit = sem_ok.acquire().await.expect("acquire");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = tx.send(());
+        };
+        let (hung_result, _) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(30), hung),
+            healthy,
+        );
+        assert!(hung_result.is_err(), "hung dispatch must time out");
+        assert!(
+            rx.await.is_ok(),
+            "healthy dispatch must complete while hung dispatch is active"
+        );
     }
 
     // ── merge_wake_events (issue #476 review) ─────────────────────────────
@@ -7863,6 +8375,7 @@ mod tests {
             max_workflow_start_delay: Duration::from_secs(365 * 24 * 3600),
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
+            workflow_task_timeout: Duration::from_secs(10),
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,

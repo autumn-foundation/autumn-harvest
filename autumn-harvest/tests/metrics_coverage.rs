@@ -15,7 +15,7 @@ use autumn_harvest::telemetry::{
     METRIC_RETENTION_DELETED, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
     METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED, METRIC_WORKFLOW_CONTINUE_AS_NEW,
     METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
-    MetricsRecorder, NoOpMetrics, WorkflowStatus,
+    METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics, WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -171,6 +171,16 @@ impl MetricsRecorder for RecordingMetrics {
             ],
         });
     }
+
+    fn record_workflow_task_timeout(&self, workflow_name: &str, queue: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_WORKFLOW_TASK_TIMEOUT,
+            labels: vec![
+                ("workflow", workflow_name.to_owned()),
+                ("queue", queue.to_owned()),
+            ],
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +206,7 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_schedule_skipped("workflow", "nightly", "paused");
     rec.record_schedule_decision_write_failed();
     rec.record_retention_tick(0, 100, 50, 0.01);
+    rec.record_workflow_task_timeout("my_workflow", "default");
 
     let samples = rec.drain();
     let names: Vec<&str> = samples.iter().map(|s| s.name).collect();
@@ -262,6 +273,10 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
         names.contains(&METRIC_RETENTION_DELETED),
         "harvest.retention.deleted not sampled"
     );
+    assert!(
+        names.contains(&METRIC_WORKFLOW_TASK_TIMEOUT),
+        "harvest.workflow.task_timeout not sampled"
+    );
 }
 
 #[test]
@@ -283,6 +298,7 @@ fn cardinality_no_execution_id_label_on_any_metric() {
     rec.record_schedule_skipped("dag", "my_dag", "max_active_runs_reached");
     rec.record_schedule_decision_write_failed();
     rec.record_retention_tick(0, 0, 0, 0.0);
+    rec.record_workflow_task_timeout("wf", "default");
 
     for sample in rec.drain() {
         for (key, _val) in &sample.labels {
