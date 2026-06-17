@@ -6132,9 +6132,11 @@ async fn batch_start_workflows(
                 rejected_count += 1;
                 let err_msg = violations
                     .iter()
-                    .map(|v| match &v.field_path {
-                        Some(fp) => format!("{} at {fp}", v.message),
-                        None => v.message.clone(),
+                    .map(|v| {
+                        v.field_path.as_ref().map_or_else(
+                            || v.message.clone(),
+                            |fp| format!("{} at {fp}", v.message),
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
