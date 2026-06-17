@@ -5332,11 +5332,10 @@ async fn start_workflow(
                         Ok(mut pre_conn) => harvest_workflow_executions::table
                             .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
                             .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-                            .filter(harvest_workflow_executions::state.eq_any([
-                                "RUNNING",
-                                "SUSPENDED",
-                                "PAUSED",
-                            ]))
+                            .filter(
+                                harvest_workflow_executions::state
+                                    .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                            )
                             .select(harvest_workflow_executions::id)
                             .first::<uuid::Uuid>(&mut pre_conn)
                             .await
@@ -11131,7 +11130,16 @@ async fn schedule_backfill(
                 // out-of-budget run would advance scheduled carryover (#488). Mirrors
                 // the max_active gate below (computed once, tracked via
                 // dispatched_this_call); like that gate it is best-effort against a
-                // concurrent tick, but never dispatches beyond the budget seen here.
+                // concurrent tick.
+                //
+                // Concurrent backfills for the *same* schedule are safe: each slot
+                // produces a deterministic `workflow_id` (via `scheduled_workflow_id_pub`)
+                // so two concurrent requests for the same slot hit the DB
+                // partial-unique-index and one is rejected — no duplicate start.
+                // The max_runs snapshot may be slightly stale under heavy concurrency,
+                // but it never dispatches beyond the budget *seen at the start of this
+                // call*, which is the closest we can get without a serialisable
+                // transaction wrapping the entire loop.
                 if schedule.max_runs.is_some_and(|max| {
                     max > 0
                         && i64::from(schedule.runs_started) + dispatched_this_call >= i64::from(max)
@@ -13094,58 +13102,77 @@ async fn set_rate_limit(
     let route = "POST /admin/rate-limits/{key}";
 
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
 
-    let query_result = diesel::sql_query(
-        "INSERT INTO harvest_rate_limit_buckets (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
+    let upsert_sql = "INSERT INTO harvest_rate_limit_buckets \
+         (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
          VALUES ($1, $2, $3, $3, NOW(), NOW(), NOW()) \
          ON CONFLICT (key) DO UPDATE \
          SET refill_rate = EXCLUDED.refill_rate, \
              burst = EXCLUDED.burst, \
              tokens = LEAST(EXCLUDED.burst, harvest_rate_limit_buckets.tokens), \
              last_refilled_at = NOW(), \
-             updated_at = NOW()"
-    )
-    .bind::<diesel::sql_types::Text, _>(&key_param)
-    .bind::<diesel::sql_types::Double, _>(request.refill_rate)
-    .bind::<diesel::sql_types::Double, _>(request.burst)
-    .execute(&mut conn)
-    .await;
+             updated_at = NOW()";
 
-    if let Err(e) = query_result {
-        let err_str = e.to_string();
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: "rate_limit_override",
-            target_type: "rate_limit",
-            target_id: Some(&key_param),
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: None,
-            status: STATUS_FAILED,
-            error_summary: Some(err_str.as_str()),
-            shard_id: None,
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        Err(map_error(database_error(e)))
-    } else {
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: "rate_limit_override",
-            target_type: "rate_limit",
-            target_id: Some(&key_param),
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: None,
-            status: STATUS_SUCCEEDED,
-            error_summary: None,
-            shard_id: None,
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        Ok(Json(BasicAck { ok: true }))
+    let mut first_err: Option<diesel::result::Error> = None;
+    let mut any_success = false;
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        match acquire_conn(shard_pool).await {
+            Ok(mut conn) => {
+                match diesel::sql_query(upsert_sql)
+                    .bind::<diesel::sql_types::Text, _>(&key_param)
+                    .bind::<diesel::sql_types::Double, _>(request.refill_rate)
+                    .bind::<diesel::sql_types::Double, _>(request.burst)
+                    .execute(&mut conn)
+                    .await
+                {
+                    Ok(_) => {
+                        any_success = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(key = %key_param, error = %e, "rate-limit upsert failed on shard");
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(key = %key_param, error = %e, "failed to acquire shard connection for rate-limit upsert");
+            }
+        }
     }
+
+    let mut audit_conn = acquire_conn(pool.default_pool()).await?;
+    let (status, err_summary) = if !any_success && first_err.is_some() {
+        (STATUS_FAILED, first_err.as_ref().map(std::string::ToString::to_string))
+    } else {
+        (STATUS_SUCCEEDED, None)
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: "rate_limit_override",
+        target_type: "rate_limit",
+        target_id: Some(&key_param),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: err_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut audit_conn, &ar).await;
+
+    if !any_success {
+        if let Some(e) = first_err {
+            return Err(map_error(database_error(e)));
+        }
+        return Err(AutumnError::service_unavailable_msg(
+            "no shards available for rate-limit upsert",
+        ));
+    }
+    Ok(Json(BasicAck { ok: true }))
 }
 
 // ── Circuit Breaker Management (issue #369) ─────────────────────────────────
