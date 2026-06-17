@@ -58,9 +58,10 @@ use crate::telemetry::{
     METRIC_SCHEDULE_FIRE_ATTEMPTS, METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS,
     METRIC_SCHEDULE_SKIPPED, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
     METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_NON_DETERMINISM,
-    METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_SLA_BREACHED,
-    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TERMINAL, MetricsRecorder, WorkflowStatus,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
+    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
+    METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TERMINAL,
+    MetricsRecorder, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -455,6 +456,15 @@ impl MetricsRecorder for MetricsRsRecorder {
     #[allow(clippy::cast_precision_loss)]
     fn record_admission_gates_active(&self, count: i64) {
         gauge!(METRIC_ADMISSION_GATES_ACTIVE).set(count as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_workflow_history_oversized(&self, workflow_name: &str, count: u64) {
+        gauge!(
+            METRIC_WORKFLOW_HISTORY_OVERSIZED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+        )
+        .set(count as f64);
     }
 }
 

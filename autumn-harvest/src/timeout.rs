@@ -1652,6 +1652,7 @@ pub fn spawn_timeout_checker(
 ///
 /// Returns the first database or persistence error encountered.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 pub async fn enforce_workflow_history_ceiling(
     conn: &mut AsyncPgConnection,
     ceiling: u64,
@@ -1660,8 +1661,7 @@ pub async fn enforce_workflow_history_ceiling(
     use diesel::sql_types::{BigInt, Nullable, Text, Uuid as SqlUuid};
 
     // Find RUNNING executions whose recorded event count >= ceiling.
-    // We use a raw SQL query so that the correlated subquery is passed to
-    // Postgres rather than being emulated in Rust.
+    // The event_count is selected inline to avoid an N+1 query pattern.
     #[derive(diesel::QueryableByName)]
     struct OversizedRow {
         #[diesel(sql_type = SqlUuid)]
@@ -1674,15 +1674,19 @@ pub async fn enforce_workflow_history_ceiling(
         parent_id: Option<uuid::Uuid>,
         #[diesel(sql_type = Nullable<Text>)]
         parent_close_policy: Option<String>,
+        #[diesel(sql_type = BigInt)]
+        event_count: i64,
     }
 
+    let ceiling_i64 = i64::try_from(ceiling).unwrap_or(i64::MAX);
     let oversized: Vec<OversizedRow> = diesel::sql_query(
-        "SELECT id, workflow_name, queue_name, parent_id, parent_close_policy \
+        "SELECT id, workflow_name, queue_name, parent_id, parent_close_policy, \
+         (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
          FROM harvest_workflow_executions \
          WHERE state = 'RUNNING' \
          AND (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= $1",
     )
-    .bind::<BigInt, _>(ceiling as i64)
+    .bind::<BigInt, _>(ceiling_i64)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -1691,16 +1695,7 @@ pub async fn enforce_workflow_history_ceiling(
 
     for row in &oversized {
         let exec_id = execution_id_from_uuid(row.id);
-        // Derive the event count for the error message (best-effort; may have
-        // grown by the time we record it, but accuracy is not critical here).
-        let event_count: i64 = diesel::sql_query(
-            "SELECT COUNT(*)::bigint AS count FROM harvest_events WHERE workflow_exec_id = $1",
-        )
-        .bind::<SqlUuid, _>(row.id)
-        .get_result::<EventCount>(conn)
-        .await
-        .map(|r| r.count)
-        .unwrap_or(ceiling as i64);
+        let event_count = row.event_count;
 
         let error_msg =
             format!("history_ceiling_exceeded: event count {event_count} >= ceiling {ceiling}");
@@ -1716,8 +1711,8 @@ pub async fn enforce_workflow_history_ceiling(
         let workflow_name = row.workflow_name.clone();
         let queue_name = row.queue_name.clone();
 
-        let applied = conn
-            .transaction::<bool, HarvestError, _>(|conn| {
+        let (applied, deferred_starts) = conn
+            .transaction::<(bool, Vec<crate::completion_trigger::DeferredTriggerStart>), HarvestError, _>(|conn| {
                 let fail_event = fail_event.clone();
                 let error_msg = error_msg.clone();
                 async move {
@@ -1733,7 +1728,7 @@ pub async fn enforce_workflow_history_ceiling(
                         .map_err(crate::error::database_error)?;
 
                     if current_state.as_deref() != Some("RUNNING") {
-                        return Ok(false);
+                        return Ok((false, Vec::new()));
                     }
 
                     store::append_single_event(conn, exec_id, fail_event).await?;
@@ -1779,9 +1774,16 @@ pub async fn enforce_workflow_history_ceiling(
                         .await?;
                     }
 
-                    apply_parent_close_cascade(conn, exec_id).await?;
-
-                    Ok(true)
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Failed,
+                        Some(metrics),
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+                    Ok((true, deferred))
                 }
                 .scope_boxed()
             })
@@ -1789,6 +1791,10 @@ pub async fn enforce_workflow_history_ceiling(
 
         if !applied {
             continue;
+        }
+
+        for start in deferred_starts {
+            start.spawn();
         }
 
         tracing::warn!(
@@ -1806,14 +1812,6 @@ pub async fn enforce_workflow_history_ceiling(
     }
 
     Ok(count)
-}
-
-/// Tiny helper for the COUNT query in `enforce_workflow_history_ceiling`.
-#[cfg(feature = "db")]
-#[derive(diesel::QueryableByName)]
-struct EventCount {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    count: i64,
 }
 
 // ---------------------------------------------------------------------------

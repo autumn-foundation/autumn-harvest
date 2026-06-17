@@ -3897,6 +3897,7 @@ async fn get_registered_workflow_schema(
 /// against `KNOWN_WORKFLOW_STATES`. `search_attr=` values must be `key:value`
 /// and are repeatable; each entry contributes a separate JSONB containment
 /// predicate so repeats narrow rather than widen.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn parse_workflow_filters(
     pairs: &[(String, String)],
 ) -> Result<WorkflowFilters, AutumnError> {
@@ -13662,7 +13663,7 @@ pub(crate) async fn load_workflows(
         query = query.filter(
             sql::<Bool>(
                 "(SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= "
-            ).bind::<BigInt, _>(min_events as i64),
+            ).bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
         );
     }
     query
@@ -13777,6 +13778,16 @@ pub(crate) async fn load_stalled_workflows(
     // stalled rows because this loader bypasses `load_workflows`.
     if filters.sla_breached {
         query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+    }
+
+    if let Some(min_events) = filters.min_history_events {
+        query = query.filter(
+            sql::<Bool>(
+                "(SELECT COUNT(*) FROM harvest_events \
+                 WHERE workflow_exec_id = harvest_workflow_executions.id) >= ",
+            )
+            .bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
+        );
     }
 
     if !filters.include_sleeping {

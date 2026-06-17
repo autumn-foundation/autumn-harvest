@@ -178,7 +178,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             labels: cfg.labels,
             #[cfg(feature = "db")]
             sharded_pool: cfg.sharded_pool,
-            max_workflow_history_events: None,
+            max_workflow_history_events: cfg.max_workflow_history_events,
         }
     }
 }
@@ -6831,6 +6831,7 @@ fn spawn_history_oversized_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut reported_workflows = std::collections::HashSet::new();
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -6850,11 +6851,19 @@ fn spawn_history_oversized_sampler(
 
             match sample_history_oversized_counts(&mut conn, soft_threshold).await {
                 Ok(counts) => {
+                    let mut active_workflows = std::collections::HashSet::new();
                     for (workflow_name, count) in &counts {
                         telemetry
                             .metrics
                             .record_workflow_history_oversized(workflow_name, *count);
+                        active_workflows.insert(workflow_name.clone());
                     }
+                    for workflow_name in reported_workflows.difference(&active_workflows) {
+                        telemetry
+                            .metrics
+                            .record_workflow_history_oversized(workflow_name, 0);
+                    }
+                    reported_workflows = active_workflows;
                 }
                 Err(error) => {
                     tracing::debug!(error = %error, "history oversized sample failed");
@@ -6892,14 +6901,19 @@ async fn sample_history_oversized_counts(
          AND (SELECT COUNT(*) FROM harvest_events he WHERE he.workflow_exec_id = wf.id) > $1 \
          GROUP BY wf.workflow_name",
     )
-    .bind::<diesel::sql_types::BigInt, _>(soft_threshold as i64)
+    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(soft_threshold).unwrap_or(i64::MAX))
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
 
     Ok(rows
         .into_iter()
-        .map(|r| (r.workflow_name, r.oversized_count.max(0) as u64))
+        .map(|r| {
+            (
+                r.workflow_name,
+                u64::try_from(r.oversized_count.max(0)).unwrap_or(0),
+            )
+        })
         .collect())
 }
 
@@ -7659,6 +7673,7 @@ mod tests {
             unknown_target_grace_window: Duration::from_secs(5),
             poison_pill_threshold: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+            max_workflow_history_events: None,
             labels: std::collections::HashMap::new(),
             #[cfg(feature = "db")]
             sharded_pool: None,

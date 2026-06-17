@@ -1635,6 +1635,17 @@ pub struct WorkerConfig {
     pub max_workflow_pause_duration: Duration,
     /// Capability labels for hardware-aware and regional routing (issue #382).
     pub labels: std::collections::HashMap<String, String>,
+    /// Hard ceiling on the number of history events a workflow may accumulate
+    /// before the server terminates it (issue #493).
+    ///
+    /// When `Some(n)`, any `RUNNING` execution whose recorded event count
+    /// reaches `n` is failed with a machine-readable `WorkflowFailed` event
+    /// (`"history_ceiling_exceeded: event count {n} >= ceiling {n}"`).
+    /// This is a server-side safety net for workflows that do not cooperate
+    /// with `ctx.should_continue_as_new()`.
+    ///
+    /// Defaults to `None` (disabled).
+    pub max_workflow_history_events: Option<u64>,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
@@ -1663,6 +1674,7 @@ impl Default for WorkerConfig {
             poison_pill_threshold: 3,
             max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
             labels: std::collections::HashMap::new(),
+            max_workflow_history_events: None,
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -1883,6 +1895,18 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_labels(mut self, labels: impl IntoIterator<Item = (String, String)>) -> Self {
         self.labels.extend(labels);
+        self
+    }
+
+    /// Set the hard ceiling on workflow history events (issue #493).
+    ///
+    /// Pass `None` to disable (the default). When set, any `RUNNING` execution
+    /// that accumulates `n` or more events is terminated with
+    /// `history_ceiling_exceeded`. Must be strictly greater than
+    /// `continue_as_new_threshold` (checked at worker startup, not here).
+    #[must_use]
+    pub const fn with_max_workflow_history_events(mut self, ceiling: Option<u64>) -> Self {
+        self.max_workflow_history_events = ceiling;
         self
     }
 
