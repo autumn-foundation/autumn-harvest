@@ -48,6 +48,76 @@ pub fn export_mermaid(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+#[cfg(feature = "testing")]
+/// Exports a `DagProfile` to a Mermaid.js Gantt chart.
+///
+/// # Examples
+///
+/// ```rust
+/// # #[cfg(feature = "testing")]
+/// # {
+/// use autumn_harvest::dag_profiler::{DagProfile, ProfilerEvent, ProfilerEventKind};
+/// use autumn_harvest::dag_export::export_mermaid_gantt;
+/// use std::time::Duration;
+///
+/// let profile = DagProfile {
+///     total_duration: Duration::from_secs(5),
+///     peak_concurrency: 1,
+///     timeline: vec![
+///         ProfilerEvent { time: Duration::from_secs(0), kind: ProfilerEventKind::TaskStarted(0, "task_a".to_string()) },
+///         ProfilerEvent { time: Duration::from_secs(2), kind: ProfilerEventKind::TaskCompleted(0, "task_a".to_string()) },
+///     ]
+/// };
+///
+/// let gantt = export_mermaid_gantt(&profile).unwrap();
+/// assert!(gantt.contains("gantt"));
+/// assert!(gantt.contains("task_a :t0, 0, 2000"));
+/// # }
+/// ```
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+pub fn export_mermaid_gantt(
+    profile: &crate::dag_profiler::DagProfile,
+) -> Result<String, std::fmt::Error> {
+    use crate::dag_profiler::ProfilerEventKind;
+    use std::collections::HashMap;
+
+    let mut out = String::new();
+    writeln!(out, "gantt")?;
+    writeln!(out, "    title DAG Execution Profile")?;
+    writeln!(out, "    dateFormat  x")?;
+    writeln!(out, "    axisFormat  %M:%S")?;
+    writeln!(out, "    section Tasks")?;
+
+    let mut start_times = HashMap::new();
+    let mut tasks = Vec::new();
+
+    for event in &profile.timeline {
+        match &event.kind {
+            ProfilerEventKind::TaskStarted(idx, name) => {
+                start_times.insert(*idx, (name.clone(), event.time));
+            }
+            ProfilerEventKind::TaskCompleted(idx, _name) => {
+                if let Some((name, start_time)) = start_times.remove(idx) {
+                    tasks.push((*idx, name, start_time, event.time));
+                }
+            }
+        }
+    }
+
+    // Sort tasks deterministically by start time, then index
+    tasks.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+
+    for (idx, name, start, end) in tasks {
+        let start_ms = start.as_millis();
+        let end_ms = end.as_millis();
+        writeln!(out, "    {name} :t{idx}, {start_ms}, {end_ms}")?;
+    }
+
+    Ok(out)
+}
+
 /// Exports the DAG definition to Graphviz DOT format.
 ///
 /// # Examples
@@ -153,5 +223,47 @@ digraph DAG {
 }
 ";
         assert_eq!(dot, expected_dot);
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_export_mermaid_gantt() {
+        use crate::dag_profiler::{DagProfile, ProfilerEvent, ProfilerEventKind};
+        use std::time::Duration;
+
+        let profile = DagProfile {
+            total_duration: Duration::from_secs(5),
+            peak_concurrency: 1,
+            timeline: vec![
+                ProfilerEvent {
+                    time: Duration::from_secs(0),
+                    kind: ProfilerEventKind::TaskStarted(0, "task_a".to_string()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(2),
+                    kind: ProfilerEventKind::TaskCompleted(0, "task_a".to_string()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(2),
+                    kind: ProfilerEventKind::TaskStarted(1, "task_b".to_string()),
+                },
+                ProfilerEvent {
+                    time: Duration::from_secs(5),
+                    kind: ProfilerEventKind::TaskCompleted(1, "task_b".to_string()),
+                },
+            ],
+        };
+
+        let gantt = export_mermaid_gantt(&profile).unwrap();
+        let expected_gantt = "\
+gantt
+    title DAG Execution Profile
+    dateFormat  x
+    axisFormat  %M:%S
+    section Tasks
+    task_a :t0, 0, 2000
+    task_b :t1, 2000, 5000
+";
+        assert_eq!(gantt, expected_gantt);
     }
 }
