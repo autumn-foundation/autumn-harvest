@@ -6926,6 +6926,20 @@ impl Worker {
     pub fn new(config: WorkerRuntimeConfig, registry: Arc<HandlerRegistry>) -> HarvestResult<Self> {
         config.validate()?;
 
+        // Validate the history ceiling against the soft threshold from the registry.
+        // HarvestBuilder already enforces this, but WorkerConfig can set the ceiling
+        // directly without going through the builder, so we re-check here where the
+        // registry (and thus the actual threshold) is available.
+        if let Some(ceiling) = config.max_workflow_history_events {
+            let threshold = registry.history_policy().continue_as_new_threshold();
+            if ceiling <= threshold {
+                return Err(HarvestError::Config(format!(
+                    "max_workflow_history_events ({ceiling}) must be strictly greater than \
+                     continue_as_new_threshold ({threshold})"
+                )));
+            }
+        }
+
         let mut ineligible_activities = Vec::new();
         for activity in registry.activities.values() {
             if let Some(requires) = activity.requires {
@@ -7934,6 +7948,41 @@ mod tests {
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         let worker = Worker::new(cfg, registry);
         assert!(worker.is_ok());
+    }
+
+    #[test]
+    fn worker_rejects_history_ceiling_at_or_below_soft_threshold() {
+        // Default soft threshold is 10_000; ceiling must be strictly greater.
+        let threshold = HandlerRegistry::new(vec![], vec![])
+            .history_policy()
+            .continue_as_new_threshold();
+
+        for bad_ceiling in [0u64, 1, threshold.saturating_sub(1), threshold] {
+            let cfg = WorkerRuntimeConfig {
+                max_workflow_history_events: Some(bad_ceiling),
+                ..default_runtime_config()
+            };
+            let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+            let err = Worker::new(cfg, registry).unwrap_err();
+            assert!(
+                err.to_string().contains("max_workflow_history_events"),
+                "ceiling {bad_ceiling}: expected config error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_accepts_history_ceiling_above_soft_threshold() {
+        let threshold = HandlerRegistry::new(vec![], vec![])
+            .history_policy()
+            .continue_as_new_threshold();
+
+        let cfg = WorkerRuntimeConfig {
+            max_workflow_history_events: Some(threshold + 1),
+            ..default_runtime_config()
+        };
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        assert!(Worker::new(cfg, registry).is_ok());
     }
 
     #[test]

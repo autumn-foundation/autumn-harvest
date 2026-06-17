@@ -127,7 +127,12 @@ impl PreparedHarvestRuntime {
                 .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
         );
         let mut worker_runtime_config = WorkerRuntimeConfig::from(worker_config);
-        worker_runtime_config.max_workflow_history_events = max_workflow_history_events;
+        // Builder-level ceiling takes precedence; WorkerConfig ceiling is kept
+        // when the builder did not set one (avoids silently disabling a ceiling
+        // that the embedder configured via WorkerConfig directly).
+        if let Some(ceiling) = max_workflow_history_events {
+            worker_runtime_config.max_workflow_history_events = Some(ceiling);
+        }
 
         Ok(Self {
             registry: Arc::new(registry),

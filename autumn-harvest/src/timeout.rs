@@ -1667,6 +1667,8 @@ pub async fn enforce_workflow_history_ceiling(
         #[diesel(sql_type = SqlUuid)]
         id: uuid::Uuid,
         #[diesel(sql_type = Text)]
+        workflow_id: String,
+        #[diesel(sql_type = Text)]
         workflow_name: String,
         #[diesel(sql_type = Text)]
         queue_name: String,
@@ -1680,7 +1682,7 @@ pub async fn enforce_workflow_history_ceiling(
 
     let ceiling_i64 = i64::try_from(ceiling).unwrap_or(i64::MAX);
     let oversized: Vec<OversizedRow> = diesel::sql_query(
-        "SELECT id, workflow_name, queue_name, parent_id, parent_close_policy, \
+        "SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
          (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
          FROM harvest_workflow_executions \
          WHERE state = 'RUNNING' \
@@ -1809,6 +1811,17 @@ pub async fn enforce_workflow_history_ceiling(
             &queue_name,
             crate::telemetry::WorkflowStatus::Failed,
         );
+
+        // Best-effort: count ceiling failures toward the schedule auto-pause threshold.
+        // Called after the transaction commits so a counter query failure cannot
+        // roll back the terminal transition.
+        crate::scheduler::maybe_increment_schedule_failure_counter(
+            conn,
+            &row.workflow_id,
+            &workflow_name,
+            metrics,
+        )
+        .await;
     }
 
     Ok(count)
