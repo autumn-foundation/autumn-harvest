@@ -1532,7 +1532,7 @@ pub struct WorkerConfig {
     /// Per-query execution timeout (issue #234).
     ///
     /// When a query handler takes longer than this to complete, the engine
-    /// terminates the handler and returns [`HarvestError::QueryTimedOut`] to
+    /// terminates the handler and returns [`crate::error::HarvestError::QueryTimedOut`] to
     /// the caller. Defaults to **5 seconds**.
     pub query_timeout: Duration,
     /// Anti-starvation aging period for the priority claim query (issue #249).
