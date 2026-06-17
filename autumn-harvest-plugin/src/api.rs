@@ -3463,6 +3463,7 @@ struct ListBatchOperationsQuery {
     limit: Option<i64>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn submit_batch_operation(
     Extension(api_state): Extension<HarvestApiState>,
     headers: axum::http::HeaderMap,
@@ -3505,6 +3506,17 @@ async fn submit_batch_operation(
             .await;
             return Err(AutumnError::bad_request_msg(err_msg));
         }
+    }
+
+    // Enforce the signal payload cap at submission so oversized payloads are
+    // rejected before the job is persisted rather than silently bypassing the
+    // cap once per matched execution during dispatch (the single-signal API
+    // enforces the same cap before calling signal::send_signal).
+    if action == BatchAction::Signal
+        && let Some(payload) = &request.signal_payload
+        && let Ok(rt) = api_state.runtime()
+    {
+        check_signal_payload_cap(payload, rt.registry.max_signal_payload_bytes)?;
     }
 
     let pool = api_state.storage_pool().map_err(map_error)?;
@@ -5614,7 +5626,11 @@ async fn start_workflow(
             queue_name: &queue_name,
             execution_timeout: request
                 .execution_timeout_secs
-                .map(chrono::Duration::seconds),
+                .map(chrono::Duration::seconds)
+                .or_else(|| {
+                    info_execution_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                }),
             memo: request.memo.clone(),
             search_attrs: request.search_attrs.clone(),
             reuse_policy,

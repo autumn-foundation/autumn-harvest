@@ -2860,9 +2860,13 @@ async fn tick_one_workflow_schedule(
     // the other's contribution.
     let new_runs_started =
         live_runs_started.saturating_add(i32::try_from(dispatched).unwrap_or(i32::MAX));
+    // Treat the schedule as budget-exhausted when the live count reaches max_runs
+    // regardless of whether *this* tick dispatched anything: a concurrent manual
+    // trigger or backfill may have consumed the last slot after the stale
+    // `schedule.runs_started` snapshot but before we read `live_runs_started`.
     let now_budget_exhausted = schedule
         .max_runs
-        .is_some_and(|max| max > 0 && dispatched > 0 && new_runs_started >= max);
+        .is_some_and(|max| max > 0 && new_runs_started >= max);
     // Eagerly exhaust on end_at: if the next valid slot is at or past end_at, mark
     // the schedule exhausted immediately so operators see it as done after the last
     // valid firing rather than waiting for the next tick to discover it.
