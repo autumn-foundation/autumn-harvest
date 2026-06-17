@@ -13,8 +13,54 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::TimeoutType;
 use crate::types::{
-    ActivityExecId, ExecutionId, ExternalActivityToken, TimerId, UpdateId, WorkerId,
+    ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
+    TimerId, UpdateId, WorkerId,
 };
+
+fn default_error_type() -> String {
+    "Error".to_string()
+}
+
+/// Which deterministic built-in produced a [`WorkflowEvent::SideEffectRecorded`]
+/// event (issue #384).
+///
+/// This is a **bounded** enum — it has a fixed, small set of variants and is
+/// safe to use as a low-cardinality `OTel` attribute value (ADR-0001 §7). Each of
+/// the `WorkflowContext` deterministic primitives lowers onto a single
+/// `SideEffectRecorded` event and stamps the originating helper here so replay
+/// diagnostics and metrics can distinguish a clock read from a UUID mint without
+/// inspecting the recorded value.
+///
+/// **Append-only invariant:** never remove or rename a variant. The serialised
+/// form is the bare variant name (`"Now"`, `"Uuid"`, …); stored events depend on
+/// it. New helper kinds are added at the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SideEffectKind {
+    /// `ctx.system_now()` / `ctx.system_time_now()` — a captured wall-clock instant.
+    Now,
+    /// `ctx.new_uuid()` — a captured `UUIDv7`.
+    Uuid,
+    /// `ctx.random_u64()` / `ctx.random_f64()` / `ctx.random_range(..)` — a captured draw.
+    Random,
+    /// `ctx.side_effect(name, f)` — an author-named one-shot value capture.
+    Custom,
+}
+
+impl SideEffectKind {
+    /// Stable, low-cardinality string label for metrics / diagnostics.
+    ///
+    /// These values are bounded (one per variant) and safe to use as an `OTel`
+    /// attribute value per ADR-0001 §7.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Now => "now",
+            Self::Uuid => "uuid",
+            Self::Random => "random",
+            Self::Custom => "custom",
+        }
+    }
+}
 
 /// All possible events in a workflow's history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +73,16 @@ pub enum WorkflowEvent {
         input: serde_json::Value,
         /// Time when the workflow was initiated.
         timestamp: DateTime<Utc>,
+        /// Output of the most recent prior COMPLETED run of the same schedule (issue #488).
+        /// `None` for the first run, for manual (non-scheduled) starts, and when no prior
+        /// run succeeded. Frozen at workflow start time; replay always returns this value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_completion_result: Option<serde_json::Value>,
+        /// Failure summary of the most recent terminal run if it ended `FAILED` or `TIMED_OUT`
+        /// (issue #488). `None` when the most recent terminal run `COMPLETED` (i.e. recovered),
+        /// and `None` for manual starts. Frozen at workflow start time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_error: Option<String>,
     },
     /// The workflow ran to completion without an error.
     WorkflowCompleted {
@@ -71,13 +127,39 @@ pub enum WorkflowEvent {
         output: serde_json::Value,
     },
     /// The activity returned an error or panicked.
+    ///
+    /// ## Backward-compatibility note (issue #227)
+    ///
+    /// `error_type` and `non_retryable` were added after the initial release.
+    /// Old events stored without these fields deserialise cleanly via
+    /// `#[serde(default)]`: `error_type` falls back to `"Error"` and
+    /// `non_retryable` falls back to `false`. The append-only invariant is
+    /// preserved — no variants removed, no renames.
     ActivityFailed {
         /// Unique ID for this specific activity attempt.
         activity_id: ActivityExecId,
-        /// String representation of the failure.
+        /// Human-readable string representation of the failure.
         error: String,
         /// How many times the activity has failed so far.
         attempt: u32,
+        /// Low-cardinality error-type name for metrics and policy matching.
+        ///
+        /// Defaults to `"Error"` for events stored before issue #227.
+        #[serde(default = "default_error_type")]
+        error_type: String,
+        /// When `true`, the worker skipped retry and routed to DLQ immediately.
+        ///
+        /// Defaults to `false` for events stored before issue #227.
+        #[serde(default)]
+        non_retryable: bool,
+        /// Optional structured details preserved from
+        /// [`ActivityFailure::with_details`](crate::failure::ActivityFailure::with_details).
+        ///
+        /// Defaults to `None` for events stored before issue #227 or for
+        /// failures returned via the legacy `Err(String)` path. Omitted from
+        /// the serialised form when `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     /// The activity exceeded its allocated `start_to_close` or `heartbeat` timeout.
     ActivityTimedOut {
@@ -317,6 +399,192 @@ pub enum WorkflowEvent {
         /// Total attempts that were made (equals `max_attempts`).
         attempt: u32,
     },
+
+    // ── External workflow signals (issue #330) ────────────────────────────
+    /// A workflow requested delivery of a named signal to another running
+    /// workflow by `ExecutionId`.
+    ///
+    /// The `signal_id` correlates this request with its terminal outcome event
+    /// (`ExternalSignalDelivered` or `ExternalSignalFailed`). On replay the
+    /// caller's context returns the recorded outcome without re-issuing the
+    /// side effect.
+    ExternalSignalRequested {
+        /// Correlation ID linking this event to its terminal outcome.
+        signal_id: ExternalSignalId,
+        /// The execution ID of the workflow that should receive the signal.
+        target: ExecutionId,
+        /// Name of the signal channel on the receiving workflow.
+        signal_name: String,
+        /// JSON payload to deliver to the receiving workflow.
+        payload: serde_json::Value,
+    },
+    /// The signal was successfully inserted into the target workflow's signal
+    /// queue (or durably queued via the outbox for cross-shard delivery).
+    ExternalSignalDelivered {
+        /// Correlation ID matching the corresponding `ExternalSignalRequested`.
+        signal_id: ExternalSignalId,
+    },
+    /// The signal could not be delivered. The `reason_code` is one of:
+    /// - `"target_terminal"` — the target workflow is already in a terminal state.
+    /// - `"target_unknown"` — no execution with the given ID was found after
+    ///   the configured grace window.
+    ExternalSignalFailed {
+        /// Correlation ID matching the corresponding `ExternalSignalRequested`.
+        signal_id: ExternalSignalId,
+        /// Machine-readable reason code (`"target_terminal"` or `"target_unknown"`).
+        reason_code: String,
+    },
+
+    // ── Detached child workflow spawn (issue #347) ───────────────────────────
+    /// A child workflow was spawned in **detached** mode: the parent does not
+    /// suspend awaiting the child's terminal result. The `parent_close_policy`
+    /// determines what happens to this child when the parent reaches a terminal
+    /// state.
+    ///
+    /// This is an **append-only** variant — old histories that contain only
+    /// `ChildWorkflowStarted` rows will still deserialize correctly because
+    /// this variant is new and independent.
+    ChildWorkflowSpawnedDetached {
+        /// The execution ID of the spawned child.
+        child_id: ExecutionId,
+        /// The name of the child workflow handler.
+        workflow_name: String,
+        /// The input passed to the child workflow.
+        input: serde_json::Value,
+        /// Policy applied to this child when the parent reaches a terminal state.
+        parent_close_policy: crate::types::ParentClosePolicy,
+    },
+
+    /// The executor applied a parent-close cascade policy to a detached child.
+    ///
+    /// Recorded once per child immediately after the cascade action is taken so
+    /// that replay is deterministic — re-running the history never re-fires the
+    /// cascade.
+    ///
+    /// `action` is one of `"request_cancel"` or `"terminate"` (never `"abandon"`,
+    /// which is a no-op).
+    ChildWorkflowCascadeApplied {
+        /// The execution ID of the child to which cascade was applied.
+        child_id: ExecutionId,
+        /// The policy that triggered this cascade.
+        policy: crate::types::ParentClosePolicy,
+        /// Machine-readable action taken: `"request_cancel"` or `"terminate"`.
+        action: String,
+    },
+
+    // ── Workflow execution timeout (issue #243) ───────────────────────────────
+    /// The workflow execution exceeded its configured `execution_timeout` wall-clock
+    /// deadline and was forcibly terminated by the timeout scanner.
+    ///
+    /// This is a **terminal** lifecycle event: once appended, the execution row
+    /// transitions to `TIMED_OUT` and no further events are written.
+    ///
+    /// ## Replay determinism
+    ///
+    /// The `deadline` field is the absolute UTC instant computed at start time
+    /// (`started_at + execution_timeout`). Re-running history always produces the
+    /// same `WorkflowExecutionTimedOut` event without consulting the live clock —
+    /// the timeout decision is derivable from the stored `deadline` alone.
+    WorkflowExecutionTimedOut {
+        /// The absolute deadline that was exceeded (`started_at + execution_timeout`).
+        deadline: DateTime<Utc>,
+        /// The actual wall-clock time when the scanner detected and enforced the timeout.
+        timed_out_at: DateTime<Utc>,
+    },
+
+    // ── Deterministic side-effect primitives (issue #384) ─────────────────────
+    /// A deterministic value was captured during live execution and frozen into
+    /// history so subsequent replays return the identical value.
+    ///
+    /// All of the `WorkflowContext` deterministic primitives — `system_now()`,
+    /// `system_time_now()`, `new_uuid()`, `random_u64()`, `random_f64()`,
+    /// `random_range()`, and `side_effect()` — lower onto this single variant so
+    /// the event-schema cost of the feature is paid exactly once. The `kind`
+    /// discriminator (a bounded enum) records which helper produced the value;
+    /// `name` is `Some` only for `side_effect()` (the author-supplied dedup key)
+    /// and `None` for the built-in unnamed helpers; `value` is the recorded JSON
+    /// result returned on every replay.
+    ///
+    /// This is an **append-only** variant added at the end of the enum. The
+    /// `harvest_events` table stores it as opaque JSON, so no migration is
+    /// required. `name` is omitted from the serialised form when `None`.
+    SideEffectRecorded {
+        /// Which built-in helper produced this value.
+        kind: SideEffectKind,
+        /// Author-supplied dedup key for `side_effect()`; `None` for built-ins.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// The recorded JSON value, replayed verbatim on every subsequent pass.
+        value: serde_json::Value,
+    },
+
+    // ── Pause / Resume (issue #383) ───────────────────────────────────────────
+    /// An operator paused this execution. While paused the executor refuses to
+    /// dispatch new commands (activities, timers, child workflows); in-flight
+    /// activities continue to completion and their results are recorded
+    /// normally. This is a **non-terminal** lifecycle event — the execution
+    /// resumes from exactly this point on
+    /// [`WorkflowExecutionResumed`](Self::WorkflowExecutionResumed).
+    ///
+    /// ## Replay determinism
+    ///
+    /// Pause/resume events are no-ops for command dispatch during replay: the
+    /// [`crate::replay::HistoryMatcher`] skips them transparently, so a recorded
+    /// pause/resume pair never alters the command sequence reconstructed from
+    /// history.
+    WorkflowExecutionPaused {
+        /// Wall-clock time the pause was applied.
+        paused_at: DateTime<Utc>,
+        /// Optional operator-supplied reason (max 500 chars, enforced at the API
+        /// boundary). `None` when no reason was given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Identity of the operator (or `"auto-resume(timeout)"` peer) that
+        /// requested the pause, captured from the audit trail.
+        actor: String,
+    },
+    /// An operator (or the bounded-pause auto-resume scanner) resumed a paused
+    /// execution. The executor re-arms and the workflow advances on its next
+    /// decision attempt; timers whose fire time elapsed while paused fire
+    /// immediately in their original order, and signals queued during the pause
+    /// are delivered in order.
+    WorkflowExecutionResumed {
+        /// Wall-clock time the resume was applied.
+        resumed_at: DateTime<Utc>,
+        /// Identity that requested the resume. `"auto-resume(timeout)"` when the
+        /// bounded-pause scanner resumed an over-long pause.
+        actor: String,
+    },
+
+    // ── External workflow cancellation (issue #492) ───────────────────────────
+    /// A workflow requested cancellation of another running workflow by `ExecutionId`.
+    ///
+    /// The `cancel_id` correlates this request with its terminal outcome event
+    /// (`ExternalCancelDelivered` or `ExternalCancelFailed`). On replay the
+    /// caller's context returns the recorded outcome without re-issuing the
+    /// side effect. Unlike signal, no payload is carried — the cancel is
+    /// target-only.
+    ExternalCancelRequested {
+        /// Correlation ID linking this event to its terminal outcome.
+        cancel_id: ExternalCancelId,
+        /// The execution ID of the workflow to cancel.
+        target: ExecutionId,
+    },
+    /// The cancel was successfully applied to the target workflow (or the
+    /// target was already in a terminal state — no-op success).
+    ExternalCancelDelivered {
+        /// Correlation ID matching the corresponding `ExternalCancelRequested`.
+        cancel_id: ExternalCancelId,
+    },
+    /// The cancel could not be delivered. The `reason_code` is one of:
+    /// - `"target_unknown"` — no execution with the given ID was found after
+    ///   the configured grace window.
+    ExternalCancelFailed {
+        /// Correlation ID matching the corresponding `ExternalCancelRequested`.
+        cancel_id: ExternalCancelId,
+        /// Machine-readable reason code (`"target_unknown"`).
+        reason_code: String,
+    },
 }
 
 impl WorkflowEvent {
@@ -356,6 +624,18 @@ impl WorkflowEvent {
             Self::WorkflowResetFork { .. } => "WorkflowResetFork",
             Self::WorkflowResetTerminated { .. } => "WorkflowResetTerminated",
             Self::LocalActivityExhausted { .. } => "LocalActivityExhausted",
+            Self::ExternalSignalRequested { .. } => "ExternalSignalRequested",
+            Self::ExternalSignalDelivered { .. } => "ExternalSignalDelivered",
+            Self::ExternalSignalFailed { .. } => "ExternalSignalFailed",
+            Self::WorkflowExecutionTimedOut { .. } => "WorkflowExecutionTimedOut",
+            Self::ChildWorkflowSpawnedDetached { .. } => "ChildWorkflowSpawnedDetached",
+            Self::ChildWorkflowCascadeApplied { .. } => "ChildWorkflowCascadeApplied",
+            Self::SideEffectRecorded { .. } => "SideEffectRecorded",
+            Self::WorkflowExecutionPaused { .. } => "WorkflowExecutionPaused",
+            Self::WorkflowExecutionResumed { .. } => "WorkflowExecutionResumed",
+            Self::ExternalCancelRequested { .. } => "ExternalCancelRequested",
+            Self::ExternalCancelDelivered { .. } => "ExternalCancelDelivered",
+            Self::ExternalCancelFailed { .. } => "ExternalCancelFailed",
         }
     }
 
@@ -371,6 +651,11 @@ impl WorkflowEvent {
                 | Self::WorkflowCancelled { .. }
                 | Self::WorkflowContinuedAsNew { .. }
                 | Self::WorkflowResetTerminated { .. }
+                | Self::WorkflowExecutionTimedOut { .. }
+                // Written to the parent history after the parent's own terminal event;
+                // never consumed by the workflow function itself, so must be skipped
+                // during unconsumed-event checks to avoid false non-determinism reports.
+                | Self::ChildWorkflowCascadeApplied { .. }
         )
     }
 }
@@ -381,11 +666,88 @@ mod tests {
     use crate::types::ActivityExecId;
     use chrono::Utc;
 
+    // ── ActivityFailed typed-failure tests (issue #227) ──────────────────────
+
+    #[test]
+    fn activity_failed_has_error_type_and_non_retryable_fields() {
+        let id = ActivityExecId::new();
+        let event = WorkflowEvent::ActivityFailed {
+            activity_id: id,
+            error: "InvalidInput: bad value".into(),
+            attempt: 1,
+            error_type: "InvalidInput".into(),
+            non_retryable: true,
+            details: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                attempt,
+                ..
+            } => {
+                assert_eq!(error_type, "InvalidInput");
+                assert!(non_retryable);
+                assert_eq!(attempt, 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn activity_failed_old_format_deserializes_with_defaults() {
+        // Old events stored without error_type / non_retryable must deserialize
+        // cleanly via serde(default).
+        let old_json = r#"{"type":"ActivityFailed","data":{"activity_id":"00000000-0000-0000-0000-000000000001","error":"connection refused","attempt":2}}"#;
+        let back: WorkflowEvent = serde_json::from_str(old_json).unwrap();
+        match back {
+            WorkflowEvent::ActivityFailed {
+                error,
+                attempt,
+                error_type,
+                non_retryable,
+                ..
+            } => {
+                assert_eq!(error, "connection refused");
+                assert_eq!(attempt, 2);
+                assert_eq!(error_type, "Error", "default error_type must be 'Error'");
+                assert!(!non_retryable, "default non_retryable must be false");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn activity_failed_retryable_round_trips() {
+        let id = ActivityExecId::new();
+        let event = WorkflowEvent::ActivityFailed {
+            activity_id: id,
+            error: "Transient: timeout".into(),
+            attempt: 1,
+            error_type: "Transient".into(),
+            non_retryable: false,
+            details: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            WorkflowEvent::ActivityFailed {
+                non_retryable: false,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn workflow_started_round_trips_serde() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"user_id": 42}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let json = serde_json::to_string(&event)?;
         let back: WorkflowEvent = serde_json::from_str(&json)?;
@@ -484,6 +846,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::Value::Null,
@@ -508,6 +872,9 @@ mod tests {
                 activity_id: ActivityExecId::new(),
                 error: "x".into(),
                 attempt: 1,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
             },
             WorkflowEvent::ActivityTimedOut {
                 activity_id: ActivityExecId::new(),
@@ -611,11 +978,112 @@ mod tests {
                 reason: "bad deploy".into(),
                 operator_id: "ops".into(),
             },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: crate::types::ExternalSignalId::new(),
+                target: ExecutionId::new(),
+                signal_name: "cancel".into(),
+                payload: serde_json::Value::Null,
+            },
+            WorkflowEvent::ExternalSignalDelivered {
+                signal_id: crate::types::ExternalSignalId::new(),
+            },
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id: crate::types::ExternalSignalId::new(),
+                reason_code: "target_terminal".into(),
+            },
+            WorkflowEvent::WorkflowExecutionTimedOut {
+                deadline: Utc::now(),
+                timed_out_at: Utc::now(),
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: crate::event::SideEffectKind::Now,
+                name: None,
+                value: serde_json::Value::Null,
+            },
+            WorkflowEvent::WorkflowExecutionPaused {
+                paused_at: Utc::now(),
+                reason: Some("incident".into()),
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::WorkflowExecutionResumed {
+                resumed_at: Utc::now(),
+                actor: "oncall".into(),
+            },
         ];
 
-        assert_eq!(events.len(), 30);
+        assert_eq!(events.len(), 37);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 30, "duplicate type names detected");
+        assert_eq!(names.len(), 37, "duplicate type names detected");
+    }
+
+    // ── SideEffectRecorded tests (issue #384) ─────────────────────────────────
+
+    #[test]
+    fn side_effect_recorded_round_trips_without_name() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Now,
+            name: None,
+            value: serde_json::json!(1_700_000_000_u64),
+        };
+        assert_eq!(event.type_name(), "SideEffectRecorded");
+        let json = serde_json::to_string(&event)?;
+        // `name: None` must be omitted from the serialised form.
+        assert!(
+            !json.contains("\"name\""),
+            "name should be skipped when None"
+        );
+        assert!(
+            json.contains("\"kind\":\"Now\""),
+            "kind tag must be present"
+        );
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::SideEffectRecorded { kind, name, value } => {
+                assert_eq!(kind, SideEffectKind::Now);
+                assert_eq!(name, None);
+                assert_eq!(value, serde_json::json!(1_700_000_000_u64));
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn side_effect_recorded_round_trips_with_custom_name() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Custom,
+            name: Some("env_lookup".into()),
+            value: serde_json::json!({"region": "us-east-1"}),
+        };
+        let json = serde_json::to_string(&event)?;
+        assert!(json.contains("\"name\":\"env_lookup\""));
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn side_effect_recorded_is_not_terminal_lifecycle() {
+        let event = WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Uuid,
+            name: None,
+            value: serde_json::Value::Null,
+        };
+        assert!(!event.is_terminal_lifecycle());
+    }
+
+    #[test]
+    fn side_effect_kind_labels_are_bounded() {
+        assert_eq!(SideEffectKind::Now.as_str(), "now");
+        assert_eq!(SideEffectKind::Uuid.as_str(), "uuid");
+        assert_eq!(SideEffectKind::Random.as_str(), "random");
+        assert_eq!(SideEffectKind::Custom.as_str(), "custom");
     }
 
     #[test]
@@ -649,6 +1117,236 @@ mod tests {
             } if reset_from_exec_id == source
         ));
 
+        Ok(())
+    }
+
+    // ── ExternalSignal event tests (issue #330) ───────────────────────────
+
+    #[test]
+    fn external_signal_requested_round_trips() -> Result<(), serde_json::Error> {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+        let event = WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            target,
+            signal_name: "tenant_cancel".into(),
+            payload: serde_json::json!({"reason": "billing_lapse"}),
+        };
+        assert_eq!(event.type_name(), "ExternalSignalRequested");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: sid,
+                target: t,
+                signal_name,
+                payload,
+            } => {
+                assert_eq!(sid, signal_id);
+                assert_eq!(t, target);
+                assert_eq!(signal_name, "tenant_cancel");
+                assert_eq!(payload["reason"], "billing_lapse");
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_delivered_round_trips() -> Result<(), serde_json::Error> {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let event = WorkflowEvent::ExternalSignalDelivered { signal_id };
+        assert_eq!(event.type_name(), "ExternalSignalDelivered");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::ExternalSignalDelivered { signal_id: sid } if sid == signal_id
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_failed_round_trips() -> Result<(), serde_json::Error> {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let event = WorkflowEvent::ExternalSignalFailed {
+            signal_id,
+            reason_code: "target_terminal".into(),
+        };
+        assert_eq!(event.type_name(), "ExternalSignalFailed");
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id: sid,
+                reason_code,
+            } => {
+                assert_eq!(sid, signal_id);
+                assert_eq!(reason_code, "target_terminal");
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_failed_unknown_target_reason_code() -> Result<(), serde_json::Error> {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let event = WorkflowEvent::ExternalSignalFailed {
+            signal_id,
+            reason_code: "target_unknown".into(),
+        };
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::ExternalSignalFailed { reason_code, .. } => {
+                assert_eq!(reason_code, "target_unknown");
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_events_are_not_terminal_lifecycle() {
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+        assert!(
+            !WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name: "x".into(),
+                payload: serde_json::Value::Null,
+            }
+            .is_terminal_lifecycle()
+        );
+        assert!(!WorkflowEvent::ExternalSignalDelivered { signal_id }.is_terminal_lifecycle());
+        assert!(
+            !WorkflowEvent::ExternalSignalFailed {
+                signal_id,
+                reason_code: "target_terminal".into(),
+            }
+            .is_terminal_lifecycle()
+        );
+    }
+
+    // ── WorkflowExecutionTimedOut tests (issue #243) ──────────────────────────
+
+    #[test]
+    fn workflow_execution_timed_out_round_trips() -> Result<(), serde_json::Error> {
+        let deadline = Utc::now();
+        let timed_out_at = Utc::now();
+        let event = WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline,
+            timed_out_at,
+        };
+
+        assert_eq!(event.type_name(), "WorkflowExecutionTimedOut");
+        assert!(event.is_terminal_lifecycle(), "timed-out must be terminal");
+
+        let json = serde_json::to_string(&event)?;
+        assert!(
+            json.contains("WorkflowExecutionTimedOut"),
+            "type tag must appear in JSON"
+        );
+        assert!(
+            json.contains("deadline"),
+            "deadline field must be serialised"
+        );
+        assert!(
+            json.contains("timed_out_at"),
+            "timed_out_at field must be serialised"
+        );
+
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(
+            matches!(back, WorkflowEvent::WorkflowExecutionTimedOut { .. }),
+            "must deserialise to the correct variant"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_execution_timed_out_type_name_is_stable() {
+        let e = WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline: Utc::now(),
+            timed_out_at: Utc::now(),
+        };
+        assert_eq!(e.type_name(), "WorkflowExecutionTimedOut");
+    }
+
+    // ── Pause/Resume tests (issue #383) ───────────────────────────────────────
+
+    #[test]
+    fn workflow_execution_paused_round_trips() -> Result<(), serde_json::Error> {
+        let paused_at = Utc::now();
+        let event = WorkflowEvent::WorkflowExecutionPaused {
+            paused_at,
+            reason: Some("investigating runaway dispatch".into()),
+            actor: "oncall@example.com".into(),
+        };
+
+        assert_eq!(event.type_name(), "WorkflowExecutionPaused");
+        // Pause is NOT terminal — a paused workflow resumes and keeps running.
+        assert!(
+            !event.is_terminal_lifecycle(),
+            "pause must not be a terminal lifecycle event"
+        );
+
+        let json = serde_json::to_string(&event)?;
+        assert!(json.contains("WorkflowExecutionPaused"));
+        assert!(json.contains("paused_at"));
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::WorkflowExecutionPaused { reason, actor, .. } => {
+                assert_eq!(reason.as_deref(), Some("investigating runaway dispatch"));
+                assert_eq!(actor, "oncall@example.com");
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_execution_paused_round_trips_without_reason() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::WorkflowExecutionPaused {
+            paused_at: Utc::now(),
+            reason: None,
+            actor: "auto".into(),
+        };
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::WorkflowExecutionPaused { reason: None, .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_execution_resumed_round_trips() -> Result<(), serde_json::Error> {
+        let resumed_at = Utc::now();
+        let event = WorkflowEvent::WorkflowExecutionResumed {
+            resumed_at,
+            actor: "auto-resume(timeout)".into(),
+        };
+
+        assert_eq!(event.type_name(), "WorkflowExecutionResumed");
+        assert!(
+            !event.is_terminal_lifecycle(),
+            "resume must not be a terminal lifecycle event"
+        );
+
+        let json = serde_json::to_string(&event)?;
+        assert!(json.contains("WorkflowExecutionResumed"));
+        assert!(json.contains("resumed_at"));
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::WorkflowExecutionResumed { actor, .. } => {
+                assert_eq!(actor, "auto-resume(timeout)");
+            }
+            _ => panic!("wrong variant"),
+        }
         Ok(())
     }
 }

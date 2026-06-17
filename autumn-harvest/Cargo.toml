@@ -12,7 +12,8 @@ keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
 
 [features]
-default = ["db"]
+default = ["db", "unified-dag-execution"]
+unified-dag-execution = ["autumn-harvest-macros/unified-dag-execution"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -23,9 +24,12 @@ db = [
 ]
 testing = []
 metrics-rs = ["dep:metrics"]
+# Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
+# generation from types that derive `schemars::JsonSchema` (issue #373).
+schema = ["dep:schemars"]
 
 [dependencies]
-autumn-harvest-macros = { version = "0.3.0", path = "../autumn-harvest-macros" }
+autumn-harvest-macros = { version = "0.4.0", path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
@@ -34,11 +38,13 @@ base64 = "0.22"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 lru = "0.16"
 croner = "2.2"
 seahash = "4.1"
+rand = { workspace = true }
 deadpool = { workspace = true, optional = true }
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
@@ -46,6 +52,15 @@ diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 metrics = { version = "0.24", optional = true }
+schemars = { version = "0.8", optional = true }
+
+[[test]]
+name = "macros_query_handlers"
+required-features = ["testing"]
+
+[[test]]
+name = "macros_compile_fail"
+required-features = ["testing"]
 
 [[test]]
 name = "external_completion_tests"
@@ -64,8 +79,24 @@ name = "replayer_tests"
 required-features = ["testing"]
 
 [[test]]
+name = "workflow_test_env_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "dag_unified_tests"
+required-features = ["testing", "unified-dag-execution"]
+
+[[test]]
 name = "replayer_integration_tests"
 required-features = ["testing", "db"]
+
+[[test]]
+name = "scheduler_ha_tests"
+required-features = ["db"]
+
+[[test]]
+name = "scheduler_carryover_tests"
+required-features = ["db", "testing"]
 
 [[test]]
 name = "build_routing_tests"
@@ -75,6 +106,43 @@ required-features = ["db"]
 name = "workflow_handle_tests"
 required-features = ["db"]
 
+[[test]]
+name = "signal_with_start_tests"
+required-features = ["db"]
+
+[[test]]
+name = "typed_stubs_tests"
+required-features = ["db"]
+
+[[example]]
+name = "signal_with_start_webhook"
+required-features = ["db"]
+
+[[example]]
+name = "update_with_start_cart"
+required-features = ["db"]
+
+[[test]]
+name = "cross_workflow_signal_tests"
+required-features = ["db"]
+
+[[test]]
+name = "transactional_activity_tests"
+required-features = ["db"]
+
+[[example]]
+name = "timezone_cron_schedule"
+
+[[example]]
+name = "collect_approvals"
+
+[[example]]
+name = "fanout_batch"
+
+[[example]]
+name = "schema_workflow"
+required-features = ["schema"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 testcontainers = { workspace = true }
@@ -83,9 +151,25 @@ proptest = "1.11.0"
 loom = "0.7.2"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+trybuild = "1"
+tempfile = "3"
+schemars = { version = "0.8" }
+
+[[test]]
+name = "replay_verifier_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "payload_cap_tests"
+required-features = ["testing"]
 
 [[bench]]
 name = "replay_bench"
+required-features = ["testing"]
+harness = false
+
+[[bench]]
+name = "replay_verifier_bench"
 required-features = ["testing"]
 harness = false
 

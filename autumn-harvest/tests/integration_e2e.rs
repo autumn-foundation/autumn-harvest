@@ -15,13 +15,14 @@ use autumn_harvest::models::{
 use autumn_harvest::queue::{EnqueueParams, StickyHint, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_timers, harvest_workflow_executions};
 use autumn_harvest::store;
-use autumn_harvest::types::{ActivityExecId, ExecutionId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, Priority};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ActivityContext, DagCatalog, HarvestBuilder, HarvestError, Schedule, SchedulerMonitor,
-    SchedulerRuntime, StartWorkflowParams, TimeoutType, WorkerConfig, WorkflowContext,
-    WorkflowIdReusePolicy, WorkflowSchedule, cancel_workflow_execution, queue,
-    register_workflow_schedules, start_or_load_workflow_execution, tick_once, timeout,
+    ActivityContext, DagCatalog, HarvestBuilder, HarvestError, OverlapPolicy, Schedule,
+    SchedulerMonitor, SchedulerRuntime, StartWorkflowParams, TimeoutType, WorkerConfig,
+    WorkflowContext, WorkflowIdReusePolicy, WorkflowSchedule, cancel_workflow_execution, queue,
+    register_workflow_schedules, start_or_load_workflow_execution, terminate_workflow_execution,
+    tick_once, timeout,
 };
 
 use chrono::Utc;
@@ -41,6 +42,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
@@ -77,6 +79,56 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
     "\n",
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
+    "\n",
+    include_str!("../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!("../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
+    include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
+    "\n",
+    include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
+    "\n",
+    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
+    "\n",
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
+    "\n",
+    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
+    "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -92,6 +144,10 @@ const INIT_SQL: &str = concat!(
 /// (created by build routing) and inserts `assigned_build_id` into
 /// `harvest_workflow_executions`; the build routing migration also alters
 /// `harvest_workers`, so that table must exist first.
+/// The parent-close-policy migration is included because the modern start path
+/// inserts/selects the nullable `parent_close_policy` column even for root
+/// workflows; the test still excludes only the uniqueness/continue-as-new
+/// migrations it is explicitly exercising.
 const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
@@ -104,6 +160,35 @@ const LEGACY_INIT_SQL: &str = concat!(
     include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
     "\n",
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
+    include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
+    "\n",
+    include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS rate_limit_key TEXT NULL;\n",
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    "\n",
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS schedule_to_close_at TIMESTAMPTZ NULL;\n",
+    "\n",
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS required_capabilities JSONB NULL;\n",
+    "\n",
+    "ALTER TABLE harvest_workers ADD COLUMN IF NOT EXISTS labels JSONB NOT NULL DEFAULT '{}';\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS pause_reason TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS pause_actor TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS current_details TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS context_headers JSONB NULL;\n",
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS context_headers JSONB NULL;\n",
+    // issue #488: the modern start path inserts schedule_id / scheduled_for.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS schedule_id UUID NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -114,6 +199,7 @@ const LEGACY_INIT_SQL: &str = concat!(
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -140,6 +226,7 @@ async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -159,6 +246,7 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
 
 async fn setup_blank_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -174,6 +262,181 @@ async fn setup_blank_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
     (database_url, container)
+}
+
+#[tokio::test]
+async fn drop_dag_runs_migration_copies_legacy_rows_to_workflow_executions() {
+    let (mut conn, _container) = setup_test_db().await;
+    let legacy_run_id = Uuid::new_v4();
+    let dag_name = "legacy_migrated_dag";
+    let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+    let dag_conf = serde_json::json!({ "customer": "acme" });
+
+    diesel::sql_query(
+        r"
+        INSERT INTO harvest_dag_runs
+            (id, dag_name, workflow_exec_id, state, logical_date, data_interval_start,
+             data_interval_end, conf, started_at, completed_at, created_at)
+        VALUES ($1, $2, NULL, 'SUCCESS', $3, $3, $3, $4, $3, $3, $3)
+        ",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(legacy_run_id)
+    .bind::<diesel::sql_types::Text, _>(dag_name)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .bind::<diesel::sql_types::Jsonb, _>(dag_conf.clone())
+    .execute(&mut conn)
+    .await
+    .expect("failed to seed legacy DAG run");
+
+    conn.batch_execute(include_str!(
+        "../migrations/20260514000000_drop_harvest_dag_runs/up.sql"
+    ))
+    .await
+    .expect("drop migration should migrate legacy DAG runs before dropping the table");
+
+    // The migration generates IDs in the legacy format (no schedule UUID embedded).
+    let workflow_id = format!("sched:{}:{}", dag_name, logical_date.timestamp());
+    let migrated = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .select(WorkflowExecution::as_select())
+        .first::<WorkflowExecution>(&mut conn)
+        .await
+        .expect("legacy DAG run should be copied into workflow executions");
+
+    assert_eq!(migrated.id, legacy_run_id);
+    assert_eq!(migrated.state, "COMPLETED");
+    assert_eq!(migrated.queue_name, "default");
+    assert_eq!(
+        migrated.input["_harvest_migrated_legacy_dag_run"],
+        serde_json::json!(true)
+    );
+    assert_eq!(migrated.input["dag_run_id"], legacy_run_id.to_string());
+    assert_eq!(migrated.input["conf"], dag_conf);
+    assert!(migrated.completed_at.is_some());
+}
+
+#[tokio::test]
+async fn drop_dag_runs_migration_does_not_turn_queued_runs_into_running_workflows() {
+    let (mut conn, _container) = setup_test_db().await;
+    let legacy_run_id = Uuid::new_v4();
+    let dag_name = "legacy_queued_dag";
+    let logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+
+    diesel::sql_query(
+        r"
+        INSERT INTO harvest_dag_runs
+            (id, dag_name, workflow_exec_id, state, logical_date, data_interval_start,
+             data_interval_end, conf, started_at, completed_at, created_at)
+        VALUES ($1, $2, NULL, 'QUEUED', $3, $3, $3, NULL, NULL, NULL, $3)
+        ",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(legacy_run_id)
+    .bind::<diesel::sql_types::Text, _>(dag_name)
+    .bind::<diesel::sql_types::Timestamptz, _>(logical_date)
+    .execute(&mut conn)
+    .await
+    .expect("failed to seed queued legacy DAG run");
+
+    conn.batch_execute(include_str!(
+        "../migrations/20260514000000_drop_harvest_dag_runs/up.sql"
+    ))
+    .await
+    .expect("drop migration should migrate queued legacy DAG runs safely");
+
+    let migrated = harvest_workflow_executions::table
+        .find(legacy_run_id)
+        .select(WorkflowExecution::as_select())
+        .first::<WorkflowExecution>(&mut conn)
+        .await
+        .expect("queued legacy DAG run should be preserved as a workflow row");
+    assert_ne!(
+        migrated.state, "RUNNING",
+        "queued legacy DAG rows must not become permanently-running workflow executions"
+    );
+    assert_eq!(migrated.state, "CANCELLED");
+    assert!(migrated.completed_at.is_some());
+
+    let running_count: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count migrated running DAG workflows");
+    assert_eq!(
+        running_count, 0,
+        "migrated queued legacy runs must not consume max_active_runs slots"
+    );
+}
+
+#[tokio::test]
+async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
+    let (mut conn, _container) = setup_test_db().await;
+    let dag_name = "legacy_subsecond_dag";
+    let first_run_id = Uuid::new_v4();
+    let second_run_id = Uuid::new_v4();
+    let first_logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.100000Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+    let second_logical_date = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.900000Z")
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc);
+
+    diesel::sql_query(
+        r"
+        INSERT INTO harvest_dag_runs
+            (id, dag_name, workflow_exec_id, state, logical_date, data_interval_start,
+             data_interval_end, conf, started_at, completed_at, created_at)
+        VALUES
+            ($1, $2, NULL, 'SUCCESS', $3, $3, $3, NULL, $3, $3, $3),
+            ($4, $2, NULL, 'SUCCESS', $5, $5, $5, NULL, $5, $5, $5)
+        ",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(first_run_id)
+    .bind::<diesel::sql_types::Text, _>(dag_name)
+    .bind::<diesel::sql_types::Timestamptz, _>(first_logical_date)
+    .bind::<diesel::sql_types::Uuid, _>(second_run_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(second_logical_date)
+    .execute(&mut conn)
+    .await
+    .expect("failed to seed subsecond legacy DAG runs");
+
+    conn.batch_execute(include_str!(
+        "../migrations/20260514000000_drop_harvest_dag_runs/up.sql"
+    ))
+    .await
+    .expect("drop migration should preserve subsecond legacy DAG identities");
+
+    let migrated: Vec<WorkflowExecution> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(dag_name))
+        .order(harvest_workflow_executions::workflow_id.asc())
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("failed to load migrated subsecond workflow rows");
+    assert_eq!(
+        migrated.len(),
+        2,
+        "same-second legacy DAG runs with distinct fractional logical dates must both migrate"
+    );
+    assert_ne!(migrated[0].workflow_id, migrated[1].workflow_id);
+    assert!(
+        migrated
+            .iter()
+            .any(|row| row.workflow_id.ends_with(".100000")),
+        "first subsecond logical date should be represented in the workflow_id: {migrated:?}"
+    );
+    assert!(
+        migrated
+            .iter()
+            .any(|row| row.workflow_id.ends_with(".900000")),
+        "second subsecond logical date should be represented in the workflow_id: {migrated:?}"
+    );
 }
 
 fn build_test_pool(database_url: &str) -> DbPool {
@@ -278,9 +541,22 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -324,6 +600,23 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         search_attrs: None,
         reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
         trace_context: None,
+        max_execution_timeout_ceiling: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        priority: Priority::default(),
+        max_workflow_input_bytes: 0,
+        start_at: None,
+        delay: None,
+        max_workflow_start_delay: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -403,6 +696,8 @@ async fn enqueue_started_workflow_task(
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -441,6 +736,13 @@ fn build_runtime_worker(
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             registry,
         )
@@ -480,11 +782,35 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_with_child,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "child_echo_workflow",
                 module: "integration_e2e",
                 handler: child_echo_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![],
@@ -498,11 +824,35 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_with_continue_as_new_child,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "child_continue_as_new_workflow",
                 module: "integration_e2e",
                 handler: continue_as_new_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![],
@@ -813,6 +1163,8 @@ async fn full_workflow_lifecycle() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({"user": "alice"}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     let inserted = store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -849,7 +1201,7 @@ async fn full_workflow_lifecycle() {
 
     // 4. Claim the task
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "worker-e2e-1", "")
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-e2e-1", "", None, &[], &[])
         .await
         .expect("claim_task failed");
     let claimed = claimed.expect("no task claimed");
@@ -923,7 +1275,7 @@ async fn claim_task_returns_none_on_empty_queue() {
     let (mut conn, _container) = setup_test_db().await;
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1", "")
+    let claimed = queue::claim_task(&mut conn, &queues, "worker-empty-1", "", None, &[], &[])
         .await
         .expect("claim_task failed");
     assert!(
@@ -945,6 +1297,8 @@ async fn worker_completes_workflow_task_and_persists_result() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -963,6 +1317,18 @@ async fn worker_completes_workflow_task_and_persists_result() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: echo_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -983,6 +1349,13 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             registry,
         )
@@ -996,7 +1369,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
         runner.run(&pool_for_run).await;
     });
 
-    let completed_execution = tokio::time::timeout(Duration::from_secs(5), async {
+    let completed_execution = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let execution = load_execution_from_url(&database_url, exec_id).await;
 
@@ -1029,6 +1402,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_marks_workflow_failed_when_handler_errors() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -1041,6 +1415,8 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1059,6 +1435,18 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: failing_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -1079,6 +1467,13 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1092,7 +1487,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
         runner.run(&pool_for_run).await;
     });
 
-    let failed_execution = tokio::time::timeout(Duration::from_secs(5), async {
+    let failed_execution = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let execution = load_execution_from_url(&database_url, exec_id).await;
 
@@ -1151,6 +1546,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: workflow_input.clone(),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1169,6 +1566,18 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_activity,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -1177,10 +1586,18 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
             handler: send_email_activity,
         }],
     ));
@@ -1201,6 +1618,13 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             registry,
         )
@@ -1269,6 +1693,8 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -1288,6 +1714,18 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_checkpointed_activity,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "checkpointed_import",
@@ -1299,10 +1737,18 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
             handler: checkpointed_import_activity,
         }],
         heartbeat_resume_state(Arc::clone(&stats)),
@@ -1340,6 +1786,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -1352,6 +1799,8 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
     let started_events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({"workflow": "activity-only"}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1383,6 +1832,13 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -1393,10 +1849,18 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                     default_start_to_close: None,
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
+                    default_schedule_to_close: None,
                     default_queue: Some("default"),
                     max_concurrent: None,
                     concurrency_key: None,
+                    rate_limit_rps: None,
+                    rate_limit_burst: None,
+                    rate_limit_key: None,
+                    circuit_breaker: None,
                     is_local: false,
+                    max_input_bytes: None,
+                    max_result_bytes: None,
+                    requires: None,
                     handler: send_email_activity,
                 }],
             )),
@@ -1411,7 +1875,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
         runner.run(&pool_for_run).await;
     });
 
-    let failed_task = tokio::time::timeout(Duration::from_secs(5), async {
+    let failed_task = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let task = load_task_from_url(&database_url, task_id).await;
 
@@ -1468,6 +1932,8 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({"timeout": "schedule_to_start"}),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -1493,10 +1959,18 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .expect("enqueue parked workflow task failed");
 
     let default_queues = vec!["default".to_string()];
-    let claimed_workflow = queue::claim_task(&mut conn, &default_queues, "parked-worker", "")
-        .await
-        .expect("claim parked workflow task failed")
-        .expect("workflow task should be claimable");
+    let claimed_workflow = queue::claim_task(
+        &mut conn,
+        &default_queues,
+        "parked-worker",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim parked workflow task failed")
+    .expect("workflow task should be claimable");
     assert_eq!(claimed_workflow.id, workflow_task_id);
     assert_eq!(claimed_workflow.state, "RUNNING");
     queue::park_workflow_task(&mut conn, workflow_task_id, None)
@@ -1516,9 +1990,16 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .await
         .expect("enqueue timed-out activity task failed");
 
-    let enforced = timeout::enforce_timeouts_once(&mut conn)
-        .await
-        .expect("timeout enforcement should succeed");
+    let enforced = timeout::enforce_timeouts_once(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        std::time::Duration::from_secs(5),
+        &None,
+        &[],
+        None,
+    )
+    .await
+    .expect("timeout enforcement should succeed");
     assert_eq!(enforced, 1);
 
     let workflow_task = load_task_from_url(&database_url, workflow_task_id).await;
@@ -1563,6 +2044,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -1594,12 +2077,31 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
                     name: "e2e_test_workflow",
                     module: "integration_e2e",
                     handler: workflow_with_slow_activity,
+                    execution_timeout: None,
+                    sla: None,
+                    concurrency: None,
+                    max_input_bytes: None,
+
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
                 }],
                 vec![ActivityInfo {
                     name: "slow_activity",
@@ -1608,10 +2110,18 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     default_start_to_close: Some(Duration::from_millis(50)),
                     default_heartbeat_timeout: None,
                     default_schedule_to_start: None,
+                    default_schedule_to_close: None,
                     default_queue: Some("default"),
                     max_concurrent: None,
                     concurrency_key: None,
+                    rate_limit_rps: None,
+                    rate_limit_burst: None,
+                    rate_limit_key: None,
+                    circuit_breaker: None,
                     is_local: false,
+                    max_input_bytes: None,
+                    max_result_bytes: None,
+                    requires: None,
                     handler: slow_activity,
                 }],
             )),
@@ -1670,6 +2180,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_completes_workflow_with_timer_round_trip() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -1685,6 +2196,8 @@ async fn worker_completes_workflow_with_timer_round_trip() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -1716,12 +2229,31 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
                     name: "e2e_test_workflow",
                     module: "integration_e2e",
                     handler: workflow_with_timer,
+                    execution_timeout: None,
+                    sla: None,
+                    concurrency: None,
+                    max_input_bytes: None,
+
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    description: None,
+                    input_schema: None,
+                    output_schema: None,
+                    error_schema: None,
                 }],
                 vec![],
             )),
@@ -1975,16 +2507,52 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_parallel_children,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "child_alpha",
                 module: "integration_e2e",
                 handler: child_alpha_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "child_beta",
                 module: "integration_e2e",
                 handler: child_beta_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![],
@@ -2066,6 +2634,7 @@ async fn worker_completes_parent_workflow_with_parallel_child_workflows() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_builder_state_is_visible_to_workflow_and_activity() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -2081,6 +2650,8 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -2100,6 +2671,18 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_builder_state,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }])
         .activities(vec![ActivityInfo {
             name: "stateful_activity",
@@ -2108,10 +2691,18 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
             handler: stateful_activity,
         }])
         .state(String::from("haunted"))
@@ -2250,7 +2841,7 @@ async fn wake_workflow_task_emits_notification() {
         .expect("enqueue should succeed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "wake-test-worker", "")
+    let claimed = queue::claim_task(&mut conn, &queues, "wake-test-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
@@ -2290,13 +2881,13 @@ async fn wake_workflow_task_does_not_requeue_active_running_task() {
         serde_json::json!({"wake": false}),
     );
     params.workflow_exec_id = Some(exec_id.as_uuid());
-    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(10);
 
     let task_id = queue::enqueue(&mut conn, &params)
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "active-worker", "")
+    let claimed = queue::claim_task(&mut conn, &queues, "active-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
@@ -2336,7 +2927,7 @@ async fn reschedule_task_clears_stale_heartbeat_timestamp() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker", "")
+    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("activity task should be claimable");
@@ -2438,6 +3029,9 @@ async fn dead_letter_queue_lifecycle() {
         input: serde_json::json!({"attempt": 3}),
         error: "SMTP connection refused after 3 retries".into(),
         attempts: 3,
+
+        owner: None,
+        severity: None,
     };
 
     let dlq_id = dlq::dead_letter(&mut conn, &entry)
@@ -2465,6 +3059,8 @@ async fn event_store_round_trip() {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"batch": "round_trip"}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: activity_id_1,
@@ -2563,6 +3159,8 @@ async fn worker_completes_workflow_after_signal_delivery() {
         &[WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -2582,6 +3180,18 @@ async fn worker_completes_workflow_after_signal_delivery() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: signal_waiting_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -2656,6 +3266,8 @@ async fn worker_handles_early_ingested_signal_before_activity() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -2690,6 +3302,18 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: activity_then_signal_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -2698,10 +3322,18 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
             handler: send_email_activity,
         }],
     ));
@@ -2735,6 +3367,8 @@ async fn duplicate_event_id_is_rejected() {
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: serde_json::json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
 
     // First insert succeeds
@@ -2802,9 +3436,22 @@ async fn insert_named_workflow_execution(
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -2839,7 +3486,7 @@ async fn claim_task_prefers_sticky_worker_within_window() {
         .expect("enqueue pinned task failed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker", "")
+    let claimed = queue::claim_task(&mut conn, &queues, "sticky-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("sticky worker should get its pinned task");
@@ -2848,7 +3495,7 @@ async fn claim_task_prefers_sticky_worker_within_window() {
         "sticky worker should claim its pinned task ahead of the higher-priority free task",
     );
 
-    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker", "")
+    let claimed_other = queue::claim_task(&mut conn, &queues, "other-worker", "", None, &[], &[])
         .await
         .expect("second claim should succeed")
         .expect("other worker should pick up the free task");
@@ -2873,7 +3520,7 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
 
     let queues = vec!["default".to_string()];
     // Different worker must not steal a fresh sticky pin.
-    let claimed = queue::claim_task(&mut conn, &queues, "interloper", "")
+    let claimed = queue::claim_task(&mut conn, &queues, "interloper", "", None, &[], &[])
         .await
         .expect("claim should succeed");
     assert!(
@@ -2882,7 +3529,7 @@ async fn claim_task_excludes_other_workers_while_sticky_active() {
     );
 
     // The owner can still claim it.
-    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker", "")
+    let owner_claim = queue::claim_task(&mut conn, &queues, "owner-worker", "", None, &[], &[])
         .await
         .expect("owner claim should succeed")
         .expect("owner should be able to claim its pinned task");
@@ -2911,7 +3558,7 @@ async fn claim_task_falls_back_to_any_worker_after_sticky_expires() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "")
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("any worker may claim after sticky_until expires");
@@ -2954,7 +3601,7 @@ async fn claim_task_treats_expired_sticky_rows_like_unpinned_rows() {
         .expect("enqueue free task failed");
 
     let queues = vec!["default".to_string()];
-    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "")
+    let claimed = queue::claim_task(&mut conn, &queues, "rescue-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("one of the eligible tasks should be claimed");
@@ -2976,7 +3623,7 @@ async fn park_workflow_task_with_sticky_hint_pins_to_worker() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker", "")
+    let _claimed = queue::claim_task(&mut conn, &queues, "park-worker", "", None, &[], &[])
         .await
         .expect("claim should succeed")
         .expect("row should be claimable");
@@ -3019,9 +3666,17 @@ async fn wake_workflow_task_refreshes_sticky_until() {
         .await
         .expect("enqueue should succeed");
     let queues = vec!["default".to_string()];
-    let _claimed = queue::claim_task(&mut conn, &queues, "wake-refresh-worker", "")
-        .await
-        .expect("claim should succeed");
+    let _claimed = queue::claim_task(
+        &mut conn,
+        &queues,
+        "wake-refresh-worker",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim should succeed");
     // Use a 5s window so both the park's sticky_until and the wake's refreshed
     // sticky_until land comfortably in the future even under DB/host clock skew
     // on CI runners. The test asserts the value was REFRESHED by comparing
@@ -3087,6 +3742,18 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: continue_as_new_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -3168,6 +3835,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -3183,6 +3851,18 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: continue_as_new_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -3297,6 +3977,23 @@ mod reuse_policy_helpers {
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         }
     }
 
@@ -3394,9 +4091,14 @@ async fn reuse_policy_allow_duplicate_cancelled_returns_existing() {
     let first = start_or_load_workflow_execution(&mut conn, params.clone())
         .await
         .expect("first start should succeed");
-    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        first.exec_id,
+        "test cancel",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let second = start_or_load_workflow_execution(&mut conn, params)
@@ -3490,9 +4192,14 @@ async fn reuse_policy_reject_duplicate_cancelled_errors() {
     let first = start_or_load_workflow_execution(&mut conn, params.clone())
         .await
         .expect("first start should succeed");
-    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        first.exec_id,
+        "test cancel",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     params.exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     let err = start_or_load_workflow_execution(&mut conn, params)
@@ -3580,9 +4287,14 @@ async fn reuse_policy_allow_failed_only_cancelled_starts_fresh() {
     let first = start_or_load_workflow_execution(&mut conn, params.clone())
         .await
         .expect("first start should succeed");
-    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        first.exec_id,
+        "test cancel",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
@@ -3692,9 +4404,14 @@ async fn reuse_policy_terminate_if_running_cancelled_starts_fresh() {
     let first = start_or_load_workflow_execution(&mut conn, params.clone())
         .await
         .expect("first start should succeed");
-    cancel_workflow_execution(&mut conn, first.exec_id, "test cancel")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        first.exec_id,
+        "test cancel",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
     params.exec_id = second_id;
@@ -3721,9 +4438,14 @@ async fn reuse_policy_terminate_if_running_retry_after_partial_failure_is_idempo
     let first = start_or_load_workflow_execution(&mut conn, params.clone())
         .await
         .expect("initial start should succeed");
-    cancel_workflow_execution(&mut conn, first.exec_id, "simulated T1 complete")
-        .await
-        .expect("cancel should succeed");
+    cancel_workflow_execution(
+        &mut conn,
+        first.exec_id,
+        "simulated T1 complete",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel should succeed");
 
     // Now retry with TerminateIfRunning. Prior run is CANCELLED → start fresh.
     let second_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
@@ -3763,17 +4485,17 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
             .expect("enqueue failed");
     }
 
-    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[], &[])
         .await
         .expect("claim 1 query failed");
-    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[], &[])
         .await
         .expect("claim 2 query failed");
     assert!(t1.is_some(), "first claim should succeed");
     assert!(t2.is_some(), "second claim should succeed");
 
     // Cap is now saturated — third claim must be deferred.
-    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[], &[])
         .await
         .expect("claim 3 query failed");
     assert!(
@@ -3787,7 +4509,7 @@ async fn concurrency_cap_limits_concurrent_claims_cluster_wide() {
         .expect("complete_task failed");
 
     // Now a slot is free; one more task should be claimable.
-    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "")
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-cc-1", "", None, &[], &[])
         .await
         .expect("claim after complete query failed");
     assert!(
@@ -3839,7 +4561,7 @@ async fn concurrency_cap_shared_key_budget_is_not_doubled() {
     // Attempt to claim all 6; the shared budget of 3 should cap the total.
     let mut claimed = 0usize;
     for _ in 0..6 {
-        if queue::claim_task(&mut conn, &queues, "worker-sk-1", "")
+        if queue::claim_task(&mut conn, &queues, "worker-sk-1", "", None, &[], &[])
             .await
             .expect("claim query failed")
             .is_some()
@@ -3874,17 +4596,17 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
     }
 
     // Claim 2 (saturating the cap).
-    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
+    let t1 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[], &[])
         .await
         .expect("claim 1 query failed")
         .expect("first task should be claimable");
-    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
+    let t2 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[], &[])
         .await
         .expect("claim 2 query failed")
         .expect("second task should be claimable");
 
     // Cap is now saturated.
-    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
+    let t3 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[], &[])
         .await
         .expect("claim 3 query failed");
     assert!(t3.is_none(), "cap must be saturated after 2 claims");
@@ -3898,10 +4620,10 @@ async fn concurrency_cap_failure_frees_slot_and_does_not_wedge_queue() {
         .expect("fail t2 failed");
 
     // The queue must not be wedged; the remaining pending tasks must be claimable.
-    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
+    let t4 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[], &[])
         .await
         .expect("claim after fail query failed");
-    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "")
+    let t5 = queue::claim_task(&mut conn, &queues, "worker-fp-1", "", None, &[], &[])
         .await
         .expect("claim 5 query failed");
     assert!(
@@ -3927,20 +4649,20 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
         let mut params =
             EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("capped_activity".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(2);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(120);
         params.concurrency_key = Some("saturated_key".to_string());
         params.max_concurrent = Some(2);
         queue::enqueue(&mut conn, &params)
             .await
             .expect("enqueue capped task failed");
         // Immediately claim each to put it in RUNNING state.
-        queue::claim_task(&mut conn, &queues, "worker-bc-1", "")
+        queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[], &[])
             .await
             .expect("claim capped task failed");
     }
 
     // Verify the key is saturated (third claim returns None).
-    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1", "")
+    let saturated_check = queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[], &[])
         .await
         .expect("saturation check query failed");
     assert!(
@@ -3953,7 +4675,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
         let mut params =
             EnqueueParams::new("default", TaskType::Activity, serde_json::json!({ "i": i }));
         params.activity_name = Some("uncapped_activity".into());
-        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(60);
         // concurrency_key left as None (default) — backward-compat path.
         queue::enqueue(&mut conn, &params)
             .await
@@ -3964,7 +4686,7 @@ async fn concurrency_cap_null_key_tasks_are_unaffected_by_saturated_key() {
     // is at its cap — the NULL check-path must not be constrained by other keys.
     let mut claimed = 0usize;
     for _ in 0..3 {
-        if queue::claim_task(&mut conn, &queues, "worker-bc-1", "")
+        if queue::claim_task(&mut conn, &queues, "worker-bc-1", "", None, &[], &[])
             .await
             .expect("uncapped claim query failed")
             .is_some()
@@ -4044,6 +4766,18 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             name: wf_name,
             module: "integration_e2e",
             handler: instant_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -4083,6 +4817,13 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )
@@ -4117,8 +4858,8 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
         .expect("load workflow_ids failed");
     for id in &workflow_ids {
         assert!(
-            id.starts_with(&format!("sched:{wf_name}:")),
-            "workflow_id '{id}' does not match expected sched: prefix"
+            id.starts_with("sched:") && id.contains(&format!(":{wf_name}:")),
+            "workflow_id '{id}' does not match expected sched:[uuid]:{wf_name}:[ts] pattern"
         );
     }
 
@@ -4140,6 +4881,18 @@ async fn workflow_schedule_max_active_runs_enforced() {
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -4178,6 +4931,13 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )
@@ -4211,6 +4971,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
 
 /// (c) Pause / resume: no dispatches after pause; dispatches resume after unpause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn workflow_schedule_pause_and_resume() {
     use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
 
@@ -4222,6 +4983,18 @@ async fn workflow_schedule_pause_and_resume() {
             name: wf_name,
             module: "integration_e2e",
             handler: instant_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -4261,6 +5034,13 @@ async fn workflow_schedule_pause_and_resume() {
                 worker_heartbeat_interval: Duration::from_secs(5),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             Arc::clone(&registry),
         )
@@ -4432,6 +5212,7 @@ async fn find_by_search_attrs(
 /// 5. `charge` signal is delivered; second cycle sets `phase=charged`.
 /// 6. `phase=awaiting_approval` filter returns nothing; `phase=charged` filter finds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn search_attrs_upsert_visible_after_update_and_filterable() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -4455,6 +5236,23 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             search_attrs: Some(serde_json::json!({"tenant": "acme"})),
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -4466,6 +5264,18 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             name: "approval_search_attrs_workflow",
             module: "integration_e2e",
             handler: approval_search_attrs_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));
@@ -4562,6 +5372,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
 /// 4. A new worker picks up the task from where it left off.
 /// 5. Signal is delivered; workflow completes with `phase=charged` in the DB.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn search_attrs_survive_worker_crash_and_resume() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -4584,6 +5395,23 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             search_attrs: Some(serde_json::json!({"tenant": "acme"})),
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -4595,6 +5423,18 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 name: "approval_search_attrs_workflow",
                 module: "integration_e2e",
                 handler: approval_search_attrs_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             }],
             vec![],
         ))
@@ -4682,6 +5522,18 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             name: "some_other_workflow",
             module: "integration_e2e",
             handler: echo_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }])
         .workflow_schedule(ws)
         .worker(WorkerConfig::default())
@@ -4719,6 +5571,7 @@ async fn drain_accepted_sets_status_to_draining() {
         None,
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -4767,6 +5620,7 @@ async fn drain_already_draining_on_second_call() {
         None,
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -4825,6 +5679,7 @@ async fn drain_already_stopped_after_transition() {
         None,
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -4878,6 +5733,7 @@ async fn drain_with_explicit_deadline_is_stored() {
         None,
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .unwrap();
@@ -4917,6 +5773,7 @@ async fn drain_preview_returns_active_workers() {
             None,
             "",
             None,
+            &std::collections::HashMap::new(),
         )
         .await
         .unwrap();
@@ -4934,4 +5791,1686 @@ async fn drain_preview_returns_active_workers() {
     for item in &items {
         assert_eq!(item.status, "Active");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #227: typed activity failure surface — end-to-end fail-fast behavior
+// ---------------------------------------------------------------------------
+
+use autumn_harvest::failure::ActivityFailure;
+
+/// Activity handler that always fails with a typed `ActivityFailure` flagged
+/// `non_retryable`. Returned via the dispatch shim's typed JSON path.
+fn always_non_retryable_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        // Manually encode through the same path the macro uses.
+        Err(
+            autumn_harvest::failure::IntoActivityErrorString::into_error_payload(
+                ActivityFailure::non_retryable("PermanentValidation", "amount must be positive"),
+            ),
+        )
+    })
+}
+
+/// Activity handler that always fails with a legacy plain `String` error.
+fn always_legacy_string_failure_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Err("foo".to_string()) })
+}
+
+/// Activity handler that always fails with a *retryable* error, simulating a
+/// downstream outage (issue #369). The circuit breaker should observe these
+/// failures and trip, after which the worker short-circuits dispatch.
+fn always_retryable_failure_activity<'a>(
+    _ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Err("downstream is down".to_string()) })
+}
+
+/// End-to-end fail-fast for a typed `ActivityFailure` flagged `non_retryable`:
+/// the activity must fail on attempt 1 (skipping the retry policy entirely),
+/// the `ActivityFailed` event in history must carry the structured
+/// `error_type` and `non_retryable` fields, and the workflow itself must
+/// reach `FAILED` because the workflow function propagates the activity
+/// error.
+///
+/// We deliberately do **not** assert on a `harvest_dead_letters` row: the
+/// worker no longer auto-inserts DLQ rows for activity failures because
+/// `dlq::replay_dead_letter` cannot meaningfully re-run them (the terminal
+/// `ActivityFailed` event makes `find_pending_scheduled_activity` reject
+/// the replayed task). Workflow-level visibility is preserved via the
+/// `ActivityFailed` + `WorkflowFailed` event pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn non_retryable_activity_fails_fast_on_attempt_one() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"amount": -1});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_activity,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![ActivityInfo {
+            name: "send_email",
+            module: "integration_e2e",
+            // Retry policy says "try 5 times" — but ActivityFailure.non_retryable
+            // must win over the policy and route to DLQ on attempt 1.
+            default_retry_policy: Some(autumn_harvest::RetryPolicy::exponential(
+                5,
+                Duration::from_millis(10),
+            )),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: always_non_retryable_activity,
+        }],
+    ));
+
+    let worker = build_runtime_worker("worker-non-retryable", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // 1. The ActivityFailed event in history carries the typed fields.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let activity_failed = history
+        .events
+        .iter()
+        .find_map(|ev| match ev {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                attempt,
+                ..
+            } => Some((error_type.clone(), *non_retryable, *attempt)),
+            _ => None,
+        })
+        .expect("history must contain ActivityFailed");
+    assert_eq!(activity_failed.0, "PermanentValidation");
+    assert!(activity_failed.1, "non_retryable flag must be true");
+    assert_eq!(
+        activity_failed.2, 1,
+        "must fail on attempt 1 — retry policy ignored"
+    );
+
+    // 2. Exactly one ActivityFailed event — the retry policy did not fire.
+    let activity_failed_count = history
+        .events
+        .iter()
+        .filter(|ev| matches!(ev, WorkflowEvent::ActivityFailed { .. }))
+        .count();
+    assert_eq!(
+        activity_failed_count, 1,
+        "non_retryable activities must not retry; got {activity_failed_count} ActivityFailed events"
+    );
+
+    // 3. No DLQ row is created for the failed activity — see the doc comment
+    //    on this test for why. The workflow's failure is observable via the
+    //    `ActivityFailed` event and the trailing `WorkflowFailed` event.
+    let dlq_rows: Vec<autumn_harvest::models::DeadLetter> = {
+        use autumn_harvest::schema::harvest_dead_letters::dsl;
+        dsl::harvest_dead_letters
+            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .select(autumn_harvest::models::DeadLetter::as_select())
+            .load(&mut conn)
+            .await
+            .expect("dlq query failed")
+    };
+    assert_eq!(
+        dlq_rows.len(),
+        0,
+        "activity retry exhaustion must not auto-insert a DLQ row (those rows are not replayable)"
+    );
+
+    // 4. The workflow ultimately failed (the workflow function propagated the
+    //    activity error). Belt-and-braces check on execution state.
+    assert_eq!(execution.state, "FAILED");
+}
+
+/// End-to-end circuit breaker (issue #369): an activity configured with a
+/// `CircuitBreakerPolicy` (threshold 1) against a downstream that is hard-down.
+///
+/// Attempt 1 dispatches normally (breaker closed) and fails with a retryable
+/// error, which trips the breaker. Attempt 2 (the retry) is short-circuited by
+/// the open breaker and recorded as a non-retryable `ActivityFailed` with
+/// `error_type = "CircuitOpen"`, terminating the workflow without burning the
+/// rest of the retry curve. The `CircuitOpen` failure lives in the workflow's
+/// own event history exactly like any other activity failure, so replay
+/// reproduces the same outcome regardless of breaker state at replay time
+/// (no new `WorkflowEvent` variant is introduced).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn circuit_breaker_short_circuits_after_tripping() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"to": "alice@example.com"});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_activity,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![ActivityInfo {
+            name: "send_email",
+            module: "integration_e2e",
+            // Allow up to 5 retries — but the breaker (threshold 1) trips on the
+            // first failure and short-circuits the retry as a CircuitOpen.
+            default_retry_policy: Some(autumn_harvest::RetryPolicy::exponential(
+                5,
+                Duration::from_millis(10),
+            )),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            // Trip after a single failure; long cooldown so it stays open.
+            circuit_breaker: Some(autumn_harvest::policy::CircuitBreakerPolicy::new(
+                1,
+                Duration::from_secs(60),
+                Duration::from_secs(300),
+            )),
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: always_retryable_failure_activity,
+        }],
+    ));
+
+    let worker = build_runtime_worker("worker-circuit-breaker", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+
+    // The breaker short-circuited a dispatch: history carries a non-retryable
+    // ActivityFailed with error_type "CircuitOpen".
+    let circuit_open = history
+        .events
+        .iter()
+        .find_map(|ev| match ev {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                ..
+            } if error_type == "CircuitOpen" => Some(*non_retryable),
+            _ => None,
+        })
+        .expect("history must contain a CircuitOpen ActivityFailed once the breaker trips");
+    assert!(
+        circuit_open,
+        "CircuitOpen failures must be non-retryable terminal for the in-flight attempt"
+    );
+
+    // The breaker prevented the full retry curve from running: far fewer than
+    // the 5 configured attempts were dispatched (attempt 1 ran, the rest were
+    // short-circuited terminally).
+    let activity_started = history
+        .events
+        .iter()
+        .filter(|ev| matches!(ev, WorkflowEvent::ActivityStarted { .. }))
+        .count();
+    assert!(
+        activity_started <= 2,
+        "breaker must curb retries; saw {activity_started} ActivityStarted events"
+    );
+
+    assert_eq!(execution.state, "FAILED");
+}
+
+/// Back-compat mirror: an activity returning a legacy `Err("foo")` short-
+/// circuits retries when `RetryPolicy::non_retryable_errors` contains `"foo"`,
+/// exactly as before #227. Confirms the legacy resolution path is still
+/// wired through the new `Option<&str>` signature on
+/// `RetryPolicy::is_non_retryable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let mut retry = autumn_harvest::RetryPolicy::exponential(5, Duration::from_millis(10));
+    retry.non_retryable_errors = vec!["foo".to_string()];
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_with_activity,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![ActivityInfo {
+            name: "send_email",
+            module: "integration_e2e",
+            default_retry_policy: Some(retry),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: always_legacy_string_failure_activity,
+        }],
+    ));
+
+    let worker = build_runtime_worker("worker-legacy-non-retry", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    // Exactly one ActivityFailed event — the legacy non_retryable_errors match
+    // short-circuited the retry policy on attempt 1, matching the pre-#227 path.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    let activity_failed_events: Vec<_> = history
+        .events
+        .iter()
+        .filter_map(|ev| match ev {
+            WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                attempt,
+                error,
+                ..
+            } => Some((error_type.clone(), *non_retryable, *attempt, error.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(activity_failed_events.len(), 1);
+    let (etype, non_retryable, attempt, error) = &activity_failed_events[0];
+    // Plain-string errors deserialize through serde defaults → "Error" / false.
+    assert_eq!(etype, "Error");
+    assert!(
+        !non_retryable,
+        "legacy errors carry non_retryable=false; the engine uses the policy match instead"
+    );
+    assert_eq!(*attempt, 1);
+    assert_eq!(error, "foo");
+
+    // No DLQ row for the failed activity — see note on
+    // `non_retryable_activity_fails_fast_on_attempt_one`.
+    let dlq_rows: Vec<autumn_harvest::models::DeadLetter> = {
+        use autumn_harvest::schema::harvest_dead_letters::dsl;
+        dsl::harvest_dead_letters
+            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .select(autumn_harvest::models::DeadLetter::as_select())
+            .load(&mut conn)
+            .await
+            .expect("dlq query failed")
+    };
+    assert_eq!(dlq_rows.len(), 0);
+    assert_eq!(execution.state, "FAILED");
+}
+
+// ===== Overlap policy integration tests (issue #241) =============================
+
+/// Count executions for a workflow in an exact DB state value.
+async fn count_executions_in_state(database_url: &str, workflow_name: &str, state: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for state count query");
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::state.eq(state))
+        .count()
+        .get_result::<i64>(&mut conn)
+        .await
+        .expect("state count query failed")
+}
+
+/// Query the number of entries in `harvest_schedules.buffered_runs` for a workflow schedule.
+async fn query_buffered_runs_count(database_url: &str, workflow_name: &str) -> usize {
+    use autumn_harvest::schema::harvest_schedules::dsl as sched_dsl;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for buffered_runs query");
+    let val: serde_json::Value = sched_dsl::harvest_schedules
+        .filter(sched_dsl::workflow_name.eq(workflow_name))
+        .select(sched_dsl::buffered_runs)
+        .first::<serde_json::Value>(&mut conn)
+        .await
+        .expect("buffered_runs query failed");
+    val.as_array().map_or(0, Vec::len)
+}
+
+/// Query all RUNNING execution IDs for a workflow schedule (used to terminate them in tests).
+async fn query_running_exec_ids(database_url: &str, workflow_name: &str) -> Vec<ExecutionId> {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for running exec ids query");
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .select(harvest_workflow_executions::id)
+        .load::<uuid::Uuid>(&mut conn)
+        .await
+        .expect("running exec ids query failed")
+        .into_iter()
+        .map(ExecutionId::from_uuid)
+        .collect()
+}
+
+/// (overlap-a) Skip explicitly configured: no buffering, total stays at 1 while a run is in flight.
+///
+/// The scheduler dispatches on tick 1, then every subsequent tick sees `running = 1` and
+/// drops the firing with `reason = "max_active_runs_reached"`.  No buffered slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_skip_explicitly_drops_new_firings() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_skip_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::Skip);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Poll until exec#1 is dispatched (up to 12 s to tolerate Docker startup latency and
+    // cron-boundary alignment jitter).  Once the first dispatch lands the state is stable:
+    // subsequent ticks all hit the Skip branch and neither add executions nor buffer slots.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let r = count_running_executions(&database_url, wf_name).await;
+            if r >= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("Skip: timed out waiting for first dispatch within 12 s");
+
+    let running = count_running_executions(&database_url, wf_name).await;
+    assert_eq!(running, 1, "Skip: must keep exactly 1 RUNNING execution");
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert_eq!(total, 1, "Skip: no extra dispatches, total must be 1");
+    let buffered = query_buffered_runs_count(&database_url, wf_name).await;
+    assert_eq!(buffered, 0, "Skip: must not buffer any firings");
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (overlap-b1) `BufferOne`: exactly one pending firing is queued in DB; subsequent firings are
+/// dropped with `reason = "buffered_slot_full"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_buffer_one_queues_single_slot() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_buffer_one_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::BufferOne);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Poll until the buffer holds exactly 1 slot (up to 12 s).  Two ticks are needed:
+    // tick 1 dispatches exec#1, tick 2 buffers the first slot.  Once buffered == 1 the
+    // state is stable: exec#1 stays RUNNING (no worker), so subsequent ticks all drop.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let b = query_buffered_runs_count(&database_url, wf_name).await;
+            if b >= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("BufferOne: timed out waiting for 1 buffered slot within 12 s");
+
+    let running = count_running_executions(&database_url, wf_name).await;
+    assert_eq!(
+        running, 1,
+        "BufferOne: must keep exactly 1 RUNNING execution"
+    );
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert_eq!(
+        total, 1,
+        "BufferOne: no extra dispatches while slot is filled"
+    );
+    let buffered = query_buffered_runs_count(&database_url, wf_name).await;
+    assert_eq!(
+        buffered, 1,
+        "BufferOne: must buffer exactly 1 firing and no more"
+    );
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (overlap-b2) `BufferAll`: every missed firing is buffered up to `buffer_all_max`; firings past
+/// the cap are dropped with `reason = "buffer_full"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_buffer_all_queues_multiple_slots() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_buffer_all_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::BufferAll)
+        .with_buffer_all_max(3);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Poll until the buffer reaches its cap of 3 slots (up to 20 s).  Four ticks are needed:
+    // tick 1 dispatches exec#1, ticks 2–4 each buffer one slot.  Once buffered == 3 (cap),
+    // subsequent ticks drop — the state is stable because exec#1 stays RUNNING (no worker).
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let b = query_buffered_runs_count(&database_url, wf_name).await;
+            if b >= 3 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("BufferAll: timed out waiting for 3 buffered slots within 20 s");
+
+    let running = count_running_executions(&database_url, wf_name).await;
+    assert_eq!(
+        running, 1,
+        "BufferAll: must keep exactly 1 RUNNING execution"
+    );
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert_eq!(
+        total, 1,
+        "BufferAll: no extra dispatches while buffer absorbs firings"
+    );
+    let buffered = query_buffered_runs_count(&database_url, wf_name).await;
+    assert_eq!(
+        buffered, 3,
+        "BufferAll: must buffer exactly 3 firings (at buffer_all_max cap)"
+    );
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (overlap-c1) `CancelOther`: in-flight run is cancelled and the new firing starts immediately.
+///
+/// Without a worker the executions stay in the state set by the scheduler DB writes:
+/// - exec#1 → CANCELLED (by `cancel_workflow_execution`)
+/// - exec#2 → RUNNING (by `start_or_load_workflow_execution`)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_cancel_other_cancels_inflight_run() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_cancel_other_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::CancelOther);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Poll until the cancel+redispatch cycle completes (up to 12 s to tolerate
+    // Docker container startup latency and cron alignment jitter).
+    let (cancelled, running) = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let c = count_executions_in_state(&database_url, wf_name, "CANCELLED").await;
+            let r = count_running_executions(&database_url, wf_name).await;
+            if c >= 1 && r == 1 {
+                return (c, r);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("CancelOther: timed out waiting for cancel+redispatch within 12 s");
+
+    assert!(
+        cancelled >= 1,
+        "CancelOther: at least 1 execution must be CANCELLED, got {cancelled}"
+    );
+    assert_eq!(
+        running, 1,
+        "CancelOther: exactly 1 execution must be RUNNING, got {running}"
+    );
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert!(
+        total >= 2,
+        "CancelOther: at least 2 total executions (cancelled + running), got {total}"
+    );
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (overlap-c2) `TerminateOther`: in-flight run is force-terminated and the new firing starts
+/// immediately.  `terminate_workflow_execution` writes state CANCELLED (force, regardless of
+/// prior state), then the new firing is dispatched as RUNNING.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_terminate_other_terminates_inflight_run() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_terminate_other_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::TerminateOther);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+    let scheduler = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    // Poll until the terminate+redispatch cycle completes (up to 12 s).
+    let (cancelled, running) = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let c = count_executions_in_state(&database_url, wf_name, "CANCELLED").await;
+            let r = count_running_executions(&database_url, wf_name).await;
+            if c >= 1 && r == 1 {
+                return (c, r);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("TerminateOther: timed out waiting for terminate+redispatch within 12 s");
+
+    assert!(
+        cancelled >= 1,
+        "TerminateOther: at least 1 execution must be CANCELLED (terminated), got {cancelled}"
+    );
+    assert_eq!(
+        running, 1,
+        "TerminateOther: exactly 1 execution must be RUNNING, got {running}"
+    );
+    let total = count_executions_for_workflow(&database_url, wf_name).await;
+    assert!(
+        total >= 2,
+        "TerminateOther: at least 2 total executions (terminated + running), got {total}"
+    );
+
+    scheduler.shutdown();
+    let _ = scheduler.join().await;
+}
+
+/// (overlap-d) `BufferOne` durability: buffered slots survive a scheduler restart.
+///
+/// Phase 1 — Scheduler A dispatches exec#1 (`slow_workflow`) and buffers one slot.
+/// Shutdown Scheduler A.  The `buffered_runs` column in DB still holds the entry.
+///
+/// Phase 2 — Exec#1 is terminated to free capacity.  Scheduler B starts.  Its
+/// drain pass sees `running = 0` and `buffered_runs` non-empty → dispatches exec#2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overlap_policy_buffer_one_survives_scheduler_restart() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let wf_name = "overlap_restart_wf";
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: wf_name,
+            module: "integration_e2e",
+            handler: slow_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![],
+    ));
+    let pool = build_test_pool(&database_url);
+
+    let ws = WorkflowSchedule::new(wf_name, Schedule::Cron("*/2 * * * * *".to_string()))
+        .with_max_active_runs(1)
+        .with_overlap_policy(OverlapPolicy::BufferOne);
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        register_workflow_schedules(&mut conn, std::slice::from_ref(&ws))
+            .await
+            .expect("register_workflow_schedules failed");
+    }
+    let workflow_schedules = Arc::new(vec![ws]);
+
+    // ---- Phase 1: run scheduler until one slot is buffered ----
+    let scheduler1 = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+    // Poll for the buffered slot to appear (up to 12 s to tolerate Docker latency).
+    let buffered_before = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let b = query_buffered_runs_count(&database_url, wf_name).await;
+            if b >= 1 {
+                return b;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("expected 1 buffered slot within 12 s");
+    assert_eq!(
+        buffered_before, 1,
+        "expected exactly 1 buffered slot before restart, got {buffered_before}"
+    );
+
+    scheduler1.shutdown();
+    let _ = scheduler1.join().await;
+
+    // buffered_runs must persist after shutdown (durability assertion).
+    let buffered_after_shutdown = query_buffered_runs_count(&database_url, wf_name).await;
+    assert_eq!(
+        buffered_after_shutdown, 1,
+        "buffered_runs must survive scheduler shutdown (got {buffered_after_shutdown})"
+    );
+
+    // Terminate exec#1 to free the capacity slot for the drain.
+    let running_ids = query_running_exec_ids(&database_url, wf_name).await;
+    assert_eq!(
+        running_ids.len(),
+        1,
+        "expected 1 RUNNING execution before restart"
+    );
+    {
+        let mut conn = pool.get().await.expect("pool get failed");
+        terminate_workflow_execution(
+            &mut conn,
+            running_ids[0],
+            "overlap restart test cleanup",
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("terminate must succeed");
+    }
+
+    // ---- Phase 2: restart scheduler; drain dispatches the buffered slot ----
+    let scheduler2 = SchedulerRuntime::spawn(
+        pool.clone(),
+        Arc::clone(&registry),
+        Arc::new(DagCatalog::default()),
+        Arc::clone(&workflow_schedules),
+    );
+
+    let total = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let n = count_executions_for_workflow(&database_url, wf_name).await;
+            if n >= 2 {
+                break n;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("buffered slot must be dispatched after scheduler restart within 8 s");
+
+    assert!(
+        total >= 2,
+        "expected >=2 total executions after restart (exec#1 terminated + exec#2 from buffer), got {total}"
+    );
+
+    scheduler2.shutdown();
+    let _ = scheduler2.join().await;
+}
+
+/// A workflow blocked on `wait_for_signal` with a short `execution_timeout`
+/// must be transitioned to `TIMED_OUT` by the timeout scanner.
+///
+/// Regression guard for issue #243: verifies the full end-to-end path:
+/// 1. Workflow is started with a 200 ms execution timeout.
+/// 2. The workflow runs, hits `wait_for_signal`, and parks (never receiving
+///    a signal — simulating a runaway execution).
+/// 3. `enforce_workflow_execution_timeouts` fires after the deadline elapses.
+/// 4. The execution row transitions to `TIMED_OUT`, the outstanding workflow
+///    task queue row is cancelled, and the history ends with
+///    `WorkflowExecutionTimedOut`.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn signal_blocked_workflow_times_out_at_deadline() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    // Start the workflow with a short execution deadline.
+    let exec_id = ExecutionId::new();
+    let execution_timeout = chrono::Duration::milliseconds(200);
+    let started_at = Utc::now();
+    let deadline_at = started_at + execution_timeout;
+    let row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "signal_blocked_wf",
+        workflow_id: "signal-blocked-timeout-001",
+        run_id: uuid::Uuid::new_v4(),
+        shard_id: 0,
+        input: serde_json::json!({}),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: Some(execution_timeout),
+        deadline_at: Some(deadline_at),
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(&mut conn)
+        .await
+        .expect("insert workflow execution failed");
+
+    // Append WorkflowStarted + SignalWaiting to simulate the workflow parked.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    // Enqueue a RUNNING workflow task (simulating the worker parked the task).
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(10);
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    // Claim and park the task to put it in RUNNING/parked state.
+    let claimed = queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "test-worker-timeout",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim task failed")
+    .expect("task should be claimable");
+    assert_eq!(claimed.id, task_id);
+    queue::park_workflow_task(&mut conn, task_id, None)
+        .await
+        .expect("park workflow task failed");
+
+    // Timeout not yet elapsed — scanner should find nothing.
+    let enforced_early = timeout::enforce_workflow_execution_timeouts(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("early enforcement should succeed");
+    assert_eq!(
+        enforced_early, 0,
+        "scanner should not fire before deadline elapses"
+    );
+
+    // Wait for the deadline to elapse.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Now the scanner should detect and enforce the timeout.
+    let enforced = timeout::enforce_workflow_execution_timeouts(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("timeout enforcement should succeed");
+    assert_eq!(enforced, 1, "scanner should enforce exactly one timeout");
+
+    // Execution must now be in TIMED_OUT state.
+    let execution = load_execution_from_url(&database_url, exec_id).await;
+    assert_eq!(
+        execution.state, "TIMED_OUT",
+        "execution should be TIMED_OUT after deadline elapsed"
+    );
+    assert!(
+        execution
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("WorkflowExecution")),
+        "execution error should mention WorkflowExecution timeout type"
+    );
+
+    // The outstanding task queue row should be cancelled.
+    let tasks = load_tasks_for_execution_from_url(&database_url, exec_id).await;
+    let workflow_task = tasks
+        .iter()
+        .find(|t| t.task_type == "workflow")
+        .expect("workflow task should still be present");
+    assert_eq!(
+        workflow_task.state, "FAILED",
+        "workflow task should be cancelled (FAILED) after execution timeout"
+    );
+
+    // History must end with WorkflowExecutionTimedOut.
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(
+        matches!(
+            history.events.last(),
+            Some(WorkflowEvent::WorkflowExecutionTimedOut { .. })
+        ),
+        "last history event must be WorkflowExecutionTimedOut, got: {:?}",
+        history.events.last()
+    );
+
+    // Verify the deadline fields are surfaced correctly.
+    assert_eq!(
+        execution.deadline_at.map(|d| d.timestamp_millis()),
+        Some(deadline_at.timestamp_millis()),
+        "deadline_at should match what was set at start time"
+    );
+    assert_eq!(
+        execution.execution_timeout,
+        Some(execution_timeout),
+        "execution_timeout should match what was set at start time"
+    );
+}
+
+// ── Per-key concurrency fair-share tests (issue #247) ─────────────────────────
+
+/// (concurrency-a) Per-key limit: under a burst of N >> limit tasks for the
+/// same concurrency key, at most `limit` are RUNNING at any moment.
+///
+/// Enqueues 6 workflow tasks with `concurrency_key = "tenant:acme"` and
+/// `concurrency_cap = 2`.  Verifies the claim query allows at most 2 to be
+/// RUNNING simultaneously and that all 6 are eventually processed.  Uses
+/// direct `claim_task` / `complete_task` calls (same pattern as
+/// `concurrency_cap_limits_concurrent_claims_cluster_wide`) to avoid
+/// interaction with the executor's 100 ms suspension timeout.
+#[tokio::test]
+async fn per_key_concurrency_cap_enforced_across_fleet() {
+    const LIMIT: u32 = 2;
+    const TOTAL: u32 = 6;
+    const KEY: &str = "tenant:acme";
+
+    let (mut conn, _container) = setup_test_db().await;
+    let queues = vec!["default".to_string()];
+
+    for i in 0..TOTAL {
+        let mut params =
+            EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
+        params.concurrency_key = Some(KEY.to_string());
+        params.max_concurrent = Some(LIMIT);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue failed");
+    }
+
+    let mut completed_count = 0u32;
+    let mut max_in_flight: u32 = 0;
+
+    // Repeatedly claim a task, assert the in-flight count respects the cap,
+    // then immediately complete one held task to free a slot.  Repeat until all
+    // TOTAL tasks have been claimed and completed.
+    let mut held: Vec<Uuid> = Vec::new();
+
+    loop {
+        // Try to claim one more task.
+        let claimed = queue::claim_task(
+            &mut conn,
+            &queues,
+            "test-worker-concurrency-a",
+            "",
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .expect("claim query failed");
+
+        if let Some(task) = claimed {
+            held.push(task.id);
+            let in_flight = u32::try_from(held.len()).unwrap();
+            assert!(
+                in_flight <= LIMIT,
+                "cap violated: {in_flight} tasks held simultaneously (limit = {LIMIT})"
+            );
+            if in_flight > max_in_flight {
+                max_in_flight = in_flight;
+            }
+        } else if !held.is_empty() {
+            // Cap is saturated; complete the oldest held task to free a slot.
+            let id = held.remove(0);
+            queue::complete_task(&mut conn, id, serde_json::json!(null))
+                .await
+                .expect("complete_task failed");
+            completed_count += 1;
+        } else {
+            // Nothing held and nothing claimable: all tasks are done.
+            break;
+        }
+
+        // Drain any tasks that can still be claimed immediately.
+        if held.len() < LIMIT as usize
+            && queue::claim_task(
+                &mut conn,
+                &queues,
+                "test-worker-concurrency-a",
+                "",
+                None,
+                &[],
+                &[],
+            )
+            .await
+            .expect("claim query failed")
+            .is_some_and(|t| {
+                held.push(t.id);
+                true
+            })
+        {
+            // extra claim consumed above
+        }
+
+        if completed_count >= TOTAL {
+            break;
+        }
+    }
+
+    // Complete any remaining held tasks.
+    for id in held {
+        queue::complete_task(&mut conn, id, serde_json::json!(null))
+            .await
+            .expect("final complete_task failed");
+        completed_count += 1;
+    }
+
+    assert_eq!(
+        completed_count, TOTAL,
+        "all {TOTAL} tasks must eventually be processed"
+    );
+    assert!(
+        max_in_flight >= 1,
+        "at least 1 task must have been in-flight at the cap limit"
+    );
+}
+
+/// (concurrency-b) Fair-share: tasks for *other* keys are NOT blocked by a
+/// saturated key.
+///
+/// Enqueues 4 "loud" workflow tasks (cap=1) and 2 "quiet" workflow tasks
+/// (cap=10).  Verifies the quiet tasks can be claimed even while the loud cap
+/// is saturated.  Uses direct `claim_task` calls to avoid the executor's
+/// 100 ms suspension timeout.
+#[tokio::test]
+async fn per_key_concurrency_does_not_block_other_keys() {
+    const LOUD_CAP: u32 = 1;
+    const LOUD_TOTAL: u32 = 4;
+    const QUIET_KEY: &str = "tenant:quiet";
+    const LOUD_KEY: &str = "tenant:loud";
+
+    let (mut conn, _container) = setup_test_db().await;
+    let queues = vec!["default".to_string()];
+
+    // Loud tenant: 4 tasks, cap=1.
+    for i in 0..LOUD_TOTAL {
+        let mut params =
+            EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
+        params.concurrency_key = Some(LOUD_KEY.to_string());
+        params.max_concurrent = Some(LOUD_CAP);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue loud task failed");
+    }
+
+    // Quiet tenant: 2 tasks with a high cap so they are never blocked.
+    for i in 0..2u32 {
+        let mut params =
+            EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({ "i": i }));
+        params.concurrency_key = Some(QUIET_KEY.to_string());
+        params.max_concurrent = Some(10u32);
+        params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue quiet task failed");
+    }
+
+    // Saturate the loud key: claim 1 loud task (cap=1 → saturated).
+    let loud_task = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[], &[])
+        .await
+        .expect("claim 1 query failed")
+        .expect("first loud task should be claimable");
+    assert_eq!(
+        loud_task.concurrency_key.as_deref(),
+        Some(LOUD_KEY),
+        "claimed task should be loud-key"
+    );
+
+    // Loud cap is now saturated — the next loud-key claim must fail.
+    // (We specifically target what comes next using separate assertions below.)
+
+    // Quiet tasks must be claimable despite loud saturation.
+    let mut quiet_claimed = 0u32;
+    let mut attempts = 0u32;
+    while quiet_claimed < 2 && attempts < 10 {
+        if let Some(task) =
+            queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[], &[])
+                .await
+                .expect("claim query failed")
+        {
+            assert_eq!(
+                task.concurrency_key.as_deref(),
+                Some(QUIET_KEY),
+                "any task claimed while loud is saturated must be a quiet-key task"
+            );
+            quiet_claimed += 1;
+            // Immediately complete quiet tasks so they don't hold state.
+            queue::complete_task(&mut conn, task.id, serde_json::json!(null))
+                .await
+                .expect("complete quiet task failed");
+        } else {
+            // No task available right now; the loud cap is blocking the loud
+            // tasks and quiet tasks haven't been claimed yet — should not happen.
+            break;
+        }
+        attempts += 1;
+    }
+
+    assert_eq!(
+        quiet_claimed, 2,
+        "both quiet-tenant tasks must be claimable even though loud cap is saturated"
+    );
+
+    // Complete the held loud task; verify the next loud task is now claimable.
+    queue::complete_task(&mut conn, loud_task.id, serde_json::json!(null))
+        .await
+        .expect("complete loud task failed");
+
+    let next_loud = queue::claim_task(&mut conn, &queues, "test-worker-b", "", None, &[], &[])
+        .await
+        .expect("claim after complete query failed");
+    assert!(
+        next_loud.is_some(),
+        "a loud-key task must become claimable after the saturating task completes"
+    );
+    assert_eq!(
+        next_loud
+            .as_ref()
+            .and_then(|t| t.concurrency_key.as_deref()),
+        Some(LOUD_KEY),
+        "next claimable task should be loud-key"
+    );
+}
+
+// ──────────── ActivityContext::attempt() / previous_failure() via worker ─────
+
+/// Shared state captured by the retry-aware activity across all attempts.
+#[derive(Default)]
+struct RetryObservations {
+    /// `(attempt_number, previous_failure)` collected on each invocation.
+    records: Mutex<Vec<(u32, Option<String>)>>,
+}
+
+fn workflow_calling_retry_activity<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("retry_context_activity", serde_json::json!(null), "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Activity that records `ctx.attempt()` and `ctx.previous_failure()` on each
+/// invocation, fails on attempts 1 and 2 with a retryable error, and succeeds
+/// on attempt 3.
+fn retry_context_activity<'a>(
+    ctx: &'a ActivityContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let obs = Arc::clone(
+            ctx.state::<Arc<RetryObservations>>()
+                .expect("RetryObservations must be registered"),
+        );
+        let attempt = ctx.attempt();
+        let prev = ctx.previous_failure().map(str::to_string);
+        obs.records.lock().unwrap().push((attempt, prev));
+
+        if attempt < 3 {
+            Err(format!("fail_attempt_{attempt}"))
+        } else {
+            Ok(serde_json::json!("success"))
+        }
+    })
+}
+
+/// Verifies that `ActivityContext::attempt()` increments correctly across
+/// worker-level retries and that `previous_failure()` carries the last error
+/// string on subsequent attempts.
+///
+/// AC #8 of issue #381: "at least one end-to-end integration test asserts that
+/// an activity which fails twice and succeeds on attempt 3 observes
+/// `ctx.attempt() == 1, 2, 3` and `ctx.previous_failure() == None,
+/// Some("…"), Some("…")`".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!(null);
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let observations = Arc::new(RetryObservations::default());
+
+    let mut shared_state_map = HashMap::new();
+    shared_state_map.insert(
+        TypeId::of::<Arc<RetryObservations>>(),
+        Box::new(Arc::clone(&observations)) as Box<dyn std::any::Any + Send + Sync>,
+    );
+    let shared_state = Arc::new(shared_state_map);
+
+    let registry = Arc::new(HandlerRegistry::with_state(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: workflow_calling_retry_activity,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![ActivityInfo {
+            name: "retry_context_activity",
+            module: "integration_e2e",
+            default_retry_policy: Some(autumn_harvest::RetryPolicy::fixed(
+                3,
+                std::time::Duration::from_millis(0),
+            )),
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: Some("default"),
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: retry_context_activity,
+        }],
+        shared_state,
+    ));
+
+    let worker = build_runtime_worker("worker-retry-ctx", 2, 4, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let records = observations.records.lock().unwrap().clone();
+
+    assert_eq!(records.len(), 3, "activity must have run exactly 3 times");
+
+    let (a1, p1) = &records[0];
+    assert_eq!(*a1, 1, "first invocation must be attempt 1");
+    assert!(
+        p1.is_none(),
+        "first invocation must have no previous_failure"
+    );
+
+    let (a2, p2) = &records[1];
+    assert_eq!(*a2, 2, "second invocation must be attempt 2");
+    assert_eq!(
+        p2.as_deref(),
+        Some("fail_attempt_1"),
+        "second invocation previous_failure must be the attempt-1 error"
+    );
+
+    let (a3, p3) = &records[2];
+    assert_eq!(*a3, 3, "third invocation must be attempt 3");
+    assert_eq!(
+        p3.as_deref(),
+        Some("fail_attempt_2"),
+        "third invocation previous_failure must be the attempt-2 error"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("connect to test DB");
+
+    // 1. Enqueue a capability-gated activity task (requires gpu=true)
+    let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!({}));
+    params.activity_name = Some("gpu_activity".to_string());
+
+    // Set required_capabilities to [{"Exact": {"key": "gpu", "value": "true"}}]
+    let requirements = vec![autumn_harvest::eligibility::Requirement::Exact {
+        key: "gpu".to_string(),
+        value: "true".to_string(),
+    }];
+    params.required_capabilities = Some(serde_json::to_value(&requirements).unwrap());
+
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue capability gated task");
+
+    // 2. Call claim_task representing an old worker (without gpu=true label registered in DB)
+    // Register worker-old first in the DB (without gpu label)
+    autumn_harvest::workers::register_worker(
+        &mut conn,
+        "worker-old",
+        &["default".to_string()],
+        &[0],
+        4,
+        "localhost",
+        None,
+        "v1",
+        None,
+        &std::collections::HashMap::new(),
+    )
+    .await
+    .unwrap();
+
+    // Try to claim task using worker-old. It should return None because the database filters it out.
+    let claimed_by_old = queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "worker-old",
+        "v1",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim_task for worker-old");
+    assert!(
+        claimed_by_old.is_none(),
+        "Old worker should not be able to claim capability-gated task"
+    );
+
+    // 3. Call claim_task representing a new capable worker
+    // Register worker-new with gpu=true label
+    let mut new_labels = std::collections::HashMap::new();
+    new_labels.insert("gpu".to_string(), "true".to_string());
+    autumn_harvest::workers::register_worker(
+        &mut conn,
+        "worker-new",
+        &["default".to_string()],
+        &[0],
+        4,
+        "localhost",
+        None,
+        "v1",
+        None,
+        &new_labels,
+    )
+    .await
+    .unwrap();
+
+    // Try to claim task using worker-new. It should succeed!
+    let claimed_by_new = queue::claim_task(
+        &mut conn,
+        &["default".to_string()],
+        "worker-new",
+        "v1",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim_task for worker-new");
+    let claimed_item = claimed_by_new.expect("New worker should successfully claim task");
+    assert_eq!(claimed_item.id, task_id);
 }

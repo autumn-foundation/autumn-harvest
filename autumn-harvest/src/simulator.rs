@@ -106,6 +106,8 @@ impl WorkflowSimulator {
         let mut history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
             timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         loop {
@@ -129,7 +131,7 @@ impl WorkflowSimulator {
                         history,
                     };
                 }
-                WorkflowOutcome::Failed { error } => {
+                WorkflowOutcome::Failed { error, .. } => {
                     history.push(WorkflowEvent::WorkflowFailed {
                         error: error.clone(),
                     });
@@ -208,6 +210,9 @@ impl WorkflowSimulator {
                                 activity_id,
                                 error: err,
                                 attempt: 1,
+                                error_type: "Error".into(),
+                                non_retryable: false,
+                                details: None,
                             });
                         }
                     }
@@ -273,6 +278,10 @@ impl WorkflowSimulator {
                 }
                 WorkflowCommand::RecordMarker { name, details } => {
                     history.push(WorkflowEvent::MarkerRecorded { name, details });
+                    advanced = true;
+                }
+                WorkflowCommand::RecordSideEffect { kind, name, value } => {
+                    history.push(WorkflowEvent::SideEffectRecorded { kind, name, value });
                     advanced = true;
                 }
                 _ => {

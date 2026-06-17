@@ -27,6 +27,7 @@ use diesel::SelectableHelper;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
@@ -37,6 +38,10 @@ use tower::ServiceExt;
 
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
+    ),
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260410010000_harvest_workflow_start_uniqueness/up.sql"
@@ -75,6 +80,85 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260506000000_harvest_audit_log/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260518000000_harvest_signal_idempotency/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
+    ),
+    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
+    ),
+    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
+    include_str!(
+        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
+    ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
+    ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 // -------------------------------------------------------------------------
@@ -106,6 +190,7 @@ impl TraceContextPropagator for FixedCarrierPropagator {
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -162,6 +247,18 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
             name: "echo_workflow",
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
         Arc::new(HashMap::new()),
@@ -249,6 +346,18 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
             name: "echo_workflow",
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
     ));

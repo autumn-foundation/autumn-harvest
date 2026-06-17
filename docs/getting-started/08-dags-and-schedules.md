@@ -1,6 +1,6 @@
 # Chapter 8 — DAGs and schedules
 
-[← Reliability knobs](07-reliability-knobs.md) · [Index](README.md) · [Next: Operating the service →](09-operations.md)
+[← Reliability knobs](07-reliability-knobs.md) · [Index](README.md) · [Next: Worker routing and capabilities →](09-worker-routing.md)
 
 ---
 
@@ -81,6 +81,83 @@ That's the whole vocabulary. Three things to notice:
   terminal state, regardless of outcome. Useful for end-of-pipeline
   notification and cleanup.
 
+## Dynamic Task Mapping (Fan-Out)
+
+Sometimes, the width of the graph isn't known at design time. You might query a database for a list of partition IDs, and then want to process each partition in parallel.
+
+Harvest supports **dynamic task mapping** (issue #485). A mapped task maps over an upstream task that returns a JSON array, executing one concurrent instance of the activity for each element in the array.
+
+### Declaring a Mapped Task
+
+Use `dag.map_activity` and chain `.over(&upstream)` to bind the fan-out to the upstream task:
+
+```rust
+#[activity]
+async fn list_partitions(_ctx: &ActivityContext) -> HarvestResult<Vec<String>> {
+    Ok(vec!["p0".into(), "p1".into(), "p2".into()])
+}
+
+#[activity]
+async fn process_partition(_ctx: &ActivityContext, partition: String) -> HarvestResult<Value> {
+    // Process single partition...
+    Ok(serde_json::Value::Null)
+}
+
+#[activity]
+async fn combine_results(_ctx: &ActivityContext, results: Vec<Value>) -> HarvestResult<Value> {
+    // Downstream collect task receives the gathered array
+    Ok(serde_json::Value::Null)
+}
+
+#[dag]
+pub fn partition_etl(dag: &mut DagBuilder) {
+    // 1. Upstream node produces a JSON array
+    let list = dag.activity(list_partitions);
+
+    // 2. Mapped node fans out over the array in parallel
+    let process = dag.map_activity(process_partition).over(&list);
+
+    // 3. Downstream collect node receives the array of results
+    let _combine = dag.activity(combine_results).upstream(&process);
+}
+```
+
+### Failure Policies
+
+By default, mapped nodes use the `FailFast` failure policy. You can override it via `.map_failure_policy(...)`:
+
+```rust
+let process = dag.map_activity(process_partition)
+    .over(&list)
+    .map_failure_policy(MapFailurePolicy::CollectAll);
+```
+
+| Policy | Behavior | Downstream Input |
+|---|---|---|
+| `FailFast` *(default)* | Stop execution and cancel in-flight instances on first failure. The mapped task fails. | Downstream does not run (unless trigger rule permits). |
+| `CollectAll` | Execute all N instances to completion. Gathers outcomes for all slots into a status array. Mapped task succeeds. | Downstream receives array of outcome objects: `[{"status":"succeeded","value":v}, {"status":"failed","error":"err"}]`. |
+
+### Behavior and Guarantees
+
+- **Empty Arrays (N = 0)**: If the upstream returns `[]`, the mapped task completes immediately as a successful no-op. Downstream collect nodes receive `[]` and still fire.
+- **Replay Determinism**: The fanned-out width N is a pure function of recorded upstream outputs. During replay, Harvest validates that the number of scheduled instances matches the runtime length of the array. If N differs on replay, Harvest halts execution with a `NonDeterministic` error.
+
+## Under the hood — unified execution
+
+Since Harvest 0.3 (`unified-dag-execution` feature, on by default), `#[dag]`
+functions are executed as *workflows* on the standard workflow execution path
+rather than through a bespoke DAG executor.  The macro lowers the graph
+definition into a `WorkflowHandlerFn` that walks `DagDefinition` level by
+level and dispatches each activity through `ctx.execute_activity_raw`, so DAG
+runs show up as workflow executions in `harvest_workflow_executions`, benefit
+from the same replay-safe history model, and are observable through all the
+same tooling.
+
+You do **not** need to register the underlying workflow manually —
+`HarvestPlugin::dags(dags![my_dag])` auto-registers the `WorkflowInfo` and
+(if the DAG has a `schedule = "..."` attribute) the `WorkflowSchedule` for
+you.
+
 ## `#[dag]` attributes
 
 | Key | Default | Meaning |
@@ -107,6 +184,148 @@ states of its upstream tasks:
 `AllDone` is the right choice for notification, cleanup, and metric-emit
 tasks. `OneSuccess` is the "fan-in for any successful branch" shape.
 `OneFailed` is the "alert on first failure" shape.
+
+## Data-dependent branching
+
+Trigger rules gate a node on the *state* of its upstreams (succeeded,
+failed, skipped). Sometimes you need to route on the upstream's *output
+value* — "if `fraud_score > 0.8`, run manual review; otherwise
+auto-approve." That's what **condition predicates** do.
+
+Call `.condition(|outputs| …)` on a `DagTaskRef`. The closure receives a
+slice of `serde_json::Value` — one element per upstream output, in the
+order the upstreams were declared. If it returns `false`, the node is
+skipped; the skip propagates downstream through the normal trigger-rule
+inference (so an `AllSuccess` child of a skipped node is also skipped, and
+an `AllDone` join that receives all skips still fires).
+
+### Fraud-routing example
+
+```rust
+use serde_json::Value;
+use autumn_harvest::prelude::*;
+
+#[activity(start_to_close = "30s")]
+async fn score_payment(ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    // Returns {"score": 0.0–1.0}
+    Ok(serde_json::json!({ "score": 0.92 }))
+}
+
+#[activity(start_to_close = "5m")]
+async fn manual_review(ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    Ok(Value::Null)
+}
+
+#[activity(start_to_close = "5s")]
+async fn auto_approve(ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    Ok(Value::Null)
+}
+
+#[activity(start_to_close = "30s")]
+async fn notify_result(ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    Ok(Value::Null)
+}
+
+#[dag(schedule = "*/5 * * * *")]
+pub fn fraud_routing(dag: &mut DagBuilder) {
+    // Step 1: score the payment.
+    let score = dag.activity(score_payment);
+
+    // Step 2a: manual review only when score is high.
+    let review = dag
+        .activity(manual_review)
+        .upstream(&score)
+        .condition(|outputs| {
+            outputs[0]["score"].as_f64().unwrap_or(0.0) > 0.8
+        });
+
+    // Step 2b: auto-approve only when score is low.
+    let approve = dag
+        .activity(auto_approve)
+        .upstream(&score)
+        .condition(|outputs| {
+            outputs[0]["score"].as_f64().unwrap_or(0.0) <= 0.8
+        });
+
+    // Step 3: join — AllDone so it fires regardless of which branch ran.
+    let _notify = dag
+        .activity(notify_result)
+        .upstream(&review)
+        .upstream(&approve)
+        .trigger_rule(TriggerRule::AllDone);
+}
+```
+
+At each run exactly one of `manual_review` / `auto_approve` executes; the
+other is skipped. `notify_result` sees two upstreams — one succeeded, one
+skipped — so `AllDone` fires. If you use `AllSuccess` there instead,
+`notify_result` would also be skipped (skipped is not succeeded).
+
+### N-way switch
+
+Conditions are plain Rust closures, so multi-way routing is just multiple
+tasks with mutually-exclusive predicates:
+
+```rust
+#[dag]
+pub fn risk_triage(dag: &mut DagBuilder) {
+    let score = dag.activity(score_payment);
+
+    let _low = dag.activity(low_risk_path).upstream(&score)
+        .condition(|o| o[0]["score"].as_f64().unwrap_or(0.0) < 0.3);
+
+    let _medium = dag.activity(medium_risk_path).upstream(&score)
+        .condition(|o| {
+            let s = o[0]["score"].as_f64().unwrap_or(0.0);
+            (0.3..0.8).contains(&s)
+        });
+
+    let _high = dag.activity(high_risk_path).upstream(&score)
+        .condition(|o| o[0]["score"].as_f64().unwrap_or(0.0) >= 0.8);
+}
+```
+
+Exactly one branch runs per execution. The engine evaluates each condition
+independently — a task is skipped when *its* condition returns `false`,
+regardless of what any sibling condition returned.
+
+### Conditions on mapped tasks
+
+`.condition(…)` is available on `DagMapTaskRef` (returned by
+`dag.map_activity(…).over(&upstream)`) and works the same way: if the
+condition is false, the entire mapped fan-out is skipped as a unit.
+
+### Determinism rule
+
+The predicate is a **pure function of upstream outputs**. Those outputs are
+already frozen in `harvest_events` when the condition runs, so the same
+closure call produces the same result on every replay — as long as the
+closure only reads the `outputs` slice and nothing else. Do not read
+process state, the system clock, or random values inside a condition
+closure; use [`ctx.side_effect`](07-reliability-knobs.md) in an upstream
+activity instead and read the recorded value through its output.
+
+### Vantage UI and observability
+
+The Vantage DAG detail page distinguishes two skip reasons:
+
+| Display text | Meaning |
+|---|---|
+| *Skipped (upstream)* | Node skipped because a trigger rule was not satisfied. |
+| *Skipped (condition)* | Node skipped because its condition predicate returned `false`. |
+
+A `MarkerRecorded` event named `dag_skip:{N}` (where *N* is the zero-based
+task index) is appended to the execution history for every condition-skip.
+This event appears on the execution timeline page and can be queried
+directly from `harvest_events`. Trigger-rule skips emit no marker, so
+pre-existing DAG histories replay unchanged.
+
+### Simulator note
+
+The offline DAG simulator (`autumn_harvest::dag_simulator`) treats all
+nodes as runnable for the purpose of structure validation — it does not
+evaluate condition closures. Use `WorkflowTestEnv` or a real run to verify
+routing behaviour.
 
 ## Registering DAGs with the plugin
 
@@ -152,6 +371,87 @@ Pausing a DAG keeps the definition registered but stops the scheduler from
 firing it; manual triggers still work. Resume by patching it back to active
 through the same management route.
 
+## Incremental scheduled jobs — last-completion-result carryover
+
+Scheduled workflows can read the previous run's output without an external
+high-water-mark table, using two `WorkflowContext` accessors added in issue #488:
+
+| Accessor | Returns |
+|---|---|
+| `ctx.last_completion_result::<T>()` | Deserialized output of the most recent *COMPLETED* run of the same schedule; `None` on first run or if no prior run succeeded |
+| `ctx.last_error()` | Error string from the most recent *terminal* run if it ended FAILED or TIMED_OUT; `None` when that run COMPLETED (recovery) or for manual starts |
+
+Both values are **resolved once at workflow start** and **frozen into the
+`WorkflowStarted` event**, so replay on any worker always returns the same
+values without re-querying the database.
+
+```rust
+use serde::{Deserialize, Serialize};
+use autumn_harvest::prelude::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Cursor {
+    last_processed_id: i64,
+}
+
+#[workflow]
+async fn incremental_etl(ctx: &WorkflowContext, _: ()) -> Result<Cursor, String> {
+    // Read the cursor written by the previous successful run.
+    let prior: Option<Cursor> = ctx
+        .last_completion_result::<Cursor>()
+        .map_err(|e| e.to_string())?;
+
+    // Log when recovering from a previous failure.
+    if let Some(err) = ctx.last_error() {
+        ctx.logger().warn(&format!("Previous run failed: {err}"));
+    }
+
+    let since_id = prior.as_ref().map(|c| c.last_processed_id).unwrap_or(0);
+    // … fetch_batch and process rows WHERE id > since_id …
+    Ok(Cursor { last_processed_id: since_id + 100 })
+}
+```
+
+See `autumn-harvest/examples/incremental_etl_schedule.rs` for the full pattern.
+
+### Semantic guarantees
+
+- **First run**: both accessors return `None`.
+- **Manual (non-scheduled) start**: both accessors return `None`; the
+  `schedule_id` is `None` on the start params, so no carryover is resolved.
+- **Skipped fires** (`OverlapPolicy::Skip`): a skipped slot never invokes
+  `start_or_load_workflow_execution`, so the next run's `last_completion_result`
+  still refers to the last non-skipped COMPLETED run. Skips do not reset or
+  advance the cursor.
+- **Recovery branch**: `last_completion_result` is the last *COMPLETED* output
+  (may be several runs old); `last_error` reflects the single most recent
+  *terminal* run and is `None` once that run COMPLETED — or was CANCELLED /
+  TERMINATED (a later cancellation masks an older failure rather than
+  resurrecting it). Check `last_error()` to know whether the job is still
+  recovering.
+- **continue-as-new**: a continuation inherits the predecessor's frozen
+  carryover (the continuation is the same logical scheduled run), so cursors and
+  recovery state survive the fork.
+- **Slot ordering**: carryover selects the *previous logical fire* by the
+  schedule slot (`scheduled_for`), not by completion time. Overlapping,
+  catch-up, or backfilled fires that finish out of order therefore can't hand a
+  later run an older slot's output and roll its cursor backward.
+- **Non-overlapping assumption**: carryover is designed for the default
+  `max_active_runs = 1` / `OverlapPolicy::Skip`. The source is the highest
+  *earlier* slot that has reached a terminal state, so if you set
+  `max_active_runs > 1` a later slot can start while an earlier slot is still
+  running and observe a stale cursor (re-processing that slot's range). Keep
+  cursor-style incremental jobs at `max_active_runs = 1`.
+- **Backfills**: backfilled runs participate in the schedule's carryover lineage
+  (they share the schedule's `schedule_id` and carry their own `scheduled_for`
+  slot, so they slot into the lineage at the correct position).
+- **Reset**: reset forks are operator interventions and are *excluded* from
+  carryover (their `schedule_id` is left `None`) so resetting an old slot cannot
+  roll a later run's incremental cursor backward.
+- **PII / payload codecs**: the carried-over output copy frozen in
+  `WorkflowStarted` is routed through the same payload codec and redacted-history
+  allowlist as any other payload, so a configured codec encrypts/redacts it.
+
 ## Workflow schedule vs DAG — which one?
 
 | Use a **workflow schedule** when… | Use a **DAG** when… |
@@ -187,4 +487,4 @@ definition in hand at test time.
 
 ---
 
-[← Reliability knobs](07-reliability-knobs.md) · [Index](README.md) · [Next: Operating the service →](09-operations.md)
+[← Reliability knobs](07-reliability-knobs.md) · [Index](README.md) · [Next: Worker routing and capabilities →](09-worker-routing.md)

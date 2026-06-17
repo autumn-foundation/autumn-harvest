@@ -21,6 +21,8 @@
 //! | HVG005 | BackgroundTask| HardBlocker  | Background task spawning             |
 //! | HVG006 | DirectIo      | HardBlocker  | Direct network / DB / filesystem I/O |
 //! | HVG007 | ProcessGlobal | HardBlocker  | Process-global state mutation        |
+//! | HVG008 | NonDeterministicPredicate| HardBlocker | Non-deterministic predicate closures|
+//! | HVG009 | UnsafeLogging | Warning      | Bare tracing calls amplified by replay |
 
 /// Severity of a guardrail rule violation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -48,6 +50,11 @@ pub enum RuleCategory {
     DirectIo,
     /// Mutation of process-global state (`static mut`, shared atomics, global registries).
     ProcessGlobal,
+    /// Non-deterministic predicate evaluated inside `await_condition` closures.
+    NonDeterministicPredicate,
+    /// Bare `tracing::{info,warn,error}!` calls inside a `#[workflow]` body that
+    /// fire on every replay cycle, amplifying log volume.
+    UnsafeLogging,
 }
 
 /// A single entry in the guardrail rule catalog.
@@ -79,8 +86,11 @@ static CATALOG: &[RuleEntry] = &[
             non-determinism error.",
         alternative: "Use ctx.now() (WorkflowContext) to read the workflow-logical clock, \
             which returns the WorkflowStarted timestamp and replays identically on every \
-            subsequent run. If you need a real wall-clock timestamp as a side-effect, wrap it \
-            in an activity and return it as the activity output.",
+            subsequent run. For a real wall-clock instant captured at the call site (e.g. \
+            \"skip the notification if the event is older than 24h *now*\"), use \
+            ctx.system_now() -> DateTime<Utc> (or ctx.system_time_now() -> SystemTime), which \
+            captures the current time once and replays it deterministically via a recorded \
+            SideEffectRecorded event.",
     },
     RuleEntry {
         id: "HVG002",
@@ -90,10 +100,12 @@ static CATALOG: &[RuleEntry] = &[
             source of randomness directly in a workflow body produces a different value on each \
             replay pass. Since the workflow function is re-run from the top on every resume, the \
             random sequence diverges from what was recorded in harvest_events.",
-        alternative: "Generate random values inside an activity (ActivityContext) and return them \
-            as the activity result, which is durably recorded. Alternatively, pass pre-generated \
-            values as workflow input. For replay-safe UUIDs, use ctx.random_uuid(id) which \
-            records the generated UUID in history and replays it deterministically.",
+        alternative: "Use the deterministic primitives on WorkflowContext, which capture the \
+            value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), \
+            ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or \
+            ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For \
+            cryptographically secure randomness, generate it inside an activity (ActivityContext) \
+            and return it as the durably-recorded activity result instead.",
     },
     RuleEntry {
         id: "HVG003",
@@ -165,6 +177,35 @@ static CATALOG: &[RuleEntry] = &[
             ctx.execute_activity_raw() boundaries. If you need to emit metrics or update a \
             registry, do so inside an activity where the side-effect is bounded to a single \
             retryable execution unit and is not re-applied on replay.",
+    },
+    RuleEntry {
+        id: "HVG008",
+        severity: Severity::HardBlocker,
+        category: RuleCategory::NonDeterministicPredicate,
+        explanation: "Evaluating non-deterministic predicates inside await_condition or \
+            await_condition_timeout (such as checking Instant::now(), SystemTime::now(), or \
+            calling random generators inside the closure) leads to non-deterministic execution \
+            paths during replay. Predicates must be pure projections of deterministic workflow \
+            local state variables rehydrated by replaying events.",
+        alternative: "Use durable timers (ctx.timer()) for time-based pauses, and ensure the \
+            predicate closure relies purely on local variables mutated by deterministic signals or \
+            activities.",
+    },
+    RuleEntry {
+        id: "HVG009",
+        severity: Severity::Warning,
+        category: RuleCategory::UnsafeLogging,
+        explanation: "Calling tracing::info!(), tracing::warn!(), tracing::error!(), or any other \
+            bare tracing macro directly inside a #[workflow] body emits one log event per replay \
+            cycle. Because the workflow executor re-runs the function from the top on every \
+            suspension/resume, a single log statement fires N times for a workflow that suspends \
+            N times. This amplifies log volume in proportion to replay depth and fills Loki/Elastic \
+            with duplicate lines that lack correlation keys, making incident triage harder.",
+        alternative: "Use ctx.logger().info(message), ctx.logger().warn(message), \
+            ctx.logger().error(message), or the convenience wrappers ctx.log_info(message), \
+            ctx.log_warn(message), ctx.log_error(message). These are suppressed automatically \
+            during replay (is_replaying() == true) and auto-tag every event with workflow_id, \
+            execution_id, workflow_type, and replay = false for log correlation.",
     },
 ];
 

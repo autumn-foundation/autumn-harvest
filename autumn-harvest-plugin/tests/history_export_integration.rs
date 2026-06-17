@@ -26,6 +26,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
@@ -53,7 +54,7 @@ fn build_test_pool(database_url: &str) -> DbPool {
 }
 
 async fn setup_database_url_with_migrations() -> Option<(String, ContainerAsync<Postgres>)> {
-    let container = match Postgres::default().start().await {
+    let container = match Postgres::default().with_tag("16").start().await {
         Ok(container) => container,
         Err(error) => {
             eprintln!(
@@ -78,7 +79,7 @@ async fn setup_database_url_with_migrations() -> Option<(String, ContainerAsync<
 
 async fn setup_two_shards_with_migrations() -> Option<((String, String), ContainerAsync<Postgres>)>
 {
-    let container = match Postgres::default().start().await {
+    let container = match Postgres::default().with_tag("16").start().await {
         Ok(container) => container,
         Err(error) => {
             eprintln!(
@@ -192,9 +193,22 @@ async fn insert_execution(
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -304,6 +318,8 @@ async fn single_full_history_export_returns_replay_fixture_shape() {
             WorkflowEvent::WorkflowStarted {
                 input: json!({ "customer": "acme" }),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -378,6 +394,8 @@ async fn batch_redacted_history_export_filters_and_reports_shard_coverage() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "authorization": "Bearer do-not-export" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;
@@ -390,6 +408,8 @@ async fn batch_redacted_history_export_filters_and_reports_shard_coverage() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "not": "selected" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;
@@ -438,6 +458,8 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "older-shard0" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;
@@ -450,6 +472,8 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "newer-shard0" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;
@@ -462,6 +486,8 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "newest-shard1" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;
@@ -521,6 +547,8 @@ async fn batch_updated_window_uses_latest_history_event_timestamp() {
         vec![WorkflowEvent::WorkflowStarted {
             input: json!({ "case": "recent-event-old-row" }),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
     )
     .await;

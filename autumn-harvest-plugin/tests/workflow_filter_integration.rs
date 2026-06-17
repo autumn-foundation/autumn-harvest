@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::shard::ShardedDbPool;
-use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 use autumn_harvest_plugin::HarvestDbPool;
@@ -28,12 +28,17 @@ use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
+    ),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
@@ -48,6 +53,71 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260501000000_harvest_workers/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260519000000_harvest_calendar_awareness/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260522000000_harvest_schedule_decisions/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260526000001_harvest_parent_close_policy/up.sql"
+    ),
+    include_str!("../../autumn-harvest/migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000000_harvest_schedule_auto_pause/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000001_harvest_poison_pill_strikes/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260601000002_harvest_ownership_metadata/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260603000000_harvest_completion_triggers/up.sql"
+    ),
+    include_str!("../../autumn-harvest/migrations/20260605000000_harvest_admission_gates/up.sql"),
+    include_str!(
+        "../../autumn-harvest/migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"
+    ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260607000000_harvest_worker_capability_labels/up.sql"
+    ),
+    include_str!(
+        "../../autumn-harvest/migrations/20260607000001_harvest_task_required_capabilities/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260607000002_harvest_workflow_pause/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260609000001_harvest_workflow_current_details/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"
+    ),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
+    ),
+    "\n",
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -59,6 +129,7 @@ fn test_app_state_without_database() -> AppState {
 async fn setup_single_database() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -78,6 +149,7 @@ async fn setup_single_database() -> (String, ContainerAsync<Postgres>) {
 
 async fn setup_sharded_databases() -> ((String, String), ContainerAsync<Postgres>) {
     let container = Postgres::default()
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -161,6 +233,23 @@ async fn seed_workflow(
             search_attrs,
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await
@@ -485,4 +574,42 @@ async fn workflow_search_attr_predicate_uses_gin_index() {
         plan_text.contains("idx_harvest_we_search"),
         "expected EXPLAIN plan to use idx_harvest_we_search, got:\n{plan_text}"
     );
+}
+
+#[tokio::test]
+async fn workflow_list_filter_failure_cause() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let _nd_wf = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "onboarding",
+        "wf-failed-nd",
+        Some(json!({
+            "failure_cause": "non_determinism",
+            "event_index": 3,
+            "expected": "ActivityScheduled",
+            "actual": "TimerStarted"
+        })),
+    )
+    .await;
+
+    let _other_wf = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "onboarding",
+        "wf-failed-other",
+        Some(json!({ "tenant": "acme" })),
+    )
+    .await;
+
+    // Filter by failure_cause=non_determinism.
+    let (status, json) = get_json(&app, "/workflows?failure_cause=non_determinism").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = workflow_ids(&json);
+    assert_eq!(ids, vec!["wf-failed-nd".to_string()]);
 }

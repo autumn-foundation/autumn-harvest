@@ -8,11 +8,76 @@ use std::any::type_name_of_val;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::policy::{RetryPolicy, TriggerRule};
+use serde_json::Value;
 
-#[derive(Debug, Clone)]
+use crate::policy::{MapFailurePolicy, RetryPolicy, TaskStatus, TriggerRule};
+
+/// A data-dependent node condition: a predicate over the deserialized outputs
+/// of upstream nodes, evaluated at dispatch time.
+///
+/// Upstream outputs are passed in upstream-declaration order.  Nodes whose
+/// upstream failed or was itself skipped contribute [`Value::Null`].
+///
+/// When the predicate returns `false` the node is skipped
+/// (`DagDispatchDecision::SkipByCondition`) without ever dispatching the
+/// activity.  The skip is recorded as a [`MarkerRecorded`] event so replay
+/// always selects the same branch.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_harvest::DagCondition;
+///
+/// let high_risk = DagCondition::new(|ups| {
+///     ups[0]["fraud_score"].as_f64().is_some_and(|s| s > 0.8)
+/// });
+/// ```
+#[allow(clippy::type_complexity)]
+#[derive(Clone)]
+pub struct DagCondition(Arc<dyn Fn(&[Value]) -> bool + Send + Sync>);
+
+impl DagCondition {
+    /// Create a new condition from a predicate closure.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&[Value]) -> bool + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    /// Evaluate the predicate against the given upstream outputs.
+    #[must_use]
+    pub fn evaluate(&self, upstream_outputs: &[Value]) -> bool {
+        (self.0)(upstream_outputs)
+    }
+}
+
+impl fmt::Debug for DagCondition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DagCondition(<fn>)")
+    }
+}
+
+/// The dispatch decision for a single DAG task, combining trigger-rule and
+/// condition-predicate checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DagDispatchDecision {
+    /// The task should be dispatched.
+    Run,
+    /// The task is skipped because its trigger rule evaluated to `false` over
+    /// upstream statuses.  No marker is recorded (replay-compat with pre-#482
+    /// histories).
+    SkipByTriggerRule,
+    /// The task is skipped because its condition predicate evaluated to
+    /// `false` over upstream outputs.  A `dag_skip:` marker is recorded in
+    /// event history to make the branch decision deterministic on replay.
+    SkipByCondition,
+}
+
+#[derive(Clone)]
 struct PendingDagTask {
     activity_name: String,
     upstreams: Vec<usize>,
@@ -20,6 +85,25 @@ struct PendingDagTask {
     retry_policy: Option<RetryPolicy>,
     start_to_close: Option<Duration>,
     queue: Option<String>,
+    map_upstream: Option<usize>,
+    map_failure_policy: MapFailurePolicy,
+    condition: Option<DagCondition>,
+}
+
+impl fmt::Debug for PendingDagTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingDagTask")
+            .field("activity_name", &self.activity_name)
+            .field("upstreams", &self.upstreams)
+            .field("trigger_rule", &self.trigger_rule)
+            .field("retry_policy", &self.retry_policy)
+            .field("start_to_close", &self.start_to_close)
+            .field("queue", &self.queue)
+            .field("map_upstream", &self.map_upstream)
+            .field("map_failure_policy", &self.map_failure_policy)
+            .field("condition", &self.condition)
+            .finish()
+    }
 }
 
 /// Immutable task definition produced by [`DagBuilder::build`].
@@ -37,6 +121,48 @@ pub struct DagTask {
     pub start_to_close: Option<Duration>,
     /// The optional specific queue to schedule this task on.
     pub queue: Option<String>,
+    /// The index of the upstream task mapped over (if any).
+    pub map_upstream: Option<usize>,
+    /// Failure policy for mapped tasks.
+    pub map_failure_policy: MapFailurePolicy,
+    /// Optional data-dependent condition predicate.  When `Some`, the
+    /// predicate is evaluated against upstream outputs after the trigger rule
+    /// passes; `false` → `DagDispatchDecision::SkipByCondition`.
+    pub condition: Option<DagCondition>,
+}
+
+impl DagTask {
+    /// Compute the dispatch decision for this task.
+    ///
+    /// `statuses` and `outputs` are indexed by global task index.
+    #[must_use]
+    pub fn dispatch_decision(
+        &self,
+        statuses: &[TaskStatus],
+        outputs: &[Value],
+    ) -> DagDispatchDecision {
+        // Collect upstream statuses for the trigger rule.
+        let upstream_statuses: Vec<TaskStatus> = self
+            .upstreams
+            .iter()
+            .map(|&i| statuses.get(i).copied().unwrap_or(TaskStatus::Skipped))
+            .collect();
+        if !self.trigger_rule.should_run(&upstream_statuses) {
+            return DagDispatchDecision::SkipByTriggerRule;
+        }
+        // Trigger rule passed — evaluate the condition if present.
+        if let Some(cond) = &self.condition {
+            let upstream_outputs: Vec<Value> = self
+                .upstreams
+                .iter()
+                .map(|&i| outputs.get(i).cloned().unwrap_or(Value::Null))
+                .collect();
+            if !cond.evaluate(&upstream_outputs) {
+                return DagDispatchDecision::SkipByCondition;
+            }
+        }
+        DagDispatchDecision::Run
+    }
 }
 
 impl From<PendingDagTask> for DagTask {
@@ -48,6 +174,9 @@ impl From<PendingDagTask> for DagTask {
             retry_policy: task.retry_policy,
             start_to_close: task.start_to_close,
             queue: task.queue,
+            map_upstream: task.map_upstream,
+            map_failure_policy: task.map_failure_policy,
+            condition: task.condition,
         }
     }
 }
@@ -150,12 +279,89 @@ impl DagTaskRef {
         self.mutate(|task| task.queue = Some(queue.into()))
     }
 
+    /// Set the mapped failure policy. Only applies to mapped tasks.
+    #[must_use]
+    pub fn map_failure_policy(self, policy: MapFailurePolicy) -> Self {
+        self.mutate(|task| task.map_failure_policy = policy)
+    }
+
+    /// Attach a data-dependent condition predicate to this task.
+    ///
+    /// The predicate receives upstream outputs in upstream-declaration order.
+    /// Upstream nodes that failed or were skipped contribute [`Value::Null`].
+    /// When the predicate returns `false`, the node is skipped
+    /// ([`DagDispatchDecision::SkipByCondition`]) and a `dag_skip:` marker is
+    /// recorded in event history so replay selects the identical branch.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use autumn_harvest::prelude::*;
+    /// # use autumn_harvest::DagCondition;
+    /// # fn score_payment() {}
+    /// # fn manual_review() {}
+    /// # fn auto_approve() {}
+    /// fn fraud_routing(dag: &mut DagBuilder) {
+    ///     let score = dag.activity(score_payment);
+    ///     let _review = dag
+    ///         .activity(manual_review)
+    ///         .upstream(&score)
+    ///         .condition(|ups| ups[0]["fraud_score"].as_f64().is_some_and(|s| s > 0.8));
+    ///     let _auto = dag
+    ///         .activity(auto_approve)
+    ///         .upstream(&score)
+    ///         .condition(|ups| ups[0]["fraud_score"].as_f64().is_some_and(|s| s <= 0.8));
+    /// }
+    /// ```
+    #[must_use]
+    pub fn condition<F>(self, predicate: F) -> Self
+    where
+        F: Fn(&[Value]) -> bool + Send + Sync + 'static,
+    {
+        self.mutate(|task| task.condition = Some(DagCondition::new(predicate)))
+    }
+
     fn mutate(self, update: impl FnOnce(&mut PendingDagTask)) -> Self {
         {
             let mut tasks = self.tasks.borrow_mut();
             update(&mut tasks[self.index]);
         }
         self
+    }
+}
+
+/// Opaque handle to a mapped task being defined inside a [`DagBuilder`].
+#[derive(Debug, Clone)]
+pub struct DagMapTaskRef {
+    tasks: SharedTasks,
+    index: usize,
+}
+
+impl DagMapTaskRef {
+    /// Bind this mapped task to map over `upstream`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and `upstream` were created by different
+    /// [`DagBuilder`] instances.
+    #[must_use]
+    pub fn over(self, upstream: &DagTaskRef) -> DagTaskRef {
+        assert!(
+            Rc::ptr_eq(&self.tasks, &upstream.tasks),
+            "cannot connect tasks from different DagBuilder instances"
+        );
+        {
+            let mut tasks = self.tasks.borrow_mut();
+            let task = &mut tasks[self.index];
+            task.map_upstream = Some(upstream.index);
+            if !task.upstreams.contains(&upstream.index) {
+                task.upstreams.push(upstream.index);
+            }
+        }
+        DagTaskRef {
+            tasks: self.tasks,
+            index: self.index,
+        }
     }
 }
 
@@ -234,9 +440,39 @@ impl DagBuilder {
             retry_policy: None,
             start_to_close: None,
             queue: self.default_queue.clone(),
+            map_upstream: None,
+            map_failure_policy: MapFailurePolicy::FailFast,
+            condition: None,
         });
 
         DagTaskRef {
+            tasks: Rc::clone(&self.tasks),
+            index,
+        }
+    }
+
+    /// Add a mapped activity task to the DAG.
+    #[must_use]
+    pub fn map_activity<F>(&mut self, activity: F) -> DagMapTaskRef
+    where
+        F: Copy + 'static,
+    {
+        let activity_name = short_activity_name(type_name_of_val(&activity));
+        let mut tasks = self.tasks.borrow_mut();
+        let index = tasks.len();
+        tasks.push(PendingDagTask {
+            activity_name,
+            upstreams: Vec::new(),
+            trigger_rule: TriggerRule::AllSuccess,
+            retry_policy: None,
+            start_to_close: None,
+            queue: self.default_queue.clone(),
+            map_upstream: None,
+            map_failure_policy: MapFailurePolicy::FailFast,
+            condition: None,
+        });
+
+        DagMapTaskRef {
             tasks: Rc::clone(&self.tasks),
             index,
         }
@@ -518,11 +754,194 @@ mod tests {
     }
 
     #[test]
-    fn should_return_task_index() {
+    fn should_support_mapped_activity_builder() {
         let mut builder = DagBuilder::new();
         let a = builder.activity(dummy_activity);
-        assert_eq!(a.index(), 0);
-        let b = builder.activity(dummy_activity);
-        assert_eq!(b.index(), 1);
+        let _b = builder.map_activity(dummy_activity2).over(&a);
+
+        let dag = builder.build().unwrap();
+        let tasks = dag.tasks();
+
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].map_upstream, Some(0));
+        assert_eq!(tasks[1].map_failure_policy, MapFailurePolicy::FailFast);
+        assert_eq!(tasks[1].upstreams, vec![0]);
+    }
+
+    #[test]
+    fn should_support_mapped_failure_policy_override() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder
+            .map_activity(dummy_activity2)
+            .over(&a)
+            .map_failure_policy(MapFailurePolicy::CollectAll);
+
+        let dag = builder.build().unwrap();
+        let tasks = dag.tasks();
+        assert_eq!(tasks[1].map_failure_policy, MapFailurePolicy::CollectAll);
+    }
+
+    // ── Phase 1 / Issue #482 — DagCondition + DagDispatchDecision ──────────
+
+    #[test]
+    fn condition_is_stored_on_task() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder
+            .activity(dummy_activity2)
+            .upstream(&a)
+            .condition(|_| true);
+
+        let dag = builder.build().unwrap();
+        let tasks = dag.tasks();
+        assert!(
+            tasks[0].condition.is_none(),
+            "root task should have no condition"
+        );
+        assert!(
+            tasks[1].condition.is_some(),
+            "conditioned task should have condition set"
+        );
+    }
+
+    #[test]
+    fn dispatch_decision_run_when_no_condition() {
+        let mut builder = DagBuilder::new();
+        let _ = builder.activity(dummy_activity);
+        let dag = builder.build().unwrap();
+        let statuses = [TaskStatus::Succeeded];
+        let outputs = [Value::Null];
+        assert_eq!(
+            dag.tasks()[0].dispatch_decision(&statuses, &outputs),
+            DagDispatchDecision::Run,
+        );
+    }
+
+    #[test]
+    fn dispatch_decision_skip_by_trigger_rule() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity2).upstream(&a); // AllSuccess default
+        let dag = builder.build().unwrap();
+        // upstream failed → trigger rule should block; condition must NOT run
+        let statuses = [TaskStatus::Failed, TaskStatus::Succeeded];
+        let outputs = [Value::Null, Value::Null];
+        assert_eq!(
+            dag.tasks()[1].dispatch_decision(&statuses, &outputs),
+            DagDispatchDecision::SkipByTriggerRule,
+        );
+    }
+
+    #[test]
+    fn dispatch_decision_condition_not_invoked_when_trigger_fails() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_clone = Arc::clone(&invoked);
+
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder
+            .activity(dummy_activity2)
+            .upstream(&a)
+            .condition(move |_| {
+                invoked_clone.store(true, Ordering::SeqCst);
+                true
+            });
+        let dag = builder.build().unwrap();
+        // upstream failed → trigger rule (AllSuccess) should be false
+        let statuses = [TaskStatus::Failed, TaskStatus::Succeeded];
+        let outputs = [Value::Null, Value::Null];
+        let decision = dag.tasks()[1].dispatch_decision(&statuses, &outputs);
+        assert_eq!(decision, DagDispatchDecision::SkipByTriggerRule);
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "condition must NOT be invoked when trigger fails"
+        );
+    }
+
+    #[test]
+    fn dispatch_decision_skip_by_condition_when_predicate_false() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder
+            .activity(dummy_activity2)
+            .upstream(&a)
+            .condition(|ups| ups[0]["score"].as_f64().is_some_and(|s| s > 0.8));
+        let dag = builder.build().unwrap();
+        let statuses = [TaskStatus::Succeeded, TaskStatus::Succeeded];
+        let outputs = [serde_json::json!({"score": 0.2}), Value::Null];
+        assert_eq!(
+            dag.tasks()[1].dispatch_decision(&statuses, &outputs),
+            DagDispatchDecision::SkipByCondition,
+        );
+    }
+
+    #[test]
+    fn dispatch_decision_run_when_condition_true() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder
+            .activity(dummy_activity2)
+            .upstream(&a)
+            .condition(|ups| ups[0]["score"].as_f64().is_some_and(|s| s > 0.8));
+        let dag = builder.build().unwrap();
+        let statuses = [TaskStatus::Succeeded, TaskStatus::Succeeded];
+        let outputs = [serde_json::json!({"score": 0.95}), Value::Null];
+        assert_eq!(
+            dag.tasks()[1].dispatch_decision(&statuses, &outputs),
+            DagDispatchDecision::Run,
+        );
+    }
+
+    #[test]
+    fn dispatch_decision_upstream_outputs_in_declaration_order() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let b = builder.activity(dummy_activity2);
+        // c depends on both a (index 0) and b (index 1), in that order
+        let _c = builder
+            .activity(dummy_activity3)
+            .upstream(&a)
+            .upstream(&b)
+            .condition(|ups| {
+                // ups[0] should be a's output, ups[1] should be b's output
+                ups[0] == serde_json::json!("from_a") && ups[1] == serde_json::json!("from_b")
+            });
+        let dag = builder.build().unwrap();
+        let statuses = [TaskStatus::Succeeded; 3];
+        let outputs = [
+            serde_json::json!("from_a"),
+            serde_json::json!("from_b"),
+            Value::Null,
+        ];
+        assert_eq!(
+            dag.tasks()[2].dispatch_decision(&statuses, &outputs),
+            DagDispatchDecision::Run,
+        );
+    }
+
+    #[test]
+    fn mapped_task_supports_condition() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder
+            .map_activity(dummy_activity2)
+            .over(&a)
+            .condition(|_| false); // always skip
+
+        let dag = builder.build().unwrap();
+        assert!(
+            dag.tasks()[1].condition.is_some(),
+            "mapped task should support condition"
+        );
+        let statuses = [TaskStatus::Succeeded, TaskStatus::Succeeded];
+        let outputs = [serde_json::json!([1, 2, 3]), Value::Null];
+        assert_eq!(
+            dag.tasks()[1].dispatch_decision(&statuses, &outputs),
+            DagDispatchDecision::SkipByCondition,
+        );
     }
 }

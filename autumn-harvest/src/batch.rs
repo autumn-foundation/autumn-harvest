@@ -483,25 +483,37 @@ mod db {
     use crate::schema::harvest_workflow_executions;
     use crate::shard::ShardedDbPool;
     use crate::signal;
+    use crate::telemetry::{MetricsRecorder, NoOpMetrics};
     use crate::types::ExecutionId;
     use crate::worker::DbPool;
     use futures::stream::{FuturesUnordered, StreamExt};
+    use std::sync::Arc;
 
     /// Knobs the executor uses to bound its blast radius on the shared task
     /// queue and event store.
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     pub struct BatchExecutorConfig {
         /// Cap on concurrent per-target operations dispatched in a single
         /// executor tick. Keeps a 10k-target batch from monopolising the
         /// connection pool — the issue's success metric calls for no more
         /// than 10% p99 regression on unrelated workflows.
         pub concurrency: u32,
+        pub metrics: Arc<dyn MetricsRecorder>,
+    }
+
+    impl std::fmt::Debug for BatchExecutorConfig {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BatchExecutorConfig")
+                .field("concurrency", &self.concurrency)
+                .finish_non_exhaustive()
+        }
     }
 
     impl Default for BatchExecutorConfig {
         fn default() -> Self {
             Self {
                 concurrency: DEFAULT_BATCH_CONCURRENCY,
+                metrics: Arc::new(NoOpMetrics),
             }
         }
     }
@@ -512,10 +524,12 @@ mod db {
     /// drops the per-call limit so a 10k batch can drain over multiple ticks.
     ///
     /// `action` is consulted only to pick the default state filter when the
-    /// caller didn't supply one: Cancel/Signal default to `RUNNING` (terminal
-    /// rows are no-ops); Terminate defaults to "every non-CANCELLED state"
-    /// because its whole purpose is to bring stuck-non-running rows to a
-    /// clean terminal state.
+    /// caller didn't supply one: Cancel/Signal default to the active states
+    /// `RUNNING`/`PAUSED` (terminal rows are no-ops, and a paused execution is
+    /// still active — cancel accepts it and a signal queues for delivery on
+    /// resume); Terminate defaults to "every non-CANCELLED state" because its
+    /// whole purpose is to bring stuck-non-running rows to a clean terminal
+    /// state.
     async fn resolve_targets_on_shard(
         conn: &mut AsyncPgConnection,
         action: BatchAction,
@@ -531,7 +545,8 @@ mod db {
                     query = query.filter(harvest_workflow_executions::state.ne("CANCELLED"));
                 }
                 BatchAction::Cancel | BatchAction::Signal => {
-                    query = query.filter(harvest_workflow_executions::state.eq("RUNNING"));
+                    query = query
+                        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]));
                 }
             }
         } else {
@@ -563,10 +578,11 @@ mod db {
         signal_name: Option<&str>,
         signal_payload: Option<&Value>,
         target: ExecutionId,
+        metrics: &dyn MetricsRecorder,
     ) -> Result<(), String> {
         match action {
             BatchAction::Cancel => {
-                cancel_workflow_execution(conn, target, "batch cancel requested")
+                cancel_workflow_execution(conn, target, "batch cancel requested", metrics)
                     .await
                     .map(|_| ())
                     .map_err(|e| e.to_string())
@@ -576,7 +592,7 @@ mod db {
                 // FAILED / TIMED_OUT) and force-writes CANCELLED. Cancel
                 // would error on those — Terminate is the operator escape
                 // hatch.
-                terminate_workflow_execution(conn, target, "batch terminate requested")
+                terminate_workflow_execution(conn, target, "batch terminate requested", metrics)
                     .await
                     .map(|_| ())
                     .map_err(|e| e.to_string())
@@ -708,6 +724,7 @@ mod db {
         let signal_name = job.signal_name.clone();
         let signal_payload = job.signal_payload.clone();
         let concurrency = usize::try_from(config.concurrency.max(1)).unwrap_or(1);
+        let metrics = Arc::clone(&config.metrics);
 
         // Dispatch in chunks of `concurrency` to bound in-flight ops.
         for chunk in targets_to_dispatch.chunks(concurrency) {
@@ -716,6 +733,7 @@ mod db {
                 let pool_for_target = pool.pool_for_execution(target).clone();
                 let signal_name = signal_name.clone();
                 let signal_payload = signal_payload.clone();
+                let metrics = Arc::clone(&metrics);
                 tasks.push(async move {
                     let mut conn = match pool_for_target.get().await {
                         Ok(c) => c,
@@ -727,6 +745,7 @@ mod db {
                         signal_name.as_deref(),
                         signal_payload.as_ref(),
                         target,
+                        metrics.as_ref(),
                     )
                     .await;
                     (target, result)

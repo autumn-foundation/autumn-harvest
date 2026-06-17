@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
-use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
     ActivityContext, StartWorkflowParams, WorkflowContext, WorkflowIdReusePolicy,
@@ -31,6 +31,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::Value;
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tracing::subscriber::DefaultGuard;
@@ -67,6 +68,50 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260501020000_harvest_batch_processed_ids/up.sql"),
     "\n",
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
+    include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
+    "\n",
+    include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
+    include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
+    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
+    "\n",
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
+    "\n",
+    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
+    "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 // -------------------------------------------------------------------------
@@ -109,6 +154,7 @@ fn install_span_capture() -> (Arc<Mutex<Vec<String>>>, DefaultGuard) {
 async fn setup_test_db() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -179,11 +225,35 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 name: "telemetry_master_workflow",
                 module: "telemetry_span_tests",
                 handler: telemetry_master_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "telem_child_wf",
                 module: "telemetry_span_tests",
                 handler: telem_child_wf,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![
@@ -194,10 +264,18 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 default_start_to_close: None,
                 default_heartbeat_timeout: None,
                 default_schedule_to_start: None,
+                default_schedule_to_close: None,
                 default_queue: Some("default"),
                 max_concurrent: None,
                 concurrency_key: None,
                 is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
+                circuit_breaker: None,
+                requires: None,
                 handler: telem_activity,
             },
             ActivityInfo {
@@ -207,10 +285,18 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 default_start_to_close: None,
                 default_heartbeat_timeout: None,
                 default_schedule_to_start: None,
+                default_schedule_to_close: None,
                 default_queue: Some("default"),
                 max_concurrent: None,
                 concurrency_key: None,
                 is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
+                circuit_breaker: None,
+                requires: None,
                 handler: telem_activity,
             },
         ],
@@ -250,6 +336,7 @@ async fn wait_for_state(database_url: &str, exec_id: ExecutionId, state: &str) {
 ///
 /// This is a plain `#[test]` (not `#[tokio::test]`) so we control the runtime
 /// and can wrap the entire async block in `with_default`.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn all_adr_0001_span_kinds_are_emitted() {
     let (names, _guard) = install_span_capture();
@@ -281,6 +368,22 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     search_attrs: None,
                     reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
                     trace_context: None,
+                    max_execution_timeout_ceiling: None,
+                    concurrency_key: None,
+                    concurrency_limit: None,
+                    priority: Priority::default(),
+                    max_workflow_input_bytes: 0,
+                    start_at: None,
+                    delay: None,
+                    max_workflow_start_delay: None,
+                    owner: None,
+                    runbook_url: None,
+                    severity: None,
+                    context_headers: None,
+
+                    sla: None,
+                    schedule_id: None,
+                    scheduled_for: None,
                 },
             )
             .await
@@ -307,6 +410,13 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         worker_heartbeat_interval: Duration::from_secs(5),
                         build_id: String::new(),
                         deployment_name: None,
+                        workflow_cache_size: 1000,
+                        priority_aging_secs: None,
+                        unknown_target_grace_window: Duration::from_secs(5),
+                        poison_pill_threshold: 3,
+                        labels: std::collections::HashMap::new(),
+                        max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                        sharded_pool: None,
                     },
                     registry,
                 )
@@ -443,6 +553,8 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     WorkflowEvent::WorkflowStarted {
                         input: Value::Null,
                         timestamp: Utc::now(),
+                        last_completion_result: None,
+                        last_error: None,
                     },
                     WorkflowEvent::ActivityScheduled {
                         activity_id: act_id,
@@ -466,6 +578,7 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                     telemetry_master_workflow,
                     Value::Null,
                     state,
+                    std::collections::HashMap::new(),
                 )
                 .await;
             });

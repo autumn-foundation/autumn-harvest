@@ -14,7 +14,8 @@
 //! | DET005 | Warning  | Process-global state reads                     |
 //! | DET006 | Error    | Direct sleep / timer primitives                |
 //! | DET007 | Error    | Background task spawning                       |
-//! | DET008 | Error    | Direct network / filesystem I/O               |
+//! | DET008 | Error    | Direct network / filesystem I/O                |
+//! | DET009 | Warning  | Bare tracing calls (log amplification)         |
 //!
 //! # Suppression
 //!
@@ -246,6 +247,34 @@ const RULES: &[Rule] = &[
         alternative: "Move all I/O into activities. Activities are the durable side-effect boundary \
                       in Harvest; their results are recorded in the event history and replayed \
                       without re-executing the I/O.",
+    },
+    Rule {
+        id: "DET009",
+        severity: DetSeverity::Warning,
+        patterns: &[
+            // Fully-qualified spellings
+            "tracing::info!(",
+            "tracing::warn!(",
+            "tracing::error!(",
+            "tracing::debug!(",
+            "tracing::trace!(",
+            "tracing::event!(",
+            // Imported spellings — `use tracing::{info, warn, …}` then bare call
+            "info!(",
+            "warn!(",
+            "error!(",
+            "debug!(",
+            "trace!(",
+        ],
+        message: "Bare tracing macro inside a workflow function fires once per replay cycle. \
+                  A workflow that suspends N times will emit N copies of this log line, \
+                  amplifying log volume and producing duplicate events without correlation keys.",
+        alternative: "Use `ctx.logger().info(msg)`, `ctx.logger().warn(msg)`, \
+                      `ctx.logger().error(msg)`, or the convenience shorthands \
+                      `ctx.log_info(msg)` / `ctx.log_warn(msg)` / `ctx.log_error(msg)`. \
+                      These are replay-aware: output is suppressed during replay cycles and \
+                      each event is auto-tagged with workflow_id, execution_id, and workflow_type. \
+                      See guardrail HVG009 in the catalog for the full rationale.",
     },
 ];
 

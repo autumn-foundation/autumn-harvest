@@ -104,6 +104,65 @@ already know an execution ID, use
 compact terminal body with `state`, `output`/`error`, and `completed_at`, or
 `204 No Content` with `Retry-After` while the workflow is still running.
 
+## Communicating with running workflows
+
+Harvest supports two styles for registering query and update handlers on a
+workflow. The **declarative style** (recommended) uses proc-macro attributes and
+bang macros; the **imperative style** is supported for advanced cases such as
+dynamic handler sets determined at runtime.
+
+### Declarative style (recommended)
+
+Annotate free-standing functions and register them on the builder:
+
+```rust
+use autumn_harvest::prelude::*;
+
+#[update(workflow = "approval_workflow", validator = validate_decision)]
+pub fn decide(ctx: &WorkflowContext, input: DecisionInput) -> Result<(), String> { /* … */ }
+
+#[query(workflow = "approval_workflow")]
+pub fn approval_status(ctx: &WorkflowContext) -> Result<StatusResponse, String> { /* … */ }
+
+HarvestBuilder::new()
+    .workflows(workflows![approval_workflow])
+    .updates(updates![decide])
+    .queries(queries![approval_status]);
+```
+
+See [`autumn-harvest/examples/approval_workflow.rs`](autumn-harvest/examples/approval_workflow.rs)
+for a complete working example including a validator and `drain_admitted_updates`.
+
+### Imperative style (supported for advanced cases)
+
+Use `ctx.register_update_handler` / `ctx.register_query_handler` directly inside
+the workflow body when handler sets are determined at runtime:
+
+```rust
+ctx.register_update_handler("decide", Some(validate_decision), |ctx, input: DecisionInput| {
+    /* … */
+});
+ctx.register_query_handler("status", |_req: &()| Ok("running"));
+```
+
+### Handler discovery via management API
+
+To enumerate all registered query and update handlers for a workflow type:
+
+```
+GET /api/harvest/workflows/types/{workflow_name}/handlers
+```
+
+Response shape:
+
+```json
+{
+  "workflow": "approval_workflow",
+  "queries": [{ "name": "approval_status", "input_type_hint": "…", "output_type_hint": "…" }],
+  "updates": [{ "name": "decide", "input_type_hint": "…", "output_type_hint": "…", "has_validator": true }]
+}
+```
+
 ## Long-running workflows
 
 Every workflow replay loads its durable event history. For pollers, monitors,
@@ -419,6 +478,86 @@ Or via the management API directly:
 GET /api/harvest/admin/concurrency
 ```
 
+### Activity error handling
+
+Activity handlers can return any error type that implements
+`autumn_harvest::failure::IntoActivityErrorString`. Out of the box that means
+**plain `String`** (the legacy shape — `Err("network down".to_string())`) **and
+`ActivityFailure`** (the typed shape introduced in #227). The macro dispatch
+chooses the right encoding at compile time, so authors never call serialisation
+helpers directly.
+
+```rust
+use autumn_harvest::prelude::*;
+
+#[activity(retry = RetryPolicy::exponential(5, Duration::from_secs(1)))]
+async fn charge_card(ctx: &ActivityContext, amount: u32) -> Result<(), ActivityFailure> {
+    // Transient — let the retry policy keep working.
+    if amount == 0 {
+        return Err(ActivityFailure::retryable(
+            "UpstreamTimeout",
+            "payment gateway timed out",
+        ));
+    }
+    // Permanent — skip remaining retries, route straight to DLQ.
+    if amount > 1_000_000 {
+        return Err(ActivityFailure::non_retryable(
+            "InvalidInput",
+            "amount exceeds per-transaction ceiling",
+        ));
+    }
+    Ok(())
+}
+```
+
+`ActivityFailure` carries four fields:
+
+| Field | Purpose |
+|---|---|
+| `error_type` | Stable, low-cardinality class name (e.g. `"InvalidInput"`, `"RateLimitExceeded"`). Used as the `error.type` attribute on `harvest.activity.duration` and `harvest.activity.failed`, and as the matcher input for `RetryPolicy::non_retryable_errors`. |
+| `message` | Human-readable description. Shown in `Display` output (`"InvalidInput: amount exceeds per-transaction ceiling"`). |
+| `details` | Optional `serde_json::Value` for structured context preserved on the `ActivityFailed` event in workflow history. |
+| `non_retryable` | When `true`, the worker skips every remaining retry attempt regardless of `RetryPolicy.max_attempts` and fails the activity on this attempt. The workflow function then sees `Err(HarvestError::ActivityFailed { … })`. |
+
+**Resolution order against `RetryPolicy::non_retryable_errors`**:
+
+1. If `ActivityFailure.non_retryable == true`, retries are skipped immediately.
+2. Otherwise the worker compares each entry in `non_retryable_errors` against
+   `error_type` first (structured, stable across log-format changes).
+3. If no `error_type` match, the worker falls back to a full-string match
+   against the raw error payload (legacy back-compat).
+
+So both of these halt retries on the first attempt:
+
+```rust
+// Typed surface (preferred).
+let mut policy = RetryPolicy::exponential(5, Duration::from_secs(1));
+policy.non_retryable_errors = vec!["InvalidInput".into()];
+// Activity returns: ActivityFailure::retryable("InvalidInput", "...")
+// → matched on error_type, no retries.
+
+// Legacy surface (still works).
+let mut policy = RetryPolicy::exponential(5, Duration::from_secs(1));
+policy.non_retryable_errors = vec!["amount exceeds per-transaction ceiling".into()];
+// Activity returns: Err("amount exceeds per-transaction ceiling".to_string())
+// → matched on raw string, no retries.
+```
+
+**Why typed errors?** Hand-formatted error strings drift every time a log
+message is reworded, silently breaking retry policies that depended on exact
+equality. The same drift makes operators do regex queries over
+`harvest_events.event_data->>'error'` to compute failure-class breakdowns.
+Lifting the class into a typed field (`error_type`) — the same shape Temporal,
+Cadence, and DBOS use — keeps retry policy stable across refactors and lets
+the `harvest.activity.failed{workflow.type="...", error.type="..."}` counter
+answer "what's the dominant failure class right now?" in one PromQL query.
+
+**Backward compatibility.** Every activity returning `Err(String)` continues to
+work unchanged: the engine wraps it as `ActivityFailure { error_type: "Error",
+non_retryable: false, .. }`, so existing dashboards see `error.type=Error`
+without code changes. Pre-#227 `ActivityFailed` events stored in the DB
+deserialise via `serde(default)` on the new fields — no migration is needed.
+
 ### Activity idempotency keys
 
 Harvest activities are **at-least-once**. A worker crash, a `start_to_close`
@@ -544,7 +683,7 @@ combined result.
 
 | CLI flag | Query param | Behavior |
 |---|---|---|
-| `--status Failed` (repeatable, also accepts comma-separated values) | `?status=Failed&status=Running` | OR filter on child status. Allowed values: `Running`, `Failed`, `Completed`, `Cancelled`, `Terminated`, `TimedOut`, `ContinuedAsNew`. |
+| `--status Failed` (repeatable, also accepts comma-separated values) | `?status=Failed&status=Running` | OR filter on child status. Allowed values: `Running`, `Paused`, `Failed`, `Completed`, `Cancelled`, `Terminated`, `TimedOut`, `ContinuedAsNew`. |
 | `--workflow-name billing_child` | `?workflow_name=billing_child` | Exact match on the child workflow name. |
 | `--limit 100` | `?limit=100` | Page size. Defaults to 50 and is capped at 500. |
 | `--cursor <cursor>` | `?cursor=<cursor>` | Continue from the previous page's `next_cursor`. |
@@ -766,13 +905,15 @@ The embedded Vantage UI (`harvest_ui_router`, typically mounted at `/api/harvest
 
 ## Status
 
-Version 0.3.0 wraps the Phase 3 surface plus additive management API contract
+Version 0.4.0 wraps the Phase 4 surface plus additive management API contract
 coverage: DAG scheduling, `#[dag]`, trigger rules, signal delivery,
 `ctx.wait_for_signal`, query registration/dispatch, the management API,
-workflow result polling, and dead-letter list/replay endpoints are implemented
-and covered by integration tests. Durable workflow cancellation is implemented
-with management API support and activity heartbeat cancellation checks.
-First-class Saga compensation is implemented through the `Saga` builder.
+workflow result waiting, dead-letter list/replay/aggregation endpoints,
+pause/resume controls, DAG retry from failed nodes, timezone-aware cron
+schedules, scaling signals, and metrics endpoints are implemented and covered
+by integration tests. Durable workflow cancellation is implemented with
+management API support and activity heartbeat cancellation checks. First-class
+Saga compensation is implemented through the `Saga` builder.
 
 API stability: pre-1.0. Breaking changes happen in minor versions per Cargo's
 0.x semver convention. Each release notes the migration where applicable.

@@ -18,7 +18,7 @@ use crate::context::{
     SharedState, WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy, empty_shared_state,
 };
 use crate::event::WorkflowEvent;
-use crate::info::WorkflowHandlerFn;
+use crate::info::{QueryHandlerInfo, UpdateHandlerInfo, WorkflowHandlerFn};
 use crate::telemetry::{
     ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID, ATTR_WORKFLOW_ID,
 };
@@ -36,6 +36,8 @@ pub enum WorkflowOutcome {
     Failed {
         /// The string description of the error encountered.
         error: String,
+        /// Structured details if the error is a non-determinism divergence.
+        non_deterministic_details: Option<crate::error::NonDeterministicDetails>,
     },
     /// The workflow suspended awaiting activity results or timer firings.
     /// The accumulated commands describe what the worker needs to schedule.
@@ -61,6 +63,9 @@ const SUSPENSION_TIMEOUT: Duration = Duration::from_millis(100);
 pub struct WorkflowExecuteSpanMeta {
     /// Logical workflow name (recorded as `harvest.workflow.id`).
     pub workflow_name: String,
+    /// Business-level workflow identifier (e.g. `"subscription-123"`).
+    /// Forwarded to [`WorkflowContext`] so [`WorkflowLogger`] can tag events.
+    pub workflow_id: String,
     /// Shard identifier (recorded as `harvest.shard.id`).
     pub shard_id: i64,
     /// Task queue name (recorded as `harvest.queue`).
@@ -70,6 +75,8 @@ pub struct WorkflowExecuteSpanMeta {
     /// W3C traceparent linking back to the original trace, present only on
     /// replay runs and only when a prior carrier stored a link.
     pub link_traceparent: Option<String>,
+    /// The worker build ID of the worker executing this workflow.
+    pub build_id: Option<String>,
 }
 
 /// Run a workflow function through replay and live execution.
@@ -104,14 +111,17 @@ pub async fn run_workflow(
 /// returning a non-determinism error on any mismatch.  This is used by
 /// [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
 /// input-changing code changes before deployment.
+#[allow(clippy::implicit_hasher)]
 pub async fn run_workflow_strict(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
     handler: WorkflowHandlerFn,
     input: Value,
     state: SharedState,
+    context_headers: std::collections::HashMap<String, String>,
 ) -> WorkflowOutcome {
-    let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state);
+    let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
+        .with_context_headers(context_headers);
 
     // ADR-0001 §2.1: strict mode is always a replay cycle.
     let span = tracing::info_span!(
@@ -124,31 +134,92 @@ pub async fn run_workflow_strict(
     async {
         let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
         match timeout_result {
-            Ok(Ok(output)) => {
-                if ctx.history_has_unconsumed_events() {
-                    WorkflowOutcome::Failed {
-                        error: "non-deterministic replay: early completion mismatch: \
-                                expected <end of history>, got <workflow returned early>"
-                            .to_string(),
+            // An infallible built-in primitive (system_now/new_uuid/random_*) may
+            // have absorbed a divergence and returned a fallback value (issue #384);
+            // surface it before the other completion checks.
+            Ok(Ok(output)) => ctx.take_deferred_nd_error().map_or_else(
+                || {
+                    if ctx.history_has_unconsumed_events() {
+                        let nd = ctx.take_nd_details().or_else(|| {
+                            Some(crate::error::NonDeterministicDetails {
+                                event_index: i32::try_from(ctx.replay_position()).ok(),
+                                expected: Some("<end of history>".to_string()),
+                                actual: Some("<workflow returned early>".to_string()),
+                                workflow_type: Some(ctx.workflow_type().to_string()),
+                                build_id: ctx.build_id().map(String::from),
+                            })
+                        });
+                        WorkflowOutcome::Failed {
+                            error: "non-deterministic replay: early completion mismatch: \
+                                    expected <end of history>, got <workflow returned early>"
+                                .to_string(),
+                            non_deterministic_details: nd,
+                        }
+                    } else if ctx.drain_commands().into_iter().any(|cmd| {
+                        // UpsertSearchAttributes and SetCurrentDetails are pure metadata
+                        // and do not affect replay determinism; exclude from this check.
+                        !matches!(
+                            cmd,
+                            WorkflowCommand::UpsertSearchAttributes { .. }
+                                | WorkflowCommand::SetCurrentDetails { .. }
+                        )
+                    }) {
+                        // New commands emitted after history was fully consumed (e.g. a
+                        // newly-added version() or side_effect() call on an old history).
+                        let nd = ctx.take_nd_details().or_else(|| {
+                            Some(crate::error::NonDeterministicDetails {
+                                event_index: i32::try_from(ctx.replay_position()).ok(),
+                                expected: Some("<no new commands>".to_string()),
+                                actual: Some("<new commands emitted>".to_string()),
+                                workflow_type: Some(ctx.workflow_type().to_string()),
+                                build_id: ctx.build_id().map(String::from),
+                            })
+                        });
+                        WorkflowOutcome::Failed {
+                            error: "non-deterministic replay: new commands emitted beyond \
+                                    recorded history"
+                                .to_string(),
+                            non_deterministic_details: nd,
+                        }
+                    } else {
+                        WorkflowOutcome::Completed { output }
                     }
-                } else if ctx.drain_commands().into_iter().any(|cmd| {
-                    // UpsertSearchAttributes is pure metadata and does not
-                    // affect replay determinism; exclude it from this check.
-                    !matches!(cmd, WorkflowCommand::UpsertSearchAttributes { .. })
-                }) {
-                    // New commands emitted after history was fully consumed (e.g. a
-                    // newly-added version() or side_effect() call on an old history).
+                },
+                |nd| {
+                    let details = ctx.take_nd_details();
                     WorkflowOutcome::Failed {
-                        error: "non-deterministic replay: new commands emitted beyond \
-                                recorded history"
-                            .to_string(),
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
                     }
-                } else {
-                    WorkflowOutcome::Completed { output }
-                }
+                },
+            ),
+            // A primitive may have drifted before the workflow returned Err from
+            // its own logic; prefer the non-determinism error (issue #384).
+            Ok(Err(error)) => {
+                let details = ctx.take_nd_details();
+                ctx.take_deferred_nd_error().map_or(
+                    WorkflowOutcome::Failed {
+                        error,
+                        non_deterministic_details: details.clone(),
+                    },
+                    |nd| WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                    },
+                )
             }
-            Ok(Err(error)) => WorkflowOutcome::Failed { error },
             Err(_elapsed) => {
+                // A plain-value built-in primitive (system_now/new_uuid/random_*)
+                // may have recorded a divergence before the workflow parked on an
+                // await point. Fail the execution now rather than suspending from
+                // a non-deterministic state (issue #384).
+                if let Some(nd) = ctx.take_deferred_nd_error() {
+                    let details = ctx.take_nd_details();
+                    return WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                    };
+                }
                 let mut commands = ctx.drain_commands();
                 if let Some(idx) = commands
                     .iter()
@@ -195,12 +266,15 @@ pub async fn run_workflow_with_state(
         state,
         WorkflowHistoryPolicy::default(),
         span_meta,
+        &[],
+        &[],
     )
     .await
 }
 
-/// Like [`run_workflow_with_state`] but installs explicit history guardrails
-/// into the [`WorkflowContext`].
+/// Like [`run_workflow_with_state`] but installs explicit history guardrails,
+/// workflow name, and payload size caps into the [`WorkflowContext`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_workflow_with_state_and_history_policy(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
@@ -209,13 +283,76 @@ pub async fn run_workflow_with_state_and_history_policy(
     state: SharedState,
     history_policy: WorkflowHistoryPolicy,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
+    declarative_query_handlers: &[&QueryHandlerInfo],
+    declarative_update_handlers: &[&UpdateHandlerInfo],
+) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+    run_workflow_with_state_history_policy_and_caps(
+        exec_id,
+        history,
+        handler,
+        input,
+        state,
+        history_policy,
+        span_meta,
+        declarative_query_handlers,
+        declarative_update_handlers,
+        "",
+        crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+        crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+        crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+        crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+        std::collections::HashMap::new(),
+    )
+    .await
+}
+
+/// Full executor entry point used by the worker, which injects the workflow name
+/// and payload size caps configured on the `BuiltHarvest` instance.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn run_workflow_with_state_history_policy_and_caps(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    state: SharedState,
+    history_policy: WorkflowHistoryPolicy,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+    declarative_query_handlers: &[&QueryHandlerInfo],
+    declarative_update_handlers: &[&UpdateHandlerInfo],
+    workflow_name: &str,
+    max_activity_input_bytes: u64,
+    max_signal_payload_bytes: u64,
+    max_workflow_input_bytes: u64,
+    max_current_details_bytes: usize,
+    context_headers: std::collections::HashMap<String, String>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
         history,
         state,
         history_policy,
-    );
+    )
+    .with_workflow_name(workflow_name)
+    .with_workflow_id(span_meta.map_or("", |m| m.workflow_id.as_str()))
+    .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
+    .with_payload_caps(
+        max_activity_input_bytes,
+        0,
+        max_signal_payload_bytes,
+        max_workflow_input_bytes,
+    )
+    .with_current_details_cap(max_current_details_bytes)
+    .with_context_headers(context_headers);
+
+    // Auto-register declarative handlers before any workflow code runs.
+    // This satisfies the AC: "authors do not call ctx.register_*_handler in
+    // their workflow body; the runtime guarantees registration happens first."
+    for h in declarative_query_handlers {
+        ctx.register_declarative_query_handler(h);
+    }
+    for h in declarative_update_handlers {
+        ctx.register_declarative_update_handler(h);
+    }
 
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
     // harvest.replay defaults to false at span creation so subscribers that only
@@ -262,14 +399,57 @@ pub async fn run_workflow_with_state_and_history_policy(
             // emitted during live execution (e.g. RecordUpdateResult from
             // execute_admitted_update) so the worker can persist them before the
             // terminal WorkflowCompleted/WorkflowFailed event.
-            Ok(Ok(output)) => (WorkflowOutcome::Completed { output }, ctx.drain_commands()),
-            Ok(Err(error)) => (WorkflowOutcome::Failed { error }, ctx.drain_commands()),
+            Ok(Ok(output)) => {
+                // A plain-value built-in primitive (system_now/new_uuid/random_*)
+                // may have absorbed a replay divergence and recorded it as a
+                // deferred non-determinism error (issue #384). Surface it as a
+                // failure rather than letting the workflow complete silently.
+                let details = ctx.take_nd_details();
+                let outcome = ctx.take_deferred_nd_error().map_or_else(
+                    || WorkflowOutcome::Completed { output },
+                    |nd| WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                    },
+                );
+                (outcome, ctx.drain_commands())
+            }
+            // A primitive may have drifted before the workflow returned Err from
+            // its own logic; prefer the non-determinism error (issue #384).
+            Ok(Err(error)) => {
+                let details = ctx.take_nd_details();
+                let outcome = ctx.take_deferred_nd_error().map_or(
+                    WorkflowOutcome::Failed {
+                        error,
+                        non_deterministic_details: details.clone(),
+                    },
+                    |nd| WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                    },
+                );
+                (outcome, ctx.drain_commands())
+            }
 
             // Timeout elapsed -- the handler is suspended on a oneshot channel.
             // Drain the commands it emitted before suspending. RecordUpdateResult
             // commands emitted in this cycle are included in the commands list and
             // will be handled by the worker alongside the suspension side-effects.
             Err(_elapsed) => {
+                // A plain-value built-in primitive (system_now/new_uuid/random_*)
+                // may have recorded a divergence before the workflow parked on an
+                // await point. Fail the execution now rather than suspending from
+                // a non-deterministic state (issue #384).
+                if let Some(nd) = ctx.take_deferred_nd_error() {
+                    let details = ctx.take_nd_details();
+                    return (
+                        WorkflowOutcome::Failed {
+                            error: format!("non-deterministic replay: {nd}"),
+                            non_deterministic_details: details,
+                        },
+                        ctx.drain_commands(),
+                    );
+                }
                 let mut commands = ctx.drain_commands();
                 // ContinueAsNew is terminal: when the workflow body parks on
                 // the dedicated suspension future, the latest command in the
@@ -322,6 +502,18 @@ mod tests {
         Box::pin(async move { Err("something went wrong".to_string()) })
     }
 
+    /// A workflow that captures a side-effect (drifts against history) and then
+    /// returns Err from its own logic.
+    fn drift_then_error_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = ctx.system_now(); // diverges from the recorded activity event
+            Err("business rule violated".to_string())
+        })
+    }
+
     /// A workflow that calls an activity (will suspend if not in history).
     fn activity_workflow<'a>(
         ctx: &'a WorkflowContext,
@@ -345,6 +537,8 @@ mod tests {
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let outcome = run_workflow(exec_id, history, echo_workflow, input.clone()).await;
@@ -363,15 +557,57 @@ mod tests {
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let outcome = run_workflow(exec_id, history, failing_workflow, Value::Null).await;
 
         match outcome {
-            WorkflowOutcome::Failed { error } => {
+            WorkflowOutcome::Failed { error, .. } => {
                 assert!(error.contains("something went wrong"));
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_prefers_deferred_drift_over_workflow_error() {
+        // Regression (issue #384): a primitive that drifts before the workflow
+        // returns Err from its own logic must surface as non-determinism rather
+        // than masquerading as an ordinary workflow failure.
+        let exec_id = ExecutionId::new();
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+            },
+            // The workflow calls system_now() here, but history recorded an
+            // activity — a genuine divergence.
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "some_activity".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+
+        let outcome = run_workflow(exec_id, history, drift_then_error_workflow, Value::Null).await;
+
+        match outcome {
+            WorkflowOutcome::Failed { error, .. } => {
+                assert!(
+                    error.contains("non-deterministic replay"),
+                    "drift must win over the workflow's own error: {error}"
+                );
+                assert!(
+                    !error.contains("business rule violated"),
+                    "the workflow's Err must not mask the drift: {error}"
+                );
+            }
+            other => panic!("expected Failed(non-determinism), got {other:?}"),
         }
     }
 
@@ -386,6 +622,8 @@ mod tests {
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let outcome = run_workflow(exec_id, history, activity_workflow, input).await;
@@ -424,6 +662,8 @@ mod tests {
         let history = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let outcome = run_workflow(
@@ -454,6 +694,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: input.clone(),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -475,310 +717,5 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
-    }
-
-    // ── RED-phase span-emission tests ──────────────────────────────────────────
-    // These assert the ADR-0001 span contract: correct names, attribute keys from
-    // the ATTR_* constants, and replay semantics.  They drive the GREEN-phase
-    // changes in this module.
-
-    /// Minimal subscriber layer that records every span name seen during a test.
-    mod span_capture {
-        use std::sync::{Arc, Mutex};
-        use tracing::Subscriber;
-        use tracing_subscriber::Layer;
-
-        #[derive(Clone, Default)]
-        pub struct SpanNames(pub Arc<Mutex<Vec<String>>>);
-
-        impl SpanNames {
-            pub fn has(&self, name: &str) -> bool {
-                self.0.lock().unwrap().iter().any(|n| n == name)
-            }
-        }
-
-        pub struct SpanNameLayer(pub SpanNames);
-
-        impl<S: Subscriber> Layer<S> for SpanNameLayer {
-            fn on_new_span(
-                &self,
-                attrs: &tracing::span::Attributes<'_>,
-                _id: &tracing::span::Id,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                self.0
-                    .0
-                    .lock()
-                    .unwrap()
-                    .push(attrs.metadata().name().to_string());
-            }
-        }
-
-        /// Subscriber that captures per-span field values as `(field_name, value_string)`.
-        #[derive(Clone, Default)]
-        #[allow(clippy::type_complexity)]
-        pub struct SpanFields(pub Arc<Mutex<Vec<(String, Vec<(String, String)>)>>>);
-
-        impl SpanFields {
-            /// Returns all field values recorded for spans with the given name.
-            pub fn fields_for(&self, span_name: &str) -> Vec<Vec<(String, String)>> {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(n, _)| n == span_name)
-                    .map(|(_, f)| f.clone())
-                    .collect()
-            }
-        }
-
-        struct FieldRecorder(Vec<(String, String)>);
-        impl tracing::field::Visit for FieldRecorder {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0
-                    .push((field.name().to_string(), format!("{value:?}")));
-            }
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                self.0.push((field.name().to_string(), value.to_string()));
-            }
-            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-                self.0.push((field.name().to_string(), value.to_string()));
-            }
-        }
-
-        pub struct SpanFieldLayer(pub SpanFields);
-
-        impl<S: Subscriber> Layer<S> for SpanFieldLayer {
-            fn on_new_span(
-                &self,
-                attrs: &tracing::span::Attributes<'_>,
-                _id: &tracing::span::Id,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let mut visitor = FieldRecorder(Vec::new());
-                attrs.record(&mut visitor);
-                self.0
-                    .0
-                    .lock()
-                    .unwrap()
-                    .push((attrs.metadata().name().to_string(), visitor.0));
-            }
-        }
-    }
-
-    // ── ADR §2.1: harvest.workflow.execute span name ──────────────────────────
-    // These are plain `#[test]` (not `#[tokio::test]`) so they can build their
-    // own Tokio runtime inside `tracing::subscriber::with_default`, which requires
-    // a synchronous closure.
-
-    /// `run_workflow` must emit a span named `harvest.workflow.execute`
-    /// (the ADR-0001 §2.1 span name).
-    ///
-    /// RED: currently emits `harvest.workflow.run` — this test fails before the fix.
-    #[test]
-    fn executor_emits_harvest_workflow_execute_span() {
-        use span_capture::{SpanNameLayer, SpanNames};
-        use tracing_subscriber::prelude::*;
-
-        let names = SpanNames::default();
-        let subscriber = tracing_subscriber::registry().with(SpanNameLayer(names.clone()));
-
-        let exec_id = ExecutionId::new();
-        let history = vec![WorkflowEvent::WorkflowStarted {
-            input: Value::Null,
-            timestamp: Utc::now(),
-        }];
-
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
-        });
-
-        assert!(
-            names.has("harvest.workflow.execute"),
-            "expected span 'harvest.workflow.execute' but only saw: {:?}",
-            names.0.lock().unwrap()
-        );
-    }
-
-    /// `run_workflow` must NOT emit a span named `harvest.workflow.run`.
-    ///
-    /// RED: currently it does — this test fails before the rename.
-    #[test]
-    fn executor_no_longer_emits_old_harvest_workflow_run_span() {
-        use span_capture::{SpanNameLayer, SpanNames};
-        use tracing_subscriber::prelude::*;
-
-        let names = SpanNames::default();
-        let subscriber = tracing_subscriber::registry().with(SpanNameLayer(names.clone()));
-
-        let exec_id = ExecutionId::new();
-        let history = vec![WorkflowEvent::WorkflowStarted {
-            input: Value::Null,
-            timestamp: Utc::now(),
-        }];
-
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
-        });
-
-        assert!(
-            !names.has("harvest.workflow.run"),
-            "old span 'harvest.workflow.run' must be removed; saw: {:?}",
-            names.0.lock().unwrap()
-        );
-    }
-
-    // ── ADR §2.1: harvest.execution.id attribute ──────────────────────────────
-
-    /// The `harvest.workflow.execute` span must carry `harvest.execution.id`
-    /// (i.e. `ATTR_EXECUTION_ID`), not the old `workflow.execution_id` field.
-    ///
-    /// RED: current code uses `workflow.execution_id` as the field name.
-    #[test]
-    fn executor_span_has_attr_execution_id_field() {
-        use crate::telemetry::ATTR_EXECUTION_ID;
-        use span_capture::{SpanFieldLayer, SpanFields};
-        use tracing_subscriber::prelude::*;
-
-        let fields = SpanFields::default();
-        let subscriber = tracing_subscriber::registry().with(SpanFieldLayer(fields.clone()));
-
-        let exec_id = ExecutionId::new();
-        let history = vec![WorkflowEvent::WorkflowStarted {
-            input: Value::Null,
-            timestamp: Utc::now(),
-        }];
-
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
-        });
-
-        let span_fields = fields.fields_for("harvest.workflow.execute");
-        assert!(
-            !span_fields.is_empty(),
-            "no 'harvest.workflow.execute' span was emitted"
-        );
-        let any_has_exec_id = span_fields
-            .iter()
-            .any(|field_set| field_set.iter().any(|(name, _)| name == ATTR_EXECUTION_ID));
-        assert!(
-            any_has_exec_id,
-            "span must carry field '{ATTR_EXECUTION_ID}'; saw fields: {span_fields:?}"
-        );
-    }
-
-    // ── ADR §2.1: harvest.replay attribute on replay spans ────────────────────
-
-    /// `run_workflow_strict` is the replay path: it must emit `harvest.workflow.execute`
-    /// with `harvest.replay = true`.
-    ///
-    /// RED: currently emits `harvest.workflow.run_strict` with no replay attribute.
-    #[test]
-    fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
-        use crate::context::empty_shared_state;
-        use crate::telemetry::ATTR_REPLAY;
-        use span_capture::{SpanFieldLayer, SpanFields};
-        use tracing_subscriber::prelude::*;
-
-        let fields = SpanFields::default();
-        let subscriber = tracing_subscriber::registry().with(SpanFieldLayer(fields.clone()));
-
-        let exec_id = ExecutionId::new();
-        // Provide a complete single-event history so the strict executor
-        // completes cleanly without non-determinism errors.
-        let history = vec![WorkflowEvent::WorkflowStarted {
-            input: Value::Null,
-            timestamp: Utc::now(),
-        }];
-
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_workflow_strict(
-                    exec_id,
-                    history,
-                    echo_workflow,
-                    Value::Null,
-                    empty_shared_state(),
-                ))
-        });
-
-        // 1. Span must be named correctly.
-        let span_fields = fields.fields_for("harvest.workflow.execute");
-        assert!(
-            !span_fields.is_empty(),
-            "run_workflow_strict must emit 'harvest.workflow.execute'; only saw: {:?}",
-            fields
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(n, _)| n.as_str())
-                .collect::<Vec<_>>()
-        );
-
-        // 2. harvest.replay must be `true`.
-        let any_has_replay_true = span_fields.iter().any(|field_set| {
-            field_set
-                .iter()
-                .any(|(name, value)| name == ATTR_REPLAY && value == "true")
-        });
-        assert!(
-            any_has_replay_true,
-            "replay span must carry '{ATTR_REPLAY} = true'; saw: {span_fields:?}"
-        );
-    }
-
-    /// `run_workflow` (live path) must emit `harvest.workflow.execute`
-    /// with `harvest.replay = false`.
-    ///
-    /// RED: current code does not set any `harvest.replay` attribute.
-    #[test]
-    fn live_executor_span_has_replay_false() {
-        use crate::telemetry::ATTR_REPLAY;
-        use span_capture::{SpanFieldLayer, SpanFields};
-        use tracing_subscriber::prelude::*;
-
-        let fields = SpanFields::default();
-        let subscriber = tracing_subscriber::registry().with(SpanFieldLayer(fields.clone()));
-
-        let exec_id = ExecutionId::new();
-        let history = vec![WorkflowEvent::WorkflowStarted {
-            input: Value::Null,
-            timestamp: Utc::now(),
-        }];
-
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(run_workflow(exec_id, history, echo_workflow, Value::Null))
-        });
-
-        let span_fields = fields.fields_for("harvest.workflow.execute");
-        let any_has_replay_false = span_fields.iter().any(|field_set| {
-            field_set
-                .iter()
-                .any(|(name, value)| name == ATTR_REPLAY && value == "false")
-        });
-        assert!(
-            any_has_replay_false,
-            "live executor span must carry '{ATTR_REPLAY} = false'; saw: {span_fields:?}"
-        );
     }
 }

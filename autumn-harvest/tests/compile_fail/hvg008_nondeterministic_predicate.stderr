@@ -1,0 +1,6 @@
+error: [HVG008] Workflow determinism violation: Evaluating non-deterministic predicates inside await_condition or await_condition_timeout (such as checking Instant::now(), SystemTime::now(), or calling random generators inside the closure) leads to non-deterministic execution paths during replay. Predicates must be pure projections of deterministic workflow local state variables rehydrated by replaying events.
+       Alternative: Use durable timers (ctx.timer()) for time-based pauses, and ensure the predicate closure relies purely on local variables mutated by deterministic signals or activities.
+ --> tests/compile_fail/hvg008_nondeterministic_predicate.rs:6:37
+  |
+6 |         let _ = std::time::Instant::now();
+  |                                     ^^^

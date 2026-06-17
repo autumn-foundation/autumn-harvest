@@ -371,6 +371,100 @@
         "GET /api/harvest/workers/health"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_no_compatible_worker"
+    },
+    {
+      "id": "harvest_schedule_ha_domination",
+      "status": "enforceable",
+      "signal_source": "harvest.schedule.fire_attempts counter with outcome label (issue #350).",
+      "default_threshold": "Ticket when lost_race / (lost_race + claimed) > 0.98 for any 5-minute window. Indicates one replica is winning nearly all schedule claims, which may signal a topology misconfiguration or a clock skew on the Postgres server.",
+      "severity": "ticket",
+      "owner_persona": "runtime on-call",
+      "description": "One replica is winning nearly all schedule-slot claims. In a healthy N-replica deployment, claims should be roughly evenly distributed. Extreme skew suggests a misconfiguration where one replica points to a different database than the others, or its shard assignments exclude it from competing.",
+      "first_action": "harvest preflight --output json && inspect harvest_schedules.fire_claim_token for stuck tokens",
+      "dependencies": [
+        {
+          "ref": "#350",
+          "status": "shipped",
+          "surface": "harvest.schedule.fire_attempts{outcome=claimed|lost_race} counter emitted by tick_workflow_schedules"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Requires harvest.schedule.fire_attempts to be exported. outcome label is low-cardinality (two values). Do NOT add execution.id or schedule.id as labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum(rate(harvest_schedule_fire_attempts_total{outcome=\"lost_race\"}[5m])) / (sum(rate(harvest_schedule_fire_attempts_total{outcome=\"lost_race\"}[5m])) + sum(rate(harvest_schedule_fire_attempts_total{outcome=\"claimed\"}[5m]))) > 0.98"
+          }
+        ]
+      },
+      "management_checks": [
+        "SELECT id, workflow_name, fire_claim_token, fire_claimed_until FROM harvest_schedules WHERE fire_claimed_until IS NOT NULL ORDER BY fire_claimed_until DESC LIMIT 10;"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_schedule_ha_domination"
+    },
+    {
+      "id": "harvest_workflow_failure_rate",
+      "status": "enforceable",
+      "signal_source": "harvest.workflow.terminal counter with outcome label (issue #519).",
+      "default_threshold": "Page when rate(harvest_workflow_terminal_total{outcome='failed'}[5m]) / rate(harvest_workflow_terminal_total[5m]) > 0.10 for any workflow.name. Tune per SLO.",
+      "severity": "page",
+      "owner_persona": "runtime on-call",
+      "description": "The fraction of terminal workflow executions that ended in 'failed' has exceeded the threshold for a given workflow type. This is the primary success-rate SLO signal. Separate outcome labels (completed, failed, cancelled, timed_out, terminated, continued_as_new) allow paging only on unexpected failure while treating operator-driven cancellations and timeouts separately.",
+      "first_action": "harvest workflow list --state FAILED --workflow <name> | head -20 to inspect recent failures; check DLQ for poison-pill tasks",
+      "dependencies": [
+        {
+          "ref": "#519",
+          "status": "shipped",
+          "surface": "harvest.workflow.terminal{outcome,workflow.name,queue} counter emitted exactly once per terminal outcome"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "outcome label is low-cardinality (6 values). workflow.name must be bounded to registered workflow types. Do NOT add execution.id as a label.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow) (rate(harvest_workflow_terminal_total{outcome=\"failed\"}[5m])) / sum by (workflow) (rate(harvest_workflow_terminal_total{outcome!=\"continued_as_new\"}[5m])) > 0.10"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?state=FAILED",
+        "GET /api/harvest/dlq"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_failure_rate"
+    },
+    {
+      "id": "harvest_workflow_non_determinism",
+      "status": "enforceable",
+      "signal_source": "ADR-0001/#138 counter harvest.workflow.non_determinism plus management API failure_cause query.",
+      "default_threshold": "Page immediately on any non-zero rate of non-deterministic replay failures. This indicates a replay-breaking deploy has been shipped to production.",
+      "severity": "page",
+      "owner_persona": "release on-call",
+      "description": "Workflow executions are failing during replay due to non-deterministic divergence (different history generated than previously recorded). This usually happens when a new code version changes workflow logic without proper version gating or routing protection.",
+      "first_action": "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism",
+      "dependencies": [
+        {
+          "ref": "#480",
+          "status": "shipped",
+          "surface": "METRIC_WORKFLOW_NON_DETERMINISM / harvest.workflow.non_determinism"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "Non-determinism signals a logic mismatch. Labels include workflow and build_id. Keep build_id low-cardinality.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow, build_id) (increase(harvest_workflow_non_determinism_total[5m])) > 0"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_non_determinism"
     }
   ]
 }

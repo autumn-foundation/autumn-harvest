@@ -32,13 +32,18 @@ autumn-harvest/          <- workspace root (this file lives here)
       pool.rs            <- Phase 2: separate pool config with shared ceiling
       testing.rs         <- Phase 3.5 (testing feature): WorkflowReplayer harness
       build_routing.rs   <- Phase 3.7: worker build-id routing (issue #171)
+      handle_typed.rs    <- Phase 3.14: type-safe client stubs and handles (issue #341)
     migrations/
       20260409000000_harvest_initial/
       20260509000000_harvest_build_routing/
+      20260518000001_harvest_workflow_execution_timeout/
+      20260613000000_harvest_workflow_sla/
     tests/
       integration_e2e.rs <- testcontainers integration tests
       replay_tests.rs    <- replay engine integration tests
       build_routing_tests.rs <- build-id routing unit + integration tests
+      sticky_routing_tests.rs <- sticky routing unit + integration tests (issue #235)
+      scheduler_ha_tests.rs <- HA scheduler claim exclusivity tests (issue #350)
       macros_*.rs        <- proc-macro integration tests
   autumn-harvest-macros/ <- proc-macro crate
     src/
@@ -56,10 +61,32 @@ Two crates in the workspace. `autumn-harvest` is the public library. `autumn-har
 - **Phase 2** (complete): event store, replay engine, workflow context, activity context, task queue (SKIP LOCKED), LISTEN/NOTIFY, worker runtime, heartbeating, timeout enforcement, workflow versioning (ctx.version), LRU workflow cache, dead letter queue, separate worker pool with shared ceiling, testcontainers integration tests
 - **Phase 3** (implemented): DAG scheduler/runtime, `DagBuilder`, `#[dag]` macro, trigger rules, signals/queries, management HTTP API, Autumn adapter crate with `HarvestExt` lifecycle integration
 - **Phase 3.5** (implemented): Local activities (`#[activity(local = true)]`, `ctx.execute_local_activity_raw`, `WorkflowCommand::RunLocalActivity`, three new `WorkflowEvent` variants, builder cap validation) — see issue #98
-- **Phase 3.6** (implemented): Update primitive (`UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed` event variants, `UpdateId` type, `UpdateRegistry`, `WorkflowContext::register_update_handler`, `validate_update`, `execute_admitted_update`, `HistoryMatcher::match_update`, `drain_admitted_updates`) — see issue #140
+- **Phase 3.6** (implemented): Update primitive (`UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed` event variants, `UpdateId` type, `UpdateRegistry`, `WorkflowContext::register_update_handler`, `validate_update`, `execute_admitted_update`, `HistoryMatcher::match_update`, `drain_admitted_updates`) — see issue #140. Declarative `#[query(workflow = "…")]` / `#[update(workflow = "…", validator = …)]` macros with `queries![]/updates![]` bang macros and `HarvestBuilder::queries()/updates()` builder methods now implemented — see issue #346
 - **Phase 3.7** (implemented): Worker build-id routing (`BuildId`, `DeploymentName` newtypes; `build_routing.rs` with `BuildCompatibilitySet`, `BuildPolicy`, `BuildReachability`; `harvest_build_policies` + `harvest_build_compat` tables; `required_build_id` on task queue; `assigned_build_id` on executions; `build_id`/`deployment_name` on workers; SKIP LOCKED claim filter; `WorkerConfig::with_build_id`, `with_deployment_name`; build policy wired into `start_or_load_workflow_execution`; cross-shard reachability via `all_build_reachability_sharded`) — see issue #171 and `docs/runbooks/safe-deploy.md` for the operator deploy playbook
 - **Phase 3.8** (implemented): Starter production alert pack and runbooks (`docs/alerts/starter-pack-v0.1.0.json`, `docs/alerts/README.md`, `docs/runbooks/harvest-alerts.md`, `docs/runbooks/synthetic-incident-drills.md`) compose ADR-0001/#138 metrics with preflight, worker health, shard health, schedules, DLQ, retention, workflow stack, and build-routing signals. Thresholds are starter defaults, not universal SLOs.
-- **Phase 4** (next): production hardening -- cancellation/saga semantics, sharding, sticky cross-worker routing, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain)
+- **Phase 3.9** (implemented): Unified DAG execution (`unified-dag-execution` feature, on by default) — see issue #256. `#[dag]` lowers graph definitions onto the standard workflow execution path: the macro emits a `WorkflowHandlerFn` that walks `DagDefinition` level by level and dispatches activities through `ctx.execute_activity_raw`. `HarvestBuilder::dags()` auto-registers `WorkflowInfo` (and `WorkflowSchedule` when a schedule attribute is present) for each unified DAG. `POST /dags/{name}/trigger` routes through `trigger_unified_dag` → `start_or_load_workflow_execution` when the dag is in `registry.workflows`. `compile_dag_catalog` skips unified DAGs so the classic DAG executor never claims them. Classic DAGs (explicit `workflow_handler: None`) still work unchanged. `harvest_dag_runs` remains write-only for bridge observability during this transition.
+- **Phase 3.10** (implemented): Read-only Query handlers (`query.rs`, `QueryRegistry`, `WorkflowContext::register_query_handler<Req,Resp>`, `execute_query_with_args`, `list_query_names`; `WorkerConfig::query_timeout` default 5 s; `telemetry::METRIC_QUERY_DURATION`; `#[query]` macro; management routes `POST /workflows/{id}/query/{name}` and `GET /workflows/{id}/queries`) — see issue #234 and `examples/progress_query.rs`.
+- **Phase 3.11** (implemented): Sticky cross-worker routing and warm-cache delta loading (`StickyRoutingConfig`, `WorkerConfig::with_sticky_routing`; `WorkflowCache` wired into worker hot path; `store::load_history_since` for delta event queries; `METRIC_WORKFLOW_CACHE_HIT` / `METRIC_WORKFLOW_CACHE_MISS` constants + `MetricsRecorder` methods; `CachedWorkflowState` redesigned with `events: Vec<WorkflowEvent>` + `next_event_id: i32` for actual delta-load support; sticky routing off by default) — see issue #235 and `docs/sticky-routing.md` for the operator guide
+- **Phase 3.12** (implemented): Workflow execution timeouts for SLA enforcement and runaway protection — see issue #243. `WorkflowExecutionTimedOut` event variant (append-only, `deadline` + `timed_out_at` fields); `TimeoutType::WorkflowExecution`; `#[workflow(execution_timeout = "30m")]` attribute parsed by the macro and stored as `WorkflowInfo::execution_timeout: Option<Duration>`; `max_workflow_execution_timeout` ceiling on `HarvestBuilder` (server-side cap applied at workflow start); `deadline_at TIMESTAMPTZ NULL` column on `harvest_workflow_executions` with a partial index on `(deadline_at) WHERE state = 'RUNNING' AND deadline_at IS NOT NULL`; `timeout::enforce_workflow_execution_timeouts` Diesel DSL scanner that appends `WorkflowExecutionTimedOut`, transitions the execution to `TIMED_OUT`, cancels outstanding task queue rows, and notifies parent child-workflows; `METRIC_WORKFLOW_TIMEOUT` counter (`harvest.workflow.timeout{workflow, queue}`) emitted on each enforcement; `WorkflowSchedule::execution_timeout` field + `with_execution_timeout` builder method for schedule-level default deadlines. Migration: `20260518000001_harvest_workflow_execution_timeout`.
+- **Phase 3.13** (implemented): Per-key concurrency limits for tenant fair-share scheduling (`ConcurrencyPolicy` newtype; `concurrency.rs` with `resolve_concurrency_key`; `WorkflowInfo.concurrency` field; `#[workflow(concurrency(key = "input.tenant_id", limit = 10))]` macro attribute; `StartWorkflowParams.concurrency_key` + `.concurrency_limit`; plugin API resolves key at workflow start; continue-as-new propagates key; `GET /admin/concurrency` management endpoint; `harvest.concurrency.in_flight`/`harvest.concurrency.deferred` metrics; sharding interaction documented in `docs/sharding.md`) — see issue #247. No new migration: `concurrency_key`/`concurrency_cap` columns and the claim-time advisory-lock enforcement were already present from the concurrency_key migration.
+- **Phase 3.14** (implemented): Type-safe workflow client stubs and handles — see issue #341. Generates PascalCase stubs (e.g. `SubscriptionFlowStub` for `fn subscription_flow(...)`) exposing typed `start`, `start_with_options`, and `signal_with_start`. Stub methods return `TypedWorkflowHandle<T>` wrapping the untyped `WorkflowHandle`, with `.result().await -> HarvestResult<T>` and `.result_snapshot().await -> HarvestResult<TypedWorkflowResult<T>>` to safely deserialize outputs. Sibling macros `#[query]`, `#[update]`, and `#[signal]` automatically generate sibling methods (`query_[query_name]`, `update_[update_name]`, `signal_[signal_name]`) on the same stub type.
+- **Phase 3.15** (implemented): HA-safe scheduler ticks under multi-replica deployments — see issue #350. `tick_workflow_schedules` now atomically claims each due `harvest_schedules` row before firing it using `UPDATE ... SET fire_claim_token = gen_random_uuid(), fire_claimed_until = NOW() + INTERVAL '30 seconds' WHERE (fire_claim_token IS NULL OR fire_claimed_until < NOW())`. Only one replica holds the claim per slot at a time. Crash-recovery window: if the claiming replica crashes before advancing `next_run_at`, the claim expires after 30 s and a healthy peer retries. The contract does not depend on `WorkflowIdReusePolicy`. New metric `harvest.schedule.fire_attempts{outcome="claimed|lost_race"}` emitted by `tick_workflow_schedules` so operators can verify exclusivity and detect HA misconfiguration. New `record_schedule_fire_attempt` method on `MetricsRecorder`. Migration `20260530000000_harvest_schedule_ha_claim` adds nullable `fire_claim_token UUID` + `fire_claimed_until TIMESTAMPTZ` columns with a partial expiry index. Runbook at `docs/runbooks/ha-deployment.md`. Alert `harvest_schedule_ha_domination` in `docs/alerts/starter-pack-v0.1.0.json`. Integration tests in `tests/scheduler_ha_tests.rs` verify the concurrent-tick guarantee, crash-recovery path, and metric emission.
+- **Phase 3.16** (implemented): DAG retry-from-failed-node operator surface — see issue #366. New management route `POST /api/harvest/dags/{dag_name}/runs/{run_exec_id}/retry` (handler `retry_dag_run` in `api.rs`) and pure resolver `autumn-harvest-plugin/src/dag_retry.rs` (`resolve_retry_plan`, `downstream_closure`, `node_outcome`). The endpoint resolves `(dag_name, run_exec_id, from_nodes)` → `reset_to_event_id = earliest_reexecute_schedule - 1` by walking the registered `DagDefinition` (node name == activity name) and the recorded history, then delegates to the existing #148 reset internals. **No new core primitive, no new `WorkflowEvent` variant, no migration.** The only core change is an opt-in `WorkflowResetRequest.allow_terminal_source` flag (`#[serde(default)]` false) so a terminal *failed* DAG run can be forked; `validate_source_execution` accepts `FAILED`/`CANCELLED`/`TIMED_OUT` only when set. Reset `reason` is augmented with `dag_retry: nodes=[...]` for the audit trail (#158); audit op `OP_DAG_RETRY = "dag.retry"`. Semantics are level-granular (operator choice): retrying any node auto-widens to its full execution level + downstream closure, so the cut lands on the clean boundary before the level and the failed node's same-level siblings re-run with it (no "name the succeeded sibling to widen" dead-end). A `409` is returned only when the fork point lands inside an unresolved *upstream* side effect (the #148 validator rejects it). Ambiguous requests (a node name that maps to >1 task because the DAG reuses the activity) are rejected `400`. `WorkflowResetRequest.allow_terminal_source` is `#[serde(skip)]` so it cannot be enabled from the public reset endpoint body. Source-state gating: `COMPLETED` → `409`, `RUNNING`/`SUSPENDED` → `409`, classic DAGs → `400`. CLI `dag retry` subcommand. Runbook `docs/runbooks/dag-retry-from-failed-node.md`. Tests: resolver unit tests in `dag_retry.rs`, HTTP+worker integration tests in `autumn-harvest-plugin/tests/dag_retry_integration.rs`, CLI mapping/coverage tests.
+- **Phase 3.17** (implemented): Poison-pill task quarantine — see issue #367. A poison-pill task crashes the worker *process* (panic, OOM, segfault, hard exit) rather than returning a clean `Err`, leaving its row stuck in `RUNNING`; SKIP LOCKED re-claim then cascades the crash across the fleet. New `poison_pill.rs` module: pure `quarantine_decision(strikes_after_increment, threshold) -> ReclaimAction` (no DB dependency, unit-tested without `db`); `orphaned_running_tasks_query()` selects `RUNNING` rows whose `worker_id` has no live `harvest_workers` heartbeat (authoritative liveness signal — reclaim does **not** depend on per-task `start_to_close`/`heartbeat_timeout`, so an un-timed orphan is recovered rather than stuck forever); `reclaim_orphaned_tasks` increments `crash_strikes` and either re-queues (under threshold) or quarantines to the DLQ (at/over threshold); `spawn_poison_pill_reclaimer` runs the sweep on the worker's `poll_interval`, wired into `WorkerMonitoringHandles` alongside the timeout checker. Quarantine moves the task to `harvest_dead_letters` with a typed `DeadLetterReason::PoisonPill { crash_strikes, last_worker_id }` (the reason discriminator distinguishes it from clean retry exhaustion), marks the queue row `FAILED`, and fails the owning workflow terminally via the existing `WorkflowFailed` event path (**no new `WorkflowEvent` variant**), waking any blocked parent. `WorkerConfig::poison_pill_threshold` (default **3**; `with_poison_pill_threshold`; `0` disables quarantine = legacy requeue-forever loop). New metric `harvest.task.quarantined{queue, reason}` (`METRIC_TASK_QUARANTINED`, `record_task_quarantined` on `MetricsRecorder`, bridged in `metrics_rs_adapter`). Migration `20260601000001_harvest_poison_pill_strikes` adds `crash_strikes INT NOT NULL DEFAULT 0` to `harvest_task_queue` plus a partial index on `(worker_id) WHERE state = 'RUNNING' AND worker_id IS NOT NULL`. Shard-local: detection and quarantine run against the connection's own database. Integration tests in `tests/poison_pill_tests.rs`.
+- **Phase 3.18** (implemented): Per-activity circuit breaker for fast-fail dispatch during downstream outages — see issue #369. Opt-in `CircuitBreakerPolicy { failure_threshold, window, cooldown }` (in `policy.rs`) attached to `ActivityInfo.circuit_breaker` via the `#[activity(circuit_breaker = ...)]` attribute. New `circuit_breaker.rs` module: pure `CircuitBreakerRegistry` (closed/open/half-open state machine, rolling-window failure counting, single half-open probe, `force_open`/`force_close`, `snapshot`/`list`) — unit-tested without `db`. `on_result` takes an `AttemptOutcome` (`Success`/`RetryableFailure`/`NonRetryableFailure`): only `RetryableFailure` trips the breaker (classification mirrors the retry decision via the shared `failure_is_non_retryable` helper, honouring both the typed `non_retryable` flag and the retry policy's `non_retryable_errors`, incl. legacy `Err(String)`), so a burst of permanent per-request errors can't open the circuit. It also takes a `DispatchToken` carrying a monotonic **generation** (bumped on every state-resetting transition — trip/close/force-open/force-close); `on_result` fences any result whose token predates the current generation, which subsumes both the half-open straggler case and the "pre-force-close failure re-trips the operator's reset" case. Cancellation-driven results (workflow/task cancelled mid-flight) are excluded from breaker accounting entirely. Activity **timeouts** (start-to-close/heartbeat) feed the breaker out-of-band via `on_external_failure` wired into `timeout::enforce_activity_timeout` (token-less, since the dispatching worker may be gone), so a hanging downstream trips the breaker too. Circuit breakers are rejected on local activities (macro compile error + defensive registry filter) since local activities bypass the dispatch path. The worker consults the breaker in `process_activity_task` before running the handler: when open it short-circuits with a non-retryable `ActivityFailure::circuit_open` (error type `"CircuitOpen"`, `ERROR_TYPE_CIRCUIT_OPEN` in `failure.rs`) recorded as an ordinary `ActivityFailed` event — **no new `WorkflowEvent` variant, no migration** — so the append-only contract and deterministic replay are unchanged. `DispatchDecision::ShortCircuit.retry_after` is `Option<Duration>` (`None` = operator-forced open / in-flight probe, so callers don't busy-loop on a stale hint). The typed failure is **consumable from workflow code**: `error_type`/`details` are threaded through `HistoryMatch::Failed` and `HarvestError::ActivityFailed` (which now carries `error_type` + `details`), with accessors `HarvestError::activity_error_type()`/`activity_details()`/`is_circuit_open()` and the `HarvestError::activity_failed(name, attempt, payload)` decoding constructor — deterministic on replay. **Rate-limit interaction:** for an activity with both `rate_limit_*` and `circuit_breaker`, rate limiting is enforced at **dispatch** rather than at claim. `queue::claim_task` skips the rate-limit gate **and** token debit for every activity with a breaker (the static set `CircuitBreakerRegistry::tracked_activity_names()` passed into the claim query), so a `CircuitOpen` short-circuit is always claimable and propagates at full speed during an outage without burning tokens. A genuine call — admitted by the authoritative `on_dispatch` in `process_activity_task` — atomically reserves one token via `queue::try_consume_rate_limit_token`; if the bucket is empty the task is rescheduled (one refill interval ahead, clamped) instead of running, so a real call can never run below zero tokens. Enforcing at dispatch (gated on the real breaker decision) avoids the claim-vs-dispatch staleness window since the breaker state is in-process and can change between the two. Plain rate-limited activities without a breaker are unchanged (gate + debit at claim). State is in-process and per-shard, shared (`HandlerRegistry::circuit_breakers()`) between the worker and the management API. Management routes `GET /admin/circuits`, `GET /admin/circuits/{activity_name}`, `POST /admin/circuits/{activity_name}/force-{open,close}` (audit ops `OP_CIRCUIT_FORCE_OPEN`/`OP_CIRCUIT_FORCE_CLOSE`). New metrics `harvest.activity.circuit.tripped` / `harvest.activity.circuit.closed` (`activity.name` label; `record_circuit_tripped`/`record_circuit_closed` on `MetricsRecorder`, bridged in `metrics_rs_adapter`). Runbook `docs/runbooks/activity-circuit-breaker.md` with the breaker-vs-retry/jitter/rate-limit decision matrix. Tests: `circuit_breaker.rs` unit tests, `tests/circuit_breaker_wiring_tests.rs`, `context::tests::context_replays_circuit_open_failure_with_typed_metadata`, and the `circuit_breaker_short_circuits_after_tripping` e2e in `tests/integration_e2e.rs`.
+- **Phase 3.19** (implemented): Published workflow input/output JSON Schema for self-service triggering — see issue #373. `WorkflowInfo` gains four new optional fields: `description: Option<&'static str>`, `input_schema: Option<fn() -> serde_json::Value>`, `output_schema: Option<fn() -> serde_json::Value>`, `error_schema: Option<fn() -> serde_json::Value>`. Three fluent builder methods: `with_description`, `with_input_schema_fn`, `with_output_schema_fn`, `with_error_schema_fn` (all `#[must_use]`). Under the new `schema` Cargo feature, `with_schemas::<I, O, E>()` derives all three schemas automatically from types that implement `schemars::JsonSchema`. Two new management API routes: `GET /workflows/registered` (sorted list of all registered workflow types with optional schemas) and `GET /workflows/registered/{name}/schema` (404 for unknown names). `POST /workflows/{name}/start` validates input against the published schema when one is set; on failure returns `400` with a structured JSON body `{"error": "input validation failed", "violations": [{"message": "…", "field_path": "…"}]}` where `field_path` is a JSON Pointer (RFC 6901). `WorkflowInfo::validate_input` is the pure validation method — returns `Ok(())` or `Err(Vec<SchemaViolation>)`. `validate_against_schema` is the standalone recursive validator. `#[workflow(description = "…")]` attribute wires description through the companion function. Opt-in: workflows without a schema compile and run identically to today — no breakage. **No new `WorkflowEvent` variants, no migrations, no shard-routing changes, no replay-determinism impact.** `RegisteredWorkflowRecord` is the serialisable discovery record. Example: `autumn-harvest/examples/schema_workflow.rs` (requires `--features schema`). New types in `info.rs`: `SchemaViolation`, `RegisteredWorkflowRecord`, `validate_against_schema`.
+- **Phase 3.22** (implemented): DLQ root-cause aggregation API for fast incident triage — see issue #385. New read-only management route `GET /api/harvest/dead-letters/aggregate` (admin auth, parity with the DLQ list endpoint, placed under the existing `/dead-letters` route family; handler `aggregate_dead_letters` in `api.rs`, fanning out across shards with `iter_shards()`). Groups dead-letter rows along a named set of dimensions and returns per-group counts plus representative `dead_letter_id`s. Repeatable `group_by=` supports `workflow_name`, `activity_name`, `queue_name`, `task_type`, `time_bucket` (companion `time_bucket=hour|day`), and `failure_signature`; repeats build a hierarchical key. Filters (`workflow_name`/`activity_name`/`queue_name`/`since`/`until`/`min_attempts`) mirror the list endpoint and apply before grouping; `since`/`until` accept RFC 3339 or relative durations (`24h`). `limit_groups` (default 50, max 500) rolls the long tail into a single `{"_other": true}` group so counts reconcile to `filtered_total`; `samples_per_group` (default 3, max 10) caps sample IDs. **`failure_signature` is the compute-on-read normalized-substring option (zero schema change)**: `dlq::failure_signature` takes the first line of `error` and normalizes UUIDs/hex/decimal runs to `<UUID>`/`<HEX>`/`<NUM>` placeholders, truncated to 200 chars — a pure, deterministic, shard-stable function. Invalid params return `400` with a JSON error body (never `500`, never a silent empty match). New core types/functions in `autumn-harvest/src/dlq.rs`: `failure_signature`, `DlqGroupDimension`, `TimeBucketGranularity`, `DlqAggregateParams` (`from_query_pairs`), `DlqRawGroup`, `DlqAggregatePartial`, `DlqGroup`, `DlqAggregateResponse`, `aggregate_dead_letters` (per-shard, `db`-gated), `merge_dlq_aggregates` (pure cross-shard merge). CLI: `harvest dlq aggregate --group-by … [--json]` (table by default). Runbook: "DLQ flood — first 60 seconds" section in `docs/runbooks/harvest-alerts.md`. Contract: `GET /dead-letters/aggregate` registered in `management_api_routes()`/`management_api_response_fields()` and `docs/api-contract.json`. **No new `WorkflowEvent` variant, no migration.** Pure unit tests in `dlq.rs`; HTTP+shard integration tests in `autumn-harvest-plugin/tests/dlq_aggregate_integration.rs`; CLI mapping/render tests in `lib.rs`. Vantage UI: the DLQ inspection page (#226) gains a **Summary toggle** (`?view=summary`) that runs the same per-shard aggregation in-process, with a `group_by` selector (default `workflow_name,failure_signature`), cross-shard merged counts/samples, and click-through into the filtered list view (`render_dead_letters_summary_view` in `ui.rs`); covered by `ui_integration.rs` tests.
+- **Phase 3.21** (implemented): Workflow terminal-outcome counter for success-rate SLOs and alerting — see issue #519. New counter `harvest.workflow.terminal` (`METRIC_WORKFLOW_TERMINAL`) incremented **exactly once** per terminal workflow outcome. Labels: `outcome` (6 bounded values: `completed`/`failed`/`cancelled`/`timed_out`/`terminated`/`continued_as_new`), `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue`. `execution.id` is never a label (ADR-0001 §7 cardinality rule). Emission points: `worker.rs` (`process_workflow_task` for Completed/Failed/ContinuedAsNew and `fail_workflow_for_history_cap`), `timeout.rs` (`enforce_workflow_execution_timeouts` for TimedOut), `execution.rs` (`cancel_workflow_execution` for Cancelled, `terminate_workflow_execution` for Terminated). `WorkflowStatus` enum extended with `Cancelled`, `TimedOut`, `Terminated` variants. `record_workflow_terminal` added to `MetricsRecorder` trait as a no-op default (additive, no breaking change). Bridged in `metrics_rs_adapter` (`MetricsRsRecorder`). `BatchExecutorConfig` gains `metrics: Arc<dyn MetricsRecorder>` field (default `NoOpMetrics`). Suspended executor cycles never increment the counter. Workflow-failure-rate alert added to `docs/alerts/starter-pack-v0.1.0.json`. ADR-0001 §7 metric catalogue updated. **No new `WorkflowEvent` variant, no migration.**
+- **Phase 3.20** (implemented): Per-activity cross-retry wall-clock deadline (`schedule_to_close`) for SLA enforcement — see issue #378. `ActivityInfo.default_schedule_to_close: Option<Duration>` (`None` = unbounded, no regression for existing activities). `#[activity(schedule_to_close = "5m", start_to_close = "30s", retry = ...)]` parses cleanly (compile-time error if used on `local = true` activities). Migration `20260606000001_harvest_activity_schedule_to_close` adds `schedule_to_close_at TIMESTAMPTZ NULL` to `harvest_task_queue` with a partial index on `(schedule_to_close_at) WHERE state IN ('RUNNING', 'PENDING') AND schedule_to_close_at IS NOT NULL`. Worker sets `EnqueueParams::schedule_to_close_at = Some(Utc::now() + schedule_to_close)` at schedule time. Retry path: before calling `requeue_for_retry`, `schedule_to_close_deadline_exceeded(task, delay)` checks if `now + retry_delay >= deadline`; if so, `record_schedule_to_close_activity_timeout` appends `ActivityTimedOut { timeout_type: ScheduleToClose }` and fails the task instead of requeuing. Scanner: `TimeoutReason::ScheduleToClose` added to `find_timed_out_tasks`; `expected_task_states_for_timeout` returns `&["RUNNING", "PENDING"]` for this reason so both in-flight and queued-past-deadline tasks are caught. `TimeoutType::ScheduleToClose` already existed in `error.rs` — no new `WorkflowEvent` variant needed. Decision matrix documented in `docs/getting-started/07-reliability-knobs.md`. Integration tests in `tests/schedule_to_close_tests.rs`.
+- **Phase 3.23** (implemented): Operator pause/resume primitive for individual workflow executions — see issue #383. Two new append-only `WorkflowEvent` variants (`WorkflowExecutionPaused { paused_at, reason, actor }`, `WorkflowExecutionResumed { resumed_at, actor }`) added at the end of the enum; both are **non-terminal** and **transparent to replay** — `HistoryMatcher::new` pre-marks their indices consumed so every scan loop skips them, leaving the reconstructed command sequence unchanged (`tests/pause_tests.rs` verifies pause→timer→resume→fire replays deterministically). Pause is enforced at the **executor/claim layer**, not the workflow handler: `queue::claim_task` skips workflow tasks whose execution is `PAUSED`, so a parked task woken by a timer fire, signal arrival, or activity completion is deferred (stays PENDING) until resume — no workflow-author cooperation required, in-flight activities still run to completion. For the claimed-then-paused race, `worker::process_workflow_task` enforces pause **authoritatively at persist time**: it opens the persistence transaction with a `FOR UPDATE` row lock on the execution (mirroring `pause_workflow_execution`'s own lock, so the two serialize) and re-checks `PAUSED` *under that lock*. If the pause committed first, the pending decision is discarded (no events appended, no tasks enqueued) and the task is re-parked inside the same transaction so resume re-derives the same commands deterministically on replay; otherwise the pause blocks until the in-flight decision commits ("already-dispatched work runs to completion"). A non-locking re-check earlier in `process_workflow_task` remains as a fast-path optimization (bail before computing metrics/history-cap/cache) but is no longer the guarantee. Schedule-failure counters are deferred to after that transaction commits so a best-effort counter query can never roll back the persisted decision. `PAUSED` is a **non-terminal active state** everywhere active runs are enumerated: it is in `KNOWN_WORKFLOW_STATES` (so `GET /workflows?state=PAUSED` and batch filters work), counted in scheduler `max_active_runs` guards and selected by `CancelOther`/`TerminateOther`, and included in the default batch `Cancel`/`Signal` target set. `execution::pause_workflow_execution` (RUNNING→PAUSED, idempotent, 404/409) and `resume_workflow_execution` (PAUSED→RUNNING, wakes the parked task) plus the pure `pause_timeout_exceeded` helper and `auto_resume_expired_pauses` scanner (`WorkerConfig::max_workflow_pause_duration`, default **24h**; force-resumes with `actor = "auto-resume(timeout)"` via `spawn_pause_auto_resumer`). Cancellation beats pause: `cancel_workflow_execution` accepts `PAUSED` and clears the pending pause record. **Pause suspends the SLA clock** (interaction with #243): `enforce_workflow_execution_timeouts` scans `state = 'RUNNING'` only, so a paused execution never times out mid-pause, and `resume_workflow_execution` pushes `deadline_at` forward by the (clamped, non-negative) pause duration so paused wall-clock is not charged against the workflow's `execution_timeout`. Overlap/`max_active_runs` counters treat `PAUSED` as active everywhere — including the backfill (`query_running_count`) and Vantage manual-trigger counters, which count `state IN ('RUNNING','PAUSED')` to match the scheduler. Updates submitted while paused are rejected with the new `HarvestError::WorkflowPaused` (409) in `store::admit_update_event`; queries still serve. Management routes `POST /api/harvest/workflows/{id}/pause` and `/resume` (audit ops `OP_WORKFLOW_PAUSE`/`OP_WORKFLOW_RESUME`); Vantage UI Pause/Resume buttons (disabled when terminal). Metrics `harvest.workflow.paused` (counter) + `harvest.workflow.pause_duration` (histogram), ADR-0001 §7 catalogue updated. Migration `20260607000002_harvest_workflow_pause` adds nullable `paused_at`/`pause_reason`/`pause_actor` to `harvest_workflow_executions` with a partial index on `(paused_at) WHERE state = 'PAUSED'`. `ctx.is_paused()` is intentionally **not** exposed — pause is operator-only.
+- **Phase 3.22** (implemented): Deterministic side-effect primitives on `WorkflowContext` — see issue #384. New public methods `system_now() -> DateTime<Utc>` and `system_time_now() -> SystemTime` (per-call wall-clock captured at first execution; distinct from the pre-existing `now()` which returns the fixed `WorkflowStarted` start-time logical clock and is **unchanged** for backward + in-flight safety), `new_uuid() -> Uuid` (UUIDv7 idempotency keys), `random_u64()`/`random_f64()`/`random_range(range)` (sampling draws), plus the pre-existing `side_effect(name, f)` and `random_uuid(id)`. All of them lower onto a **single new** append-only `WorkflowEvent::SideEffectRecorded { kind: SideEffectKind, name: Option<String>, value }` variant (added at the end of the enum; `SideEffectKind` is a bounded enum `Now`/`Uuid`/`Random`/`Custom` with `as_str()` for OTel labels), so the event-schema cost is paid once forever. New internal `WorkflowCommand::RecordSideEffect` (bookkeeping, persisted by the worker exactly like `RecordMarker`). `HistoryMatcher::match_side_effect_event(kind, name)` matches them in command (cursor) order and surfaces drift as `HistoryMatch::Diverged`; `match_side_effect(id)` delegates to it and remains **backward-compatible** with pre-#384 executions that recorded `side_effect` as `MarkerRecorded { name: "side_effect:{id}" }`. The infallible built-ins (`system_now`/`new_uuid`/`random_*`) return plain values, so on a replay divergence they record a deferred non-determinism error (`WorkflowContext::take_deferred_nd_error`) that the executor converts to `WorkflowFailed`; `WorkflowReplayer` classifies it as the new `NonDeterminismKind::SideEffectDrift`. Guardrails HVG001/HVG002 now recommend these primitives by name. Deps: `uuid` gains the `v7` feature, new `rand` workspace dep. **No DB migration** (the variant is opaque JSON in `harvest_events`), no change to the adjacently-tagged event JSON contract, no macro-path change. Example: `autumn-harvest/examples/deterministic_primitives.rs`. Tests: unit tests in `event.rs`/`context.rs`/`replay.rs`, replayer drift tests in `tests/replayer_tests.rs`.
+- **Phase 3.24** (implemented): Signal-or-deadline waits for human-in-the-loop flows — see issue #476. `WorkflowContext::receive_signal_timeout::<O>(signal_name, timeout) -> HarvestResult<Option<O>>` and untyped sibling `wait_for_signal_timeout(signal_name, timeout) -> HarvestResult<Option<Value>>` resolve to `Some(payload)` when the signal arrives before the deadline and `None` when the durable timer fires first. **No new `WorkflowEvent` variant, no migration** — the race composes the existing `TimerStarted`/`TimerFired` + `SignalReceived` events; the winner is decided by recorded-history order via the new `HistoryMatcher::match_signal_or_timer` (returns the new `SignalOrTimerMatch` enum, exported from `lib.rs`). Timer-win never consumes a late signal (it stays observable for a later `receive_signal*`); signal-win transparently consumes the stray `TimerFired` from the still-armed durable timer. Deterministic race timer IDs `__signal_timeout:{seq}:{signal_name}` from a per-context `signal_timeout_seq` counter; live path suspends with the already-supported `StartTimer` + `WaitForSignal` mixed batch (timer row deduped by `timer_id` on re-park). `WorkflowTestEnv` exercises both branches deterministically without sleeping (`queue_signal` → signal branch; omitted → auto-fired timer). Workflow-author-side only: no client/typed-stub change, no HTTP route. Example `examples/approval_with_timeout.rs`. Tests: matcher unit tests in `replay.rs`, context tests in `context.rs`, harness tests in `tests/workflow_test_env_tests.rs`, replayer fixtures (incl. 1,000 randomized-ordering replays) in `tests/replayer_tests.rs`.
+- **Phase 3.25** (implemented): Atomic start-or-attach + update (`update_with_start`) for entity-workflow patterns — see issue #479. `update_with_start_workflow_execution` applies the same start-or-attach reuse-policy matrix as `signal_with_start_workflow_execution` (issue #244) but admits exactly one update in the same shard-local transaction. **No new `WorkflowEvent` variant, no migration** — reuses the existing `UpdateAdmitted`/`UpdateCompleted`/`UpdateFailed` variants. `UpdateWithStartParams<'a>` mirrors `SignalWithStartParams` with update-specific fields (`update_id: UpdateId`, `update_name: String`, `update_args: Value`); `UpdateWithStartOutcome` reports `exec_id`, `workflow_name`, `workflow_id`, `state`, `started_fresh: bool`, `update_id: UpdateId`, `update_admitted: bool`. Idempotency deduplication is scoped to `(workflow_name, workflow_id)` via the `idempotency_key` field — a retry carrying the same key returns the cached outcome without re-admitting. PAUSED executions are rejected with `HarvestError::WorkflowPaused` (409); the entire transaction rolls back so no orphan `WorkflowStarted` event is appended on rejection. Validator runs at admission time inside the outer transaction; a rejected validator also rolls back the start. `TypedUpdateWithStartOptions` in `handle_typed.rs` provides the options struct for the generated typed stub method. `#[update(workflow = "name")]` macro generates `update_with_start_{fn_name}` on the stub type (sibling to the existing `signal_with_start` method). HTTP route `POST /api/harvest/workflows/{workflow_name}/update-with-start` → `201 Created` (fresh start) or `200 OK` (attached); `409 Conflict` on `RejectDuplicate`; `422` on validator rejection. Audit op `OP_WORKFLOW_UPDATE_WITH_START = "workflow.update_with_start"`. Example `examples/update_with_start_cart.rs` (cart entity-workflow: first `add_item` creates the cart; subsequent calls attach). Tests: `tests/update_with_start_tests.rs` (struct-level + DB integration). Outcome matrix (same as signal-with-start except PAUSED always rejects): Prior `RUNNING`/`SUSPENDED` + `AllowDuplicate` → admit to existing; + `RejectDuplicate` → `Err(AlreadyExists)`; + `TerminateIfRunning` → cancel + start fresh + admit. Terminal prior (`COMPLETED`/`FAILED`/`CANCELLED`) + `AllowDuplicate` or `AllowDuplicateFailedOnly` → start fresh + admit. Prior `TERMINATED` → start fresh + admit for all policies (sealed state released from uniqueness index). Prior `PAUSED` → `Err(WorkflowPaused)` for all policies.
+- **Phase 3.26** (implemented): Bounded schedule catchup window — see issue #484. New `CatchupPolicy` enum (`SkipAll`, `MostRecent`, `Window(Duration)`, `Unbounded`) in `policy.rs` controls post-downtime catchup behavior. `from_db(mode, window_secs, catchup_bool)` resolves the effective policy, with `NULL`/unknown modes falling back to the legacy `catchup` bool (zero-backfill migration, identical behavior for existing rows). `WorkflowSchedule` gains `catchup_policy: Option<CatchupPolicy>`, plus builder methods `with_catchup_policy` and `with_catchup_window`. New `catchup_run_plan` function in `scheduler.rs` replaces the direct `due_run_plan` call: `MostRecent` keeps only the last slot, `Window(w)` keeps slots within `now - w`, both record a `dropped` count. Drops are emitted on the `harvest.schedule.skipped` counter with reason `catchup_window_exceeded` and written to a single `record_decision_graceful` audit row. `last_catchup_dropped` / `last_catchup_at` columns on `harvest_schedules` persist the drop count from the most recent recovery tick. `GET /admin/schedules` surfaces four new fields: `catchup_policy_effective`, `catchup_window_secs`, `catchup_dropped_last_recovery`, `last_catchup_at`. Migration `20260613000001_harvest_schedule_catchup_window` adds the four columns with DB-level defaults. **No new `WorkflowEvent` variant, no migration backfill required.** Tests: pure unit tests in `policy.rs` and `scheduler.rs`; DB integration tests in `tests/scheduler_catchup_tests.rs`.
+- **Phase 3.27** (implemented): External workflow cancel primitive — see issue #492. `ctx.request_cancel_external_workflow(target: ExecutionId) -> HarvestResult<()>` lets a running workflow durably cancel an arbitrary sibling workflow by `ExecutionId`. Three new append-only `WorkflowEvent` variants at the end of the enum: `ExternalCancelRequested { cancel_id: ExternalCancelId, target }`, `ExternalCancelDelivered { cancel_id }`, `ExternalCancelFailed { cancel_id, reason_code: String }`. New `ExternalCancelId(Uuid)` newtype (exact clone of `ExternalSignalId`, re-exported from `lib.rs`). New `HarvestError::ExternalCancelFailed { cancel_id, target, reason_code }`. **Key semantic differences from `signal_external_workflow`:** (1) already-terminal target = **no-op success** (`ExternalCancelDelivered`), NOT a failure — the goal (target not running) is already met; (2) only `target_unknown` after the grace window resolves as `ExternalCancelFailed`; (3) **self-cancel** (`target == own ExecutionId`) is rejected immediately with `reason_code = "self_cancel"`; (4) no payload field. `HistoryMatcher::match_external_cancel(target)` added with `StashedExternalCancel` stash and `HistoryMatch::ExternalCancelInProgress`/`ExternalCancelFailed` variants; all ~8 existing scan loops updated to stash cancel events transparently. `WorkflowCommand::RequestCancelExternalWorkflow` dispatched through the worker's generalized `SignalBatchItem::Cancel(CancelExternalWorkflowRun)` variant: same-shard delivery calls `execution::cancel_workflow_execution` (already-terminal → Delivered); cross-shard leaves for `enforce_external_cancels_outbox` in `timeout.rs` (mirrors `enforce_external_signals_outbox`). `record_external_cancel_sent` no-op metric on `MetricsRecorder`. **No DB migration** (events are opaque JSON in `harvest_events`). `WorkflowContext::new_test()` harness covers the cancel path via `testing.rs`. Integration tests in `tests/cross_workflow_cancel_tests.rs` (same-shard live cancel, already-terminal no-op, grace-window unknown, cross-shard outbox). Example: `examples/cancel_external_workflow.rs` (fraud-review supervisor aborts in-flight fulfillment). `ExternalCancelId` and `ExternalSignalId` both re-exported from `autumn_harvest::types` via `lib.rs`. Event enum now has 41 variants. **Shared external-primitive hardening (applies to both `signal_external_workflow` and the cancel primitive):** the inline persist path (`persist_external_signal_inline`) wraps each batch's request + delivery + terminal appends in a single transaction so a concurrent outbox sweep never observes a half-written `*Requested` event without its terminal (no double-append at a stale `next_event_id`); and the outbox scanners (`enforce_external_signals_outbox`/`enforce_external_cancels_outbox`) attempt delivery *before* the grace window converts a result to `target_unknown` — only a `NotFound` delivery attempt past the grace window becomes a permanent failure, so a target that starts slightly late (or is first seen after worker downtime) is still reached. Because the inline/outbox cancel now runs the target cancellation inside that outer transaction, it uses `execution::cancel_workflow_execution_collect` (the no-spawn variant) and spawns the target's completion-trigger / parent-close-cascade follow-up starts (and records the terminal metric) **only after the outer transaction commits**, so a rollback never leaves trigger workflows started for a cancellation that did not become durable. Finally, the shared `persist_signal_wait_park` re-checks recorded history for a resolved external terminal after parking (mirroring its pending-signal self-wake), so a caller whose cross-shard/`NotFound` request the outbox resolves during the park gap is woken rather than left parked until an unrelated event.
+- **Phase 3.28** (implemented): Soft workflow SLA breach signal for slow-but-healthy runs — see issue #487. A non-fatal companion to `execution_timeout` (#243): a workflow author declares an expected duration (`#[workflow(sla = "2h")]` → `WorkflowInfo::sla: Option<Duration>`) and a scanner emits the `harvest.workflow.sla_breached{workflow, queue}` counter (`METRIC_WORKFLOW_SLA_BREACHED`) **exactly once** when the run exceeds it — **without ever altering the run's lifecycle**. A breaching run that later succeeds still reaches `COMPLETED` normally. **No new `WorkflowEvent` variant, zero `harvest_events` footprint, replay-neutral** (like query handlers). Start-time override via `StartWorkflowParams.sla` (HTTP `sla_secs` on `POST /workflows/{name}/start`), falling back to the `WorkflowInfo` default. The declared default is resolved on **every** start path — plain start, signal-with-start, update-with-start, batch start, schedule tick/backfill, manual UI trigger, outbox, webhook delivery, completion-trigger (via `GLOBAL_WORKFLOW_METADATA`/`WorkflowMetadata.sla` and `DeferredTriggerStart.sla`), and spawned child workflows (`worker.rs` resolves the child's `WorkflowInfo.sla` and stamps `sla_deadline_at` inline). DAG start paths carry no SLA (the `#[dag]` macro has no `sla` attribute). Persisted on `harvest_workflow_executions` as four nullable/defaulted columns: `sla INTERVAL`, `sla_deadline_at TIMESTAMPTZ` (= `started_at + effective_sla`, NULL when no SLA), `sla_breached BOOLEAN NOT NULL DEFAULT FALSE`, `sla_breached_at TIMESTAMPTZ`, with a partial index on `(sla_deadline_at) WHERE sla_deadline_at IS NOT NULL AND sla_breached = FALSE AND state <> 'PAUSED' AND (completed_at IS NULL OR completed_at > sla_deadline_at)` (the `completed_at` clause keeps on-time terminal rows out of the index so it doesn't accumulate every SLA-bearing completed run). `timeout::enforce_workflow_sla_breaches` is an observation-only atomic Diesel `UPDATE ... SET sla_breached = true, sla_breached_at = NOW() WHERE state <> 'PAUSED' AND sla_deadline_at IS NOT NULL AND sla_breached = false AND sla_deadline_at < COALESCE(completed_at, NOW()) RETURNING (id, workflow_name, queue_name)`; the `sla_breached = false` guard makes it **exactly-once** across repeated scans, restarts, and multi-replica deployments. **The scanner is terminal-inclusive**: it compares `sla_deadline_at` against `COALESCE(completed_at, NOW())`, so RUNNING rows are judged against the current time and already-terminal rows (COMPLETED/FAILED/CANCELLED/TIMED_OUT/TERMINATED/CONTINUED_AS_NEW) against their actual `completed_at`. This means (a) a run that finished *before* its deadline is never a false-positive breach, and (b) a run that crossed its deadline and then went terminal within one scan interval is still caught after the fact — covering completion, failure, cancel, terminate, timeout, and continue-as-new uniformly with no per-terminal-path marker (and avoiding the metrics-availability problem, since the scanner always owns its recorder). `PAUSED` is excluded so a parked run never breaches mid-pause; `SUSPENDED` is not a persisted state (the state CHECK constraint forbids it). It is folded into `enforce_timeouts_once` **before** `enforce_workflow_execution_timeouts`, reusing the existing shard/pool/poll-interval/telemetry wiring, and never touches `state`, `harvest_events`, or the task queue. A non-positive SLA budget (`<= 0`) is treated as "no SLA" at start; an out-of-range/overflowing duration maps to "no SLA" rather than an immediate breach. **Clamp rule:** when `sla > execution_timeout`, `sla` is clamped down to `execution_timeout` at start (the hard timeout would kill the run first, so a later soft signal could never fire); the clamp is resolved at every registry-aware start path (the plain HTTP start plus signal-with-start, update-with-start, batch, manual-trigger, backfill, and the Vantage UI trigger, via `clamp_info_default_sla`). Continue-as-new (`worker.rs`) and reset (`reset.rs`) re-anchor a fresh `sla_deadline_at` per run; pause suspends the SLA clock — resume pushes `sla_deadline_at` forward by the pause span (mirroring `deadline_at`), but **only for a deadline still ahead when the pause began**: a deadline already elapsed before the pause stays in the past so the breach is still observed by the scanner after resume rather than being pushed into the future. Observable via management API (`sla_deadline_at`, `sla_breached`, `sla_breached_at` on the execution record) and filterable with `GET /workflows?sla_breached=true` (`WorkflowFilters.sla_breached`, applied on both the standard and stalled-workflow loaders). `record_workflow_sla_breach` added to `MetricsRecorder` as a no-op default (additive), bridged in `metrics_rs_adapter`. Migration `20260613000000_harvest_workflow_sla`. Out of scope (per issue): hard termination, stalled-run detection (#486), per-activity SLAs, auto-remediation, dedicated Vantage UI page.
+- **Phase 3.29** (implemented): Last-completion-result carryover for incremental scheduled jobs — see issue #488. Two new `WorkflowContext` accessors: `last_completion_result::<T>() -> HarvestResult<Option<T>>` (deserialized output of the most recent prior COMPLETED run of the same schedule) and `last_error() -> Option<String>` (error of the most recent terminal run if it ended FAILED/TIMED_OUT, `None` when it recovered). Both values are **resolved once at workflow-start time inside the start transaction** and **frozen into two additive `#[serde(default, skip_serializing_if = "Option::is_none")]` fields on the existing `WorkflowStarted` event** — pre-upgrade JSON deserializes to `None`, no new `WorkflowEvent` variant, append-only invariant preserved. `schedule_id UUID NULL` + `scheduled_for TIMESTAMPTZ NULL` columns added to `harvest_workflow_executions` with a partial covering index on `(schedule_id, scheduled_for DESC) WHERE schedule_id IS NOT NULL AND completed_at IS NOT NULL` (migration `20260616000001_harvest_workflow_schedule_id`). `scheduled_for` is the **logical schedule slot** the run fires for; carryover is selected by **previous logical slot** (`scheduled_for < current slot`, ordered `scheduled_for DESC`), NOT completion time, so overlapping / catch-up / backfilled fires that finish out of slot order can't roll an incremental cursor backward (and a backfill of an *older* slot sees the cursor as of its own slot, never a future fire's output); when the current run carries no slot, no carryover is resolved. Scheduler dispatch (incl. the backfill runner) sets `schedule_id: Some(schedule.id)` and `scheduled_for: Some(slot)` (the same slot encoded in the `sched:` workflow_id) so backfilled runs share the schedule's carryover lineage; all other `StartWorkflowParams` sites set both to `None`. `OverlapPolicy::Skip` never reaches the start path, so skipped fires cannot advance carryover. Manual starts see `None` for both accessors. `continue_as_new` preserves carryover across the fork by **copying the predecessor's frozen `last_completion_result`/`last_error` forward** (threaded through `WorkflowTaskPersistence`, sourced from the already-decoded replay history so it is codec-safe) and keeps the predecessor's `scheduled_for` — the continuation is the same logical run and must not re-resolve. **Reset forks set `schedule_id: None`** (operator interventions are deliberately excluded from scheduled carryover so resetting an old slot cannot roll a later run's cursor backward). The migration backfills `schedule_id` and `scheduled_for` for already-fired scheduled rows by parsing the `sched:{uuid}:{name}:{slot}` workflow_id (regex-guarded `::uuid` / `to_timestamp(...::double precision)` casts) so the first post-upgrade fire still sees prior output in the right order. Two shard-local Diesel queries in `resolve_carryover` (slot-ordered, both bounded `scheduled_for < current slot`) run inside the same connection transaction as the start: one for `COMPLETED` output (`.eq("COMPLETED")`), one for the most-recent terminal across **all** terminal states (`.eq_any(["COMPLETED","FAILED","TIMED_OUT","CANCELLED","TERMINATED"])`, error surfaced only for FAILED/TIMED_OUT so a later cancellation masks an older failure) — so after `completed → failed` the result reflects the old completed output while error reflects the recent failure. The frozen `last_completion_result` is added to the payload-codec key set (`PayloadCodecs::transform_event_data`) and the redacted-history allowlist (`history_export::is_payload_field`) so a configured codec encrypts/redacts the carried-over output copy. `WorkflowTestEnv::with_last_completion_result<T>()` and `with_last_error(String)` fluent builder methods for no-DB unit testing. `WorkflowDetailsResponse` in the plugin API exposes `last_completion_result` and `last_error` convenience fields surfaced from `history[0]`. Example `autumn-harvest/examples/incremental_etl_schedule.rs`. Docs `docs/getting-started/08-dags-and-schedules.md` — "Incremental scheduled jobs" section. Tests: 4 unit tests in `tests/workflow_test_env_tests.rs` (`test_last_completion_result_none_on_first_run`, `test_last_completion_result_seeded_value`, `test_last_error_seeded_value`, `test_last_completion_result_replays_deterministically`); integration test file `tests/scheduler_carryover_tests.rs` (testcontainers, 4 scenarios).
+- **Phase 4** (next): production hardening -- sharding, observability, metrics, dashboard (Vantage UI — Workers tab shipped in issue #142; DLQ, schedules, and DAG visualization pages remain); Step 5 of issue #256 (remove classic DAG executor, drop `harvest_dag_runs`). Note: the cancellation primitive and `Saga` both ship; their interaction semantics, idempotency contract, and replay-determinism contract are documented in `docs/saga.md` and locked in by three integration tests in `tests/saga_tests.rs` (issue #238).
 
 ---
 
@@ -90,6 +117,22 @@ pub fn __autumn_activity_info_{name}() -> ::autumn_harvest::ActivityInfo
 `workflows![name1, name2]` expands to `vec![__autumn_workflow_info_name1(), __autumn_workflow_info_name2()]`.
 
 `activities![name1, name2]` expands to `vec![__autumn_activity_info_name1(), __autumn_activity_info_name2()]`.
+
+`#[query(workflow = "name")]` generates:
+
+```
+pub fn __autumn_query_handler_info_{name}() -> ::autumn_harvest::QueryHandlerInfo
+```
+
+`#[update(workflow = "name")]` generates:
+
+```
+pub fn __autumn_update_handler_info_{name}() -> ::autumn_harvest::UpdateHandlerInfo
+```
+
+`queries![name1, name2]` expands to `vec![__autumn_query_handler_info_name1(), __autumn_query_handler_info_name2()]`.
+
+`updates![name1, name2]` expands to `vec![__autumn_update_handler_info_name1(), __autumn_update_handler_info_name2()]`.
 
 ### Key Design Decisions
 
@@ -154,14 +197,15 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `types.rs` | 1 | Newtypes: `WorkflowId` (String), `ExecutionId` (Uuid v4), `ActivityExecId` (Uuid v4), `TimerId` (String), `WorkerId` (String) |
 | `error.rs` | 1 | `HarvestError` (thiserror), `HarvestResult<T>`, `TimeoutType` enum |
 | `policy.rs` | 1 | `RetryPolicy`, `TriggerRule`, `Schedule`, `TaskStatus`, `compute_retry_delay` |
-| `event.rs` | 1 | `WorkflowEvent` enum (28 variants, adjacently-tagged serde), `type_name()`. Variants added in issue #140: `UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed` |
+| `event.rs` | 1 | `WorkflowEvent` enum (41 variants, adjacently-tagged serde), `type_name()`. Variants added in issue #140: `UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed`. `SideEffectRecorded` + bounded `SideEffectKind` enum added in issue #384 (deterministic primitives). `ExternalCancelRequested`, `ExternalCancelDelivered`, `ExternalCancelFailed` added in issue #492 |
+| `event.rs` | 1 | `WorkflowEvent` enum (35 variants, adjacently-tagged serde), `type_name()`. Variants added in issue #140: `UpdateAdmitted`, `UpdateCompleted`, `UpdateFailed`. `SideEffectRecorded` + bounded `SideEffectKind` enum added in issue #384 (deterministic primitives). `WorkflowStarted` gains two additive optional fields in issue #488: `last_completion_result: Option<serde_json::Value>` and `last_error: Option<String>` (both `#[serde(default, skip_serializing_if = "Option::is_none")]`, frozen at schedule-fire time). |
 | `context.rs` | 1+2 | `WorkflowContext` (replay, suspension, version gate, timers), `ActivityContext` (heartbeat channel, cancellation) |
 | `info.rs` | 1 | `WorkflowInfo`, `ActivityInfo`, `WorkflowHandlerFn`, `ActivityHandlerFn` type aliases |
 | `builder.rs` | 1 | `HarvestBuilder` (fluent), `WorkerConfig` (queues, concurrency, timeouts) |
 | `prelude.rs` | 1 | Core glob re-export surface including macros |
 | `schema.rs` | 1 | Diesel `table!` macros -- 11 tables (includes `harvest_build_policies`, `harvest_build_compat`) |
 | `models.rs` | 1 | `Queryable`/`Selectable` read structs and `Insertable` `New*` write structs for all 11 tables |
-| `store.rs` | 2 | Event store and read helpers: `append_events`, `load_history`, `events_to_rows` with sequential event IDs, `load_workflow_children` for parent -> child operator queries |
+| `store.rs` | 2 | Event store and read helpers: `append_events`, `load_history`, `load_history_since` (delta load for cache-hit path, issue #235), `events_to_rows` with sequential event IDs, `load_workflow_children` for parent -> child operator queries |
 | `replay.rs` | 2 | Deterministic replay engine: `HistoryMatcher` walks event history, detects non-determinism |
 | `executor.rs` | 2 | Workflow executor: `run_workflow` drives replay + live execution, handles suspension |
 | `queue.rs` | 2 | Postgres task queue: `enqueue`, `claim` (FOR UPDATE SKIP LOCKED), `complete`, `fail` |
@@ -169,24 +213,29 @@ Current implementation scope: `ExecutionId`/`ShardId` encoding, `ShardRouter`, `
 | `worker.rs` | 2 | Worker runtime: poll loop, semaphore-bounded concurrent dispatch, graceful shutdown |
 | `workers.rs` | 4 | Worker fleet registry: `register_worker`, `heartbeat_worker`, `transition_status`, `list_workers`, `get_worker`, `fleet_health`, `spawn_worker_heartbeat` |
 | `heartbeat.rs` | 2 | Batched heartbeat flusher: debounced channel receiver, last-write-wins timestamp + checkpoint payload DB update |
-| `timeout.rs` | 2 | Timeout enforcement scanner: start-to-close, schedule-to-start, heartbeat timeout queries |
-| `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction |
+| `timeout.rs` | 2 | Timeout enforcement scanner: start-to-close, schedule-to-start, heartbeat timeout queries, and workflow execution timeouts (`enforce_workflow_execution_timeouts`, issue #243) |
+| `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction. `CachedWorkflowState` holds `events: Vec<WorkflowEvent>` + `next_event_id: i32` for delta-load support (issue #235). |
 | `dlq.rs` | 2 | Dead letter queue: `DeadLetterEntry` builder, move-to-DLQ on retry exhaustion |
 | `pool.rs` | 2 | Separate DB pool config: web pool + worker pool with shared ceiling, minimum guarantees |
 | `update.rs` | 3.6 | Update primitive: `UpdateRegistry` (type-erased validators + async handlers), `BoxUpdateHandler`, `BoxUpdateValidator`. `WorkflowContext` methods: `register_update_handler`, `register_update_handler_no_validator`, `validate_update`, `execute_admitted_update`. `HistoryMatcher` methods: `match_update(update_id)`, `drain_admitted_updates()`. Error variants: `HarvestError::UpdateRejected`, `HarvestError::UpdateHandlerNotFound` |
+| `query.rs` | 3.10 | Query registry: `QueryRegistry`, `QueryHandler`. `WorkflowContext` methods: `register_query` (no-arg), `register_query_handler<Req,Resp>` (typed), `execute_query_with_args`, `list_query_names`. Error variants: `QueryHandlerNotFound`, `WorkflowNotRunning`, `QueryHandlerPanicked`, `QueryTimedOut`. `WorkerConfig::query_timeout` (default 5 s). `telemetry::METRIC_QUERY_DURATION` constant. No `WorkflowEvent` variants — queries leave zero footprint in `harvest_events`. |
 | `build_routing.rs` | 3.7 | Worker build-id routing: `BuildCompatibilitySet` (in-memory eligibility checker), `BuildPolicy`, `BuildCompatEntry`, `BuildReachability`. DB functions: `set_build_policy`, `get_build_policy`, `list_build_policies`, `declare_compat`, `revoke_compat`, `load_compat_set`, `build_reachability`, `all_build_reachability`, `all_build_reachability_sharded` (cross-shard fan-out), `merge_reachability`. New newtypes in `types.rs`: `BuildId`, `DeploymentName`. See `docs/runbooks/safe-deploy.md` for the operator deploy playbook. |
-| `telemetry.rs` | 4 | OpenTelemetry surface: `TraceContextCarrier`, `TraceContextPropagator`, `MetricsRecorder`, `TelemetryConfig` — no-op by default, opt-in via `HarvestBuilder::telemetry`. Implements all 8 ADR-0001 span kinds (issue #136); see `docs/adr/0001-otel-trace-contract.md` for the full attribute schema and propagation rules. Metric catalogue (ADR-0001 §7): `harvest.workflow.started` (counter, `worker.rs`), `harvest.workflow.duration` (histogram, `worker.rs`), `harvest.activity.duration` (histogram, `worker.rs`), `harvest.timer.started` (counter, `worker.rs`), `harvest.queue.depth` (gauge, `worker.rs` sampler), `harvest.dlq.entries` (gauge, `worker.rs` sampler), `harvest.schedule.runs` (counter, `scheduler.rs`), `harvest.schedule.skipped` (counter, `scheduler.rs`), `harvest.retention.deleted` (counter, `retention.rs`). Cardinality rule: `execution.id` is span-only; `MetricsRecorder` API enforces this by construction. |
+| `telemetry.rs` | 4 | OpenTelemetry surface: `TraceContextCarrier`, `TraceContextPropagator`, `MetricsRecorder`, `TelemetryConfig` — no-op by default, opt-in via `HarvestBuilder::telemetry`. Implements all 8 ADR-0001 span kinds (issue #136); see `docs/adr/0001-otel-trace-contract.md` for the full attribute schema and propagation rules. Metric catalogue (ADR-0001 §7): `harvest.workflow.started` (counter, `worker.rs`), `harvest.workflow.duration` (histogram, `worker.rs`), `harvest.workflow.terminal` (counter, `worker.rs`/`timeout.rs`/`execution.rs`, issue #519, labels: `workflow.name`, `queue`, `outcome` — 6 bounded values: completed/failed/cancelled/timed_out/terminated/continued_as_new), `harvest.activity.duration` (histogram, `worker.rs`), `harvest.timer.started` (counter, `worker.rs`), `harvest.queue.depth` (gauge, `worker.rs` sampler), `harvest.dlq.entries` (gauge, `worker.rs` sampler), `harvest.schedule.runs` (counter, `scheduler.rs`), `harvest.schedule.skipped` (counter, `scheduler.rs`), `harvest.retention.deleted` (counter, `retention.rs`), `harvest.workflow.cache_hit` (counter, `worker.rs`, issue #235), `harvest.workflow.cache_miss` (counter, `worker.rs`, issue #235), `harvest.workflow.timeout` (counter, `timeout.rs`, issue #243), `harvest.workflow.sla_breached` (counter, `timeout.rs`, issue #487, labels: `workflow`, `queue`; observation-only, emitted exactly once per run on soft-SLA breach), `harvest.schedule.fire_attempts` (counter, `scheduler.rs`, issue #350, labels: `schedule`, `outcome`), `harvest.task.quarantined` (counter, `poison_pill.rs`, issue #367, labels: `queue`, `reason`), `harvest.activity.circuit.tripped` (counter, `worker.rs`, issue #369, label: `activity.name`), `harvest.activity.circuit.closed` (counter, `circuit_breaker.rs`, issue #369, label: `activity.name`). Cardinality rule: `execution.id` is span-only; `MetricsRecorder` API enforces this by construction. |
+| `concurrency.rs` | 3.13 | Per-key concurrency limits (issue #247): `ConcurrencyPolicy { key_expr, limit }` attached to `WorkflowInfo`; `resolve_concurrency_key(expr, input)` resolves a dot-notation field path against the JSON input at workflow-start time. Limits enforced within a shard via the existing `concurrency_key`/`concurrency_cap` claim-query path. See `docs/sharding.md` for the cross-shard scope contract. |
 | `metrics_rs_adapter.rs` | 4 | `metrics-rs` feature flag adapter: `MetricsRsRecorder` bridges `MetricsRecorder` → `metrics` crate global registry. See `docs/telemetry.md` for recipe. |
+| `poison_pill.rs` | 3.17 | Poison-pill task quarantine (issue #367): pure `quarantine_decision`/`ReclaimAction` (no DB dep), `orphaned_running_tasks_query` (worker-liveness reclaim, independent of per-task timeouts), `reclaim_orphaned_tasks` (increment `crash_strikes`, requeue-or-quarantine), `spawn_poison_pill_reclaimer`. Quarantine → `harvest_dead_letters` with `DeadLetterReason::PoisonPill` + terminal `WorkflowFailed` (no new event variant). `WorkerConfig::poison_pill_threshold` (default 3, 0 disables). Shard-local. |
+| `circuit_breaker.rs` | 3.18 | Per-activity circuit breaker (issue #369): `CircuitBreakerRegistry` (closed/open/half-open, rolling-window failure count, single half-open probe, `on_dispatch`/`on_result`, `force_open`/`force_close`, `snapshot`/`list`), `CircuitPhase`, `DispatchDecision`, `CircuitTransition`, `CircuitSnapshot`. Pure/in-process, per-shard; consulted by the worker before dispatch and shared with the management API via `HandlerRegistry::circuit_breakers()`. No new event variant, no migration. |
 | `migrations/` | 1 | SQL -- run with `diesel migration run` |
 
 ### Macro Modules (`autumn-harvest-macros`)
 
 | File | Purpose |
 |------|---------|
-| `lib.rs` | Entry points: `#[workflow]`, `#[activity]`, `workflows![]`, `activities![]` |
+| `lib.rs` | Entry points: `#[workflow]`, `#[activity]`, `#[query]`, `workflows![]`, `activities![]` |
 | `workflow.rs` | `workflow_macro` — emits user fn + companion `WorkflowInfo` fn |
 | `activity.rs` | `activity_macro` — parses `retry`, `start_to_close`, `heartbeat_timeout`, `schedule_to_start`, `queue` attrs; emits user fn + companion `ActivityInfo` fn |
 | `collect.rs` | `workflows_macro` / `activities_macro` — expand to `vec![companion_calls...]` |
+| `query.rs` | `query_macro` — pass-through attribute that validates the annotated item is a function; used for documentation and future typed query discovery |
 
 ---
 
@@ -228,6 +277,254 @@ Duration strings: `"30s"`, `"5m"`, `"1h"`. Parsed via Harvest core's local `task
 
 `#[workflow]` takes no attributes in Phase 1.
 
+### Embedder Primitives — SignalWithStart (issue #244)
+
+`signal_with_start_workflow_execution` is the atomic *start-or-attach + signal*
+primitive built for webhook receivers and idempotent event-driven flows. It
+collapses the racy fetch-then-start-then-signal trio into one shard-local
+transaction. The same primitive is exposed over HTTP as
+`POST /api/harvest/workflows/{workflow_name}/signal-with-start`.
+
+**Outcome matrix** — `reuse_policy` × prior execution state:
+
+| Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
+|-------------|------------------|-------------------|---------------------------|----------------------|
+| none | start + signal | start + signal | start + signal | start + signal |
+| RUNNING / SUSPENDED | signal existing | `Err(AlreadyExists)` | signal existing | cancel + start + signal |
+| COMPLETED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| FAILED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| CANCELLED | start fresh + signal | `Err(AlreadyExists)` | start fresh + signal | start fresh + signal |
+| TERMINATED | start fresh + signal | start fresh + signal | start fresh + signal | start fresh + signal |
+
+For terminal priors, `AllowDuplicate` and `AllowDuplicateFailedOnly` diverge
+from the standalone `start_or_load_workflow_execution` semantics (which return
+the existing terminal run): signal-with-start escalates internally to a
+fresh start so the spec's "no signal silently dropped" invariant holds.
+
+`TERMINATED` is the *sealed* state set by the reset path: the row is released
+from the partial unique index, so `RejectDuplicate` no longer treats it as a
+duplicate. The reset operator explicitly opted the prior row out of the
+uniqueness scope, matching the broader `start_or_load_workflow_execution`
+semantics.
+
+**Idempotency dedupe is scoped to the logical workflow**, not the
+`workflow_exec_id`. A webhook retry carrying the same `idempotency_key` that
+arrives after the original execution has reached a terminal state will be
+recognised as a duplicate and short-circuited: no fresh execution is started
+and no second signal is queued, even though the fresh-start escalation would
+otherwise create a new `exec_id`. The dedupe joins `harvest_signals` to
+`harvest_workflow_executions` so the per-shard partial unique index
+(`workflow_exec_id, idempotency_key`) is augmented with a
+`(workflow_name, workflow_id)` scope.
+
+`SignalWithStartOutcome.started_fresh` distinguishes a freshly inserted run
+from one attached to an existing live execution; `signal_delivered` reports
+whether the signal row was actually queued (it is `false` when the prior
+execution is terminal or the `idempotency_key` matched a row that was
+already enqueued).
+
+**Event ordering.** On fresh start the call appends only `WorkflowStarted` in
+this transaction; the signal is staged as a `harvest_signals` row that the
+worker's existing `ingest_pending_signals` path promotes to `SignalReceived`
+*before* the workflow function is first dispatched. No new `WorkflowEvent`
+variant is introduced — the issue's append-only invariant is preserved by
+construction.
+
+**Idempotency key.** `idempotency_key: Option<String>` is backed by a partial
+unique index on `harvest_signals (workflow_exec_id, idempotency_key) WHERE
+idempotency_key IS NOT NULL`. Two webhook deliveries carrying the same key
+produce exactly one `SignalReceived` event.
+
+HTTP route:
+- `POST /api/harvest/workflows/{workflow_name}/signal-with-start` with body
+  `{ workflow_id, start_input, signal_name, signal_payload, id_reuse_policy?, idempotency_key?, queue?, memo?, search_attrs?, execution_timeout_secs? }`
+  → `201 Created` (fresh start) or `200 OK` (attached) with response
+  `{ execution_id, workflow_name, workflow_id, state, started_fresh, signal_delivered }`.
+- `409 Conflict` when `id_reuse_policy = reject_duplicate` rejects an
+  existing execution.
+
+See `examples/signal_with_start_webhook.rs` for a worked Stripe webhook
+example.
+
+### Typed Dispatch
+
+Use the companion functions generated by `#[workflow]` and `#[activity]` instead of raw string names when dispatching from within a workflow. The companion name is `{fn_name}_info()` (the public alias for the hidden `__autumn_{workflow|activity}_info_{name}()` function).
+
+| Raw (string-based)                                            | Typed (info-based)                                           |
+|---------------------------------------------------------------|--------------------------------------------------------------|
+| `ctx.execute_activity_raw("send_email", json!(...), "q")`    | `ctx.execute_activity(&send_email_info(), input).await?`     |
+| `ctx.execute_activity_raw_with_opts("send_email", ..., "q")` | `ctx.execute_activity_with_opts(&send_email_info(), input, queue_override, retry, timeout).await?` |
+| `ctx.execute_local_activity_raw("checksum", ...)`            | `ctx.execute_local_activity(&checksum_info(), input).await?` |
+| `ctx.spawn_child_workflow_raw("child", json!(...))`           | `ctx.spawn_child_workflow(&child_info(), input).await?`      |
+| `ctx.wait_for_signal("approved")`                             | `ctx.receive_signal::<Approval>("approved").await?`          |
+| `ctx.wait_for_signal_timeout("approved", timeout)`            | `ctx.receive_signal_timeout::<Approval>("approved", timeout).await?` |
+
+`execute_activity` delegates to `execute_activity_with_opts` with all overrides `None`, so `ActivityInfo` defaults (queue, retry policy, start-to-close) are consistently applied. The `queue_override` in `execute_activity_with_opts` takes priority over `info.default_queue` which takes priority over `"default"`.
+
+```rust
+#[activity(start_to_close = "30s", queue = "email-workers")]
+async fn send_email(ctx: &ActivityContext, addr: String) -> Result<(), String> { /* ... */ }
+
+#[workflow]
+async fn onboarding(ctx: &WorkflowContext, user_id: i64) -> Result<(), String> {
+    // Queue and retry defaults come from send_email_info() — no magic strings.
+    ctx.execute_activity(&send_email_info(), format!("user-{user_id}@example.com")).await?;
+
+    // Override the queue for priority routing; keep all other defaults.
+    ctx.execute_activity_with_opts(
+        &send_email_info(),
+        format!("user-{user_id}@example.com"),
+        Some("priority-email"),
+        None,
+        None,
+    ).await?;
+
+    // Child workflows — output type is inferred from the annotation.
+    let report: ReportResult = ctx.spawn_child_workflow(&generate_report_info(), user_id).await?;
+
+    // Typed signal receive — payload deserialized directly.
+    let approval: Approval = ctx.receive_signal("approval").await?;
+    Ok(())
+}
+```
+
+Local activities also have a `_with_opts` variant for per-call retry/timeout overrides:
+```rust
+ctx.execute_local_activity_with_opts(&checksum_info(), data, Some(retry_policy), Some(timeout)).await?;
+```
+
+### Signal-or-Deadline Waits (issue #476)
+
+`receive_signal_timeout` / `wait_for_signal_timeout` bound a signal wait with a durable deadline — the primitive for human-in-the-loop and callback-driven flows (approval gates, payment confirmations, webhook callbacks with an SLA):
+
+```rust
+#[workflow]
+async fn document_review(ctx: &WorkflowContext, doc_id: String) -> Result<String, String> {
+    // Two lines: await approval, else auto-reject after 24 hours.
+    let decision: Option<Decision> = ctx
+        .receive_signal_timeout("approval", Duration::from_secs(24 * 60 * 60))
+        .await
+        .map_err(|e| e.to_string())?;
+    match decision {
+        Some(d) => Ok(format!("decided by {}", d.approver)),
+        None => Ok("auto_rejected".to_string()),   // deadline fired first
+    }
+}
+```
+
+`Ok(Some(payload))` when the signal arrives before the deadline; `Ok(None)` when the durable timer fires first. The untyped `wait_for_signal_timeout` returns `HarvestResult<Option<Value>>`, mirroring the `wait_for_signal` / `receive_signal` pairing.
+
+**Determinism contract.** The race composes the existing `TimerStarted`/`TimerFired` and `SignalReceived` events — **no new `WorkflowEvent` variant, no migration**. The winner is decided by **recorded history order**: whichever of `SignalReceived` or `TimerFired` appears first in `harvest_events` wins on every replay, regardless of wall-clock timing on the replaying worker. A history containing both events always replays to the same branch (`HistoryMatcher::match_signal_or_timer`, returning the `SignalOrTimerMatch` enum). When the signal wins, the stray `TimerFired` from the still-armed durable timer is consumed transparently; when the timer wins, **no signal payload is consumed** — a late delivery remains observable by a subsequent `receive_signal*` call.
+
+Mechanics: each call deterministically derives a race timer ID (`__signal_timeout:{seq}:{signal_name}` from a per-context counter) and, on first live execution, suspends with a `StartTimer` + `WaitForSignal` command batch (a suspension shape the worker already supports; the timer row is deduped by `timer_id` on re-park). The mixed park self-wakes if a signal arrived while the task was still executing, so an early approval is processed immediately rather than at the deadline. Wake-up ingest appends due timer fires and pending signals in occurrence order (DB-clock `received_at` vs DB-clock-anchored `fires_at`), so a worker claiming the woken task late cannot flip an on-time signal to the timeout branch. `timeout` is rounded up to whole seconds. Composition caveat: like `ctx.timer` and `wait_for_signal` today, the race cannot share one suspension batch with `ScheduleActivity` or `StartChildWorkflow` commands (`tokio::join!` with `execute_activity`/`spawn_child_workflow` is rejected by the worker's suspension-shape handler) and is deferred — not raced — by an inline `RunLocalActivity` sibling (`extract_run_local_activity` drops wait commands, so the deadline is only armed after the local activity completes). All three are pre-existing engine limitations shared by every wait primitive. The replay matcher already tolerates interleaved sibling events (activities, local activities, child workflows, markers, side effects, sibling timers, and stashed signals compete at their recorded history positions) so histories from a future mixed-batch implementation replay correctly. `WorkflowTestEnv` supports both branches without real sleeping: `queue_signal(...)` exercises the signal branch, omitting it auto-fires the deadline timer. See `examples/approval_with_timeout.rs`.
+
+### Query Handlers
+
+Query handlers let operators and UIs read arbitrary workflow-internal state without writing any event to `harvest_events`. They are pure synchronous functions registered via `WorkflowContext::register_query_handler` (typed) or `register_query` (no-arg shorthand). Use `#[query]` as a documentation marker on the handler function.
+
+```rust
+#[derive(serde::Deserialize)]
+struct ProgressQuery { include_summary: bool }
+
+#[derive(serde::Serialize)]
+struct ProgressResponse { processed: u64, total: u64 }
+
+#[workflow]
+async fn batch_processor(ctx: &WorkflowContext, _input: ()) -> Result<(), String> {
+    let processed = Arc::new(Mutex::new(0u64));
+    let state = processed.clone();
+    ctx.register_query_handler("progress", move |req: &ProgressQuery| {
+        Ok(ProgressResponse { processed: *state.lock().unwrap(), total: 1000 })
+    });
+    ctx.register_query("status", || serde_json::json!("running"));
+    // ... activities ...
+    Ok(())
+}
+```
+
+Management API:
+- `POST /api/harvest/workflows/{exec_id}/query/{name}` with body `{"args": <value>}` → `{"result": <value>}`
+- `GET /api/harvest/workflows/{exec_id}/queries` → sorted list of registered query names
+
+Errors: `QueryHandlerNotFound` (404), `WorkflowNotRunning` (409), `QueryHandlerPanicked` (503), `QueryTimedOut` (408).
+
+Configure the per-query timeout via `WorkerConfig::default().with_query_timeout(Duration::from_secs(10))` (default 5 s). Queries are replay-safe: they never emit `WorkflowCommand`s and leave zero footprint in `harvest_events`.
+
+### Fan-out / Parallel Activities
+
+`WorkflowContext` exposes first-class fan-out for dispatching N activities in parallel and collecting results in input order.  Two semantics are available:
+
+| Method | Semantics |
+|--------|-----------|
+| `execute_activity_fan_out(info, inputs)` | Fail-fast: returns `Ok(Vec<O>)` or the **first** `Err` |
+| `execute_activity_fan_out_collect(info, inputs)` | Collect-all: returns `Ok(Vec<Result<O, String>>)` — per-slot errors |
+| `execute_activity_fan_out_raw(activities)` | Raw fail-fast: `Vec<(String, Value, String)>` input |
+| `execute_activity_fan_out_collect_raw(activities)` | Raw collect-all |
+
+```rust
+// Typed, homogeneous fan-out — all slots run the same activity
+// (≤ 3 lines of code measured from the example):
+let results: Vec<ItemResult> = ctx
+    .execute_activity_fan_out(&process_item_info(), items)
+    .await
+    .map_err(|e| e.to_string())?;
+
+// Collect-all — per-slot Vec<Result<O, String>>:
+let per_slot: Vec<Result<ItemResult, String>> = ctx
+    .execute_activity_fan_out_collect(&process_item_info(), items)
+    .await
+    .map_err(|e| e.to_string())?;
+
+// Raw heterogeneous fan-out:
+let results = ctx.execute_activity_fan_out_raw(vec![
+    ("send_email".to_string(), json!(addr1), "email-workers".to_string()),
+    ("send_sms".to_string(),   json!(phone), "sms-workers".to_string()),
+]).await.map_err(|e| e.to_string())?;
+```
+
+**Determinism rule — the input collection MUST be derived from already-recorded state** (workflow input, prior activity outputs, signals).  Never derive the collection from non-deterministic sources such as the system clock, `rand`, or an in-process counter.  If the collection is derived from a prior activity output, that output is in history and is therefore deterministic.
+
+**Replay mechanics**: a `MarkerRecorded { name: "fan_out:{n}" }` event is appended before the activity events on the first live run.  On replay the recorded count is compared to the current collection length; if they differ, `HarvestError::NonDeterministic` is returned immediately rather than silently corrupting results.
+
+**Cancellation**: both methods check `ctx.is_cancelled()` before dispatching and return `HarvestError::Cancelled` if the workflow has been cancelled.
+
+See `autumn-harvest/examples/fanout_batch.rs` for a complete end-to-end example covering all three shapes (static N, dynamic N from a prior activity, and collect-all with partial failure).
+
+### Deterministic Primitives (issue #384)
+
+First-class, replay-safe alternatives to the non-deterministic APIs the guardrails (HVG001 wall-clock, HVG002 randomness) warn about. One `WorkflowContext` method call per value — no local-activity definition, no magic strings. Each helper captures its value on the **first** live execution, freezes it into a single `SideEffectRecorded` event, and replays the identical value on every subsequent pass and every worker.
+
+| Method | Returns | Captures |
+|--------|---------|----------|
+| `ctx.system_now()` | `DateTime<Utc>` | wall-clock instant at the call site |
+| `ctx.system_time_now()` | `std::time::SystemTime` | same instant as a `SystemTime` |
+| `ctx.new_uuid()` | `Uuid` | a fresh UUIDv7 (idempotency keys) |
+| `ctx.random_u64()` / `ctx.random_f64()` | `u64` / `f64` | a sampling draw |
+| `ctx.random_range(range)` | `T` | a uniform draw from `range` (e.g. `0..100`) |
+| `ctx.side_effect(name, f)` | `HarvestResult<T>` | any one-shot value; `name` dedups within an execution |
+
+`now()` (unchanged) returns the fixed `WorkflowStarted` timestamp — the workflow-logical *start* clock. Use `system_now()` when you need the *current* wall clock captured at the call site (e.g. "skip the notification if the event is older than 24h now").
+
+```rust
+#[workflow]
+async fn notify(ctx: &WorkflowContext, event: Event) -> Result<(), String> {
+    // Wall-clock decision — captured once, replayed verbatim.
+    let fresh = ctx.system_now().timestamp() - event.occurred_at < 24 * 60 * 60;
+    // Idempotency key — UUIDv7 captured once; safe across retries.
+    let key = ctx.new_uuid().to_string();
+    // Sampling — deterministic across replays.
+    let in_rollout = ctx.random_range(0..100) < 10;
+    // One-shot environment capture.
+    let region: String = ctx
+        .side_effect("region", || std::env::var("REGION").unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    // ...
+    Ok(())
+}
+```
+
+All six lower onto the single append-only `WorkflowEvent::SideEffectRecorded { kind, name, value }` variant (`kind: SideEffectKind` ∈ `Now`/`Uuid`/`Random`/`Custom`). The `HistoryMatcher` matches them in command order; a divergence (reorder/insert/remove/rename across a code change) is surfaced by `WorkflowReplayer` as `NonDeterminismKind::SideEffectDrift`. `side_effect`/`random_uuid` recorded under the pre-#384 engine (as `MarkerRecorded`) still replay correctly. Randomness is **not** cryptographically secure — for security-grade entropy, use a regular activity. See `autumn-harvest/examples/deterministic_primitives.rs`.
+
 ### Local Activities
 
 Local activities run **inline on the workflow worker task** — they are never enqueued to `harvest_task_queue` and never dispatched to a remote worker. Their results are still recorded durably in `harvest_events` (`LocalActivityScheduled`, `LocalActivityCompleted`, `LocalActivityFailed`) so deterministic replay works identically to regular activities.
@@ -263,6 +560,111 @@ async fn compute_checksum(ctx: &ActivityContext, data: Vec<u8>) -> Result<String
 - You need the activity to run on a different worker pool or machine
 - The operation might take more than 60 s or needs heartbeating to signal liveness
 - You want `schedule_to_start` timeout enforcement
+
+### Workflow Input/Output JSON Schema (issue #373)
+
+Operators and non-Rust callers can discover the expected JSON shape of each workflow's input and output through the management API without reading Rust source. Schema publishing is **opt-in** — workflows that don't attach a schema continue to work exactly as today.
+
+#### Opt-in via manual schema function
+
+```rust
+fn onboard_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "integer"},
+            "email":   {"type": "string"}
+        },
+        "required": ["user_id", "email"]
+    })
+}
+
+// In the builder — chain after the companion function:
+.workflows(vec![
+    onboarding_info()
+        .with_description("Handles new-user onboarding from signup to first action")
+        .with_input_schema_fn(onboard_input_schema),
+])
+```
+
+#### Opt-in via `schema` feature + `schemars`
+
+Enable the `schema` Cargo feature and derive `JsonSchema` on your types:
+
+```toml
+# In your Cargo.toml:
+autumn-harvest = { version = "0.3", features = ["schema"] }
+schemars = "0.8"
+```
+
+```rust
+#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+pub struct OnboardInput { pub user_id: i64, pub email: String }
+
+// In the builder:
+.workflows(vec![
+    onboarding_info().with_schemas::<OnboardInput, (), String>(),
+])
+```
+
+#### `#[workflow(description = "…")]`
+
+Attach a one-paragraph description directly in the macro attribute:
+
+```rust
+#[workflow(description = "Handles new-user onboarding from signup to first action")]
+async fn onboarding(ctx: &WorkflowContext, input: OnboardInput) -> Result<(), String> { … }
+```
+
+#### Discovery endpoints
+
+```
+GET /api/harvest/workflows/registered
+```
+Returns a sorted JSON array of all registered workflow types:
+```json
+[
+  { "name": "onboarding", "description": "Handles new-user onboarding…",
+    "input_schema": { "type": "object", … }, "output_schema": null, "error_schema": null },
+  { "name": "no_schema_wf", "input_schema": null, "output_schema": null, "error_schema": null }
+]
+```
+
+```
+GET /api/harvest/workflows/registered/{name}/schema
+```
+Returns the record for a single workflow type, or `404` if the name is unknown.
+
+#### Server-side input validation
+
+When a workflow has a published `input_schema`, `POST /api/harvest/workflows/{name}/start` validates the input **before** the workflow enters the task queue. A bad input returns:
+```json
+HTTP 400
+{
+  "error": "input validation failed",
+  "violations": [
+    { "message": "missing required field 'email'", "field_path": "/email" },
+    { "message": "expected type 'integer', got 'string'", "field_path": "/user_id" }
+  ]
+}
+```
+`field_path` is a JSON Pointer (RFC 6901). Workflows without a schema accept any input, unchanged.
+
+#### curl examples
+
+```bash
+# Correctly shaped input — starts the workflow:
+curl -X POST /api/harvest/workflows/onboarding/start \
+  -H 'Content-Type: application/json' \
+  -d '{"input": {"user_id": 1, "email": "alice@example.com"}}'
+
+# Deliberately wrong shape — rejected at the API boundary (400):
+curl -X POST /api/harvest/workflows/onboarding/start \
+  -H 'Content-Type: application/json' \
+  -d '{"input": {"user_id": "not_an_int"}}'
+```
+
+See `autumn-harvest/examples/schema_workflow.rs` for a full working demonstration.
 
 ---
 
@@ -326,7 +728,7 @@ The `testing` feature in `autumn-harvest/Cargo.toml` gates `WorkflowContext::new
 | `harvest_build_policies` | `Uuid` | Per-queue active build policy: new starts get `assigned_build_id = policy.build_id` |
 | `harvest_build_compat` | `Uuid` | Compatibility declarations: workers running build B may process executions assigned build A |
 
-`harvest_workflow_executions` is the hub — six tables join back to it via `workflow_exec_id`. `harvest_build_policies` and `harvest_build_compat` are keyed by `queue_name` and `(build_id, compatible_with)` respectively.
+`harvest_workflow_executions` is the hub — six tables join back to it via `workflow_exec_id`. `harvest_build_policies` and `harvest_build_compat` are keyed by `queue_name` and `(build_id, compatible_with)` respectively. `execution_timeout` and `deadline_at` (issue #243) are nullable columns on `harvest_workflow_executions`: `deadline_at = started_at + execution_timeout` is set at start time so the timeout scanner uses an indexed O(log n) scan rather than per-row arithmetic.
 
 ---
 
@@ -414,15 +816,17 @@ Worker pool and web pool are independently sized but share a total connection ce
 `WorkflowContext::version()` emits a `VersionMarker` event on first live call and replays the recorded version on subsequent runs. This allows workflow code to branch on version (`if ctx.version() >= 2 { ... }`) to handle non-determinism across deploys without breaking replay of in-flight executions.
 
 **DD-4: Basic in-process LRU cache**
-`WorkflowCache` is a bounded LRU cache for workflow state, keyed by `ExecutionId`. Cross-worker sticky routing (ensuring the same execution always lands on the same worker) is deferred to Phase 3/4. For now, cache misses just reload from the event store.
+`WorkflowCache` is a bounded LRU cache for workflow state, keyed by `ExecutionId`. It is wired into the worker hot path (Phase 3.11 / issue #235): on a cache hit the worker loads only delta events since the last suspension (`store::load_history_since`) rather than the full history. Sticky cross-worker routing (ensuring follow-up tasks prefer the owning worker) is enabled via `WorkerConfig::with_sticky_routing`. See `docs/sticky-routing.md`.
 
 ---
 
 ## Phase 4 Scope (next)
 
 - **Worker fleet observability** (implemented, issue #100): `harvest_workers` table, per-worker heartbeat upsert, `Active → Draining → Stopped` lifecycle, `GET /workers`, `GET /workers/{id}`, `GET /workers/health` management routes, cross-shard aggregation via `iter_shards()`.
-- **Cancellation semantics**: explicit workflow/activity cancellation and propagation
-- **Saga primitives**: compensations and failure orchestration
-- **Cross-worker routing**: sticky execution affinity and shard-aware placement
-- **Sharding follow-up**: per-shard worker poll loops, per-shard scheduler tick loops with DAG→shard pinning, and multi-shard observability (the core `ShardId`/`ShardRouter`/`ShardedDbPool` primitives and the shard-aware write/read paths in the plugin are already in place).
-- **Operational surface**: richer metrics, observability, and dashboard/UI work
+- **Cancellation semantics** (implemented): explicit workflow/activity cancellation and propagation via `cancel_workflow_execution`, `WorkflowContext::is_cancelled`, `check_cancellation`, cooperative heartbeat cancellation, and grace-period hard-abort. Interaction with `Saga` documented in `docs/saga.md` (issue #238). Parent-close cascade boundary owned by issue #347: when a parent reaches a terminal state, `apply_parent_close_cascade` propagates the configured `ParentClosePolicy` to all running detached children — `RequestCancel` delivers a cancellation (CANCELLED state) and `Terminate` force-fails with a `"ParentClosed"` error (FAILED state); `Abandon` is a no-op. Cascade runs after the parent's terminal transaction commits and is wired into `cancel_workflow_execution`, `persist_workflow_completion`, and `persist_workflow_failure`.
+- **Saga primitives** (implemented): `Saga::new`, `Saga::step`, `Saga::compensate_all`, LIFO unwind, `HarvestError::SagaCompensationFailed`. Cancellation + idempotency semantics documented and test-locked in `tests/saga_tests.rs` (issue #238).
+- **Cross-worker routing** (implemented, issue #235): sticky execution affinity via `StickyRoutingConfig` + warm-cache delta loading. Shard-aware placement follow-up TBD.
+- **Schedule jitter** (implemented, issue #240): `WorkflowSchedule::with_jitter(Duration)` spreads co-scheduled cron/interval fires over a configurable window using a deterministic seahash offset (`compute_jitter_offset`). `DagInfo.jitter` threads through `as_workflow_schedule`. `GET /admin/schedules` surfaces `jitter_secs` and `effective_fire_time`. Zero-jitter default preserves existing behaviour. Migration: `jitter_secs BIGINT NOT NULL DEFAULT 0` on `harvest_schedules`.
+- **Schedule overlap policy** (implemented, issue #241): `OverlapPolicy` enum (`Skip`, `BufferOne`, `BufferAll`, `CancelOther`, `TerminateOther`) controls what happens when a new firing collides with a still-running execution. `WorkflowSchedule::with_overlap_policy(OverlapPolicy)` and `with_buffer_all_max(u32)` builder methods configured to match schedulers capability. Effective start-times and execution details surfaced in `GET /admin/schedules`. Migration: `overlap_policy VARCHAR(50) NOT NULL DEFAULT 'skip'`, `buffer_all_max INTEGER NOT NULL DEFAULT 0` on `harvest_schedules`.
+- **Calendar-aware schedules and backfills** (implemented, issue #337): `Calendar` definition (durable exclusions, dynamic weekends, default configs); calendar association with schedules; skip/overlap policy interactions; preview generator (`GET /admin/schedules/preview` returning list of effective, original, and skipped fire times); sharded backfill runner (`POST /admin/schedules/{id}/backfill` creating independent executions pinned to shard-local boundaries). Migration: `calendar_name VARCHAR(255) NULL` on `harvest_schedules`.
+- **Pre-retention history archival hook** (implemented, issue #345): `HistoryArchiver` trait with custom async `archive` handler, `RetentionConfig.archiver` registered on `HarvestBuilder`, diesel `RetentionMonitor` with `METRIC_RETENTION_DELETED`, row skip on failure with `SkipFreeze` cursor safety, and connection leases in multi-worker environments using background drop lease-releasing guards.

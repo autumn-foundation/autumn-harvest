@@ -5,32 +5,52 @@
 //! ```
 
 pub use crate::builder::{HarvestBuilder, WorkerConfig};
+pub use crate::calendar::{
+    Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
+};
+pub use crate::circuit_breaker::{
+    AttemptOutcome, CircuitBreakerRegistry, CircuitPhase, CircuitSnapshot, CircuitTransition,
+    DispatchDecision, DispatchToken,
+};
 pub use crate::context::{ActivityContext, WorkflowContext};
-pub use crate::dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
+pub use crate::dag::{
+    DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
+    DagTask, DagTaskRef,
+};
 pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
-pub use crate::event::WorkflowEvent;
+pub use crate::event::{SideEffectKind, WorkflowEvent};
+pub use crate::failure::{ActivityFailure, IntoActivityErrorString};
 #[cfg(feature = "db")]
 pub use crate::handle::{
     StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,
     WorkflowResultState, start_or_load_workflow_execution_with_handle,
 };
-pub use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
-pub use crate::policy::{RetryPolicy, Schedule, TriggerRule};
+#[cfg(feature = "db")]
+pub use crate::handle_typed::{
+    TypedSignalWithStartOptions, TypedStartOptions, TypedWorkflowHandle, TypedWorkflowResult,
+};
+pub use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
+pub use crate::policy::{
+    CircuitBreakerPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy,
+    TaskStatus, TriggerRule, WorkflowSchedule,
+};
 pub use crate::query::QueryRegistry;
 pub use crate::saga::Saga;
 #[cfg(feature = "db")]
 pub use crate::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
-    register_schedules, tick_once, trigger_dag,
+    register_schedules, tick_once, trigger_unified_dag,
 };
 pub use crate::telemetry::{
     ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
     TraceContextCarrier, TraceContextPropagator, WorkflowStatus,
 };
 pub use crate::types::{
-    ActivityExecId, BuildId, DeploymentName, ExecutionId, IdempotencyKey, TimerId, WorkerId,
-    WorkflowId,
+    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalSignalId, IdempotencyKey,
+    Priority, TimerId, WorkerId, WorkflowId,
 };
 
 // Re-export macros from autumn-harvest-macros.
-pub use autumn_harvest_macros::{activities, activity, dag, dags, workflow, workflows};
+pub use autumn_harvest_macros::{
+    activities, activity, dag, dags, queries, query, signal, update, updates, workflow, workflows,
+};

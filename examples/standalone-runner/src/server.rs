@@ -23,6 +23,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = standalone_runtime_config(database_url);
     let built = standalone_builder().try_build()?;
     let runner = HarvestRunner::start(built, &config, HarvestRunnerResources::new(pool.clone()))
+        .await
         .map_err(|error| format!("failed to start Harvest runner: {error}"))?;
 
     let api_state = HarvestApiState::new();

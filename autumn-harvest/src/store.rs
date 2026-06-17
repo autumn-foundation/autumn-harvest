@@ -47,6 +47,17 @@ pub struct WorkflowChildCursor {
     pub exec_id: uuid::Uuid,
 }
 
+/// Whether a child workflow was spawned in await or detached mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwaitMode {
+    /// Parent suspended until the child's terminal result (classic spawn).
+    Awaited,
+    /// Parent did not suspend; child runs independently under a parent-close
+    /// policy.
+    Detached,
+}
+
 /// Operator-facing child workflow row used by management API read models.
 #[derive(Debug, Clone)]
 pub struct WorkflowChildRow {
@@ -58,6 +69,11 @@ pub struct WorkflowChildRow {
     pub error_summary: Option<String>,
     pub shard_id: i32,
     pub depth: u8,
+    /// How this child was spawned (awaited or detached).
+    pub await_mode: AwaitMode,
+    /// For detached children, the policy applied when the parent closes. `None`
+    /// for awaited children.
+    pub parent_close_policy: Option<crate::types::ParentClosePolicy>,
 }
 
 type WorkflowChildProjection = (
@@ -68,6 +84,7 @@ type WorkflowChildProjection = (
     Option<chrono::DateTime<chrono::Utc>>,
     Option<String>,
     i32,
+    Option<String>,
 );
 
 /// Convert in-memory events to insertable rows with sequential event IDs
@@ -267,6 +284,14 @@ pub async fn admit_update_event(
                     crate::error::HarvestError::NotFound(format!("workflow execution {exec_id}"))
                 })?;
 
+            // Reject updates submitted while the execution is paused with a
+            // dedicated error (issue #383). Updates may admit-and-mutate workflow
+            // state, so they are rejected rather than silently queued behind the
+            // pause — surfacing operator intent as a 409 at the API layer.
+            if execution.state == "PAUSED" {
+                return Err(crate::error::HarvestError::WorkflowPaused(exec_id));
+            }
+
             // Reject the update if the execution is no longer running.
             if execution.state != "RUNNING" {
                 return Err(crate::error::HarvestError::UpdateRejected {
@@ -301,7 +326,47 @@ pub async fn admit_update_event(
 
 /// Load the full event history for a workflow execution, ordered by `event_id`.
 ///
+/// Lock the workflow execution row `FOR UPDATE` and then load its full event
+/// history.
+///
+/// Acquiring the row lock first ensures that concurrent event appends
+/// (e.g. from a second worker racing on the same task) serialise correctly:
+/// the transaction that holds the lock owns the right to append the next
+/// event batch.
+///
+/// This is an internal helper called by the transactional activity commit
+/// path in [`crate::context::ActivityContext::run_transactional`] and by
+/// several private functions in `worker.rs`.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the execution row
+/// does not exist, and [`crate::error::HarvestError::Database`] on any other
+/// query failure.
+pub(crate) async fn lock_and_load_history(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<EventHistory> {
+    use crate::error::HarvestError;
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    // Acquire a row-level lock so concurrent writers serialize around this
+    // transaction.  We only need the id to confirm the row exists.
+    dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .for_update()
+        .select(dsl::id)
+        .first::<uuid::Uuid>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+    load_history(conn, exec_id).await
+}
+
 /// Deserializes each row's `event_data` JSON back into [`WorkflowEvent`].
+///
 /// The returned [`EventHistory::next_event_id`] is set to one past the last
 /// loaded event (or 0 if the history is empty), ready for use with
 /// [`append_events()`].
@@ -349,6 +414,83 @@ pub async fn load_history_with_codecs(
         events,
         next_event_id,
     })
+}
+
+/// Load only events appended since a known event-id cursor.
+///
+/// Returns events where `event_id >= from_event_id`, ordered by `event_id ASC`.
+/// When the result is empty (no new events), `next_event_id` is set to
+/// `from_event_id` so callers can use it as the baseline for the next ingestion.
+///
+/// This is the delta-load companion to [`load_history`]: the worker calls this
+/// on cache hits to fetch only the timer-fire / signal events appended since
+/// the last suspension, and prepends the cached event snapshot to reconstruct
+/// the full history without reading old events from Postgres.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn load_history_since(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    from_event_id: i32,
+) -> HarvestResult<EventHistory> {
+    use crate::models::HarvestEvent;
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_id.ge(from_event_id))
+        .order(harvest_events::event_id.asc())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_event_id = rows
+        .last()
+        .map_or(from_event_id, |r| r.event_id.saturating_add(1));
+
+    let events = rows
+        .into_iter()
+        .map(|row| crate::payload_codec::PayloadCodecs::default().decode_event(row.event_data))
+        .collect::<Result<Vec<WorkflowEvent>, _>>()?;
+
+    Ok(EventHistory {
+        exec_id,
+        events,
+        next_event_id,
+    })
+}
+
+/// Load raw `harvest_events` rows for `exec_id` with `id > after_row_id`.
+///
+/// Returns rows ordered by `id ASC`. The `id` column is the `BIGSERIAL` primary
+/// key and serves as the SSE resume cursor (`Last-Event-ID`). Pass `-1` for
+/// `after_row_id` to load all events.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[cfg(feature = "db")]
+pub async fn load_events_after_row_id(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    after_row_id: i64,
+    limit: Option<i64>,
+) -> HarvestResult<Vec<crate::models::HarvestEvent>> {
+    let mut query = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::id.gt(after_row_id))
+        .order(harvest_events::id.asc())
+        .into_boxed();
+    if let Some(n) = limit {
+        query = query.limit(n);
+    }
+    query
+        .select(crate::models::HarvestEvent::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
 }
 
 /// Load the direct children of `parent_id` from one shard.
@@ -401,6 +543,7 @@ pub async fn load_workflow_children(
             harvest_workflow_executions::completed_at,
             harvest_workflow_executions::error,
             harvest_workflow_executions::shard_id,
+            harvest_workflow_executions::parent_close_policy,
         ))
         .load::<WorkflowChildProjection>(conn)
         .await
@@ -408,7 +551,16 @@ pub async fn load_workflow_children(
         .map(|rows| {
             rows.into_iter()
                 .map(
-                    |(id, workflow_name, state, started_at, completed_at, error, shard_id)| {
+                    |(
+                        id,
+                        workflow_name,
+                        state,
+                        started_at,
+                        completed_at,
+                        error,
+                        shard_id,
+                        parent_close_policy,
+                    )| {
                         workflow_child_row_from_parts(
                             id,
                             workflow_name,
@@ -418,6 +570,7 @@ pub async fn load_workflow_children(
                             error,
                             shard_id,
                             depth,
+                            parent_close_policy.as_deref(),
                         )
                     },
                 )
@@ -435,7 +588,15 @@ fn workflow_child_row_from_parts(
     error: Option<String>,
     shard_id: i32,
     depth: u8,
+    parent_close_policy_str: Option<&str>,
 ) -> WorkflowChildRow {
+    let parent_close_policy =
+        parent_close_policy_str.and_then(|s| s.parse::<crate::types::ParentClosePolicy>().ok());
+    let await_mode = if parent_close_policy.is_some() {
+        AwaitMode::Detached
+    } else {
+        AwaitMode::Awaited
+    };
     WorkflowChildRow {
         exec_id: ExecutionId::from_uuid(id),
         workflow_name,
@@ -445,6 +606,8 @@ fn workflow_child_row_from_parts(
         error_summary: summarize_error(error),
         shard_id,
         depth,
+        await_mode,
+        parent_close_policy,
     }
 }
 
@@ -502,6 +665,28 @@ pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
     Ok(())
 }
 
+/// Overwrite `current_details` on the execution row (issue #473).
+///
+/// Called by the worker after each execution cycle when the workflow author
+/// called `ctx.set_current_details(...)` during live (non-replay) execution.
+/// Uses a simple overwrite; the application layer enforces last-write-wins by
+/// calling `take_current_details()` on the context, which drains the field.
+pub async fn update_current_details(
+    conn: &mut AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
+    details: &str,
+) -> crate::error::HarvestResult<()> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+        .set(dsl::current_details.eq(Some(details)))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
 fn summarize_error(error: Option<String>) -> Option<String> {
     const MAX_ERROR_SUMMARY_CHARS: usize = 240;
 
@@ -527,6 +712,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -611,6 +798,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::Value::Null,
@@ -637,6 +826,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({"user": "alice"}),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),

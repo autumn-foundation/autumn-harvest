@@ -1,0 +1,41 @@
+error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::thread_rng(), Uuid::new_v4(), or any other source of randomness directly in a workflow body produces a different value on each replay pass. Since the workflow function is re-run from the top on every resume, the random sequence diverges from what was recorded in harvest_events.
+       Alternative: Use the deterministic primitives on WorkflowContext, which capture the value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For cryptographically secure randomness, generate it inside an activity (ActivityContext) and return it as the durably-recorded activity result instead.
+ --> tests/compile_fail/hvg002_randomness.rs:6:19
+  |
+6 |     let _ = rand::random::<u64>();
+  |                   ^^^^^^
+
+error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::thread_rng(), Uuid::new_v4(), or any other source of randomness directly in a workflow body produces a different value on each replay pass. Since the workflow function is re-run from the top on every resume, the random sequence diverges from what was recorded in harvest_events.
+       Alternative: Use the deterministic primitives on WorkflowContext, which capture the value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For cryptographically secure randomness, generate it inside an activity (ActivityContext) and return it as the durably-recorded activity result instead.
+ --> tests/compile_fail/hvg002_randomness.rs:7:36
+  |
+7 |     let _ = ctx.side_effect(&rand::random::<u64>().to_string(), || 42);
+  |                                    ^^^^^^
+
+error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::thread_rng(), Uuid::new_v4(), or any other source of randomness directly in a workflow body produces a different value on each replay pass. Since the workflow function is re-run from the top on every resume, the random sequence diverges from what was recorded in harvest_events.
+       Alternative: Use the deterministic primitives on WorkflowContext, which capture the value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For cryptographically secure randomness, generate it inside an activity (ActivityContext) and return it as the durably-recorded activity result instead.
+  --> tests/compile_fail/hvg002_randomness.rs:10:31
+   |
+10 |     let mut rng = rand::rngs::OsRng;
+   |                               ^^^^^
+
+error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::thread_rng(), Uuid::new_v4(), or any other source of randomness directly in a workflow body produces a different value on each replay pass. Since the workflow function is re-run from the top on every resume, the random sequence diverges from what was recorded in harvest_events.
+       Alternative: Use the deterministic primitives on WorkflowContext, which capture the value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For cryptographically secure randomness, generate it inside an activity (ActivityContext) and return it as the durably-recorded activity result instead.
+  --> tests/compile_fail/hvg002_randomness.rs:11:17
+   |
+11 |     let _ = rng.r#gen::<f64>();
+   |                 ^^^^^
+
+error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::thread_rng(), Uuid::new_v4(), or any other source of randomness directly in a workflow body produces a different value on each replay pass. Since the workflow function is re-run from the top on every resume, the random sequence diverges from what was recorded in harvest_events.
+       Alternative: Use the deterministic primitives on WorkflowContext, which capture the value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For cryptographically secure randomness, generate it inside an activity (ActivityContext) and return it as the durably-recorded activity result instead.
+  --> tests/compile_fail/hvg002_randomness.rs:14:19
+   |
+14 |     let _ = rand::random_range(0..10);
+   |                   ^^^^^^^^^^^^
+
+error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::thread_rng(), Uuid::new_v4(), or any other source of randomness directly in a workflow body produces a different value on each replay pass. Since the workflow function is re-run from the top on every resume, the random sequence diverges from what was recorded in harvest_events.
+       Alternative: Use the deterministic primitives on WorkflowContext, which capture the value once and replay it verbatim: ctx.new_uuid() for a UUIDv7 (idempotency keys), ctx.random_u64() / ctx.random_f64() / ctx.random_range(range) for sampling draws, or ctx.side_effect(name, f) to capture any one-shot non-deterministic value. For cryptographically secure randomness, generate it inside an activity (ActivityContext) and return it as the durably-recorded activity result instead.
+  --> tests/compile_fail/hvg002_randomness.rs:15:19
+   |
+15 |     let _ = rand::random_bool(0.5);
+   |                   ^^^^^^^^^^^

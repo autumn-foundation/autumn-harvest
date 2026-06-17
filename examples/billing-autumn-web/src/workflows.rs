@@ -3,10 +3,13 @@ use std::sync::{Arc, Mutex};
 use autumn_harvest::prelude::*;
 use serde_json::{Value, json};
 
-use crate::domain::{
-    BillingOutcome, CHECKOUT_QUEUE, CheckoutRequest, INVOICE_QUEUE, InvoiceRequest, InvoiceResult,
-    OPS_QUEUE, PAYMENT_QUEUE,
+use crate::activities::{
+    authorize_payment_info, cancel_subscription_record_info, charge_subscription_info,
+    create_customer_profile_info, create_invoice_info, create_subscription_record_info,
+    delete_customer_profile_info, record_payment_capture_info, send_invoice_info,
+    send_receipt_info, validate_checkout_info, void_invoice_info, void_payment_authorization_info,
 };
+use crate::domain::{BillingOutcome, CheckoutRequest, InvoiceRequest, InvoiceResult, OPS_QUEUE};
 
 pub fn workflows() -> Vec<WorkflowInfo> {
     workflows![
@@ -16,7 +19,11 @@ pub fn workflows() -> Vec<WorkflowInfo> {
     ]
 }
 
-#[workflow]
+#[workflow(
+    owner = "billing-team",
+    runbook = "https://wiki.acme.com/billing-runbook",
+    severity = "sev1"
+)]
 #[allow(clippy::too_many_lines)]
 pub async fn billing_checkout(
     ctx: &WorkflowContext,
@@ -30,10 +37,9 @@ pub async fn billing_checkout(
         })
     });
 
-    let validated = ctx
-        .execute_activity_raw("validate_checkout", json!(request), CHECKOUT_QUEUE)
+    let checkout: CheckoutRequest = ctx
+        .execute_activity(&validate_checkout_info(), request)
         .await?;
-    let checkout: CheckoutRequest = serde_json::from_value(validated)?;
     let tax_version = ctx.version("billing_checkout_v2_tax", 1, 2);
     let subscription_uuid = ctx.random_uuid("subscription-id")?;
     let subscription_id = format!("sub_{}", subscription_uuid.simple());
@@ -41,54 +47,52 @@ pub async fn billing_checkout(
     *status.lock().expect("status lock poisoned") = String::from("reserving");
     let mut saga = Saga::new(ctx);
 
-    let customer_profile = saga
+    let customer_profile: Value = saga
         .step(
             || async {
-                ctx.execute_activity_raw(
-                    "create_customer_profile",
+                ctx.execute_activity(
+                    &create_customer_profile_info(),
                     json!({
                         "tenant_id": checkout.tenant_id,
                         "customer_id": checkout.customer_id,
                     }),
-                    CHECKOUT_QUEUE,
                 )
                 .await
             },
             |profile| async move {
-                ctx.execute_activity_raw("delete_customer_profile", profile, CHECKOUT_QUEUE)
+                ctx.execute_activity::<_, Value>(&delete_customer_profile_info(), profile)
                     .await
                     .map(|_| ())
             },
         )
         .await?;
 
-    let authorization = saga
+    let authorization: Value = saga
         .step(
             || async {
-                ctx.execute_activity_raw(
-                    "authorize_payment",
+                ctx.execute_activity(
+                    &authorize_payment_info(),
                     json!({
                         "customer_profile": customer_profile,
                         "payment_method_id": checkout.payment_method_id,
                         "amount_cents": checkout.subtotal_cents(),
                     }),
-                    PAYMENT_QUEUE,
                 )
                 .await
             },
             |auth| async move {
-                ctx.execute_activity_raw("void_payment_authorization", auth, PAYMENT_QUEUE)
+                ctx.execute_activity::<_, Value>(&void_payment_authorization_info(), auth)
                     .await
                     .map(|_| ())
             },
         )
         .await?;
 
-    let subscription_record = saga
+    let subscription_record: Value = saga
         .step(
             || async {
-                ctx.execute_activity_raw(
-                    "create_subscription_record",
+                ctx.execute_activity(
+                    &create_subscription_record_info(),
                     json!({
                         "subscription_id": subscription_id,
                         "tenant_id": checkout.tenant_id,
@@ -96,12 +100,11 @@ pub async fn billing_checkout(
                         "plan": checkout.plan,
                         "seats": checkout.seats,
                     }),
-                    CHECKOUT_QUEUE,
                 )
                 .await
             },
             |record| async move {
-                ctx.execute_activity_raw("cancel_subscription_record", record, CHECKOUT_QUEUE)
+                ctx.execute_activity::<_, Value>(&cancel_subscription_record_info(), record)
                     .await
                     .map(|_| ())
             },
@@ -134,23 +137,22 @@ pub async fn billing_checkout(
         subtotal_cents: checkout.subtotal_cents(),
         tax_enabled: tax_version >= 2,
     };
-    let invoice = saga
+    let invoice: InvoiceResult = saga
         .step(
             || async {
-                ctx.spawn_child_workflow_raw("issue_initial_invoice", json!(invoice_input))
+                ctx.spawn_child_workflow(&issue_initial_invoice_info(), &invoice_input)
                     .await
             },
-            |invoice| async move {
-                ctx.execute_activity_raw("void_invoice", invoice, INVOICE_QUEUE)
+            |invoice: InvoiceResult| async move {
+                ctx.execute_activity::<_, Value>(&void_invoice_info(), json!(invoice))
                     .await
                     .map(|_| ())
             },
         )
         .await?;
-    let invoice: InvoiceResult = serde_json::from_value(invoice)?;
 
     *status.lock().expect("status lock poisoned") = String::from("awaiting_payment_capture");
-    let capture = ctx.wait_for_signal("payment_captured").await?;
+    let capture: Value = ctx.receive_signal("payment_captured").await?;
     let captured = capture
         .get("captured")
         .and_then(Value::as_bool)
@@ -171,25 +173,23 @@ pub async fn billing_checkout(
     };
     let capture_id = capture_id.to_owned();
 
-    ctx.execute_activity_raw(
-        "record_payment_capture",
+    ctx.execute_activity::<_, Value>(
+        &record_payment_capture_info(),
         json!({
             "subscription_id": subscription_id,
             "invoice_id": invoice.invoice_id,
             "capture_id": capture_id,
         }),
-        PAYMENT_QUEUE,
     )
     .await?;
     ctx.timer("receipt-settlement-window", 1).await?;
-    ctx.execute_activity_raw(
-        "send_receipt",
+    ctx.execute_activity::<_, Value>(
+        &send_receipt_info(),
         json!({
             "tenant_id": checkout.tenant_id,
             "customer_id": checkout.customer_id,
             "invoice_id": invoice.invoice_id,
         }),
-        CHECKOUT_QUEUE,
     )
     .await?;
 
@@ -202,21 +202,28 @@ pub async fn billing_checkout(
     })
 }
 
-#[workflow]
+#[workflow(
+    owner = "billing-team",
+    runbook = "https://wiki.acme.com/invoice-runbook",
+    severity = "sev2"
+)]
 pub async fn issue_initial_invoice(
     ctx: &WorkflowContext,
     request: InvoiceRequest,
 ) -> HarvestResult<InvoiceResult> {
-    let invoice = ctx
-        .execute_activity_raw("create_invoice", json!(request), INVOICE_QUEUE)
+    let invoice: InvoiceResult = ctx
+        .execute_activity(&create_invoice_info(), request)
         .await?;
-    let invoice: InvoiceResult = serde_json::from_value(invoice)?;
-    ctx.execute_activity_raw("send_invoice", json!(invoice), INVOICE_QUEUE)
+    ctx.execute_activity::<_, Value>(&send_invoice_info(), &invoice)
         .await?;
     Ok(invoice)
 }
 
-#[workflow]
+#[workflow(
+    owner = "billing-team",
+    runbook = "https://wiki.acme.com/cycle-runbook",
+    severity = "sev3"
+)]
 pub async fn monthly_billing_cycle(ctx: &WorkflowContext, input: Value) -> HarvestResult<Value> {
     let cycle = input.get("cycle").and_then(Value::as_u64).unwrap_or(1);
     let stop_after = input
@@ -232,13 +239,12 @@ pub async fn monthly_billing_cycle(ctx: &WorkflowContext, input: Value) -> Harve
         }));
     }
 
-    ctx.execute_activity_raw(
-        "charge_subscription",
+    ctx.execute_activity::<_, Value>(
+        &charge_subscription_info(),
         json!({
             "subscription_id": input.get("subscription_id").cloned().unwrap_or(Value::Null),
             "cycle": cycle,
         }),
-        PAYMENT_QUEUE,
     )
     .await?;
     ctx.timer(&format!("next-cycle-{cycle}"), 86_400).await?;

@@ -233,6 +233,7 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 |----------------------------|-------------------------------|--------------|-----------------------------------------------|-----------------------|
 | `METRIC_WORKFLOW_STARTED`  | `harvest.workflow.started`    | Counter      | `workflow.name` (bounded), `queue` (bounded)  | `execution.id`        |
 | `METRIC_WORKFLOW_DURATION` | `harvest.workflow.duration`   | Histogram    | `workflow.name`, `queue`, `status`            | `execution.id`        |
+| `METRIC_WORKFLOW_TERMINAL` | `harvest.workflow.terminal`   | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue`, `outcome` (6 values: completed/failed/cancelled/timed_out/terminated/continued_as_new) | `execution.id` |
 | `METRIC_ACTIVITY_DURATION` | `harvest.activity.duration`   | Histogram    | `activity.name` (bounded), `queue`, `status` | `execution.id`        |
 | `METRIC_TIMER_STARTED`     | `harvest.timer.started`       | Counter      | _(none)_                                      |                       |
 | `METRIC_QUEUE_DEPTH`       | `harvest.queue.depth`         | Gauge        | `queue` (bounded)                             | `execution.id`        |
@@ -240,6 +241,8 @@ The following metrics are defined by the constants in `telemetry.rs`. The
 | `METRIC_SCHEDULE_RUNS`     | `harvest.schedule.runs`       | Counter      | `kind` (2 values), `name` (bounded)           |                       |
 | `METRIC_SCHEDULE_SKIPPED`  | `harvest.schedule.skipped`    | Counter      | `kind`, `name`, `reason` (3 values)           |                       |
 | `METRIC_RETENTION_DELETED` | `harvest.retention.deleted`   | Counter      | `shard` (≤ 256)                               |                       |
+| `METRIC_WORKFLOW_PAUSED`   | `harvest.workflow.paused`     | Counter      | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id`      |
+| `METRIC_WORKFLOW_PAUSE_DURATION` | `harvest.workflow.pause_duration` | Histogram | `workflow` (= `METRIC_LABEL_WORKFLOW`), `queue` | `execution.id` |
 
 **Cardinality rule**: `execution.id` (a UUID) is **explicitly forbidden** as a
 metric label. It is unbounded and would explode the metric time-series in any

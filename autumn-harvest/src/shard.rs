@@ -152,8 +152,8 @@ impl ShardRouter {
 
     /// Pick a shard for a DAG at catalog-compile time.
     ///
-    /// DAG state (`harvest_schedules`, `harvest_dag_runs`) is scoped per
-    /// database, so each DAG must be pinned to a single shard that owns it.
+    /// DAG schedules (`harvest_schedules`) are scoped per database, so each
+    /// DAG must be pinned to a single shard that owns it.
     /// The same name always maps to the same shard because rendezvous hashing
     /// is stable.
     #[must_use]
@@ -220,6 +220,26 @@ impl std::fmt::Debug for ShardedDbPool {
 }
 
 #[cfg(feature = "db")]
+pub static GLOBAL_SHARDED_POOL: std::sync::RwLock<Option<ShardedDbPool>> =
+    std::sync::RwLock::new(None);
+
+#[cfg(feature = "db")]
+pub static GLOBAL_SHARD_ROUTER: std::sync::RwLock<Option<ShardRouter>> =
+    std::sync::RwLock::new(None);
+
+/// Install a `ShardRouter` into the global registry.
+///
+/// This should only be called once during runtime initialization (e.g. by
+/// the `HarvestRunner` or `HarvestApiRuntime`) to avoid race conditions and
+/// overwrites from temporary constructors in tests.
+#[cfg(feature = "db")]
+pub fn install_global_router(router: ShardRouter) {
+    if let Ok(mut lock) = GLOBAL_SHARD_ROUTER.write() {
+        *lock = Some(router);
+    }
+}
+
+#[cfg(feature = "db")]
 impl ShardedDbPool {
     /// Wrap an existing single pool as a one-shard sharded pool at `ShardId(0)`.
     ///
@@ -230,10 +250,14 @@ impl ShardedDbPool {
         let shard = ShardId::new(0);
         let mut pools = BTreeMap::new();
         pools.insert(shard, pool);
-        Self {
+        let this = Self {
             pools,
             default_shard: shard,
+        };
+        if let Ok(mut lock) = GLOBAL_SHARDED_POOL.write() {
+            *lock = Some(this.clone());
         }
+        this
     }
 
     /// Build a sharded pool from a pre-computed map of shard → pool.
@@ -251,10 +275,14 @@ impl ShardedDbPool {
             pools.contains_key(&default_shard),
             "default_shard {default_shard} has no configured pool"
         );
-        Self {
+        let this = Self {
             pools,
             default_shard,
+        };
+        if let Ok(mut lock) = GLOBAL_SHARDED_POOL.write() {
+            *lock = Some(this.clone());
         }
+        this
     }
 
     /// The default shard used when an `ExecutionId` carries the unencoded
@@ -280,6 +308,12 @@ impl ShardedDbPool {
             .expect("default shard pool is always present")
     }
 
+    /// Look up the pool for a shard exactly, with no default fallback.
+    #[must_use]
+    pub fn exact_pool_for(&self, shard: ShardId) -> Option<&DbPool> {
+        self.pools.get(&shard)
+    }
+
     /// Resolve the pool that owns a given `ExecutionId`.
     #[must_use]
     pub fn pool_for_execution(&self, exec_id: ExecutionId) -> &DbPool {
@@ -288,6 +322,16 @@ impl ShardedDbPool {
             return self.pool_for(self.default_shard);
         }
         self.pool_for(shard)
+    }
+
+    /// Resolve the pool that owns a given `ExecutionId` exactly, with no default fallback.
+    #[must_use]
+    pub fn exact_pool_for_execution(&self, exec_id: ExecutionId) -> Option<&DbPool> {
+        let shard = exec_id.shard();
+        if shard.is_unencoded() {
+            return self.pools.get(&self.default_shard);
+        }
+        self.pools.get(&shard)
     }
 
     /// Iterate over `(shard, pool)` pairs in ascending shard order.

@@ -11,9 +11,14 @@ readme = "../README.md"
 keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
 
+[features]
+unified-dag-execution = ["autumn-harvest/unified-dag-execution"]
+webhooks = ["autumn-harvest/db"]
+
+
 [dependencies]
-autumn-harvest = { version = "0.3.0", path = "../autumn-harvest", features = ["db"] }
-autumn-web = "0.4"
+autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", features = ["db"] }
+autumn-web = "0.5"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
@@ -21,6 +26,7 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 tracing = { workspace = true }
 diesel = { workspace = true }
 diesel-async = { workspace = true }
@@ -32,10 +38,12 @@ tower = "0.5"
 maud = { version = "0.27", features = ["axum"] }
 
 [dev-dependencies]
-autumn-harvest = { version = "0.3.0", path = "../autumn-harvest", features = ["db", "testing"] }
+autumn-web = { version = "0.5", features = ["test-support"] }
+autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true

@@ -33,8 +33,9 @@ Stop at any chapter — each one ends in a runnable state.
 6. [Idempotency](06-idempotency.md) — `ctx.idempotency_key()` and subkeys for at-least-once safety.
 7. [Reliability knobs](07-reliability-knobs.md) — retries, concurrency caps, local activities, queues, versioning, search attributes.
 8. [DAGs and schedules](08-dags-and-schedules.md) — `#[dag]`, `DagBuilder`, trigger rules, cron schedules, manual triggers, offline lint/sim/profile.
-9. [Operating the service](09-operations.md) — preflight, dashboard, CLI, DLQ, worker drain, reuse policies.
-10. [Testing your workflow code](10-testing.md) — unit tests and `WorkflowReplayer` regression coverage.
+9. [Worker routing and capabilities](09-worker-routing.md) — Queue name partitioning, Build-ID compatibility, and capability labels.
+10. [Operating the service](10-operations.md) — preflight, dashboard, CLI, DLQ, worker drain, reuse policies.
+11. [Testing your workflow code](11-testing.md) — unit tests and `WorkflowReplayer` regression coverage.
 
 Start with [Chapter 1 →](01-project-skeleton.md)
 

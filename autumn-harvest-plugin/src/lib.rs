@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod config;
+pub mod dag_retry;
 pub mod outbox;
 pub mod plugin;
 pub mod preflight;
@@ -12,6 +13,9 @@ pub mod state;
 pub mod ui;
 pub mod version_gate_retirement;
 pub mod version_usage;
+
+#[cfg(feature = "webhooks")]
+pub mod webhook;
 
 pub use api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,

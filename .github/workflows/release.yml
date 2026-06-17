@@ -36,20 +36,19 @@ jobs:
           fetch-depth: 0
       - name: Install git-cliff
         uses: taiki-e/install-action@git-cliff
+      - name: Verify CHANGELOG.md is current
+        run: |
+          git-cliff --config cliff.toml --output /tmp/CHANGELOG.md
+          perl -0pi -e 's/\n+\z/\n/' /tmp/CHANGELOG.md
+          if ! diff -u CHANGELOG.md /tmp/CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is out of date for ${{ github.ref_name }}. Run git-cliff --config cliff.toml --output CHANGELOG.md and commit it before tagging the release."
+            exit 1
+          fi
       - name: Generate release notes
         id: release-notes
         run: |
           git-cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
-      - name: Update CHANGELOG.md
-        run: |
-          git-cliff --config cliff.toml --output CHANGELOG.md
-      - name: Commit changelog to trunk
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
-          git commit -m "docs: update CHANGELOG.md for ${{ github.ref_name }}"
-          git push origin HEAD:trunk
+          perl -0pi -e 's/\n+\z/\n/' RELEASE_NOTES.md
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:

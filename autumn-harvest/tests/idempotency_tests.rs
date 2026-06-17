@@ -154,13 +154,88 @@ fn with_idempotency_key_overrides_default() {
 #[test]
 fn attempt_returns_one_for_default_test_context() {
     let ctx = ActivityContext::new_test();
-    assert_eq!(ctx.attempt(), Some(1));
+    assert_eq!(ctx.attempt(), 1);
 }
 
 #[test]
 fn with_attempt_sets_attempt_number() {
     let ctx = ActivityContext::new_test().with_attempt(3);
-    assert_eq!(ctx.attempt(), Some(3));
+    assert_eq!(ctx.attempt(), 3);
+}
+
+#[test]
+fn previous_failure_returns_none_on_first_attempt() {
+    let ctx = ActivityContext::new_test();
+    assert_eq!(ctx.previous_failure(), None);
+}
+
+#[test]
+fn with_previous_failure_stores_message() {
+    let ctx = ActivityContext::new_test().with_previous_failure(Some("timeout error".to_string()));
+    assert_eq!(ctx.previous_failure(), Some("timeout error"));
+}
+
+#[test]
+fn with_previous_failure_accepts_none() {
+    let ctx = ActivityContext::new_test().with_previous_failure(None);
+    assert_eq!(ctx.previous_failure(), None);
+}
+
+#[test]
+fn max_attempts_returns_one_for_default_test_context() {
+    let ctx = ActivityContext::new_test();
+    assert_eq!(ctx.max_attempts(), 1);
+}
+
+#[test]
+fn with_max_attempts_sets_value() {
+    let ctx = ActivityContext::new_test().with_max_attempts(5);
+    assert_eq!(ctx.max_attempts(), 5);
+}
+
+#[test]
+fn last_attempt_pattern_compiles_in_five_lines() {
+    // Verify that the "last-attempt escape hatch" pattern from the issue compiles
+    // and works correctly. The pattern must fit in ≤5 non-blank lines of activity body.
+    let ctx = ActivityContext::new_test()
+        .with_attempt(3)
+        .with_max_attempts(3);
+    let is_last = ctx.attempt() == ctx.max_attempts();
+    assert!(is_last, "attempt 3 of 3 should be the last attempt");
+
+    let ctx2 = ActivityContext::new_test()
+        .with_attempt(2)
+        .with_max_attempts(3);
+    assert!(
+        !ctx2.is_last_attempt(),
+        "attempt 2 of 3 is not the last attempt"
+    );
+}
+
+#[test]
+fn is_last_attempt_helper_matches_manual_comparison() {
+    let ctx = ActivityContext::new_test()
+        .with_attempt(3)
+        .with_max_attempts(3);
+    assert!(ctx.is_last_attempt());
+
+    let ctx2 = ActivityContext::new_test()
+        .with_attempt(1)
+        .with_max_attempts(3);
+    assert!(!ctx2.is_last_attempt());
+}
+
+#[test]
+fn is_retrying_returns_true_when_attempt_gt_one() {
+    let ctx = ActivityContext::new_test()
+        .with_attempt(2)
+        .with_max_attempts(3);
+    assert!(ctx.is_retrying());
+
+    let ctx_first = ActivityContext::new_test()
+        .with_attempt(1)
+        .with_max_attempts(3);
+    assert!(!ctx_first.is_retrying());
 }
 
 // ── Default key does not contain PII / input payloads ────────────────────

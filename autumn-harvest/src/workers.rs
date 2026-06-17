@@ -53,9 +53,11 @@ pub struct WorkerRegistration {
     pub build_id: String,
     /// Optional human-readable deployment name, e.g. `"prod-blue"` (issue #171).
     pub deployment_name: Option<String>,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: std::collections::HashMap<String, String>,
 }
 use crate::models::{HarvestWorker, NewHarvestWorker};
-use crate::schema::{harvest_task_queue, harvest_workers};
+use crate::schema::{harvest_task_queue, harvest_workers, harvest_workflow_executions};
 use crate::worker::DbPool;
 
 // ---------------------------------------------------------------------------
@@ -285,7 +287,7 @@ pub fn parse_worker_filters(pairs: &[(String, String)]) -> Result<WorkerFilters,
 ///
 /// Returns [`HarvestError`] on serialization or database failure.
 #[allow(clippy::too_many_arguments)]
-pub async fn register_worker(
+pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
     queues: &[String],
@@ -295,12 +297,14 @@ pub async fn register_worker(
     version: Option<&str>,
     build_id: &str,
     deployment_name: Option<&str>,
+    labels: &std::collections::HashMap<String, String, S>,
 ) -> HarvestResult<()> {
     use diesel::pg::upsert::excluded;
 
     let queues_json = serde_json::to_value(queues).map_err(HarvestError::Serialization)?;
     let shards_json =
         serde_json::to_value(shard_assignments).map_err(HarvestError::Serialization)?;
+    let labels_json = serde_json::to_value(labels).map_err(HarvestError::Serialization)?;
 
     let row = NewHarvestWorker {
         worker_id,
@@ -311,6 +315,7 @@ pub async fn register_worker(
         version,
         build_id,
         deployment_name,
+        labels: labels_json,
     };
 
     diesel::insert_into(harvest_workers::table)
@@ -328,6 +333,7 @@ pub async fn register_worker(
             harvest_workers::version.eq(excluded(harvest_workers::version)),
             harvest_workers::build_id.eq(excluded(harvest_workers::build_id)),
             harvest_workers::deployment_name.eq(excluded(harvest_workers::deployment_name)),
+            harvest_workers::labels.eq(excluded(harvest_workers::labels)),
             harvest_workers::status.eq(WorkerStatus::Active.as_str()),
         ))
         .execute(conn)
@@ -350,11 +356,13 @@ pub async fn heartbeat_worker(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
     in_flight_count: i32,
+    labels: &serde_json::Value,
 ) -> HarvestResult<usize> {
     let affected = diesel::update(harvest_workers::table.find(worker_id))
         .set((
             harvest_workers::last_heartbeat_at.eq(Utc::now()),
             harvest_workers::in_flight_count.eq(in_flight_count),
+            harvest_workers::labels.eq(labels),
         ))
         .execute(conn)
         .await
@@ -693,6 +701,117 @@ pub fn preview_item_from_row(row: &WorkerRow) -> DrainPreviewItem {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PinnedExecutionRow + list_pinned_executions (issue #235)
+// ---------------------------------------------------------------------------
+
+/// Summary of one workflow execution currently sticky-pinned to a worker.
+///
+/// An execution is "live-pinned" when it has a parked task in
+/// `harvest_task_queue` with `sticky_worker_id = <this worker>` and a
+/// non-expired `sticky_until`. That is the authoritative liveness signal:
+/// `harvest_workflow_executions.sticky_worker_id` is only written on terminal
+/// transitions (completed / failed / continued-as-new) and therefore does NOT
+/// reflect currently-suspended executions.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PinnedExecutionRow {
+    /// Unique execution UUID.
+    pub execution_id: Uuid,
+    /// Registered workflow function name.
+    pub workflow_name: String,
+    /// Business-key workflow ID supplied by the caller.
+    pub workflow_id: String,
+    /// Lifecycle state of the execution (e.g. `"Running"`, `"Suspended"`).
+    pub state: String,
+    /// Task queue the parked task is waiting on.
+    pub queue_name: String,
+    /// Wall-clock start time of this execution.
+    pub started_at: DateTime<Utc>,
+    /// When the affinity lease expires (UTC). After this the task becomes
+    /// claimable by any eligible worker.
+    pub sticky_until: DateTime<Utc>,
+}
+
+/// List workflow executions currently soft-pinned to `worker_id` via the
+/// task-queue affinity mechanism (issue #235).
+///
+/// Queries `harvest_task_queue` for parked tasks whose `sticky_worker_id`
+/// matches `worker_id` and whose lease (`sticky_until`) has not yet expired,
+/// then joins to `harvest_workflow_executions` for metadata.
+///
+/// The returned set shrinks as leases expire or executions complete, and grows
+/// as follow-up tasks park back to this worker.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the Postgres query fails.
+pub async fn list_pinned_executions(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<Vec<PinnedExecutionRow>> {
+    use crate::schema::harvest_task_queue;
+    use diesel::dsl::sql;
+    use diesel::sql_types::Nullable;
+    use diesel::sql_types::Timestamptz;
+
+    type Row = (
+        Uuid,                  // harvest_task_queue.workflow_exec_id
+        Option<DateTime<Utc>>, // harvest_task_queue.sticky_until
+        Uuid,                  // harvest_workflow_executions.id
+        String,                // workflow_name
+        String,                // workflow_id
+        String,                // state
+        String,                // queue_name (from execution)
+        DateTime<Utc>,         // started_at
+    );
+
+    let rows: Vec<Row> = harvest_task_queue::table
+        .inner_join(harvest_workflow_executions::table)
+        .filter(harvest_task_queue::sticky_worker_id.eq(worker_id))
+        .filter(harvest_task_queue::sticky_until.gt(sql::<Nullable<Timestamptz>>("NOW()")))
+        .filter(harvest_task_queue::state.eq_any(["PENDING", "RUNNING"]))
+        .select((
+            harvest_task_queue::workflow_exec_id.assume_not_null(),
+            harvest_task_queue::sticky_until,
+            harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
+            harvest_workflow_executions::workflow_id,
+            harvest_workflow_executions::state,
+            harvest_workflow_executions::queue_name,
+            harvest_workflow_executions::started_at,
+        ))
+        .order(harvest_workflow_executions::started_at.asc())
+        .load(conn)
+        .await
+        .map_err(|e| HarvestError::Database(e.to_string()))?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(
+            |(
+                _,
+                sticky_until,
+                exec_id,
+                workflow_name,
+                workflow_id,
+                state,
+                queue_name,
+                started_at,
+            )| {
+                sticky_until.map(|su| PinnedExecutionRow {
+                    execution_id: exec_id,
+                    workflow_name,
+                    workflow_id,
+                    state,
+                    queue_name,
+                    started_at,
+                    sticky_until: su,
+                })
+            },
+        )
+        .collect())
+}
+
 /// Read the current lifecycle status of a worker without modifying it.
 ///
 /// Returns `None` when the worker row does not exist.
@@ -913,6 +1032,7 @@ pub fn spawn_worker_heartbeat(
     remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -923,7 +1043,14 @@ pub fn spawn_worker_heartbeat(
 
             match pool.get().await {
                 Ok(mut conn) => {
-                    match heartbeat_worker(&mut conn, &registration.worker_id, in_flight).await {
+                    match heartbeat_worker(
+                        &mut conn,
+                        &registration.worker_id,
+                        in_flight,
+                        &labels_json,
+                    )
+                    .await
+                    {
                         Ok(0) => {
                             tracing::info!(
                                 worker_id = %registration.worker_id,
@@ -939,6 +1066,7 @@ pub fn spawn_worker_heartbeat(
                                 registration.version.as_deref(),
                                 &registration.build_id,
                                 registration.deployment_name.as_deref(),
+                                &registration.labels,
                             )
                             .await
                             {
@@ -1237,6 +1365,7 @@ mod tests {
             version: Some("0.3.0".to_string()),
             build_id: String::new(),
             deployment_name: None,
+            labels: std::collections::HashMap::new(),
         };
         assert_eq!(reg.worker_id, "w1");
         assert_eq!(reg.queues, vec!["default"]);
@@ -1262,6 +1391,7 @@ mod tests {
                 drain_deadline_at: None,
                 build_id: String::new(),
                 deployment_name: None,
+                labels: serde_json::json!({}),
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],
@@ -1330,6 +1460,7 @@ mod tests {
                 drain_deadline_at: None,
                 build_id: String::new(),
                 deployment_name: None,
+                labels: serde_json::json!({}),
             },
             health: WorkerHealth::Healthy,
             active_task_ids,
@@ -1513,6 +1644,7 @@ mod tests {
                 drain_deadline_at: None,
                 build_id: String::new(),
                 deployment_name: None,
+                labels: serde_json::json!({}),
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],

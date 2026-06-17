@@ -461,6 +461,102 @@ impl FromStr for ExternalActivityToken {
     }
 }
 
+/// Unique identifier for a single `signal_external_workflow` invocation.
+///
+/// Generated when the workflow calls `ctx.signal_external_workflow(...)` and
+/// embedded in the `ExternalSignalRequested`, `ExternalSignalDelivered`, and
+/// `ExternalSignalFailed` events so the request can be correlated with its
+/// outcome during replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExternalSignalId(Uuid);
+
+impl ExternalSignalId {
+    /// Creates a new, random `ExternalSignalId` using a v4 UUID.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Returns the underlying `Uuid`.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Wraps an existing `Uuid` as an `ExternalSignalId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for ExternalSignalId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ExternalSignalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for ExternalSignalId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
+/// Unique identifier for a single `request_cancel_external_workflow` invocation.
+///
+/// Generated when the workflow calls `ctx.request_cancel_external_workflow(...)` and
+/// embedded in the `ExternalCancelRequested`, `ExternalCancelDelivered`, and
+/// `ExternalCancelFailed` events so the request can be correlated with its
+/// outcome during replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ExternalCancelId(Uuid);
+
+impl ExternalCancelId {
+    /// Creates a new, random `ExternalCancelId` using a v4 UUID.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Returns the underlying `Uuid`.
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+
+    /// Wraps an existing `Uuid` as an `ExternalCancelId`.
+    #[must_use]
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for ExternalCancelId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for ExternalCancelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for ExternalCancelId {
+    type Err = uuid::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Uuid::parse_str(s).map(Self)
+    }
+}
+
 /// Durable timer handle within a workflow.
 ///
 /// ## Examples
@@ -714,6 +810,90 @@ impl fmt::Display for IdempotencyKey {
     }
 }
 
+// ── ParentClosePolicy ─────────────────────────────────────────────────────────
+
+/// Determines what happens to a detached child workflow when its parent
+/// reaches a terminal state (Completed, Failed, Cancelled, Terminated, or
+/// execution-timeout).
+///
+/// This is only relevant for children spawned via
+/// [`WorkflowContext::spawn_child_workflow_detached_raw`]. Children spawned via
+/// the await path (`spawn_child_workflow_raw`) pin the parent alive until the
+/// child terminates — no cascade policy is needed.
+///
+/// The three variants mirror Temporal's `ParentClosePolicy` so that operators
+/// with Temporal experience can map their mental model directly.
+///
+/// ## Default
+///
+/// When calling `spawn_child_workflow_detached_raw`, the default policy is
+/// `RequestCancel`. Children that should outlive their parent unconditionally
+/// must opt in to `Abandon` explicitly.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::types::ParentClosePolicy;
+///
+/// let policy = ParentClosePolicy::default();
+/// assert_eq!(policy, ParentClosePolicy::RequestCancel);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentClosePolicy {
+    /// Children continue independently — no cascade when the parent closes.
+    ///
+    /// Use for "fire-and-forget" fan-out and long-lived monitor patterns where
+    /// the child must outlive the parent regardless of how the parent terminates.
+    Abandon,
+    /// Parent close emits a cancel signal at each child's root. Children
+    /// observe `ctx.is_cancelled()` and may exit cleanly, running compensations
+    /// if needed. This is the **default**.
+    ///
+    /// Use when children should be informed of the parent's demise and given a
+    /// chance to shut down gracefully. Children that ignore cancellation will
+    /// continue running; there is no hard-kill guarantee.
+    #[default]
+    RequestCancel,
+    /// Children are force-failed by the executor without running compensations
+    /// or further activities. The child's terminal event will carry the error
+    /// `"ParentClosed"`.
+    ///
+    /// Use for "tear-down cascade" — when the parent's failure means child
+    /// results are meaningless and immediate cleanup of queue tasks is desired.
+    Terminate,
+}
+
+impl ParentClosePolicy {
+    /// Returns the canonical lowercase string representation used in the DB.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Abandon => "abandon",
+            Self::RequestCancel => "request_cancel",
+            Self::Terminate => "terminate",
+        }
+    }
+}
+
+impl fmt::Display for ParentClosePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ParentClosePolicy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "abandon" => Ok(Self::Abandon),
+            "request_cancel" => Ok(Self::RequestCancel),
+            "terminate" => Ok(Self::Terminate),
+            other => Err(format!("unknown ParentClosePolicy: {other:?}")),
+        }
+    }
+}
+
 // ── BuildId ───────────────────────────────────────────────────────────────────
 
 /// Immutable build identifier advertised by a worker process.
@@ -793,6 +973,115 @@ impl DeploymentName {
 impl fmt::Display for DeploymentName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+// ── Priority ──────────────────────────────────────────────────────────────────
+
+/// Task priority for within-queue ordering (issue #249).
+///
+/// Workers claim tasks in `priority DESC, available_at ASC` order, so
+/// higher-priority tasks are claimed before lower-priority ones that arrived
+/// earlier.  Same-priority tasks are FIFO by `available_at`.
+///
+/// The numeric values are chosen so that `Normal = 0` preserves backward
+/// compatibility: pre-upgrade rows written with `priority = 0` continue to
+/// behave as `Normal` without any data migration.
+///
+/// Priority is **queue metadata**, not workflow history.  Changing a task's
+/// priority via `PATCH /tasks/{id}` does not add a `WorkflowEvent`, does not
+/// affect replay determinism, and takes effect on the next claim attempt.
+///
+/// ## Anti-starvation
+///
+/// When `WorkerConfig::priority_aging_secs` is set, a task's effective
+/// priority is boosted by `+1` for every `aging_secs` it has waited in
+/// `PENDING` state.  This bounds the maximum starvation time for `Low`
+/// priority tasks even under sustained high-priority load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    /// Lower than normal; used for bulk background work that should yield to
+    /// all interactive traffic.  Maps to `-1` in the database so `ORDER BY
+    /// priority DESC` places it behind `Normal`.
+    Low,
+    /// Default priority.  Pre-upgrade rows with `priority = 0` are treated as
+    /// `Normal`.  Maps to `0`.
+    #[default]
+    Normal,
+    /// Above-normal urgency; claim-ordered ahead of `Normal` and `Low` tasks.
+    /// Maps to `1`.
+    High,
+    /// Highest urgency lane; use sparingly for incident-response runbooks and
+    /// latency-SLA paths.  Maps to `2`.
+    Critical,
+}
+
+impl Priority {
+    /// Returns the integer value stored in the `priority` column.
+    ///
+    /// `ORDER BY priority DESC` in the claim query ensures `Critical (2) >
+    /// High (1) > Normal (0) > Low (-1)`.
+    #[must_use]
+    pub const fn as_i32(self) -> i32 {
+        match self {
+            Self::Low => -1,
+            Self::Normal => 0,
+            Self::High => 1,
+            Self::Critical => 2,
+        }
+    }
+
+    /// Convert from a database integer back to a `Priority`.
+    ///
+    /// Returns `None` for values outside the declared range so callers can
+    /// handle unknown values gracefully (e.g. treat as `Normal`).
+    #[must_use]
+    pub const fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            -1 => Some(Self::Low),
+            0 => Some(Self::Normal),
+            1 => Some(Self::High),
+            2 => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Low => f.write_str("low"),
+            Self::Normal => f.write_str("normal"),
+            Self::High => f.write_str("high"),
+            Self::Critical => f.write_str("critical"),
+        }
+    }
+}
+
+impl std::str::FromStr for Priority {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "normal" => Ok(Self::Normal),
+            "high" => Ok(Self::High),
+            "critical" => Ok(Self::Critical),
+            other => Err(format!(
+                "unknown priority '{other}'; expected low | normal | high | critical"
+            )),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Priority {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 

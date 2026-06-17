@@ -25,6 +25,7 @@ use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
@@ -45,6 +46,7 @@ fn build_test_pool(database_url: &str) -> DbPool {
 
 async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -153,6 +155,7 @@ async fn create_harvest_role_without_sequence_usage(database_url: &str) -> Strin
 
 async fn setup_two_shards_with_migrations() -> ((String, String), ContainerAsync<Postgres>) {
     let container = Postgres::default()
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -209,6 +212,17 @@ fn workflow_info() -> WorkflowInfo {
         name: "echo_workflow",
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
     }
 }
 
@@ -220,10 +234,18 @@ fn activity_info(queue: Option<&'static str>) -> ActivityInfo {
         default_start_to_close: None,
         default_heartbeat_timeout: None,
         default_schedule_to_start: None,
+        default_schedule_to_close: None,
         default_queue: queue,
         max_concurrent: None,
         concurrency_key: None,
         is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        circuit_breaker: None,
+        requires: None,
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
     }
 }
@@ -293,6 +315,7 @@ async fn register_active_worker(pool: &DbPool, worker_id: &str, queues: &[String
         Some(env!("CARGO_PKG_VERSION")),
         "",
         None,
+        &std::collections::HashMap::new(),
     )
     .await
     .expect("worker registration should succeed");

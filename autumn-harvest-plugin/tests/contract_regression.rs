@@ -231,7 +231,10 @@ fn contract_request_fields_match_code_registry() {
     }
 }
 
-/// No contract route may be both `read_only:true` and use a mutating HTTP method.
+/// No contract route may be both `read_only:true` and use a mutating HTTP method,
+/// unless the route is annotated with `post_for_body_only:true` to signal that
+/// POST was chosen solely to allow a structured request body and the route never
+/// writes workflow events (e.g. `POST /workflows/{id}/query/{query_name}`).
 #[test]
 fn contract_read_only_classification_is_consistent() {
     let contract = load_contract();
@@ -241,11 +244,13 @@ fn contract_read_only_classification_is_consistent() {
         let method = route["method"].as_str().unwrap_or("");
         let path = route["path"].as_str().unwrap_or("");
         let read_only = route["read_only"].as_bool().unwrap_or(false);
+        let post_for_body_only = route["post_for_body_only"].as_bool().unwrap_or(false);
 
-        if mutating_methods.contains(&method) {
+        if mutating_methods.contains(&method) && !post_for_body_only {
             assert!(
                 !read_only,
-                "route {method} {path} uses a mutating HTTP method but is marked read_only:true"
+                "route {method} {path} uses a mutating HTTP method but is marked read_only:true \
+                 (set post_for_body_only:true if POST is used only for body-passing)"
             );
         }
     }

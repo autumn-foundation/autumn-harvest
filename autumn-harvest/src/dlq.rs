@@ -4,6 +4,9 @@
 //! table for post-mortem inspection and potential manual reprocessing. This is
 //! the final resting place for permanently failed tasks.
 
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -17,6 +20,7 @@ use uuid::Uuid;
 use crate::error::{HarvestError, HarvestResult};
 use crate::models::{DeadLetter, NewDeadLetter};
 use crate::queue::{EnqueueParams, TaskType};
+use crate::worker::HandlerRegistry;
 
 pub const DEFAULT_BULK_LIMIT: u32 = 100;
 /// Maximum number of DLQ rows a single bulk operation can act on.
@@ -106,6 +110,14 @@ pub enum DeadLetterReason {
         cap: u64,
         workflow_type: String,
     },
+    /// A task crashed the worker process `crash_strikes` times in a row
+    /// (issue #367). The orphan-reclaim scanner quarantined it instead of
+    /// re-dispatching it to crash another worker. `last_worker_id` is the
+    /// worker that held the row when the final strike was observed.
+    PoisonPill {
+        crash_strikes: i32,
+        last_worker_id: Option<String>,
+    },
 }
 
 impl std::fmt::Display for DeadLetterReason {
@@ -149,6 +161,8 @@ fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult
 ///     input: serde_json::json!({"to": "user@example.com"}),
 ///     error: "connection refused".to_string(),
 ///     attempts: 3,
+///     owner: None,
+///     severity: None,
 /// };
 /// ```
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -161,6 +175,8 @@ pub struct NewDeadLetterEntry {
     pub input: serde_json::Value,
     pub error: String,
     pub attempts: i32,
+    pub owner: Option<String>,
+    pub severity: Option<String>,
 }
 
 /// Insert a task into the dead-letter queue and return the generated DLQ entry ID.
@@ -183,6 +199,8 @@ pub async fn dead_letter(
         input: entry.input.clone(),
         error: &entry.error,
         attempts: entry.attempts,
+        owner: entry.owner.as_deref(),
+        severity: entry.severity.as_deref(),
     };
 
     let inserted: Vec<Uuid> = diesel::insert_into(harvest_dead_letters::table)
@@ -223,12 +241,20 @@ pub async fn dead_letter_count(conn: &mut AsyncPgConnection) -> HarvestResult<i6
 pub async fn list_dead_letters(
     conn: &mut AsyncPgConnection,
     limit: i64,
+    owner: Option<&str>,
 ) -> HarvestResult<Vec<DeadLetter>> {
     use crate::schema::harvest_dead_letters::dsl;
 
-    dsl::harvest_dead_letters
+    let mut query = dsl::harvest_dead_letters
+        .into_boxed()
         .order(dsl::failed_at.desc())
-        .limit(limit)
+        .limit(limit);
+
+    if let Some(o) = owner {
+        query = query.filter(dsl::owner.eq(o.to_string()));
+    }
+
+    query
         .select(DeadLetter::as_select())
         .load(conn)
         .await
@@ -250,6 +276,7 @@ pub async fn list_dead_letters(
 pub async fn replay_dead_letter(
     conn: &mut AsyncPgConnection,
     dead_letter_id: Uuid,
+    registry: Option<&HandlerRegistry>,
 ) -> HarvestResult<Uuid> {
     use crate::schema::harvest_dead_letters::dsl;
 
@@ -272,18 +299,57 @@ pub async fn replay_dead_letter(
             params.activity_name = entry.activity_name;
             params.max_attempts = entry.attempts.max(1);
 
-            // Restore required_build_id from the owning execution so the
-            // replayed task is only claimable by a compatible worker build.
+            // Restore required_build_id and concurrency policy from the owning
+            // execution so the replayed task is subject to the same constraints.
             if let Some(exec_id) = params.workflow_exec_id {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-                let build_id: Option<Option<String>> = exec_dsl::harvest_workflow_executions
-                    .find(exec_id)
-                    .select(exec_dsl::assigned_build_id)
-                    .first(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                params.required_build_id = build_id.flatten();
+                let row: Option<(Option<String>, String, String)> =
+                    exec_dsl::harvest_workflow_executions
+                        .find(exec_id)
+                        .select((
+                            exec_dsl::assigned_build_id,
+                            exec_dsl::workflow_name,
+                            exec_dsl::state,
+                        ))
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+                if let Some((build_id, workflow_name, state)) = row {
+                    // Refuse to revive a task into a workflow that has already
+                    // reached a terminal state. Re-running the activity/workflow
+                    // task would execute user code and append events against a
+                    // dead execution, corrupting its history (issue #367). This
+                    // is what makes a poison-pill activity DLQ entry — whose
+                    // owning workflow is failed at quarantine time —
+                    // non-replayable.
+                    if state != "RUNNING" {
+                        return Err(HarvestError::WorkflowNotRunning(
+                            exec_id.to_string().parse().map_err(|_| {
+                                HarvestError::Database(format!(
+                                    "execution id {exec_id} is not a valid ExecutionId"
+                                ))
+                            })?,
+                        ));
+                    }
+                    params.required_build_id = build_id;
+                    // Concurrency policy lives on WorkflowInfo and governs
+                    // workflow-task slots only.  Activity tasks are not subject
+                    // to the workflow-level cap (the claim query enforces caps
+                    // per task_type, so mixing them would throttle activities
+                    // against the wrong budget).
+                    if task_type == TaskType::Workflow
+                        && let Some(reg) = registry
+                        && let Some(info) = reg.workflows.get(&workflow_name)
+                        && let Some(policy) = &info.concurrency
+                    {
+                        params.concurrency_key = crate::concurrency::resolve_concurrency_key(
+                            policy.key_expr,
+                            &params.input,
+                        );
+                        params.max_concurrent = Some(policy.limit);
+                    }
+                }
             }
 
             let task_id = crate::queue::enqueue(conn, &params).await?;
@@ -404,6 +470,7 @@ async fn query_dead_letters_for_bulk(
 pub async fn bulk_replay_dead_letters(
     conn: &mut AsyncPgConnection,
     filter: &BulkDlqFilter,
+    registry: Option<&HandlerRegistry>,
 ) -> HarvestResult<BulkDlqResult> {
     let matched = usize::try_from(count_bulk_filter_matches(conn, filter).await?).unwrap_or(0);
     let rows = query_dead_letters_for_bulk(conn, filter).await?;
@@ -426,7 +493,7 @@ pub async fn bulk_replay_dead_letters(
     let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
 
     for row in &rows {
-        match replay_dead_letter(conn, row.id).await {
+        match replay_dead_letter(conn, row.id, registry).await {
             Ok(_task_id) => {
                 acted_on += 1;
                 acted_ids.push(row.id.to_string());
@@ -522,6 +589,714 @@ pub async fn bulk_discard_dead_letters(
 }
 
 // ---------------------------------------------------------------------------
+// Root-cause aggregation (issue #385)
+// ---------------------------------------------------------------------------
+//
+// The DLQ aggregation endpoint answers the operator's first incident question —
+// "what is the shape of this fire?" — by grouping dead-letter rows along a small,
+// named set of dimensions and returning per-group counts plus a handful of
+// representative `dead_letter_id`s. It is a read-path-only feature: no new
+// `WorkflowEvent` variants and no schema change.
+//
+// **Signature derivation choice.** `harvest_dead_letters.error` is freeform
+// `TEXT`, so grouping on the raw column yields a long tail of singletons. This
+// slice implements the *compute-on-read normalized substring* option (the
+// zero-migration choice called out in the issue): [`failure_signature`] takes
+// the first line of the error, normalizes dynamic runs (UUIDs, long hex strings,
+// and decimal integers) to fixed placeholders, and truncates to
+// [`SIGNATURE_MAX_LEN`] characters. Because it is a pure function of the error
+// text, the same root cause aggregates identically across queries and across
+// shards.
+
+/// Maximum length of a derived failure signature, in characters.
+pub const SIGNATURE_MAX_LEN: usize = 200;
+
+/// Default cap on the number of groups returned by an aggregation query.
+pub const DEFAULT_LIMIT_GROUPS: u32 = 50;
+/// Hard ceiling on `limit_groups`.
+pub const MAX_LIMIT_GROUPS: u32 = 500;
+/// Default number of sample `dead_letter_id`s included per group.
+pub const DEFAULT_SAMPLES_PER_GROUP: u32 = 3;
+/// Hard ceiling on `samples_per_group`.
+pub const MAX_SAMPLES_PER_GROUP: u32 = 10;
+
+const PLACEHOLDER_UUID: &str = "<UUID>";
+const PLACEHOLDER_HEX: &str = "<HEX>";
+const PLACEHOLDER_NUM: &str = "<NUM>";
+
+/// Derive a stable, deterministic failure signature from a freeform DLQ error.
+///
+/// The signature is the first line of `error`, with dynamic runs (UUIDs, long
+/// hex strings, and decimal integers) normalized to fixed placeholders and the
+/// result truncated to [`SIGNATURE_MAX_LEN`] characters. It is a pure function
+/// of its input, so it is identical across queries and across shards for the
+/// same root-cause error text (issue #385).
+#[must_use]
+pub fn failure_signature(error: &str) -> String {
+    let first_line = error.lines().next().unwrap_or("").trim();
+    let normalized = normalize_dynamic_runs(first_line);
+    truncate_chars(normalized.trim(), SIGNATURE_MAX_LEN)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
+const fn is_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+}
+
+fn normalize_dynamic_runs(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut token = String::new();
+    for ch in input.chars() {
+        if is_token_char(ch) {
+            token.push(ch);
+        } else {
+            if !token.is_empty() {
+                out.push_str(&normalize_token(&token));
+                token.clear();
+            }
+            out.push(ch);
+        }
+    }
+    if !token.is_empty() {
+        out.push_str(&normalize_token(&token));
+    }
+    out
+}
+
+fn normalize_token(token: &str) -> String {
+    if is_uuid(token) {
+        return PLACEHOLDER_UUID.to_string();
+    }
+    if is_hex_run(token) {
+        return PLACEHOLDER_HEX.to_string();
+    }
+    replace_digit_runs(token)
+}
+
+fn is_uuid(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, b)| {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            *b == b'-'
+        } else {
+            b.is_ascii_hexdigit()
+        }
+    })
+}
+
+fn is_hex_run(token: &str) -> bool {
+    if let Some(body) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
+        return !body.is_empty() && body.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    // Plain hex: require length >= 8 to avoid normalizing short words, and
+    // require at least one hex letter (a-f/A-F) so pure decimal strings ≥8
+    // digits fall through to replace_digit_runs instead of becoming <HEX>.
+    token.len() >= 8
+        && token.bytes().all(|b| b.is_ascii_hexdigit())
+        && token
+            .bytes()
+            .any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
+}
+
+fn replace_digit_runs(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut in_digits = false;
+    for ch in token.chars() {
+        if ch.is_ascii_digit() {
+            if !in_digits {
+                out.push_str(PLACEHOLDER_NUM);
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// A dimension the DLQ aggregation can group on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DlqGroupDimension {
+    /// Workflow name of the owning execution (resolved via `workflow_exec_id`).
+    WorkflowName,
+    /// Activity name recorded on the dead-letter row.
+    ActivityName,
+    /// Task queue name.
+    QueueName,
+    /// Task type (`WORKFLOW` / `ACTIVITY`).
+    TaskType,
+    /// `failed_at` truncated to the configured [`TimeBucketGranularity`].
+    TimeBucket,
+    /// Derived [`failure_signature`] of the error text.
+    FailureSignature,
+}
+
+impl DlqGroupDimension {
+    /// Wire name used in query parameters and response keys.
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::WorkflowName => "workflow_name",
+            Self::ActivityName => "activity_name",
+            Self::QueueName => "queue_name",
+            Self::TaskType => "task_type",
+            Self::TimeBucket => "time_bucket",
+            Self::FailureSignature => "failure_signature",
+        }
+    }
+
+    /// Parse a dimension from its wire name, or `None` if unknown.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "workflow_name" => Self::WorkflowName,
+            "activity_name" => Self::ActivityName,
+            "queue_name" => Self::QueueName,
+            "task_type" => Self::TaskType,
+            "time_bucket" => Self::TimeBucket,
+            "failure_signature" => Self::FailureSignature,
+            _ => return None,
+        })
+    }
+}
+
+/// Granularity of the `time_bucket` `group_by` dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeBucketGranularity {
+    /// Truncate `failed_at` to the hour.
+    Hour,
+    /// Truncate `failed_at` to the day.
+    Day,
+}
+
+impl TimeBucketGranularity {
+    /// Format a timestamp into its bucket key.
+    #[must_use]
+    pub fn format(self, ts: DateTime<Utc>) -> String {
+        match self {
+            Self::Hour => ts.format("%Y-%m-%dT%H:00:00Z").to_string(),
+            Self::Day => ts.format("%Y-%m-%d").to_string(),
+        }
+    }
+}
+
+/// Parsed, validated parameters for a DLQ aggregation query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DlqAggregateParams {
+    /// Ordered, de-duplicated grouping dimensions (hierarchical key).
+    pub group_by: Vec<DlqGroupDimension>,
+    /// Granularity for the `time_bucket` dimension.
+    pub time_bucket: TimeBucketGranularity,
+    /// Filter: exact workflow name (applied before grouping).
+    pub workflow_name: Option<String>,
+    /// Filter: exact activity name.
+    pub activity_name: Option<String>,
+    /// Filter: exact queue name.
+    pub queue_name: Option<String>,
+    /// Filter: exact task type (`"activity"` or `"workflow"`, case-insensitive).
+    pub task_type: Option<String>,
+    /// Filter: inclusive lower bound on `failed_at`.
+    pub since: Option<DateTime<Utc>>,
+    /// Filter: exclusive upper bound on `failed_at`.
+    pub until: Option<DateTime<Utc>>,
+    /// Filter: minimum number of attempts.
+    pub min_attempts: Option<i32>,
+    /// Cap on returned groups; long tail rolls into `_other`.
+    pub limit_groups: u32,
+    /// Number of sample `dead_letter_id`s per group.
+    pub samples_per_group: u32,
+}
+
+impl Default for DlqAggregateParams {
+    fn default() -> Self {
+        Self {
+            group_by: Vec::new(),
+            time_bucket: TimeBucketGranularity::Hour,
+            workflow_name: None,
+            activity_name: None,
+            queue_name: None,
+            task_type: None,
+            since: None,
+            until: None,
+            min_attempts: None,
+            limit_groups: DEFAULT_LIMIT_GROUPS,
+            samples_per_group: DEFAULT_SAMPLES_PER_GROUP,
+        }
+    }
+}
+
+impl DlqAggregateParams {
+    /// Parse and validate query-string pairs into aggregation parameters.
+    ///
+    /// `now` anchors relative durations (e.g. `since=24h`). Unknown query keys
+    /// are ignored (forward-compatible), but invalid values for known keys —
+    /// an unknown `group_by` dimension, a malformed duration, or an out-of-range
+    /// `limit_groups`/`samples_per_group` — return `Err(message)` so the caller
+    /// can answer `400 Bad Request` rather than silently matching nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable error message string on any invalid parameter
+    /// value, or when no `group_by` dimension is supplied.
+    pub fn from_query_pairs(
+        pairs: &[(String, String)],
+        now: DateTime<Utc>,
+    ) -> Result<Self, String> {
+        let mut params = Self::default();
+
+        for (key, value) in pairs {
+            match key.as_str() {
+                "group_by" => {
+                    let dim = DlqGroupDimension::from_wire(value.trim()).ok_or_else(|| {
+                        format!(
+                            "unknown group_by dimension '{value}'; expected one of: \
+                             workflow_name, activity_name, queue_name, task_type, \
+                             time_bucket, failure_signature"
+                        )
+                    })?;
+                    if !params.group_by.contains(&dim) {
+                        params.group_by.push(dim);
+                    }
+                }
+                "time_bucket" => {
+                    params.time_bucket = match value.trim() {
+                        "hour" => TimeBucketGranularity::Hour,
+                        "day" => TimeBucketGranularity::Day,
+                        other => {
+                            return Err(format!(
+                                "invalid time_bucket '{other}'; expected 'hour' or 'day'"
+                            ));
+                        }
+                    };
+                }
+                "workflow_name" => set_filter(&mut params.workflow_name, value),
+                "activity_name" => set_filter(&mut params.activity_name, value),
+                "queue_name" => set_filter(&mut params.queue_name, value),
+                "task_type" => {
+                    let v = value.trim();
+                    if !v.eq_ignore_ascii_case("activity") && !v.eq_ignore_ascii_case("workflow") {
+                        return Err(format!(
+                            "invalid task_type '{v}'; expected 'activity' or 'workflow'"
+                        ));
+                    }
+                    params.task_type = Some(v.to_string());
+                }
+                "since" => params.since = Some(parse_instant("since", value, now)?),
+                "until" => params.until = Some(parse_instant("until", value, now)?),
+                "min_attempts" => {
+                    let n: i32 = value.trim().parse().map_err(|_| {
+                        format!("invalid min_attempts '{value}'; expected a non-negative integer")
+                    })?;
+                    if n < 0 {
+                        return Err(format!(
+                            "invalid min_attempts '{value}'; expected a non-negative integer"
+                        ));
+                    }
+                    params.min_attempts = Some(n);
+                }
+                "limit_groups" => {
+                    let n: u32 = value.trim().parse().map_err(|_| {
+                        format!(
+                            "invalid limit_groups '{value}'; expected an integer in [1, {MAX_LIMIT_GROUPS}]"
+                        )
+                    })?;
+                    if !(1..=MAX_LIMIT_GROUPS).contains(&n) {
+                        return Err(format!(
+                            "invalid limit_groups '{value}'; expected an integer in [1, {MAX_LIMIT_GROUPS}]"
+                        ));
+                    }
+                    params.limit_groups = n;
+                }
+                "samples_per_group" => {
+                    let n: u32 = value.trim().parse().map_err(|_| {
+                        format!(
+                            "invalid samples_per_group '{value}'; expected an integer in [0, {MAX_SAMPLES_PER_GROUP}]"
+                        )
+                    })?;
+                    if n > MAX_SAMPLES_PER_GROUP {
+                        return Err(format!(
+                            "invalid samples_per_group '{value}'; expected an integer in [0, {MAX_SAMPLES_PER_GROUP}]"
+                        ));
+                    }
+                    params.samples_per_group = n;
+                }
+                _ => {}
+            }
+        }
+
+        if params.group_by.is_empty() {
+            return Err("at least one group_by dimension is required".to_string());
+        }
+
+        Ok(params)
+    }
+}
+
+fn set_filter(slot: &mut Option<String>, value: &str) {
+    let trimmed = value.trim();
+    if !trimmed.is_empty() {
+        *slot = Some(trimmed.to_string());
+    }
+}
+
+fn parse_instant(field: &str, value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    let trimmed = value.trim();
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(parsed.with_timezone(&Utc));
+    }
+    if let Some(dur) = crate::task_duration(trimmed)
+        && let Ok(chrono_dur) = chrono::Duration::from_std(dur)
+    {
+        return Ok(now - chrono_dur);
+    }
+    Err(format!(
+        "invalid {field} '{value}'; expected an RFC 3339 timestamp or a relative \
+         duration like '24h'"
+    ))
+}
+
+/// A single grouped result with its raw (per-dimension) key, used internally
+/// before the key is rendered to JSON. Shared by the per-shard DB aggregator
+/// and the cross-shard merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DlqRawGroup {
+    /// Per-dimension values aligned with [`DlqAggregateParams::group_by`].
+    /// `None` represents a missing/null dimension value (e.g. no activity name).
+    pub key: Vec<Option<String>>,
+    /// Number of DLQ rows in this group.
+    pub count: i64,
+    /// Earliest `failed_at` in the group.
+    pub first_seen: Option<DateTime<Utc>>,
+    /// Latest `failed_at` in the group.
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Representative `dead_letter_id`s (capped at `samples_per_group`).
+    pub sample_ids: Vec<String>,
+}
+
+/// Per-shard partial aggregate, merged across shards by [`merge_dlq_aggregates`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DlqAggregatePartial {
+    /// Total DLQ rows on this shard, before filters.
+    pub total: i64,
+    /// DLQ rows on this shard matching the filters, before grouping.
+    pub filtered_total: i64,
+    /// Per-group partial counts on this shard.
+    pub groups: Vec<DlqRawGroup>,
+}
+
+/// One group in the merged aggregation response.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DlqGroup {
+    /// Hierarchical key: a JSON object mapping each grouping dimension to its
+    /// value, or `{"_other": true}` for the long-tail rollup row.
+    pub key: serde_json::Value,
+    /// Number of DLQ rows in this group, summed across shards.
+    pub count: i64,
+    /// Earliest `failed_at` across shards (omitted for the `_other` row).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_seen: Option<DateTime<Utc>>,
+    /// Latest `failed_at` across shards (omitted for the `_other` row).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<DateTime<Utc>>,
+    /// Representative `dead_letter_id`s, taken from any shard.
+    pub sample_dead_letter_ids: Vec<String>,
+}
+
+/// The full DLQ aggregation response.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DlqAggregateResponse {
+    /// Total DLQ rows across all shards, before filters.
+    pub total: i64,
+    /// DLQ rows across all shards matching the filters, before grouping.
+    pub filtered_total: i64,
+    /// Returned groups, ordered by descending count.
+    pub groups: Vec<DlqGroup>,
+    /// `true` when the long tail was rolled into an `_other` group.
+    pub truncated: bool,
+}
+
+fn min_instant(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+fn max_instant(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+fn render_group_key(params: &DlqAggregateParams, key: &[Option<String>]) -> serde_json::Value {
+    let mut obj = serde_json::Map::with_capacity(key.len());
+    for (dim, value) in params.group_by.iter().zip(key.iter()) {
+        let v = value
+            .clone()
+            .map_or(serde_json::Value::Null, serde_json::Value::String);
+        obj.insert(dim.as_wire().to_string(), v);
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Merge per-shard partial aggregates into a single response.
+///
+/// Counts sum across shards; `first_seen`/`last_seen` take the global min/max;
+/// sample IDs are taken from any shard up to `samples_per_group`. Groups are
+/// ordered by descending count (ties broken by key for determinism). When more
+/// than `limit_groups` distinct groups exist, the long tail is rolled into a
+/// single `{"_other": true}` group so the per-group counts reconcile to
+/// `filtered_total`, and `truncated` is set to `true`.
+#[must_use]
+pub fn merge_dlq_aggregates(
+    params: &DlqAggregateParams,
+    partials: Vec<DlqAggregatePartial>,
+) -> DlqAggregateResponse {
+    let mut total = 0i64;
+    let mut filtered_total = 0i64;
+    let mut merged: HashMap<Vec<Option<String>>, DlqRawGroup> = HashMap::new();
+
+    for partial in partials {
+        total += partial.total;
+        filtered_total += partial.filtered_total;
+        for group in partial.groups {
+            let entry = merged
+                .entry(group.key.clone())
+                .or_insert_with(|| DlqRawGroup {
+                    key: group.key.clone(),
+                    count: 0,
+                    first_seen: None,
+                    last_seen: None,
+                    sample_ids: Vec::new(),
+                });
+            entry.count += group.count;
+            entry.first_seen = min_instant(entry.first_seen, group.first_seen);
+            entry.last_seen = max_instant(entry.last_seen, group.last_seen);
+            for id in group.sample_ids {
+                if entry.sample_ids.len() < params.samples_per_group as usize {
+                    entry.sample_ids.push(id);
+                }
+            }
+        }
+    }
+
+    let mut groups: Vec<DlqRawGroup> = merged.into_values().collect();
+    groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
+
+    let limit = params.limit_groups as usize;
+    let mut out = Vec::new();
+    let mut truncated = false;
+
+    if groups.len() > limit {
+        let other_count: i64 = groups[limit..].iter().map(|g| g.count).sum();
+        for group in &groups[..limit] {
+            out.push(DlqGroup {
+                key: render_group_key(params, &group.key),
+                count: group.count,
+                first_seen: group.first_seen,
+                last_seen: group.last_seen,
+                sample_dead_letter_ids: group.sample_ids.clone(),
+            });
+        }
+        if other_count > 0 {
+            out.push(DlqGroup {
+                key: serde_json::json!({ "_other": true }),
+                count: other_count,
+                first_seen: None,
+                last_seen: None,
+                sample_dead_letter_ids: Vec::new(),
+            });
+            truncated = true;
+        }
+    } else {
+        for group in &groups {
+            out.push(DlqGroup {
+                key: render_group_key(params, &group.key),
+                count: group.count,
+                first_seen: group.first_seen,
+                last_seen: group.last_seen,
+                sample_dead_letter_ids: group.sample_ids.clone(),
+            });
+        }
+    }
+
+    DlqAggregateResponse {
+        total,
+        filtered_total,
+        groups: out,
+        truncated,
+    }
+}
+
+type AggregateRow = (
+    Uuid,
+    Option<Uuid>,
+    Option<String>,
+    String,
+    String,
+    DateTime<Utc>,
+    String,
+);
+
+/// Compute a per-shard DLQ aggregate against the connection's own database.
+///
+/// Loads the filtered dead-letter rows and groups them in process so the derived
+/// [`failure_signature`] (which has no stored column) can be computed on read.
+/// The returned [`DlqAggregatePartial`] is shard-local; callers fan out across
+/// shards with `iter_shards()` and combine the partials with
+/// [`merge_dlq_aggregates`].
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+pub async fn aggregate_dead_letters(
+    conn: &mut AsyncPgConnection,
+    params: &DlqAggregateParams,
+) -> HarvestResult<DlqAggregatePartial> {
+    use crate::schema::harvest_dead_letters::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Bool, Text};
+
+    let total: i64 = dsl::harvest_dead_letters
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let mut query = dsl::harvest_dead_letters.into_boxed();
+    if let Some(ref name) = params.activity_name {
+        query = query.filter(dsl::activity_name.eq(name.clone()));
+    }
+    if let Some(ref q) = params.queue_name {
+        query = query.filter(dsl::queue_name.eq(q.clone()));
+    }
+    if let Some(ref tt) = params.task_type {
+        query = query.filter(
+            sql::<Bool>("LOWER(task_type) = LOWER(")
+                .bind::<Text, _>(tt.clone())
+                .sql(")"),
+        );
+    }
+    if let Some(since) = params.since {
+        query = query.filter(dsl::failed_at.ge(since));
+    }
+    if let Some(until) = params.until {
+        query = query.filter(dsl::failed_at.lt(until));
+    }
+    if let Some(min) = params.min_attempts {
+        query = query.filter(dsl::attempts.ge(min));
+    }
+    if let Some(ref wf_name) = params.workflow_name {
+        query = query.filter(
+            sql::<Bool>(
+                "workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = ",
+            )
+            .bind::<Text, _>(wf_name.clone())
+            .sql(")"),
+        );
+    }
+
+    let rows: Vec<AggregateRow> = query
+        .select((
+            dsl::id,
+            dsl::workflow_exec_id,
+            dsl::activity_name,
+            dsl::queue_name,
+            dsl::task_type,
+            dsl::failed_at,
+            dsl::error,
+        ))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let filtered_total = i64::try_from(rows.len()).unwrap_or(i64::MAX);
+
+    // Resolve workflow names only when grouping on that dimension.
+    let workflow_names = if params.group_by.contains(&DlqGroupDimension::WorkflowName) {
+        let exec_ids: Vec<Uuid> = rows.iter().filter_map(|r| r.1).collect();
+        load_workflow_names(conn, &exec_ids).await?
+    } else {
+        HashMap::new()
+    };
+
+    let mut groups: HashMap<Vec<Option<String>>, DlqRawGroup> = HashMap::new();
+    for (id, exec_id, activity_name, queue_name, task_type, failed_at, error) in rows {
+        let key: Vec<Option<String>> = params
+            .group_by
+            .iter()
+            .map(|dim| match dim {
+                DlqGroupDimension::WorkflowName => {
+                    exec_id.and_then(|e| workflow_names.get(&e).cloned())
+                }
+                DlqGroupDimension::ActivityName => activity_name.clone(),
+                DlqGroupDimension::QueueName => Some(queue_name.clone()),
+                DlqGroupDimension::TaskType => Some(task_type.clone()),
+                DlqGroupDimension::TimeBucket => Some(params.time_bucket.format(failed_at)),
+                DlqGroupDimension::FailureSignature => Some(failure_signature(&error)),
+            })
+            .collect();
+
+        let entry = groups.entry(key.clone()).or_insert_with(|| DlqRawGroup {
+            key,
+            count: 0,
+            first_seen: None,
+            last_seen: None,
+            sample_ids: Vec::new(),
+        });
+        entry.count += 1;
+        entry.first_seen = min_instant(entry.first_seen, Some(failed_at));
+        entry.last_seen = max_instant(entry.last_seen, Some(failed_at));
+        if entry.sample_ids.len() < params.samples_per_group as usize {
+            entry.sample_ids.push(id.to_string());
+        }
+    }
+
+    Ok(DlqAggregatePartial {
+        total,
+        filtered_total,
+        groups: groups.into_values().collect(),
+    })
+}
+
+async fn load_workflow_names(
+    conn: &mut AsyncPgConnection,
+    exec_ids: &[Uuid],
+) -> HarvestResult<HashMap<Uuid, String>> {
+    use crate::schema::harvest_workflow_executions::dsl as wf;
+
+    if exec_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(Uuid, String)> = wf::harvest_workflow_executions
+        .filter(wf::id.eq_any(exec_ids))
+        .select((wf::id, wf::workflow_name))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows.into_iter().collect())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -540,6 +1315,8 @@ mod tests {
             input: serde_json::json!({"to": "alice@example.com"}),
             error: "SMTP connection refused after 3 attempts".into(),
             attempts: 3,
+            owner: None,
+            severity: None,
         };
 
         assert_eq!(entry.queue_name, "email-queue");
@@ -561,6 +1338,8 @@ mod tests {
             input: serde_json::Value::Null,
             error: "unknown failure".into(),
             attempts: 1,
+            owner: None,
+            severity: None,
         };
 
         assert!(entry.workflow_exec_id.is_none());
@@ -592,6 +1371,25 @@ mod tests {
 
         assert_eq!(back, reason);
         assert!(json.contains("HistoryCapExceeded"));
+    }
+
+    #[test]
+    fn dead_letter_reason_poison_pill_is_typed_json() {
+        let reason = DeadLetterReason::PoisonPill {
+            crash_strikes: 3,
+            last_worker_id: Some("worker-7".into()),
+        };
+
+        let json = reason.to_string();
+        let back: DeadLetterReason =
+            serde_json::from_str(&json).expect("typed reason should deserialize");
+
+        assert_eq!(back, reason);
+        // Carries the discriminator distinguishing it from clean retry exhaustion,
+        // plus the crash-strike count and last worker for triage (issue #367 AC5).
+        assert!(json.contains("PoisonPill"));
+        assert!(json.contains("crash_strikes"));
+        assert!(json.contains("worker-7"));
     }
 
     #[test]
@@ -693,6 +1491,405 @@ mod tests {
         assert!(back.dry_run);
     }
 
+    // ----- Failure signature derivation (issue #385) -----
+
+    #[test]
+    fn failure_signature_passes_through_clean_message() {
+        assert_eq!(
+            failure_signature("stripe: rate limited"),
+            "stripe: rate limited"
+        );
+    }
+
+    #[test]
+    fn failure_signature_normalizes_uuid() {
+        let sig = failure_signature("order 550e8400-e29b-41d4-a716-446655440000 not found");
+        assert_eq!(sig, "order <UUID> not found");
+    }
+
+    #[test]
+    fn failure_signature_normalizes_decimal_runs() {
+        let sig = failure_signature("timeout after 30000ms connecting to port 5432");
+        assert_eq!(sig, "timeout after <NUM>ms connecting to port <NUM>");
+    }
+
+    #[test]
+    fn failure_signature_pure_decimal_gte8_digits_is_num_not_hex() {
+        // Pure decimal strings ≥8 digits must not be classified as <HEX>.
+        let sig = failure_signature("error for user 12345678 in tenant 999999999");
+        assert_eq!(sig, "error for user <NUM> in tenant <NUM>");
+    }
+
+    #[test]
+    fn failure_signature_normalizes_long_hex_run() {
+        let sig = failure_signature("checksum mismatch deadbeef0123cafe babe");
+        // "deadbeef0123cafe" contains hex letters (d, e, a, b, e, f, c, a, f, e) → <HEX>;
+        // "babe" is short → left intact.
+        assert_eq!(sig, "checksum mismatch <HEX> babe");
+    }
+
+    #[test]
+    fn failure_signature_normalizes_0x_prefixed_hex() {
+        let sig = failure_signature("bad pointer 0xDEAD here");
+        assert_eq!(sig, "bad pointer <HEX> here");
+    }
+
+    #[test]
+    fn failure_signature_takes_first_line_only() {
+        let sig = failure_signature("connection refused\n  at src/net.rs:42\n  backtrace...");
+        assert_eq!(sig, "connection refused");
+    }
+
+    #[test]
+    fn failure_signature_truncates_to_max_len() {
+        let long = "x".repeat(500);
+        let sig = failure_signature(&long);
+        assert_eq!(sig.chars().count(), SIGNATURE_MAX_LEN);
+    }
+
+    #[test]
+    fn failure_signature_is_deterministic_and_shard_stable() {
+        let a = failure_signature("stripe charge ch_3Abc declined for user 1234");
+        let b = failure_signature("stripe charge ch_3Abc declined for user 1234");
+        assert_eq!(a, b);
+        // Same root cause with different dynamic ids collapses identically.
+        let c = failure_signature("stripe charge ch_3Abc declined for user 9999");
+        assert_eq!(a, c);
+    }
+
+    // ----- Parameter parsing & validation (issue #385) -----
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn params_parse_single_group_by() {
+        let p = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "workflow_name")]),
+            Utc::now(),
+        )
+        .expect("valid");
+        assert_eq!(p.group_by, vec![DlqGroupDimension::WorkflowName]);
+        assert_eq!(p.limit_groups, DEFAULT_LIMIT_GROUPS);
+        assert_eq!(p.samples_per_group, DEFAULT_SAMPLES_PER_GROUP);
+    }
+
+    #[test]
+    fn params_parse_hierarchical_group_by_preserves_order() {
+        let p = DlqAggregateParams::from_query_pairs(
+            &pairs(&[
+                ("group_by", "workflow_name"),
+                ("group_by", "failure_signature"),
+            ]),
+            Utc::now(),
+        )
+        .expect("valid");
+        assert_eq!(
+            p.group_by,
+            vec![
+                DlqGroupDimension::WorkflowName,
+                DlqGroupDimension::FailureSignature
+            ]
+        );
+    }
+
+    #[test]
+    fn params_dedupe_repeated_group_by() {
+        let p = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "queue_name"), ("group_by", "queue_name")]),
+            Utc::now(),
+        )
+        .expect("valid");
+        assert_eq!(p.group_by, vec![DlqGroupDimension::QueueName]);
+    }
+
+    #[test]
+    fn params_require_at_least_one_group_by() {
+        let err =
+            DlqAggregateParams::from_query_pairs(&pairs(&[("limit_groups", "10")]), Utc::now())
+                .unwrap_err();
+        assert!(err.contains("at least one group_by"), "{err}");
+    }
+
+    #[test]
+    fn params_reject_unknown_group_by() {
+        let err =
+            DlqAggregateParams::from_query_pairs(&pairs(&[("group_by", "tenant_id")]), Utc::now())
+                .unwrap_err();
+        assert!(err.contains("unknown group_by dimension"), "{err}");
+    }
+
+    #[test]
+    fn params_reject_invalid_time_bucket() {
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "time_bucket"), ("time_bucket", "week")]),
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid time_bucket"), "{err}");
+    }
+
+    #[test]
+    fn params_reject_limit_groups_out_of_range() {
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "queue_name"), ("limit_groups", "9999")]),
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(err.contains("limit_groups"), "{err}");
+
+        let err_zero = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "queue_name"), ("limit_groups", "0")]),
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(err_zero.contains("limit_groups"), "{err_zero}");
+    }
+
+    #[test]
+    fn params_reject_samples_per_group_out_of_range() {
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "queue_name"), ("samples_per_group", "50")]),
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(err.contains("samples_per_group"), "{err}");
+    }
+
+    #[test]
+    fn params_reject_malformed_duration() {
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "queue_name"), ("since", "yesterday")]),
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid since"), "{err}");
+    }
+
+    #[test]
+    fn params_parse_relative_since_duration() {
+        let now = Utc::now();
+        let p = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "queue_name"), ("since", "24h")]),
+            now,
+        )
+        .expect("valid");
+        let since = p.since.expect("since set");
+        let delta = (now - since).num_seconds();
+        assert!((86_390..=86_410).contains(&delta), "delta was {delta}");
+    }
+
+    #[test]
+    fn params_parse_rfc3339_since() {
+        let p = DlqAggregateParams::from_query_pairs(
+            &pairs(&[
+                ("group_by", "queue_name"),
+                ("since", "2026-05-18T03:00:00Z"),
+            ]),
+            Utc::now(),
+        )
+        .expect("valid");
+        assert_eq!(
+            p.since
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "2026-05-18T03:00:00Z"
+        );
+    }
+
+    #[test]
+    fn params_reject_negative_min_attempts() {
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "queue_name"), ("min_attempts", "-1")]),
+            Utc::now(),
+        )
+        .unwrap_err();
+        assert!(err.contains("min_attempts"), "{err}");
+    }
+
+    // ----- Merge logic (issue #385) -----
+
+    fn raw_group(values: &[Option<&str>], count: i64, samples: &[&str]) -> DlqRawGroup {
+        DlqRawGroup {
+            key: values.iter().map(|v| v.map(str::to_string)).collect(),
+            count,
+            first_seen: None,
+            last_seen: None,
+            sample_ids: samples.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn merge_sums_counts_across_shards() {
+        let params = DlqAggregateParams {
+            group_by: vec![DlqGroupDimension::QueueName],
+            ..Default::default()
+        };
+        let partials = vec![
+            DlqAggregatePartial {
+                total: 10,
+                filtered_total: 6,
+                groups: vec![raw_group(&[Some("email")], 4, &["a"])],
+            },
+            DlqAggregatePartial {
+                total: 8,
+                filtered_total: 5,
+                groups: vec![raw_group(&[Some("email")], 3, &["b"])],
+            },
+        ];
+        let resp = merge_dlq_aggregates(&params, partials);
+        assert_eq!(resp.total, 18);
+        assert_eq!(resp.filtered_total, 11);
+        assert_eq!(resp.groups.len(), 1);
+        assert_eq!(resp.groups[0].count, 7);
+        assert_eq!(resp.groups[0].key["queue_name"], "email");
+        assert!(!resp.truncated);
+    }
+
+    #[test]
+    fn merge_caps_samples_per_group() {
+        let params = DlqAggregateParams {
+            group_by: vec![DlqGroupDimension::QueueName],
+            samples_per_group: 2,
+            ..Default::default()
+        };
+        let partials = vec![
+            DlqAggregatePartial {
+                total: 0,
+                filtered_total: 3,
+                groups: vec![raw_group(&[Some("q")], 3, &["a", "b"])],
+            },
+            DlqAggregatePartial {
+                total: 0,
+                filtered_total: 2,
+                groups: vec![raw_group(&[Some("q")], 2, &["c", "d"])],
+            },
+        ];
+        let resp = merge_dlq_aggregates(&params, partials);
+        assert_eq!(resp.groups[0].sample_dead_letter_ids.len(), 2);
+    }
+
+    #[test]
+    fn merge_rolls_long_tail_into_other_and_reconciles() {
+        let params = DlqAggregateParams {
+            group_by: vec![DlqGroupDimension::FailureSignature],
+            limit_groups: 2,
+            ..Default::default()
+        };
+        let partials = vec![DlqAggregatePartial {
+            total: 100,
+            filtered_total: 100,
+            groups: vec![
+                raw_group(&[Some("sig-a")], 50, &["a"]),
+                raw_group(&[Some("sig-b")], 30, &["b"]),
+                raw_group(&[Some("sig-c")], 15, &["c"]),
+                raw_group(&[Some("sig-d")], 5, &["d"]),
+            ],
+        }];
+        let resp = merge_dlq_aggregates(&params, partials);
+        assert!(resp.truncated);
+        // 2 top groups + 1 _other rollup.
+        assert_eq!(resp.groups.len(), 3);
+        assert_eq!(resp.groups[0].count, 50);
+        assert_eq!(resp.groups[1].count, 30);
+        let other = resp.groups.last().unwrap();
+        assert_eq!(other.key["_other"], true);
+        assert_eq!(other.count, 20);
+        // Totals reconcile: sum of group counts == filtered_total.
+        let sum: i64 = resp.groups.iter().map(|g| g.count).sum();
+        assert_eq!(sum, resp.filtered_total);
+    }
+
+    #[test]
+    fn merge_orders_groups_by_descending_count() {
+        let params = DlqAggregateParams {
+            group_by: vec![DlqGroupDimension::QueueName],
+            ..Default::default()
+        };
+        let partials = vec![DlqAggregatePartial {
+            total: 0,
+            filtered_total: 60,
+            groups: vec![
+                raw_group(&[Some("small")], 10, &[]),
+                raw_group(&[Some("big")], 50, &[]),
+            ],
+        }];
+        let resp = merge_dlq_aggregates(&params, partials);
+        assert_eq!(resp.groups[0].key["queue_name"], "big");
+        assert_eq!(resp.groups[1].key["queue_name"], "small");
+    }
+
+    #[test]
+    fn merge_renders_hierarchical_key() {
+        let params = DlqAggregateParams {
+            group_by: vec![
+                DlqGroupDimension::WorkflowName,
+                DlqGroupDimension::FailureSignature,
+            ],
+            ..Default::default()
+        };
+        let partials = vec![DlqAggregatePartial {
+            total: 0,
+            filtered_total: 1,
+            groups: vec![raw_group(
+                &[Some("onboarding"), Some("stripe: rate limited")],
+                1,
+                &["x"],
+            )],
+        }];
+        let resp = merge_dlq_aggregates(&params, partials);
+        assert_eq!(resp.groups[0].key["workflow_name"], "onboarding");
+        assert_eq!(
+            resp.groups[0].key["failure_signature"],
+            "stripe: rate limited"
+        );
+    }
+
+    #[test]
+    fn merge_renders_null_for_missing_dimension_value() {
+        let params = DlqAggregateParams {
+            group_by: vec![DlqGroupDimension::ActivityName],
+            ..Default::default()
+        };
+        let partials = vec![DlqAggregatePartial {
+            total: 0,
+            filtered_total: 1,
+            groups: vec![raw_group(&[None], 1, &["x"])],
+        }];
+        let resp = merge_dlq_aggregates(&params, partials);
+        assert!(resp.groups[0].key["activity_name"].is_null());
+    }
+
+    #[test]
+    fn dimension_wire_round_trip() {
+        for dim in [
+            DlqGroupDimension::WorkflowName,
+            DlqGroupDimension::ActivityName,
+            DlqGroupDimension::QueueName,
+            DlqGroupDimension::TaskType,
+            DlqGroupDimension::TimeBucket,
+            DlqGroupDimension::FailureSignature,
+        ] {
+            assert_eq!(DlqGroupDimension::from_wire(dim.as_wire()), Some(dim));
+        }
+    }
+
+    #[test]
+    fn time_bucket_formats() {
+        let ts = DateTime::parse_from_rfc3339("2026-05-18T03:42:17Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            TimeBucketGranularity::Hour.format(ts),
+            "2026-05-18T03:00:00Z"
+        );
+        assert_eq!(TimeBucketGranularity::Day.format(ts), "2026-05-18");
+    }
+
     #[test]
     fn dead_letter_entry_serializes_to_json() {
         let entry = NewDeadLetterEntry {
@@ -704,6 +1901,8 @@ mod tests {
             input: serde_json::json!({"amount": 99.99}),
             error: "payment declined".into(),
             attempts: 5,
+            owner: None,
+            severity: None,
         };
 
         let json = serde_json::to_string(&entry).expect("should serialize");

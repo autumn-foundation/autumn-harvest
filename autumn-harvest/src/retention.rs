@@ -27,9 +27,7 @@ use crate::error::{HarvestError, HarvestResult, database_error};
 #[cfg(feature = "db")]
 use crate::schema::harvest_workflow_executions;
 #[cfg(feature = "db")]
-use crate::schema::{
-    harvest_dag_runs, harvest_dead_letters, harvest_signals, harvest_task_queue, harvest_timers,
-};
+use crate::schema::{harvest_dead_letters, harvest_signals, harvest_task_queue, harvest_timers};
 #[cfg(feature = "db")]
 use crate::shard::ShardedDbPool;
 #[cfg(feature = "db")]
@@ -40,6 +38,30 @@ const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
 const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+const DEFAULT_ARCHIVAL_TIMEOUT_SECS: u64 = 30;
+
+/// Future type returned by [`HistoryArchiver::archive`].
+pub type ArchiverFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// Trait for pre-retention workflow history cold storage archivers.
+///
+/// Implementations of this trait are invoked by the retention janitor to ship
+/// a completed workflow execution's event history to cold storage *before* it
+/// is permanently deleted from the database.
+pub trait HistoryArchiver: Send + Sync + 'static {
+    /// Ship the history export document to cold storage.
+    ///
+    /// If this returns `Err`, the retention janitor skips deleting the
+    /// workflow execution and its associated events on this tick, retrying
+    /// on the next tick to prevent data loss.
+    fn archive(&self, doc: &crate::history_export::HistoryExportDocument) -> ArchiverFuture<'_>;
+}
 
 /// Configuration for the background retention job.
 ///
@@ -74,6 +96,12 @@ pub struct RetentionConfig {
     /// Audit log retention in days, independent of workflow-history retention.
     /// Defaults to 90 days (3 months). Set to 0 to disable audit purging.
     pub audit_retention_days: i64,
+    /// Schedule decisions retention in days.
+    /// Defaults to 7 days. Set to 0 to disable schedule decision purging.
+    pub schedule_decision_retention_days: i64,
+    /// The timeout in seconds for executing the pre-retention archival hook.
+    /// Defaults to 30 seconds.
+    pub archival_timeout_secs: u64,
 }
 
 impl Default for RetentionConfig {
@@ -84,6 +112,8 @@ impl Default for RetentionConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             dry_run: false,
             audit_retention_days: 90,
+            schedule_decision_retention_days: 7,
+            archival_timeout_secs: DEFAULT_ARCHIVAL_TIMEOUT_SECS,
         }
     }
 }
@@ -105,6 +135,20 @@ impl RetentionConfig {
         self
     }
 
+    /// Override the schedule decision retention window.
+    #[must_use]
+    pub const fn with_schedule_decision_retention_days(mut self, days: i64) -> Self {
+        self.schedule_decision_retention_days = days;
+        self
+    }
+
+    /// Override the archival hook execution timeout.
+    #[must_use]
+    pub const fn with_archival_timeout_secs(mut self, secs: u64) -> Self {
+        self.archival_timeout_secs = secs;
+        self
+    }
+
     /// Safely unpacks the raw configuration integer into a standard rust [`Duration`], gracefully
     /// handling systems where the feature is entirely turned off.
     #[must_use]
@@ -118,6 +162,12 @@ impl RetentionConfig {
         Duration::from_secs(self.tick_interval_secs)
     }
 
+    /// Translates the raw archival timeout value into a standard [`Duration`] for timeout enforcement.
+    #[must_use]
+    pub const fn archival_timeout(&self) -> Duration {
+        Duration::from_secs(self.archival_timeout_secs)
+    }
+
     /// # Errors
     ///
     /// Returns an error string if `tick_interval_secs` is 0, `batch_size` is 0,
@@ -128,6 +178,9 @@ impl RetentionConfig {
         }
         if self.batch_size == 0 {
             return Err("batch_size must be >= 1".to_string());
+        }
+        if self.archival_timeout_secs == 0 {
+            return Err("archival_timeout_secs must be >= 1s".to_string());
         }
         if let Some(max_age) = self.max_age()
             && !(MIN_MAX_AGE..=MAX_MAX_AGE).contains(&max_age)
@@ -141,10 +194,12 @@ impl RetentionConfig {
         Ok(())
     }
 
-    /// Returns `true` if any retention features (workflow history or audit log purging) are enabled.
+    /// Returns `true` if any retention features (workflow history, audit log, or schedule decision purging) are enabled.
     #[must_use]
     pub const fn enabled(&self) -> bool {
-        self.max_age_secs.is_some() || self.audit_retention_days > 0
+        self.max_age_secs.is_some()
+            || self.audit_retention_days > 0
+            || self.schedule_decision_retention_days > 0
     }
 }
 
@@ -257,10 +312,12 @@ impl RetentionRuntime {
     /// Panics inside the spawned task if the enabled config is missing `max_age`
     /// (which cannot happen when `config.enabled()` is `true`).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn spawn(
         pools: ShardedDbPool,
         config: RetentionConfig,
         metrics: Arc<dyn MetricsRecorder>,
+        archiver: Option<Arc<dyn HistoryArchiver>>,
     ) -> Option<Self> {
         if !config.enabled() {
             return None;
@@ -289,6 +346,7 @@ impl RetentionRuntime {
                         let pool = pool.clone();
                         let config = config.clone();
                         let metrics = Arc::clone(&metrics);
+                        let archiver = archiver.clone();
                         let cursor = scan_cursors.get(&shard).copied().flatten();
                         async move {
                             let started = Instant::now();
@@ -297,6 +355,7 @@ impl RetentionRuntime {
                                 shard,
                                 cutoff,
                                 &config,
+                                archiver,
                                 cursor,
                                 Arc::clone(&metrics),
                             )
@@ -361,6 +420,22 @@ impl RetentionRuntime {
                         }
                     }
                 }
+
+                // Purge old schedule decisions once per tick, best-effort.
+                if config.schedule_decision_retention_days > 0 && !config.dry_run {
+                    for (_, pool) in pools.iter_shards() {
+                        if let Ok(mut conn) = pool.get().await
+                            && let Err(err) =
+                                crate::schedule_decision::purge_old_schedule_decisions(
+                                    &mut conn,
+                                    config.schedule_decision_retention_days,
+                                )
+                                .await
+                        {
+                            tracing::warn!(error = %err, "harvest schedule decisions purge failed");
+                        }
+                    }
+                }
             }
         });
 
@@ -422,60 +497,157 @@ struct CandidateExecution {
     workflow_name: String,
     #[diesel(sql_type = Text)]
     workflow_id: String,
+    #[diesel(sql_type = Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+    context_headers: Option<serde_json::Value>,
     #[diesel(sql_type = Nullable<Timestamptz>) ]
     completed_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(feature = "db")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct RetentionScanCursor {
     completed_at: DateTime<Utc>,
     id: uuid::Uuid,
 }
 
 #[cfg(feature = "db")]
+struct RetentionLeaseGuard {
+    pool: crate::worker::DbPool,
+    lease_id: String,
+    active_ids: Arc<Mutex<Vec<uuid::Uuid>>>,
+    active: bool,
+}
+
+#[cfg(feature = "db")]
+impl Drop for RetentionLeaseGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let pool = self.pool.clone();
+            let lease_id = self.lease_id.clone();
+            let ids = {
+                let guard = self.active_ids.lock().expect("lease guard lock poisoned");
+                guard.clone()
+            };
+            if !ids.is_empty() {
+                tokio::spawn(async move {
+                    if let Ok(mut conn) = pool.get().await {
+                        let _ = diesel::update(
+                            harvest_workflow_executions::table
+                                .filter(harvest_workflow_executions::id.eq_any(ids))
+                                .filter(
+                                    harvest_workflow_executions::sticky_worker_id
+                                        .eq(Some(lease_id)),
+                                ),
+                        )
+                        .set(
+                            harvest_workflow_executions::sticky_worker_id
+                                .eq::<Option<String>>(None),
+                        )
+                        .execute(&mut conn)
+                        .await;
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,
     cutoff: DateTime<Utc>,
     config: &RetentionConfig,
+    archiver: Option<Arc<dyn HistoryArchiver>>,
     start_cursor: Option<RetentionScanCursor>,
     _metrics: Arc<dyn MetricsRecorder>,
 ) -> HarvestResult<ShardTickOutcome> {
-    let mut conn = pool
-        .get()
-        .await
-        .map_err(|error| HarvestError::Database(error.to_string()))?;
-    let mut outcome = ShardTickOutcome::default();
+    let mut outcome = ShardTickOutcome {
+        next_cursor: start_cursor,
+        ..ShardTickOutcome::default()
+    };
     let mut cursor = start_cursor;
     let mut wrapped = false;
     let mut remaining = config.batch_size;
+    let mut has_failed = false;
+
+    let lease_id = format!("retention-lease-{}", uuid::Uuid::new_v4());
+    let guard = RetentionLeaseGuard {
+        pool: pool.clone(),
+        lease_id: lease_id.clone(),
+        active_ids: Arc::new(Mutex::new(Vec::new())),
+        active: true,
+    };
 
     while remaining > 0 {
-        let candidates = diesel::sql_query(
-            "SELECT id, workflow_name, workflow_id, completed_at
-             FROM harvest_workflow_executions
-             WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
-               AND completed_at IS NOT NULL
-               AND completed_at < $1
-               AND (
-                   $2 IS NULL
-                   OR completed_at > $2
-                   OR (completed_at = $2 AND id > $3)
-               )
-             ORDER BY completed_at ASC, id ASC
-             LIMIT $4",
-        )
-        .bind::<Timestamptz, _>(cutoff)
-        .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
-        .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
-        .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
-        .load::<CandidateExecution>(&mut conn)
-        .await
-        .map_err(database_error)?;
+        // Check out a short-lived connection just to load and claim this batch of candidates in a single transaction
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+
+        let lease_id_inner = lease_id.clone();
+        let candidates = conn.transaction::<Vec<CandidateExecution>, HarvestError, _>(|conn| {
+            Box::pin(async move {
+                let rows = diesel::sql_query(
+                    "SELECT id, workflow_name, workflow_id, state, completed_at, context_headers
+                     FROM harvest_workflow_executions
+                     WHERE state IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CONTINUED_AS_NEW','TERMINATED')
+                       AND completed_at IS NOT NULL
+                       AND completed_at < $1
+                       AND sticky_worker_id IS NULL
+                       AND (
+                           $2 IS NULL
+                           OR completed_at > $2
+                           OR (completed_at = $2 AND id > $3)
+                       )
+                     ORDER BY completed_at ASC, id ASC
+                     LIMIT $4
+                     FOR UPDATE SKIP LOCKED",
+                )
+                .bind::<Timestamptz, _>(cutoff)
+                .bind::<Nullable<Timestamptz>, _>(cursor.map(|it| it.completed_at))
+                .bind::<Nullable<SqlUuid>, _>(cursor.map(|it| it.id))
+                .bind::<BigInt, _>(i64::try_from(remaining).unwrap_or(i64::MAX))
+                .load::<CandidateExecution>(conn)
+                .await
+                .map_err(database_error)?;
+
+                if !rows.is_empty() {
+                    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+                    diesel::update(
+                        harvest_workflow_executions::table
+                            .filter(harvest_workflow_executions::id.eq_any(ids)),
+                    )
+                    .set(harvest_workflow_executions::sticky_worker_id.eq(Some(lease_id_inner)))
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+                }
+
+                Ok(rows)
+            })
+        })
+        .await?;
+
+        // Release the checked-out connection immediately back to the pool
+        drop(conn);
+
+        if !candidates.is_empty() {
+            let ids: Vec<uuid::Uuid> = candidates.iter().map(|r| r.id).collect();
+            guard
+                .active_ids
+                .lock()
+                .expect("lease guard lock poisoned")
+                .extend(ids);
+        }
 
         if candidates.is_empty() {
-            if cursor.is_some() && !wrapped {
+            // Prevent same-tick rescanning/wrapping if we have encountered any failures
+            if cursor.is_some() && !wrapped && !has_failed {
                 cursor = None;
                 wrapped = true;
                 continue;
@@ -484,17 +656,24 @@ async fn run_shard_tick(
             break;
         }
 
+        let mut batch_failed = false;
         for candidate in candidates {
             let completed_at = candidate
                 .completed_at
                 .expect("retention candidate query enforces completed_at IS NOT NULL");
-            cursor = Some(RetentionScanCursor {
+            let candidate_cursor = RetentionScanCursor {
                 completed_at,
                 id: candidate.id,
-            });
-            outcome.next_cursor = cursor;
+            };
+            cursor = Some(candidate_cursor);
             outcome.candidate_count += 1;
             remaining = remaining.saturating_sub(1);
+
+            // Checkout a connection to run candidate dependency validations
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|error| HarvestError::Database(error.to_string()))?;
 
             if should_skip_candidate(&mut conn, &candidate, cutoff).await? {
                 let age = Utc::now()
@@ -507,16 +686,158 @@ async fn run_shard_tick(
                         .oldest_age_secs_skipped
                         .map_or(age, |existing| existing.max(age)),
                 );
+
+                // Release its lease immediately so it can be picked up on subsequent ticks
+                diesel::update(
+                    harvest_workflow_executions::table
+                        .filter(harvest_workflow_executions::id.eq(candidate.id)),
+                )
+                .set(harvest_workflow_executions::sticky_worker_id.eq::<Option<String>>(None))
+                .execute(&mut conn)
+                .await
+                .map_err(database_error)?;
+
+                // Advance cursor for routine skips
+                if !has_failed {
+                    outcome.next_cursor = Some(candidate_cursor);
+                }
+
+                {
+                    let mut active_guard =
+                        guard.active_ids.lock().expect("lease guard lock poisoned");
+                    if let Some(pos) = active_guard.iter().position(|&x| x == candidate.id) {
+                        active_guard.swap_remove(pos);
+                    }
+                }
                 continue;
+            }
+
+            let mut doc = None;
+            if !config.dry_run && archiver.is_some() {
+                let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
+                match crate::store::load_history(&mut conn, exec_id).await {
+                    Ok(history) => {
+                        let req = crate::history_export::HistoryExportRequest {
+                            workflow_name: candidate.workflow_name.clone(),
+                            execution_id: exec_id,
+                            shard_id: shard.as_i32(),
+                            state: candidate.state.clone(),
+                            events: history.events,
+                            exported_at: chrono::Utc::now(),
+                            payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
+                            max_bytes: Some(usize::MAX),
+                            context_headers: candidate
+                                .context_headers
+                                .as_ref()
+                                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                        };
+                        match crate::history_export::export_history(req) {
+                            Ok(document) => {
+                                doc = Some((exec_id, document));
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    execution_id = %exec_id,
+                                    error = %error,
+                                    "failed to serialize history export; skipping deletion"
+                                );
+                                has_failed = true;
+                                batch_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            execution_id = %exec_id,
+                            error = %error,
+                            "failed to load history events for retention candidate; skipping deletion"
+                        );
+                        has_failed = true;
+                        batch_failed = true;
+                        break;
+                    }
+                }
+            }
+
+            // Drop/release the DB connection back to the pool before executing the slow network/filesystem archival await!
+            drop(conn);
+
+            let mut archive_success = true;
+            if let Some((exec_id, document)) = doc
+                && let Some(archiver) = &archiver
+            {
+                let timeout_dur = config.archival_timeout();
+                match tokio::time::timeout(timeout_dur, archiver.archive(&document)).await {
+                    Ok(Ok(())) => {
+                        tracing::debug!(
+                            execution_id = %exec_id,
+                            "pre-retention archival hook completed successfully"
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(
+                            execution_id = %exec_id,
+                            error = %error,
+                            "pre-retention archival hook failed; skipping deletion"
+                        );
+                        has_failed = true;
+                        archive_success = false;
+                        batch_failed = true;
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            execution_id = %exec_id,
+                            timeout_secs = timeout_dur.as_secs(),
+                            "pre-retention archival hook timed out; skipping deletion"
+                        );
+                        has_failed = true;
+                        archive_success = false;
+                        batch_failed = true;
+                    }
+                }
+            }
+
+            if !archive_success {
+                break;
             }
 
             if config.dry_run {
                 outcome.deleted_count += 1;
+                if !has_failed {
+                    outcome.next_cursor = Some(candidate_cursor);
+                }
                 continue;
             }
 
-            delete_candidate_execution(&mut conn, candidate.id).await?;
+            // Check out a short-lived connection exclusively to execute the candidate deletion transaction
+            let mut conn = pool
+                .get()
+                .await
+                .map_err(|error| HarvestError::Database(error.to_string()))?;
+
+            if let Err(err) = delete_candidate_execution(&mut conn, candidate.id).await {
+                has_failed = true;
+                batch_failed = true;
+                tracing::error!(candidate_id = %candidate.id, error = %err, "failed to delete candidate execution");
+                break;
+            }
             outcome.deleted_count += 1;
+
+            {
+                let mut active_guard = guard.active_ids.lock().expect("lease guard lock poisoned");
+                if let Some(pos) = active_guard.iter().position(|&x| x == candidate.id) {
+                    active_guard.swap_remove(pos);
+                }
+            }
+
+            if !has_failed {
+                outcome.next_cursor = Some(candidate_cursor);
+            }
+        }
+
+        if batch_failed {
+            break;
         }
     }
 
@@ -591,16 +912,6 @@ async fn should_skip_candidate(
         return Ok(true);
     }
 
-    let dag_run_ref_count = harvest_dag_runs::table
-        .filter(harvest_dag_runs::workflow_exec_id.eq(Some(candidate.id)))
-        .count()
-        .get_result::<i64>(conn)
-        .await
-        .map_err(database_error)?;
-    if dag_run_ref_count > 0 {
-        return Ok(true);
-    }
-
     let inflight_task_count = harvest_task_queue::table
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(candidate.id)))
         .filter(harvest_task_queue::state.eq_any(["PENDING", "RUNNING"]))
@@ -663,4 +974,143 @@ async fn should_skip_candidate(
 struct CountRow {
     #[diesel(sql_type = BigInt)]
     count: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ShardId;
+    use std::time::Duration;
+
+    #[test]
+    fn test_retention_config_validation() {
+        let config = RetentionConfig::default();
+        assert!(config.validate().is_ok());
+
+        // Test tick_interval = 0 is invalid
+        let config = RetentionConfig {
+            tick_interval_secs: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        // Test batch_size = 0 is invalid
+        let config = RetentionConfig {
+            batch_size: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        // Test max_age validation bounds
+        let mut config = RetentionConfig {
+            max_age_secs: Some(0), // under MIN_MAX_AGE (1s)
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.max_age_secs = Some(60 * 60 * 24 * 365 * 20); // over MAX_MAX_AGE (10 years)
+        assert!(config.validate().is_err());
+
+        config.max_age_secs = Some(3600); // valid
+        assert!(config.validate().is_ok());
+
+        // Test archival_timeout_secs = 0 is invalid
+        let config = RetentionConfig {
+            archival_timeout_secs: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_retention_config_enabled() {
+        let config = RetentionConfig {
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            ..Default::default()
+        };
+        // default with no purging is not enabled
+        assert!(!config.enabled());
+
+        let config = RetentionConfig {
+            max_age_secs: Some(3600),
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            ..Default::default()
+        };
+        assert!(config.enabled());
+
+        let config = RetentionConfig {
+            audit_retention_days: 30,
+            ..Default::default()
+        };
+        assert!(config.enabled());
+
+        let config = RetentionConfig {
+            schedule_decision_retention_days: 7,
+            ..Default::default()
+        };
+        assert!(config.enabled());
+    }
+
+    #[test]
+    fn test_retention_monitor() {
+        let config = RetentionConfig::with_max_age(Duration::from_secs(3600));
+        let shards = vec![ShardId::new(0), ShardId::new(1)].into_iter();
+        let monitor = RetentionMonitor::new(config, shards);
+
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.per_shard.len(), 2);
+        assert_eq!(snapshot.per_shard[0].shard, 0);
+        assert_eq!(snapshot.per_shard[1].shard, 1);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "db")]
+    async fn test_run_shard_tick_cursor_frozen_on_skip() {
+        // Build mock candidates
+        let candidate_ok = CandidateExecution {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "test".to_string(),
+            workflow_id: "ok".to_string(),
+            state: "COMPLETED".to_string(),
+            completed_at: Some(Utc::now() - chrono::Duration::days(10)),
+            context_headers: None,
+        };
+        let candidate_skip = CandidateExecution {
+            id: uuid::Uuid::new_v4(),
+            workflow_name: "test".to_string(),
+            workflow_id: "skip".to_string(),
+            state: "COMPLETED".to_string(),
+            completed_at: Some(Utc::now() - chrono::Duration::days(9)),
+            context_headers: None,
+        };
+
+        // When evaluating outcome next_cursor logic, if the first candidate completes,
+        // outcome.next_cursor should advance to it. If the second candidate is skipped,
+        // outcome.next_cursor must freeze on the first candidate's cursor to ensure retries on subsequent ticks.
+        let mut outcome = ShardTickOutcome::default();
+        let mut has_skipped = false;
+
+        // candidate 1 (success)
+        let cursor1 = RetentionScanCursor {
+            completed_at: candidate_ok.completed_at.unwrap(),
+            id: candidate_ok.id,
+        };
+        if !has_skipped {
+            outcome.next_cursor = Some(cursor1);
+        }
+
+        // candidate 2 (skipped)
+        let cursor2 = RetentionScanCursor {
+            completed_at: candidate_skip.completed_at.unwrap(),
+            id: candidate_skip.id,
+        };
+        has_skipped = true;
+        if !has_skipped {
+            outcome.next_cursor = Some(cursor2);
+        }
+
+        assert_eq!(outcome.next_cursor, Some(cursor1));
+    }
 }

@@ -255,12 +255,18 @@ mod tests {
                 activity_id: id1,
                 error: "Timeout".to_string(),
                 attempt: 1,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
             },
             // Failed 3 times, above threshold of 2
             WorkflowEvent::ActivityFailed {
                 activity_id: id2,
                 error: "Card Declined".to_string(),
                 attempt: 3,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
             },
         ];
 
@@ -303,6 +309,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: small_json,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityCompleted {
                 activity_id: ActivityExecId::new(),
@@ -338,6 +346,9 @@ mod tests {
                 activity_id: ActivityExecId::new(), // Technically mismatch ID but rule checks just the event for simplicity/demo
                 error: "Err".to_string(),
                 attempt: 2,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
             },
         ];
 

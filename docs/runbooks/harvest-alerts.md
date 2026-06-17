@@ -167,10 +167,45 @@ the workflow owner if failures are deterministic payload or code regressions.
 
 ## harvest_dlq_growth
 
+### DLQ flood — the first 60 seconds
+
+When the DLQ entry count crosses the alert threshold during an incident, the
+first question is *the shape of the fire*, not any single entry. Lead with the
+aggregation endpoint instead of paging the flat list or opening `psql`:
+
+```bash
+# What is this fire made of? One root cause or ten?
+harvest dlq aggregate \
+  --group-by workflow_name,failure_signature \
+  --since 24h --samples-per-group 3
+```
+
+Read the table top-down:
+
+- **One dominant group** (e.g. `onboarding / "stripe: rate limited" → 1,842`):
+  a single root cause. Fix the dependency, then bulk-replay with confidence
+  using the sample IDs to spot-check first
+  (`harvest dlq bulk-replay --dry-run …`).
+- **A flat spread across many groups**: unrelated bugs. Do *not* bulk-replay;
+  triage case by case from the largest groups down.
+
+`failure_signature` normalizes UUIDs, hex, and numbers in the first line of
+each error to fixed placeholders, so the same root cause aggregates identically
+across queries and shards. Counts sum across shards; `_other` rolls up the long
+tail so totals reconcile to `filtered_total`. Narrow with the same filters as
+the list endpoint (`--workflow-name`, `--activity-name`, `--queue-name`,
+`--since`, `--until`, `--min-attempts`) and pivot to a single entry via the
+`sample_dead_letter_ids`. The endpoint backing this is
+`GET /api/harvest/dead-letters/aggregate` (admin auth, parity with the list
+endpoint). The same view is one click away in the Vantage UI: open the **Dead
+Letters** page and flip the **Summary** toggle to see the top groups, switch the
+`group_by` dimension, and drill into the filtered list.
+
 ### Triage steps
 
-1. Run `harvest dlq list --limit 25`.
-2. Group entries by activity, workflow, shard, and error summary.
+1. Run the `harvest dlq aggregate` summary above to classify the flood.
+2. For the dominant group, pivot to its `sample_dead_letter_ids`, or list a
+   slice with `harvest dlq list --limit 25` for full row detail.
 3. Check whether the same activity failure alert is firing.
 4. Pick one affected execution and run `harvest workflow stack <execution_id>`.
 
@@ -320,3 +355,82 @@ queue; replay safety is the reason this alert exists.
 
 Escalate to the release owner when production work is stuck behind build
 compatibility or when rollback requires reverse compatibility declarations.
+
+## harvest_schedule_ha_domination
+
+### Triage steps
+
+1. Check the `lost_race / (lost_race + claimed)` ratio in Grafana for the last 5–10 minutes.
+2. Query Postgres for stuck claim tokens:
+   ```sql
+   SELECT id, workflow_name, fire_claim_token, fire_claimed_until, next_run_at
+   FROM harvest_schedules
+   WHERE fire_claimed_until IS NOT NULL
+   ORDER BY fire_claimed_until DESC
+   LIMIT 10;
+   ```
+3. Verify all replicas share the same `DATABASE_URL` and shard routing configuration.
+4. Run `harvest worker health --output json` to confirm fleet coverage.
+
+### Likely causes
+
+- One or more replicas point to a **different Postgres instance** than the majority of the fleet (the "different DB" replica claims a disjoint set; others always see it as locked).
+- Incorrect `shard_assignments` exclude most replicas from the affected shard.
+- A stuck or crashed replica's claim token has not expired (token older than 30 s + tick interval is a bug; see escalation).
+
+### False positives
+
+In a **single-replica deployment** or **initial startup** before the first tick, `lost_race = 0` and `claimed = 1 per tick`. This alert should never fire for single-replica deployments (ratio is always 0).
+
+In a **two-replica deployment**, healthy steady-state is approximately `lost_race ≈ claimed` (each replica wins about half the slots at the tick boundary). The 0.98 threshold ensures this alert does not fire for expected contention.
+
+### Safe actions
+
+Fix the database configuration so all replicas share the same shard pools. Do not manually clear `fire_claim_token` rows unless you have confirmed the claiming replica has stopped; the 30-second TTL handles crash recovery automatically.
+
+### Escalation criteria
+
+Escalate to the platform owner if:
+- A `fire_claim_token` row has `fire_claimed_until` more than 2 minutes in the past and `next_run_at` has not advanced (indicates the claiming process is alive but wedged without completing the fire or clearing the claim — this should not happen with the current implementation and would indicate a bug).
+- The alert fires on a single-replica deployment (indicates a misconfiguration or metric collection error).
+
+## harvest_workflow_non_determinism
+
+### Triage steps
+
+1. Locate failed executions by querying the management API:
+   ```bash
+   GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism
+   ```
+2. Fetch the detailed search attributes of the failed execution to identify:
+   - `expected` (expected event/command generated during execution)
+   - `actual` (actual event/command recorded in the history)
+   - `event_index` (index where the divergence occurred)
+   - `build_id` (the build ID of the running worker when it failed)
+3. Check recent deployment history to see if a new release was shipped without proper version gating or routing protection.
+4. Run replay tests on the workflow using the exported history to reproduce the non-determinism error.
+
+### Likely causes
+
+- Code deployment that modifies workflow logic (adding, removing, or reordering activities, signals, timers, or child workflows) without updating the version gate.
+- Side effects that are not wrapped in `WorkflowContext::side_effect()`, such as direct system calls, time queries (`Instant::now()`), or random number generation.
+- Iteration order on non-deterministic collections (like `HashMap` or `HashSet`) in the workflow function.
+
+### False positives
+
+None. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible.
+
+### Safe actions
+
+1. Roll back the offending deployment immediately to the last known-good version.
+2. If the deployment must stay, declare build compatibility appropriately or use version gates.
+3. For individual executions blocked in `FAILED` state due to non-determinism, once the code is fixed or rolled back, they can be reset to the pre-divergence event index using the reset API:
+   ```bash
+   POST /api/harvest/workflows/{execution_id}/reset
+   ```
+   Specifying the event index prior to the divergence.
+
+### Escalation criteria
+
+Escalate immediately to the release owner and the team who shipped the latest version. Replay divergence blocks execution progress for all active workflows of that type, risking data inconsistency.
+

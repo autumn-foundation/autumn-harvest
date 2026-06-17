@@ -622,6 +622,43 @@ fn dag_commands_match_dag_management_routes() {
 }
 
 #[test]
+fn dag_retry_maps_to_retry_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "--actor",
+        "oncall@example.com",
+        "dag",
+        "retry",
+        "nightly_etl",
+        "11111111-2222-3333-4444-555555555555",
+        "--from-node",
+        "step_6",
+        "--from-node",
+        "step_7",
+        "--reason",
+        "S3 incident 2026-05-17",
+        "--dry-run",
+    ])
+    .expect("dag retry args should parse");
+    let request = cli.api_request().expect("retry request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/dags/nightly_etl/runs/11111111-2222-3333-4444-555555555555/retry"
+    );
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "from_nodes": ["step_6", "step_7"],
+            "reason": "S3 incident 2026-05-17",
+            "operator_id": "oncall@example.com",
+            "dry_run": true
+        }))
+    );
+}
+
+#[test]
 fn dead_letter_replay_matches_management_route() {
     let cli = Cli::try_parse_from([
         "harvest",

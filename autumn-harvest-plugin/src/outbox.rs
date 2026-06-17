@@ -1,3 +1,5 @@
+//! Transactional outbox implementation for reliable workflow event emission.
+
 use std::time::Duration;
 
 use autumn_web::AppState;
@@ -14,7 +16,7 @@ use uuid::Uuid;
 
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::shard::ShardRouter;
-use autumn_harvest::types::ExecutionId;
+use autumn_harvest::types::{ExecutionId, Priority};
 use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
 
 use crate::config::HarvestOutboxConfig;
@@ -281,6 +283,17 @@ pub(crate) async fn dispatch_workflow_start_request(
         .await
         .map_err(database_error)?;
 
+    let (owner, runbook_url, severity, info_sla) = state
+        .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
+        .and_then(|registry| {
+            registry
+                .workflows
+                .get(&request.workflow_name)
+                .map(|wf| (wf.owner, wf.runbook_url, wf.severity, wf.sla))
+        })
+        .unwrap_or((None, None, None, None));
+    let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+
     let start = start_or_load_workflow_execution(
         &mut conn,
         StartWorkflowParams {
@@ -295,6 +308,21 @@ pub(crate) async fn dispatch_workflow_start_request(
             search_attrs: request.search_attrs.clone(),
             reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
             trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner,
+            runbook_url,
+            severity,
+            context_headers: None,
+            sla,
+            schedule_id: None,
+            scheduled_for: None,
         },
     )
     .await?;

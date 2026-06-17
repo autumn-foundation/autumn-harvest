@@ -21,13 +21,21 @@ use autumn_web::reexports::axum::extract::State;
 /// The 30-second pause is intentional: kill the process and restart while the
 /// timer is counting down. The engine replays the welcome step from Postgres
 /// history and resumes exactly at the timer — without re-running the activity.
-#[workflow]
+#[workflow(
+    owner = "support",
+    runbook = "https://wiki.acme.com/greeting-runbook",
+    severity = "sev4"
+)]
 async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> {
-    let welcome = ctx
-        .execute_activity_raw(
-            "send_greeting",
+    // ctx.logger() is replay-aware: this line fires exactly once even if the
+    // worker restarts and replays the history — use it instead of tracing::info!
+    // directly in workflow bodies (see guardrail HVG009).
+    ctx.logger().info("greeting workflow started");
+
+    let welcome: serde_json::Value = ctx
+        .execute_activity(
+            &send_greeting_info(),
             serde_json::json!({ "name": name, "kind": "welcome" }),
-            "default",
         )
         .await?;
 
@@ -36,13 +44,16 @@ async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> 
     // the welcome activity above.
     ctx.timer("greeting-pause", 30).await?;
 
-    let farewell = ctx
-        .execute_activity_raw(
-            "send_greeting",
+    ctx.logger().info("timer fired, delivering farewell");
+
+    let farewell: serde_json::Value = ctx
+        .execute_activity(
+            &send_greeting_info(),
             serde_json::json!({ "name": name, "kind": "farewell" }),
-            "default",
         )
         .await?;
+
+    ctx.logger().info("greeting workflow completed");
 
     Ok(format!(
         "{} — {}",
@@ -52,13 +63,16 @@ async fn greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> 
 }
 
 /// Fast request/response variant used by `POST /greet`.
-#[workflow]
+#[workflow(
+    owner = "support",
+    runbook = "https://wiki.acme.com/instant-greeting-runbook",
+    severity = "sev4"
+)]
 async fn instant_greeting(ctx: &WorkflowContext, name: String) -> HarvestResult<String> {
-    let greeting = ctx
-        .execute_activity_raw(
-            "send_greeting",
+    let greeting: serde_json::Value = ctx
+        .execute_activity(
+            &send_greeting_info(),
             serde_json::json!({ "name": name, "kind": "hello" }),
-            "default",
         )
         .await?;
 
@@ -121,6 +135,22 @@ async fn greet(
                 search_attrs: None,
                 reuse_policy: WorkflowIdReusePolicy::RejectDuplicate,
                 trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
             },
         )
         .await
@@ -169,7 +199,7 @@ mod tests {
         assert_eq!(wf.name, "greeting");
         assert_eq!(instant.name, "instant_greeting");
         assert_eq!(act.name, "send_greeting");
-        // The default worker listens on "default", matching execute_activity_raw's queue arg.
+        // The activity has no explicit queue attribute, so the typed helper defaults to "default".
         assert!(
             WorkerConfig::default()
                 .queues

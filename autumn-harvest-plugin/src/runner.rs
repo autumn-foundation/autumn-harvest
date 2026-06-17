@@ -1,7 +1,7 @@
 //! Reusable Harvest runtime ownership for standalone or embedded processes.
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use autumn_harvest::BuiltHarvest;
@@ -77,11 +77,13 @@ impl HarvestRunnerResources {
 struct PreparedHarvestRuntime {
     registry: Arc<HandlerRegistry>,
     dag_catalog: Arc<DagCatalog>,
+    registered_dag_names: HashSet<String>,
     workflow_schedules: Arc<Vec<WorkflowSchedule>>,
     worker_runtime_config: WorkerRuntimeConfig,
     storage_pool: HarvestDbPool,
     shard_router: ShardRouter,
     retention_config: RetentionConfig,
+    history_archiver: Option<Arc<dyn autumn_harvest::HistoryArchiver>>,
 }
 
 impl PreparedHarvestRuntime {
@@ -91,6 +93,26 @@ impl PreparedHarvestRuntime {
     ) -> autumn_web::AutumnResult<Self> {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
         let retention_config = built.retention().clone();
+        let history_archiver = built.history_archiver().cloned();
+        let classic_dag_names = built
+            .dags()
+            .iter()
+            .filter(|dag| dag.workflow_handler.is_none())
+            .map(|dag| dag.name)
+            .collect::<Vec<_>>();
+        if !classic_dag_names.is_empty() {
+            return Err(AutumnError::service_unavailable_msg(format!(
+                "classic DAG execution is not supported by this runtime; \
+                 rebuild with autumn-harvest/unified-dag-execution or remove classic DAGs: {}",
+                classic_dag_names.join(", ")
+            )));
+        }
+        let registered_dag_names = built
+            .dags()
+            .iter()
+            .filter(|dag| dag.workflow_handler.is_some())
+            .map(|dag| dag.name.to_string())
+            .collect();
         let workflow_schedules = Arc::new(built.workflow_schedules().to_vec());
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
@@ -107,11 +129,13 @@ impl PreparedHarvestRuntime {
         Ok(Self {
             registry: Arc::new(registry),
             dag_catalog,
+            registered_dag_names,
             workflow_schedules,
             worker_runtime_config: WorkerRuntimeConfig::from(worker_config),
             storage_pool: HarvestDbPool::from(resources.harvest_pool),
             shard_router,
             retention_config,
+            history_archiver,
         })
     }
 }
@@ -184,11 +208,13 @@ impl HarvestRunner {
     ///
     /// Returns an error if the workflow/activity registrations are invalid or
     /// the worker configuration cannot be materialized.
-    pub fn start(
+    #[allow(clippy::too_many_lines)]
+    pub async fn start(
         built: BuiltHarvest,
         config: &HarvestRuntimeConfig,
         resources: HarvestRunnerResources,
     ) -> autumn_web::AutumnResult<Self> {
+        let completion_triggers = built.completion_triggers().to_vec();
         let prepared = PreparedHarvestRuntime::build(built, resources)?;
         let registry = Arc::clone(&prepared.registry);
         let dag_catalog = Arc::clone(&prepared.dag_catalog);
@@ -196,12 +222,32 @@ impl HarvestRunner {
         let queues = prepared.worker_runtime_config.queues.clone();
         let harvest_pool = prepared.storage_pool.clone_inner();
         let shard_router = prepared.shard_router.clone();
+        autumn_harvest::shard::install_global_router(shard_router.clone());
 
         if !config.worker_enabled && !config.scheduler_enabled {
             tracing::info!(
                 mode = ?config.mode,
                 "harvest runtime started without local worker or scheduler ownership"
             );
+        }
+
+        // Sync static triggers before starting workers (issue #517)
+        for (shard_id, shard_pool) in prepared.storage_pool.iter_shards() {
+            let mut conn = shard_pool.get().await.map_err(|e| {
+                AutumnError::service_unavailable_msg(format!(
+                    "Failed to get DB connection to sync completion triggers for shard {shard_id}: {e}"
+                ))
+            })?;
+            autumn_harvest::completion_trigger::sync_completion_triggers(
+                &mut conn,
+                &completion_triggers,
+            )
+            .await
+            .map_err(|e| {
+                AutumnError::service_unavailable_msg(format!(
+                    "Failed to sync completion triggers on startup for shard {shard_id}: {e:?}"
+                ))
+            })?;
         }
 
         let worker = if config.worker_enabled {
@@ -226,8 +272,9 @@ impl HarvestRunner {
             })
         });
         let scheduler = if config.scheduler_enabled {
-            Some(SchedulerRuntime::spawn(
-                harvest_pool,
+            Some(SchedulerRuntime::spawn_sharded(
+                prepared.storage_pool.sharded_pool().clone(),
+                shard_router.clone(),
                 Arc::clone(&registry),
                 Arc::clone(&dag_catalog),
                 Arc::clone(&workflow_schedules),
@@ -243,6 +290,7 @@ impl HarvestRunner {
                 prepared.storage_pool.sharded_pool().clone(),
                 prepared.retention_config.clone(),
                 Arc::clone(&registry.telemetry().metrics),
+                prepared.history_archiver,
             )
         } else {
             tracing::info!(
@@ -262,6 +310,7 @@ impl HarvestRunner {
                 prepared.storage_pool.sharded_pool().clone(),
                 BatchExecutorConfig {
                     concurrency: config.batch.concurrency,
+                    metrics: Arc::clone(&registry.telemetry().metrics),
                 },
                 std::time::Duration::from_millis(config.batch.tick_interval_ms),
             ))
@@ -281,7 +330,8 @@ impl HarvestRunner {
                 retention_trigger,
             ),
             shard_router,
-        );
+        )
+        .with_registered_dag_names(prepared.registered_dag_names.iter().cloned());
 
         Ok(Self {
             api_runtime,

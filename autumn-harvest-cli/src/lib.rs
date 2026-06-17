@@ -214,6 +214,13 @@ pub enum CliError {
         label: &'static str,
     },
 
+    /// A required input source (file or inline JSON) was not provided.
+    #[error("{label}")]
+    MissingInput {
+        /// User-facing message.
+        label: &'static str,
+    },
+
     /// HTTP transport failed.
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
@@ -269,6 +276,17 @@ pub enum CliError {
         /// Last observed lifecycle status.
         last_status: String,
     },
+
+    /// The SSE event stream closed abnormally (e.g. slow consumer).
+    #[error("SSE stream closed by server: {message}")]
+    SseStreamError {
+        /// Server-supplied error detail.
+        message: String,
+    },
+
+    /// A CLI argument value was invalid (e.g. unrecognised scope format).
+    #[error("{0}")]
+    InvalidInput(String),
 }
 
 impl CliError {
@@ -294,6 +312,7 @@ enum Commands {
         command: ShardCommand,
     },
     /// Manage workflow executions.
+    #[command(alias = "workflows")]
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
@@ -340,6 +359,12 @@ enum Commands {
         #[command(subcommand)]
         command: ConcurrencyCommand,
     },
+    /// Manage per-activity rate limits.
+    #[command(alias = "rate-limits")]
+    RateLimit {
+        #[command(subcommand)]
+        command: RateLimitCommand,
+    },
     /// Manage batch operations.
     Batch {
         #[command(subcommand)]
@@ -349,6 +374,12 @@ enum Commands {
     Audit {
         #[command(subcommand)]
         command: AuditCommand,
+    },
+    /// Manage admission gates for incident-response halts (issue #377).
+    #[command(alias = "gates")]
+    Gate {
+        #[command(subcommand)]
+        command: GateCommand,
     },
     /// Report recorded workflow version-gate usage.
     VersionUsage {
@@ -404,6 +435,39 @@ enum Commands {
     Worker {
         #[command(subcommand)]
         command: WorkerCommand,
+    },
+    /// Stream live workflow execution events.
+    #[command(alias = "event")]
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
+    },
+    /// Start N workflow executions in one batched request (issue #357).
+    ///
+    /// Reads newline-delimited JSON (NDJSON) items from a file or inline JSON
+    /// array and submits them as a single `POST /workflows/batch_start` call.
+    ///
+    /// Each NDJSON line must be a JSON object with at least a `workflow_name`
+    /// key.  Optional keys: `workflow_id`, `input`, `search_attributes`,
+    /// `idempotency_key`.
+    ///
+    /// Exits non-zero when `--atomic` is set and any item is rejected.
+    #[command(name = "start-batch")]
+    StartBatch {
+        /// NDJSON file of workflow start items. Use `-` to read from stdin.
+        ///
+        /// Conflicts with `--items-json`.
+        #[arg(long, value_name = "PATH", conflicts_with = "items_json")]
+        file: Option<PathBuf>,
+        /// Inline JSON array of workflow start items.
+        ///
+        /// Conflicts with `--file`.
+        #[arg(long, conflicts_with = "file")]
+        items_json: Option<String>,
+        /// Require all-or-nothing semantics: if any item fails validation the
+        /// entire batch is rejected with no executions inserted.
+        #[arg(long, default_value_t = false)]
+        atomic: bool,
     },
 }
 
@@ -486,6 +550,36 @@ enum AuditCommand {
     },
 }
 
+/// Admission gate subcommands (issue #377).
+#[derive(Debug, Subcommand)]
+enum GateCommand {
+    /// Create an admission gate to halt new workflow starts.
+    #[command(alias = "add")]
+    Create {
+        /// Scope: `fleet`, `workflow_name=<name>`, `queue=<name>`, `shard_id=<N>`, or `owner=<id>`.
+        #[arg(long)]
+        scope: String,
+        /// Required human-readable reason included in blocked-caller errors and the audit log.
+        #[arg(long)]
+        reason: String,
+        /// Optional extended message shown in the Vantage UI.
+        #[arg(long)]
+        message: Option<String>,
+        /// ISO 8601 expiry timestamp after which the gate self-clears (e.g. 2026-06-06T12:00:00Z).
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
+    /// List all active (non-lifted) admission gates.
+    #[command(alias = "ls")]
+    List,
+    /// Lift (remove) an admission gate by ID.
+    #[command(alias = "delete", alias = "rm", alias = "remove")]
+    Lift {
+        /// Gate ID (UUID) to lift.
+        id: String,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum ShardCommand {
     /// Show per-shard readiness and rollout blockers.
@@ -502,6 +596,7 @@ enum ShardCommand {
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
     /// List workflow executions.
+    #[command(alias = "ls")]
     List {
         /// Maximum number of rows to return.
         #[arg(long, value_parser = clap::value_parser!(i64).range(1..=200))]
@@ -517,6 +612,18 @@ enum WorkflowCommand {
         /// AND multiple predicates together.
         #[arg(long = "search-attr", value_name = "KEY=VALUE")]
         search_attr: Vec<String>,
+        /// Filter by owner (exact match).
+        #[arg(long)]
+        owner: Option<String>,
+        /// Only return executions that have made no event progress for at
+        /// least this many minutes. Excludes workflows correctly sleeping on
+        /// a future-dated durable timer unless --include-sleeping is also set.
+        #[arg(long)]
+        no_progress_minutes: Option<i64>,
+        /// Include executions sleeping on a future-dated durable timer in the
+        /// stalled-workflow results. Only meaningful with --no-progress-minutes.
+        #[arg(long)]
+        include_sleeping: bool,
     },
     /// Get one workflow execution and event history.
     Get {
@@ -588,6 +695,12 @@ enum WorkflowCommand {
         /// `allow_duplicate_failed_only`, `terminate_if_running`.
         #[arg(long, value_name = "POLICY")]
         reuse_policy: Option<String>,
+        /// Target ISO 8601 / RFC 3339 timestamp to start the workflow.
+        #[arg(long)]
+        start_at: Option<String>,
+        /// Delay duration before starting the workflow (e.g. "10s", "5m").
+        #[arg(long)]
+        delay: Option<String>,
     },
     /// Cancel a workflow execution.
     Cancel {
@@ -664,6 +777,11 @@ enum WorkflowCommand {
         execution_id: String,
         /// Update ID returned by a prior `harvest workflow update` call.
         update_id: String,
+    },
+    /// List declarative query and update handlers registered for a workflow type.
+    Handlers {
+        /// Registered workflow name.
+        workflow_name: String,
     },
 }
 
@@ -798,6 +916,30 @@ enum DagCommand {
         /// Registered DAG name.
         dag_name: String,
     },
+    /// Retry a failed DAG run from one or more failed nodes (issue #366).
+    ///
+    /// Re-executes the named node(s) and every node declared downstream of
+    /// them, carrying over the recorded results of all upstream nodes. Use
+    /// `--dry-run` first to preview the resolved reset point and the exact
+    /// re-execute / carry-over sets without committing.
+    Retry {
+        /// Registered (unified) DAG name.
+        dag_name: String,
+        /// The failed DAG run's execution id.
+        run_exec_id: String,
+        /// Node (activity) name to retry from. Repeatable.
+        #[arg(long = "from-node", value_name = "NODE", required = true)]
+        from_node: Vec<String>,
+        /// Operator-supplied recovery reason (recorded in the audit trail).
+        #[arg(long)]
+        reason: String,
+        /// Operator identity for audit. Defaults to the global `--actor`.
+        #[arg(long)]
+        operator_id: Option<String>,
+        /// Preview the plan without committing any write.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -863,6 +1005,17 @@ enum ScheduleCommand {
         /// Schedule row ID (UUID).
         id: String,
     },
+    /// Trigger an immediate one-off run of a schedule.
+    TriggerNow {
+        /// Schedule row ID (UUID).
+        id: String,
+        /// Optional free-text reason recorded in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Force-trigger even if the schedule is currently paused.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -877,6 +1030,23 @@ enum RetentionCommand {
 enum ConcurrencyCommand {
     /// Show per-key concurrency stats: cap, in-flight, and pending counts.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum RateLimitCommand {
+    /// Show all active per-activity rate limit token buckets and refill rates.
+    Status,
+    /// Insert or dynamically override a rate limit configuration.
+    Set {
+        /// Opaque rate limit identifier key.
+        key: String,
+        /// Rate at which tokens are added to the bucket per second.
+        #[arg(long)]
+        refill_rate: f64,
+        /// Maximum capacity of the token bucket.
+        #[arg(long)]
+        burst: f64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -951,6 +1121,48 @@ enum DeadLetterCommand {
         /// Preview matching rows without performing any writes.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Aggregate dead-lettered tasks by dimension for fast root-cause triage.
+    ///
+    /// Groups the DLQ by one or more dimensions and reports per-group counts
+    /// with representative sample IDs, merged across shards. Renders a table by
+    /// default; pass --json for piping.
+    Aggregate {
+        /// Grouping dimensions (comma-separated or repeated). Supported:
+        /// `workflow_name`, `activity_name`, `queue_name`, `task_type`,
+        /// `time_bucket`, `failure_signature`. Order builds a hierarchical key.
+        #[arg(long = "group-by", value_delimiter = ',', required = true)]
+        group_by: Vec<String>,
+        /// Granularity for the `time_bucket` dimension: hour (default) or day.
+        #[arg(long)]
+        time_bucket: Option<String>,
+        /// Filter by workflow name (applied before grouping).
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Filter by activity name.
+        #[arg(long)]
+        activity_name: Option<String>,
+        /// Filter by queue name.
+        #[arg(long)]
+        queue_name: Option<String>,
+        /// Inclusive lower bound on `failed_at`: RFC 3339 or relative (e.g. `24h`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Exclusive upper bound on `failed_at`: RFC 3339 or relative.
+        #[arg(long)]
+        until: Option<String>,
+        /// Only include entries with at least this many attempts.
+        #[arg(long)]
+        min_attempts: Option<i32>,
+        /// Cap on returned groups [1–500] (default 50). Long tail rolls into `_other`.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=500))]
+        limit_groups: Option<u32>,
+        /// Representative sample IDs per group [0–10] (default 3).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(0..=10))]
+        samples_per_group: Option<u32>,
+        /// Print the raw JSON API payload instead of a table.
+        #[arg(long)]
+        json: bool,
     },
     /// Bulk-discard dead-lettered tasks matching a filter (delete without replay).
     ///
@@ -1045,6 +1257,24 @@ enum WorkerCommand {
     Health,
 }
 
+/// Subcommands for `harvest events`.
+#[derive(Debug, Subcommand)]
+enum EventsCommand {
+    /// Open the SSE stream for a workflow execution and print events to stdout.
+    ///
+    /// Each SSE event block is printed as `<event-type>: <json-data>`.
+    /// The stream terminates when the execution reaches a terminal state
+    /// (`event: stream-end`) or when the connection is closed.
+    Tail {
+        /// Workflow execution ID to watch.
+        execution_id: String,
+        /// Resume from this event row ID (Last-Event-ID header).
+        /// Events with id > this value are replayed before entering live-tail mode.
+        #[arg(long)]
+        last_event_id: Option<i64>,
+    },
+}
+
 impl Cli {
     /// Build the management API request represented by these CLI arguments.
     ///
@@ -1060,13 +1290,15 @@ impl Cli {
             Commands::Workflow { command } => workflow_request(command),
             Commands::History { command } => Ok(history_request(command)),
             Commands::Handoff { command } => handoff_request(command),
-            Commands::Dag { command } => dag_request(command),
+            Commands::Dag { command } => dag_request(command, self.actor.as_deref()),
             Commands::Schedule { command } => schedule_request(command),
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
+            Commands::RateLimit { command } => Ok(rate_limit_request(command)),
             Commands::Batch { command } => batch_request(command),
             Commands::Audit { command } => Ok(audit_request(command)),
+            Commands::Gate { command } => gate_request(command),
             Commands::Worker { command } => Ok(worker_request(command)),
             Commands::VersionUsage {
                 workflow_name,
@@ -1098,6 +1330,12 @@ impl Cli {
                 *shard_id,
             )),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
+            Commands::Events { .. } => unreachable!("Events command handles its own requests"),
+            Commands::StartBatch {
+                file,
+                items_json,
+                atomic,
+            } => start_batch_request(file.as_deref(), items_json.as_deref(), *atomic),
         }
     }
 }
@@ -1139,6 +1377,18 @@ pub mod tui;
 pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     if matches!(cli.command, Commands::Tui) {
         return tui::run_tui(&cli).await;
+    }
+
+    // SSE streaming: bypasses JSON execute path.
+    if let Commands::Events {
+        command:
+            EventsCommand::Tail {
+                execution_id,
+                last_event_id,
+            },
+    } = &cli.command
+    {
+        return run_events_tail(&cli, execution_id, *last_event_id).await;
     }
 
     // --wait mode: issue drain then poll until Stopped or timeout.
@@ -1253,6 +1503,121 @@ pub async fn execute(cli: &Cli) -> Result<Value, CliError> {
     serde_json::from_str(&body).map_err(CliError::ParseResponse)
 }
 
+/// Open the SSE stream for `execution_id` and print events to stdout.
+///
+/// Each complete SSE event block is printed as `<event-type>: <data>`.
+/// The function returns when the server sends `event: stream-end` or the
+/// connection closes. SSE comment lines (keepalives) are silently discarded.
+async fn run_events_tail(
+    cli: &Cli,
+    execution_id: &str,
+    last_event_id: Option<i64>,
+) -> Result<(), CliError> {
+    let path = format!("/executions/{}", path_segment(execution_id));
+    let url = format!(
+        "{}{}/events/stream",
+        cli.base_url.trim_end_matches('/'),
+        path
+    );
+
+    let client = reqwest::Client::new();
+    let mut builder = client
+        .get(&url)
+        .header("Accept", "text/event-stream")
+        .header("Cache-Control", "no-cache");
+
+    if let Some(token) = &cli.token {
+        builder = builder.bearer_auth(token);
+    }
+    if let Some(id) = last_event_id {
+        builder = builder.header("Last-Event-ID", id.to_string());
+    }
+
+    let response = builder.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await?;
+        return Err(CliError::Http { status, body });
+    }
+
+    let mut response = response;
+    let mut buf: Vec<u8> = Vec::new();
+    // SSE fields for the current event block.
+    let mut ev_id = String::new();
+    let mut ev_type = String::new();
+    let mut ev_data = String::new();
+
+    loop {
+        let chunk = response.chunk().await?;
+        let Some(bytes) = chunk else {
+            // Server closed the connection.
+            break;
+        };
+        buf.extend_from_slice(&bytes);
+
+        // Process complete lines from buf.
+        while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes = &buf[..nl];
+            // Strip trailing CR for CRLF line endings.
+            let line_bytes = line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes);
+            let line = String::from_utf8_lossy(line_bytes).into_owned();
+            buf.drain(..=nl);
+
+            if line.is_empty() {
+                // Empty line = dispatch event block.
+                if !ev_data.is_empty() || !ev_type.is_empty() {
+                    let display_type = if ev_type.is_empty() {
+                        "message"
+                    } else {
+                        &ev_type
+                    };
+                    println!("{display_type}: {ev_data}");
+                    if ev_type == "stream-end" {
+                        return Ok(());
+                    }
+                    if ev_type == "stream-error" {
+                        return Err(CliError::SseStreamError {
+                            message: ev_data.clone(),
+                        });
+                    }
+                }
+                ev_id.clear();
+                ev_type.clear();
+                ev_data.clear();
+            } else if line.starts_with(':') {
+                // SSE comment (keepalive ping) — discard silently.
+            } else {
+                let (key, value) = line.find(':').map_or((line.as_str(), ""), |colon_idx| {
+                    let (k, mut v) = line.split_at(colon_idx);
+                    v = &v[1..];
+                    if v.starts_with(' ') {
+                        v = &v[1..];
+                    }
+                    (k, v)
+                });
+                match key {
+                    "id" => {
+                        ev_id = value.to_string();
+                        let _ = &ev_id; // suppress unused warning; stored for protocol correctness
+                    }
+                    "event" => {
+                        ev_type = value.to_string();
+                    }
+                    "data" => {
+                        if !ev_data.is_empty() {
+                            ev_data.push('\n');
+                        }
+                        ev_data.push_str(value);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Issue drain then poll `GET /workers/{id}` until status reaches `Stopped`
 /// or `wait_timeout_secs` elapses. Prints each poll result as it arrives.
 async fn run_worker_drain_wait(
@@ -1333,6 +1698,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if handoff_wants_table(cli) {
         return Ok(format_handoff_table(value));
     }
+    if dlq_aggregate_wants_table(cli) {
+        return Ok(format_dlq_aggregate_table(value));
+    }
     if audit_list_wants_table(cli) {
         return Ok(format_audit_table(value));
     }
@@ -1345,13 +1713,139 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if backfill_wants_table(cli) {
         return Ok(format_backfill_table(value));
     }
+    if rate_limit_wants_table(cli) {
+        return Ok(format_rate_limit_table(value));
+    }
 
-    let output = if workflow_children_wants_raw_json(cli) || handoff_wants_raw_json(cli) {
+    let output = if workflow_children_wants_raw_json(cli)
+        || handoff_wants_raw_json(cli)
+        || dlq_aggregate_wants_raw_json(cli)
+    {
         OutputFormat::Json
     } else {
         cli.output
     };
     format_output(value, output)
+}
+
+fn dlq_aggregate_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Dlq {
+            command: DeadLetterCommand::Aggregate { json: false, .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn dlq_aggregate_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::Dlq {
+            command: DeadLetterCommand::Aggregate { json: true, .. }
+        }
+    )
+}
+
+/// Render the DLQ aggregation response as a human-readable table.
+///
+/// One row per group: the hierarchical key columns, the count, the time window,
+/// and a comma-joined preview of sample dead-letter IDs.
+fn format_dlq_aggregate_table(value: &Value) -> String {
+    let total = value.get("total").and_then(Value::as_i64).unwrap_or(0);
+    let filtered = value
+        .get("filtered_total")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let truncated = value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let Some(groups) = value.get("groups").and_then(Value::as_array) else {
+        return format!("total: {total}  filtered: {filtered}\nNo DLQ groups found.");
+    };
+    if groups.is_empty() {
+        return format!("total: {total}  filtered: {filtered}\nNo DLQ groups found.");
+    }
+
+    // Collect the union of key field names (in first-seen order), skipping the
+    // `_other` rollup marker so it does not create a phantom column.
+    let mut key_cols: Vec<String> = Vec::new();
+    for group in groups {
+        if let Some(obj) = group.get("key").and_then(Value::as_object) {
+            for name in obj.keys() {
+                if name != "_other" && !key_cols.iter().any(|c| c == name) {
+                    key_cols.push(name.clone());
+                }
+            }
+        }
+    }
+
+    let mut header: Vec<String> = key_cols.iter().map(|c| c.to_uppercase()).collect();
+    header.push("COUNT".to_string());
+    header.push("FIRST_SEEN".to_string());
+    header.push("LAST_SEEN".to_string());
+    header.push("SAMPLES".to_string());
+
+    let mut rows = vec![header];
+    for group in groups {
+        let key = group.get("key");
+        let is_other = key
+            .and_then(|k| k.get("_other"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut row: Vec<String> = Vec::new();
+        for (idx, col) in key_cols.iter().enumerate() {
+            if is_other {
+                // The `_other` rollup has no per-dimension key; label the first
+                // column and leave the rest blank.
+                row.push(if idx == 0 {
+                    "(other)".to_string()
+                } else {
+                    String::new()
+                });
+            } else {
+                row.push(cell_str(key.and_then(|k| k.get(col))));
+            }
+        }
+        row.push(cell_number(group.get("count")));
+        row.push(cell_str(group.get("first_seen")));
+        row.push(cell_str(group.get("last_seen")));
+        let samples = group
+            .get("sample_dead_letter_ids")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        row.push(samples);
+        rows.push(row);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut summary = format!("total: {total}  filtered: {filtered}");
+    if truncated {
+        summary.push_str("  (long tail rolled into _other)");
+    }
+    format!("{summary}\n\n{table}")
 }
 
 fn backfill_wants_table(cli: &Cli) -> bool {
@@ -1361,6 +1855,62 @@ fn backfill_wants_table(cli: &Cli) -> bool {
             command: ScheduleCommand::Backfill { .. }
         }
     ) && cli.output == OutputFormat::PrettyJson
+}
+
+fn rate_limit_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::RateLimit {
+            command: RateLimitCommand::Status
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+fn format_rate_limit_table(value: &Value) -> String {
+    let Some(items) = value.as_array().filter(|v| !v.is_empty()) else {
+        return "No rate limit buckets found.".to_string();
+    };
+
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "KEY".to_string(),
+        "REFILL_RATE".to_string(),
+        "BURST_CAPACITY".to_string(),
+        "CURRENT_TOKENS".to_string(),
+        "LAST_REFILLED_AT".to_string(),
+    ]);
+
+    for item in items {
+        rows.push(vec![
+            cell_str(item.get("key")),
+            format_f64(item.get("refill_rate")),
+            format_f64(item.get("burst")),
+            format_f64(item.get("tokens")),
+            cell_str(item.get("last_refilled_at")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_f64(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_f64)
+        .map_or_else(String::new, |number| format!("{number:.2}"))
 }
 
 fn format_backfill_table(value: &Value) -> String {
@@ -2185,11 +2735,17 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             state,
             workflow_name,
             search_attr,
+            owner,
+            no_progress_minutes,
+            include_sleeping,
         } => Ok(ApiRequest::get(build_workflow_list_path(
             *limit,
             state,
             workflow_name.as_deref(),
             search_attr,
+            owner.as_deref(),
+            *no_progress_minutes,
+            *include_sleeping,
         )?)),
         WorkflowCommand::Get { execution_id } => Ok(ApiRequest::get(format!(
             "/workflows/{}",
@@ -2227,6 +2783,8 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             search_attrs_file,
             execution_timeout_secs,
             reuse_policy,
+            start_at,
+            delay,
         } => {
             let mut body = Map::new();
             insert_string(&mut body, "workflow_id", workflow_id.as_deref());
@@ -2258,6 +2816,8 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
                 body.insert("execution_timeout_secs".to_string(), json!(timeout));
             }
             insert_string(&mut body, "reuse_policy", reuse_policy.as_deref());
+            insert_string(&mut body, "start_at", start_at.as_deref());
+            insert_string(&mut body, "delay", delay.as_deref());
 
             Ok(ApiRequest::post(
                 format!("/workflows/{}/start", path_segment(workflow_name)),
@@ -2367,6 +2927,10 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             "/workflows/{}/update/{}/result",
             path_segment(execution_id),
             path_segment(update_id),
+        ))),
+        WorkflowCommand::Handlers { workflow_name } => Ok(ApiRequest::get(format!(
+            "/workflows/types/{}/handlers",
+            path_segment(workflow_name),
         ))),
     }
 }
@@ -2578,7 +3142,7 @@ fn heartbeat_handoff_request(
     ))
 }
 
-fn dag_request(command: &DagCommand) -> Result<ApiRequest, CliError> {
+fn dag_request(command: &DagCommand, actor: Option<&str>) -> Result<ApiRequest, CliError> {
     match command {
         DagCommand::List => Ok(ApiRequest::get("/dags")),
         DagCommand::Runs { dag_name } => Ok(ApiRequest::get(format!(
@@ -2609,6 +3173,33 @@ fn dag_request(command: &DagCommand) -> Result<ApiRequest, CliError> {
             format!("/dags/{}", path_segment(dag_name)),
             json!({ "paused": false }),
         )),
+        DagCommand::Retry {
+            dag_name,
+            run_exec_id,
+            from_node,
+            reason,
+            operator_id,
+            dry_run,
+        } => {
+            let operator = operator_id
+                .as_deref()
+                .or(actor)
+                .unwrap_or("cli")
+                .to_string();
+            Ok(ApiRequest::post(
+                format!(
+                    "/dags/{}/runs/{}/retry",
+                    path_segment(dag_name),
+                    path_segment(run_exec_id)
+                ),
+                Some(json!({
+                    "from_nodes": from_node,
+                    "reason": reason,
+                    "operator_id": operator,
+                    "dry_run": dry_run,
+                })),
+            ))
+        }
     }
 }
 
@@ -2681,6 +3272,17 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
                 body: None,
             })
         }
+        ScheduleCommand::TriggerNow { id, reason, force } => {
+            let mut body = serde_json::Map::new();
+            if let Some(r) = reason {
+                body.insert("reason".to_string(), Value::String(r.clone()));
+            }
+            let mut path = format!("/admin/schedules/{}/trigger", path_segment(id));
+            if *force {
+                path.push_str("?force=true");
+            }
+            Ok(ApiRequest::post(path, Some(Value::Object(body))))
+        }
     }
 }
 
@@ -2694,6 +3296,23 @@ fn retention_request(command: &RetentionCommand) -> ApiRequest {
 fn concurrency_request(command: &ConcurrencyCommand) -> ApiRequest {
     match command {
         ConcurrencyCommand::Status => ApiRequest::get("/admin/concurrency"),
+    }
+}
+
+fn rate_limit_request(command: &RateLimitCommand) -> ApiRequest {
+    match command {
+        RateLimitCommand::Status => ApiRequest::get("/admin/rate-limits"),
+        RateLimitCommand::Set {
+            key,
+            refill_rate,
+            burst,
+        } => ApiRequest::post(
+            format!("/admin/rate-limits/{}", path_segment(key)),
+            Some(json!({
+                "refill_rate": refill_rate,
+                "burst": burst,
+            })),
+        ),
     }
 }
 
@@ -2792,6 +3411,55 @@ fn batch_request(command: &BatchCommand) -> Result<ApiRequest, CliError> {
     }
 }
 
+/// Build the `POST /workflows/batch_start` request (issue #357).
+///
+/// Reads NDJSON items from `file` or parses `items_json` as a JSON array,
+/// then wraps them in `{ "items": [...], "atomic": <bool> }`.
+fn start_batch_request(
+    file: Option<&Path>,
+    items_json: Option<&str>,
+    atomic: bool,
+) -> Result<ApiRequest, CliError> {
+    let items: Value = match (file, items_json) {
+        (Some(path), None) => {
+            // NDJSON: one JSON object per non-empty line.
+            let raw = read_json_file(path, "NDJSON items")?;
+            let mut arr = Vec::new();
+            for line in raw.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let item: Value =
+                    serde_json::from_str(trimmed).map_err(|source| CliError::InvalidJson {
+                        label: "NDJSON items",
+                        source,
+                    })?;
+                arr.push(item);
+            }
+            Value::Array(arr)
+        }
+        (None, Some(inline)) => {
+            serde_json::from_str(inline).map_err(|source| CliError::InvalidJson {
+                label: "items JSON",
+                source,
+            })?
+        }
+        (None, None) => {
+            return Err(CliError::MissingInput {
+                label: "start-batch requires --file or --items-json",
+            });
+        }
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both being set"),
+    };
+
+    let body = json!({
+        "items": items,
+        "atomic": atomic,
+    });
+    Ok(ApiRequest::post("/workflows/batch_start", Some(body)))
+}
+
 fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
     match command {
         DeadLetterCommand::List { limit } => ApiRequest::get(path_with_limit(
@@ -2838,6 +3506,55 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
                 *dry_run,
             )),
         ),
+        DeadLetterCommand::Aggregate {
+            group_by,
+            time_bucket,
+            workflow_name,
+            activity_name,
+            queue_name,
+            since,
+            until,
+            min_attempts,
+            limit_groups,
+            samples_per_group,
+            json: _,
+        } => {
+            let mut params: Vec<(&str, String)> = Vec::new();
+            for dim in group_by {
+                params.push(("group_by", dim.clone()));
+            }
+            if let Some(tb) = time_bucket {
+                params.push(("time_bucket", tb.clone()));
+            }
+            if let Some(v) = workflow_name {
+                params.push(("workflow_name", v.clone()));
+            }
+            if let Some(v) = activity_name {
+                params.push(("activity_name", v.clone()));
+            }
+            if let Some(v) = queue_name {
+                params.push(("queue_name", v.clone()));
+            }
+            if let Some(v) = since {
+                params.push(("since", v.clone()));
+            }
+            if let Some(v) = until {
+                params.push(("until", v.clone()));
+            }
+            if let Some(v) = min_attempts {
+                params.push(("min_attempts", v.to_string()));
+            }
+            if let Some(v) = limit_groups {
+                params.push(("limit_groups", v.to_string()));
+            }
+            if let Some(v) = samples_per_group {
+                params.push(("samples_per_group", v.to_string()));
+            }
+            ApiRequest::get(format!(
+                "/dead-letters/aggregate?{}",
+                encode_query_params(&params)
+            ))
+        }
     }
 }
 
@@ -2861,6 +3578,54 @@ fn build_bulk_dlq_body(
         body.insert("dry_run".to_string(), json!(true));
     }
     Value::Object(body)
+}
+
+fn gate_request(command: &GateCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        GateCommand::List => Ok(ApiRequest::get("/admin/gates")),
+        GateCommand::Lift { id } => Ok(ApiRequest {
+            method: ApiMethod::Delete,
+            path: format!("/admin/gates/{}", path_segment(id)),
+            body: None,
+        }),
+        GateCommand::Create {
+            scope,
+            reason,
+            message,
+            expires_at,
+        } => {
+            // Parse scope string: "fleet", "workflow_name=X", "queue=X", "shard_id=N", "owner=X"
+            let (scope_kind, scope_value) = if scope == "fleet" {
+                ("fleet".to_string(), None::<String>)
+            } else if let Some(v) = scope.strip_prefix("workflow_name=") {
+                ("workflow_name".to_string(), Some(v.to_string()))
+            } else if let Some(v) = scope.strip_prefix("queue=") {
+                ("queue".to_string(), Some(v.to_string()))
+            } else if let Some(v) = scope.strip_prefix("shard_id=") {
+                ("shard_id".to_string(), Some(v.to_string()))
+            } else if let Some(v) = scope.strip_prefix("owner=") {
+                ("owner".to_string(), Some(v.to_string()))
+            } else {
+                return Err(CliError::InvalidInput(format!(
+                    "unknown scope '{scope}'; expected: fleet, workflow_name=<name>, queue=<name>, shard_id=<N>, or owner=<id>"
+                )));
+            };
+            let mut body = serde_json::json!({
+                "scope_kind": scope_kind,
+                "reason": reason,
+            });
+            if let Some(v) = scope_value {
+                body["scope_value"] = serde_json::json!(v);
+            }
+            if let Some(msg) = message {
+                body["message"] = serde_json::json!(msg);
+            }
+            if let Some(exp) = expires_at {
+                body["expires_at"] = serde_json::json!(exp);
+            }
+            Ok(ApiRequest::post("/admin/gates", Some(body)))
+        }
+    }
 }
 
 fn worker_request(command: &WorkerCommand) -> ApiRequest {
@@ -3077,6 +3842,9 @@ fn build_workflow_list_path(
     states: &[String],
     workflow_name: Option<&str>,
     search_attrs: &[String],
+    owner: Option<&str>,
+    no_progress_minutes: Option<i64>,
+    include_sleeping: bool,
 ) -> Result<String, CliError> {
     let mut params: Vec<(&'static str, String)> = Vec::new();
     if let Some(value) = limit {
@@ -3095,6 +3863,15 @@ fn build_workflow_list_path(
             .split_once('=')
             .ok_or_else(|| CliError::InvalidSearchAttr { value: raw.clone() })?;
         params.push(("search_attr", format!("{key}:{value}")));
+    }
+    if let Some(o) = owner {
+        params.push(("owner", o.to_string()));
+    }
+    if let Some(minutes) = no_progress_minutes {
+        params.push(("no_progress_minutes", minutes.to_string()));
+    }
+    if include_sleeping {
+        params.push(("include_sleeping", "true".to_string()));
     }
 
     if params.is_empty() {
@@ -4175,5 +4952,205 @@ mod reuse_policy_tests {
         let rendered = render_response(&cli, &payload).expect("table should render");
 
         assert!(rendered.contains("No old-version executions found"));
+    }
+
+    #[test]
+    fn rate_limit_status_builds_get_request() {
+        let req = parse(&["rate-limit", "status"]).api_request().unwrap();
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/admin/rate-limits");
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn rate_limit_set_builds_post_request() {
+        let req = parse(&[
+            "rate-limit",
+            "set",
+            "my-key",
+            "--refill-rate",
+            "10.5",
+            "--burst",
+            "20",
+        ])
+        .api_request()
+        .unwrap();
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/admin/rate-limits/my-key");
+        let body = req.body.as_ref().unwrap();
+        assert_eq!(body["refill_rate"].as_f64().unwrap(), 10.5);
+        assert_eq!(body["burst"].as_f64().unwrap(), 20.0);
+    }
+
+    #[test]
+    fn rate_limit_table_renders_headers_and_rows() {
+        let cli = parse(&["rate-limit", "status"]);
+        let payload = json!([
+            {
+                "key": "test-key-1",
+                "refill_rate": 5.0,
+                "burst": 10.0,
+                "tokens": 8.5,
+                "last_refilled_at": "2026-05-22T22:00:00Z"
+            }
+        ]);
+        let rendered = render_response(&cli, &payload).unwrap();
+        assert!(rendered.contains("KEY"));
+        assert!(rendered.contains("REFILL_RATE"));
+        assert!(rendered.contains("BURST_CAPACITY"));
+        assert!(rendered.contains("CURRENT_TOKENS"));
+        assert!(rendered.contains("LAST_REFILLED_AT"));
+        assert!(rendered.contains("test-key-1"));
+        assert!(rendered.contains("5.00"));
+        assert!(rendered.contains("10.00"));
+        assert!(rendered.contains("8.50"));
+        assert!(rendered.contains("2026-05-22T22:00:00Z"));
+    }
+}
+
+#[cfg(test)]
+mod dlq_aggregate_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn aggregate_maps_to_get_with_repeated_group_by() {
+        let req = request(&[
+            "dlq",
+            "aggregate",
+            "--group-by",
+            "workflow_name,failure_signature",
+            "--since",
+            "24h",
+            "--samples-per-group",
+            "3",
+        ]);
+        assert_eq!(req.method, ApiMethod::Get);
+        assert!(req.path.starts_with("/dead-letters/aggregate?"));
+        assert!(
+            req.path.contains("group_by=workflow_name"),
+            "path: {}",
+            req.path
+        );
+        assert!(
+            req.path.contains("group_by=failure_signature"),
+            "path: {}",
+            req.path
+        );
+        assert!(req.path.contains("since=24h"), "path: {}", req.path);
+        assert!(
+            req.path.contains("samples_per_group=3"),
+            "path: {}",
+            req.path
+        );
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn aggregate_passes_all_filters() {
+        let req = request(&[
+            "dlq",
+            "aggregate",
+            "--group-by",
+            "queue_name",
+            "--time-bucket",
+            "day",
+            "--workflow-name",
+            "onboarding",
+            "--activity-name",
+            "charge_card",
+            "--queue-name",
+            "billing",
+            "--until",
+            "2026-05-18T04:00:00Z",
+            "--min-attempts",
+            "3",
+            "--limit-groups",
+            "100",
+        ]);
+        assert!(req.path.contains("time_bucket=day"));
+        assert!(req.path.contains("workflow_name=onboarding"));
+        assert!(req.path.contains("activity_name=charge_card"));
+        assert!(req.path.contains("queue_name=billing"));
+        assert!(req.path.contains("min_attempts=3"));
+        assert!(req.path.contains("limit_groups=100"));
+    }
+
+    #[test]
+    fn aggregate_requires_group_by() {
+        let parsed = Cli::try_parse_from(["harvest", "dlq", "aggregate"]);
+        assert!(parsed.is_err(), "--group-by is required");
+    }
+
+    #[test]
+    fn aggregate_rejects_out_of_range_limit_groups() {
+        let parsed = Cli::try_parse_from([
+            "harvest",
+            "dlq",
+            "aggregate",
+            "--group-by",
+            "queue_name",
+            "--limit-groups",
+            "9999",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "limit_groups > 500 must be rejected by clap"
+        );
+    }
+
+    #[test]
+    fn aggregate_table_renders_groups_and_other_rollup() {
+        let cli = parse(&["dlq", "aggregate", "--group-by", "workflow_name"]);
+        let payload = json!({
+            "total": 100,
+            "filtered_total": 100,
+            "truncated": true,
+            "groups": [
+                {
+                    "key": {"workflow_name": "onboarding"},
+                    "count": 60,
+                    "first_seen": "2026-05-18T03:00:00Z",
+                    "last_seen": "2026-05-18T04:00:00Z",
+                    "sample_dead_letter_ids": ["id-a", "id-b"]
+                },
+                {
+                    "key": {"_other": true},
+                    "count": 40,
+                    "sample_dead_letter_ids": []
+                }
+            ]
+        });
+
+        let rendered = render_response(&cli, &payload).expect("table should render");
+        assert!(rendered.contains("WORKFLOW_NAME"), "{rendered}");
+        assert!(rendered.contains("COUNT"), "{rendered}");
+        assert!(rendered.contains("onboarding"), "{rendered}");
+        assert!(rendered.contains("(other)"), "{rendered}");
+        assert!(rendered.contains("id-a,id-b"), "{rendered}");
+        assert!(
+            rendered.contains("long tail rolled into _other"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn aggregate_json_flag_emits_raw_payload() {
+        let cli = parse(&["dlq", "aggregate", "--group-by", "workflow_name", "--json"]);
+        let payload = json!({"total": 1, "filtered_total": 1, "truncated": false, "groups": []});
+        let rendered = render_response(&cli, &payload).expect("json should render");
+        // Compact JSON (no pretty indentation) for piping.
+        assert!(rendered.starts_with('{'));
+        assert!(rendered.contains("\"total\":1"));
     }
 }

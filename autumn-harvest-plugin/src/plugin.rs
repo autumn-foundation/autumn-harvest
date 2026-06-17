@@ -14,7 +14,7 @@ use autumn_web::plugin::Plugin;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{HarvestApiState, harvest_api_router};
+use crate::api::{HarvestApiState, acquire_conn, harvest_api_router};
 use crate::config::{HarvestMode, HarvestRuntimeConfig};
 use crate::outbox::spawn_workflow_start_outbox_relay;
 use crate::runner::{HarvestRunner, HarvestRunnerResources};
@@ -33,9 +33,15 @@ struct OutboxRuntime {
     handle: JoinHandle<()>,
 }
 
+struct GateRefreshRuntime {
+    shutdown: CancellationToken,
+    handle: JoinHandle<()>,
+}
+
 struct HarvestRuntime {
     runner: HarvestRunner,
     outbox: Option<OutboxRuntime>,
+    gate_refresh: Option<GateRefreshRuntime>,
 }
 
 /// Plugin-local shared slot: holds the pre-built `HarvestBuilder` until the
@@ -181,6 +187,9 @@ impl Plugin for HarvestPlugin {
             runtime: None,
         }));
         let api_state = HarvestApiState::new();
+        // issue #377: arm fail-closed so any request in the window between
+        // HTTP server bind and the boot-time gate load is safely rejected.
+        api_state.arm_gate_cache_fail_closed();
         api_state.set_admin_auth_boundary(api_middleware.is_some());
 
         let startup_slot = Arc::clone(&slot);
@@ -192,7 +201,20 @@ impl Plugin for HarvestPlugin {
             .on_startup(move |state| {
                 let slot = Arc::clone(&startup_slot);
                 let api_state = startup_api_state.clone();
-                async move { start_harvest_runtime(&state, &slot, &api_state) }
+                async move {
+                    tracing::info!("on_startup hook: executing start_harvest_runtime");
+                    let res = start_harvest_runtime(&state, &slot, &api_state).await;
+                    match &res {
+                        Ok(()) => tracing::info!(
+                            "on_startup hook: start_harvest_runtime completed successfully"
+                        ),
+                        Err(e) => tracing::error!(
+                            "on_startup hook: start_harvest_runtime failed with error: {:?}",
+                            e
+                        ),
+                    }
+                    res
+                }
             })
             .on_shutdown(move || {
                 let slot = Arc::clone(&shutdown_slot);
@@ -215,12 +237,14 @@ impl Plugin for HarvestPlugin {
     }
 }
 
-fn start_harvest_runtime(
+#[allow(clippy::too_many_lines, clippy::unused_async)]
+async fn start_harvest_runtime(
     state: &AppState,
     slot: &Arc<Mutex<HarvestRuntimeSlot>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
     api_state.set_deployment_profile(state.profile().to_string());
+    api_state.set_admin_auth_session_key(state.auth_session_key());
     let app_config = AutumnConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let harvest_config = HarvestRuntimeConfig::load()
@@ -252,6 +276,32 @@ fn start_harvest_runtime(
         ));
     };
 
+    #[allow(unused_mut)]
+    let mut builder = builder;
+    #[cfg(feature = "webhooks")]
+    {
+        #[allow(unused_imports)]
+        use crate::webhook::{
+            __autumn_activity_info_deliver_webhook, __autumn_workflow_info_webhook_delivery,
+            deliver_webhook, webhook_delivery,
+        };
+        builder = builder
+            .workflows(autumn_harvest::prelude::workflows![webhook_delivery])
+            .activities(autumn_harvest::prelude::activities![deliver_webhook]);
+
+        if !builder
+            .worker_config_mut()
+            .queues
+            .iter()
+            .any(|q| q == "webhooks")
+        {
+            builder
+                .worker_config_mut()
+                .queues
+                .push("webhooks".to_string());
+        }
+    }
+
     let mut built = builder
         .try_build()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
@@ -262,6 +312,14 @@ fn start_harvest_runtime(
     // Mirror the configured shutdown timeout so drain requests can compute a
     // sensible default deadline without the caller having to supply one.
     api_state.set_worker_shutdown_timeout(built.worker_config().shutdown_timeout);
+    // Propagate the per-query timeout from WorkerConfig (issue #234).
+    api_state.set_query_timeout(built.worker_config().query_timeout);
+    // Propagate the server-side execution timeout ceiling (issue #243).
+    api_state.set_max_workflow_execution_timeout(built.max_workflow_execution_timeout);
+    // Propagate the server-side start delay ceiling (issue #322).
+    api_state.set_max_workflow_start_delay(built.worker_config().max_workflow_start_delay);
+    // Propagate batch start caps from builder config (issue #357).
+    api_state.set_batch_start_config(&built.batch_start_config);
 
     // Apply the api_state audit retention override only when explicitly set,
     // so that builder-level retention config is not silently clobbered.
@@ -277,7 +335,15 @@ fn start_harvest_runtime(
     if let Some(app_pool) = app_pool.as_ref() {
         runner_resources = runner_resources.with_app_pool(app_pool.clone());
     }
-    let runner = HarvestRunner::start(built, &harvest_config, runner_resources)?;
+    let payload_codecs = built.payload_codecs().clone();
+    let query_handlers = built.query_handlers().to_vec();
+    let update_handlers = built.update_handlers().to_vec();
+    let max_workflow_input_bytes = built.max_workflow_input_bytes;
+    let max_workflow_execution_timeout = built.max_workflow_execution_timeout;
+    let max_workflow_start_delay = built.max_workflow_start_delay;
+    let max_signal_payload_bytes = built.max_signal_payload_bytes;
+    let query_timeout = built.worker_config().query_timeout;
+    let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
     let harvest_db_pool = runner.storage_pool();
     let workflow_handle_client = WorkflowHandleClient::new(
         harvest_db_pool.sharded_pool().clone(),
@@ -286,10 +352,179 @@ fn start_harvest_runtime(
             autumn_harvest::ShardId::new(0),
             workflow_result_notification_url,
         )],
-    );
+    )
+    .with_codecs(payload_codecs)
+    .with_shared_state(runner.api_runtime().registry().shared_state())
+    .with_handlers(query_handlers, update_handlers)
+    .with_max_workflow_input_bytes(max_workflow_input_bytes)
+    .with_max_workflow_execution_timeout(max_workflow_execution_timeout)
+    .with_max_workflow_start_delay(max_workflow_start_delay)
+    .with_max_signal_payload_bytes(max_signal_payload_bytes)
+    .with_query_timeout(query_timeout)
+    .with_history_policy(runner.api_runtime().registry().history_policy());
     state.insert_extension(harvest_db_pool.clone());
+    state.insert_extension(runner.api_runtime().registry().clone());
+
+    #[cfg(feature = "webhooks")]
+    let client = workflow_handle_client.clone();
     state.insert_extension(workflow_handle_client);
-    api_state.install_storage_pool(harvest_db_pool);
+
+    #[cfg(feature = "webhooks")]
+    {
+        tracing::info!("HarvestPlugin: inserting WebhookDelegateExt into AppState extensions");
+        let delegate = std::sync::Arc::new(
+            move |state: &AppState,
+                  sub: autumn_web::webhook_outbound::WebhookSubscription,
+                  log: autumn_web::webhook_outbound::WebhookDeliveryLog| {
+                let client = client.clone();
+                let harvest_db = state.extension::<crate::state::HarvestDbPool>();
+
+                let (owner, runbook_url, severity, info_sla) = state
+                    .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
+                    .and_then(|registry| {
+                        registry
+                            .workflows
+                            .get("webhook_delivery")
+                            .map(|wf| (wf.owner, wf.runbook_url, wf.severity, wf.sla))
+                    })
+                    .unwrap_or((None, None, None, None));
+                let sla = info_sla.and_then(|d| autumn_harvest::chrono::Duration::from_std(d).ok());
+
+                Box::pin(async move {
+                    let workflow_id = format!("webhook-delivery-{}", log.id);
+                    let shard =
+                        client.pick_shard_for_new_workflow("webhook_delivery", &workflow_id);
+                    let exec_id = autumn_harvest::types::ExecutionId::new_for_shard(shard);
+
+                    let start_params = autumn_harvest::execution::StartWorkflowParams {
+                        workflow_name: "webhook_delivery",
+                        workflow_id: &workflow_id,
+                        exec_id,
+                        input: serde_json::json!({
+                            "subscription_id": sub.id,
+                            "topic": log.topic,
+                            "payload": log.payload,
+                        }),
+                        parent_id: None,
+                        queue_name: "webhooks",
+                        execution_timeout: None,
+                        memo: None,
+                        search_attrs: None,
+                        reuse_policy: autumn_harvest::WorkflowIdReusePolicy::default(),
+                        trace_context: None,
+                        max_execution_timeout_ceiling: None,
+                        concurrency_key: None,
+                        concurrency_limit: None,
+                        priority: autumn_harvest::prelude::Priority::default(),
+                        max_workflow_input_bytes,
+                        start_at: None,
+                        delay: None,
+                        max_workflow_start_delay: None,
+                        owner,
+                        runbook_url,
+                        severity,
+                        context_headers: None,
+                        sla,
+                        schedule_id: None,
+                        scheduled_for: None,
+                    };
+
+                    let Some(harvest_db) = harvest_db else {
+                        return Err(autumn_web::error::AutumnError::internal_server_error_msg(
+                            "HarvestDbPool not found on AppState extensions",
+                        ));
+                    };
+                    let pool = harvest_db.pool_for(shard).clone();
+                    let mut conn = pool.get().await.map_err(|e| {
+                        autumn_web::error::AutumnError::internal_server_error_msg(e.to_string())
+                    })?;
+
+                    client
+                        .start_or_load(&mut conn, start_params)
+                        .await
+                        .map_err(|e| {
+                            autumn_web::error::AutumnError::internal_server_error_msg(format!(
+                                "failed to start Harvest webhook workflow: {e}"
+                            ))
+                        })?;
+
+                    Ok(())
+                })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send>,
+                    >
+            },
+        );
+        state.insert_extension(autumn_web::webhook_outbound::WebhookDelegateExt(delegate));
+    }
+
+    api_state.install_storage_pool(harvest_db_pool.clone());
+
+    // issue #377: boot-time gate load — populate the cache before any traffic hits.
+    if let Ok(mut boot_conn) = acquire_conn(harvest_db_pool.default_pool()).await {
+        match autumn_harvest::admission_gate::db::load_active_gates(&mut boot_conn).await {
+            Ok(gates) => {
+                api_state.gate_cache().refresh(gates);
+                tracing::debug!("admission gate cache populated at startup");
+            }
+            Err(e) => tracing::warn!(error = %e, "could not load admission gates at startup"),
+        }
+    }
+
+    // issue #377: spawn background gate-cache refresh (≤2 s p95 cross-replica propagation).
+    let gate_refresh = {
+        let cache = api_state.gate_cache();
+        let api_state_for_metrics = api_state.clone();
+        let pool = harvest_db_pool.clone_inner();
+        let shutdown = CancellationToken::new();
+        let cancel_for_task = shutdown.child_token();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = cancel_for_task.cancelled() => return,
+                    () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                }
+                // Fail-closed on any error: if the gate table is
+                // unreadable the cache transitions to uninitialized so
+                // check() blocks new starts rather than silently admitting
+                // them with a stale open snapshot.
+                match acquire_conn(&pool).await {
+                    Ok(mut conn) => {
+                        match autumn_harvest::admission_gate::db::load_active_gates(&mut conn).await
+                        {
+                            Ok(gates) => {
+                                let count = i64::try_from(gates.len()).unwrap_or(0);
+                                cache.refresh(gates);
+                                if let Ok(rt) = api_state_for_metrics.runtime() {
+                                    rt.registry()
+                                        .telemetry()
+                                        .metrics
+                                        .record_admission_gates_active(count);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "admission gate refresh failed; entering fail-closed mode"
+                                );
+                                cache.set_fail_closed();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "admission gate refresh: could not acquire DB connection; \
+                             entering fail-closed mode"
+                        );
+                        cache.set_fail_closed();
+                    }
+                }
+            }
+        });
+        Some(GateRefreshRuntime { shutdown, handle })
+    };
+
     let outbox = app_pool.as_ref().and_then(|_| {
         if harvest_config.outbox.enabled {
             let shutdown = CancellationToken::new();
@@ -304,8 +539,13 @@ fn start_harvest_runtime(
 
     {
         let mut guard = slot.lock().expect("harvest lock poisoned");
-        guard.runtime = Some(HarvestRuntime { runner, outbox });
+        guard.runtime = Some(HarvestRuntime {
+            runner,
+            outbox,
+            gate_refresh,
+        });
     }
+
     Ok(())
 }
 
@@ -359,6 +599,10 @@ async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: H
         return;
     };
 
+    if let Some(gate_refresh) = runtime.gate_refresh {
+        gate_refresh.shutdown.cancel();
+        let _ = gate_refresh.handle.await;
+    }
     if let Some(outbox) = runtime.outbox {
         outbox.shutdown.cancel();
         if let Err(error) = outbox.handle.await
@@ -468,6 +712,17 @@ mod tests {
             name: "echo",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            concurrency: None,
+            max_input_bytes: None,
+            sla: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }
     }
 
@@ -479,10 +734,18 @@ mod tests {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -498,6 +761,13 @@ mod tests {
             max_active_runs: 1,
             default_queue: Some("default"),
             builder: build,
+            workflow_handler: None,
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }
     }
 
@@ -553,6 +823,36 @@ mod tests {
         );
 
         assert!(app.has_plugin(std::any::type_name::<HarvestPlugin>()));
+    }
+
+    #[tokio::test]
+    async fn harvest_runner_rejects_classic_dags_without_unified_handler() {
+        let built = HarvestBuilder::new().dags(vec![fake_dag_info()]).build();
+        let pool = test_pool("postgres://harvest:harvest@localhost:5432/harvest", 4);
+        let result = HarvestRunner::start(
+            built,
+            &HarvestRuntimeConfig {
+                mode: HarvestMode::External,
+                worker_enabled: false,
+                scheduler_enabled: false,
+                database: HarvestDatabaseConfig {
+                    url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_string()),
+                },
+                outbox: HarvestOutboxConfig::default(),
+                batch: crate::config::HarvestBatchConfig::default(),
+                readiness: crate::config::HarvestReadinessConfig::default(),
+            },
+            HarvestRunnerResources::new(pool),
+        )
+        .await;
+
+        let Err(err) = result else {
+            panic!("classic DAG runtime should be rejected before startup");
+        };
+        assert!(
+            err.to_string().contains("classic DAG"),
+            "error should identify unsupported classic DAG configuration: {err}"
+        );
     }
 
     #[test]

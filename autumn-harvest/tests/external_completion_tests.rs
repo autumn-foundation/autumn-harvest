@@ -433,6 +433,8 @@ async fn context_replays_completed_external_activity() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -471,6 +473,8 @@ async fn context_replays_failed_external_activity() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -509,6 +513,8 @@ async fn context_replays_timed_out_external_activity() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -549,6 +555,8 @@ async fn context_awaiting_external_re_emits_same_token_idempotently() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -599,6 +607,8 @@ async fn context_execute_activity_external_detects_non_determinism() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -622,7 +632,7 @@ async fn context_execute_activity_external_detects_non_determinism() {
         .await;
 
     assert!(
-        matches!(result, Err(HarvestError::NonDeterministic(_))),
+        matches!(result, Err(HarvestError::NonDeterministic { .. })),
         "expected NonDeterministic, got {result:?}"
     );
     assert!(ctx.drain_commands().is_empty());
@@ -642,6 +652,8 @@ async fn context_double_complete_is_idempotent_replay() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -685,6 +697,8 @@ async fn context_post_restart_while_awaiting_with_deadline_extensions() {
         WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,

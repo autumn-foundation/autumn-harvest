@@ -10,11 +10,62 @@ use diesel::prelude::*;
 use uuid::Uuid;
 
 use crate::schema::{
-    harvest_audit_log, harvest_backfill_log, harvest_batch_jobs, harvest_build_compat,
-    harvest_build_policies, harvest_dag_runs, harvest_dead_letters, harvest_events,
-    harvest_external_tasks, harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers,
-    harvest_workers, harvest_workflow_executions,
+    harvest_admission_gates, harvest_audit_log, harvest_backfill_log, harvest_batch_jobs,
+    harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
+    harvest_completion_trigger_fires, harvest_completion_trigger_outbox,
+    harvest_completion_triggers, harvest_dead_letters, harvest_events, harvest_external_tasks,
+    harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_signals,
+    harvest_task_queue, harvest_timers, harvest_workers, harvest_workflow_executions,
 };
+
+// ── Calendar ──────────────────────────────────────────────────────────────────
+
+/// A named calendar row from `harvest_calendars`.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_calendars)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestCalendar {
+    pub id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    /// `true` for built-in calendars that operators cannot delete.
+    pub built_in: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insert struct for creating a new calendar.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_calendars)]
+pub struct NewHarvestCalendar<'a> {
+    pub id: Uuid,
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+    pub built_in: bool,
+}
+
+/// A single date exclusion row from `harvest_calendar_exclusions`.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_calendar_exclusions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestCalendarExclusion {
+    pub id: Uuid,
+    pub calendar_name: String,
+    pub excluded_date: chrono::NaiveDate,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert struct for adding a date to a calendar's exclusion set.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_calendar_exclusions)]
+pub struct NewHarvestCalendarExclusion<'a> {
+    pub calendar_name: &'a str,
+    pub excluded_date: chrono::NaiveDate,
+}
 
 // ── WorkflowExecution ─────────────────────────────────────────────────────────
 
@@ -40,11 +91,51 @@ pub struct WorkflowExecution {
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub execution_timeout: Option<chrono::Duration>,
+    /// Absolute UTC deadline for execution-level timeout (issue #243).
+    /// Computed at start as `started_at + execution_timeout`. NULL = no deadline.
+    pub deadline_at: Option<DateTime<Utc>>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     /// Build ID assigned at workflow start time (issue #171). `None` = pre-policy.
     pub assigned_build_id: Option<String>,
+    /// Parent-close policy for detached children (issue #347). `None` = awaited.
+    pub parent_close_policy: Option<String>,
+    pub owner: Option<String>,
+    pub runbook_url: Option<String>,
+    pub severity: Option<String>,
+    /// Wall-clock instant the active pause was applied (issue #383). `None` = not paused.
+    pub paused_at: Option<DateTime<Utc>>,
+    /// Optional operator-supplied pause reason (issue #383).
+    pub pause_reason: Option<String>,
+    /// Identity that requested the active pause (issue #383).
+    pub pause_actor: Option<String>,
+    /// Last-write-wins human-readable status string set by the workflow author
+    /// via `ctx.set_current_details(...)` (issue #473). `None` = never set.
+    pub current_details: Option<String>,
+    /// Ambient string key-value context attached at start and propagated to all
+    /// activities and child workflows (issue #481). `None` = empty map.
+    /// Skipped in serde output: raw header values may contain auth tokens or
+    /// tenant secrets and must not be exposed via management API responses.
+    #[serde(skip)]
+    pub context_headers: Option<serde_json::Value>,
+    /// Optional declared SLA budget for soft breach signal (issue #487).
+    /// Stored so continue-as-new / reset can re-anchor per run. `None` = no SLA.
+    pub sla: Option<chrono::Duration>,
+    /// Absolute UTC deadline for soft SLA enforcement (issue #487).
+    /// Computed at start as `started_at + sla`. `None` = no SLA declared.
+    pub sla_deadline_at: Option<DateTime<Utc>>,
+    /// Whether the soft SLA deadline has been breached (issue #487).
+    /// Set exactly once by the scanner; never by the workflow engine.
+    pub sla_breached: bool,
+    /// Wall-clock instant the SLA was first detected as breached (issue #487).
+    /// `None` when `sla_breached = false`.
+    pub sla_breached_at: Option<DateTime<Utc>>,
+    /// Schedule that fired this execution (issue #488). `None` for manual starts.
+    pub schedule_id: Option<Uuid>,
+    /// Logical schedule slot this run fires for (issue #488); carryover is ordered by
+    /// this, not `completed_at`. `None` for manual starts.
+    pub scheduled_for: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -60,17 +151,43 @@ pub struct NewWorkflowExecution<'a> {
     pub parent_id: Option<Uuid>,
     pub queue_name: &'a str,
     pub execution_timeout: Option<chrono::Duration>,
+    /// Absolute UTC deadline for execution-level timeout (issue #243).
+    /// NULL = no deadline enforced.
+    pub deadline_at: Option<DateTime<Utc>>,
     pub memo: Option<serde_json::Value>,
     pub search_attrs: Option<serde_json::Value>,
     /// Build ID from the active build policy for this queue at start time.
     pub assigned_build_id: Option<String>,
+    /// Parent-close policy for detached children (issue #347). `None` = awaited.
+    pub parent_close_policy: Option<String>,
+    pub owner: Option<&'a str>,
+    pub runbook_url: Option<&'a str>,
+    pub severity: Option<&'a str>,
+    /// Ambient context headers (issue #481). `None` = no headers.
+    pub context_headers: Option<serde_json::Value>,
+    /// Optional declared SLA budget (issue #487). NULL = no SLA.
+    pub sla: Option<chrono::Duration>,
+    /// Absolute UTC SLA deadline (issue #487). NULL = no SLA.
+    pub sla_deadline_at: Option<DateTime<Utc>>,
+    /// Schedule that fired this execution (issue #488). `None` for manual starts.
+    pub schedule_id: Option<Uuid>,
+    /// Logical schedule slot this run fires for (issue #488); carryover is ordered by
+    /// this, not `completed_at`. `None` for manual starts.
+    pub scheduled_for: Option<DateTime<Utc>>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
 
 /// A single event in the workflow execution history (append-only).
 #[derive(
-    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Queryable,
+    QueryableByName,
+    Selectable,
+    Identifiable,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 #[diesel(table_name = harvest_events)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
@@ -114,6 +231,7 @@ pub struct TaskQueueItem {
     pub task_type: String,
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<String>,
+    pub activity_id: Option<Uuid>,
     pub input: serde_json::Value,
     pub state: String,
     pub priority: i32,
@@ -141,6 +259,23 @@ pub struct TaskQueueItem {
     pub concurrency_cap: Option<i32>,
     /// Build ID required to claim this task (issue #171). NULL = any worker.
     pub required_build_id: Option<String>,
+    /// Optional rate limit key to throttle execution throughput.
+    pub rate_limit_key: Option<String>,
+    /// Consecutive worker crashes attributed to this task (issue #367).
+    ///
+    /// Incremented each time the orphan-reclaim scanner reclaims this row from
+    /// a dead worker without it having completed. When it reaches the
+    /// configured poison-pill threshold the task is quarantined to the DLQ.
+    pub crash_strikes: i32,
+    /// Absolute UTC deadline for the total activity lifetime across all retry
+    /// attempts (issue #378). Set once at initial enqueue; never refreshed on
+    /// retry. NULL = no total deadline (unbounded retries).
+    pub schedule_to_close_at: Option<DateTime<Utc>>,
+    /// Structured capability requirements JSONB payload (issue #382).
+    pub required_capabilities: Option<serde_json::Value>,
+    /// Ambient context headers propagated from the parent workflow (issue #481).
+    #[serde(skip)]
+    pub context_headers: Option<serde_json::Value>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -152,6 +287,7 @@ pub struct NewTaskQueueItem<'a> {
     pub task_type: &'a str,
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<&'a str>,
+    pub activity_id: Option<Uuid>,
     pub input: serde_json::Value,
     pub priority: i32,
     pub max_attempts: i32,
@@ -169,41 +305,51 @@ pub struct NewTaskQueueItem<'a> {
     pub concurrency_cap: Option<i32>,
     /// Build ID required to claim this task. `None` = any worker may claim.
     pub required_build_id: Option<&'a str>,
+    /// Optional rate limit key to throttle execution throughput.
+    pub rate_limit_key: Option<&'a str>,
+    /// Absolute UTC deadline for the total activity lifetime (issue #378).
+    /// NULL = no total deadline enforced.
+    pub schedule_to_close_at: Option<DateTime<Utc>>,
+    /// Structured capability requirements JSONB payload (issue #382).
+    pub required_capabilities: Option<serde_json::Value>,
+    /// Ambient context headers propagated from the parent workflow (issue #481).
+    pub context_headers: Option<serde_json::Value>,
 }
 
-// ── DagRun ────────────────────────────────────────────────────────────────────
-
-/// A single DAG run instance.
+/// Database representation of a rate limit bucket.
 #[derive(
-    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Queryable,
+    Selectable,
+    Identifiable,
+    Insertable,
+    AsChangeset,
+    serde::Serialize,
+    serde::Deserialize,
 )]
-#[diesel(table_name = harvest_dag_runs)]
+#[diesel(table_name = harvest_rate_limit_buckets)]
+#[diesel(primary_key(key))]
 #[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct DagRun {
-    pub id: Uuid,
-    pub dag_name: String,
-    pub workflow_exec_id: Option<Uuid>,
-    pub state: String,
-    pub logical_date: DateTime<Utc>,
-    pub data_interval_start: DateTime<Utc>,
-    pub data_interval_end: DateTime<Utc>,
-    pub conf: Option<serde_json::Value>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
+pub struct RateLimitBucket {
+    pub key: String,
+    pub refill_rate: f64,
+    pub burst: f64,
+    pub tokens: f64,
+    pub last_refilled_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
-/// Insert struct for creating a new DAG run.
-#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
-#[diesel(table_name = harvest_dag_runs)]
-pub struct NewDagRun<'a> {
-    pub id: Uuid,
-    pub dag_name: &'a str,
-    pub workflow_exec_id: Option<Uuid>,
-    pub logical_date: DateTime<Utc>,
-    pub data_interval_start: DateTime<Utc>,
-    pub data_interval_end: DateTime<Utc>,
-    pub conf: Option<serde_json::Value>,
+/// Insert struct for a rate limit bucket.
+#[derive(Debug, Insertable, AsChangeset, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_rate_limit_buckets)]
+pub struct NewRateLimitBucket<'a> {
+    pub key: &'a str,
+    pub refill_rate: f64,
+    pub burst: f64,
+    pub tokens: f64,
+    pub last_refilled_at: DateTime<Utc>,
 }
 
 // ── Schedule ──────────────────────────────────────────────────────────────────
@@ -233,6 +379,55 @@ pub struct HarvestSchedule {
     pub workflow_input: Option<serde_json::Value>,
     /// Task queue for workflow dispatches. NULL for DAG schedule rows.
     pub queue_name: Option<String>,
+    /// When the schedule was paused. NULL when the schedule is active.
+    pub paused_at: Option<DateTime<Utc>>,
+    /// Actor identity that issued the most recent pause. NULL when active.
+    pub paused_by: Option<String>,
+    /// Free-text reason recorded with the most recent pause. NULL when active or no reason given.
+    pub pause_reason: Option<String>,
+    /// Maximum jitter window in seconds. 0 = no jitter (default).
+    pub jitter_secs: i64,
+    /// Overlap policy variant stored as a `snake_case` string (issue #241).
+    pub overlap_policy: String,
+    /// Durable buffered fire times for `BufferOne`/`BufferAll` (issue #241).
+    pub buffered_runs: serde_json::Value,
+    /// Maximum buffered slots under `BufferAll` (issue #241). Default 100.
+    pub buffer_all_max: i32,
+    /// Optional named calendar for this schedule (issue #337). NULL = no filtering.
+    pub calendar_name: Option<String>,
+    /// What to do when the fire date is calendar-excluded (issue #337).
+    pub skip_policy: String,
+    /// Token set by the replica that atomically claimed this slot for firing (issue #350).
+    /// NULL = no claim held. Cleared when `next_run_at` is advanced after a successful fire.
+    pub fire_claim_token: Option<Uuid>,
+    /// UTC expiry for the current claim (issue #350). When past, any replica may re-claim
+    /// (crash-recovery path). NULL when `fire_claim_token` is NULL.
+    pub fire_claimed_until: Option<DateTime<Utc>>,
+    /// Auto-pause threshold (issue #360). NULL = auto-pause disabled.
+    pub consecutive_failure_limit: Option<i32>,
+    /// Running count of consecutive schedule-triggered execution failures (issue #360).
+    pub consecutive_failure_count: i32,
+    /// Set to the timestamp when the schedule was auto-paused (issue #360). NULL = not auto-paused.
+    pub auto_paused_at: Option<DateTime<Utc>>,
+    /// Absolute UTC cutoff for this schedule (issue #478). NULL = no cutoff.
+    pub end_at: Option<DateTime<Utc>>,
+    /// Total run budget (issue #478). NULL = unlimited.
+    pub max_runs: Option<i32>,
+    /// Count of executions actually started by this schedule (issue #478).
+    pub runs_started: i32,
+    /// Set when the schedule transitions to the exhausted state (issue #478). NULL = still active.
+    pub exhausted_at: Option<DateTime<Utc>>,
+    /// Machine-readable reason for exhaustion: `"end_at_reached"` or `"max_runs_exhausted"` (issue #478).
+    pub exhausted_reason: Option<String>,
+    /// Catchup policy discriminator for missed fire slots (issue #484).
+    /// One of `"skip_all"`, `"most_recent"`, `"window"`, `"unbounded"`. NULL = legacy bool fallback.
+    pub catchup_policy: Option<String>,
+    /// Window duration in seconds for the `"window"` catchup policy (issue #484). NULL = unused.
+    pub catchup_window_secs: Option<i64>,
+    /// Number of missed slots dropped on the most recent recovery tick (issue #484).
+    pub last_catchup_dropped: i32,
+    /// Timestamp of the most recent recovery tick that produced drops (issue #484). NULL = none yet.
+    pub last_catchup_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).
@@ -252,6 +447,18 @@ pub struct NewHarvestSchedule<'a> {
     pub workflow_input: Option<serde_json::Value>,
     /// Task queue for workflow dispatches. None for DAG schedule rows.
     pub queue_name: Option<&'a str>,
+    /// Maximum jitter window in seconds. 0 = no jitter.
+    pub jitter_secs: i64,
+    /// Overlap policy for this schedule (issue #241).
+    pub overlap_policy: &'a str,
+    /// Durable buffered fire times JSON array (issue #241).
+    pub buffered_runs: serde_json::Value,
+    /// Maximum buffered slots under `BufferAll` (issue #241).
+    pub buffer_all_max: i32,
+    /// Optional named calendar for this schedule (issue #337).
+    pub calendar_name: Option<&'a str>,
+    /// What to do when the fire date is calendar-excluded (issue #337).
+    pub skip_policy: &'a str,
 }
 
 // ── Signal ────────────────────────────────────────────────────────────────────
@@ -269,6 +476,7 @@ pub struct HarvestSignal {
     pub payload: serde_json::Value,
     pub received_at: DateTime<Utc>,
     pub consumed: bool,
+    pub idempotency_key: Option<String>,
 }
 
 /// Insert struct for queuing a new signal.
@@ -278,6 +486,7 @@ pub struct NewHarvestSignal<'a> {
     pub workflow_exec_id: Uuid,
     pub signal_name: &'a str,
     pub payload: serde_json::Value,
+    pub idempotency_key: Option<&'a str>,
 }
 
 // ── Timer ─────────────────────────────────────────────────────────────────────
@@ -324,6 +533,8 @@ pub struct DeadLetter {
     pub error: String,
     pub attempts: i32,
     pub failed_at: DateTime<Utc>,
+    pub owner: Option<String>,
+    pub severity: Option<String>,
 }
 
 /// Insert struct for moving a failed task to the dead-letter queue.
@@ -338,6 +549,8 @@ pub struct NewDeadLetter<'a> {
     pub input: serde_json::Value,
     pub error: &'a str,
     pub attempts: i32,
+    pub owner: Option<&'a str>,
+    pub severity: Option<&'a str>,
 }
 
 // ── ExternalTask ──────────────────────────────────────────────────────────────
@@ -406,6 +619,8 @@ pub struct HarvestWorker {
     pub build_id: String,
     /// Optional human-readable deployment name (issue #171).
     pub deployment_name: Option<String>,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: serde_json::Value,
 }
 
 /// Insert struct for registering a new worker process.
@@ -422,6 +637,8 @@ pub struct NewHarvestWorker<'a> {
     pub build_id: &'a str,
     /// Optional deployment name for operator observability.
     pub deployment_name: Option<&'a str>,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: serde_json::Value,
 }
 
 // ── BatchJob ──────────────────────────────────────────────────────────────────
@@ -601,4 +818,168 @@ pub struct NewBackfillLogRow {
     pub error_summary: Option<String>,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+// ── Schedule Decisions ────────────────────────────────────────────────────────
+
+/// A queryable decision record for a scheduler tick (issue #325).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_schedule_decisions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ScheduleDecision {
+    pub id: Uuid,
+    pub schedule_id: Option<Uuid>,
+    pub schedule_name: String,
+    pub target_kind: String,
+    pub decision: String,
+    pub reason_code: String,
+    pub detail: Option<serde_json::Value>,
+    pub occurred_at: DateTime<Utc>,
+    pub next_fire_at: DateTime<Utc>,
+    pub shard_id: i16,
+}
+
+/// Insertable model for creating a schedule decision record.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_schedule_decisions)]
+pub struct NewScheduleDecision {
+    pub id: Uuid,
+    pub schedule_id: Option<Uuid>,
+    pub schedule_name: String,
+    pub target_kind: String,
+    pub decision: String,
+    pub reason_code: String,
+    pub detail: Option<serde_json::Value>,
+    pub occurred_at: DateTime<Utc>,
+    pub next_fire_at: DateTime<Utc>,
+    pub shard_id: i16,
+}
+
+// ── Completion Triggers ────────────────────────────────────────────────────────
+
+/// Queryable model representing a completion trigger.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_completion_triggers)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CompletionTriggerDb {
+    pub id: Uuid,
+    pub source_workflow_name: String,
+    pub terminal_states: serde_json::Value,
+    pub target_workflow_name: String,
+    pub input_mapping: serde_json::Value,
+    pub queue_name: Option<String>,
+    pub is_static: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Insertable model for registering/creating a completion trigger.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_triggers)]
+pub struct NewCompletionTriggerDb {
+    pub id: Uuid,
+    pub source_workflow_name: String,
+    pub terminal_states: serde_json::Value,
+    pub target_workflow_name: String,
+    pub input_mapping: serde_json::Value,
+    pub queue_name: Option<String>,
+    pub is_static: bool,
+}
+
+/// Queryable model representing a fired completion trigger event instance.
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_trigger_fires)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CompletionTriggerFireDb {
+    pub source_exec_id: Uuid,
+    pub trigger_id: Uuid,
+    pub fired_at: DateTime<Utc>,
+}
+
+/// Insertable model for registering a fired completion trigger.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_trigger_fires)]
+pub struct NewCompletionTriggerFireDb {
+    pub source_exec_id: Uuid,
+    pub trigger_id: Uuid,
+}
+
+/// Queryable model representing a deferred completion trigger outbox task.
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_trigger_outbox)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CompletionTriggerOutboxDb {
+    pub id: Uuid,
+    pub source_exec_id: Uuid,
+    pub trigger_id: Uuid,
+    pub target_shard: i32,
+    pub target_workflow_name: String,
+    pub target_workflow_id: String,
+    pub target_input: serde_json::Value,
+    pub queue_name: Option<String>,
+    pub concurrency_key: Option<String>,
+    pub concurrency_limit: Option<i32>,
+    pub priority: serde_json::Value,
+    pub max_workflow_input_bytes: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insertable model for registering a deferred completion trigger outbox task.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_trigger_outbox)]
+pub struct NewCompletionTriggerOutboxDb {
+    pub source_exec_id: Uuid,
+    pub trigger_id: Uuid,
+    pub target_shard: i32,
+    pub target_workflow_name: String,
+    pub target_workflow_id: String,
+    pub target_input: serde_json::Value,
+    pub queue_name: Option<String>,
+    pub concurrency_key: Option<String>,
+    pub concurrency_limit: Option<i32>,
+    pub priority: serde_json::Value,
+    pub max_workflow_input_bytes: i64,
+}
+
+// ── AdmissionGate ─────────────────────────────────────────────────────────────
+
+/// A persisted admission gate row from `harvest_admission_gates` (issue #377).
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_admission_gates)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct AdmissionGateRow {
+    pub id: Uuid,
+    /// Scope kind discriminator: `"fleet"`, `"workflow_name"`, `"queue"`,
+    /// `"shard_id"`, or `"owner"`.
+    pub scope_kind: String,
+    /// Scope value: `None` for `"fleet"`, the specific string for all others.
+    pub scope_value: Option<String>,
+    pub reason: String,
+    pub message: Option<String>,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    /// `None` = no expiry; auto-ignored at/after this time.
+    pub expires_at: Option<DateTime<Utc>>,
+    /// `None` = still active; set on lift.
+    pub lifted_at: Option<DateTime<Utc>>,
+    pub lifted_by: Option<String>,
+}
+
+/// Insert struct for creating a new admission gate.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_admission_gates)]
+pub struct NewAdmissionGateRow<'a> {
+    pub id: Uuid,
+    pub scope_kind: &'a str,
+    pub scope_value: Option<&'a str>,
+    pub reason: &'a str,
+    pub message: Option<&'a str>,
+    pub created_by: &'a str,
+    pub expires_at: Option<DateTime<Utc>>,
 }

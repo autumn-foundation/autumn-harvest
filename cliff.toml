@@ -7,11 +7,11 @@ All notable changes to autumn-harvest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n
 """
-body = """
-{%- macro remote_url() -%}
+body = '''{%- macro remote_url() -%}
   https://github.com/madmax983/autumn-harvest
 {%- endmacro -%}
 
+{% if commits | length > 0 -%}
 {% if version -%}
   ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else -%}
@@ -21,19 +21,16 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
   ### {{ group | striptags | trim | upper_first }}
   {% for commit in commits %}
-    - {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
-      {{ commit.message | upper_first }}\
-      {% if commit.breaking %} [**BREAKING**]{% endif %}\
-      ([{{ commit.id | truncate(length=7, end="") }}]({{ self::remote_url() }}/commit/{{ commit.id }}))\
+    - {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | split(pat="\n") | first | upper_first }}{% if commit.breaking %} [**BREAKING**]{% endif %}([{{ commit.id | truncate(length=7, end="") }}]({{ self::remote_url() }}/commit/{{ commit.id }}))
   {% endfor %}
 {% endfor %}
-"""
+{%- endif -%}'''
 footer = ""
 trim = true
 
 [git]
 conventional_commits = true
-filter_unconventional = true
+filter_unconventional = false
 split_commits = false
 protect_breaking_commits = true
 filter_commits = false
@@ -41,14 +38,29 @@ tag_pattern = "v[0-9].*"
 sort_commits = "newest"
 
 commit_parsers = [
+  { message = "^docs: update CHANGELOG\\.md", skip = true },
+  { message = "^chore: release notes", skip = true },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^Merge pull request", skip = true },
   { message = "^feat", group = "<!-- 0 -->Added" },
+  { message = "^Add ", group = "<!-- 0 -->Added" },
+  { message = "^Implement ", group = "<!-- 0 -->Added" },
+  { message = "^Issue #[0-9]+:", group = "<!-- 0 -->Added" },
+  { message = "^Persist ", group = "<!-- 0 -->Added" },
+  { message = "^Display ", group = "<!-- 0 -->Added" },
+  { message = "^Unify ", group = "<!-- 0 -->Added" },
+  { message = "^Propagate ", group = "<!-- 0 -->Added" },
+  { message = "^Auto-pause ", group = "<!-- 0 -->Added" },
+  { message = "^Declarative ", group = "<!-- 0 -->Added" },
+  { message = "^Deterministic ", group = "<!-- 0 -->Added" },
+  { message = "^impl", group = "<!-- 0 -->Added" },
   { message = "^fix", group = "<!-- 1 -->Fixed" },
+  { message = "^Fix ", group = "<!-- 1 -->Fixed" },
   { message = "^perf", group = "<!-- 2 -->Performance" },
   { message = "^refactor", group = "<!-- 3 -->Changed" },
   { message = "^docs", group = "<!-- 4 -->Documentation" },
   { message = "^style", group = "<!-- 5 -->Styling" },
   { message = "^test", group = "<!-- 6 -->Testing" },
-  { message = "^chore\\(release\\)", skip = true },
   { message = "^chore|^ci", group = "<!-- 7 -->Miscellaneous" },
   { body = ".*security", group = "<!-- 8 -->Security" },
   { message = "^revert", group = "<!-- 9 -->Reverted" },

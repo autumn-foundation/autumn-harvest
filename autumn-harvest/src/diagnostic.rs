@@ -1,3 +1,5 @@
+//! Diagnostic reporting for simulated workflow executions.
+
 use crate::analyzer::{AnalyzerWarning, HistoryAnalyzer};
 use crate::history_export::export_mermaid_sequence;
 use crate::simulator::SimulatorResult;
@@ -87,6 +89,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::json!({"status": "ok"}),

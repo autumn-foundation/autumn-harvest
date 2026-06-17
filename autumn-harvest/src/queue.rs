@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::error::HarvestResult;
 use crate::models::{NewTaskQueueItem, TaskQueueItem};
 use crate::telemetry::TraceContextCarrier;
-use crate::types::ExecutionId;
+use crate::types::{ExecutionId, Priority};
 
 // ---------------------------------------------------------------------------
 // TaskType
@@ -64,6 +64,7 @@ pub struct EnqueueParams {
     pub task_type: TaskType,
     pub workflow_exec_id: Option<Uuid>,
     pub activity_name: Option<String>,
+    pub activity_id: Option<Uuid>,
     pub input: serde_json::Value,
     pub priority: i32,
     pub max_attempts: i32,
@@ -100,6 +101,16 @@ pub struct EnqueueParams {
     /// will skip this task. `None` = any worker may claim (pre-policy / legacy
     /// executions).
     pub required_build_id: Option<String>,
+    /// Optional rate limit key to throttle execution throughput.
+    pub rate_limit_key: Option<String>,
+    /// Absolute UTC deadline for the entire activity lifetime across all retry
+    /// attempts (issue #378). Computed once at initial enqueue as
+    /// `NOW() + schedule_to_close`. NULL = no total deadline.
+    pub schedule_to_close_at: Option<chrono::DateTime<Utc>>,
+    /// Structured capability requirements JSONB payload (issue #382).
+    pub required_capabilities: Option<serde_json::Value>,
+    /// Ambient context headers propagated from the parent workflow (issue #481).
+    pub context_headers: Option<serde_json::Value>,
 }
 
 impl EnqueueParams {
@@ -115,6 +126,7 @@ impl EnqueueParams {
             task_type,
             workflow_exec_id: None,
             activity_name: None,
+            activity_id: None,
             input,
             priority: 0,
             max_attempts: 3,
@@ -131,7 +143,22 @@ impl EnqueueParams {
             concurrency_key: None,
             max_concurrent: None,
             required_build_id: None,
+            rate_limit_key: None,
+            schedule_to_close_at: None,
+            required_capabilities: None,
+            context_headers: None,
         }
+    }
+
+    /// Set the task priority, overriding the `Normal` default.
+    ///
+    /// The claim query orders candidates by `priority DESC, available_at ASC`
+    /// so tasks with higher priority are always claimed before lower-priority
+    /// tasks that arrived earlier on the same queue.
+    #[must_use]
+    pub const fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = priority.as_i32();
+        self
     }
 
     /// Pin this task to the given worker for the duration of `timeout`.
@@ -193,6 +220,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         task_type: params.task_type.as_str(),
         workflow_exec_id: params.workflow_exec_id,
         activity_name: params.activity_name.as_deref(),
+        activity_id: params.activity_id,
         input: params.input.clone(),
         priority: params.priority,
         max_attempts: params.max_attempts,
@@ -212,6 +240,10 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         concurrency_key: params.concurrency_key.as_deref(),
         concurrency_cap,
         required_build_id: params.required_build_id.as_deref(),
+        rate_limit_key: params.rate_limit_key.as_deref(),
+        schedule_to_close_at: params.schedule_to_close_at,
+        required_capabilities: params.required_capabilities.clone(),
+        context_headers: params.context_headers.clone(),
     };
 
     diesel::insert_into(harvest_task_queue::table)
@@ -246,6 +278,14 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 /// Uses `FOR UPDATE SKIP LOCKED` so concurrent workers never contend on the
 /// same row. Returns `None` if no eligible task is available.
 ///
+/// # Priority and anti-starvation
+///
+/// Tasks are ordered `priority DESC, available_at ASC` so higher-priority work
+/// is claimed first.  When `priority_aging_secs` is `Some(K)`, each task's
+/// effective priority is boosted by `+1` for every `K` seconds it has been
+/// waiting in `PENDING` state.  This bounds the maximum starvation time for
+/// `Low` priority tasks even under sustained high-priority load.
+///
 /// # Sticky routing
 ///
 /// When a row has `sticky_worker_id` set and `sticky_until > NOW()`, only that
@@ -257,11 +297,15 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
+#[allow(clippy::too_many_lines)]
 pub async fn claim_task(
     conn: &mut AsyncPgConnection,
     queues: &[String],
     worker_id: &str,
     worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -288,13 +332,53 @@ pub async fn claim_task(
     // Build routing filter (issue #171): a task with required_build_id can only
     // be claimed by a worker whose build_id matches, is declared compatible, OR
     // the worker has an empty build_id (legacy worker — can claim anything).
+    // When priority_aging_secs is Some(K), each task's effective priority is
+    // boosted by floor(wait_seconds / K) to prevent indefinite starvation.
+    // A NULL value (or 0, which the builder normalizes to None) disables aging.
+    //
+    // Circuit-breaker rate limiting (issue #369, $5 = the static set of activity
+    // names that have a circuit-breaker policy): for these activities the
+    // rate-limit *gate* and token *debit* are BOTH skipped at claim time. Rate
+    // limiting is instead enforced authoritatively at dispatch, gated on the real
+    // `on_dispatch` decision in process_activity_task: a genuine downstream call
+    // atomically consumes a token (`try_consume_rate_limit_token`, rescheduling
+    // if none is available) while a `CircuitOpen` short-circuit consumes nothing.
+    //
+    // This avoids the claim-vs-dispatch staleness race: the breaker state is
+    // in-process and can change between claim and dispatch, so any claim-time
+    // rate-limit decision keyed on breaker phase is necessarily approximate.
+    // Moving it to dispatch lets short-circuits stay claimable at full speed
+    // during an outage (no gate) while guaranteeing a real call never runs
+    // without a token (authoritative debit). Non-circuit rate-limited activities
+    // are unaffected — they gate and debit at claim as before.
+    //
+    // The concurrency cap is never bypassed: a real call must always respect
+    // `max_concurrent`.
+    //
+    // Pause gating (issue #383): workflow tasks whose execution is in the
+    // `PAUSED` state are never claimed. They stay PENDING (or parked) until the
+    // execution is resumed, at which point they become claimable again. This is
+    // the single executor-layer chokepoint that defers timer fires, signal
+    // deliveries, and activity-completion wakes uniformly while paused — no
+    // workflow-author cooperation required. In-flight activity tasks are not
+    // `task_type = 'workflow'` and so continue to run to completion.
+    let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
+
     let result: Vec<TaskQueueItem> = diesel::sql_query(
-        "WITH candidate AS ( \
-             SELECT id, concurrency_key, concurrency_cap \
+        "WITH worker_info AS ( \
+             SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels \
+         ), \
+         candidate AS ( \
+             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name \
              FROM harvest_task_queue \
+             CROSS JOIN worker_info \
              WHERE queue_name = ANY($2) \
                AND state = 'PENDING' \
                AND scheduled_at <= NOW() \
+               AND ( \
+                   schedule_to_close_at IS NULL \
+                   OR schedule_to_close_at > NOW() \
+               ) \
                AND ( \
                    sticky_worker_id IS NULL \
                    OR sticky_worker_id = $1 \
@@ -307,7 +391,9 @@ pub async fn claim_task(
                    OR ( \
                        SELECT COUNT(*) FROM harvest_task_queue inner_q \
                        WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
+                         AND inner_q.task_type = harvest_task_queue.task_type \
                          AND inner_q.state = 'RUNNING' \
+                         AND inner_q.worker_id IS NOT NULL \
                    ) < harvest_task_queue.concurrency_cap \
                ) \
                AND ( \
@@ -320,38 +406,109 @@ pub async fn claim_task(
                          AND compatible_with = harvest_task_queue.required_build_id \
                    ) \
                ) \
+               AND ( \
+                   task_type <> 'workflow' \
+                   OR workflow_exec_id IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM harvest_workflow_executions e \
+                       WHERE e.id = harvest_task_queue.workflow_exec_id \
+                         AND e.state = 'PAUSED' \
+                   ) \
+               ) \
+               AND ( \
+                   task_type != 'activity' \
+                   OR activity_name IS NULL \
+                   OR required_capabilities IS NOT NULL \
+                   OR NOT (activity_name = ANY($6)) \
+               ) \
+               AND ( \
+                   required_capabilities IS NULL \
+                   OR NOT EXISTS ( \
+                       SELECT 1 \
+                       FROM jsonb_array_elements(required_capabilities) AS r(value) \
+                       WHERE ( \
+                           r.value ? 'Exact' AND ( \
+                               worker_info.labels->>(r.value->'Exact'->>'key') IS NULL \
+                               OR worker_info.labels->>(r.value->'Exact'->>'key') != (r.value->'Exact'->>'value') \
+                           ) \
+                       ) OR ( \
+                           r.value ? 'In' AND ( \
+                               worker_info.labels->>(r.value->'In'->>'key') IS NULL \
+                               OR NOT ( \
+                                   (r.value->'In'->'values') @> jsonb_build_array(worker_info.labels->>(r.value->'In'->>'key')) \
+                               ) \
+                           ) \
+                       ) \
+                   ) \
+               ) \
+               AND ( \
+                   rate_limit_key IS NULL \
+                   OR harvest_task_queue.activity_name = ANY($5) \
+                   OR EXISTS ( \
+                       SELECT 1 FROM harvest_rate_limit_buckets b \
+                       WHERE b.key = harvest_task_queue.rate_limit_key \
+                         AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+                   ) \
+               ) \
              ORDER BY \
                  CASE \
                      WHEN sticky_worker_id = $1 AND sticky_until > NOW() THEN 1 \
                      ELSE 0 \
                  END DESC, \
-                 priority DESC, \
+                 CASE \
+                     WHEN $4::BIGINT IS NOT NULL AND $4::BIGINT > 0 \
+                     THEN priority + FLOOR(EXTRACT(EPOCH FROM (NOW() - scheduled_at)) / $4::BIGINT)::INT \
+                     ELSE priority \
+                 END DESC, \
                  scheduled_at ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
-         ) \
-         UPDATE harvest_task_queue \
-         SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
-         FROM candidate \
-         WHERE harvest_task_queue.id = candidate.id \
-           AND ( \
-               candidate.concurrency_key IS NULL \
-               OR ( \
-                   pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
-                   AND ( \
-                       candidate.concurrency_cap IS NULL \
-                       OR ( \
-                           SELECT COUNT(*) FROM harvest_task_queue recheck \
-                           WHERE recheck.concurrency_key = candidate.concurrency_key \
-                             AND recheck.state = 'RUNNING' \
-                       ) < candidate.concurrency_cap \
-                   ) \
-               ) \
-           ) \
-         RETURNING harvest_task_queue.*",
+        ), \
+        rate_limit_debit AS ( \
+            UPDATE harvest_rate_limit_buckets b \
+            SET tokens = LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) - 1.0, \
+                last_refilled_at = NOW() \
+            FROM candidate \
+            WHERE b.key = candidate.rate_limit_key \
+              AND NOT (candidate.activity_name = ANY($5)) \
+              AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+            RETURNING b.key AS debited_key \
+        ), \
+        claimed AS ( \
+            UPDATE harvest_task_queue \
+            SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
+            FROM candidate \
+            WHERE harvest_task_queue.id = candidate.id \
+              AND ( \
+                  candidate.concurrency_key IS NULL \
+                  OR ( \
+                      pg_try_advisory_xact_lock(hashtext(candidate.concurrency_key)::bigint) \
+                      AND ( \
+                          candidate.concurrency_cap IS NULL \
+                          OR ( \
+                              SELECT COUNT(*) FROM harvest_task_queue recheck \
+                              WHERE recheck.concurrency_key = candidate.concurrency_key \
+                                AND recheck.task_type = candidate.task_type \
+                                AND recheck.state = 'RUNNING' \
+                                AND recheck.worker_id IS NOT NULL \
+                          ) < candidate.concurrency_cap \
+                      ) \
+                  ) \
+              ) \
+              AND ( \
+                  candidate.rate_limit_key IS NULL \
+                  OR candidate.activity_name = ANY($5) \
+                  OR EXISTS (SELECT 1 FROM rate_limit_debit WHERE debited_key = candidate.rate_limit_key) \
+              ) \
+            RETURNING harvest_task_queue.* \
+        ) \
+        SELECT * FROM claimed",
     )
     .bind::<diesel::sql_types::Text, _>(worker_id)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
     .bind::<diesel::sql_types::Text, _>(worker_build_id)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(aging_secs_i64)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(ineligible_activities)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -360,20 +517,102 @@ pub async fn claim_task(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Worker-pool scaling signals
+// ---------------------------------------------------------------------------
+
+/// Live scaling signals for a task queue.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct QueueScalingSignal {
+    /// The task queue name.
+    pub queue: String,
+    /// Number of tasks in `PENDING` state with `scheduled_at <= NOW()`.
+    pub backlog: i64,
+    /// Number of tasks in `RUNNING` state.
+    pub in_flight: i64,
+    /// Number of tasks in `PENDING` state with `scheduled_at > NOW()`.
+    pub scheduled: i64,
+    /// Number of active (healthy, non-draining) workers currently polling this queue.
+    pub active_workers: i64,
+}
+
+/// Helper struct for queue task counts.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct QueueTaskCounts {
+    /// The task queue name.
+    pub queue: String,
+    /// Number of tasks in `PENDING` state with `scheduled_at <= NOW()`.
+    pub backlog: i64,
+    /// Number of tasks in `RUNNING` state.
+    pub in_flight: i64,
+    /// Number of tasks in `PENDING` state with `scheduled_at > NOW()`.
+    pub scheduled: i64,
+}
+
+/// Return backlog, in-flight, and scheduled task counts per queue on this shard.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn queue_task_counts(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Vec<QueueTaskCounts>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        backlog: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        in_flight: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        scheduled: i64,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT \
+             queue_name AS queue, \
+             COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at <= $1) AS backlog, \
+             COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, \
+             COUNT(*) FILTER (WHERE state = 'PENDING' AND scheduled_at > $1) AS scheduled \
+         FROM harvest_task_queue \
+         GROUP BY queue_name",
+    )
+    .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| QueueTaskCounts {
+            queue: r.queue,
+            backlog: r.backlog,
+            in_flight: r.in_flight,
+            scheduled: r.scheduled,
+        })
+        .collect())
+}
+
 // Concurrency-key stats
 // ---------------------------------------------------------------------------
 
-/// Live stats for a single concurrency group key.
+/// Live stats for a single `(concurrency_key, task_type)` pair.
+///
+/// The claim query enforces concurrency caps independently per key+type,
+/// so stats are also reported at that granularity.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConcurrencyKeyStats {
     /// The concurrency group key.
     pub key: String,
-    /// Declared maximum concurrent tasks for this key.
+    /// Task type this row covers (`"workflow"` or `"activity"`).
+    pub task_type: String,
+    /// Declared maximum concurrent tasks for this key+type.
     pub max_concurrent: i32,
-    /// Number of tasks currently in `RUNNING` state for this key.
+    /// Number of tasks currently in `RUNNING` state for this key+type.
     pub in_flight: i64,
-    /// Number of tasks in `PENDING` state for this key (may be deferred by
-    /// the cap if `in_flight >= max_concurrent`).
+    /// Number of tasks in `PENDING` state for this key+type (may be deferred
+    /// by the cap if `in_flight >= max_concurrent`).
     pub pending: i64,
 }
 
@@ -393,6 +632,8 @@ pub async fn concurrency_key_stats(
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Text)]
         key: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        task_type: String,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         max_concurrent: i32,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -404,15 +645,16 @@ pub async fn concurrency_key_stats(
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT \
              concurrency_key AS key, \
+             task_type, \
              MAX(concurrency_cap)::INT4 AS max_concurrent, \
-             COUNT(*) FILTER (WHERE state = 'RUNNING') AS in_flight, \
+             COUNT(*) FILTER (WHERE state = 'RUNNING' AND worker_id IS NOT NULL) AS in_flight, \
              COUNT(*) FILTER (WHERE state = 'PENDING') AS pending \
          FROM harvest_task_queue \
          WHERE concurrency_key IS NOT NULL \
            AND concurrency_cap IS NOT NULL \
            AND queue_name = ANY($1) \
-           AND state IN ('RUNNING', 'PENDING') \
-         GROUP BY concurrency_key",
+           AND (state = 'PENDING' OR (state = 'RUNNING' AND worker_id IS NOT NULL)) \
+         GROUP BY concurrency_key, task_type",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
     .load(conn)
@@ -423,6 +665,7 @@ pub async fn concurrency_key_stats(
         .into_iter()
         .map(|r| ConcurrencyKeyStats {
             key: r.key,
+            task_type: r.task_type,
             max_concurrent: r.max_concurrent,
             in_flight: r.in_flight,
             pending: r.pending,
@@ -436,6 +679,27 @@ pub async fn concurrency_key_stats(
 /// observed after the activity has successfully finished.
 ///
 /// # Errors
+/// Lock the task queue row `FOR UPDATE` and return its current `state`.
+///
+/// Used by [`crate::context::ActivityContext::run_transactional`] to verify
+/// the task is still `RUNNING` before committing the transactional activity
+/// result.  Returns `None` when the row no longer exists.
+pub(crate) async fn task_state_for_update(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+) -> HarvestResult<Option<String>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    dsl::harvest_task_queue
+        .find(task_id)
+        .for_update()
+        .select(dsl::state)
+        .first::<String>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)
+}
+
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn complete_task(
@@ -454,6 +718,7 @@ pub async fn complete_task(
         dsl::state.eq("COMPLETED"),
         dsl::output.eq(Some(output)),
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
+        dsl::error.eq(None::<String>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
     .execute(conn)
@@ -651,13 +916,52 @@ pub async fn record_heartbeat(
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on update failure.
+/// Reschedule a `RUNNING` task back to `PENDING` after a retryable failure.
+///
+/// Stores `previous_error` in the task row's `error` column so the next
+/// dispatch can surface it via `ActivityContext::previous_failure()`.
+/// The heartbeat details payload is preserved so the retry attempt can resume
+/// from the last flushed checkpoint.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
 pub async fn requeue_for_retry(
     conn: &mut AsyncPgConnection,
     task_id: Uuid,
     delay: Duration,
+    previous_error: &str,
 ) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
     let next_run = Utc::now() + delay;
-    reschedule_task(conn, task_id, next_run).await
+
+    let queue_name = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::crash_strikes.eq(0),
+        dsl::scheduled_at.eq(next_run),
+        dsl::error.eq(Some(previous_error)),
+    ))
+    .returning(dsl::queue_name)
+    .get_result::<String>(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?
+    .ok_or_else(|| {
+        crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
+    })?;
+
+    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
+
+    Ok(())
 }
 
 /// Reset a task to `PENDING` at an explicit timestamp.
@@ -686,6 +990,63 @@ pub async fn reschedule_task(
         dsl::worker_id.eq(None::<String>),
         dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
         dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+        // Clean continuation (suspension or retryable-error reschedule) means
+        // the task made progress without crashing a worker, so the poison-pill
+        // crash streak resets — the threshold measures *consecutive* crashes
+        // (issue #367).
+        dsl::crash_strikes.eq(0),
+        dsl::scheduled_at.eq(scheduled_at),
+    ))
+    .returning(dsl::queue_name)
+    .get_result::<String>(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?
+    .ok_or_else(|| {
+        crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
+    })?;
+
+    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
+
+    Ok(())
+}
+
+/// Defer a `RUNNING` task back to `PENDING` for a rate-limit retry **without
+/// counting it as an attempt** (issue #369).
+///
+/// Used by the dispatch-time rate-limit gate for circuit-breaker activities:
+/// when no token is available the handler never runs, so [`claim_task`]'s
+/// `attempt + 1` increment must be undone — otherwise repeated deferrals would
+/// silently drain the retry budget and DLQ the task before it ever executed.
+/// Otherwise mirrors [`reschedule_task`] (clean continuation: resets the
+/// poison-pill crash streak and re-notifies the queue).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn defer_rate_limited_task(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    scheduled_at: chrono::DateTime<Utc>,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let queue_name = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::crash_strikes.eq(0),
+        // Undo the claim-time attempt increment: a rate-limit deferral is not an
+        // execution, so it must not consume the retry budget.
+        dsl::attempt.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
+            "GREATEST(attempt - 1, 0)",
+        )),
         dsl::scheduled_at.eq(scheduled_at),
     ))
     .returning(dsl::queue_name)
@@ -830,6 +1191,11 @@ pub async fn park_workflow_task(
         .await
         .map_err(crate::error::database_error)?
     } else {
+        // No sticky hint: clear any stale affinity left by a previous worker
+        // that ran with sticky routing enabled. Without this, wake_workflow_task
+        // would refresh sticky_until from the stored sticky_timeout column and
+        // re-pin the execution to the old worker even though the current worker
+        // is running with sticky routing disabled.
         use crate::schema::harvest_task_queue::dsl;
         diesel::update(
             dsl::harvest_task_queue
@@ -840,6 +1206,9 @@ pub async fn park_workflow_task(
         .set((
             dsl::worker_id.eq(None::<String>),
             dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+            dsl::sticky_worker_id.eq(None::<String>),
+            dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+            dsl::sticky_timeout.eq(None::<chrono::Duration>),
         ))
         .execute(conn)
         .await
@@ -894,6 +1263,7 @@ pub async fn wake_workflow_task(
                  worker_id = NULL, \
                  started_at = NULL, \
                  scheduled_at = $2, \
+                 activity_name = NULL, \
                  sticky_until = CASE \
                      WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
                      THEN NOW() + sticky_timeout \
@@ -901,9 +1271,10 @@ pub async fn wake_workflow_task(
                  END \
              WHERE workflow_exec_id = $1 \
                AND task_type = 'workflow' \
-               AND state = 'RUNNING' \
-               AND worker_id IS NULL \
-               AND started_at IS NULL \
+               AND ( \
+                   (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
+                   OR (state = 'PENDING' AND scheduled_at > $2 AND activity_name = 'mixed_signal_suspension') \
+               ) \
              RETURNING queue_name",
         )
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
@@ -915,12 +1286,222 @@ pub async fn wake_workflow_task(
         rows.into_iter().map(|r| r.queue_name).collect()
     };
 
+    // A workflow task may already be PENDING with an elapsed `scheduled_at` —
+    // e.g. a timer fired while the execution was PAUSED (issue #383), so the
+    // task was enqueued but never re-pended by the UPDATE above. Such a task is
+    // immediately claimable once the execution is RUNNING again, but no fresh
+    // NOTIFY was emitted for it, so a LISTEN-based worker would sleep until the
+    // next poll interval. Notify those queues too so resume re-arms promptly.
+    let already_due_queue_names: Vec<String> = {
+        use diesel::deserialize::QueryableByName;
+        use diesel::sql_types::Text;
+
+        #[derive(QueryableByName)]
+        struct QueueNameRow {
+            #[diesel(sql_type = Text)]
+            queue_name: String,
+        }
+
+        let rows: Vec<QueueNameRow> = diesel::sql_query(
+            "SELECT DISTINCT queue_name FROM harvest_task_queue \
+             WHERE workflow_exec_id = $1 \
+               AND task_type = 'workflow' \
+               AND state = 'PENDING' \
+               AND scheduled_at <= $2",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        rows.into_iter().map(|r| r.queue_name).collect()
+    };
+
     let mut queue_names = queue_names;
+    queue_names.extend(already_due_queue_names);
     queue_names.sort();
     queue_names.dedup();
 
     crate::notify::notify_tasks_enqueued(conn, &queue_names, Uuid::nil()).await?;
 
+    Ok(())
+}
+
+/// Update the priority of a pending task via the management API.
+///
+/// Only tasks in `PENDING` state are eligible; already-running tasks ignore
+/// the change (the running attempt keeps its original priority). The next retry
+/// attempt will use the new value because it will be re-claimed using the
+/// updated row. Terminal tasks (`COMPLETED`, `FAILED`, `CANCELLED`) are not
+/// found by this filter and the function returns `false`.
+///
+/// Returns `true` when the update was applied, `false` when the task was not
+/// found in an updatable state (terminal tasks return `false`).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn update_task_priority(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    priority: Priority,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    )
+    .set(dsl::priority.eq(priority.as_i32()))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(updated > 0)
+}
+
+/// Returns `true` if a task with the given ID exists in the queue (regardless of state).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let found: Option<Uuid> = dsl::harvest_task_queue
+        .filter(dsl::id.eq(task_id))
+        .select(dsl::id)
+        .first::<Uuid>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    Ok(found.is_some())
+}
+
+/// Check if any pending tasks in the specified queues are throttled due to rate limits.
+///
+/// Returns the rate limit keys that are currently saturated (have < 1.0 tokens).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn check_throttled_keys(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+) -> HarvestResult<Vec<String>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        rate_limit_key: String,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT DISTINCT q.rate_limit_key \
+         FROM harvest_task_queue q \
+         JOIN harvest_rate_limit_buckets b ON b.key = q.rate_limit_key \
+         WHERE q.queue_name = ANY($1) \
+           AND q.state = 'PENDING' \
+           AND q.scheduled_at <= NOW() \
+           AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) < 1.0"
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().map(|r| r.rate_limit_key).collect())
+}
+
+/// Atomically consume one rate-limit token from `key`'s bucket at dispatch time.
+///
+/// Returns `true` if a token was available and debited (the caller may proceed
+/// with the real downstream call), or `false` if no token could be reserved and
+/// the caller must defer (e.g. reschedule the task) rather than run the call.
+///
+/// Used by the circuit breaker (issue #369): activities with a breaker skip the
+/// claim-time rate-limit gate and debit entirely (see [`claim_task`]); their rate
+/// limiting is enforced *here*, gated on the authoritative `on_dispatch`
+/// decision, so a `CircuitOpen` short-circuit consumes no token while a genuine
+/// call atomically reserves one. The check-and-debit is a single UPDATE so two
+/// concurrent dispatches cannot both reserve the last token.
+///
+/// **Fails closed:** returns `false` both when the bucket is empty *and* when the
+/// bucket row is missing. Because the claim-time gate is skipped for these
+/// activities, this is the sole rate-limit enforcement point; treating a missing
+/// bucket as "allow" would let a configured limit run unthrottled if bucket
+/// auto-registration failed or the row was deleted. A `rate_limit_key` is only
+/// set when a limit is configured (so a bucket should exist), and deferring until
+/// it does matches the old claim-time gate, which also would not admit the task
+/// without a bucket row.
+///
+/// Mirrors the claim-time debit math (apply pending refill, then `-1.0`).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn try_consume_rate_limit_token(
+    conn: &mut AsyncPgConnection,
+    key: &str,
+) -> HarvestResult<bool> {
+    #[derive(diesel::QueryableByName)]
+    struct Outcome {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        debited: bool,
+    }
+
+    // A single conditional UPDATE: the row is debited only if a token is
+    // available. `RETURNING`/`EXISTS` reports whether the debit happened; a
+    // missing bucket row or an empty bucket both yield `debited = false`.
+    let outcome: Option<Outcome> = diesel::sql_query(
+        "WITH debited AS ( \
+             UPDATE harvest_rate_limit_buckets \
+             SET tokens = LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) - 1.0, \
+                 last_refilled_at = NOW() \
+             WHERE key = $1 \
+               AND LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) >= 1.0 \
+             RETURNING key \
+        ) \
+        SELECT EXISTS (SELECT 1 FROM debited) AS debited",
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .get_result(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?;
+
+    // Fail closed: only proceed when a token was actually reserved.
+    Ok(outcome.is_some_and(|o| o.debited))
+}
+
+/// Return one rate-limit token previously reserved by
+/// [`try_consume_rate_limit_token`] (capped at burst).
+///
+/// Used by the circuit breaker (issue #369) on the rare path where a token was
+/// reserved for a genuine call that then turns out not to run — e.g. the activity
+/// already has a terminal event, or the task row stopped being `RUNNING`
+/// (cancelled/timed out concurrently) between the reservation and appending
+/// `ActivityStarted`. Refunding keeps the bucket accurate (a call that never
+/// happened consumes no token), symmetric with a short-circuit reserving nothing.
+/// Mirrors the debit math (apply pending refill, then `+1.0`). A missing bucket
+/// row is a no-op.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets \
+         SET tokens = LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate + 1.0), \
+             last_refilled_at = NOW() \
+         WHERE key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     Ok(())
 }
 
@@ -1016,6 +1597,23 @@ mod tests {
         let params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
         assert!(params.concurrency_key.is_none());
         assert!(params.max_concurrent.is_none());
+    }
+
+    #[test]
+    fn enqueue_params_schedule_to_close_at_defaults_to_none() {
+        let params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
+        assert!(
+            params.schedule_to_close_at.is_none(),
+            "schedule_to_close_at must default to None (unbounded)"
+        );
+    }
+
+    #[test]
+    fn enqueue_params_schedule_to_close_at_can_be_set() {
+        let deadline = Utc::now() + Duration::seconds(300);
+        let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
+        params.schedule_to_close_at = Some(deadline);
+        assert_eq!(params.schedule_to_close_at, Some(deadline));
     }
 
     #[test]

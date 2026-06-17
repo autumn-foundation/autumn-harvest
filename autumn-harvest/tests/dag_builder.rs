@@ -108,6 +108,14 @@ fn harvest_builder_collects_dags() {
         max_active_runs: 1,
         default_queue: Some("etl-workers"),
         builder: build_daily,
+        workflow_handler: None,
+        jitter: ::std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
     }]);
 
     assert_eq!(builder.dag_count(), 1);

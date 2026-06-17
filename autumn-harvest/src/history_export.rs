@@ -5,6 +5,7 @@ use crate::types::ExecutionId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::str::FromStr;
 
@@ -113,6 +114,12 @@ pub struct HistoryExportDocument {
     /// JSON. Redacted exports preserve event shape but summarize sensitive
     /// payload-bearing fields.
     pub events: Vec<Value>,
+    /// Per-execution context headers from the original run. `None` means the
+    /// export was produced before this field was introduced (legacy) or no
+    /// headers were attached. Used by `WorkflowReplayer::replay_from_json` to
+    /// restore the same ambient headers the workflow saw during live execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_headers: Option<HashMap<String, String>>,
 }
 
 /// Input needed to export one workflow execution history.
@@ -135,6 +142,10 @@ pub struct HistoryExportRequest {
     /// Optional serialized byte limit. Defaults to
     /// [`DEFAULT_HISTORY_EXPORT_MAX_BYTES`].
     pub max_bytes: Option<usize>,
+    /// Per-execution context headers attached at workflow start. When `Some`,
+    /// the headers are embedded in the export document so replaying the export
+    /// restores the same ambient headers the original execution saw.
+    pub context_headers: Option<HashMap<String, String>>,
 }
 
 /// History export failure modes.
@@ -187,6 +198,13 @@ pub fn export_history(
             truncation_behavior: "fail".to_string(),
         },
         events,
+        // Omit header values under Redacted policy — they may contain auth
+        // tokens or tenant secrets that should not appear in shared exports.
+        context_headers: if request.payload_policy == HistoryPayloadPolicy::Redacted {
+            None
+        } else {
+            request.context_headers
+        },
     };
 
     let actual_bytes = measure_export_bytes(&mut document)?;
@@ -246,7 +264,17 @@ fn redact_value(value: &mut Value) -> Result<(), HistoryExportError> {
 }
 
 fn is_payload_field(key: &str) -> bool {
-    matches!(key, "input" | "output" | "payload" | "details")
+    // `value` is the arbitrary `ctx.side_effect(...)` result on a
+    // `SideEffectRecorded` event (issue #384). Before #384 custom side effects
+    // were stored under `MarkerRecorded.details` and redacted via "details"; the
+    // new field must be redacted too so secrets/PII captured by the closure are
+    // not leaked in a redacted export.
+    // `last_completion_result` is the prior run's output frozen into WorkflowStarted
+    // for scheduled carryover (issue #488); redact it like any other payload copy.
+    matches!(
+        key,
+        "input" | "output" | "payload" | "details" | "value" | "last_completion_result"
+    )
 }
 
 fn is_token_field(key: &str) -> bool {
@@ -334,7 +362,10 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowCancelled { .. }
                 | WorkflowEvent::WorkflowContinuedAsNew { .. }
                 | WorkflowEvent::WorkflowResetFork { .. }
-                | WorkflowEvent::WorkflowResetTerminated { .. } => {
+                | WorkflowEvent::WorkflowResetTerminated { .. }
+                | WorkflowEvent::WorkflowExecutionTimedOut { .. }
+                | WorkflowEvent::WorkflowExecutionPaused { .. }
+                | WorkflowEvent::WorkflowExecutionResumed { .. } => {
                     self.handle_workflow_event(event)?;
                 }
                 WorkflowEvent::ActivityScheduled { .. }
@@ -350,10 +381,14 @@ impl MermaidExporter {
                 }
                 WorkflowEvent::ChildWorkflowStarted { .. }
                 | WorkflowEvent::ChildWorkflowCompleted { .. }
-                | WorkflowEvent::ChildWorkflowFailed { .. } => {
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::ChildWorkflowCascadeApplied { .. } => {
                     self.handle_child_workflow_event(event)?;
                 }
-                WorkflowEvent::SignalReceived { .. } | WorkflowEvent::MarkerRecorded { .. } => {
+                WorkflowEvent::SignalReceived { .. }
+                | WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. } => {
                     self.handle_misc_event(event)?;
                 }
                 WorkflowEvent::ActivityAwaitingExternal { .. }
@@ -372,6 +407,16 @@ impl MermaidExporter {
                 | WorkflowEvent::UpdateCompleted { .. }
                 | WorkflowEvent::UpdateFailed { .. } => {
                     self.handle_update_event(event)?;
+                }
+                WorkflowEvent::ExternalSignalRequested { .. }
+                | WorkflowEvent::ExternalSignalDelivered { .. }
+                | WorkflowEvent::ExternalSignalFailed { .. } => {
+                    self.handle_external_signal_event(event)?;
+                }
+                WorkflowEvent::ExternalCancelRequested { .. }
+                | WorkflowEvent::ExternalCancelDelivered { .. }
+                | WorkflowEvent::ExternalCancelFailed { .. } => {
+                    self.handle_external_cancel_event(event)?;
                 }
             }
         }
@@ -426,6 +471,22 @@ impl MermaidExporter {
                     "    Note over WF: Reset Terminated (fork: {reset_to_exec_id}): {safe_reason}"
                 )?;
             }
+            WorkflowEvent::WorkflowExecutionTimedOut { deadline, .. } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Execution Timed Out (deadline: {deadline})"
+                )?;
+            }
+            WorkflowEvent::WorkflowExecutionPaused { actor, reason, .. } => {
+                let detail = reason
+                    .as_deref()
+                    .map(|r| format!(": {}", r.replace('\n', " ").replace('"', "'")))
+                    .unwrap_or_default();
+                writeln!(self.out, "    Note over WF: Paused by {actor}{detail}")?;
+            }
+            WorkflowEvent::WorkflowExecutionResumed { actor, .. } => {
+                writeln!(self.out, "    Note over WF: Resumed by {actor}")?;
+            }
             _ => unreachable!(),
         }
         Ok(())
@@ -472,6 +533,7 @@ impl MermaidExporter {
                 activity_id,
                 error,
                 attempt,
+                ..
             } => {
                 let safe_error = error.replace('\n', " ").replace('"', "'");
                 writeln!(
@@ -558,6 +620,33 @@ impl MermaidExporter {
                     "    Note right of WF: Child Workflow Failed (ID: {child_id}): {safe_error}"
                 )?;
             }
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name,
+                parent_close_policy,
+                ..
+            } => {
+                let participant = format!("Child_{workflow_name}");
+                if self.participants.insert(participant.clone()) {
+                    writeln!(
+                        self.out,
+                        "    participant {participant} as Child: {workflow_name}"
+                    )?;
+                }
+                writeln!(
+                    self.out,
+                    "    WF-->>{participant}: Spawn Detached (ID: {child_id}, policy: {policy})",
+                    policy = parent_close_policy.as_str(),
+                )?;
+            }
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id, action, ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note right of WF: Cascade Applied to Child {child_id}: {action}"
+                )?;
+            }
             _ => unreachable!(),
         }
         Ok(())
@@ -577,6 +666,10 @@ impl MermaidExporter {
             }
             WorkflowEvent::MarkerRecorded { name, .. } => {
                 writeln!(self.out, "    Note over WF: Marker: {name}")?;
+            }
+            WorkflowEvent::SideEffectRecorded { kind, name, .. } => {
+                let label = name.as_deref().unwrap_or(kind.as_str());
+                writeln!(self.out, "    Note over WF: Side Effect: {label}")?;
             }
             _ => unreachable!(),
         }
@@ -695,6 +788,73 @@ impl MermaidExporter {
         }
         Ok(())
     }
+
+    fn handle_external_signal_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Signal Requested: {signal_name} → {target} (id: {signal_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalSignalDelivered { signal_id } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Signal Delivered (id: {signal_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalSignalFailed {
+                signal_id,
+                reason_code,
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Signal Failed ({reason_code}) (id: {signal_id})"
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn handle_external_cancel_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<(), std::fmt::Error> {
+        match event {
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Cancel Requested → {target} (id: {cancel_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalCancelDelivered { cancel_id } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Cancel Delivered (id: {cancel_id})"
+                )?;
+            }
+            WorkflowEvent::ExternalCancelFailed {
+                cancel_id,
+                reason_code,
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Cancel Failed ({reason_code}) (id: {cancel_id})"
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -717,6 +877,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({}),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -762,6 +924,8 @@ mod tests {
                 WorkflowEvent::WorkflowStarted {
                     input: serde_json::json!({ "customer": "acme" }),
                     timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
                 },
                 WorkflowEvent::WorkflowCompleted {
                     output: serde_json::json!({ "ok": true }),
@@ -770,6 +934,7 @@ mod tests {
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(64 * 1024),
+            context_headers: None,
         })
         .expect("full export should fit under the limit");
 
@@ -809,6 +974,8 @@ mod tests {
                         "authorization": "Bearer top-secret"
                     }),
                     timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
                 },
                 WorkflowEvent::ActivityScheduled {
                     activity_id,
@@ -835,6 +1002,7 @@ mod tests {
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Redacted,
             max_bytes: Some(64 * 1024),
+            context_headers: None,
         })
         .expect("redacted export should fit under the limit");
 
@@ -862,6 +1030,51 @@ mod tests {
     }
 
     #[test]
+    fn redacted_history_export_redacts_side_effect_recorded_value() {
+        use crate::event::SideEffectKind;
+        use crate::types::ExecutionId;
+
+        let document = export_history(HistoryExportRequest {
+            workflow_name: "secret_capture".to_string(),
+            execution_id: ExecutionId::new(),
+            shard_id: 0,
+            state: "RUNNING".to_string(),
+            events: vec![
+                WorkflowEvent::WorkflowStarted {
+                    input: serde_json::json!({}),
+                    timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
+                },
+                // A custom side_effect that captured a secret in its closure. Pre
+                // #384 this lived under MarkerRecorded.details and was redacted;
+                // it must remain redacted under the new SideEffectRecorded.value.
+                WorkflowEvent::SideEffectRecorded {
+                    kind: SideEffectKind::Custom,
+                    name: Some("api_credential".to_string()),
+                    value: serde_json::json!({ "token": "super-secret-credential" }),
+                },
+            ],
+            exported_at: Utc::now(),
+            payload_policy: HistoryPayloadPolicy::Redacted,
+            max_bytes: Some(64 * 1024),
+            context_headers: None,
+        })
+        .expect("redacted export should fit under the limit");
+
+        let json = serde_json::to_string(&document).expect("export should serialize");
+        // Event shape and the side-effect name remain visible for debugging…
+        assert!(json.contains("SideEffectRecorded"));
+        assert!(json.contains("api_credential"));
+        // …but the captured value must not leak.
+        assert!(!json.contains("super-secret-credential"));
+
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("redacted export should be valid JSON");
+        assert_eq!(value["events"][1]["data"]["value"]["redacted"], true);
+    }
+
+    #[test]
     fn history_export_size_limit_fails_with_machine_readable_metadata() {
         use crate::types::ExecutionId;
 
@@ -873,10 +1086,13 @@ mod tests {
             events: vec![WorkflowEvent::WorkflowStarted {
                 input: serde_json::json!({ "large": "x".repeat(512) }),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             }],
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Full,
             max_bytes: Some(128),
+            context_headers: None,
         })
         .expect_err("oversized full export must fail unless limit is raised");
 
@@ -915,6 +1131,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_activity_event(&event);
     }
@@ -926,6 +1144,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_timer_event(&event);
     }
@@ -937,6 +1157,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_child_workflow_event(&event);
     }
@@ -948,6 +1170,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_misc_event(&event);
     }
@@ -959,6 +1183,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_local_activity_event(&event);
     }
@@ -970,6 +1196,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_external_activity_event(&event);
     }
@@ -981,6 +1209,8 @@ mod tests {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         };
         let _ = exporter.handle_update_event(&event);
     }

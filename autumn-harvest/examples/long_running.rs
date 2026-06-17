@@ -1,3 +1,4 @@
+#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Example: long-running polling workflow with continue-as-new guardrails.
 //!
 //! This example is intentionally compile-friendly: it demonstrates the workflow
@@ -14,22 +15,19 @@ use serde_json::{Value, json};
 
 #[workflow]
 #[allow(clippy::missing_errors_doc)]
-pub async fn poll_customer_exports(
-    ctx: &WorkflowContext,
-    mut state: Value,
-) -> HarvestResult<Value> {
+pub async fn poll_customer_exports(ctx: &WorkflowContext, state: Value) -> HarvestResult<Value> {
+    let mut state = state;
     loop {
         let cycle = state.get("cycle").and_then(Value::as_u64).unwrap_or(0);
         let cursor = state.get("cursor").cloned().unwrap_or(Value::Null);
 
-        let page = ctx
-            .execute_activity_raw(
-                "poll_customer_export_page",
+        let page: Value = ctx
+            .execute_activity(
+                &poll_customer_export_page_info(),
                 json!({
                     "cycle": cycle,
                     "cursor": cursor,
                 }),
-                "pollers",
             )
             .await?;
 
@@ -62,7 +60,7 @@ pub async fn poll_customer_exports(
 pub async fn poll_customer_export_page(
     _ctx: &ActivityContext,
     input: Value,
-) -> HarvestResult<Value> {
+) -> Result<Value, String> {
     let cycle = input.get("cycle").and_then(Value::as_u64).unwrap_or(0);
 
     Ok(json!({

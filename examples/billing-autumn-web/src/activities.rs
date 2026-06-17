@@ -23,9 +23,21 @@ pub fn activities() -> Vec<ActivityInfo> {
         export_billing_events,
         reconcile_gateway,
         notify_finance,
+        scan_discrepancies,
+        flag_for_audit,
+        auto_close_run,
+        send_reconciliation_summary,
     ]
 }
 
+/// Validate the checkout payload before any side-effects.
+///
+/// Demonstrates issue #227: returning `ActivityFailure::non_retryable(...)`
+/// short-circuits the retry policy on a permanently-invalid input. The
+/// `RetryPolicy::exponential(3, …)` would normally allow three attempts;
+/// the typed `non_retryable` flag wins over the policy and routes the
+/// task straight to the DLQ on attempt 1 — proving that authors no longer
+/// need to register every fail-fast error string in `non_retryable_errors`.
 #[activity(
     start_to_close = "10s",
     retry = RetryPolicy::exponential(3, Duration::from_millis(100)),
@@ -34,13 +46,15 @@ pub fn activities() -> Vec<ActivityInfo> {
 pub async fn validate_checkout(
     _ctx: &ActivityContext,
     request: CheckoutRequest,
-) -> HarvestResult<CheckoutRequest> {
+) -> Result<CheckoutRequest, ActivityFailure> {
     let request = request.normalized();
     if request.seats == 0 {
-        return Err(HarvestError::WorkflowFailed {
-            name: "validate_checkout".to_owned(),
-            reason: "seats must be greater than zero".to_owned(),
-        });
+        // Permanent validation failure — operators see this as
+        // `error.type="PermanentValidation"` on `harvest.activity.failed`.
+        return Err(ActivityFailure::non_retryable(
+            "PermanentValidation",
+            "seats must be greater than zero",
+        ));
     }
     Ok(request)
 }
@@ -170,4 +184,35 @@ pub async fn reconcile_gateway(_ctx: &ActivityContext, input: Value) -> HarvestR
 #[activity(start_to_close = "30s", queue = "ops")]
 pub async fn notify_finance(_ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
     Ok(json!({ "notified": input }))
+}
+
+// Activities for the data-dependent branching example (anomaly_routing DAG).
+
+#[activity(start_to_close = "2m", queue = "ops")]
+pub async fn scan_discrepancies(_ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    // Returns the count of billing discrepancies found in the reconciliation window.
+    Ok(json!({ "discrepancy_count": 0, "window": input }))
+}
+
+// Runs only when scan_discrepancies reported at least one discrepancy.
+#[activity(start_to_close = "5m", queue = "ops")]
+pub async fn flag_for_audit(_ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    tracing::warn!(report = ?input, "discrepancies detected — flagging for finance audit");
+    Ok(json!({ "flagged": true }))
+}
+
+// Runs only when scan_discrepancies reported zero discrepancies.
+#[activity(start_to_close = "30s", queue = "ops")]
+pub async fn auto_close_run(_ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
+    tracing::info!(report = ?input, "reconciliation clean — auto-closing run");
+    Ok(json!({ "closed": true }))
+}
+
+#[activity(start_to_close = "30s", queue = "ops")]
+pub async fn send_reconciliation_summary(
+    _ctx: &ActivityContext,
+    input: Value,
+) -> HarvestResult<Value> {
+    tracing::info!(summary = ?input, "sent reconciliation summary");
+    Ok(json!({ "sent": true }))
 }

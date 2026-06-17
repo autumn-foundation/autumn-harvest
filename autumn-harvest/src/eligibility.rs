@@ -1,0 +1,385 @@
+use std::collections::HashMap;
+
+/// A single capability requirement for task execution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Requirement {
+    /// Exact match requirement: `key = "value"`.
+    Exact { key: String, value: String },
+    /// Set membership requirement: `key in ["a", "b"]`.
+    In { key: String, values: Vec<String> },
+}
+
+/// Helper to strip leading and trailing quotes from a string token.
+fn strip_quotes(s: &str) -> &str {
+    let mut s = s.trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s = &s[1..s.len() - 1];
+    }
+    s.trim()
+}
+
+/// Parse a comma-separated list of requirements (implicit AND).
+///
+/// Supports exact matches like `key = "value"` and set membership like
+/// `key in ["a", "b"]`. Handles spaces and quotes robustly.
+/// # Errors
+///
+/// Returns an error string if the requirement syntax is invalid or if it contains an empty key.
+pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_brackets = false;
+    let mut in_quotes = None;
+
+    for c in s.chars() {
+        match c {
+            '\'' | '"' => {
+                if in_quotes == Some(c) {
+                    in_quotes = None;
+                } else if in_quotes.is_none() {
+                    in_quotes = Some(c);
+                }
+                current.push(c);
+            }
+            '[' if in_quotes.is_none() => {
+                in_brackets = true;
+                current.push(c);
+            }
+            ']' if in_quotes.is_none() => {
+                in_brackets = false;
+                current.push(c);
+            }
+            ',' if !in_brackets && in_quotes.is_none() => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    tokens.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+    if in_quotes.is_some() {
+        return Err("unbalanced quotes in requirements string".to_string());
+    }
+    if in_brackets {
+        return Err("unbalanced brackets in requirements string".to_string());
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        tokens.push(trimmed.to_string());
+    }
+
+    let mut requirements = Vec::new();
+    for token in tokens {
+        requirements.push(parse_single_requirement(&token)?);
+    }
+
+    Ok(requirements)
+}
+
+fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
+    let mut eq_idx = None;
+    let mut in_idx = None;
+    let mut in_quotes = None;
+    let token_chars: Vec<char> = token.chars().collect();
+    let token_lower = token.to_lowercase();
+    let token_lower_chars: Vec<char> = token_lower.chars().collect();
+
+    let mut i = 0;
+    while i < token_chars.len() {
+        let c = token_chars[i];
+        match c {
+            '\'' | '"' => {
+                if in_quotes == Some(c) {
+                    in_quotes = None;
+                } else if in_quotes.is_none() {
+                    in_quotes = Some(c);
+                }
+            }
+            '=' if in_quotes.is_none() && eq_idx.is_none() => {
+                eq_idx = Some(i);
+            }
+            _ => {
+                if in_quotes.is_none()
+                    && in_idx.is_none()
+                    && i + 3 < token_chars.len()
+                    && token_lower_chars[i] == ' '
+                    && token_lower_chars[i + 1] == 'i'
+                    && token_lower_chars[i + 2] == 'n'
+                    && token_lower_chars[i + 3] == ' '
+                {
+                    in_idx = Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    (eq_idx, in_idx)
+}
+
+fn parse_exact(token: &str, idx: usize) -> Result<Requirement, String> {
+    let key_raw = &token[..idx];
+    let mut val_raw = &token[idx + 1..];
+    if val_raw.starts_with('=') {
+        val_raw = &val_raw[1..];
+    }
+
+    let key = strip_quotes(key_raw).to_string();
+    if key.is_empty() {
+        return Err(format!("empty key in requirement '{token}'"));
+    }
+    let value = strip_quotes(val_raw).to_string();
+
+    Ok(Requirement::Exact { key, value })
+}
+
+fn parse_in(token: &str, idx: usize) -> Result<Requirement, String> {
+    let key_raw = &token[..idx];
+    let val_raw = &token[idx + 4..];
+
+    let key = strip_quotes(key_raw).to_string();
+    if key.is_empty() {
+        return Err(format!("empty key in requirement '{token}'"));
+    }
+
+    let val_trimmed = val_raw.trim();
+    if !val_trimmed.starts_with('[') || !val_trimmed.ends_with(']') {
+        return Err(format!(
+            "invalid set syntax in requirement '{token}'; expected [...]"
+        ));
+    }
+
+    let inner = &val_trimmed[1..val_trimmed.len() - 1];
+    let mut values = Vec::new();
+    for item in inner.split(',') {
+        let item_stripped = strip_quotes(item);
+        if !item_stripped.is_empty() {
+            values.push(item_stripped.to_string());
+        }
+    }
+
+    Ok(Requirement::In { key, values })
+}
+
+fn parse_single_requirement(token: &str) -> Result<Requirement, String> {
+    let (eq_idx, in_idx) = find_operator_indices(token);
+
+    match (eq_idx, in_idx) {
+        (Some(idx), None) => parse_exact(token, idx),
+        (None, Some(idx)) => parse_in(token, idx),
+        (Some(eq_i), Some(in_i)) => {
+            if in_i < eq_i {
+                parse_in(token, in_i)
+            } else {
+                parse_exact(token, eq_i)
+            }
+        }
+        (None, None) => Err(format!(
+            "invalid requirement syntax: '{token}'; expected '=' or 'in'"
+        )),
+    }
+}
+
+/// Evaluates if a worker's capability labels satisfy the requirements.
+#[must_use]
+pub fn matches_requirements<S: std::hash::BuildHasher>(
+    requirements: &[Requirement],
+    labels: &HashMap<String, String, S>,
+) -> bool {
+    for req in requirements {
+        match req {
+            Requirement::Exact { key, value } => {
+                let Some(val) = labels.get(key) else {
+                    return false;
+                };
+                if val != value {
+                    return false;
+                }
+            }
+            Requirement::In { key, values } => {
+                let Some(val) = labels.get(key) else {
+                    return false;
+                };
+                if !values.contains(val) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_requirements_exact() {
+        let parsed = parse_requirements("gpu = true").unwrap();
+        assert_eq!(
+            parsed,
+            vec![Requirement::Exact {
+                key: "gpu".to_string(),
+                value: "true".to_string()
+            }]
+        );
+
+        let parsed_quotes = parse_requirements("gpu = \"true\"").unwrap();
+        assert_eq!(
+            parsed_quotes,
+            vec![Requirement::Exact {
+                key: "gpu".to_string(),
+                value: "true".to_string()
+            }]
+        );
+
+        let parsed_eq_eq = parse_requirements("region == 'us-east-1'").unwrap();
+        assert_eq!(
+            parsed_eq_eq,
+            vec![Requirement::Exact {
+                key: "region".to_string(),
+                value: "us-east-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_requirements_in() {
+        let parsed = parse_requirements("region in [eu-west-1, eu-central-1]").unwrap();
+        assert_eq!(
+            parsed,
+            vec![Requirement::In {
+                key: "region".to_string(),
+                values: vec!["eu-west-1".to_string(), "eu-central-1".to_string()]
+            }]
+        );
+
+        let parsed_quotes =
+            parse_requirements("region in ['eu-west-1', \"eu-central-1\"]").unwrap();
+        assert_eq!(
+            parsed_quotes,
+            vec![Requirement::In {
+                key: "region".to_string(),
+                values: vec!["eu-west-1".to_string(), "eu-central-1".to_string()]
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_requirements_composite() {
+        let parsed = parse_requirements("gpu = true, region in [eu-west-1, eu-central-1]").unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                Requirement::Exact {
+                    key: "gpu".to_string(),
+                    value: "true".to_string()
+                },
+                Requirement::In {
+                    key: "region".to_string(),
+                    values: vec!["eu-west-1".to_string(), "eu-central-1".to_string()]
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_requirements_invalid() {
+        assert!(parse_requirements("gpu").is_err());
+        assert!(parse_requirements("region in").is_err());
+        assert!(parse_requirements("region in eu-west-1").is_err());
+        assert!(parse_requirements("gpu = 'true").is_err());
+        assert!(parse_requirements("region in [eu-west-1").is_err());
+        assert!(parse_requirements("region in ['eu-west-1', \"eu-central-1\"").is_err());
+        assert!(parse_requirements("some_key = \"value").is_err());
+    }
+
+    #[test]
+    fn test_parse_requirements_edge_cases() {
+        // Exact match with 'in' inside quotes
+        let parsed1 = parse_requirements("description = 'written in rust'").unwrap();
+        assert_eq!(
+            parsed1,
+            vec![Requirement::Exact {
+                key: "description".to_string(),
+                value: "written in rust".to_string()
+            }]
+        );
+
+        let parsed2 = parse_requirements("location = \"in Berlin\"").unwrap();
+        assert_eq!(
+            parsed2,
+            vec![Requirement::Exact {
+                key: "location".to_string(),
+                value: "in Berlin".to_string()
+            }]
+        );
+
+        // Commas enclosed in quoted strings
+        let parsed3 = parse_requirements("some_key = \"value, with, comma\"").unwrap();
+        assert_eq!(
+            parsed3,
+            vec![Requirement::Exact {
+                key: "some_key".to_string(),
+                value: "value, with, comma".to_string()
+            }]
+        );
+
+        // Set membership with equal signs inside quoted/unquoted set items
+        let parsed4 = parse_requirements("runtime in [cuda=12, rocm=6]").unwrap();
+        assert_eq!(
+            parsed4,
+            vec![Requirement::In {
+                key: "runtime".to_string(),
+                values: vec!["cuda=12".to_string(), "rocm=6".to_string()]
+            }]
+        );
+    }
+
+    #[test]
+    fn test_matches_requirements() {
+        let reqs = vec![
+            Requirement::Exact {
+                key: "gpu".to_string(),
+                value: "true".to_string(),
+            },
+            Requirement::In {
+                key: "region".to_string(),
+                values: vec!["eu-west-1".to_string(), "eu-central-1".to_string()],
+            },
+        ];
+
+        let mut labels = HashMap::new();
+        labels.insert("gpu".to_string(), "true".to_string());
+        labels.insert("region".to_string(), "eu-west-1".to_string());
+        assert!(matches_requirements(&reqs, &labels));
+
+        // Mismatched value
+        let mut labels_wrong_val = labels.clone();
+        labels_wrong_val.insert("gpu".to_string(), "false".to_string());
+        assert!(!matches_requirements(&reqs, &labels_wrong_val));
+
+        // Missing key
+        let mut labels_missing_key = labels.clone();
+        labels_missing_key.remove("region");
+        assert!(!matches_requirements(&reqs, &labels_missing_key));
+
+        // In match wrong value
+        let mut labels_wrong_in = labels.clone();
+        labels_wrong_in.insert("region".to_string(), "us-east-1".to_string());
+        assert!(!matches_requirements(&reqs, &labels_wrong_in));
+
+        // Empty requirements always match
+        assert!(matches_requirements(&[], &labels));
+    }
+}

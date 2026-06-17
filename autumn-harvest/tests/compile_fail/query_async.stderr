@@ -1,0 +1,5 @@
+error: #[query] handlers must be synchronous (async fn is not supported for queries)
+ --> tests/compile_fail/query_async.rs:5:7
+  |
+5 | async fn get_status(_ctx: &WorkflowContext) -> Result<u64, String> {
+  |       ^^

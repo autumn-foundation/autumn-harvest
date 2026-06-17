@@ -11,6 +11,8 @@ fn test_update_validate_deadlock() {
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: chrono::Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     let ctx = Arc::new(WorkflowContext::for_replay(
         ExecutionId::from_uuid(Uuid::new_v4()),
@@ -50,6 +52,8 @@ async fn test_update_handler_deadlock() {
     let events = vec![WorkflowEvent::WorkflowStarted {
         input: Value::Null,
         timestamp: chrono::Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     let ctx = Arc::new(WorkflowContext::for_replay(
         ExecutionId::from_uuid(Uuid::new_v4()),

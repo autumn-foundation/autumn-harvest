@@ -14,6 +14,7 @@ use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
@@ -22,14 +23,16 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
 use autumn_harvest::queue::{self as queue_mod, EnqueueParams, TaskType};
+use autumn_harvest::schema::harvest_task_queue::dsl as queue_dsl;
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_STARTED, MetricsRecorder, TelemetryConfig, WorkflowStatus,
+    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_STARTED, MetricsRecorder, TelemetryConfig,
+    WorkflowStatus,
 };
-use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, RetryPolicy, WorkflowContext, WorkflowHistoryPolicy};
 use chrono::Utc;
@@ -65,6 +68,50 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
     "\n",
     include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
+    include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
+    "\n",
+    include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
+    include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
+    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
+    "\n",
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
+    "\n",
+    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
+    "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
 
 // ---------------------------------------------------------------------------
@@ -191,6 +238,16 @@ impl MetricsRecorder for RecordingMetrics {
             vec![("depth", depth.to_string()), ("shard", shard.to_string())],
         );
     }
+
+    fn record_workflow_non_determinism(&self, workflow_name: &str, build_id: &str) {
+        self.push(
+            METRIC_WORKFLOW_NON_DETERMINISM,
+            vec![
+                ("workflow", workflow_name.to_owned()),
+                ("build_id", build_id.to_owned()),
+            ],
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +257,7 @@ impl MetricsRecorder for RecordingMetrics {
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -311,6 +369,13 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 worker_heartbeat_interval: Duration::from_secs(30),
                 build_id: String::new(),
                 deployment_name: None,
+                workflow_cache_size: 1000,
+                priority_aging_secs: None,
+                unknown_target_grace_window: Duration::from_secs(5),
+                poison_pill_threshold: 3,
+                labels: std::collections::HashMap::new(),
+                max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                sharded_pool: None,
             },
             registry,
         )
@@ -466,6 +531,33 @@ fn parent_with_history_capped_child<'a>(
     })
 }
 
+fn detached_cascade_reaches_history_cap<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let first = ctx
+            .spawn_child_workflow_detached_raw(
+                "history_cap_never_finishing_child",
+                serde_json::json!({"child": 1}),
+                ParentClosePolicy::RequestCancel,
+            )
+            .map_err(|error| error.to_string())?;
+        let second = ctx
+            .spawn_child_workflow_detached_raw(
+                "history_cap_never_finishing_child",
+                serde_json::json!({"child": 2}),
+                ParentClosePolicy::Terminate,
+            )
+            .map_err(|error| error.to_string())?;
+
+        Ok(serde_json::json!({
+            "first": first.to_string(),
+            "second": second.to_string(),
+        }))
+    })
+}
+
 fn child_breaches_history_cap_inline<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
@@ -530,9 +622,22 @@ async fn workflow_and_activity_metrics_are_recorded() {
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -546,6 +651,8 @@ async fn workflow_and_activity_metrics_are_recorded() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -573,6 +680,18 @@ async fn workflow_and_activity_metrics_are_recorded() {
             name: "metrics_test_workflow",
             module: "metrics_integration",
             handler: metrics_test_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "metrics_activity",
@@ -581,10 +700,18 @@ async fn workflow_and_activity_metrics_are_recorded() {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: Some("default"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
             handler: metrics_activity,
         }],
         autumn_harvest::context::empty_shared_state(),
@@ -691,6 +818,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn continue_as_new_records_history_size_and_rotation_metrics() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = AsyncPgConnection::establish(&database_url)
@@ -712,9 +840,22 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
+            deadline_at: None,
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
         })
         .execute(&mut conn)
         .await
@@ -726,6 +867,8 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -751,6 +894,18 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             name: "continue_metric_workflow",
             module: "metrics_integration",
             handler: continue_metric_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
         autumn_harvest::context::empty_shared_state(),
@@ -789,6 +944,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_hard_cap_moves_offender_to_dlq() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -811,9 +967,22 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
+            deadline_at: None,
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
         })
         .execute(&mut conn)
         .await
@@ -826,6 +995,8 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "already-large".into(),
@@ -857,6 +1028,18 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             name: "history_cap_violator",
             module: "metrics_integration",
             handler: history_cap_violator,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![],
         autumn_harvest::context::empty_shared_state(),
@@ -883,7 +1066,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
         "execution error should identify hard cap reason, got: {error}"
     );
 
-    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
         .await
         .expect("failed to list DLQ rows");
     let dlq_row = dead_letters
@@ -894,6 +1077,138 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
         dlq_row.error.contains("HistoryCapExceeded"),
         "DLQ reason should identify hard cap, got: {}",
         dlq_row.error
+    );
+    assert_eq!(
+        dlq_row.attempts, 1,
+        "DLQ attempts must match the terminal task attempt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({"case":"attempt-regression"});
+    let workflow_id = format!("hard-cap-attempt-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            id: exec_id.as_uuid(),
+            workflow_name: "history_cap_violator",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "already-large".into(),
+                details: serde_json::json!({}),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append initial history failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    let task_id = queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    diesel::update(queue_dsl::harvest_task_queue.find(task_id))
+        .set(queue_dsl::attempt.eq(2))
+        .execute(&mut conn)
+        .await
+        .expect("failed to force attempt");
+
+    let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(2);
+    let registry = Arc::new(
+        HandlerRegistry::new(
+            vec![WorkflowInfo {
+                name: "history_cap_violator",
+                module: "metrics_integration",
+                handler: history_cap_violator,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+            }],
+            vec![],
+        )
+        .with_history_policy(policy),
+    );
+
+    let worker = build_worker("metrics-worker-hard-cap-attempt", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let _execution = wait_for_state(&database_url, exec_id, "FAILED").await;
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
+        .await
+        .expect("failed to list DLQ rows");
+    let dlq_row = dead_letters
+        .iter()
+        .find(|row| row.workflow_exec_id == Some(exec_id.as_uuid()))
+        .expect("hard-cap offender must be moved to DLQ");
+    assert_eq!(
+        dlq_row.attempts, 3,
+        "DLQ attempts must preserve terminal task attempt count"
     );
 }
 
@@ -931,9 +1246,22 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 parent_id: None,
                 queue_name: "default",
                 execution_timeout: None,
+                deadline_at: None,
                 memo: None,
                 search_attrs: None,
                 assigned_build_id: None,
+                parent_close_policy: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+
+                sla: None,
+
+                sla_deadline_at: None,
+                schedule_id: None,
+                scheduled_for: None,
             })
             .execute(&mut conn)
             .await
@@ -946,6 +1274,8 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 WorkflowEvent::WorkflowStarted {
                     input: workflow_input.clone(),
                     timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
                 },
                 WorkflowEvent::MarkerRecorded {
                     name: "side_effect:near-cap".into(),
@@ -981,11 +1311,35 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 name: "suspended_command_reaches_history_cap",
                 module: "metrics_integration",
                 handler: suspended_command_reaches_history_cap,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "history_cap_never_finishing_child",
                 module: "metrics_integration",
                 handler: history_cap_never_finishing_child,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![ActivityInfo {
@@ -995,10 +1349,18 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: Some("unpolled"),
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
             handler: metrics_activity,
         }],
         autumn_harvest::context::empty_shared_state(),
@@ -1021,7 +1383,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
     worker.shutdown();
     handle.await.expect("worker task should join cleanly");
 
-    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
         .await
         .expect("failed to list DLQ rows");
 
@@ -1096,9 +1458,22 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
+            deadline_at: None,
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
         })
         .execute(&mut conn)
         .await
@@ -1111,6 +1486,8 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             WorkflowEvent::WorkflowStarted {
                 input: workflow_input.clone(),
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "side_effect:near-cap-local-retry".into(),
@@ -1142,6 +1519,18 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             name: "local_activity_retry_reaches_history_cap",
             module: "metrics_integration",
             handler: local_activity_retry_reaches_history_cap,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }],
         vec![ActivityInfo {
             name: "history_cap_always_failing_local",
@@ -1150,10 +1539,18 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             default_start_to_close: Some(Duration::from_secs(5)),
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
             is_local: true,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
             handler: history_cap_always_failing_local,
         }],
         autumn_harvest::context::empty_shared_state(),
@@ -1200,7 +1597,185 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
         history.events
     );
 
-    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
+        .await
+        .expect("failed to list DLQ rows");
+    assert!(
+        dead_letters.iter().any(|row| {
+            row.workflow_exec_id == Some(exec_id.as_uuid())
+                && row.error.contains("HistoryCapExceeded")
+        }),
+        "workflow should have a typed DLQ row; got: {dead_letters:?}"
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_parent_close_cascade_counts_against_history_cap() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({});
+    let workflow_id = format!("detached-cascade-cap-{}", Uuid::new_v4());
+
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(NewWorkflowExecution {
+            id: exec_id.as_uuid(),
+            workflow_name: "detached_cascade_reaches_history_cap",
+            workflow_id: &workflow_id,
+            run_id: Uuid::new_v4(),
+            shard_id: 0,
+            input: workflow_input.clone(),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+    let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(5);
+    let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
+        vec![
+            WorkflowInfo {
+                name: "detached_cascade_reaches_history_cap",
+                module: "metrics_integration",
+                handler: detached_cascade_reaches_history_cap,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+            },
+            WorkflowInfo {
+                name: "history_cap_never_finishing_child",
+                module: "metrics_integration",
+                handler: history_cap_never_finishing_child,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+            },
+        ],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+        policy,
+    ));
+
+    let worker = build_worker("metrics-worker-detached-cascade-cap", registry);
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let parent_execution = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let execution = load_execution(&database_url, exec_id).await;
+            if execution.state != "RUNNING" {
+                break execution;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("workflow did not reach a terminal state");
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    assert_eq!(parent_execution.state, "FAILED");
+    let error = parent_execution
+        .error
+        .expect("hard cap should fail execution");
+    assert!(
+        error.contains("HistoryCapExceeded"),
+        "execution error should identify hard cap reason, got: {error}"
+    );
+
+    let parent_history = load_history(&database_url, exec_id).await;
+    assert!(
+        !parent_history.events.iter().any(|event| matches!(
+            event,
+            WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
+                | WorkflowEvent::WorkflowCompleted { .. }
+        )),
+        "detached spawn and cascade events should not persist after cap breach: {:?}",
+        parent_history.events
+    );
+
+    let children = load_child_executions(&database_url, exec_id).await;
+    assert!(
+        children.is_empty(),
+        "detached child rows should not be created after cap breach: {children:?}"
+    );
+
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
         .await
         .expect("failed to list DLQ rows");
     assert!(
@@ -1235,9 +1810,22 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             parent_id: None,
             queue_name: "default",
             execution_timeout: None,
+            deadline_at: None,
             memo: None,
             search_attrs: None,
             assigned_build_id: None,
+            parent_close_policy: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+
+            sla: None,
+
+            sla_deadline_at: None,
+            schedule_id: None,
+            scheduled_for: None,
         })
         .execute(&mut conn)
         .await
@@ -1249,6 +1837,8 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
         &[WorkflowEvent::WorkflowStarted {
             input: workflow_input.clone(),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }],
         0,
     )
@@ -1276,11 +1866,35 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
                 name: "parent_with_history_capped_child",
                 module: "metrics_integration",
                 handler: parent_with_history_capped_child,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
             WorkflowInfo {
                 name: "child_breaches_history_cap_inline",
                 module: "metrics_integration",
                 handler: child_breaches_history_cap_inline,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
             },
         ],
         vec![ActivityInfo {
@@ -1290,10 +1904,18 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             default_start_to_close: Some(Duration::from_secs(5)),
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
             is_local: true,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
             handler: history_cap_local_step,
         }],
         autumn_harvest::context::empty_shared_state(),
@@ -1361,7 +1983,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
         child_history.events
     );
 
-    let dead_letters = dlq::list_dead_letters(&mut conn, 10)
+    let dead_letters = dlq::list_dead_letters(&mut conn, 10, None)
         .await
         .expect("failed to list DLQ rows");
     assert!(
@@ -1390,6 +2012,9 @@ async fn dlq_depth_sampler_emits_dlq_entries_metric() {
         input: serde_json::json!({}),
         error: "intentional test failure".to_string(),
         attempts: 3,
+
+        owner: None,
+        severity: None,
     };
     dlq::dead_letter(&mut conn, &dlq_entry)
         .await
@@ -1460,4 +2085,202 @@ async fn dlq_depth_sampler_emits_dlq_entries_metric() {
         .and_then(|v| v.parse().ok())
         .expect("depth label must be a valid u64");
     assert!(depth >= 1, "dlq.entries depth must be >= 1, got {depth}");
+}
+
+fn non_deterministic_test_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.execute_activity_raw("wrong_name", serde_json::Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({"msg": "non-det"});
+
+    let exec_row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "non_deterministic_test_workflow",
+        workflow_id: &format!("non-det-{}", Uuid::new_v4()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: workflow_input.clone(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&exec_row)
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    // Replay history expects "step_1" activity scheduled.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "step_1".into(),
+                input: serde_json::Value::Null,
+                queue: "default".into(),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append events failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    // Wire up RecordingMetrics.
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![WorkflowInfo {
+            name: "non_deterministic_test_workflow",
+            module: "metrics_integration",
+            handler: non_deterministic_test_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+
+    // Worker with a build_id
+    let config = WorkerRuntimeConfig {
+        worker_id: "nd-worker-1".to_string(),
+        queues: vec!["default".to_string()],
+        notification_database_url: None,
+        max_concurrent_workflows: 2,
+        max_concurrent_activities: 2,
+        poll_interval: Duration::from_millis(25),
+        shutdown_timeout: Duration::from_secs(2),
+        cancellation_grace_period: Duration::from_secs(1),
+        sticky_timeout: Duration::from_secs(5),
+        max_local_activity_start_to_close: Duration::from_secs(60),
+        shard_assignments: vec![ShardId::new(0)],
+        worker_heartbeat_interval: Duration::from_secs(30),
+        build_id: "test-build-v999".to_string(),
+        deployment_name: None,
+        workflow_cache_size: 1000,
+        priority_aging_secs: None,
+        unknown_target_grace_window: Duration::from_secs(5),
+        poison_pill_threshold: 3,
+        labels: std::collections::HashMap::new(),
+        max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+        sharded_pool: None,
+    };
+    let worker = Arc::new(Worker::new(config, registry).expect("worker should build"));
+    let pool = build_test_pool(&database_url);
+
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    // Wait for the workflow execution to fail.
+    let ex = wait_for_state(&database_url, exec_id, "FAILED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    // --- assertions ---
+
+    // 1. Metric is recorded.
+    let names = recording.names();
+    assert!(
+        names.contains(&METRIC_WORKFLOW_NON_DETERMINISM),
+        "METRIC_WORKFLOW_NON_DETERMINISM must be emitted; got: {names:?}"
+    );
+
+    let emissions = recording.drain();
+    let nd_emission = emissions
+        .iter()
+        .find(|e| e.name == METRIC_WORKFLOW_NON_DETERMINISM)
+        .expect("non_determinism emission must exist");
+    assert!(
+        nd_emission
+            .labels_debug
+            .contains("workflow=non_deterministic_test_workflow"),
+        "non-determinism label must include workflow name; got: {}",
+        nd_emission.labels_debug
+    );
+    assert!(
+        nd_emission
+            .labels_debug
+            .contains("build_id=test-build-v999"),
+        "non-determinism label must include build_id; got: {}",
+        nd_emission.labels_debug
+    );
+
+    // 2. search_attrs in DB contains the details.
+    let search_attrs = ex.search_attrs.expect("search_attrs should be populated");
+    assert_eq!(search_attrs["failure_cause"], "non_determinism");
+    assert_eq!(search_attrs["event_index"], 1); // Divergence at position 1 (the scheduled activity).
+    assert_eq!(search_attrs["expected"], "ActivityScheduled(wrong_name)");
+    assert_eq!(search_attrs["actual"], "ActivityScheduled(step_1)");
+    assert_eq!(
+        search_attrs["workflow_type"],
+        "non_deterministic_test_workflow"
+    );
+    assert_eq!(search_attrs["build_id"], "test-build-v999");
 }

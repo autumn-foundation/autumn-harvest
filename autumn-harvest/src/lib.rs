@@ -11,9 +11,32 @@
 /// resolution local to this crate, where the `migrations/` directory always
 /// ships alongside.
 #[cfg(feature = "db")]
+#[macro_export]
+macro_rules! cfg_db {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
+#[cfg(not(feature = "db"))]
+#[macro_export]
+macro_rules! cfg_db {
+    ($($item:item)*) => {};
+}
+
+#[cfg(feature = "db")]
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
 
+// Consume the env var emitted by build.rs so that Cargo recompiles this
+// crate (and re-runs embed_migrations!()) whenever a migration is added or
+// removed — even when only the migrations/ directory changed and no Rust
+// source file was edited.
+#[cfg(feature = "db")]
+const _MIGRATIONS_LIST: &str = env!("HARVEST_MIGRATIONS_LIST");
+
+/// Admission gate primitive for incident-response operators (issue #377).
+pub mod admission_gate;
 /// History analyzer and linter.
 pub mod analyzer;
 /// Audit trail for management API mutations (issue #158).
@@ -21,11 +44,22 @@ pub mod analyzer;
 pub mod audit;
 /// Batch operations for fleet-wide workflow cancel/terminate/signal (issue #102).
 pub mod batch;
+/// Batch workflow start types: caps and per-item request/result structs (issue #357).
+pub mod batch_start;
 /// Worker build-id routing for safe rolling deploys (issue #171).
 #[cfg(feature = "db")]
 pub mod build_routing;
 pub mod builder;
 pub mod cache;
+/// Calendar-aware schedule filtering: named exclusion sets, skip policies, and
+/// schedule preview generation (issue #337).
+pub mod calendar;
+/// Per-activity circuit breaker that fast-fails dispatch during downstream
+/// outages (issue #369).
+pub mod circuit_breaker;
+pub mod completion_trigger;
+/// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
+pub mod concurrency;
 pub mod context;
 pub mod critical_path;
 pub mod dag;
@@ -39,6 +73,7 @@ pub mod dag_simulator;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;
+pub mod eligibility;
 pub mod error;
 pub mod event;
 #[cfg(feature = "db")]
@@ -47,10 +82,13 @@ pub mod execution;
 pub mod executor;
 #[cfg(feature = "db")]
 pub mod external_task;
+pub mod failure;
 /// Deterministic workflow guardrail rule catalog (issue #173).
 pub mod guardrail;
 #[cfg(feature = "db")]
 pub mod handle;
+#[cfg(feature = "db")]
+pub mod handle_typed;
 pub mod history_export;
 pub mod info;
 /// `metrics` crate adapter for [`telemetry::MetricsRecorder`].
@@ -63,6 +101,7 @@ pub mod info;
 #[cfg(feature = "metrics-rs")]
 pub mod metrics_rs_adapter;
 pub mod payload_codec;
+pub mod poison_pill;
 pub mod policy;
 pub mod pool;
 pub mod prelude;
@@ -105,6 +144,8 @@ pub mod notify;
 #[doc(hidden)]
 pub mod queue;
 #[cfg(feature = "db")]
+pub mod schedule_decision;
+#[cfg(feature = "db")]
 pub mod scheduler;
 #[cfg(feature = "db")]
 #[allow(clippy::wildcard_imports)]
@@ -125,18 +166,37 @@ pub mod worker;
 #[cfg(feature = "db")]
 pub mod workers;
 
+pub use admission_gate::{
+    AdmissionGate, AdmissionGateCache, AdmissionGateId, AdmissionGateView, GateScope,
+    MAX_ACTIVE_GATES, check_admission,
+};
 pub use analyzer::{
     AnalyzerRule, AnalyzerWarning, ExcessiveRetriesRule, HistoryAnalyzer, LargePayloadRule,
     SuspiciousTimerRule,
 };
-pub use builder::{BuiltHarvest, HarvestBuilder, HarvestBuilderError, WorkerConfig};
+pub use builder::{
+    BuiltHarvest, HarvestBuilder, HarvestBuilderError, StickyRoutingConfig, WorkerConfig,
+};
 pub use cache::{CachedWorkflowState, WorkflowCache};
+#[cfg(feature = "db")]
+pub use calendar::{
+    BackfillSlot, create_calendar, delete_calendar, get_calendar, list_calendars,
+    load_exclusions_for_calendar, plan_backfill_with_calendar, preview_schedule_firings,
+    replace_calendar_exclusions,
+};
+pub use calendar::{
+    Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
+};
+pub use completion_trigger::{CompletionTrigger, InputMapping, TerminalState};
 pub use context::{
     ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, WorkflowCommand, WorkflowContext,
     WorkflowHistoryPolicy,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
-pub use dag::{DagBuildError, DagBuilder, DagDefinition, DagTask, DagTaskRef};
+pub use dag::{
+    DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
+    DagTask, DagTaskRef,
+};
 pub use dag_export::{export_dot, export_mermaid};
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
@@ -152,11 +212,15 @@ pub use det_check::{
 };
 pub use diagnostic::{DiagnosticReport, SimulatorResultExt};
 pub use error::{HarvestError, HarvestResult, TimeoutType};
-pub use event::WorkflowEvent;
+pub use event::{SideEffectKind, WorkflowEvent};
 #[cfg(feature = "db")]
 pub use execution::{
-    CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
-    cancel_workflow_execution, start_or_load_workflow_execution, terminate_workflow_execution,
+    CancelledWorkflowExecution, PausedWorkflowExecution, ResumedWorkflowExecution,
+    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, StartedWorkflowExecution,
+    UpdateWithStartOutcome, UpdateWithStartParams, auto_resume_expired_pauses,
+    cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
+    signal_with_start_workflow_execution, start_or_load_workflow_execution,
+    terminate_workflow_execution, update_with_start_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use guardrail::{
@@ -168,50 +232,71 @@ pub use handle::{
     StartedWorkflowHandle, WorkflowHandle, WorkflowHandleClient, WorkflowResult,
     WorkflowResultState, start_or_load_workflow_execution_with_handle,
 };
+#[cfg(feature = "db")]
+pub use handle_typed::{
+    TypedSignalWithStartOptions, TypedStartOptions, TypedUpdateWithStartOptions,
+    TypedWorkflowHandle, TypedWorkflowResult,
+};
 pub use history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HISTORY_EXPORT_SCHEMA, HISTORY_EXPORT_VERSION,
     HistoryExportDocument, HistoryExportError, HistoryExportRequest, HistoryExportSizeLimit,
     HistoryExportStatus, HistoryPayloadPolicy, export_history, export_mermaid_sequence,
 };
-pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
+pub use info::{
+    ActivityHandlerFn, ActivityInfo, DagInfo, QueryHandlerFn, QueryHandlerInfo, UpdateHandlerFn,
+    UpdateHandlerInfo, UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo,
+};
 pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
 pub use policy::validate_schedule;
-pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule, WorkflowSchedule};
+pub use policy::{
+    CatchupPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus,
+    TriggerRule, WorkflowSchedule,
+};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
-pub use replay::{HistoryMatch, HistoryMatcher};
+pub use replay::{HistoryMatch, HistoryMatcher, SignalOrTimerMatch};
 #[cfg(feature = "db")]
 pub use reset::{
     ResetInvalidPoint, ResetPlan, ResetResult, ResetSignalReapplyPolicy, ResetUnresolvedSideEffect,
     WorkflowResetError, WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
     validate_reset_point,
 };
-pub use retention::RetentionConfig;
+pub use retention::{ArchiverFuture, HistoryArchiver, RetentionConfig};
 #[cfg(feature = "db")]
 pub use retention::{RetentionMonitor, RetentionRuntime, RetentionStatus, RetentionTickResult};
 pub use saga::Saga;
 #[cfg(feature = "db")]
+pub use schedule_decision::record_decision_graceful;
+#[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
-    register_schedules, register_workflow_schedules, tick_once, trigger_dag,
+    register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
 };
 pub use shard::ShardRouter;
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
+#[cfg(feature = "db")]
+pub use store::AwaitMode;
 pub use telemetry::{
     ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
     TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, WorkflowStatus,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
+#[cfg(feature = "testing")]
+pub use testing::{
+    BatchReplayReport, CiReport, FailOnMode, FixtureResult, FixtureStatus, HarnessErrorKind,
+    ReplayVerifier, ReportFormat, TestRunOutcome, WorkflowTestEnv,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,
 };
 pub use types::{
-    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ShardId, TimerId,
-    UpdateId, WorkerId, WorkflowId, WorkflowIdReusePolicy,
+    ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalCancelId,
+    ExternalSignalId, ParentClosePolicy, Priority, ShardId, TimerId, UpdateId, WorkerId,
+    WorkflowId, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]
@@ -226,10 +311,63 @@ pub use store::EventHistory;
 pub use models::{AuditRecord, NewAuditRecord};
 
 #[cfg(feature = "db")]
-pub use queue::ConcurrencyKeyStats;
+pub use diesel;
+#[cfg(feature = "db")]
+pub use diesel_async;
+
+#[cfg(feature = "db")]
+pub use queue::{ConcurrencyKeyStats, QueueScalingSignal, QueueTaskCounts, queue_task_counts};
 
 // Allow macro-generated code to use ::autumn_harvest::serde_json
 pub use serde_json;
+// Allow macro-generated code to use ::autumn_harvest::serde
+pub use serde;
+// Allow macro-generated code to use ::autumn_harvest::chrono
+pub use chrono;
+// Allow macro-generated code to use ::autumn_harvest::uuid (e.g. update_with_start UUIDv5 derivation)
+pub use uuid;
+// Allow macro-generated code to use ::autumn_harvest::futures.
+#[doc(hidden)]
+pub use futures;
+
+/// Parse a human-readable byte-size string like `"2MiB"`, `"256KiB"`, `"4MB"`.
+///
+/// Accepted suffixes: `KiB`, `KB`, `MiB`, `MB`, `GiB`, `GB`, or no suffix for
+/// plain bytes. Returns `None` for empty strings or unrecognised suffixes.
+///
+/// ## Examples
+///
+/// ```rust
+/// assert_eq!(autumn_harvest::parse_byte_size("2MiB"), Some(2 * 1024 * 1024));
+/// assert_eq!(autumn_harvest::parse_byte_size("256KiB"), Some(256 * 1024));
+/// assert_eq!(autumn_harvest::parse_byte_size("4MB"), Some(4_000_000));
+/// assert_eq!(autumn_harvest::parse_byte_size("invalid"), None);
+/// ```
+#[must_use]
+#[allow(clippy::option_if_let_else)]
+pub fn parse_byte_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (digits, multiplier): (&str, u64) = if let Some(n) = s.strip_suffix("GiB") {
+        (n.trim(), 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("GB") {
+        (n.trim(), 1_000_000_000)
+    } else if let Some(n) = s.strip_suffix("MiB") {
+        (n.trim(), 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB") {
+        (n.trim(), 1_000_000)
+    } else if let Some(n) = s.strip_suffix("KiB") {
+        (n.trim(), 1024)
+    } else if let Some(n) = s.strip_suffix("KB") {
+        (n.trim(), 1_000)
+    } else {
+        (s, 1)
+    };
+    let n: u64 = digits.parse().ok()?;
+    n.checked_mul(multiplier)
+}
 
 /// Parse a human-readable duration string like `"5m"`, `"30s"`, `"1h"`.
 ///

@@ -17,6 +17,8 @@ fn make_admitted_history(update_id: UpdateId, name: &str) -> Vec<WorkflowEvent> 
         WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({}),
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -360,6 +362,8 @@ fn history_matcher_finds_update_completed() {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -393,6 +397,8 @@ fn history_matcher_finds_update_failed() {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -426,6 +432,8 @@ fn history_matcher_returns_no_match_for_admitted_without_completion() {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -454,6 +462,8 @@ fn history_matcher_returns_no_match_for_unknown_update_id() {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::UpdateCompleted {
             update_id: known_id,
@@ -483,6 +493,8 @@ fn update_events_do_not_break_activity_replay() {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id,
@@ -528,6 +540,8 @@ fn drain_admitted_updates_returns_pending_update() {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -555,6 +569,8 @@ fn drain_admitted_updates_excludes_already_completed() {
         WorkflowEvent::WorkflowStarted {
             input: serde_json::Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id: completed_id,

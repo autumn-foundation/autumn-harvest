@@ -47,6 +47,8 @@ jobs:
         run: cargo test -p autumn-harvest --all-features --tests --no-run
       - name: Run all-features lib tests
         run: cargo test -p autumn-harvest --all-features --lib
+      - name: Free disk space
+        run: cargo clean
       - name: Run plugin lib tests
         run: cargo test -p autumn-harvest-plugin --lib
       - name: Run macros tests

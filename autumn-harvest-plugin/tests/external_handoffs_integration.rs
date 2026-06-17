@@ -22,6 +22,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
@@ -38,6 +39,7 @@ fn build_test_pool(database_url: &str) -> DbPool {
 
 async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -136,9 +138,22 @@ async fn seed_external_handoff(
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&execution)

@@ -22,6 +22,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
@@ -38,6 +39,7 @@ fn build_test_pool(database_url: &str) -> DbPool {
 
 async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -57,6 +59,7 @@ async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgre
 
 async fn setup_two_shards_with_migrations() -> ((String, String), ContainerAsync<Postgres>) {
     let container = Postgres::default()
+        .with_tag("16")
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -185,9 +188,22 @@ async fn insert_version_execution_with_markers(
         parent_id: None,
         queue_name: "default",
         execution_timeout: None,
+        deadline_at: None,
         memo: None,
         search_attrs: None,
         assigned_build_id: None,
+        parent_close_policy: None,
+
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+
+        sla: None,
+
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -214,6 +230,8 @@ async fn insert_version_execution_with_markers(
     let mut events = vec![WorkflowEvent::WorkflowStarted {
         input: json!({}),
         timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
     }];
     events.extend(markers.iter().map(|(change_id, recorded_version)| {
         WorkflowEvent::MarkerRecorded {

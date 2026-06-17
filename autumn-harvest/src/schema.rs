@@ -26,11 +26,50 @@ diesel::table! {
         started_at -> Timestamptz,
         completed_at -> Nullable<Timestamptz>,
         execution_timeout -> Nullable<Interval>,
+        /// Absolute UTC deadline for execution-level timeout (issue #243).
+        /// Computed at start as `started_at + execution_timeout`. NULL = no deadline.
+        deadline_at -> Nullable<Timestamptz>,
         memo -> Nullable<Jsonb>,
         search_attrs -> Nullable<Jsonb>,
         created_at -> Timestamptz,
         /// Build ID assigned to this execution at start time (issue #171).
         assigned_build_id -> Nullable<Text>,
+        /// Parent-close policy for detached children (issue #347). NULL for awaited children.
+        parent_close_policy -> Nullable<Text>,
+        owner -> Nullable<Text>,
+        runbook_url -> Nullable<Text>,
+        severity -> Nullable<Text>,
+        /// Wall-clock instant the active pause was applied (issue #383). NULL = not paused.
+        paused_at -> Nullable<Timestamptz>,
+        /// Optional operator-supplied pause reason (issue #383).
+        pause_reason -> Nullable<Text>,
+        /// Identity that requested the active pause, from the audit trail (issue #383).
+        pause_actor -> Nullable<Text>,
+        /// Last-write-wins human-readable status string set by the workflow author
+        /// via `ctx.set_current_details(...)` (issue #473). NULL = never set.
+        current_details -> Nullable<Text>,
+        /// Per-execution ambient context headers (issue #481). NULL = empty map.
+        context_headers -> Nullable<Jsonb>,
+        /// Optional declared SLA budget for soft breach signal (issue #487).
+        /// Stored so continue-as-new / reset can re-anchor per run. NULL = no SLA.
+        sla -> Nullable<Interval>,
+        /// Absolute UTC deadline for soft SLA enforcement (issue #487).
+        /// Computed at start as `started_at + sla`. NULL = no SLA declared.
+        sla_deadline_at -> Nullable<Timestamptz>,
+        /// Whether the soft SLA deadline has been breached (issue #487).
+        /// Set exactly once by the scanner; never by the workflow engine.
+        /// Leaves `harvest_events` untouched (zero replay footprint).
+        sla_breached -> Bool,
+        /// Wall-clock instant the SLA was first detected as breached (issue #487).
+        /// `NULL` when `sla_breached = false`.
+        sla_breached_at -> Nullable<Timestamptz>,
+        /// Schedule that fired this execution (issue #488). NULL for manual starts.
+        /// Used to resolve the last-completion-result carryover at workflow start time.
+        schedule_id -> Nullable<Uuid>,
+        /// The logical schedule slot this run fires for (issue #488). Carryover is
+        /// ordered by this rather than `completed_at` so out-of-order completions can't
+        /// roll an incremental cursor backward. NULL for non-scheduled executions.
+        scheduled_for -> Nullable<Timestamptz>,
     }
 }
 
@@ -56,6 +95,7 @@ diesel::table! {
         task_type -> Text,
         workflow_exec_id -> Nullable<Uuid>,
         activity_name -> Nullable<Text>,
+        activity_id -> Nullable<Uuid>,
         input -> Jsonb,
         state -> Text,
         priority -> Int4,
@@ -81,23 +121,43 @@ diesel::table! {
         concurrency_cap -> Nullable<Int4>,
         /// Build ID required to claim this task (issue #171). NULL = any worker.
         required_build_id -> Nullable<Text>,
+        rate_limit_key -> Nullable<Text>,
+        /// Number of times this task was reclaimed from a dead worker without
+        /// completing (issue #367). Quarantined to the DLQ once it reaches the
+        /// operator-configured poison-pill threshold. Distinct from `attempt`.
+        crash_strikes -> Int4,
+        /// Absolute UTC deadline for the entire activity lifecycle across all retry
+        /// attempts (issue #378). Computed once at initial enqueue as
+        /// `NOW() + schedule_to_close`. NULL = no total deadline enforced.
+        schedule_to_close_at -> Nullable<Timestamptz>,
+        /// Structured capability requirements JSONB payload (issue #382).
+        required_capabilities -> Nullable<Jsonb>,
+        /// Per-execution ambient context headers propagated from the parent workflow (issue #481).
+        context_headers -> Nullable<Jsonb>,
     }
 }
 
 diesel::table! {
     use diesel::sql_types::*;
 
-    harvest_dag_runs (id) {
+    harvest_calendars (id) {
         id -> Uuid,
-        dag_name -> Text,
-        workflow_exec_id -> Nullable<Uuid>,
-        state -> Text,
-        logical_date -> Timestamptz,
-        data_interval_start -> Timestamptz,
-        data_interval_end -> Timestamptz,
-        conf -> Nullable<Jsonb>,
-        started_at -> Nullable<Timestamptz>,
-        completed_at -> Nullable<Timestamptz>,
+        name -> Text,
+        description -> Nullable<Text>,
+        /// `true` for built-in calendars that operators cannot delete.
+        built_in -> Bool,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_calendar_exclusions (id) {
+        id -> Uuid,
+        calendar_name -> Text,
+        excluded_date -> Date,
         created_at -> Timestamptz,
     }
 }
@@ -120,6 +180,67 @@ diesel::table! {
         workflow_name -> Nullable<Text>,
         workflow_input -> Nullable<Jsonb>,
         queue_name -> Nullable<Text>,
+        paused_at -> Nullable<Timestamptz>,
+        paused_by -> Nullable<Text>,
+        pause_reason -> Nullable<Text>,
+        jitter_secs -> Int8,
+        /// Overlap policy variant for this schedule (issue #241).
+        overlap_policy -> Text,
+        /// Durable buffered fire times for `BufferOne`/`BufferAll` (issue #241).
+        buffered_runs -> Jsonb,
+        /// Maximum buffered slots under `BufferAll` (issue #241).
+        buffer_all_max -> Int4,
+        /// Optional named calendar for this schedule (issue #337). NULL = no filtering.
+        calendar_name -> Nullable<Text>,
+        /// What to do when the fire date is calendar-excluded (issue #337).
+        skip_policy -> Text,
+        /// Token held by the replica that claimed this slot for firing (issue #350).
+        /// NULL means no replica currently holds a claim on this schedule row.
+        fire_claim_token -> Nullable<Uuid>,
+        /// Absolute UTC expiry of the current fire claim (issue #350).
+        /// When `fire_claimed_until < NOW()` the claim is expired and any replica
+        /// may re-claim the slot (crash-recovery path).
+        fire_claimed_until -> Nullable<Timestamptz>,
+        /// Number of consecutive failures required before the schedule auto-pauses
+        /// (issue #360). NULL = auto-pause disabled (existing behaviour).
+        consecutive_failure_limit -> Nullable<Int4>,
+        /// Running count of consecutive schedule-triggered execution failures.
+        /// Incremented by the worker completion path on `FAILED`/`TIMED_OUT`;
+        /// reset to 0 on `COMPLETED` or on operator resume. Default 0.
+        consecutive_failure_count -> Int4,
+        /// Set to `NOW()` when `consecutive_failure_count` reaches `consecutive_failure_limit`.
+        /// NULL = schedule is not auto-paused.
+        auto_paused_at -> Nullable<Timestamptz>,
+        /// Absolute UTC cutoff for this schedule (issue #478).
+        /// When `next_run_at >= end_at`, no further runs are started and the
+        /// schedule is transitioned to the exhausted state. NULL = no cutoff.
+        end_at -> Nullable<Timestamptz>,
+        /// Total run budget (issue #478). Once `runs_started` reaches this value
+        /// the schedule is exhausted and stops firing. NULL = no budget limit.
+        max_runs -> Nullable<Int4>,
+        /// Monotonically-increasing count of executions actually started by this
+        /// schedule (issue #478). Only incremented when a run is truly dispatched —
+        /// skipped firings (overlap, calendar, pause) do NOT increment this counter.
+        runs_started -> Int4,
+        /// Set to `NOW()` when the schedule transitions to the exhausted state
+        /// (issue #478). NULL = schedule is still active (not exhausted).
+        exhausted_at -> Nullable<Timestamptz>,
+        /// Machine-readable reason for exhaustion (issue #478).
+        /// One of: `"end_at_reached"`, `"max_runs_exhausted"`. NULL when not exhausted.
+        exhausted_reason -> Nullable<Text>,
+        /// Catchup policy discriminator for missed fire slots (issue #484).
+        /// One of: `"skip_all"`, `"most_recent"`, `"window"`, `"unbounded"`.
+        /// NULL means the legacy `catchup` bool drives behaviour (zero backfill).
+        catchup_policy -> Nullable<Text>,
+        /// Window duration in seconds for the `"window"` catchup policy (issue #484).
+        /// NULL for all other policies.
+        catchup_window_secs -> Nullable<Int8>,
+        /// Count of missed slots dropped on the most recent recovery tick (issue #484).
+        /// 0 when no recovery has occurred or the policy is SkipAll/Unbounded.
+        last_catchup_dropped -> Int4,
+        /// Timestamp of the most recent recovery tick that produced drops (issue #484).
+        /// NULL when `last_catchup_dropped` = 0.
+        last_catchup_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -133,6 +254,11 @@ diesel::table! {
         payload -> Jsonb,
         received_at -> Timestamptz,
         consumed -> Bool,
+        /// Optional dedup key for `SignalWithStart` (issue #244). When
+        /// present, a partial unique index over
+        /// (`workflow_exec_id`, `idempotency_key`) rejects duplicate inserts
+        /// so upstream webhook retries land exactly one `SignalReceived` event.
+        idempotency_key -> Nullable<Text>,
     }
 }
 
@@ -162,6 +288,8 @@ diesel::table! {
         error -> Text,
         attempts -> Int4,
         failed_at -> Timestamptz,
+        owner -> Nullable<Text>,
+        severity -> Nullable<Text>,
     }
 }
 
@@ -202,6 +330,7 @@ diesel::table! {
         build_id -> Text,
         /// Optional human-readable deployment name (issue #171).
         deployment_name -> Nullable<Text>,
+        labels -> Jsonb,
     }
 }
 
@@ -295,18 +424,116 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_schedule_decisions (id) {
+        id -> Uuid,
+        schedule_id -> Nullable<Uuid>,
+        schedule_name -> Text,
+        target_kind -> Text,
+        decision -> Text,
+        reason_code -> Text,
+        detail -> Nullable<Jsonb>,
+        occurred_at -> Timestamptz,
+        next_fire_at -> Timestamptz,
+        shard_id -> Int2,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_rate_limit_buckets (key) {
+        key -> Text,
+        refill_rate -> Double,
+        burst -> Double,
+        tokens -> Double,
+        last_refilled_at -> Timestamptz,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_completion_triggers (id) {
+        id -> Uuid,
+        source_workflow_name -> Text,
+        terminal_states -> Jsonb,
+        target_workflow_name -> Text,
+        input_mapping -> Jsonb,
+        queue_name -> Nullable<Text>,
+        is_static -> Bool,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_completion_trigger_fires (source_exec_id, trigger_id) {
+        source_exec_id -> Uuid,
+        trigger_id -> Uuid,
+        fired_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    harvest_completion_trigger_outbox (id) {
+        id -> Uuid,
+        source_exec_id -> Uuid,
+        trigger_id -> Uuid,
+        target_shard -> Integer,
+        target_workflow_name -> Text,
+        target_workflow_id -> Text,
+        target_input -> Jsonb,
+        queue_name -> Nullable<Text>,
+        concurrency_key -> Nullable<Text>,
+        concurrency_limit -> Nullable<Integer>,
+        priority -> Jsonb,
+        max_workflow_input_bytes -> BigInt,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Admission gates that halt new workflow starts for a scoped subset of work (issue #377).
+    harvest_admission_gates (id) {
+        id -> Uuid,
+        /// Scope kind: `fleet` | `workflow_name` | `queue` | `shard_id` | `owner`
+        scope_kind -> Text,
+        /// Scope value: NULL for fleet; specific value for all other kinds.
+        scope_value -> Nullable<Text>,
+        reason -> Text,
+        message -> Nullable<Text>,
+        created_by -> Text,
+        created_at -> Timestamptz,
+        expires_at -> Nullable<Timestamptz>,
+        lifted_at -> Nullable<Timestamptz>,
+        lifted_by -> Nullable<Text>,
+    }
+}
+
 diesel::joinable!(harvest_events -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_task_queue -> harvest_workflow_executions (workflow_exec_id));
-diesel::joinable!(harvest_dag_runs -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_signals -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_timers -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_external_tasks -> harvest_workflow_executions (workflow_exec_id));
+diesel::joinable!(harvest_schedule_decisions -> harvest_schedules (schedule_id));
+// harvest_calendar_exclusions references harvest_calendars(name), not the PK(id),
+// so diesel::joinable! cannot be used here. Queries use explicit filter conditions.
 
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
     harvest_task_queue,
-    harvest_dag_runs,
     harvest_schedules,
     harvest_signals,
     harvest_timers,
@@ -318,4 +545,11 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_build_policies,
     harvest_build_compat,
     harvest_backfill_log,
+    harvest_calendars,
+    harvest_calendar_exclusions,
+    harvest_schedule_decisions,
+    harvest_rate_limit_buckets,
+    harvest_completion_triggers,
+    harvest_completion_trigger_fires,
+    harvest_completion_trigger_outbox,
 );

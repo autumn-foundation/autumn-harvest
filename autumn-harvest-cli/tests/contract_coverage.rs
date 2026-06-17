@@ -389,6 +389,20 @@ fn dag_unpause_is_covered() {
     assert_covered(&["dag", "unpause", "my_dag"]);
 }
 
+#[test]
+fn dag_retry_is_covered() {
+    assert_covered(&[
+        "dag",
+        "retry",
+        "my_dag",
+        "11111111-2222-3333-4444-555555555555",
+        "--from-node",
+        "step_6",
+        "--reason",
+        "incident",
+    ]);
+}
+
 // ── schedules ─────────────────────────────────────────────────────────────────
 
 #[test]
@@ -624,6 +638,20 @@ fn dag_unpause_body_fields_are_documented() {
 }
 
 #[test]
+fn dag_retry_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "dag",
+        "retry",
+        "my_dag",
+        "11111111-2222-3333-4444-555555555555",
+        "--from-node",
+        "step_6",
+        "--reason",
+        "incident",
+    ]);
+}
+
+#[test]
 fn dlq_bulk_replay_body_fields_are_documented() {
     assert_body_fields_documented(&[
         "dlq",
@@ -756,5 +784,35 @@ fn schedule_backfill_body_fields_are_documented() {
         "--max-count",
         "50",
         "--include-paused",
+    ]);
+}
+
+// ── start-batch (issue #357) ──────────────────────────────────────────────────
+
+#[test]
+fn start_batch_is_covered() {
+    assert_covered(&[
+        "start-batch",
+        "--items-json",
+        r#"[{"workflow_name":"onboarding","workflow_id":"w1"}]"#,
+    ]);
+}
+
+#[test]
+fn start_batch_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "start-batch",
+        "--items-json",
+        r#"[{"workflow_name":"onboarding","workflow_id":"w1"}]"#,
+    ]);
+}
+
+#[test]
+fn start_batch_atomic_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "start-batch",
+        "--items-json",
+        r#"[{"workflow_name":"onboarding"}]"#,
+        "--atomic",
     ]);
 }

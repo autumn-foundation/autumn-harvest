@@ -4,8 +4,9 @@ use std::any::{Any, TypeId};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::batch_start::BatchStartConfig;
 use crate::context::{SharedStateMap, WorkflowHistoryPolicy};
-use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
+use crate::info::{ActivityInfo, DagInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 use crate::payload_codec::{PayloadCodec, PayloadCodecs};
 use crate::policy::WorkflowSchedule;
 use crate::retention::RetentionConfig;
@@ -36,18 +37,98 @@ use crate::types::ShardId;
 /// assert_eq!(built.workflow_count(), 0);
 /// assert!(built.state::<DatabasePool>().is_some());
 /// ```
-#[derive(Default)]
+/// Default payload cap values (issue #252).
+pub const DEFAULT_MAX_ACTIVITY_INPUT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+/// Default maximum activity result payload size.
+pub const DEFAULT_MAX_ACTIVITY_RESULT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+/// Default maximum signal payload size.
+pub const DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES: u64 = 256 * 1024; // 256 KiB
+/// Default maximum workflow input payload size.
+pub const DEFAULT_MAX_WORKFLOW_INPUT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
+/// Default maximum workflow start delay (365 days).
+pub const DEFAULT_MAX_WORKFLOW_START_DELAY: Duration = Duration::from_secs(365 * 24 * 3600);
+/// Default bounded-pause ceiling before auto-resume (24 hours, issue #383).
+pub const DEFAULT_MAX_WORKFLOW_PAUSE_DURATION: Duration = Duration::from_secs(24 * 3600);
+
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
     dags: Vec<DagInfo>,
     workflow_schedules: Vec<WorkflowSchedule>,
+    auto_registered_dag_workflows: Vec<String>,
+    /// Declarative query handlers collected via `queries![…]`.
+    query_handlers: Vec<QueryHandlerInfo>,
+    /// Declarative update handlers collected via `updates![…]`.
+    update_handlers: Vec<UpdateHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
+    history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
     payload_codecs: PayloadCodecs,
     history_policy: WorkflowHistoryPolicy,
+    /// Server-side ceiling on `execution_timeout` (issue #243).
+    ///
+    /// When set, any `start_workflow` call that requests an `execution_timeout`
+    /// larger than this ceiling is rejected with [`BuildError::ExecutionTimeoutExceedsCeiling`].
+    /// `None` means no ceiling is enforced.
+    max_workflow_execution_timeout: Option<Duration>,
+    /// Maximum allowed byte length for an activity input payload (issue #252).
+    /// Default: 2 MiB.
+    max_activity_input_bytes: u64,
+    /// Maximum allowed byte length for an activity result payload (issue #252).
+    /// Default: 2 MiB.
+    max_activity_result_bytes: u64,
+    /// Maximum allowed byte length for a signal payload (issue #252).
+    /// Default: 256 KiB.
+    max_signal_payload_bytes: u64,
+    /// Maximum allowed byte length for a workflow start input payload (issue #252).
+    /// Default: 2 MiB.
+    max_workflow_input_bytes: u64,
+    /// Maximum byte length for `current_details` strings set via
+    /// `ctx.set_current_details(...)` (issue #473).
+    /// Default: 1 KiB.
+    max_current_details_bytes: usize,
+    /// Server-side ceiling on workflow start delay (issue #322).
+    /// Default: 365 days.
+    max_workflow_start_delay: Option<Duration>,
+    /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
+    unknown_target_grace_window: Option<Duration>,
+    /// Hard caps for `POST /workflows/batch_start` (issue #357).
+    batch_start_config: BatchStartConfig,
+    /// Declarative completion triggers (issue #517).
+    completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
+}
+
+impl Default for HarvestBuilder {
+    fn default() -> Self {
+        Self {
+            workflows: Vec::new(),
+            activities: Vec::new(),
+            dags: Vec::new(),
+            workflow_schedules: Vec::new(),
+            auto_registered_dag_workflows: Vec::new(),
+            query_handlers: Vec::new(),
+            update_handlers: Vec::new(),
+            worker_config: WorkerConfig::default(),
+            state: std::collections::HashMap::new(),
+            telemetry: None,
+            retention: crate::retention::RetentionConfig::default(),
+            history_archiver: None,
+            payload_codecs: crate::payload_codec::PayloadCodecs::default(),
+            history_policy: crate::context::WorkflowHistoryPolicy::default(),
+            max_workflow_execution_timeout: None,
+            max_activity_input_bytes: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            max_activity_result_bytes: DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
+            max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            max_workflow_input_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            max_current_details_bytes: crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+            max_workflow_start_delay: None,
+            unknown_target_grace_window: None,
+            batch_start_config: BatchStartConfig::default(),
+            completion_triggers: Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for HarvestBuilder {
@@ -57,13 +138,33 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("activity_count", &self.activities.len())
             .field("dag_count", &self.dags.len())
             .field("workflow_schedule_count", &self.workflow_schedules.len())
+            .field(
+                "auto_registered_dag_workflow_count",
+                &self.auto_registered_dag_workflows.len(),
+            )
+            .field("query_handler_count", &self.query_handlers.len())
+            .field("update_handler_count", &self.update_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry_configured", &self.telemetry.is_some())
             .field("retention", &self.retention)
             .field("payload_codecs", &"configured")
             .field("history_policy", &self.history_policy)
-            .finish()
+            .field(
+                "max_workflow_execution_timeout",
+                &self.max_workflow_execution_timeout,
+            )
+            .field("max_activity_input_bytes", &self.max_activity_input_bytes)
+            .field("max_activity_result_bytes", &self.max_activity_result_bytes)
+            .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
+            .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
+            .field("max_workflow_start_delay", &self.max_workflow_start_delay)
+            .field(
+                "unknown_target_grace_window",
+                &self.unknown_target_grace_window,
+            )
+            .field("batch_start_config", &self.batch_start_config)
+            .finish_non_exhaustive()
     }
 }
 
@@ -73,12 +174,43 @@ pub struct BuiltHarvest {
     activities: Vec<ActivityInfo>,
     dags: Vec<DagInfo>,
     workflow_schedules: Vec<WorkflowSchedule>,
+    /// Declarative query handlers indexed by workflow name for fast lookup.
+    query_handlers: Vec<QueryHandlerInfo>,
+    /// Declarative update handlers indexed by workflow name for fast lookup.
+    update_handlers: Vec<UpdateHandlerInfo>,
     worker_config: WorkerConfig,
     state: SharedStateMap,
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
+    history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
     payload_codecs: PayloadCodecs,
     history_policy: WorkflowHistoryPolicy,
+    /// Server-side ceiling on `execution_timeout` (issue #243). `None` = no ceiling.
+    pub max_workflow_execution_timeout: Option<Duration>,
+    /// Maximum allowed byte length for an activity input payload (issue #252).
+    /// Default: 2 MiB.
+    pub max_activity_input_bytes: u64,
+    /// Maximum allowed byte length for an activity result payload (issue #252).
+    /// Default: 2 MiB.
+    pub max_activity_result_bytes: u64,
+    /// Maximum allowed byte length for a signal payload (issue #252).
+    /// Default: 256 KiB.
+    pub max_signal_payload_bytes: u64,
+    /// Maximum allowed byte length for a workflow start input payload (issue #252).
+    /// Default: 2 MiB.
+    pub max_workflow_input_bytes: u64,
+    /// Maximum byte length for `current_details` strings (issue #473).
+    /// Default: 1 KiB.
+    pub max_current_details_bytes: usize,
+    /// Server-side ceiling on workflow start delay (issue #322).
+    /// Default: 365 days.
+    pub max_workflow_start_delay: Duration,
+    /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
+    pub unknown_target_grace_window: Duration,
+    /// Hard caps for `POST /workflows/batch_start` (issue #357).
+    pub batch_start_config: BatchStartConfig,
+    /// Declarative completion triggers (issue #517).
+    completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -88,13 +220,49 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("activity_count", &self.activities.len())
             .field("dag_count", &self.dags.len())
             .field("workflow_schedule_count", &self.workflow_schedules.len())
+            .field("query_handler_count", &self.query_handlers.len())
+            .field("update_handler_count", &self.update_handlers.len())
             .field("worker_config", &self.worker_config)
             .field("state_count", &self.state.len())
             .field("telemetry", &self.telemetry)
             .field("retention", &self.retention)
             .field("payload_codecs", &"configured")
             .field("history_policy", &self.history_policy)
-            .finish()
+            .field(
+                "max_workflow_execution_timeout",
+                &self.max_workflow_execution_timeout,
+            )
+            .field("max_activity_input_bytes", &self.max_activity_input_bytes)
+            .field("max_activity_result_bytes", &self.max_activity_result_bytes)
+            .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
+            .field("max_workflow_input_bytes", &self.max_workflow_input_bytes)
+            .field("max_current_details_bytes", &self.max_current_details_bytes)
+            .field("max_workflow_start_delay", &self.max_workflow_start_delay)
+            .field(
+                "unknown_target_grace_window",
+                &self.unknown_target_grace_window,
+            )
+            .field("batch_start_config", &self.batch_start_config)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A float wrapper that implements `Eq` and `PartialEq` by doing bitwise comparison.
+/// Useful for keeping errors `Eq`-compliant.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct FloatEq(pub f64);
+
+impl PartialEq for FloatEq {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for FloatEq {}
+
+impl std::fmt::Display for FloatEq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -193,12 +361,106 @@ pub enum HarvestBuilderError {
         reason: String,
     },
 
+    /// A normal workflow registration reused the name of a DAG that is
+    /// auto-registered as a workflow for unified DAG execution.
+    #[error(
+        "workflow name '{name}' collides with an auto-registered DAG workflow; \
+         register workflows and DAGs with distinct names"
+    )]
+    DagWorkflowNameCollision {
+        /// The shared workflow/DAG name.
+        name: String,
+    },
+
+    /// A DAG references an activity registered as local-only. Local activities
+    /// run inline on the workflow worker and cannot be scheduled through the
+    /// DAG activity queue lowering.
+    #[error(
+        "DAG '{dag}' references local activity '{activity}'; local activities cannot be used in DAG definitions"
+    )]
+    LocalActivityInDag {
+        /// DAG containing the local activity task.
+        dag: String,
+        /// Local activity referenced by the DAG.
+        activity: String,
+    },
+
+    /// A workflow declares `ConcurrencyPolicy { limit: 0 }`, which makes the
+    /// saturation check `(SELECT COUNT(*) ...) < 0` always false, permanently
+    /// deferring every start for that workflow.
+    #[error(
+        "workflow '{workflow}' has a ConcurrencyPolicy with limit = 0; \
+         use limit >= 1 or omit the concurrency policy to disable the cap"
+    )]
+    ZeroWorkflowConcurrencyLimit {
+        /// The workflow name.
+        workflow: String,
+    },
+
     /// A [`WorkerConfig`] field has an invalid value.
     #[error("invalid worker configuration: {0}")]
     InvalidWorkerConfig(String),
+
+    /// A [`crate::policy::Schedule::CronInTimezone`] variant declares a
+    /// timezone name that is not a valid IANA entry. The name is rejected at
+    /// build time so the operator sees a clear error rather than silently
+    /// misfiring at the wrong time.
+    #[error(
+        "unknown timezone '{name}'; use an IANA timezone name \
+         (e.g. \"America/Los_Angeles\", \"Europe/London\", \"UTC\")"
+    )]
+    UnknownTimezone {
+        /// The unrecognised IANA timezone name.
+        name: String,
+    },
+
+    /// Two activities sharing a `rate_limit_key` declare different
+    /// `rate_limit_rps` or `rate_limit_burst` values.
+    #[error(
+        "rate_limit_key '{key}' has conflicting rate limit values across activities: {activities:?}"
+    )]
+    RateLimitKeyMismatch {
+        /// The shared rate limit key.
+        key: String,
+        /// Each `(activity_name, rate_limit_rps, Option<rate_limit_burst>)` pair with a conflicting value.
+        activities: Vec<(String, FloatEq, Option<FloatEq>)>,
+    },
+
+    /// An activity declares a `rate_limit_key` but no `rate_limit_rps`.
+    #[error(
+        "activity '{activity}' sets rate_limit_key = \"{key}\" but has no rate_limit_rps; \
+         add rate_limit_rps or remove the rate_limit_key"
+    )]
+    RateLimitKeyWithoutCap {
+        /// The activity name.
+        activity: String,
+        /// The orphaned rate limit key.
+        key: String,
+    },
+
+    /// A completion trigger references an unknown workflow name as a source or target.
+    #[non_exhaustive]
+    #[error(
+        "completion_trigger references unknown workflow '{workflow_name}' as {role}; \
+         registered workflows: {registered:?}"
+    )]
+    UnknownCompletionTriggerWorkflow {
+        /// The unrecognised workflow name in the trigger.
+        workflow_name: String,
+        /// The role the workflow plays ("source" or "target").
+        role: &'static str,
+        /// All workflow names currently registered on the builder.
+        registered: Vec<String>,
+    },
 }
 
 impl BuiltHarvest {
+    /// Declarative completion triggers registered on the builder.
+    #[must_use]
+    pub fn completion_triggers(&self) -> &[crate::completion_trigger::CompletionTrigger] {
+        &self.completion_triggers
+    }
+
     #[must_use]
     pub const fn payload_codecs(&self) -> &PayloadCodecs {
         &self.payload_codecs
@@ -252,10 +514,49 @@ impl BuiltHarvest {
         &self.worker_config
     }
 
+    /// Server-side ceiling on execution timeouts (issue #243).
+    ///
+    /// `None` means no ceiling is enforced; the per-workflow default and
+    /// per-call override are accepted as-is.
+    #[must_use]
+    pub const fn max_workflow_execution_timeout_ceiling(&self) -> Option<Duration> {
+        self.max_workflow_execution_timeout
+    }
+
     /// Registered DAG metadata.
     #[must_use]
     pub fn dags(&self) -> &[DagInfo] {
         &self.dags
+    }
+
+    /// Declarative query handlers collected via `.queries(queries![…])`.
+    #[must_use]
+    pub fn query_handlers(&self) -> &[QueryHandlerInfo] {
+        &self.query_handlers
+    }
+
+    /// Declarative update handlers collected via `.updates(updates![…])`.
+    #[must_use]
+    pub fn update_handlers(&self) -> &[UpdateHandlerInfo] {
+        &self.update_handlers
+    }
+
+    /// Returns all query handler infos for the named workflow.
+    #[must_use]
+    pub fn query_handlers_for(&self, workflow_name: &str) -> Vec<&QueryHandlerInfo> {
+        self.query_handlers
+            .iter()
+            .filter(|h| h.workflow == workflow_name)
+            .collect()
+    }
+
+    /// Returns all update handler infos for the named workflow.
+    #[must_use]
+    pub fn update_handlers_for(&self, workflow_name: &str) -> Vec<&UpdateHandlerInfo> {
+        self.update_handlers
+            .iter()
+            .filter(|h| h.workflow == workflow_name)
+            .collect()
     }
 
     /// Telemetry configuration (spans propagator + metrics recorder).
@@ -268,6 +569,12 @@ impl BuiltHarvest {
     #[must_use]
     pub const fn retention(&self) -> &RetentionConfig {
         &self.retention
+    }
+
+    /// Get the registered pre-retention history archiver hook.
+    #[must_use]
+    pub fn history_archiver(&self) -> Option<&Arc<dyn crate::retention::HistoryArchiver>> {
+        self.history_archiver.as_ref()
     }
 
     /// Override the audit log retention window after the build step.
@@ -296,7 +603,15 @@ impl BuiltHarvest {
                 Arc::new(self.state),
                 self.telemetry,
             )
-            .with_history_policy(self.history_policy),
+            .with_handler_infos(self.query_handlers, self.update_handlers)
+            .with_history_policy(self.history_policy)
+            .with_payload_caps(
+                self.max_activity_input_bytes,
+                self.max_workflow_input_bytes,
+                self.max_activity_result_bytes,
+                self.max_signal_payload_bytes,
+            )
+            .with_current_details_cap(self.max_current_details_bytes),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -324,7 +639,15 @@ impl BuiltHarvest {
                 Arc::new(self.state),
                 self.telemetry,
             )
-            .with_history_policy(self.history_policy),
+            .with_handler_infos(self.query_handlers, self.update_handlers)
+            .with_history_policy(self.history_policy)
+            .with_payload_caps(
+                self.max_activity_input_bytes,
+                self.max_workflow_input_bytes,
+                self.max_activity_result_bytes,
+                self.max_signal_payload_bytes,
+            )
+            .with_current_details_cap(self.max_current_details_bytes),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -340,6 +663,26 @@ impl HarvestBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register completion triggers.
+    #[must_use]
+    pub fn completion_triggers(
+        mut self,
+        triggers: Vec<crate::completion_trigger::CompletionTrigger>,
+    ) -> Self {
+        self.completion_triggers.extend(triggers);
+        self
+    }
+
+    /// Register a single completion trigger.
+    #[must_use]
+    pub fn completion_trigger(
+        mut self,
+        trigger: crate::completion_trigger::CompletionTrigger,
+    ) -> Self {
+        self.completion_triggers.push(trigger);
+        self
     }
 
     /// Register workflow definitions (output of `workflows![]` macro).
@@ -364,9 +707,57 @@ impl HarvestBuilder {
     /// Register DAG definitions (output of `dags![]` macro).
     ///
     /// DAGs define graphs of steps that run according to a schedule.
+    ///
+    /// When the `unified-dag-execution` feature is enabled every DAG whose
+    /// `workflow_handler` is populated (i.e. produced by the `#[dag]` macro
+    /// with that feature on) is also auto-registered as a [`WorkflowInfo`] and,
+    /// if it carries a schedule attribute, as a [`WorkflowSchedule`]. This
+    /// wires unified DAGs into the standard workflow execution and scheduler
+    /// paths without requiring separate `.workflow_schedule(...)` calls.
     #[must_use]
     pub fn dags(mut self, dags: Vec<DagInfo>) -> Self {
-        self.dags.extend(dags);
+        for dag in dags {
+            #[cfg(feature = "unified-dag-execution")]
+            {
+                if let Some(workflow_info) = dag.as_workflow_info() {
+                    self.auto_registered_dag_workflows
+                        .push(workflow_info.name.to_string());
+                    self.workflows.push(workflow_info);
+                }
+                if let Some(workflow_schedule) = dag.as_workflow_schedule() {
+                    self.workflow_schedules.push(workflow_schedule);
+                }
+            }
+            self.dags.push(dag);
+        }
+        self
+    }
+
+    /// Register declarative query handlers (output of `queries![…]` macro).
+    ///
+    /// Each [`QueryHandlerInfo`] is associated with a specific workflow name via
+    /// the `workflow = "…"` attribute. The runtime uses this list to auto-register
+    /// handlers before the workflow function runs, and the management API exposes
+    /// them via `GET /workflows/types/{name}/handlers`.
+    ///
+    /// Calling this method multiple times appends all provided handlers.
+    #[must_use]
+    pub fn queries(mut self, handlers: Vec<QueryHandlerInfo>) -> Self {
+        self.query_handlers.extend(handlers);
+        self
+    }
+
+    /// Register declarative update handlers (output of `updates![…]` macro).
+    ///
+    /// Each [`UpdateHandlerInfo`] is associated with a specific workflow name via
+    /// the `workflow = "…"` attribute. The runtime uses this list to auto-register
+    /// handlers before the workflow function runs, and the management API exposes
+    /// them via `GET /workflows/types/{name}/handlers`.
+    ///
+    /// Calling this method multiple times appends all provided handlers.
+    #[must_use]
+    pub fn updates(mut self, handlers: Vec<UpdateHandlerInfo>) -> Self {
+        self.update_handlers.extend(handlers);
         self
     }
 
@@ -403,6 +794,19 @@ impl HarvestBuilder {
     #[must_use]
     pub fn worker(mut self, config: WorkerConfig) -> Self {
         self.worker_config = config;
+        self
+    }
+
+    /// Access mutable worker configuration.
+    pub const fn worker_config_mut(&mut self) -> &mut WorkerConfig {
+        &mut self.worker_config
+    }
+
+    #[cfg(feature = "db")]
+    /// Set the sharded database pool on the worker config.
+    #[must_use]
+    pub fn with_sharded_pool(mut self, pool: crate::shard::ShardedDbPool) -> Self {
+        self.worker_config.sharded_pool = Some(pool);
         self
     }
 
@@ -443,6 +847,13 @@ impl HarvestBuilder {
         self
     }
 
+    /// Register a pre-retention history archiver hook.
+    #[must_use]
+    pub fn history_archiver(mut self, archiver: impl crate::retention::HistoryArchiver) -> Self {
+        self.history_archiver = Some(Arc::new(archiver));
+        self
+    }
+
     /// Override the soft history-size threshold used by
     /// [`crate::context::WorkflowContext::should_continue_as_new`].
     #[must_use]
@@ -457,6 +868,122 @@ impl HarvestBuilder {
     #[must_use]
     pub const fn history_event_hard_cap(mut self, cap: u64) -> Self {
         self.history_policy = self.history_policy.with_event_hard_cap(cap);
+        self
+    }
+
+    /// Set a server-side ceiling on `execution_timeout` for all workflows (issue #243).
+    ///
+    /// When set, any `start_workflow` call that provides an `execution_timeout`
+    /// larger than this ceiling is rejected. This acts as a defense against client
+    /// bugs that accidentally request absurdly long deadlines.
+    ///
+    /// `None` (the default) means no ceiling is enforced — per-workflow defaults
+    /// and per-call overrides are accepted as-is.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::HarvestBuilder;
+    /// use std::time::Duration;
+    ///
+    /// let built = HarvestBuilder::new()
+    ///     .max_workflow_execution_timeout(Duration::from_secs(86_400)) // 24h ceiling
+    ///     .build();
+    ///
+    /// assert_eq!(built.max_workflow_execution_timeout, Some(Duration::from_secs(86_400)));
+    /// ```
+    #[must_use]
+    pub const fn max_workflow_execution_timeout(mut self, ceiling: Duration) -> Self {
+        self.max_workflow_execution_timeout = Some(ceiling);
+        self
+    }
+
+    /// Set the global maximum byte length for activity input payloads (issue #252).
+    ///
+    /// Default: 2 MiB. Per-activity overrides declared via
+    /// `#[activity(max_input_bytes = "…")]` raise (never lower) this ceiling for
+    /// a specific activity.
+    #[must_use]
+    pub const fn max_activity_input_bytes(mut self, bytes: u64) -> Self {
+        self.max_activity_input_bytes = bytes;
+        self
+    }
+
+    /// Set the global maximum byte length for activity result payloads (issue #252).
+    ///
+    /// Default: 2 MiB. Per-activity overrides declared via
+    /// `#[activity(max_result_bytes = "…")]` raise (never lower) this ceiling for
+    /// a specific activity.
+    #[must_use]
+    pub const fn max_activity_result_bytes(mut self, bytes: u64) -> Self {
+        self.max_activity_result_bytes = bytes;
+        self
+    }
+
+    /// Set the global maximum byte length for signal payloads (issue #252).
+    ///
+    /// Default: 256 KiB. Enforcement happens at the management-API
+    /// signal-send boundary before any `SignalReceived` event is appended.
+    #[must_use]
+    pub const fn max_signal_payload_bytes(mut self, bytes: u64) -> Self {
+        self.max_signal_payload_bytes = bytes;
+        self
+    }
+
+    /// Set the global maximum byte length for workflow start input payloads
+    /// (issue #252).
+    ///
+    /// Default: 2 MiB. Enforcement happens at `start_workflow` time before the
+    /// `WorkflowStarted` event or `harvest_workflow_executions` row is inserted.
+    /// Per-workflow-type overrides declared via `#[workflow(max_input_bytes = "…")]`
+    /// raise (never lower) this ceiling for a specific workflow type.
+    #[must_use]
+    pub const fn max_workflow_input_bytes(mut self, bytes: u64) -> Self {
+        self.max_workflow_input_bytes = bytes;
+        self
+    }
+
+    /// Set the global maximum byte length for `current_details` strings set via
+    /// `ctx.set_current_details(...)` (issue #473).
+    ///
+    /// Values longer than the cap are silently truncated to the nearest valid
+    /// UTF-8 character boundary at or before the cap. The truncation happens
+    /// identically on the live and replay paths so it cannot itself cause a
+    /// non-determinism divergence.
+    ///
+    /// Default: 1 KiB.
+    #[must_use]
+    pub const fn with_current_details_cap(mut self, cap_bytes: usize) -> Self {
+        self.max_current_details_bytes = cap_bytes;
+        self
+    }
+
+    /// Set the global maximum allowed start delay for a workflow (issue #322).
+    ///
+    /// Default: 365 days.
+    #[must_use]
+    pub const fn max_workflow_start_delay(mut self, delay: Duration) -> Self {
+        self.max_workflow_start_delay = Some(delay);
+        self
+    }
+
+    /// Set the grace window before cross-workflow signaling fails for unknown target (issue #330).
+    ///
+    /// Default: 5 seconds.
+    #[must_use]
+    pub const fn unknown_target_grace_window(mut self, window: Duration) -> Self {
+        self.unknown_target_grace_window = Some(window);
+        self
+    }
+
+    /// Override the hard caps for `POST /workflows/batch_start` (issue #357).
+    ///
+    /// Defaults: `max_items_per_batch = 1000`, `max_total_bytes = 10 MiB`.
+    /// Both limits are checked before any execution row is inserted; exceeding
+    /// either returns `413 Payload Too Large`.
+    #[must_use]
+    pub const fn batch_start_config(mut self, config: BatchStartConfig) -> Self {
+        self.batch_start_config = config;
         self
     }
 
@@ -516,33 +1043,172 @@ impl HarvestBuilder {
         }
 
         validate_concurrency_keys(&self.activities)?;
-        validate_workflow_schedules(&self.workflow_schedules, &self.workflows)?;
+        validate_workflow_concurrency_limits(&self.workflows)?;
+        validate_dag_workflow_name_collisions(
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
+        validate_workflow_schedules(
+            &self.workflow_schedules,
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
+        validate_completion_triggers(
+            &self.completion_triggers,
+            &self.workflows,
+            &self.auto_registered_dag_workflows,
+        )?;
         validate_local_activity_timeouts(
             &self.activities,
             self.worker_config.max_local_activity_start_to_close,
         )?;
+        validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
+        validate_dag_schedules(&self.dags)?;
+        validate_rate_limit_keys(&self.activities)?;
+
+        let mut worker_config = self.worker_config;
+        let max_workflow_start_delay = self
+            .max_workflow_start_delay
+            .unwrap_or(worker_config.max_workflow_start_delay);
+        worker_config.max_workflow_start_delay = max_workflow_start_delay;
+
+        let unknown_target_grace_window = self
+            .unknown_target_grace_window
+            .unwrap_or(worker_config.unknown_target_grace_window);
+        worker_config.unknown_target_grace_window = unknown_target_grace_window;
 
         Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
             dags: self.dags,
             workflow_schedules: self.workflow_schedules,
-            worker_config: self.worker_config,
+            query_handlers: self.query_handlers,
+            update_handlers: self.update_handlers,
+            worker_config,
             state: self.state,
             telemetry: Arc::new(self.telemetry.unwrap_or_default()),
             retention: self.retention,
+            history_archiver: self.history_archiver,
             payload_codecs: self.payload_codecs.clone(),
             history_policy: self.history_policy,
+            max_workflow_execution_timeout: self.max_workflow_execution_timeout,
+            max_activity_input_bytes: self.max_activity_input_bytes,
+            max_activity_result_bytes: self.max_activity_result_bytes,
+            max_signal_payload_bytes: self.max_signal_payload_bytes,
+            max_workflow_input_bytes: self.max_workflow_input_bytes,
+            max_current_details_bytes: self.max_current_details_bytes,
+            max_workflow_start_delay,
+            unknown_target_grace_window,
+            batch_start_config: self.batch_start_config,
+            completion_triggers: self.completion_triggers,
         })
     }
+}
+
+fn validate_dags_do_not_use_local_activities(
+    dags: &[DagInfo],
+    activities: &[ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashSet;
+
+    let local_activities = activities
+        .iter()
+        .filter(|activity| activity.is_local)
+        .map(|activity| activity.name)
+        .collect::<HashSet<_>>();
+    if local_activities.is_empty() || dags.is_empty() {
+        return Ok(());
+    }
+
+    for dag in dags {
+        let Ok(definition) = dag.build_definition() else {
+            continue;
+        };
+        for task in definition.tasks() {
+            if local_activities.contains(task.activity_name.as_str()) {
+                return Err(HarvestBuilderError::LocalActivityInDag {
+                    dag: dag.name.to_string(),
+                    activity: task.activity_name.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Verify that unified DAG auto-registration does not overwrite or get
+/// overwritten by a normal workflow with the same name.
+fn validate_dag_workflow_name_collisions(
+    workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashMap;
+
+    if auto_registered_dag_workflows.is_empty() {
+        return Ok(());
+    }
+
+    let mut auto_counts: HashMap<&str, usize> = HashMap::new();
+    for name in auto_registered_dag_workflows {
+        *auto_counts.entry(name.as_str()).or_default() += 1;
+    }
+
+    let mut workflow_counts: HashMap<&str, usize> = HashMap::new();
+    for workflow in workflows {
+        *workflow_counts.entry(workflow.name).or_default() += 1;
+    }
+
+    for (name, auto_count) in auto_counts {
+        if workflow_counts.get(name).copied().unwrap_or_default() > auto_count {
+            return Err(HarvestBuilderError::DagWorkflowNameCollision {
+                name: name.to_string(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Verify that every [`WorkflowSchedule`] references a workflow name that is
 /// actually registered on the builder. Fails fast with
 /// [`HarvestBuilderError::UnknownWorkflowSchedule`] on the first mismatch.
+fn validate_completion_triggers(
+    triggers: &[crate::completion_trigger::CompletionTrigger],
+    workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
+) -> Result<(), HarvestBuilderError> {
+    if triggers.is_empty() {
+        return Ok(());
+    }
+    let registered: Vec<String> = workflows
+        .iter()
+        .map(|w| w.name.to_string())
+        .chain(auto_registered_dag_workflows.iter().cloned())
+        .collect();
+    for trigger in triggers {
+        if !registered.contains(&trigger.source_workflow_name) {
+            return Err(HarvestBuilderError::UnknownCompletionTriggerWorkflow {
+                workflow_name: trigger.source_workflow_name.clone(),
+                role: "source",
+                registered,
+            });
+        }
+        if !registered.contains(&trigger.target_workflow_name) {
+            return Err(HarvestBuilderError::UnknownCompletionTriggerWorkflow {
+                workflow_name: trigger.target_workflow_name.clone(),
+                role: "target",
+                registered,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_workflow_schedules(
     schedules: &[WorkflowSchedule],
     workflows: &[crate::info::WorkflowInfo],
+    auto_registered_dag_workflows: &[String],
 ) -> Result<(), HarvestBuilderError> {
     if schedules.is_empty() {
         return Ok(());
@@ -555,6 +1221,16 @@ fn validate_workflow_schedules(
                 registered,
             });
         }
+        if schedule.dag_name.is_none()
+            && auto_registered_dag_workflows
+                .iter()
+                .any(|dag_name| dag_name == &schedule.workflow_name)
+        {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: schedule.workflow_name.clone(),
+                reason: "workflow schedule targets an auto-registered DAG workflow; use the DAG schedule registration instead".to_string(),
+            });
+        }
         // Reject zero-length intervals (would cause infinite loops in due_run_plan
         // with catchup=true) and invalid cron expressions (would silently never fire).
         if let crate::policy::Schedule::Interval(dur) = &schedule.schedule {
@@ -564,9 +1240,44 @@ fn validate_workflow_schedules(
                     reason: "interval must be at least 1 second".to_string(),
                 });
             }
-        } else if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
+        } else {
+            // Validate timezone names early so operators get a typed error rather
+            // than a silent bad-timezone panic at first scheduler tick.
+            if let crate::policy::Schedule::CronInTimezone { tz, .. } = &schedule.schedule
+                && tz.parse::<chrono_tz::Tz>().is_err()
+            {
+                return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
+            }
+            if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
+                return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                    workflow_name: schedule.workflow_name.clone(),
+                    reason,
+                });
+            }
+        }
+        if let Err(reason) = crate::policy::validate_jitter(&schedule.schedule, schedule.jitter) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_dag_schedules(dags: &[crate::info::DagInfo]) -> Result<(), HarvestBuilderError> {
+    for dag in dags {
+        let Some(schedule) = &dag.schedule else {
+            continue;
+        };
+        if let crate::policy::Schedule::CronInTimezone { tz, .. } = schedule
+            && tz.parse::<chrono_tz::Tz>().is_err()
+        {
+            return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
+        }
+        if let Err(reason) = crate::policy::validate_schedule(schedule) {
+            return Err(HarvestBuilderError::InvalidWorkflowSchedule {
+                workflow_name: dag.name.to_string(),
                 reason,
             });
         }
@@ -633,6 +1344,72 @@ fn validate_concurrency_keys(
     Ok(())
 }
 
+struct RateLimitKeyEntry {
+    first_rps: f64,
+    first_burst: f64,
+    contributors: Vec<(String, f64, Option<f64>)>,
+}
+
+/// Verify that rate limiting attributes on activities are consistent and valid.
+fn validate_rate_limit_keys(
+    activities: &[crate::info::ActivityInfo],
+) -> Result<(), HarvestBuilderError> {
+    use std::collections::HashMap;
+
+    let mut seen: HashMap<&str, RateLimitKeyEntry> = HashMap::new();
+
+    for activity in activities {
+        // rate_limit_key without rate_limit_rps silently bypasses or breaks — reject it.
+        if let (Some(key), None) = (activity.rate_limit_key, activity.rate_limit_rps) {
+            return Err(HarvestBuilderError::RateLimitKeyWithoutCap {
+                activity: activity.name.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        // rate_limit_burst without rate_limit_rps is invalid.
+        if activity.rate_limit_burst.is_some() && activity.rate_limit_rps.is_none() {
+            return Err(HarvestBuilderError::InvalidWorkerConfig(format!(
+                "activity '{}' declares rate_limit_burst but no rate_limit_rps",
+                activity.name
+            )));
+        }
+
+        let Some(rps) = activity.rate_limit_rps else {
+            continue;
+        };
+
+        let effective_burst = activity.rate_limit_burst.unwrap_or(rps);
+        let effective_key: &str = activity.rate_limit_key.unwrap_or(activity.name);
+        let entry = seen
+            .entry(effective_key)
+            .or_insert_with(|| RateLimitKeyEntry {
+                first_rps: rps,
+                first_burst: effective_burst,
+                contributors: Vec::new(),
+            });
+        entry
+            .contributors
+            .push((activity.name.to_string(), rps, activity.rate_limit_burst));
+
+        if (entry.first_rps - rps).abs() > 1e-9
+            || (entry.first_burst - effective_burst).abs() > 1e-9
+        {
+            let mapped = entry
+                .contributors
+                .iter()
+                .map(|(name, r, b)| (name.clone(), FloatEq(*r), b.map(FloatEq)))
+                .collect();
+            return Err(HarvestBuilderError::RateLimitKeyMismatch {
+                key: effective_key.to_string(),
+                activities: mapped,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Reject local activities whose `default_start_to_close` exceeds the worker
 /// cap. Failing early gives operators a clear error instead of a runtime surprise.
 fn validate_local_activity_timeouts(
@@ -652,6 +1429,53 @@ fn validate_local_activity_timeouts(
         }
     }
     Ok(())
+}
+
+/// Reject workflows whose `ConcurrencyPolicy` declares `limit = 0`. A zero
+/// limit makes the claim predicate `running < 0` always false, permanently
+/// deferring every workflow start for that key. Catch it at build time.
+fn validate_workflow_concurrency_limits(
+    workflows: &[crate::info::WorkflowInfo],
+) -> Result<(), HarvestBuilderError> {
+    for wf in workflows {
+        if wf.concurrency.is_some_and(|p| p.limit == 0) {
+            return Err(HarvestBuilderError::ZeroWorkflowConcurrencyLimit {
+                workflow: wf.name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Configuration for sticky cross-worker routing (issue #235).
+///
+/// Sticky routing keeps follow-up tasks for a workflow execution on the worker
+/// that already has that execution's event history in its in-process LRU cache,
+/// reducing cold event-history reloads from Postgres.
+///
+/// Sticky routing is **off by default**. Enable it via
+/// [`WorkerConfig::with_sticky_routing`].
+///
+/// ## Trade-offs
+///
+/// | Parameter | Short TTL | Long TTL |
+/// |-----------|-----------|----------|
+/// | Cache hit rate | Lower (sticky window may expire before follow-up arrives) | Higher |
+/// | Failover latency | Fast (expired window → any eligible worker claims) | Slower |
+/// | Load distribution | Better (sticky windows expire quickly) | Skewed toward hot workers |
+///
+/// A 5–30 second `lease_ttl` is a reasonable starting point for most
+/// deployments. See `docs/sticky-routing.md` for the full operator guide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StickyRoutingConfig {
+    /// How long to prefer the owning worker for follow-up tasks after a
+    /// workflow suspends.
+    ///
+    /// The task queue will offer tasks whose workflow has an active,
+    /// unexpired sticky lease to the owning worker before any other eligible
+    /// worker can claim them. Once the window elapses the task becomes
+    /// claimable by any eligible worker (safe failover).
+    pub lease_ttl: Duration,
 }
 
 /// Worker concurrency and queue configuration.
@@ -705,6 +1529,52 @@ pub struct WorkerConfig {
     /// Optional human-readable deployment name for operator observability
     /// (issue #171), e.g. `"prod-blue"` or `"canary"`.
     pub deployment_name: Option<String>,
+    /// Per-query execution timeout (issue #234).
+    ///
+    /// When a query handler takes longer than this to complete, the engine
+    /// terminates the handler and returns [`HarvestError::QueryTimedOut`] to
+    /// the caller. Defaults to **5 seconds**.
+    pub query_timeout: Duration,
+    /// Anti-starvation aging period for the priority claim query (issue #249).
+    ///
+    /// When `Some(K)`, a task's effective priority is boosted by `+1` for
+    /// every `K` seconds it has been waiting in `PENDING` state. This ensures
+    /// that low-priority tasks are not indefinitely starved under sustained
+    /// high-priority load.
+    ///
+    /// A value of `0` is normalized to `None` (no aging). `None` is the
+    /// default — existing deployments are unaffected.
+    pub priority_aging_secs: Option<u32>,
+    /// Maximum allowed start delay for a workflow (issue #322).
+    /// Default: 365 days.
+    pub max_workflow_start_delay: Duration,
+    /// Grace window before cross-workflow signaling fails for unknown target (issue #330).
+    /// Default: 5 seconds.
+    pub unknown_target_grace_window: Duration,
+    /// Consecutive worker crashes a task may cause before it is quarantined to
+    /// the dead-letter queue instead of re-queued (issue #367).
+    ///
+    /// When the orphan-reclaim scanner reclaims a task from a dead worker, it
+    /// increments the task's `crash_strikes`. Once `crash_strikes` reaches this
+    /// threshold the task is moved to the DLQ and its owning workflow is failed
+    /// terminally, rather than being re-dispatched to crash another worker.
+    ///
+    /// Defaults to **3**. Set to `0` to disable quarantine entirely (reclaimed
+    /// poison pills are re-queued indefinitely — the legacy retry-loop
+    /// behaviour).
+    pub poison_pill_threshold: i32,
+    /// Maximum wall-clock time a workflow execution may stay paused before the
+    /// bounded-pause auto-resume scanner force-resumes it with
+    /// `actor = "auto-resume(timeout)"` (issue #383).
+    ///
+    /// This prevents orphaned-pause backlogs when an operator pauses a workflow
+    /// during an incident and never resumes it. Defaults to **24 hours**.
+    pub max_workflow_pause_duration: Duration,
+    /// Capability labels for hardware-aware and regional routing (issue #382).
+    pub labels: std::collections::HashMap<String, String>,
+    #[cfg(feature = "db")]
+    /// Optional sharded database pool for exact shard routing.
+    pub sharded_pool: Option<crate::shard::ShardedDbPool>,
 }
 
 impl Default for WorkerConfig {
@@ -716,13 +1586,22 @@ impl Default for WorkerConfig {
             max_concurrent_activities: 50,
             shutdown_timeout: Duration::from_secs(30),
             workflow_cache_size: 1000,
-            sticky_timeout: Duration::from_secs(5),
+            sticky_timeout: Duration::ZERO,
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: vec![ShardId::new(0)],
             max_local_activity_start_to_close: Duration::from_secs(60),
             worker_heartbeat_interval: Duration::from_secs(5),
             build_id: String::new(),
             deployment_name: None,
+            query_timeout: Duration::from_secs(5),
+            priority_aging_secs: None,
+            max_workflow_start_delay: DEFAULT_MAX_WORKFLOW_START_DELAY,
+            unknown_target_grace_window: Duration::from_secs(5),
+            poison_pill_threshold: 3,
+            max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
+            labels: std::collections::HashMap::new(),
+            #[cfg(feature = "db")]
+            sharded_pool: None,
         }
     }
 }
@@ -810,6 +1689,147 @@ impl WorkerConfig {
         self.deployment_name = Some(name.into());
         self
     }
+
+    /// Override the per-query execution timeout (default 5 s, issue #234).
+    ///
+    /// When a query handler takes longer than this to complete, the engine
+    /// terminates the handler and returns [`crate::error::HarvestError::QueryTimedOut`]
+    /// to the caller.
+    #[must_use]
+    pub const fn with_query_timeout(mut self, timeout: Duration) -> Self {
+        self.query_timeout = timeout;
+        self
+    }
+
+    /// Enable priority aging to prevent low-priority task starvation (issue #249).
+    ///
+    /// When set to `K` seconds, a task's effective priority is boosted by `+1`
+    /// for every `K` seconds it has been waiting in `PENDING` state. This
+    /// bounds the maximum starvation time for `Low` priority tasks even under
+    /// sustained high-priority load.
+    ///
+    /// A value of `0` is treated as "no aging" and normalised to `None`.
+    /// Defaults to `None` (aging disabled) — existing deployments are
+    /// unaffected.
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// // Low-priority tasks gain +1 effective priority every 5 minutes of waiting.
+    /// let config = WorkerConfig::default().with_priority_aging_secs(300);
+    /// assert_eq!(config.priority_aging_secs, Some(300));
+    /// ```
+    #[must_use]
+    pub const fn with_priority_aging_secs(mut self, secs: u32) -> Self {
+        self.priority_aging_secs = if secs == 0 { None } else { Some(secs) };
+        self
+    }
+
+    /// Set the poison-pill quarantine threshold (issue #367).
+    ///
+    /// A task that crashes `threshold` workers in a row is quarantined to the
+    /// dead-letter queue instead of being re-dispatched. Set to `0` to disable
+    /// quarantine (reclaimed poison pills are re-queued indefinitely).
+    ///
+    /// ## Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_poison_pill_threshold(5);
+    /// assert_eq!(config.poison_pill_threshold, 5);
+    /// ```
+    #[must_use]
+    pub const fn with_poison_pill_threshold(mut self, threshold: i32) -> Self {
+        self.poison_pill_threshold = threshold;
+        self
+    }
+
+    /// Override the maximum start delay for a workflow (issue #322).
+    ///
+    /// Default: 365 days.
+    #[must_use]
+    pub const fn with_max_workflow_start_delay(mut self, delay: Duration) -> Self {
+        self.max_workflow_start_delay = delay;
+        self
+    }
+
+    /// Override the unknown target grace window for cross-workflow signaling (issue #330).
+    ///
+    /// Default: 5 seconds.
+    #[must_use]
+    pub const fn with_unknown_target_grace_window(mut self, window: Duration) -> Self {
+        self.unknown_target_grace_window = window;
+        self
+    }
+
+    /// Override the bounded-pause ceiling before auto-resume (issue #383).
+    ///
+    /// A workflow paused longer than this is force-resumed by the auto-resume
+    /// scanner with `actor = "auto-resume(timeout)"`. Default: 24 hours.
+    #[must_use]
+    pub const fn with_max_workflow_pause_duration(mut self, max: Duration) -> Self {
+        self.max_workflow_pause_duration = max;
+        self
+    }
+
+    /// Enable sticky cross-worker routing (issue #235).
+    ///
+    /// Sticky routing is **off by default**. When enabled, each time a workflow
+    /// suspends the task queue records a soft affinity lease pointing at the
+    /// current worker. Subsequent tasks for that execution are offered to the
+    /// owning worker first so its in-process LRU cache stays warm, reducing
+    /// full event-history reloads from Postgres.
+    ///
+    /// When the lease expires (after `config.lease_ttl`) the task becomes
+    /// claimable by any eligible worker — sticky routing never blocks progress.
+    /// Note: worker drain or unhealthy status does **not** trigger early lease
+    /// expiry; only the TTL controls when other workers can claim the task.
+    ///
+    /// See `docs/sticky-routing.md` for the full operator guide including
+    /// the lease-TTL trade-off and interaction with shard assignments and
+    /// build-id routing.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::{StickyRoutingConfig, WorkerConfig};
+    /// use std::time::Duration;
+    ///
+    /// let config = WorkerConfig::default()
+    ///     .with_sticky_routing(StickyRoutingConfig {
+    ///         lease_ttl: Duration::from_secs(10),
+    ///     });
+    /// ```
+    #[must_use]
+    pub const fn with_sticky_routing(mut self, config: StickyRoutingConfig) -> Self {
+        self.sticky_timeout = config.lease_ttl;
+        self
+    }
+
+    /// Attach a key-value capability label (issue #382).
+    #[must_use]
+    pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.labels.insert(key.into(), value.into());
+        self
+    }
+
+    /// Attach a map or list of key-value capability labels (issue #382).
+    #[must_use]
+    pub fn with_labels(mut self, labels: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.labels.extend(labels);
+        self
+    }
+
+    #[cfg(feature = "db")]
+    /// Set the sharded database pool for exact shard routing.
+    #[must_use]
+    pub fn with_sharded_pool(mut self, pool: crate::shard::ShardedDbPool) -> Self {
+        self.sharded_pool = Some(pool);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -824,6 +1844,17 @@ mod tests {
             name: "test",
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
         }
     }
 
@@ -838,6 +1869,35 @@ mod tests {
             max_active_runs: 1,
             default_queue: Some("default"),
             builder: build,
+            workflow_handler: None,
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+        }
+    }
+
+    #[cfg(feature = "unified-dag-execution")]
+    fn fake_unified_dag_info() -> DagInfo {
+        fn build(_dag: &mut DagBuilder) {}
+
+        DagInfo {
+            name: "daily_etl",
+            module: "test",
+            schedule: Some(Schedule::Manual),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("default"),
+            builder: build,
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
         }
     }
 
@@ -880,6 +1940,23 @@ mod tests {
     }
 
     #[test]
+    fn worker_config_default_max_pause_duration_is_24h() {
+        let config = WorkerConfig::default();
+        assert_eq!(
+            config.max_workflow_pause_duration,
+            Duration::from_secs(24 * 3600),
+            "bounded-pause ceiling must default to 24 hours"
+        );
+    }
+
+    #[test]
+    fn worker_config_with_max_pause_duration_overrides() {
+        let config =
+            WorkerConfig::default().with_max_workflow_pause_duration(Duration::from_secs(60));
+        assert_eq!(config.max_workflow_pause_duration, Duration::from_secs(60));
+    }
+
+    #[test]
     fn worker_config_with_empty_queues_clears_list() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
         assert!(config.queues.is_empty());
@@ -899,6 +1976,31 @@ mod tests {
     fn harvest_builder_collects_dags() {
         let builder = HarvestBuilder::new().dags(vec![fake_dag_info()]);
         assert_eq!(builder.dag_count(), 1);
+    }
+
+    #[cfg(feature = "unified-dag-execution")]
+    #[test]
+    fn harvest_builder_rejects_workflow_schedule_targeting_auto_registered_dag_name() {
+        let result = HarvestBuilder::new()
+            .dags(vec![fake_unified_dag_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "daily_etl",
+                Schedule::Interval(Duration::from_secs(60)),
+            ))
+            .try_build();
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            HarvestBuilderError::InvalidWorkflowSchedule {
+                ref workflow_name,
+                ..
+            } if workflow_name == "daily_etl"
+        ));
+        assert!(
+            err.to_string().contains("auto-registered DAG"),
+            "error should explain the DAG/workflow schedule collision: {err}"
+        );
     }
 
     #[test]
@@ -996,10 +2098,18 @@ mod tests {
                 default_start_to_close: None,
                 default_heartbeat_timeout: None,
                 default_schedule_to_start: None,
+                default_schedule_to_close: None,
                 default_queue: None,
                 max_concurrent: None,
                 concurrency_key: None,
                 is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
+                circuit_breaker: None,
+                requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .state(String::from("haunted"))
@@ -1035,10 +2145,18 @@ mod tests {
             default_start_to_close: None,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent,
             concurrency_key: key,
             is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -1051,10 +2169,18 @@ mod tests {
             default_start_to_close: start_to_close,
             default_heartbeat_timeout: None,
             default_schedule_to_start: None,
+            default_schedule_to_close: None,
             default_queue: None,
             max_concurrent: None,
             concurrency_key: None,
             is_local: true,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
         }
     }
@@ -1161,6 +2287,69 @@ mod tests {
         assert!(err.to_string().contains("act_a"));
     }
 
+    #[test]
+    fn builder_rejects_zero_workflow_concurrency_limit() {
+        use crate::concurrency::ConcurrencyPolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![WorkflowInfo {
+                name: "report_wf",
+                module: "test",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
+                sla: None,
+                concurrency: Some(ConcurrencyPolicy {
+                    key_expr: "input.tenant_id",
+                    limit: 0,
+                }),
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+            }])
+            .try_build();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::ZeroWorkflowConcurrencyLimit { ref workflow }
+                    if workflow == "report_wf"
+            ),
+            "expected ZeroWorkflowConcurrencyLimit, got: {err}"
+        );
+        assert!(err.to_string().contains("report_wf"));
+    }
+
+    #[test]
+    fn builder_accepts_workflow_with_nonzero_concurrency_limit() {
+        use crate::concurrency::ConcurrencyPolicy;
+        let result = HarvestBuilder::new()
+            .workflows(vec![WorkflowInfo {
+                name: "report_wf",
+                module: "test",
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                execution_timeout: None,
+                sla: None,
+                concurrency: Some(ConcurrencyPolicy {
+                    key_expr: "input.tenant_id",
+                    limit: 5,
+                }),
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+            }])
+            .try_build();
+        assert!(result.is_ok());
+    }
+
     // ── Local activity cap tests ──────────────────────────────────────────
 
     #[test]
@@ -1170,6 +2359,23 @@ mod tests {
             config.max_local_activity_start_to_close,
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn worker_config_poison_pill_threshold_defaults_to_3() {
+        assert_eq!(WorkerConfig::default().poison_pill_threshold, 3);
+    }
+
+    #[test]
+    fn worker_config_with_poison_pill_threshold_overrides() {
+        let config = WorkerConfig::default().with_poison_pill_threshold(7);
+        assert_eq!(config.poison_pill_threshold, 7);
+    }
+
+    #[test]
+    fn worker_config_poison_pill_threshold_zero_disables() {
+        let config = WorkerConfig::default().with_poison_pill_threshold(0);
+        assert_eq!(config.poison_pill_threshold, 0);
     }
 
     #[test]
@@ -1260,13 +2466,332 @@ mod tests {
                 default_start_to_close: Some(Duration::from_secs(300)),
                 default_heartbeat_timeout: None,
                 default_schedule_to_start: None,
+                default_schedule_to_close: None,
                 default_queue: None,
                 max_concurrent: None,
                 concurrency_key: None,
                 is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
+                circuit_breaker: None,
+                requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             }])
             .try_build();
         assert!(result.is_ok());
+    }
+
+    // ── max_workflow_execution_timeout tests (issue #243) ─────────────────────
+
+    #[test]
+    fn builder_max_workflow_execution_timeout_defaults_to_none() {
+        let built = HarvestBuilder::new().build();
+        assert!(
+            built.max_workflow_execution_timeout.is_none(),
+            "default ceiling must be None"
+        );
+    }
+
+    #[test]
+    fn builder_max_workflow_execution_timeout_is_carried_through_build() {
+        let ceiling = Duration::from_secs(86_400);
+        let built = HarvestBuilder::new()
+            .max_workflow_execution_timeout(ceiling)
+            .build();
+        assert_eq!(
+            built.max_workflow_execution_timeout,
+            Some(ceiling),
+            "ceiling must survive build()"
+        );
+    }
+
+    #[test]
+    fn builder_max_workflow_execution_timeout_accessor_matches_field() {
+        let ceiling = Duration::from_secs(3_600);
+        let built = HarvestBuilder::new()
+            .max_workflow_execution_timeout(ceiling)
+            .build();
+        assert_eq!(
+            built.max_workflow_execution_timeout_ceiling(),
+            Some(ceiling)
+        );
+    }
+
+    // ── CronInTimezone builder validation ────────────────────────────────────
+
+    #[test]
+    fn builder_rejects_unknown_timezone_in_workflow_schedule() {
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::CronInTimezone {
+                    expr: "0 9 * * *".to_string(),
+                    tz: "Not/ATimezone".to_string(),
+                },
+            ))
+            .try_build();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, HarvestBuilderError::UnknownTimezone { name } if name == "Not/ATimezone"),
+            "expected UnknownTimezone, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_valid_timezone_in_workflow_schedule() {
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::CronInTimezone {
+                    expr: "0 9 * * 1-5".to_string(),
+                    tz: "America/Los_Angeles".to_string(),
+                },
+            ))
+            .try_build();
+
+        assert!(
+            result.is_ok(),
+            "valid timezone must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_unknown_timezone_in_dag_schedule() {
+        fn build(_dag: &mut DagBuilder) {}
+        let dag = DagInfo {
+            name: "daily_etl",
+            module: "test",
+            schedule: Some(Schedule::CronInTimezone {
+                expr: "0 9 * * 1-5".to_string(),
+                tz: "Not/ATimezone".to_string(),
+            }),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: build,
+            workflow_handler: None,
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+        };
+        let result = HarvestBuilder::new().dags(vec![dag]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownTimezone { ref name }) if name == "Not/ATimezone"
+            ),
+            "unknown timezone in DAG schedule must be rejected at build time: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_accepts_valid_timezone_in_dag_schedule() {
+        fn build(_dag: &mut DagBuilder) {}
+        let dag = DagInfo {
+            name: "daily_etl",
+            module: "test",
+            schedule: Some(Schedule::CronInTimezone {
+                expr: "0 9 * * 1-5".to_string(),
+                tz: "America/New_York".to_string(),
+            }),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: build,
+            workflow_handler: None,
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+        };
+        let result = HarvestBuilder::new().dags(vec![dag]).try_build();
+        assert!(
+            result.is_ok(),
+            "valid timezone in DAG schedule must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_disagreeing_rate_limits_on_same_key() {
+        let act1 = ActivityInfo {
+            name: "act1",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(10.0),
+            rate_limit_burst: Some(5.0),
+            rate_limit_key: Some("stripe"),
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+        let act2 = ActivityInfo {
+            name: "act2",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: Some(20.0), // mismatched rps!
+            rate_limit_burst: Some(5.0),
+            rate_limit_key: Some("stripe"),
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+
+        let result = HarvestBuilder::new()
+            .activities(vec![act1, act2])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyMismatch { ref key, .. }) if key == "stripe"
+            ),
+            "expected RateLimitKeyMismatch error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_rate_limit_key_without_cap() {
+        let act = ActivityInfo {
+            name: "act1",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            rate_limit_rps: None, // Missing RPS!
+            rate_limit_burst: None,
+            rate_limit_key: Some("stripe"),
+            circuit_breaker: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            requires: None,
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        };
+
+        let result = HarvestBuilder::new().activities(vec![act]).try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::RateLimitKeyWithoutCap { ref activity, ref key })
+                    if activity == "act1" && key == "stripe"
+            ),
+            "expected RateLimitKeyWithoutCap error, got: {result:?}"
+        );
+    }
+
+    // ── BatchStartConfig (issue #357) ─────────────────────────────────────────
+
+    #[test]
+    fn built_harvest_batch_start_config_defaults_to_spec_values() {
+        use crate::batch_start::{DEFAULT_BATCH_START_MAX_BYTES, DEFAULT_BATCH_START_MAX_ITEMS};
+        let built = HarvestBuilder::new().build();
+        assert_eq!(
+            built.batch_start_config.max_items_per_batch,
+            DEFAULT_BATCH_START_MAX_ITEMS
+        );
+        assert_eq!(
+            built.batch_start_config.max_total_bytes,
+            DEFAULT_BATCH_START_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn harvest_builder_batch_start_config_overrides_are_propagated() {
+        use crate::batch_start::BatchStartConfig;
+        let custom = BatchStartConfig {
+            max_items_per_batch: 500,
+            max_total_bytes: 5 * 1024 * 1024,
+        };
+        let built = HarvestBuilder::new()
+            .batch_start_config(custom.clone())
+            .build();
+        assert_eq!(built.batch_start_config, custom);
+    }
+
+    #[test]
+    fn harvest_builder_validates_static_completion_triggers() {
+        use crate::completion_trigger::CompletionTrigger;
+
+        // Both source and target registered -> Ok
+        let trigger = CompletionTrigger::new("test", "test");
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_triggers(vec![trigger])
+            .try_build();
+        assert!(
+            result.is_ok(),
+            "Expected builder success with registered workflows, got: {result:?}"
+        );
+
+        // Unknown source -> Error
+        let trigger_bad_source = CompletionTrigger::new("unknown_source", "test");
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_triggers(vec![trigger_bad_source])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownCompletionTriggerWorkflow {
+                    ref workflow_name,
+                    role,
+                    ..
+                }) if workflow_name == "unknown_source" && role == "source"
+            ),
+            "Expected UnknownCompletionTriggerWorkflow error for source, got: {result:?}"
+        );
+
+        // Unknown target -> Error
+        let trigger_bad_target = CompletionTrigger::new("test", "unknown_target");
+        let result = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .completion_triggers(vec![trigger_bad_target])
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::UnknownCompletionTriggerWorkflow {
+                    ref workflow_name,
+                    role,
+                    ..
+                }) if workflow_name == "unknown_target" && role == "target"
+            ),
+            "Expected UnknownCompletionTriggerWorkflow error for target, got: {result:?}"
+        );
     }
 }

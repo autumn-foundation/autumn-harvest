@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::completion_trigger::DeferredTriggerStart;
 use crate::error::{HarvestError, database_error};
 use crate::event::WorkflowEvent;
+use crate::execution::apply_parent_close_cascade;
 use crate::models::{HarvestEvent, NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::{
@@ -21,6 +23,7 @@ use crate::schema::{
     harvest_workflow_executions,
 };
 use crate::types::{ExecutionId, ShardId};
+use crate::worker::HandlerRegistry;
 
 /// How undelivered source signals are handled during reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -75,6 +78,20 @@ pub struct WorkflowResetRequest {
     pub operator_id: String,
     #[serde(default)]
     pub signal_reapply: ResetSignalReapplyPolicy,
+    /// When `true`, the source execution may be in a terminal failure state
+    /// (`FAILED`, `CANCELLED`, `TIMED_OUT`) instead of `RUNNING`. This opt-in is
+    /// used by the DAG retry-from-failed-node operator surface (issue #366),
+    /// which forks a *failed* DAG run; a terminal DAG run is the common case
+    /// there. `COMPLETED` and `TERMINATED` sources are always rejected.
+    ///
+    /// **Not settable from the wire.** This field is `#[serde(skip)]` so the
+    /// public `POST /workflows/{id}/reset` endpoint — which deserializes this
+    /// struct directly — can never enable it; the request body always
+    /// deserializes it to `false`, preserving that endpoint's strict
+    /// `RUNNING`-only contract. Only in-process callers (the DAG retry handler)
+    /// set it via struct construction.
+    #[serde(skip)]
+    pub allow_terminal_source: bool,
 }
 
 impl WorkflowResetRequest {
@@ -322,6 +339,7 @@ fn boundary_validity(
     (valid, unresolved_at_target)
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_event_to_pending(
     event_id: i64,
     event: &WorkflowEvent,
@@ -364,6 +382,17 @@ fn apply_event_to_pending(
         } => insert_pending(
             pending,
             "ChildWorkflowStarted",
+            child_id.to_string(),
+            Some(workflow_name.clone()),
+            event_id,
+        ),
+        WorkflowEvent::ChildWorkflowSpawnedDetached {
+            child_id,
+            workflow_name,
+            ..
+        } => insert_pending(
+            pending,
+            "ChildWorkflowSpawnedDetached",
             child_id.to_string(),
             Some(workflow_name.clone()),
             event_id,
@@ -422,6 +451,32 @@ fn apply_event_to_pending(
         | WorkflowEvent::UpdateFailed { update_id, .. } => {
             remove_pending(pending, "UpdateAdmitted", &update_id.to_string());
         }
+        WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            signal_name,
+            ..
+        } => insert_pending(
+            pending,
+            "ExternalSignalRequested",
+            signal_id.to_string(),
+            Some(signal_name.clone()),
+            event_id,
+        ),
+        WorkflowEvent::ExternalSignalDelivered { signal_id }
+        | WorkflowEvent::ExternalSignalFailed { signal_id, .. } => {
+            remove_pending(pending, "ExternalSignalRequested", &signal_id.to_string());
+        }
+        WorkflowEvent::ExternalCancelRequested { cancel_id, .. } => insert_pending(
+            pending,
+            "ExternalCancelRequested",
+            cancel_id.to_string(),
+            None,
+            event_id,
+        ),
+        WorkflowEvent::ExternalCancelDelivered { cancel_id }
+        | WorkflowEvent::ExternalCancelFailed { cancel_id, .. } => {
+            remove_pending(pending, "ExternalCancelRequested", &cancel_id.to_string());
+        }
         _ => {}
     }
 }
@@ -464,7 +519,7 @@ pub async fn preview_workflow_reset(
 ) -> Result<ResetPlan, WorkflowResetError> {
     let request = request.normalized();
     let execution = load_source_execution(conn, exec_id, false).await?;
-    validate_source_execution(exec_id, &execution)?;
+    validate_source_execution(exec_id, &execution, request.allow_terminal_source)?;
     let rows = load_event_rows(conn, exec_id).await?;
     let events = decode_events(&rows)?;
     let mut plan = validate_reset_point(&events, request.reset_to_event_id)?;
@@ -484,66 +539,105 @@ pub async fn reset_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     request: WorkflowResetRequest,
+    registry: Option<&HandlerRegistry>,
 ) -> Result<ResetResult, WorkflowResetError> {
     let request = request.normalized();
-    conn.transaction::<ResetResult, WorkflowResetError, _>(|conn| {
-        async move {
-            let source = load_source_execution(conn, exec_id, true).await?;
-            validate_source_execution(exec_id, &source)?;
+    let (res, deferred_starts) = conn
+        .transaction::<(ResetResult, Vec<DeferredTriggerStart>), WorkflowResetError, _>(|conn| {
+            async move {
+                let source = load_source_execution(conn, exec_id, true).await?;
+                validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
 
-            let rows = load_event_rows(conn, exec_id).await?;
-            let events = decode_events(&rows)?;
-            let plan = validate_reset_point(&events, request.reset_to_event_id)?;
+                let rows = load_event_rows(conn, exec_id).await?;
+                let events = decode_events(&rows)?;
+                let plan = validate_reset_point(&events, request.reset_to_event_id)?;
 
-            let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
-            let source_next_event_id = rows.last().map_or(0, |row| row.event_id.saturating_add(1));
+                let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
+                let source_next_event_id =
+                    rows.last().map_or(0, |row| row.event_id.saturating_add(1));
 
-            terminate_source_execution(conn, exec_id, new_exec_id, &request, source_next_event_id)
+                let deferred = terminate_source_execution(
+                    conn,
+                    exec_id,
+                    new_exec_id,
+                    &request,
+                    source_next_event_id,
+                )
                 .await?;
-            let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
-            copy_carried_events(conn, new_exec_id, &rows, request.reset_to_event_id).await?;
-            append_fork_marker(conn, new_exec_id, exec_id, &request, &plan).await?;
+                let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
+                copy_carried_events(conn, new_exec_id, &rows, request.reset_to_event_id).await?;
+                append_fork_marker(conn, new_exec_id, exec_id, &request, &plan).await?;
 
-            let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
-                conn,
-                exec_id,
-                &format!("workflow reset to {new_exec_id}: {}", request.reason),
-            )
-            .await?;
-            let source_timers_removed = remove_pending_timers(conn, exec_id).await?;
-            let source_external_cancelled = cancel_pending_external_tasks(conn, exec_id).await?;
-            let signals_buffered =
-                reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply).await?;
+                let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
+                    conn,
+                    exec_id,
+                    &format!("workflow reset to {new_exec_id}: {}", request.reason),
+                )
+                .await?;
+                let source_timers_removed = remove_pending_timers(conn, exec_id).await?;
+                let source_external_cancelled =
+                    cancel_pending_external_tasks(conn, exec_id).await?;
+                let signals_buffered =
+                    reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply)
+                        .await?;
 
-            enqueue_fork_workflow_task(conn, &fork, new_exec_id).await?;
+                enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
 
-            Ok(ResetResult {
-                new_exec_id,
-                reset_from_exec_id: exec_id,
-                reset_to_event_id: request.reset_to_event_id,
-                events_carried_over: plan.events_carried_over,
-                source_tasks_cancelled: source_tasks_cancelled + source_external_cancelled,
-                source_timers_removed,
-                source_signals_dropped: match request.signal_reapply {
-                    ResetSignalReapplyPolicy::Drop => signals_buffered,
-                    ResetSignalReapplyPolicy::Buffer => 0,
-                },
-                source_signals_buffered: match request.signal_reapply {
-                    ResetSignalReapplyPolicy::Drop => 0,
-                    ResetSignalReapplyPolicy::Buffer => signals_buffered,
-                },
-            })
-        }
-        .scope_boxed()
-    })
-    .await
+                Ok((
+                    ResetResult {
+                        new_exec_id,
+                        reset_from_exec_id: exec_id,
+                        reset_to_event_id: request.reset_to_event_id,
+                        events_carried_over: plan.events_carried_over,
+                        source_tasks_cancelled: source_tasks_cancelled + source_external_cancelled,
+                        source_timers_removed,
+                        source_signals_dropped: match request.signal_reapply {
+                            ResetSignalReapplyPolicy::Drop => signals_buffered,
+                            ResetSignalReapplyPolicy::Buffer => 0,
+                        },
+                        source_signals_buffered: match request.signal_reapply {
+                            ResetSignalReapplyPolicy::Drop => 0,
+                            ResetSignalReapplyPolicy::Buffer => signals_buffered,
+                        },
+                    },
+                    deferred,
+                ))
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    for start in deferred_starts {
+        start.spawn();
+    }
+
+    Ok(res)
 }
 
 fn validate_source_execution(
     exec_id: ExecutionId,
     execution: &WorkflowExecution,
+    allow_terminal_source: bool,
 ) -> Result<(), WorkflowResetError> {
-    if execution.state != "RUNNING" {
+    if allow_terminal_source {
+        // DAG retry-from-failed-node (issue #366): a failed DAG run is terminal,
+        // so RUNNING is no longer required. A non-failure terminal state
+        // (COMPLETED / TERMINATED) is still rejected — there is nothing to retry.
+        // PAUSED is a non-terminal active state (issue #383) and is resettable.
+        match execution.state.as_str() {
+            "RUNNING" | "PAUSED" | "FAILED" | "CANCELLED" | "TIMED_OUT" => {}
+            other => {
+                return Err(WorkflowResetError::TerminalSource {
+                    exec_id,
+                    state: other.to_string(),
+                });
+            }
+        }
+    } else if !matches!(execution.state.as_str(), "RUNNING" | "PAUSED") {
+        // PAUSED is non-terminal (issue #383): an operator who paused a bad run
+        // can reset it directly without resuming first (which would dispatch the
+        // parked decision they were trying to avoid). Sealing the source cancels
+        // its parked task, so the decision never lands.
         return Err(WorkflowResetError::TerminalSource {
             exec_id,
             state: execution.state.clone(),
@@ -673,7 +767,7 @@ async fn terminate_source_execution(
     new_exec_id: ExecutionId,
     request: &WorkflowResetRequest,
     source_next_event_id: i32,
-) -> Result<(), WorkflowResetError> {
+) -> Result<Vec<DeferredTriggerStart>, WorkflowResetError> {
     crate::store::append_events(
         conn,
         source_exec_id,
@@ -686,8 +780,21 @@ async fn terminate_source_execution(
     )
     .await?;
 
+    // Seal the source run as TERMINATED. The state filter guards against a
+    // concurrent reset double-sealing the same row. The standalone reset path
+    // reaches `RUNNING` or `PAUSED` (issue #383, both non-terminal); the DAG
+    // retry path (issue #366) accepts terminal failure states via
+    // `allow_terminal_source`, so those must also be sealed here — otherwise the
+    // update would match zero rows and leave the source in
+    // `FAILED`/`CANCELLED`/`TIMED_OUT`, defeating the caller's `TERMINATED`
+    // re-fork guard.
+    let sealable_states: Vec<&str> = if request.allow_terminal_source {
+        vec!["RUNNING", "PAUSED", "FAILED", "CANCELLED", "TIMED_OUT"]
+    } else {
+        vec!["RUNNING", "PAUSED"]
+    };
     diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
-        .filter(harvest_workflow_executions::state.eq("RUNNING"))
+        .filter(harvest_workflow_executions::state.eq_any(sealable_states))
         .set((
             harvest_workflow_executions::state.eq("TERMINATED"),
             harvest_workflow_executions::output.eq(None::<Value>),
@@ -696,12 +803,18 @@ async fn terminate_source_execution(
                 request.reason
             ))),
             harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            // Clear the now-stale pause metadata when sealing a PAUSED source so
+            // the sealed row carries no residual pause state (issue #383).
+            harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            harvest_workflow_executions::pause_reason.eq(None::<String>),
+            harvest_workflow_executions::pause_actor.eq(None::<String>),
         ))
         .execute(conn)
         .await
         .map_err(database_error)?;
+    let deferred = apply_parent_close_cascade(conn, source_exec_id).await?;
 
-    Ok(())
+    Ok(deferred)
 }
 
 async fn insert_fork_execution(
@@ -709,6 +822,12 @@ async fn insert_fork_execution(
     source: &WorkflowExecution,
     new_exec_id: ExecutionId,
 ) -> Result<WorkflowExecution, WorkflowResetError> {
+    // Re-compute deadline_at from the source execution's timeout so the fork
+    // gets a fresh deadline anchored to its own start time (issue #243).
+    let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
+    // Re-anchor the soft SLA deadline per-fork (issue #487).
+    let sla_deadline_at = source.sla.map(|d| chrono::Utc::now() + d);
+
     let row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
         workflow_name: &source.workflow_name,
@@ -719,9 +838,22 @@ async fn insert_fork_execution(
         parent_id: None,
         queue_name: &source.queue_name,
         execution_timeout: source.execution_timeout,
+        deadline_at,
+        sla: source.sla,
+        sla_deadline_at,
         memo: source.memo.clone(),
         search_attrs: source.search_attrs.clone(),
         assigned_build_id: source.assigned_build_id.clone(),
+        parent_close_policy: None, // reset fork is a fresh root execution
+        owner: source.owner.as_deref(),
+        runbook_url: source.runbook_url.as_deref(),
+        severity: source.severity.as_deref(),
+        context_headers: source.context_headers.clone(),
+        // Reset forks are operator interventions, not scheduled fires: leaving
+        // schedule_id NULL keeps their (re-)completion out of scheduled carryover so a
+        // reset of an old slot can't roll a later run's incremental cursor backward (#488).
+        schedule_id: None,
+        scheduled_for: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -836,6 +968,7 @@ struct SignalForReset {
     id: Uuid,
     signal_name: String,
     payload: Value,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Insertable)]
@@ -844,6 +977,7 @@ struct NewSignalForReset {
     workflow_exec_id: Uuid,
     signal_name: String,
     payload: Value,
+    idempotency_key: Option<String>,
 }
 
 async fn reapply_or_drop_signals(
@@ -863,6 +997,7 @@ async fn reapply_or_drop_signals(
             harvest_signals::id,
             harvest_signals::signal_name,
             harvest_signals::payload,
+            harvest_signals::idempotency_key,
         ))
         .load(conn)
         .await
@@ -875,6 +1010,7 @@ async fn reapply_or_drop_signals(
                 workflow_exec_id: new_exec_id.as_uuid(),
                 signal_name: signal.signal_name.clone(),
                 payload: signal.payload.clone(),
+                idempotency_key: signal.idempotency_key.clone(),
             })
             .collect::<Vec<_>>();
         diesel::insert_into(harvest_signals::table)
@@ -900,6 +1036,7 @@ async fn enqueue_fork_workflow_task(
     conn: &mut AsyncPgConnection,
     fork: &WorkflowExecution,
     new_exec_id: ExecutionId,
+    registry: Option<&HandlerRegistry>,
 ) -> Result<(), WorkflowResetError> {
     let mut enqueue = EnqueueParams::new(
         fork.queue_name.clone(),
@@ -908,6 +1045,14 @@ async fn enqueue_fork_workflow_task(
     );
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = fork.assigned_build_id.clone();
+    if let Some(reg) = registry
+        && let Some(info) = reg.workflows.get(&fork.workflow_name)
+        && let Some(policy) = &info.concurrency
+    {
+        enqueue.concurrency_key =
+            crate::concurrency::resolve_concurrency_key(policy.key_expr, &fork.input);
+        enqueue.max_concurrent = Some(policy.limit);
+    }
     queue::enqueue(conn, &enqueue).await?;
     Ok(())
 }
@@ -918,15 +1063,101 @@ mod tests {
     use serde_json::Value;
 
     use crate::event::WorkflowEvent;
-    use crate::types::{ActivityExecId, ExecutionId, TimerId};
+    use crate::types::{ActivityExecId, ExecutionId, ExternalCancelId, ParentClosePolicy, TimerId};
 
-    use super::{ResetSignalReapplyPolicy, validate_reset_point};
+    use super::{
+        ResetSignalReapplyPolicy, WorkflowResetError, validate_reset_point,
+        validate_source_execution,
+    };
+
+    fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
+        crate::models::WorkflowExecution {
+            id: ExecutionId::new().as_uuid(),
+            workflow_name: "wf".into(),
+            workflow_id: "id".into(),
+            run_id: uuid::Uuid::new_v4(),
+            shard_id: 0,
+            state: state.into(),
+            input: Value::Null,
+            output: None,
+            error: None,
+            parent_id: None,
+            sticky_worker_id: None,
+            queue_name: "default".into(),
+            started_at: Utc::now(),
+            completed_at: None,
+            execution_timeout: None,
+            deadline_at: None,
+            memo: None,
+            search_attrs: None,
+            created_at: Utc::now(),
+            assigned_build_id: None,
+            parent_close_policy: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            sla_deadline_at: None,
+            sla_breached: false,
+            sla_breached_at: None,
+            paused_at: Some(Utc::now()),
+            pause_reason: Some("operator pause".into()),
+            pause_actor: Some("oncall".into()),
+            current_details: None,
+            schedule_id: None,
+            scheduled_for: None,
+        }
+    }
+
+    #[test]
+    fn validate_source_accepts_running_and_paused_as_non_terminal() {
+        // Issue #383: PAUSED is a non-terminal active state, so an operator can
+        // reset a paused run directly without resuming it first.
+        for state in ["RUNNING", "PAUSED"] {
+            let exec = execution_in_state(state);
+            assert!(
+                validate_source_execution(ExecutionId::new(), &exec, false).is_ok(),
+                "{state} must be accepted as a non-terminal reset source"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_source_rejects_terminal_states_without_override() {
+        for state in [
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "TERMINATED",
+        ] {
+            let exec = execution_in_state(state);
+            assert!(
+                matches!(
+                    validate_source_execution(ExecutionId::new(), &exec, false),
+                    Err(WorkflowResetError::TerminalSource { .. })
+                ),
+                "{state} must be rejected as a non-terminal reset source"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_source_paused_accepted_with_terminal_override() {
+        // The DAG-retry path (allow_terminal_source = true) must also admit a
+        // paused active run alongside the terminal failure states.
+        let exec = execution_in_state("PAUSED");
+        assert!(validate_source_execution(ExecutionId::new(), &exec, true).is_ok());
+    }
 
     #[test]
     fn reset_point_allows_workflow_started_boundary() {
         let events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
         }];
 
         let plan = validate_reset_point(&events, 0).expect("workflow start is always valid");
@@ -942,6 +1173,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -968,12 +1201,109 @@ mod tests {
     }
 
     #[test]
+    fn reset_point_rejects_unresolved_external_cancel() {
+        // An unresolved external cancel (ExternalCancelRequested with no terminal)
+        // is an in-flight side effect: forking there would re-issue the cancel
+        // from the new execution. Mirrors the external-signal handling (issue #492).
+        let cancel_id = ExternalCancelId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::MarkerRecorded {
+                name: "after-cancel".into(),
+                details: Value::Null,
+            },
+        ];
+
+        let err = validate_reset_point(&events, 1).expect_err("cancel is still unresolved");
+        assert_eq!(err.reset_to_event_id, 1);
+        assert_eq!(err.unresolved_side_effects.len(), 1);
+        assert_eq!(
+            err.unresolved_side_effects[0].kind,
+            "ExternalCancelRequested"
+        );
+        assert_eq!(
+            err.unresolved_side_effects[0].side_effect_id,
+            cancel_id.to_string()
+        );
+    }
+
+    #[test]
+    fn reset_point_allows_resolved_external_cancel() {
+        // Once the cancel has a terminal, the boundary after it is valid.
+        let cancel_id = ExternalCancelId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+            },
+            WorkflowEvent::ExternalCancelRequested { cancel_id, target },
+            WorkflowEvent::ExternalCancelDelivered { cancel_id },
+        ];
+
+        let plan = validate_reset_point(&events, 2).expect("resolved cancel is a valid boundary");
+        assert!(plan.unresolved_side_effects.is_empty());
+    }
+
+    #[test]
+    fn reset_point_rejects_detached_spawn_boundary() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+            },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id,
+                workflow_name: "sidecar".into(),
+                input: Value::Null,
+                parent_close_policy: ParentClosePolicy::RequestCancel,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "after-detached-spawn".into(),
+                details: Value::Null,
+            },
+        ];
+
+        let err = validate_reset_point(&events, 1).expect_err("detached child is still unresolved");
+        assert_eq!(err.reset_to_event_id, 1);
+        assert_eq!(err.nearest_valid_before, Some(0));
+        assert_eq!(err.nearest_valid_after, None);
+        assert_eq!(err.unresolved_side_effects.len(), 1);
+        assert_eq!(
+            err.unresolved_side_effects[0].kind,
+            "ChildWorkflowSpawnedDetached"
+        );
+        assert_eq!(
+            err.unresolved_side_effects[0].side_effect_id,
+            child_id.to_string()
+        );
+        assert_eq!(
+            err.unresolved_side_effects[0].name.as_deref(),
+            Some("sidecar")
+        );
+    }
+
+    #[test]
     fn reset_point_allows_resolved_timer_boundary() {
         let timer_id = TimerId::new("cooldown");
         let events = vec![
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
@@ -1009,6 +1339,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::LocalActivityScheduled {
                 activity_id,
@@ -1040,6 +1372,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::LocalActivityScheduled {
                 activity_id,
@@ -1070,6 +1404,8 @@ mod tests {
             WorkflowEvent::WorkflowStarted {
                 input: Value::Null,
                 timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
             },
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),
@@ -1082,6 +1418,25 @@ mod tests {
         assert!(
             err.message
                 .contains("continue-as-new histories cannot be reset")
+        );
+    }
+
+    #[test]
+    fn allow_terminal_source_is_not_settable_from_the_wire() {
+        // The public POST /workflows/{id}/reset endpoint deserializes this
+        // struct directly; a malicious/mistaken body must not be able to flip
+        // the terminal-source escape hatch on.
+        let body = serde_json::json!({
+            "reset_to_event_id": 1,
+            "reason": "x",
+            "operator_id": "y",
+            "allow_terminal_source": true
+        });
+        let request: super::WorkflowResetRequest =
+            serde_json::from_value(body).expect("body deserializes");
+        assert!(
+            !request.allow_terminal_source,
+            "allow_terminal_source must remain false when set via the request body"
         );
     }
 }
