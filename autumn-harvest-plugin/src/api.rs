@@ -2491,6 +2491,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("DELETE", "/admin/schedules/{id}"),
         ("GET", "/admin/schedules/{id}/preview"),
         ("POST", "/admin/schedules/preview"),
+        ("GET", "/admin/schedules/decisions"),
+        ("GET", "/admin/schedules/{id}/decisions"),
         // ── calendars (issue #337) ────────────────────────────────────────────
         ("GET", "/calendars"),
         ("GET", "/calendars/{name}"),
@@ -10571,7 +10573,14 @@ async fn trigger_schedule_now(
             concurrency_key: None,
             concurrency_limit: None,
             priority: Priority::default(),
-            max_workflow_input_bytes: 0,
+            max_workflow_input_bytes: runtime
+                .registry
+                .workflows
+                .get(&workflow_name)
+                .and_then(|info| info.max_input_bytes)
+                .map_or(runtime.registry.max_workflow_input_bytes, |per| {
+                    per.max(runtime.registry.max_workflow_input_bytes)
+                }),
             start_at: None,
             delay: None,
             max_workflow_start_delay: None,
@@ -11226,6 +11235,30 @@ async fn schedule_backfill(
                     });
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
+                // issue #377: check admission gates before firing a backfill run.
+                if let Some((gate_id, gate_reason, scope_kind)) = api_state.gate_cache().check(
+                    &wf_name,
+                    dispatch_queue,
+                    0, // backfill uses ExecutionId::new() → ShardId::UNENCODED → default shard
+                    owner,
+                ) {
+                    let reason_label = match gate_reason.char_indices().nth(64) {
+                        Some((idx2, _)) => &gate_reason[..idx2],
+                        None => &gate_reason,
+                    };
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_admission_blocked(scope_kind, reason_label);
+                    shard_failures.push(BackfillShardFailure {
+                        shard_id: 0,
+                        reason: format!("admission blocked by gate {gate_id}: {gate_reason}"),
+                    });
+                    failed += 1;
+                    continue;
+                }
+
                 let result = start_or_load_workflow_execution(
                     &mut conn,
                     StartWorkflowParams {
@@ -11244,7 +11277,14 @@ async fn schedule_backfill(
                         concurrency_key: None,
                         concurrency_limit: None,
                         priority: Priority::default(),
-                        max_workflow_input_bytes: 0,
+                        max_workflow_input_bytes: runtime
+                            .registry
+                            .workflows
+                            .get(&wf_name)
+                            .and_then(|info| info.max_input_bytes)
+                            .map_or(runtime.registry.max_workflow_input_bytes, |per| {
+                                per.max(runtime.registry.max_workflow_input_bytes)
+                            }),
                         start_at: None,
                         delay: None,
                         max_workflow_start_delay: None,

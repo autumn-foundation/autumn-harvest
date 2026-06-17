@@ -3699,6 +3699,51 @@
     },
     {
       "method": "GET",
+      "path": "/admin/schedules/decisions",
+      "category": "schedule",
+      "read_only": true,
+      "description": "List schedule-decision records (fire/skip/overlap/catchup outcomes) across all schedules.",
+      "params": [
+        { "name": "schedule_id", "type": "string", "description": "Filter by schedule UUID." },
+        { "name": "decision", "type": "string", "description": "Filter by decision kind (e.g. fired, skipped, overlap_skipped)." },
+        { "name": "reason", "type": "string", "description": "Filter by reason label." },
+        { "name": "limit", "type": "integer", "description": "Maximum number of records to return. Defaults to 50." }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "fields": []
+      },
+      "error_responses": [
+        { "status": 400, "description": "Invalid schedule_id UUID." },
+        { "status": 503, "description": "Database unavailable." }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/admin/schedules/{id}/decisions",
+      "category": "schedule",
+      "read_only": true,
+      "description": "List schedule-decision records for a specific schedule.",
+      "params": [
+        { "name": "decision", "type": "string", "description": "Filter by decision kind." },
+        { "name": "reason", "type": "string", "description": "Filter by reason label." },
+        { "name": "limit", "type": "integer", "description": "Maximum number of records to return. Defaults to 50." }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true,
+        "fields": []
+      },
+      "error_responses": [
+        { "status": 404, "description": "Schedule not found." },
+        { "status": 503, "description": "Database unavailable." }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/calendars",
       "category": "calendar",
       "read_only": true,
