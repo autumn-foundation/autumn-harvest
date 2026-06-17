@@ -91,13 +91,16 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut eq_idx = None;
     let mut in_idx = None;
     let mut in_quotes = None;
-    let token_chars: Vec<char> = token.chars().collect();
-    let token_lower = token.to_lowercase();
-    let token_lower_chars: Vec<char> = token_lower.chars().collect();
 
     let mut i = 0;
-    while i < token_chars.len() {
-        let c = token_chars[i];
+    let token_len = token.len();
+    while i < token_len {
+        let remaining = &token[i..];
+        let mut chars = remaining.char_indices();
+        let Some((_, c)) = chars.next() else {
+            break;
+        };
+
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -112,17 +115,13 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
             _ => {
                 if in_quotes.is_none()
                     && in_idx.is_none()
-                    && i + 3 < token_chars.len()
-                    && token_lower_chars[i] == ' '
-                    && token_lower_chars[i + 1] == 'i'
-                    && token_lower_chars[i + 2] == 'n'
-                    && token_lower_chars[i + 3] == ' '
+                    && remaining.to_lowercase().starts_with(" in ")
                 {
                     in_idx = Some(i);
                 }
             }
         }
-        i += 1;
+        i += c.len_utf8();
     }
     (eq_idx, in_idx)
 }
@@ -344,6 +343,13 @@ mod tests {
                 values: vec!["cuda=12".to_string(), "rocm=6".to_string()]
             }]
         );
+    }
+
+    #[test]
+    fn test_multibyte_character_panic() {
+        // Trigger the multibyte char boundary panic
+        let _ = parse_requirements("🦀=true");
+        let _ = parse_requirements("region in [🦀, 🦄]");
     }
 
     #[test]
