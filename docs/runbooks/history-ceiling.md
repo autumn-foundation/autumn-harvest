@@ -41,13 +41,13 @@ A non-zero gauge means executions of that workflow type are not calling
 ### Via the management API
 
 ```bash
-# List executions with ≥ 10 000 history events, most oversized first
+# List executions with ≥ 10 000 history events
 curl -s "http://localhost:8080/api/harvest/workflows?min_history_events=10000&limit=50" \
-  | jq '.workflows[] | {id: .execution_id, name: .workflow_name, state: .state}'
+  | jq '.[] | {id: .execution_id, name: .workflow_name, state: .state}'
 ```
 
-`min_history_events` accepts any non-negative integer. The results are
-aggregated across all shards and returned in descending event-count order.
+`min_history_events` accepts any non-negative integer. Results are aggregated
+across all shards and returned in the default `created_at` order.
 
 ### Via the preflight report
 
