@@ -127,6 +127,8 @@ pub struct WorkerRuntimeConfig {
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
+    /// Hard ceiling on durable event count per execution (issue #493). `None` = no ceiling.
+    pub max_workflow_history_events: Option<u64>,
 }
 
 impl WorkerRuntimeConfig {
@@ -176,6 +178,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             labels: cfg.labels,
             #[cfg(feature = "db")]
             sharded_pool: cfg.sharded_pool,
+            max_workflow_history_events: None,
         }
     }
 }
@@ -6760,6 +6763,7 @@ struct WorkerMonitoringHandles {
     timeout_checker: tokio::task::JoinHandle<()>,
     poison_pill_reclaimer: tokio::task::JoinHandle<()>,
     pause_auto_resumer: tokio::task::JoinHandle<()>,
+    history_oversized_sampler: tokio::task::JoinHandle<()>,
 }
 
 /// Spawn the bounded-pause auto-resume scanner (issue #383).
@@ -6809,6 +6813,94 @@ fn spawn_pause_auto_resumer(
             }
         }
     })
+}
+
+/// Periodically sample the count of in-flight (RUNNING) executions per
+/// workflow type whose history size exceeds the soft `continue_as_new`
+/// threshold and emit it as a gauge metric (issue #493, AC2).
+///
+/// A non-zero gauge value signals runaway workflow executions that are
+/// growing toward the hard ceiling and should be addressed by the author
+/// (e.g. via `ctx.should_continue_as_new()`) or by the operator (via the
+/// hard ceiling or manual continue-as-new).
+fn spawn_history_oversized_sampler(
+    pool: DbPool,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    soft_threshold: u64,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let mut conn = match pool.get().await {
+                Ok(conn) => conn,
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "history oversized sampler could not acquire DB connection"
+                    );
+                    continue;
+                }
+            };
+
+            match sample_history_oversized_counts(&mut conn, soft_threshold).await {
+                Ok(counts) => {
+                    for (workflow_name, count) in &counts {
+                        telemetry
+                            .metrics
+                            .record_workflow_history_oversized(workflow_name, *count);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "history oversized sample failed");
+                }
+            }
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
+/// Query the count of RUNNING executions per workflow type that have
+/// accumulated more than `soft_threshold` events.
+///
+/// Returns `(workflow_name, count)` pairs; omits workflow types with zero
+/// oversized executions.
+async fn sample_history_oversized_counts(
+    conn: &mut diesel_async::AsyncPgConnection,
+    soft_threshold: u64,
+) -> crate::error::HarvestResult<Vec<(String, u64)>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        workflow_name: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        oversized_count: i64,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT wf.workflow_name, COUNT(*)::bigint AS oversized_count \
+         FROM harvest_workflow_executions wf \
+         WHERE wf.state IN ('RUNNING', 'SUSPENDED') \
+         AND (SELECT COUNT(*) FROM harvest_events he WHERE he.workflow_exec_id = wf.id) > $1 \
+         GROUP BY wf.workflow_name",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(soft_threshold as i64)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.workflow_name, r.oversized_count.max(0) as u64))
+        .collect())
 }
 
 impl Worker {
@@ -6996,6 +7088,7 @@ impl Worker {
             self.config.sharded_pool.clone(),
             self.config.shard_assignments.clone(),
             self.registry.circuit_breakers(),
+            self.config.max_workflow_history_events,
         );
         // Worker-stale threshold mirrors the fleet-health classifier:
         // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
@@ -7026,6 +7119,13 @@ impl Worker {
             self.config.max_workflow_pause_duration,
             self.registry.telemetry().clone(),
         );
+        let history_oversized_sampler = spawn_history_oversized_sampler(
+            pool.clone(),
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.registry.history_policy().continue_as_new_threshold(),
+            self.config.poll_interval,
+        );
 
         WorkerMonitoringHandles {
             queue_depth_sampler,
@@ -7035,6 +7135,7 @@ impl Worker {
             timeout_checker,
             poison_pill_reclaimer,
             pause_auto_resumer,
+            history_oversized_sampler,
         }
     }
 
@@ -7178,6 +7279,13 @@ impl Worker {
                     "dlq depth sampler failed during shutdown"
                 );
             }
+        }
+        if let Err(error) = monitors.history_oversized_sampler.await {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "history oversized sampler failed during shutdown"
+            );
         }
     }
 

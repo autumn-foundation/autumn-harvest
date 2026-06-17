@@ -317,6 +317,20 @@ pub const METRIC_SCHEDULE_FIRE_ATTEMPTS: &str = "harvest.schedule.fire_attempts"
 /// window. Each auto-pause event means operator action is required to resume.
 pub const METRIC_SCHEDULE_AUTO_PAUSED: &str = "harvest.schedule.auto_paused";
 
+/// Gauge: count of *in-flight* (RUNNING/SUSPENDED) executions whose durable
+/// event history has grown past the configured soft
+/// `continue_as_new_threshold` (issue #493).
+///
+/// Labeled by `workflow` (workflow type name). `execution.id` MUST NOT appear
+/// here (ADR-0001 §7 cardinality rule).
+///
+/// Sampled on the same cadence as `harvest.queue.depth` (the
+/// `spawn_queue_depth_sampler` interval). A non-zero value means at least one
+/// in-flight workflow is accumulating history faster than its author drains it
+/// via `continue_as_new`. Alert on sustained non-zero values so the operator
+/// can nudge the author or enable `max_workflow_history_events`.
+pub const METRIC_WORKFLOW_HISTORY_OVERSIZED: &str = "harvest.workflow.history_oversized";
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -677,6 +691,21 @@ pub trait MetricsRecorder: Send + Sync {
     /// A workflow replay non-determinism (divergence) failure was detected.
     fn record_workflow_non_determinism(&self, workflow_name: &str, build_id: &str) {
         let _ = (workflow_name, build_id);
+    }
+
+    /// Gauge snapshot: `count` in-flight executions for `workflow_name` whose
+    /// durable event count exceeds the configured soft continue-as-new
+    /// threshold (issue #493).
+    ///
+    /// Callers emit one call per distinct workflow name per sampler tick so
+    /// the gauge resets cleanly when oversized executions drain. A `count` of
+    /// `0` should be emitted for known workflow names once the oversized count
+    /// drops to zero so the gauge falls back to zero rather than going stale.
+    ///
+    /// Maps to [`METRIC_WORKFLOW_HISTORY_OVERSIZED`].
+    /// Per ADR-0001 §7, `execution.id` must never be a label here.
+    fn record_workflow_history_oversized(&self, workflow_name: &str, count: u64) {
+        let _ = (workflow_name, count);
     }
 
     /// An activity invocation finished.

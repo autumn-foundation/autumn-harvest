@@ -316,6 +316,8 @@ async fn start_harvest_runtime(
     api_state.set_query_timeout(built.worker_config().query_timeout);
     // Propagate the server-side execution timeout ceiling (issue #243).
     api_state.set_max_workflow_execution_timeout(built.max_workflow_execution_timeout);
+    // Propagate the hard history event ceiling (issue #493).
+    api_state.set_max_workflow_history_events(built.max_workflow_history_events);
     // Propagate the server-side start delay ceiling (issue #322).
     api_state.set_max_workflow_start_delay(built.worker_config().max_workflow_start_delay);
     // Propagate batch start caps from builder config (issue #357).

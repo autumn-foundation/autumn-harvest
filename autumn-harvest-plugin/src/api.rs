@@ -297,6 +297,9 @@ pub struct HarvestApiState {
     /// Loaded from Postgres before the worker pool starts accepting new work so
     /// there is no admission window between plugin boot and re-apply.
     gate_cache: Arc<autumn_harvest::AdmissionGateCache>,
+    /// Hard ceiling on per-execution event count (issue #493).
+    /// `None` = ceiling disabled; executions are terminated when they exceed this count.
+    max_workflow_history_events: Arc<Mutex<Option<u64>>>,
 }
 
 impl Default for HarvestApiState {
@@ -324,6 +327,7 @@ impl Default for HarvestApiState {
             batch_start_max_items: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_ITEMS)),
             batch_start_max_bytes: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_BYTES)),
             gate_cache: Arc::new(autumn_harvest::AdmissionGateCache::new()),
+            max_workflow_history_events: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -400,6 +404,35 @@ impl HarvestApiState {
     pub fn max_workflow_execution_timeout(&self) -> Option<std::time::Duration> {
         *self
             .max_workflow_execution_timeout
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Set the hard ceiling on per-execution event count (issue #493).
+    ///
+    /// Call this during startup from the plugin to propagate
+    /// `BuiltHarvest::max_workflow_history_events` into the API state so the
+    /// preflight check can surface it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_max_workflow_history_events(&self, ceiling: Option<u64>) {
+        *self
+            .max_workflow_history_events
+            .lock()
+            .expect("harvest api state lock poisoned") = ceiling;
+    }
+
+    /// Current hard ceiling on per-execution event count (issue #493).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn max_workflow_history_events(&self) -> Option<u64> {
+        *self
+            .max_workflow_history_events
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -1689,6 +1722,8 @@ pub(crate) struct WorkflowFilters {
     pub(crate) include_sleeping: bool,
     /// When true, return only executions whose soft SLA has been breached (#487).
     pub(crate) sla_breached: bool,
+    /// Only return executions with at least this many recorded events (issue #493).
+    pub(crate) min_history_events: Option<u64>,
 }
 
 impl WorkflowFilters {
@@ -3951,6 +3986,14 @@ pub(crate) fn parse_workflow_filters(
             }
             "sla_breached" => {
                 filters.sla_breached = value.trim().eq_ignore_ascii_case("true");
+            }
+            "min_history_events" => {
+                let parsed = value.trim().parse::<u64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid min_history_events '{value}'; expected a non-negative integer"
+                    ))
+                })?;
+                filters.min_history_events = Some(parsed);
             }
             _ => {
                 // Ignore unknown query parameters so future additions stay non-breaking.
@@ -13610,6 +13653,17 @@ pub(crate) async fn load_workflows(
     }
     if filters.sla_breached {
         query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+    }
+    if let Some(min_events) = filters.min_history_events {
+        // Correlated subquery: filter to executions with at least `min_events`
+        // recorded events. No schema migration is required — the count is
+        // computed on read from the existing `harvest_events` table.
+        use diesel::sql_types::BigInt;
+        query = query.filter(
+            sql::<Bool>(
+                "(SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= "
+            ).bind::<BigInt, _>(min_events as i64),
+        );
     }
     query
         .select(WorkflowExecution::as_select())
