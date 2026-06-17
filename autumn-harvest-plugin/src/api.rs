@@ -10430,9 +10430,17 @@ async fn trigger_schedule_now(
         triggered_at.timestamp_millis(),
         uuid::Uuid::new_v4().simple()
     );
-    let trigger_exec_shard = runtime
-        .router
-        .pick_for_new_workflow(&workflow_name, &workflow_id);
+    let trigger_exec_shard = if schedule.dag_name.is_some() {
+        // DAG runs are pinned to a shard by dag_name (stable rendezvous hash on
+        // the name alone), mirroring `scheduler.rs` and `GET /dags/{name}/runs`.
+        // Using pick_for_new_workflow with a random workflow_id would produce a
+        // different shard and make the manual run invisible to the DAG runs list.
+        runtime.router.pick_for_dag(&workflow_name)
+    } else {
+        runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &workflow_id)
+    };
 
     // issue #377: check admission gates before firing a manual trigger.
     {
@@ -11305,10 +11313,15 @@ async fn schedule_backfill(
                 let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
                 // issue #377: check admission gates before firing a backfill run.
+                // Workflow backfill writes to pool.default_pool() and creates
+                // ExecutionId::new() (ShardId::UNENCODED) which resolves to the
+                // configured default shard — use that shard ID here, not a
+                // hard-coded 0 which is wrong when the default shard has a
+                // different ID.
                 if let Some((gate_id, gate_reason, scope_kind)) = api_state.gate_cache().check(
                     &wf_name,
                     dispatch_queue,
-                    0, // backfill uses ExecutionId::new() → ShardId::UNENCODED → default shard
+                    runtime.router.default_shard().as_i32(),
                     owner,
                 ) {
                     let reason_label = match gate_reason.char_indices().nth(64) {
