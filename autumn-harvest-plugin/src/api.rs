@@ -5326,10 +5326,11 @@ async fn start_workflow(
                         Ok(mut pre_conn) => harvest_workflow_executions::table
                             .filter(harvest_workflow_executions::workflow_name.eq(&workflow_name))
                             .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
-                            .filter(
-                                harvest_workflow_executions::state
-                                    .eq_any(["RUNNING", "SUSPENDED", "PAUSED"]),
-                            )
+                            .filter(harvest_workflow_executions::state.eq_any([
+                                "RUNNING",
+                                "SUSPENDED",
+                                "PAUSED",
+                            ]))
                             .select(harvest_workflow_executions::id)
                             .first::<uuid::Uuid>(&mut pre_conn)
                             .await
@@ -5628,8 +5629,7 @@ async fn start_workflow(
                 .execution_timeout_secs
                 .map(chrono::Duration::seconds)
                 .or_else(|| {
-                    info_execution_timeout
-                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                    info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())
                 }),
             memo: request.memo.clone(),
             search_attrs: request.search_attrs.clone(),
