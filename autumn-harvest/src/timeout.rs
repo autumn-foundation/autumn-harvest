@@ -1702,9 +1702,8 @@ pub async fn enforce_workflow_history_ceiling(
         .map(|r| r.count)
         .unwrap_or(ceiling as i64);
 
-        let error_msg = format!(
-            "history_ceiling_exceeded: event count {event_count} >= ceiling {ceiling}"
-        );
+        let error_msg =
+            format!("history_ceiling_exceeded: event count {event_count} >= ceiling {ceiling}");
         let fail_event = WorkflowEvent::WorkflowFailed {
             error: error_msg.clone(),
         };
@@ -1740,18 +1739,16 @@ pub async fn enforce_workflow_history_ceiling(
                     store::append_single_event(conn, exec_id, fail_event).await?;
 
                     // Transition to FAILED state.
-                    diesel::update(
-                        harvest_workflow_executions::table.find(row.id),
-                    )
-                    .set((
-                        harvest_workflow_executions::state.eq("FAILED"),
-                        harvest_workflow_executions::output.eq(None::<serde_json::Value>),
-                        harvest_workflow_executions::error.eq(Some(error_msg.clone())),
-                        harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
-                    ))
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
+                    diesel::update(harvest_workflow_executions::table.find(row.id))
+                        .set((
+                            harvest_workflow_executions::state.eq("FAILED"),
+                            harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                            harvest_workflow_executions::error.eq(Some(error_msg.clone())),
+                            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
 
                     // Cancel outstanding task queue rows.
                     diesel::update(
