@@ -486,13 +486,8 @@ pub async fn claim_task(
               ) \
               AND ( \
                   candidate.rate_limit_key IS NULL \
-                  OR candidate.activity_name = ANY($5) \
-                  OR EXISTS ( \
-                      SELECT 1 FROM harvest_rate_limit_buckets rl \
-                      WHERE rl.key = candidate.rate_limit_key \
-                        AND LEAST(rl.burst, rl.tokens + EXTRACT(EPOCH FROM (NOW() - rl.last_refilled_at)) * rl.refill_rate) >= 1.0 \
-                      FOR UPDATE \
-                  ) \
+                  OR harvest_task_queue.activity_name = ANY($5) \
+                  OR pg_try_advisory_xact_lock(hashtext(candidate.rate_limit_key || ':rate_limit')::bigint) \
               ) \
             RETURNING harvest_task_queue.* \
         ), \

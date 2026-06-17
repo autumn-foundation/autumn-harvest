@@ -39,11 +39,12 @@ use autumn_harvest::audit::{
     OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL,
     OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
-    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
-    OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH,
-    TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY,
-    TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
+    OP_WORKFLOW_START, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK,
+    TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -2307,7 +2308,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         // operators re-prioritize a stuck pending task without restarting the
         // workflow. Already-running tasks ignore the change; the next retry
         // attempt uses the updated priority.
-        .route("/tasks/{id}", patch(patch_task_priority))
+        .route(
+            "/tasks/{id}",
+            patch(patch_task_priority).route_layer(require_admin.clone()),
+        )
         // Audit trail (issue #158): read-only endpoint to query management
         // API mutations. See `audit::ALL_MUTATION_ROUTES` for covered paths.
         .route("/admin/audit", get(list_audit_records))
@@ -13392,9 +13396,13 @@ struct PatchTaskPriorityResponse {
 
 async fn patch_task_priority(
     Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
     Path(task_id_str): Path<String>,
     Json(request): Json<PatchTaskPriorityRequest>,
 ) -> Result<impl IntoResponse, AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "PATCH /tasks/{id}";
+
     let task_id = task_id_str
         .parse::<uuid::Uuid>()
         .map_err(|_| AutumnError::bad_request_msg(format!("invalid task id '{task_id_str}'")))?;
@@ -13410,6 +13418,21 @@ async fn patch_task_priority(
                 .map_err(map_error)?;
 
         if updated {
+            let task_id_str_ref = task_id.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_TASK_REPRIORITIZE,
+                target_type: TARGET_TASK,
+                target_id: Some(task_id_str_ref.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
             return Ok((
                 StatusCode::OK,
                 Json(PatchTaskPriorityResponse {

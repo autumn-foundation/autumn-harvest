@@ -100,6 +100,8 @@ pub const OP_BUILD_COMPAT_REVOKE: &str = "build_routing.compat.revoke";
 pub const OP_CIRCUIT_FORCE_OPEN: &str = "circuit.force_open";
 /// Audit operation: Forced an activity circuit breaker closed (issue #369).
 pub const OP_CIRCUIT_FORCE_CLOSE: &str = "circuit.force_close";
+/// Audit operation: Re-prioritized a pending task queue item (issue #249).
+pub const OP_TASK_REPRIORITIZE: &str = "task.reprioritize";
 /// Audit operation: Created an admission gate (issue #377).
 pub const OP_GATE_CREATE: &str = "gate.create";
 /// Audit operation: Lifted (removed) an admission gate (issue #377).
@@ -108,6 +110,8 @@ pub const OP_GATE_LIFT: &str = "gate.lift";
 // ── Target type constants ─────────────────────────────────────────────────────
 
 pub const TARGET_CIRCUIT: &str = "circuit";
+/// Audit target type for task queue operations (issue #249).
+pub const TARGET_TASK: &str = "task";
 /// Audit target type for admission gate operations (issue #377).
 pub const TARGET_GATE: &str = "gate";
 pub const TARGET_WORKFLOW: &str = "workflow";
@@ -331,6 +335,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     // Retire is a read-only reachability check; no DB state is written.
     ("POST /admin/build-routing/retire", RouteClass::ReadOnly),
+    // Task queue management (issue #249)
+    ("PATCH /tasks/{id}", RouteClass::Mutating),
 ];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
@@ -372,6 +378,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // Admission gates (issue #377)
     OP_GATE_CREATE,
     OP_GATE_LIFT,
+    // Task queue management (issue #249)
+    OP_TASK_REPRIORITIZE,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -555,6 +563,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/gates", None),
     ("POST /admin/gates", Some(OP_GATE_CREATE)),
     ("DELETE /admin/gates/{id}", Some(OP_GATE_LIFT)),
+    // Task queue management (issue #249)
+    ("PATCH /tasks/{id}", Some(OP_TASK_REPRIORITIZE)),
 ];
 
 // ── Query filters ─────────────────────────────────────────────────────────────
