@@ -216,6 +216,7 @@ async fn scanner_times_out_pending_task_with_expired_schedule_to_close() {
         &None,
         &[],
         None,
+        None,
     )
     .await
     .expect("enforce_timeouts_once");
@@ -309,6 +310,7 @@ async fn scanner_times_out_running_task_with_expired_schedule_to_close() {
         &None,
         &[],
         None,
+        None,
     )
     .await
     .expect("enforce_timeouts_once");
@@ -395,6 +397,7 @@ async fn scanner_does_not_affect_tasks_without_schedule_to_close() {
         &None,
         &[],
         None,
+        None,
     )
     .await
     .expect("enforce_timeouts_once");
@@ -478,6 +481,7 @@ async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
         Duration::from_secs(60),
         &None,
         &[],
+        None,
         None,
     )
     .await
@@ -589,6 +593,7 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
         Duration::from_secs(60),
         &None,
         &[],
+        None,
         None,
     )
     .await

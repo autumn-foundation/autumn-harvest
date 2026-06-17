@@ -73,6 +73,11 @@ pub struct HarvestBuilder {
     /// larger than this ceiling is rejected with [`BuildError::ExecutionTimeoutExceedsCeiling`].
     /// `None` means no ceiling is enforced.
     max_workflow_execution_timeout: Option<Duration>,
+    /// Optional hard ceiling on the number of durable events a RUNNING workflow
+    /// execution may accumulate (issue #493). When a workflow's event count
+    /// reaches or exceeds this value the execution is terminated with
+    /// `WorkflowFailed` and a machine-readable reason. `None` = no ceiling.
+    max_workflow_history_events: Option<u64>,
     /// Maximum allowed byte length for an activity input payload (issue #252).
     /// Default: 2 MiB.
     max_activity_input_bytes: u64,
@@ -118,6 +123,7 @@ impl Default for HarvestBuilder {
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
             max_workflow_execution_timeout: None,
+            max_workflow_history_events: None,
             max_activity_input_bytes: DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
             max_activity_result_bytes: DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
             max_signal_payload_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
@@ -154,6 +160,10 @@ impl std::fmt::Debug for HarvestBuilder {
                 "max_workflow_execution_timeout",
                 &self.max_workflow_execution_timeout,
             )
+            .field(
+                "max_workflow_history_events",
+                &self.max_workflow_history_events,
+            )
             .field("max_activity_input_bytes", &self.max_activity_input_bytes)
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
@@ -187,6 +197,8 @@ pub struct BuiltHarvest {
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243). `None` = no ceiling.
     pub max_workflow_execution_timeout: Option<Duration>,
+    /// Hard ceiling on durable event count per execution (issue #493). `None` = no ceiling.
+    pub max_workflow_history_events: Option<u64>,
     /// Maximum allowed byte length for an activity input payload (issue #252).
     /// Default: 2 MiB.
     pub max_activity_input_bytes: u64,
@@ -231,6 +243,10 @@ impl std::fmt::Debug for BuiltHarvest {
             .field(
                 "max_workflow_execution_timeout",
                 &self.max_workflow_execution_timeout,
+            )
+            .field(
+                "max_workflow_history_events",
+                &self.max_workflow_history_events,
             )
             .field("max_activity_input_bytes", &self.max_activity_input_bytes)
             .field("max_activity_result_bytes", &self.max_activity_result_bytes)
@@ -451,6 +467,24 @@ pub enum HarvestBuilderError {
         role: &'static str,
         /// All workflow names currently registered on the builder.
         registered: Vec<String>,
+    },
+
+    /// `max_workflow_history_events` is set but is not strictly greater than
+    /// the configured soft `continue_as_new_threshold`.
+    ///
+    /// The hard ceiling must always be higher than the advisory threshold so a
+    /// workflow that crosses the soft line gets a chance to rotate via
+    /// `continue_as_new` before the ceiling terminates it.
+    #[error(
+        "max_workflow_history_events ({ceiling}) must be strictly greater than \
+         history_continue_as_new_threshold ({threshold}); \
+         raise the ceiling or lower the soft threshold"
+    )]
+    HistoryCeilingBelowSoftThreshold {
+        /// The configured hard ceiling.
+        ceiling: u64,
+        /// The configured soft continue-as-new threshold.
+        threshold: u64,
     },
 }
 
@@ -871,6 +905,24 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set a server-side hard ceiling on the number of durable events a RUNNING
+    /// workflow execution may accumulate (issue #493).
+    ///
+    /// When set, the background timeout scanner terminates any execution whose
+    /// recorded event count reaches or exceeds `ceiling` with `WorkflowFailed`
+    /// and a machine-readable error reason of the form
+    /// `"history_ceiling_exceeded: event count {n} >= ceiling {c}"`.
+    ///
+    /// `None` (the default) means no ceiling is enforced.
+    ///
+    /// The ceiling MUST be strictly greater than `history_continue_as_new_threshold`
+    /// (default 10,000). A misconfiguration is caught by [`Self::try_build`].
+    #[must_use]
+    pub const fn max_workflow_history_events(mut self, ceiling: Option<u64>) -> Self {
+        self.max_workflow_history_events = ceiling;
+        self
+    }
+
     /// Set a server-side ceiling on `execution_timeout` for all workflows (issue #243).
     ///
     /// When set, any `start_workflow` call that provides an `execution_timeout`
@@ -1066,6 +1118,16 @@ impl HarvestBuilder {
         validate_dag_schedules(&self.dags)?;
         validate_rate_limit_keys(&self.activities)?;
 
+        if let Some(ceiling) = self.max_workflow_history_events {
+            let threshold = self.history_policy.continue_as_new_threshold();
+            if ceiling <= threshold {
+                return Err(HarvestBuilderError::HistoryCeilingBelowSoftThreshold {
+                    ceiling,
+                    threshold,
+                });
+            }
+        }
+
         let mut worker_config = self.worker_config;
         let max_workflow_start_delay = self
             .max_workflow_start_delay
@@ -1092,6 +1154,7 @@ impl HarvestBuilder {
             payload_codecs: self.payload_codecs.clone(),
             history_policy: self.history_policy,
             max_workflow_execution_timeout: self.max_workflow_execution_timeout,
+            max_workflow_history_events: self.max_workflow_history_events,
             max_activity_input_bytes: self.max_activity_input_bytes,
             max_activity_result_bytes: self.max_activity_result_bytes,
             max_signal_payload_bytes: self.max_signal_payload_bytes,
@@ -1572,6 +1635,17 @@ pub struct WorkerConfig {
     pub max_workflow_pause_duration: Duration,
     /// Capability labels for hardware-aware and regional routing (issue #382).
     pub labels: std::collections::HashMap<String, String>,
+    /// Hard ceiling on the number of history events a workflow may accumulate
+    /// before the server terminates it (issue #493).
+    ///
+    /// When `Some(n)`, any `RUNNING` execution whose recorded event count
+    /// reaches `n` is failed with a machine-readable `WorkflowFailed` event
+    /// (`"history_ceiling_exceeded: event count {n} >= ceiling {n}"`).
+    /// This is a server-side safety net for workflows that do not cooperate
+    /// with `ctx.should_continue_as_new()`.
+    ///
+    /// Defaults to `None` (disabled).
+    pub max_workflow_history_events: Option<u64>,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
@@ -1600,6 +1674,7 @@ impl Default for WorkerConfig {
             poison_pill_threshold: 3,
             max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
             labels: std::collections::HashMap::new(),
+            max_workflow_history_events: None,
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -1820,6 +1895,18 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_labels(mut self, labels: impl IntoIterator<Item = (String, String)>) -> Self {
         self.labels.extend(labels);
+        self
+    }
+
+    /// Set the hard ceiling on workflow history events (issue #493).
+    ///
+    /// Pass `None` to disable (the default). When set, any `RUNNING` execution
+    /// that accumulates `n` or more events is terminated with
+    /// `history_ceiling_exceeded`. Must be strictly greater than
+    /// `continue_as_new_threshold` (checked at worker startup, not here).
+    #[must_use]
+    pub const fn with_max_workflow_history_events(mut self, ceiling: Option<u64>) -> Self {
+        self.max_workflow_history_events = ceiling;
         self
     }
 
@@ -2792,6 +2879,116 @@ mod tests {
                 }) if workflow_name == "unknown_target" && role == "target"
             ),
             "Expected UnknownCompletionTriggerWorkflow error for target, got: {result:?}"
+        );
+    }
+
+    // --- AC3 / AC5 / AC6: max_workflow_history_events builder tests (issue #493) ---
+
+    #[test]
+    fn builder_max_workflow_history_events_defaults_to_none() {
+        let built = HarvestBuilder::new().build();
+        assert_eq!(
+            built.max_workflow_history_events, None,
+            "ceiling must default to None (no ceiling enforced)"
+        );
+    }
+
+    #[test]
+    fn builder_max_workflow_history_events_is_carried_through_build() {
+        // Default soft threshold is 10_000; ceiling must be strictly greater.
+        let built = HarvestBuilder::new()
+            .max_workflow_history_events(Some(50_000))
+            .build();
+        assert_eq!(built.max_workflow_history_events, Some(50_000));
+    }
+
+    #[test]
+    fn builder_max_workflow_history_events_none_clears_ceiling() {
+        let built = HarvestBuilder::new()
+            .max_workflow_history_events(Some(50_000))
+            .max_workflow_history_events(None)
+            .build();
+        assert_eq!(built.max_workflow_history_events, None);
+    }
+
+    #[test]
+    fn builder_max_workflow_history_events_must_be_strictly_greater_than_soft_threshold() {
+        // Default soft threshold is 10_000; a ceiling of 9_999 must fail.
+        let result = HarvestBuilder::new()
+            .max_workflow_history_events(Some(9_999))
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::HistoryCeilingBelowSoftThreshold {
+                    ceiling: 9_999,
+                    threshold: 10_000,
+                })
+            ),
+            "expected HistoryCeilingBelowSoftThreshold but got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_max_workflow_history_events_exactly_equal_to_threshold_fails() {
+        // Ceiling == soft threshold must also fail (strictly-greater required).
+        let result = HarvestBuilder::new()
+            .max_workflow_history_events(Some(10_000))
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::HistoryCeilingBelowSoftThreshold {
+                    ceiling: 10_000,
+                    threshold: 10_000,
+                })
+            ),
+            "expected HistoryCeilingBelowSoftThreshold for equal values but got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_max_workflow_history_events_error_message_is_informative() {
+        let err = HarvestBuilder::new()
+            .max_workflow_history_events(Some(5_000))
+            .try_build()
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("5000"),
+            "error message should contain ceiling: {msg}"
+        );
+        assert!(
+            msg.contains("10000"),
+            "error message should contain threshold: {msg}"
+        );
+    }
+
+    #[test]
+    fn builder_ceiling_above_custom_soft_threshold_passes() {
+        // With a custom soft threshold of 500, a ceiling of 501 must succeed.
+        let built = HarvestBuilder::new()
+            .history_continue_as_new_threshold(500)
+            .max_workflow_history_events(Some(501))
+            .build();
+        assert_eq!(built.max_workflow_history_events, Some(501));
+    }
+
+    #[test]
+    fn builder_ceiling_equal_to_custom_soft_threshold_fails() {
+        let result = HarvestBuilder::new()
+            .history_continue_as_new_threshold(500)
+            .max_workflow_history_events(Some(500))
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::HistoryCeilingBelowSoftThreshold {
+                    ceiling: 500,
+                    threshold: 500,
+                })
+            ),
+            "expected failure when ceiling == custom threshold, got {result:?}"
         );
     }
 }

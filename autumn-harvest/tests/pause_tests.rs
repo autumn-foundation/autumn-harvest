@@ -183,6 +183,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             poison_pill_threshold: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             labels: std::collections::HashMap::new(),
+            max_workflow_history_events: None,
             sharded_pool: None,
         },
         registry,

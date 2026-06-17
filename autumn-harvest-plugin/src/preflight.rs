@@ -78,6 +78,7 @@ pub async fn build_preflight_report(api_state: &HarvestApiState) -> PreflightRep
     checks.push(check_dlq_read_access(api_state).await);
     checks.push(check_retention_visibility(api_state));
     checks.push(check_admin_auth_boundary(api_state));
+    checks.push(check_history_ceiling_config(api_state));
 
     let overall_status = checks
         .iter()
@@ -1207,6 +1208,65 @@ fn check_admin_auth_boundary(api_state: &HarvestApiState) -> PreflightCheckResul
             "auth_boundary_present": has_boundary,
         }),
     )
+}
+
+fn check_history_ceiling_config(api_state: &HarvestApiState) -> PreflightCheckResult {
+    let ceiling = api_state.max_workflow_history_events();
+    let soft_threshold = api_state
+        .runtime()
+        .ok()
+        .map(|rt| rt.registry().history_policy().continue_as_new_threshold());
+
+    match (ceiling, soft_threshold) {
+        (Some(ceiling), Some(threshold)) => check(
+            "history_ceiling_config",
+            PreflightStatus::Pass,
+            "hard history event ceiling is configured and validated above the soft threshold",
+            None,
+            Vec::new(),
+            json!({
+                "ceiling_enabled": true,
+                "max_workflow_history_events": ceiling,
+                "continue_as_new_threshold": threshold,
+                "headroom": ceiling.saturating_sub(threshold),
+            }),
+        ),
+        (Some(ceiling), None) => check(
+            "history_ceiling_config",
+            PreflightStatus::Pass,
+            "hard history event ceiling is configured",
+            None,
+            Vec::new(),
+            json!({
+                "ceiling_enabled": true,
+                "max_workflow_history_events": ceiling,
+                "continue_as_new_threshold": null,
+            }),
+        ),
+        (None, Some(threshold)) => check(
+            "history_ceiling_config",
+            PreflightStatus::Pass,
+            "history ceiling is disabled; soft continue-as-new threshold is the only guard",
+            None,
+            Vec::new(),
+            json!({
+                "ceiling_enabled": false,
+                "continue_as_new_threshold": threshold,
+                "note": "set max_workflow_history_events on HarvestBuilder to enable the hard ceiling",
+            }),
+        ),
+        (None, None) => check(
+            "history_ceiling_config",
+            PreflightStatus::Pass,
+            "history ceiling is disabled and no runtime is available to inspect the soft threshold",
+            None,
+            Vec::new(),
+            json!({
+                "ceiling_enabled": false,
+                "continue_as_new_threshold": null,
+            }),
+        ),
+    }
 }
 
 #[cfg(test)]

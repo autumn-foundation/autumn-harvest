@@ -114,6 +114,7 @@ impl PreparedHarvestRuntime {
             .map(|dag| dag.name.to_string())
             .collect();
         let workflow_schedules = Arc::new(built.workflow_schedules().to_vec());
+        let max_workflow_history_events = built.max_workflow_history_events;
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
@@ -125,13 +126,20 @@ impl PreparedHarvestRuntime {
             compile_dag_catalog(dags)
                 .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
         );
+        let mut worker_runtime_config = WorkerRuntimeConfig::from(worker_config);
+        // Builder-level ceiling takes precedence; WorkerConfig ceiling is kept
+        // when the builder did not set one (avoids silently disabling a ceiling
+        // that the embedder configured via WorkerConfig directly).
+        if let Some(ceiling) = max_workflow_history_events {
+            worker_runtime_config.max_workflow_history_events = Some(ceiling);
+        }
 
         Ok(Self {
             registry: Arc::new(registry),
             dag_catalog,
             registered_dag_names,
             workflow_schedules,
-            worker_runtime_config: WorkerRuntimeConfig::from(worker_config),
+            worker_runtime_config,
             storage_pool: HarvestDbPool::from(resources.harvest_pool),
             shard_router,
             retention_config,

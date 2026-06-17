@@ -1496,6 +1496,7 @@ pub async fn enforce_timeouts_once(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
     circuit_breakers: Option<&crate::circuit_breaker::CircuitBreakerRegistry>,
+    max_workflow_history_events: Option<u64>,
 ) -> HarvestResult<usize> {
     let timed_out = find_timed_out_tasks(conn).await?;
     let mut count = timed_out.len();
@@ -1567,6 +1568,9 @@ pub async fn enforce_timeouts_once(
         shard_assignments,
     )
     .await?;
+    if let Some(ceiling) = max_workflow_history_events {
+        count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
+    }
     Ok(count)
 }
 
@@ -1587,6 +1591,7 @@ pub fn spawn_timeout_checker(
     sharded_pool: Option<crate::shard::ShardedDbPool>,
     shard_assignments: Vec<crate::types::ShardId>,
     circuit_breakers: std::sync::Arc<crate::circuit_breaker::CircuitBreakerRegistry>,
+    max_workflow_history_events: Option<u64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1608,6 +1613,7 @@ pub fn spawn_timeout_checker(
                     &sharded_pool,
                     &shard_assignments,
                     Some(&circuit_breakers),
+                    max_workflow_history_events,
                 )
                 .await
                 {
@@ -1629,6 +1635,201 @@ pub fn spawn_timeout_checker(
             }
         }
     })
+}
+
+/// Terminate RUNNING workflow executions whose durable event count has reached
+/// or exceeded the operator-configured hard ceiling (issue #493).
+///
+/// The ceiling is set via `HarvestBuilder::max_workflow_history_events`.  No
+/// new `WorkflowEvent` variant is introduced: each affected execution receives
+/// an ordinary `WorkflowFailed` event with a machine-readable error string of
+/// the form `"history_ceiling_exceeded: event count {n} >= ceiling {c}"`, and
+/// its state transitions to `FAILED`.  Outstanding task-queue rows are
+/// cancelled and any awaiting parent is notified.
+///
+/// Idempotency: the inner transaction re-checks `state = 'RUNNING'` under a
+/// `FOR UPDATE` lock, so a concurrent completion or a duplicate scanner tick
+/// can never double-append the failure event.
+///
+/// Returns the number of executions that were terminated.
+///
+/// # Errors
+///
+/// Returns the first database or persistence error encountered.
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
+pub async fn enforce_workflow_history_ceiling(
+    conn: &mut AsyncPgConnection,
+    ceiling: u64,
+    metrics: &(dyn MetricsRecorder + Send + Sync),
+) -> HarvestResult<usize> {
+    use diesel::sql_types::{BigInt, Nullable, Text, Uuid as SqlUuid};
+
+    // Find RUNNING executions whose recorded event count >= ceiling.
+    // The event_count is selected inline to avoid an N+1 query pattern.
+    #[derive(diesel::QueryableByName)]
+    struct OversizedRow {
+        #[diesel(sql_type = SqlUuid)]
+        id: uuid::Uuid,
+        #[diesel(sql_type = Text)]
+        workflow_id: String,
+        #[diesel(sql_type = Text)]
+        workflow_name: String,
+        #[diesel(sql_type = Text)]
+        queue_name: String,
+        #[diesel(sql_type = Nullable<SqlUuid>)]
+        parent_id: Option<uuid::Uuid>,
+        #[diesel(sql_type = Nullable<Text>)]
+        parent_close_policy: Option<String>,
+        #[diesel(sql_type = BigInt)]
+        event_count: i64,
+    }
+
+    let ceiling_i64 = i64::try_from(ceiling).unwrap_or(i64::MAX);
+    let oversized: Vec<OversizedRow> = diesel::sql_query(
+        "SELECT id, workflow_id, workflow_name, queue_name, parent_id, parent_close_policy, \
+         (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id)::bigint AS event_count \
+         FROM harvest_workflow_executions \
+         WHERE state = 'RUNNING' \
+         AND (SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= $1",
+    )
+    .bind::<BigInt, _>(ceiling_i64)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    let count = oversized.len();
+
+    for row in &oversized {
+        let exec_id = execution_id_from_uuid(row.id);
+        let event_count = row.event_count;
+
+        let error_msg =
+            format!("history_ceiling_exceeded: event count {event_count} >= ceiling {ceiling}");
+        let fail_event = WorkflowEvent::WorkflowFailed {
+            error: error_msg.clone(),
+        };
+
+        let parent_uuid = if row.parent_close_policy.is_none() {
+            row.parent_id
+        } else {
+            None
+        };
+        let workflow_name = row.workflow_name.clone();
+        let queue_name = row.queue_name.clone();
+
+        let (applied, deferred_starts) = conn
+            .transaction::<(bool, Vec<crate::completion_trigger::DeferredTriggerStart>), HarvestError, _>(|conn| {
+                let fail_event = fail_event.clone();
+                let error_msg = error_msg.clone();
+                async move {
+                    // Re-check state under FOR UPDATE to guard against concurrent
+                    // completion or a duplicate scanner tick.
+                    let current_state: Option<String> = harvest_workflow_executions::table
+                        .find(row.id)
+                        .for_update()
+                        .select(harvest_workflow_executions::state)
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+
+                    if current_state.as_deref() != Some("RUNNING") {
+                        return Ok((false, Vec::new()));
+                    }
+
+                    store::append_single_event(conn, exec_id, fail_event).await?;
+
+                    // Transition to FAILED state.
+                    diesel::update(harvest_workflow_executions::table.find(row.id))
+                        .set((
+                            harvest_workflow_executions::state.eq("FAILED"),
+                            harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+                            harvest_workflow_executions::error.eq(Some(error_msg.clone())),
+                            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+
+                    // Cancel outstanding task queue rows.
+                    diesel::update(
+                        harvest_task_queue::table
+                            .filter(harvest_task_queue::workflow_exec_id.eq(row.id))
+                            .filter(
+                                harvest_task_queue::state
+                                    .eq("PENDING")
+                                    .or(harvest_task_queue::state.eq("RUNNING")),
+                            ),
+                    )
+                    .set((
+                        harvest_task_queue::state.eq("FAILED"),
+                        harvest_task_queue::error.eq(Some(&error_msg)),
+                        harvest_task_queue::completed_at.eq(Some(Utc::now())),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
+                    if let Some(parent_uuid) = parent_uuid {
+                        wake_parent_for_child_timeout(
+                            conn,
+                            execution_id_from_uuid(parent_uuid),
+                            exec_id,
+                            &error_msg,
+                        )
+                        .await?;
+                    }
+
+                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Failed,
+                        Some(metrics),
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+                    Ok((true, deferred))
+                }
+                .scope_boxed()
+            })
+            .await?;
+
+        if !applied {
+            continue;
+        }
+
+        for start in deferred_starts {
+            start.spawn();
+        }
+
+        tracing::warn!(
+            exec_id = %exec_id,
+            workflow_name = %workflow_name,
+            ceiling = ceiling,
+            "workflow execution terminated: history ceiling exceeded"
+        );
+
+        metrics.record_workflow_terminal(
+            &workflow_name,
+            &queue_name,
+            crate::telemetry::WorkflowStatus::Failed,
+        );
+
+        // Best-effort: count ceiling failures toward the schedule auto-pause threshold.
+        // Called after the transaction commits so a counter query failure cannot
+        // roll back the terminal transition.
+        crate::scheduler::maybe_increment_schedule_failure_counter(
+            conn,
+            &row.workflow_id,
+            &workflow_name,
+            metrics,
+        )
+        .await;
+    }
+
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------

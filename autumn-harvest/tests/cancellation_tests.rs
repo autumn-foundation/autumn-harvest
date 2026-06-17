@@ -491,6 +491,7 @@ async fn signal_insert_waits_for_concurrent_cancellation_lock() {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn running_activity_heartbeat_observes_workflow_cancellation() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -523,6 +524,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                max_workflow_history_events: None,
                 sharded_pool: None,
             },
             registry,
@@ -727,6 +729,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                max_workflow_history_events: None,
                 sharded_pool: None,
             },
             registry,
@@ -875,6 +878,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                max_workflow_history_events: None,
                 sharded_pool: None,
             },
             registry,
@@ -1018,6 +1022,7 @@ async fn activity_without_cancellation_check_completes_normally() {
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                max_workflow_history_events: None,
                 sharded_pool: None,
             },
             registry,
