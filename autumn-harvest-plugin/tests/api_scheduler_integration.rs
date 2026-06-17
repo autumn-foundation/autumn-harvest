@@ -6625,6 +6625,7 @@ async fn api_trigger_preserves_dag_metadata() {
     }
 
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
