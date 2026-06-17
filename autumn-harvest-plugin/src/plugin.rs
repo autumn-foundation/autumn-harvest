@@ -324,7 +324,7 @@ async fn start_harvest_runtime(
     api_state.set_max_workflow_history_events(
         built
             .max_workflow_history_events
-            .or(built.worker_config().max_workflow_history_events),
+            .or_else(|| built.worker_config().max_workflow_history_events),
     );
     // Propagate the server-side start delay ceiling (issue #322).
     api_state.set_max_workflow_start_delay(built.worker_config().max_workflow_start_delay);
