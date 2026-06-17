@@ -369,7 +369,7 @@ pub async fn claim_task(
              SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), '{}'::jsonb) AS labels \
          ), \
          candidate AS ( \
-             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key \
+             SELECT id, task_type, concurrency_key, concurrency_cap, rate_limit_key, activity_name \
              FROM harvest_task_queue \
              CROSS JOIN worker_info \
              WHERE queue_name = ANY($2) \
@@ -463,6 +463,16 @@ pub async fn claim_task(
                  scheduled_at ASC \
              LIMIT 1 FOR UPDATE SKIP LOCKED \
         ), \
+        rate_limit_debit AS ( \
+            UPDATE harvest_rate_limit_buckets b \
+            SET tokens = LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) - 1.0, \
+                last_refilled_at = NOW() \
+            FROM candidate \
+            WHERE b.key = candidate.rate_limit_key \
+              AND NOT (candidate.activity_name = ANY($5)) \
+              AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+            RETURNING b.key AS debited_key \
+        ), \
         claimed AS ( \
             UPDATE harvest_task_queue \
             SET state = 'RUNNING', worker_id = $1, started_at = NOW(), attempt = attempt + 1 \
@@ -486,20 +496,10 @@ pub async fn claim_task(
               ) \
               AND ( \
                   candidate.rate_limit_key IS NULL \
-                  OR harvest_task_queue.activity_name = ANY($5) \
-                  OR pg_try_advisory_xact_lock(hashtext(candidate.rate_limit_key || ':rate_limit')::bigint) \
+                  OR candidate.activity_name = ANY($5) \
+                  OR EXISTS (SELECT 1 FROM rate_limit_debit WHERE debited_key = candidate.rate_limit_key) \
               ) \
             RETURNING harvest_task_queue.* \
-        ), \
-        decrement_bucket AS ( \
-            UPDATE harvest_rate_limit_buckets b \
-            SET tokens = LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) - 1.0, \
-                last_refilled_at = NOW() \
-            FROM claimed \
-            WHERE b.key = claimed.rate_limit_key \
-              AND NOT (claimed.activity_name = ANY($5)) \
-              AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
-            RETURNING b.key \
         ) \
         SELECT * FROM claimed",
     )

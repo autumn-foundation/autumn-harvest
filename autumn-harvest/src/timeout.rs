@@ -592,8 +592,13 @@ async fn enforce_activity_timeout(
     // until its total deadline elapsed without any handler being dispatched.
     // No downstream call was made, so the breaker must NOT be fed — a backlog
     // spike would otherwise incorrectly open the circuit.
-    let downstream_call_made =
-        matches!(reason, TimeoutReason::ScheduleToClose) && task.state == "PENDING";
+    // ScheduleToStart: task sat in the queue until the schedule-to-start window
+    // expired without ever being dispatched — no downstream call was made.
+    // ScheduleToClose on a PENDING task: total deadline expired before dispatch.
+    // Neither case represents a downstream failure; suppress the breaker so a
+    // queue backlog does not incorrectly open the circuit.
+    let downstream_call_made = matches!(reason, TimeoutReason::ScheduleToStart)
+        || (matches!(reason, TimeoutReason::ScheduleToClose) && task.state == "PENDING");
     if enforced
         && !downstream_call_made
         && let Some(breakers) = circuit_breakers

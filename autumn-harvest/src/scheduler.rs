@@ -2767,7 +2767,11 @@ async fn tick_one_workflow_schedule(
                 concurrency_key,
                 concurrency_limit,
                 priority: Priority::default(),
-                max_workflow_input_bytes: 0,
+                max_workflow_input_bytes: wf_info
+                    .and_then(|info| info.max_input_bytes)
+                    .map_or(registry.max_workflow_input_bytes, |per| {
+                        per.max(registry.max_workflow_input_bytes)
+                    }),
                 start_at: None,
                 delay: None,
                 max_workflow_start_delay: None,

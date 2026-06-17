@@ -804,6 +804,26 @@ pub async fn enforce_completion_triggers_outbox(
                     .execute(conn)
                     .await;
             }
+            Err(crate::error::HarvestError::PayloadTooLarge {
+                kind,
+                observed_bytes,
+                cap_bytes,
+                ..
+            }) => {
+                // Permanent error: payload will never fit regardless of retries.
+                // Delete the outbox row so it does not retry forever.
+                tracing::error!(
+                    target_workflow = %task.target_workflow_name,
+                    kind = %kind,
+                    observed_bytes,
+                    cap_bytes,
+                    "[completion_trigger outbox] permanent error: oversized input payload; deleting outbox row"
+                );
+                let _ = diesel::delete(outbox_dsl::harvest_completion_trigger_outbox)
+                    .filter(outbox_dsl::id.eq(task.id))
+                    .execute(conn)
+                    .await;
+            }
             Err(e) => {
                 tracing::error!(
                     "[completion_trigger outbox] Failed to start workflow execution cross-shard: {:?}",

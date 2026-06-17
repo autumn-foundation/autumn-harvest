@@ -6125,6 +6125,50 @@ async fn batch_start_workflows(
             let item = &request.items[*idx];
             let input = item.input.clone().unwrap_or(Value::Null);
 
+            // Validate input against the workflow's published JSON Schema (if any).
+            if let Some(info) = runtime.registry.workflows.get(&item.workflow_name)
+                && let Err(violations) = info.validate_input(&input)
+            {
+                rejected_count += 1;
+                let err_msg = violations
+                    .iter()
+                    .map(|v| match &v.field_path {
+                        Some(fp) => format!("{} at {fp}", v.message),
+                        None => v.message.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                results.push(BatchStartItemResult {
+                    index: *idx,
+                    status: BatchStartItemStatus::Rejected,
+                    execution_id: None,
+                    error: Some(format!("input validation failed: {err_msg}")),
+                });
+                if request.atomic {
+                    let () = audit_batch_start_failure(
+                        &api_state,
+                        &actor,
+                        &source,
+                        request_id.as_deref(),
+                        route,
+                        "atomic batch rejected: input schema validation failed",
+                    )
+                    .await;
+                    results.sort_by_key(|r| r.index);
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(BatchStartRejectedResponse {
+                            message: format!(
+                                "atomic batch aborted: item {idx} failed input schema validation"
+                            ),
+                            rejected: results,
+                        }),
+                    )
+                        .into_response();
+                }
+                continue;
+            }
+
             // Workflow-specific cap takes precedence; global cap is the fallback.
             let effective_wf_cap = runtime
                 .registry
