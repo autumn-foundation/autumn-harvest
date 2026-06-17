@@ -10659,6 +10659,21 @@ async fn trigger_schedule_now(
         .workflows
         .get(&workflow_name)
         .and_then(|info| clamp_info_default_sla(info.sla, info.execution_timeout));
+    let info_execution_timeout = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.execution_timeout)
+        .and_then(|d| chrono::Duration::from_std(d).ok());
+    let (concurrency_key, concurrency_limit) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.concurrency.as_ref())
+        .map_or((None, None), |policy| {
+            let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
+            (key, Some(policy.limit))
+        });
 
     let result = start_or_load_workflow_execution(
         &mut exec_conn,
@@ -10669,14 +10684,16 @@ async fn trigger_schedule_now(
             input: input.clone(),
             parent_id: None,
             queue_name: &queue_name,
-            execution_timeout: None,
+            execution_timeout: info_execution_timeout,
             memo: None,
             search_attrs: None,
             reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
             trace_context: None,
-            max_execution_timeout_ceiling: None,
-            concurrency_key: None,
-            concurrency_limit: None,
+            max_execution_timeout_ceiling: api_state
+                .max_workflow_execution_timeout()
+                .map(|d| chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)),
+            concurrency_key,
+            concurrency_limit,
             priority: Priority::default(),
             max_workflow_input_bytes: runtime
                 .registry

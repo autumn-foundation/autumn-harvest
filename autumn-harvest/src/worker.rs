@@ -3080,13 +3080,22 @@ async fn persist_all_started_child_workflows(
             // Insert rows and enqueue tasks for new children.
             for child in &new_children {
                 let child_workflow_id = child.child_id.to_string();
-                let (owner, runbook_url, severity, child_sla) = registry
+                let (owner, runbook_url, severity, child_sla, child_execution_timeout) = registry
                     .workflows
                     .get(child.workflow_name.as_str())
-                    .map_or((None, None, None, None), |w| {
-                        (w.owner, w.runbook_url, w.severity, w.sla)
+                    .map_or((None, None, None, None, None), |w| {
+                        (
+                            w.owner,
+                            w.runbook_url,
+                            w.severity,
+                            w.sla,
+                            w.execution_timeout,
+                        )
                     });
+                let child_execution_timeout =
+                    child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
                 let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+                let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
                 let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
                 let child_row = NewWorkflowExecution {
                     id: child.child_id.as_uuid(),
@@ -3097,8 +3106,8 @@ async fn persist_all_started_child_workflows(
                     input: child.input.clone(),
                     parent_id: Some(parent_exec_id.as_uuid()),
                     queue_name: &queue_name,
-                    execution_timeout: None,
-                    deadline_at: None,
+                    execution_timeout: child_execution_timeout,
+                    deadline_at: child_deadline_at,
                     sla: child_sla,
                     sla_deadline_at: child_sla_deadline_at,
                     memo: None,

@@ -242,12 +242,18 @@ pub async fn resolve_target_queue(
             .unwrap_or_else(|| "default".to_string());
     }
 
-    // Otherwise, acquire a connection to Shard 0 to query the schedules.
+    // Otherwise, acquire a connection to the configured default shard to query
+    // the schedules. Schedules are created on the default shard; using a
+    // hard-coded shard 0 would miss them in deployments where the default shard
+    // is not 0.
     let default_pool = crate::shard::GLOBAL_SHARDED_POOL
         .read()
         .ok()
         .and_then(|p| p.clone())
-        .map(|sp| sp.pool_for(crate::types::ShardId::new(0)).clone());
+        .map(|sp| {
+            let shard = sp.default_shard();
+            sp.pool_for(shard).clone()
+        });
 
     if let Some(dp) = default_pool
         && let Ok(mut default_conn) = dp.get().await

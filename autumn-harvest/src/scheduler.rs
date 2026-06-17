@@ -2758,7 +2758,9 @@ async fn tick_one_workflow_schedule(
                 input,
                 parent_id: None,
                 queue_name: dispatch_queue,
-                execution_timeout: None,
+                execution_timeout: wf_info
+                    .and_then(|info| info.execution_timeout)
+                    .and_then(|d| chrono::Duration::from_std(d).ok()),
                 memo: None,
                 search_attrs: None,
                 reuse_policy: scheduled_workflow_reuse_policy(),
