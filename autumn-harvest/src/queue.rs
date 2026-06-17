@@ -493,6 +493,7 @@ pub async fn claim_task(
             FROM claimed \
             WHERE b.key = claimed.rate_limit_key \
               AND NOT (claimed.activity_name = ANY($5)) \
+              AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
             RETURNING b.key \
         ) \
         SELECT * FROM claimed",

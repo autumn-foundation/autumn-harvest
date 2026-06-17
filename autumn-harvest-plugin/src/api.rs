@@ -5316,7 +5316,7 @@ async fn start_workflow(
                             .filter(harvest_workflow_executions::workflow_id.eq(&workflow_id))
                             .filter(
                                 harvest_workflow_executions::state
-                                    .ne_all(["CONTINUED_AS_NEW", "TERMINATED"]),
+                                    .eq_any(["RUNNING", "SUSPENDED", "PAUSED"]),
                             )
                             .select(harvest_workflow_executions::id)
                             .first::<uuid::Uuid>(&mut pre_conn)
@@ -10369,6 +10369,11 @@ async fn trigger_schedule_now(
     // pool.default_pool() here would target zero rows (issue #478).
     let sched_pool = pool.pool_for(schedule_shard);
     let mut sched_conn = acquire_conn(sched_pool).await?;
+    // Acquire a connection on the execution shard so the start call lands on the
+    // correct Postgres database (trigger_exec_shard was resolved above via the
+    // ShardRouter — using pool.default_pool() here would silently misroute in
+    // multi-shard deployments).
+    let mut exec_conn = acquire_conn(pool.pool_for(trigger_exec_shard)).await?;
 
     // For Skip policy, fail closed: if the running-count query fails on any shard,
     // treat it as saturated rather than silently firing through.
@@ -10449,11 +10454,7 @@ async fn trigger_schedule_now(
         }
     }
 
-    // ExecutionId::new() embeds ShardId::UNENCODED, which ShardRouter resolves to
-    // the default shard. This is consistent with how the scheduler fires executions
-    // (all schedule-initiated runs land on the default shard in single-shard
-    // deployments; multi-shard schedule pinning is a follow-up to issue #171).
-    let exec_id = ExecutionId::new();
+    let exec_id = ExecutionId::new_for_shard(trigger_exec_shard);
 
     let (owner, runbook_url, severity) = {
         let wf_meta = runtime
@@ -10487,7 +10488,7 @@ async fn trigger_schedule_now(
         .and_then(|info| clamp_info_default_sla(info.sla, info.execution_timeout));
 
     let result = start_or_load_workflow_execution(
-        &mut conn,
+        &mut exec_conn,
         StartWorkflowParams {
             workflow_name: &workflow_name,
             workflow_id: &workflow_id,
