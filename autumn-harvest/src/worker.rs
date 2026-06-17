@@ -7842,6 +7842,7 @@ mod tests {
             poison_pill_threshold: 3,
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             labels: std::collections::HashMap::new(),
+            max_workflow_history_events: None,
             #[cfg(feature = "db")]
             sharded_pool: None,
         };

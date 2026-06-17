@@ -375,6 +375,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 poison_pill_threshold: 3,
                 labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+                max_workflow_history_events: None,
                 sharded_pool: None,
             },
             registry,
@@ -2226,6 +2227,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         poison_pill_threshold: 3,
         labels: std::collections::HashMap::new(),
         max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
+        max_workflow_history_events: None,
         sharded_pool: None,
     };
     let worker = Arc::new(Worker::new(config, registry).expect("worker should build"));
