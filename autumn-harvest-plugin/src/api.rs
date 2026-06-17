@@ -6860,7 +6860,10 @@ async fn signal_with_start_workflow(
             queue_name: &queue_name,
             execution_timeout: request
                 .execution_timeout_secs
-                .map(chrono::Duration::seconds),
+                .map(chrono::Duration::seconds)
+                .or_else(|| {
+                    info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())
+                }),
             memo: request.memo,
             search_attrs: request.search_attrs,
             reuse_policy,
@@ -7308,6 +7311,39 @@ async fn update_with_start_workflow(
         });
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
+    // Run the registered update handler's validator (if any) before admitting.
+    if let Some(update_info) = runtime
+        .registry
+        .update_handlers
+        .iter()
+        .find(|h| h.workflow == workflow_name && h.name == request.update_name)
+        && let Some(validator) = update_info.validator
+        && let Err(reason) = (validator)(&update_args)
+    {
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_UPDATE_WITH_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: None,
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: request.idempotency_key.as_deref(),
+            status: STATUS_FAILED,
+            error_summary: Some("update validator rejected"),
+            shard_id: Some(shard.as_i32()),
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "update rejected by validator",
+                "reason": reason,
+            })),
+        )
+            .into_response();
+    }
+
     let params = UpdateWithStartParams {
         workflow_name: &workflow_name,
         workflow_id: &workflow_id,
@@ -7317,7 +7353,8 @@ async fn update_with_start_workflow(
         queue_name: &queue_name,
         execution_timeout: request
             .execution_timeout_secs
-            .map(chrono::Duration::seconds),
+            .map(chrono::Duration::seconds)
+            .or_else(|| info_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok())),
         memo: request.memo,
         search_attrs: request.search_attrs,
         reuse_policy,

@@ -284,6 +284,10 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ),
                             ::std::option::Option::None => ::std::option::Option::None,
                         };
+                        let concurrency_key = Self::info().concurrency.and_then(|p|
+                            ::autumn_harvest::concurrency::resolve_concurrency_key(p.key_expr, &start_input)
+                        );
+                        let concurrency_limit = Self::info().concurrency.map(|p| p.limit);
                         let params = ::autumn_harvest::UpdateWithStartParams {
                             workflow_name: #workflow_simple_name,
                             workflow_id: &workflow_id,
@@ -299,8 +303,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ),
                             trace_context: opts.trace_context,
                             max_execution_timeout_ceiling,
-                            concurrency_key: ::std::option::Option::None,
-                            concurrency_limit: ::std::option::Option::None,
+                            concurrency_key,
+                            concurrency_limit,
                             update_id,
                             update_name: #fn_name_str.to_string(),
                             update_args,
@@ -407,6 +411,10 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 ),
                                 ::std::option::Option::None => ::std::option::Option::None,
                             };
+                            let concurrency_key = Self::info().concurrency.and_then(|p|
+                                ::autumn_harvest::concurrency::resolve_concurrency_key(p.key_expr, &start_input)
+                            );
+                            let concurrency_limit = Self::info().concurrency.map(|p| p.limit);
                             let params = ::autumn_harvest::UpdateWithStartParams {
                                 workflow_name: #workflow_simple_name,
                                 workflow_id: &workflow_id,
@@ -422,8 +430,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 ),
                                 trace_context: opts.trace_context,
                                 max_execution_timeout_ceiling,
-                                concurrency_key: ::std::option::Option::None,
-                                concurrency_limit: ::std::option::Option::None,
+                                concurrency_key,
+                                concurrency_limit,
                                 update_id,
                                 update_name: #fn_name_str.to_string(),
                                 update_args,
