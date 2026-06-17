@@ -3357,6 +3357,7 @@ async fn timeout_sweeper_does_not_append_timeout_after_activity_completion() {
             &None,
             &[],
             None,
+            None,
         )
         .await
     });
