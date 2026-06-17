@@ -2239,7 +2239,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/schedules/{id}/pause", post(pause_schedule))
         .route("/admin/schedules/{id}/resume", post(resume_schedule))
         .route("/admin/schedules/{id}/backfill", post(schedule_backfill))
-        .route("/admin/schedules/{id}/trigger", post(trigger_schedule_now))
+        .route(
+            "/admin/schedules/{id}/trigger",
+            post(trigger_schedule_now).route_layer(require_admin.clone()),
+        )
         .route("/admin/schedules/{id}", delete(delete_schedule))
         .route("/admin/schedules/decisions", get(list_fleet_decisions))
         .route(
@@ -6078,6 +6081,64 @@ async fn batch_start_workflows(
     for r in gate_rejected {
         results.push(r);
         rejected_count += 1;
+    }
+
+    // ── Atomic pre-flight schema check ──────────────────────────────────────
+    // For atomic=true we guarantee zero inserts when any item is invalid.
+    // Gate rejections are already handled above.  Schema validation is pure
+    // (no DB), so run it over every surviving item now, before Phase 2 acquires
+    // any shard connection.  This prevents the race where item N's validation
+    // failure returns 409 after items 0..N-1 were already started.
+    if request.atomic {
+        let mut schema_violations: Vec<BatchStartItemResult> = Vec::new();
+        for (idx, _) in shard_groups.values().flatten() {
+            let item = &request.items[*idx];
+            let input = item.input.clone().unwrap_or(Value::Null);
+            if let Some(info) = runtime.registry.workflows.get(&item.workflow_name)
+                && let Err(violations) = info.validate_input(&input)
+            {
+                let err_msg = violations
+                    .iter()
+                    .map(|v| {
+                        v.field_path.as_ref().map_or_else(
+                            || v.message.clone(),
+                            |fp| format!("{} at {fp}", v.message),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                schema_violations.push(BatchStartItemResult {
+                    index: *idx,
+                    status: BatchStartItemStatus::Rejected,
+                    execution_id: None,
+                    error: Some(format!("input validation failed: {err_msg}")),
+                });
+            }
+        }
+        if !schema_violations.is_empty() {
+            let () = audit_batch_start_failure(
+                &api_state,
+                &actor,
+                &source,
+                request_id.as_deref(),
+                route,
+                "atomic batch rejected: input schema validation failed",
+            )
+            .await;
+            schema_violations.sort_by_key(|r| r.index);
+            return (
+                StatusCode::CONFLICT,
+                Json(BatchStartRejectedResponse {
+                    message: format!(
+                        "{} of {} items failed input schema validation; no executions inserted (atomic=true)",
+                        schema_violations.len(),
+                        request.items.len()
+                    ),
+                    rejected: schema_violations,
+                }),
+            )
+                .into_response();
+        }
     }
 
     // ── Phase 2: per-shard, acquire ONE connection and process all items ──────
@@ -11431,6 +11492,30 @@ async fn schedule_backfill(
                             )
                         });
 
+                // issue #377: enforce admission gates for DAG backfills, mirroring
+                // the workflow backfill branch gate check.
+                if let Some((gate_id, gate_reason, scope_kind)) =
+                    api_state
+                        .gate_cache()
+                        .check(&dag_name, dag_queue, shard_id.as_i32(), owner)
+                {
+                    let reason_label = match gate_reason.char_indices().nth(64) {
+                        Some((idx2, _)) => &gate_reason[..idx2],
+                        None => &gate_reason,
+                    };
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_admission_blocked(scope_kind, reason_label);
+                    shard_failures.push(BackfillShardFailure {
+                        shard_id: shard_id.as_i32(),
+                        reason: format!("admission blocked by gate {gate_id}: {gate_reason}"),
+                    });
+                    failed += 1;
+                    continue;
+                }
+
                 let start_result = start_or_load_workflow_execution(
                     &mut conn,
                     StartWorkflowParams {
@@ -13065,16 +13150,40 @@ async fn list_rate_limits(
     use autumn_harvest::schema::harvest_rate_limit_buckets::dsl::harvest_rate_limit_buckets;
 
     let pool = api_state.storage_pool().map_err(map_error)?;
-    let mut conn = acquire_conn(pool.default_pool()).await?;
 
-    let buckets = harvest_rate_limit_buckets
-        .select(RateLimitBucket::as_select())
-        .load::<RateLimitBucket>(&mut conn)
-        .await
-        .map_err(database_error)
-        .map_err(map_error)?;
+    // Aggregate across all shards so operators see every configured key.
+    // Rate-limit config is written to all shards by `set_rate_limit`; per-shard
+    // token counters diverge at runtime.  Deduplicate by key, keeping the entry
+    // with the fewest remaining tokens (worst-case view across the fleet).
+    let mut merged: std::collections::BTreeMap<String, RateLimitBucket> =
+        std::collections::BTreeMap::new();
 
-    Ok(Json(buckets))
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let buckets = harvest_rate_limit_buckets
+            .select(RateLimitBucket::as_select())
+            .load::<RateLimitBucket>(&mut conn)
+            .await
+            .map_err(database_error)
+            .map_err(map_error)?;
+        for b in buckets {
+            use std::collections::btree_map::Entry;
+            match merged.entry(b.key.clone()) {
+                Entry::Vacant(e) => {
+                    e.insert(b);
+                }
+                Entry::Occupied(mut e) => {
+                    // Keep the most-depleted view (lowest tokens) so operators see
+                    // the worst-case shard rather than an optimistically full one.
+                    if b.tokens < e.get().tokens {
+                        e.insert(b);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(merged.into_values().collect()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -13113,45 +13222,42 @@ async fn set_rate_limit(
              last_refilled_at = NOW(), \
              updated_at = NOW()";
 
-    let mut first_err: Option<diesel::result::Error> = None;
-    let mut any_success = false;
+    // Fail fast on any shard error: an emergency throttle must be applied to the
+    // entire fleet.  A partial write would leave some shards with the old bucket
+    // while operators believe the limit is active everywhere.
+    let mut shard_error: Option<String> = None;
 
     for (_shard, shard_pool) in pool.iter_shards() {
         match acquire_conn(shard_pool).await {
             Ok(mut conn) => {
-                match diesel::sql_query(upsert_sql)
+                if let Err(e) = diesel::sql_query(upsert_sql)
                     .bind::<diesel::sql_types::Text, _>(&key_param)
                     .bind::<diesel::sql_types::Double, _>(request.refill_rate)
                     .bind::<diesel::sql_types::Double, _>(request.burst)
                     .execute(&mut conn)
                     .await
                 {
-                    Ok(_) => {
-                        any_success = true;
-                    }
-                    Err(e) => {
-                        tracing::warn!(key = %key_param, error = %e, "rate-limit upsert failed on shard");
-                        if first_err.is_none() {
-                            first_err = Some(e);
-                        }
+                    tracing::warn!(key = %key_param, error = %e, "rate-limit upsert failed on shard");
+                    if shard_error.is_none() {
+                        shard_error = Some(e.to_string());
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!(key = %key_param, error = %e, "failed to acquire shard connection for rate-limit upsert");
+                if shard_error.is_none() {
+                    shard_error = Some(format!("shard connection unavailable: {e}"));
+                }
             }
         }
     }
 
     let mut audit_conn = acquire_conn(pool.default_pool()).await?;
-    let (status, err_summary) = if !any_success && first_err.is_some() {
-        (
-            STATUS_FAILED,
-            first_err.as_ref().map(std::string::ToString::to_string),
-        )
-    } else {
-        (STATUS_SUCCEEDED, None)
-    };
+    let (status, err_summary) = shard_error
+        .as_ref()
+        .map_or((STATUS_SUCCEEDED, None), |err_str| {
+            (STATUS_FAILED, Some(err_str.as_str()))
+        });
     let ar = NewAuditRecord {
         actor: &actor,
         operation: "rate_limit_override",
@@ -13161,19 +13267,16 @@ async fn set_rate_limit(
         request_id: request_id.as_deref(),
         idempotency_key: None,
         status,
-        error_summary: err_summary.as_deref(),
+        error_summary: err_summary,
         shard_id: None,
         source: &source,
     };
     let _ = audit::insert_audit(&mut audit_conn, &ar).await;
 
-    if !any_success {
-        if let Some(e) = first_err {
-            return Err(map_error(database_error(e)));
-        }
-        return Err(AutumnError::service_unavailable_msg(
-            "no shards available for rate-limit upsert",
-        ));
+    if let Some(err_str) = shard_error {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "rate-limit override not fully applied — shard error: {err_str}"
+        )));
     }
     Ok(Json(BasicAck { ok: true }))
 }
