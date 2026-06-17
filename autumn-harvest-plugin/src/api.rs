@@ -13145,7 +13145,10 @@ async fn set_rate_limit(
 
     let mut audit_conn = acquire_conn(pool.default_pool()).await?;
     let (status, err_summary) = if !any_success && first_err.is_some() {
-        (STATUS_FAILED, first_err.as_ref().map(std::string::ToString::to_string))
+        (
+            STATUS_FAILED,
+            first_err.as_ref().map(std::string::ToString::to_string),
+        )
     } else {
         (STATUS_SUCCEEDED, None)
     };
