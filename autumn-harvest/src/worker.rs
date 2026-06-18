@@ -8064,17 +8064,17 @@ pub async fn quarantine_workflow_task_timeout(
                         // a parent_close_policy). Detached children are managed by
                         // apply_parent_close_cascade above, mirroring the poison-pill
                         // and timeout paths.
-                        if parent_close_policy_opt.is_none() {
-                            if let Some(parent_uuid) = parent_id_opt {
-                                let parent_exec_id = execution_id_from_uuid(parent_uuid);
-                                let _ = wake_parent_for_child_failure(
-                                    conn,
-                                    parent_exec_id,
-                                    exec_id,
-                                    &error_msg,
-                                )
-                                .await;
-                            }
+                        if parent_close_policy_opt.is_none()
+                            && let Some(parent_uuid) = parent_id_opt
+                        {
+                            let parent_exec_id = execution_id_from_uuid(parent_uuid);
+                            let _ = wake_parent_for_child_failure(
+                                conn,
+                                parent_exec_id,
+                                exec_id,
+                                &error_msg,
+                            )
+                            .await;
                         }
                         (deferred, Some(entry.queue_name.clone()))
                     } else {
