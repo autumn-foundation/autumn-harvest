@@ -106,6 +106,9 @@ pub const OP_TASK_REPRIORITIZE: &str = "task.reprioritize";
 pub const OP_GATE_CREATE: &str = "gate.create";
 /// Audit operation: Lifted (removed) an admission gate (issue #377).
 pub const OP_GATE_LIFT: &str = "gate.lift";
+/// Audit operation: Erased PII payload fields from a completed workflow
+/// execution (issue #495). Terminal-only, irreversible.
+pub const OP_WORKFLOW_ERASE_PAYLOADS: &str = "workflow.erase_payloads";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -337,6 +340,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /admin/build-routing/retire", RouteClass::ReadOnly),
     // Task queue management (issue #249)
     ("PATCH /tasks/{id}", RouteClass::Mutating),
+    // PII erasure (issue #495): admin-only, irreversible, terminal-only.
+    ("POST /workflows/{id}/erase-payloads", RouteClass::Mutating),
 ];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
@@ -380,6 +385,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_GATE_LIFT,
     // Task queue management (issue #249)
     OP_TASK_REPRIORITIZE,
+    // PII erasure (issue #495)
+    OP_WORKFLOW_ERASE_PAYLOADS,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -565,6 +572,11 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("DELETE /admin/gates/{id}", Some(OP_GATE_LIFT)),
     // Task queue management (issue #249)
     ("PATCH /tasks/{id}", Some(OP_TASK_REPRIORITIZE)),
+    // PII erasure (issue #495)
+    (
+        "POST /workflows/{id}/erase-payloads",
+        Some(OP_WORKFLOW_ERASE_PAYLOADS),
+    ),
 ];
 
 // ── Query filters ─────────────────────────────────────────────────────────────

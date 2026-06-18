@@ -39,12 +39,12 @@ use autumn_harvest::audit::{
     OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL,
     OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
-    OP_WORKFLOW_START, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
-    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK,
-    TARGET_WORKER, TARGET_WORKFLOW,
+    OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
+    OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
+    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT,
+    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -2167,6 +2167,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(cancel_workflow).route_layer(require_admin.clone()),
         )
         .route(
+            "/workflows/{id}/erase-payloads",
+            post(erase_workflow_payloads_handler).route_layer(require_admin.clone()),
+        )
+        .route(
             "/workflows/{id}/pause",
             post(pause_workflow).route_layer(require_admin.clone()),
         )
@@ -2442,6 +2446,7 @@ pub(crate) async fn has_harvest_admin_access(
 /// The contract regression test compares this list against `docs/api-contract.json`;
 /// update both together whenever routes change.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] {
     &[
         // ── workflows ────────────────────────────────────────────────────────
@@ -2459,6 +2464,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{id}/cancel"),
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
+        ("POST", "/workflows/{id}/erase-payloads"),
         ("POST", "/workflows/{id}/reset"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
         ("GET", "/workflows/{id}/queries"),
@@ -2940,6 +2946,20 @@ pub const fn management_api_response_fields()
                 "state",
                 "actor",
                 "pause_duration_secs",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/erase-payloads",
+            Some(&[
+                "execution_id",
+                "events_scrubbed",
+                "fields_tombstoned",
+                "execution_row_scrubbed",
+                "signals_scrubbed",
+                "children",
+                "skipped_children",
+                "failures",
             ]),
         ),
         (
@@ -7853,6 +7873,77 @@ async fn resume_workflow(
                 pause_duration_secs: resumed.pause_duration_secs,
             }),
         )),
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
+// ── PII Erasure (issue #495) ──────────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct EraseWorkflowPayloadsRequest {
+    /// Optional operator-supplied reason for the erasure (e.g. "GDPR Art. 17
+    /// right-to-erasure request for subject ID 12345"). Included in the audit
+    /// trail. Truncated to 500 characters at the API boundary.
+    reason: Option<String>,
+}
+
+/// `POST /workflows/{id}/erase-payloads` — tombstone all payload-bearing
+/// fields for a completed workflow execution (and its terminal children on the
+/// same shard). Admin-guarded. Returns 409 if the execution is not terminal,
+/// 404 if not found, 200 on success (including idempotent re-runs).
+async fn erase_workflow_payloads_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    request: Option<Json<EraseWorkflowPayloadsRequest>>,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Json<autumn_harvest::erase::EraseOutcome>,
+    ),
+    AutumnError,
+> {
+    use autumn_harvest::models::NewAuditRecord;
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/erase-payloads";
+    let request = request.map(|Json(b)| b).unwrap_or_default();
+
+    // Truncate reason at the API boundary so the core never sees an
+    // arbitrarily long string.
+    let reason = request
+        .reason
+        .as_deref()
+        .map(|r| r.chars().take(500).collect::<String>())
+        .unwrap_or_default();
+
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+
+    let result = autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id, &reason).await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_WORKFLOW_ERASE_PAYLOADS,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(exec_id_str.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
         Err(e) => Err(conflict_from(e)),
     }
 }

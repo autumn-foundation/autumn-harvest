@@ -74,6 +74,12 @@ pub mod dag_simulator;
 pub mod det_check;
 pub mod diagnostic;
 pub mod eligibility;
+/// Targeted PII erasure for completed workflow executions (issue #495).
+///
+/// Provides [`erase::erase_workflow_payloads`] (DB-gated) plus the pure
+/// helpers [`erase::tombstone_payload_fields`] and
+/// [`erase::is_terminal_state`] that are unit-testable without a database.
+pub mod erase;
 pub mod error;
 pub mod event;
 #[cfg(feature = "db")]

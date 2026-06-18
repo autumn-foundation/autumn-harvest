@@ -710,6 +710,21 @@ enum WorkflowCommand {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Erase PII payload fields from a completed workflow execution (GDPR Art. 17).
+    ///
+    /// Replaces all payload-bearing fields (`input`, `output`, `payload`, `details`,
+    /// `value`, `last_completion_result`) with a tombstone marker. The execution
+    /// itself and its audit trail are preserved. Only terminal executions
+    /// (COMPLETED, FAILED, CANCELLED, `TIMED_OUT`, `CONTINUED_AS_NEW`, TERMINATED)
+    /// can be erased. Cascades to terminal child executions on the same shard.
+    /// This operation is irreversible.
+    ErasePayloads {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Erasure reason (e.g. "GDPR Art. 17 request ID: DSR-12345"), recorded in audit log.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Fork a workflow execution at an event boundary.
     Reset {
         /// Workflow execution ID.
@@ -2832,6 +2847,17 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             insert_string(&mut body, "reason", reason.as_deref());
             Ok(ApiRequest::post(
                 format!("/workflows/{}/cancel", path_segment(execution_id)),
+                Some(Value::Object(body)),
+            ))
+        }
+        WorkflowCommand::ErasePayloads {
+            execution_id,
+            reason,
+        } => {
+            let mut body = Map::new();
+            insert_string(&mut body, "reason", reason.as_deref());
+            Ok(ApiRequest::post(
+                format!("/workflows/{}/erase-payloads", path_segment(execution_id)),
                 Some(Value::Object(body)),
             ))
         }
@@ -5152,5 +5178,53 @@ mod dlq_aggregate_cli_tests {
         // Compact JSON (no pretty indentation) for piping.
         assert!(rendered.starts_with('{'));
         assert!(rendered.contains("\"total\":1"));
+    }
+}
+
+#[cfg(test)]
+mod erase_payloads_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn erase_payloads_builds_post_request() {
+        let req = request(&["workflow", "erase-payloads", "abc-123"]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/abc-123/erase-payloads");
+    }
+
+    #[test]
+    fn erase_payloads_with_reason_includes_reason_in_body() {
+        let req = request(&[
+            "workflow",
+            "erase-payloads",
+            "abc-123",
+            "--reason",
+            "GDPR Art. 17 request DSR-99",
+        ]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/abc-123/erase-payloads");
+        let body = req.body.as_ref().expect("should have a body");
+        assert_eq!(body["reason"], "GDPR Art. 17 request DSR-99");
+    }
+
+    #[test]
+    fn erase_payloads_without_reason_sends_no_reason_field() {
+        let req = request(&["workflow", "erase-payloads", "abc-123"]);
+        let body = req.body.as_ref().expect("should have a body");
+        assert!(
+            body.get("reason").is_none() || body["reason"].is_null(),
+            "omitting --reason must not send the field"
+        );
     }
 }
