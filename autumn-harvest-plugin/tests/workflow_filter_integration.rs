@@ -150,7 +150,7 @@ async fn setup_single_database() -> (String, Option<ContainerAsync<Postgres>>) {
         // Derive the database URL by replacing the database component.
         let database_url = {
             let base = admin_url.trim_end_matches('/');
-            let without_db = base.rsplitn(2, '/').nth(1).unwrap_or(base);
+            let without_db = base.rsplit_once('/').map_or(base, |(before, _)| before);
             format!("{without_db}/{db_name}")
         };
 
@@ -223,7 +223,7 @@ async fn setup_sharded_databases() -> ((String, String), Option<ContainerAsync<P
     // Derive the base URL (without database name) to construct shard URLs.
     let base_url = {
         let base = admin_url.trim_end_matches('/');
-        let without_db = base.rsplitn(2, '/').nth(1).unwrap_or(base);
+        let without_db = base.rsplit_once('/').map_or(base, |(before, _)| before);
         without_db.to_string()
     };
     let shard0_url = format!("{base_url}/{shard0_db}");
@@ -665,7 +665,7 @@ async fn workflow_list_filter_failure_cause() {
 // ── Issue #498: cursor pagination + time-range filters ───────────────────────
 
 /// Stamp `created_at` directly on an already-inserted execution so tests can
-/// control insertion order without relying on NOW() timing.
+/// control insertion order without relying on `NOW()` timing.
 async fn set_created_at(
     database_url: &str,
     exec_id: ExecutionId,
@@ -819,7 +819,9 @@ async fn workflow_list_pagination_returns_envelope() {
             None,
         )
         .await;
-        let ts = chrono::DateTime::from_timestamp(1_750_000_000 + (i as i64) * 10, 0).unwrap();
+        let ts =
+            chrono::DateTime::from_timestamp(1_750_000_000 + i64::try_from(i).unwrap() * 10, 0)
+                .unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -876,7 +878,9 @@ async fn workflow_list_pagination_asc_order() {
             None,
         )
         .await;
-        let ts = chrono::DateTime::from_timestamp(1_750_000_000 + (i as i64) * 10, 0).unwrap();
+        let ts =
+            chrono::DateTime::from_timestamp(1_750_000_000 + i64::try_from(i).unwrap() * 10, 0)
+                .unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -925,7 +929,9 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
             None,
         )
         .await;
-        let ts = chrono::DateTime::from_timestamp(1_700_000_000 + (i as i64) * 10, 0).unwrap();
+        let ts =
+            chrono::DateTime::from_timestamp(1_700_000_000 + i64::try_from(i).unwrap() * 10, 0)
+                .unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -948,7 +954,8 @@ async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
             None,
         )
         .await;
-        let ts = chrono::DateTime::from_timestamp(2_000_000_000 + (i as i64), 0).unwrap();
+        let ts =
+            chrono::DateTime::from_timestamp(2_000_000_000 + i64::try_from(i).unwrap(), 0).unwrap();
         set_created_at(&database_url, exec_id, ts).await;
     }
 
@@ -991,7 +998,7 @@ async fn workflow_list_pagination_sharded_global_order() {
         set_created_at(
             &shard0_url,
             exec_id,
-            chrono::DateTime::from_timestamp(base_ts + (i as i64) * 20, 0).unwrap(),
+            chrono::DateTime::from_timestamp(base_ts + i64::try_from(i).unwrap() * 20, 0).unwrap(),
         )
         .await;
     }
@@ -1007,7 +1014,8 @@ async fn workflow_list_pagination_sharded_global_order() {
         set_created_at(
             &shard1_url,
             exec_id,
-            chrono::DateTime::from_timestamp(base_ts + 10 + (i as i64) * 20, 0).unwrap(),
+            chrono::DateTime::from_timestamp(base_ts + 10 + i64::try_from(i).unwrap() * 20, 0)
+                .unwrap(),
         )
         .await;
     }

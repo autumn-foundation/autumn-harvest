@@ -3970,6 +3970,7 @@ pub(crate) fn parse_workflow_filters(
     pairs: &[(String, String)],
 ) -> Result<WorkflowFilters, AutumnError> {
     let mut limit_raw: Option<i64> = None;
+    let mut page_size_raw: Option<i64> = None;
     let mut filters = WorkflowFilters::default();
 
     for (key, value) in pairs {
@@ -4109,8 +4110,9 @@ pub(crate) fn parse_workflow_filters(
                         "invalid page_size '{value}'; expected a positive integer"
                     ))
                 })?;
-                // page_size overrides limit; will be clamped below.
-                limit_raw = Some(parsed);
+                // Tracked separately from `limit` so `page_size` always wins
+                // regardless of query-parameter order (issue #498 review).
+                page_size_raw = Some(parsed);
                 filters.paginated = true;
             }
             "cursor" => {
@@ -4124,7 +4126,11 @@ pub(crate) fn parse_workflow_filters(
         }
     }
 
-    let limit = limit_raw
+    // `page_size` takes precedence over `limit` whenever it is present, so the
+    // documented "page_size overrides limit" contract holds independent of the
+    // order the two parameters appear in the query string.
+    let limit = page_size_raw
+        .or(limit_raw)
         .unwrap_or(DEFAULT_WORKFLOW_LIMIT)
         .clamp(1, MAX_WORKFLOW_LIMIT);
     Ok(filters.with_limit(limit))
@@ -14122,10 +14128,11 @@ pub(crate) async fn load_workflows(
     use diesel::dsl::sql;
     use diesel::sql_types::{BigInt, Bool, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
 
-    // Fetch one extra row so the caller can detect whether a next page exists.
-    // The extra row is never returned to the API client — it is used only to
-    // determine whether `next_cursor` should be set.
-    let fetch_limit = filters.limit + 1;
+    // Honor `filters.limit` exactly. Direct callers (e.g. the DAG-runs UI loader
+    // `load_dag_runs_from_owning_shard`) render every row returned, so the
+    // overflow probe must NOT be baked in here. `load_workflows_from_shards`
+    // opts into the `+1` over-fetch by passing a probe filter with `limit + 1`.
+    let fetch_limit = filters.limit;
 
     let mut query = harvest_workflow_executions::table.into_boxed();
 
@@ -14238,9 +14245,14 @@ pub(crate) async fn load_workflows_from_shards(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut workflows = Vec::new();
 
+    // Over-fetch one extra row per shard so the post-merge step can detect
+    // whether a next page exists. The probe row is dropped after truncation.
+    // `saturating_add` guards against `i64::MAX` overflow.
+    let probe_filters = filters.clone().with_limit(filters.limit.saturating_add(1));
+
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = load_workflows(&mut conn, filters)
+        let mut rows = load_workflows(&mut conn, &probe_filters)
             .await
             .map_err(map_error)?;
         workflows.append(&mut rows);
@@ -14266,7 +14278,10 @@ pub(crate) async fn load_workflows_from_shards(
     }
 
     let limit = usize::try_from(filters.limit).unwrap_or(usize::MAX);
-    let next_cursor = if workflows.len() > limit {
+    // Guard `limit > 0` so a hand-built filter with `limit == 0` can never
+    // underflow `limit - 1` (the HTTP path always clamps to >= 1, but this is
+    // a `pub(crate)` entry point).
+    let next_cursor = if limit > 0 && workflows.len() > limit {
         let last_kept = &workflows[limit - 1];
         let cursor = encode_workflow_list_cursor(last_kept);
         workflows.truncate(limit);
@@ -14298,7 +14313,7 @@ pub(crate) async fn load_stalled_workflows(
     filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<StalledWorkflowRow>> {
     use diesel::dsl::{max, sql};
-    use diesel::sql_types::{BigInt, Bool};
+    use diesel::sql_types::{BigInt, Bool, Text};
     use std::collections::{HashMap, HashSet};
 
     let Some(minutes) = filters.no_progress_minutes else {
@@ -14358,6 +14373,20 @@ pub(crate) async fn load_stalled_workflows(
     // stalled rows because this loader bypasses `load_workflows`.
     if filters.sla_breached {
         query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+    }
+    // Honor the time-range and exec-id-prefix filters (issue #498) on the
+    // stalled path too: without these, `?no_progress_minutes=N&started_after=…`
+    // (or `&exec_id_prefix=…`) would return rows outside the requested bounds
+    // because this loader bypasses `load_workflows`.
+    if let Some(after) = filters.started_after {
+        query = query.filter(harvest_workflow_executions::started_at.ge(after));
+    }
+    if let Some(before) = filters.started_before {
+        query = query.filter(harvest_workflow_executions::started_at.le(before));
+    }
+    if let Some(prefix) = &filters.exec_id_prefix {
+        let pattern = format!("{}%", prefix.to_lowercase());
+        query = query.filter(sql::<Bool>("CAST(id AS TEXT) ILIKE ").bind::<Text, _>(pattern));
     }
 
     if let Some(min_events) = filters.min_history_events {
@@ -20200,8 +20229,7 @@ mod tests {
             .expect_err("invalid started_after must error");
         assert!(
             err.to_string().contains("invalid started_after"),
-            "expected helpful error, got: {}",
-            err
+            "expected helpful error, got: {err}"
         );
     }
 
@@ -20269,6 +20297,21 @@ mod tests {
         let err = parse_workflow_filters(&pairs(&[("page_size", "big")]))
             .expect_err("non-numeric page_size must error");
         assert!(err.to_string().contains("invalid page_size"));
+    }
+
+    #[test]
+    fn parse_workflow_filters_page_size_wins_over_limit_regardless_of_order() {
+        // page_size before limit.
+        let a = parse_workflow_filters(&pairs(&[("page_size", "25"), ("limit", "200")]))
+            .expect("should parse");
+        assert_eq!(a.limit, 25, "page_size must override limit");
+        // limit before page_size — page_size must still win.
+        let b = parse_workflow_filters(&pairs(&[("limit", "200"), ("page_size", "25")]))
+            .expect("should parse");
+        assert_eq!(
+            b.limit, 25,
+            "page_size must override limit regardless of order"
+        );
     }
 
     #[test]
