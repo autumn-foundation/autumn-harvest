@@ -653,9 +653,9 @@ pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildRe
     for shard_results in per_shard {
         for r in shard_results {
             let entry = merged
-                .entry(r.build_id.clone())
-                .or_insert_with(|| BuildReachability {
-                    build_id: r.build_id.clone(),
+                .entry(r.build_id)
+                .or_insert_with_key(|k| BuildReachability {
+                    build_id: k.clone(),
                     open_executions: 0,
                     pending_tasks: 0,
                     active_workers: 0,

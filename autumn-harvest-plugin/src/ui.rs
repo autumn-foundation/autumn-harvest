@@ -614,17 +614,15 @@ async fn list_dags_ui(
                     let Some(dag_name) = row.dag_name.clone() else {
                         continue;
                     };
-                    let entry = dags
-                        .entry(dag_name.clone())
-                        .or_insert_with(|| DagUiSummary {
-                            name: dag_name.clone(),
-                            schedule_expr: row.schedule_expr.clone(),
-                            task_count: 0,
-                            is_paused: row.is_paused,
-                            next_run_at: row.next_run_at,
-                            max_active_runs: row.max_active_runs,
-                            catchup: row.catchup,
-                        });
+                    let entry = dags.entry(dag_name).or_insert_with_key(|k| DagUiSummary {
+                        name: k.clone(),
+                        schedule_expr: row.schedule_expr.clone(),
+                        task_count: 0,
+                        is_paused: row.is_paused,
+                        next_run_at: row.next_run_at,
+                        max_active_runs: row.max_active_runs,
+                        catchup: row.catchup,
+                    });
                     merge_dag_schedule_row(entry, &row);
                 }
             }

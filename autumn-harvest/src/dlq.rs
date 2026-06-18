@@ -1079,15 +1079,13 @@ pub fn merge_dlq_aggregates(
         total += partial.total;
         filtered_total += partial.filtered_total;
         for group in partial.groups {
-            let entry = merged
-                .entry(group.key.clone())
-                .or_insert_with(|| DlqRawGroup {
-                    key: group.key.clone(),
-                    count: 0,
-                    first_seen: None,
-                    last_seen: None,
-                    sample_ids: Vec::new(),
-                });
+            let entry = merged.entry(group.key).or_insert_with_key(|k| DlqRawGroup {
+                key: k.clone(),
+                count: 0,
+                first_seen: None,
+                last_seen: None,
+                sample_ids: Vec::new(),
+            });
             entry.count += group.count;
             entry.first_seen = min_instant(entry.first_seen, group.first_seen);
             entry.last_seen = max_instant(entry.last_seen, group.last_seen);
