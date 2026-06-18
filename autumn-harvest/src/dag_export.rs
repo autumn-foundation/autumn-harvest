@@ -6,6 +6,54 @@
 use crate::dag::DagDefinition;
 use std::fmt::Write;
 
+#[cfg(feature = "testing")]
+use crate::dag_profiler::DagProfile;
+
+/// Exports a DAG execution profile to a Mermaid.js Gantt chart.
+///
+/// This provides a visual timeline of task executions, showing their start times,
+/// durations, and concurrency based on simulated profiling data.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "testing")]
+pub fn export_mermaid_gantt(profile: &DagProfile) -> Result<String, std::fmt::Error> {
+    use crate::dag_profiler::ProfilerEventKind;
+
+    let mut out = String::new();
+    writeln!(out, "```mermaid")?;
+    writeln!(out, "gantt")?;
+    writeln!(out, "    dateFormat X")?;
+    writeln!(out, "    axisFormat %S")?;
+    writeln!(out, "    title DAG Execution Profile")?;
+    writeln!(out, "    section Tasks")?;
+
+    let mut start_times = std::collections::HashMap::new();
+
+    for event in &profile.timeline {
+        match &event.kind {
+            ProfilerEventKind::TaskStarted(idx, name) => {
+                start_times.insert(*idx, (name.clone(), event.time));
+            }
+            ProfilerEventKind::TaskCompleted(idx, _) => {
+                if let Some((name, start_time)) = start_times.remove(idx) {
+                    let duration = event.time.saturating_sub(start_time);
+                    writeln!(
+                        out,
+                        "    {} : {}, {}s",
+                        name,
+                        start_time.as_secs(),
+                        duration.as_secs()
+                    )?;
+                }
+            }
+        }
+    }
+
+    writeln!(out, "```")?;
+    Ok(out)
+}
+
 /// Exports the DAG definition to a Mermaid.js flowchart.
 ///
 /// # Examples
@@ -110,6 +158,46 @@ mod tests {
 
         let dot = export_dot(&dag).unwrap();
         assert_eq!(dot, "digraph DAG {\n}\n");
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn test_export_mermaid_gantt_simple() {
+        use crate::dag_profiler::DagProfiler;
+        use std::time::Duration;
+
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let b1 = builder.activity(dummy_activity2).upstream(&a);
+        let b2 = builder.activity(dummy_activity2).upstream(&a);
+        let _c = builder
+            .activity(dummy_activity3)
+            .upstream(&b1)
+            .upstream(&b2);
+
+        let dag = builder.build().unwrap();
+        let profiler = DagProfiler::new(dag)
+            .mock_duration("dummy_activity", Duration::from_secs(10))
+            .mock_duration("dummy_activity2", Duration::from_secs(5))
+            .mock_duration("dummy_activity3", Duration::from_secs(2));
+
+        let profile = profiler.profile();
+        let gantt = export_mermaid_gantt(&profile).unwrap();
+
+        let expected_gantt = "\
+```mermaid
+gantt
+    dateFormat X
+    axisFormat %S
+    title DAG Execution Profile
+    section Tasks
+    dummy_activity : 0, 10s
+    dummy_activity2 : 10, 5s
+    dummy_activity2 : 10, 5s
+    dummy_activity3 : 15, 2s
+```
+";
+        assert_eq!(gantt, expected_gantt);
     }
 
     #[test]
