@@ -8210,7 +8210,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
             let _ = tx.send(());
         };
-        let (hung_result, _) = tokio::join!(
+        let (hung_result, ()) = tokio::join!(
             tokio::time::timeout(Duration::from_millis(30), hung),
             healthy,
         );
