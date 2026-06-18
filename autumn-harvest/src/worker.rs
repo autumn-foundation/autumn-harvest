@@ -7939,11 +7939,7 @@ pub async fn quarantine_workflow_task_timeout(
         Some(exec_uuid) => {
             let res = exec_dsl::harvest_workflow_executions
                 .find(exec_uuid)
-                .select((
-                    exec_dsl::owner,
-                    exec_dsl::severity,
-                    exec_dsl::parent_id,
-                ))
+                .select((exec_dsl::owner, exec_dsl::severity, exec_dsl::parent_id))
                 .first::<(Option<String>, Option<String>, Option<uuid::Uuid>)>(&mut conn)
                 .await
                 .optional()
