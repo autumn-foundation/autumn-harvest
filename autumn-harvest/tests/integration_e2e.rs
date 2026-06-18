@@ -1288,6 +1288,7 @@ async fn claim_task_returns_none_on_empty_queue() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn worker_completes_workflow_task_and_persists_result() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)

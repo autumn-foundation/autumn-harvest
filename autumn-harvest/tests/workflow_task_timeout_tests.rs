@@ -42,7 +42,7 @@ use uuid::Uuid;
 /// database so leftover databases are harmless.
 enum Keepalive {
     #[allow(dead_code)]
-    Container(ContainerAsync<Postgres>),
+    Container(Box<ContainerAsync<Postgres>>),
     /// No cleanup needed; the test database is abandoned (unique UUID name).
     LocalDb,
 }
@@ -120,6 +120,16 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
 );
+
+// ---------------------------------------------------------------------------
+// Diesel helper types
+// ---------------------------------------------------------------------------
+
+#[derive(QueryableByName)]
+struct ReasonRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    error: String,
+}
 
 // ---------------------------------------------------------------------------
 // Recording metrics stub
@@ -211,7 +221,7 @@ async fn setup() -> (AsyncPgConnection, DbPool, Keepalive) {
         .build()
         .expect("pool build");
 
-    (conn, pool, Keepalive::Container(container))
+    (conn, pool, Keepalive::Container(Box::new(container)))
 }
 
 /// Insert a RUNNING workflow execution and return its UUID.
@@ -386,12 +396,15 @@ async fn quarantine_writes_dlq_and_fails_execution() {
     assert_eq!(dlq_count, 1, "exactly one DLQ entry expected");
 
     // Terminal metric emitted.
-    let terminal = metrics.terminal.lock().unwrap();
-    assert!(
+    let has_terminal = {
+        let terminal = metrics.terminal.lock().unwrap();
         terminal
             .iter()
-            .any(|(wf, q, _)| wf == "timeout_wf" && q == "default"),
-        "record_workflow_terminal should be called with (timeout_wf, default), got {terminal:?}"
+            .any(|(wf, q, _)| wf == "timeout_wf" && q == "default")
+    };
+    assert!(
+        has_terminal,
+        "record_workflow_terminal should be called with (timeout_wf, default)"
     );
 }
 
@@ -419,19 +432,14 @@ async fn quarantine_writes_typed_dlq_reason() {
     .await;
 
     // Inspect the raw reason JSON stored in harvest_dead_letters.
-    #[derive(QueryableByName)]
-    struct ReasonRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        error: String,
-    }
     let rows: Vec<ReasonRow> = diesel::sql_query("SELECT error FROM harvest_dead_letters LIMIT 1")
         .load(&mut conn)
         .await
         .expect("query dlq");
-    let reason_json = &rows.get(0).expect("dlq row").error;
+    let reason_json = rows.into_iter().next().expect("dlq row").error;
 
     let reason: DeadLetterReason =
-        serde_json::from_str(reason_json).expect("reason must deserialize");
+        serde_json::from_str(&reason_json).expect("reason must deserialize");
     assert!(
         matches!(
             reason,
