@@ -7912,16 +7912,26 @@ pub async fn quarantine_workflow_task_timeout(
         .unwrap_or((serde_json::Value::Null, 1));
 
     // Fetch owner/severity from the execution row for the DLQ entry.
+    // Also record whether the execution row exists so we can skip the
+    // event-append path inside the transaction when the row has been
+    // deleted or archived (FK violation would otherwise roll back the
+    // entire quarantine, leaving the task un-quarantined).
+    let mut exec_exists = false;
     let (owner, severity) = match exec_id_opt {
-        Some(exec_uuid) => exec_dsl::harvest_workflow_executions
-            .find(exec_uuid)
-            .select((exec_dsl::owner, exec_dsl::severity))
-            .first::<(Option<String>, Option<String>)>(&mut conn)
-            .await
-            .optional()
-            .ok()
-            .flatten()
-            .unwrap_or((None, None)),
+        Some(exec_uuid) => {
+            let res = exec_dsl::harvest_workflow_executions
+                .find(exec_uuid)
+                .select((exec_dsl::owner, exec_dsl::severity))
+                .first::<(Option<String>, Option<String>)>(&mut conn)
+                .await
+                .optional()
+                .ok()
+                .flatten();
+            if res.is_some() {
+                exec_exists = true;
+            }
+            res.unwrap_or((None, None))
+        }
         None => (None, None),
     };
 
@@ -7951,34 +7961,38 @@ pub async fn quarantine_workflow_task_timeout(
                 queue::fail_task(conn, task_id, &error_msg).await?;
 
                 let (deferred, queue_used) = if let Some(exec_uuid) = exec_id_opt {
-                    let exec_id = execution_id_from_uuid(exec_uuid);
-                    let history = crate::store::load_history(conn, exec_id).await?;
-                    crate::store::append_events(
-                        conn,
-                        exec_id,
-                        &[WorkflowEvent::WorkflowFailed {
-                            error: error_msg.clone(),
-                        }],
-                        history.next_event_id,
-                    )
-                    .await?;
-                    // update_workflow_execution_failed returns an error when the
-                    // execution is already terminal; ignore it — the DLQ entry
-                    // and event append are the durable record.
-                    let _ = update_workflow_execution_failed(
-                        conn, exec_id, &worker_id, &error_msg, None,
-                    )
-                    .await;
-                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
-                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                        conn,
-                        exec_id,
-                        crate::completion_trigger::TerminalState::Failed,
-                        None,
-                    )
-                    .await?;
-                    deferred.extend(triggers);
-                    (deferred, Some(entry.queue_name.clone()))
+                    if exec_exists {
+                        let exec_id = execution_id_from_uuid(exec_uuid);
+                        let history = crate::store::load_history(conn, exec_id).await?;
+                        crate::store::append_events(
+                            conn,
+                            exec_id,
+                            &[WorkflowEvent::WorkflowFailed {
+                                error: error_msg.clone(),
+                            }],
+                            history.next_event_id,
+                        )
+                        .await?;
+                        // update_workflow_execution_failed returns an error when the
+                        // execution is already terminal; ignore it — the DLQ entry
+                        // and event append are the durable record.
+                        let _ = update_workflow_execution_failed(
+                            conn, exec_id, &worker_id, &error_msg, None,
+                        )
+                        .await;
+                        let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                            conn,
+                            exec_id,
+                            crate::completion_trigger::TerminalState::Failed,
+                            None,
+                        )
+                        .await?;
+                        deferred.extend(triggers);
+                        (deferred, Some(entry.queue_name.clone()))
+                    } else {
+                        (Vec::new(), None)
+                    }
                 } else {
                     (Vec::new(), None)
                 };
