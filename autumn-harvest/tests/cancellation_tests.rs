@@ -522,6 +522,8 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+
+                workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
@@ -727,6 +729,8 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+
+                workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
@@ -876,6 +880,8 @@ async fn activity_exits_early_on_workflow_cancellation() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+
+                workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
@@ -1020,6 +1026,8 @@ async fn activity_without_cancellation_check_completes_normally() {
                 priority_aging_secs: None,
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
+
+                workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,

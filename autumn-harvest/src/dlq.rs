@@ -118,6 +118,19 @@ pub enum DeadLetterReason {
         crash_strikes: i32,
         last_worker_id: Option<String>,
     },
+    /// A workflow-task dispatch did not complete or suspend within the
+    /// `workflow_task_timeout` budget `task_timeout_strikes` times in a row
+    /// (issue #494). The worker reclaimed the concurrency slot on each
+    /// occasion; after hitting the threshold the task was quarantined rather
+    /// than re-queued indefinitely.
+    ///
+    /// `timeout_secs` is the configured budget (whole seconds) at quarantine
+    /// time. `task_timeout_strikes` is the in-process consecutive-timeout
+    /// count that triggered escalation.
+    WorkflowTaskTimeout {
+        task_timeout_strikes: i32,
+        timeout_secs: u64,
+    },
 }
 
 impl std::fmt::Display for DeadLetterReason {
@@ -1390,6 +1403,23 @@ mod tests {
         assert!(json.contains("PoisonPill"));
         assert!(json.contains("crash_strikes"));
         assert!(json.contains("worker-7"));
+    }
+
+    #[test]
+    fn dead_letter_reason_workflow_task_timeout_is_typed_json() {
+        let reason = DeadLetterReason::WorkflowTaskTimeout {
+            task_timeout_strikes: 3,
+            timeout_secs: 10,
+        };
+
+        let json = reason.to_string();
+        let back: DeadLetterReason =
+            serde_json::from_str(&json).expect("typed reason should deserialize");
+
+        assert_eq!(back, reason);
+        assert!(json.contains("WorkflowTaskTimeout"));
+        assert!(json.contains("task_timeout_strikes"));
+        assert!(json.contains("timeout_secs"));
     }
 
     #[test]
