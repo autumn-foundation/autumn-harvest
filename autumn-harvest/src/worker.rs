@@ -7898,6 +7898,7 @@ pub async fn quarantine_workflow_task_timeout(
 ) {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+    use diesel::BoolExpressionMethods;
 
     let mut conn = match pool.get().await {
         Ok(c) => c,
@@ -8006,8 +8007,11 @@ pub async fn quarantine_workflow_task_timeout(
                         diesel::update(
                             task_dsl::harvest_task_queue
                                 .filter(task_dsl::workflow_exec_id.eq(exec_uuid))
-                                .filter(task_dsl::state.eq("PENDING"))
-                                .or_filter(task_dsl::state.eq("RUNNING")),
+                                .filter(
+                                    task_dsl::state
+                                        .eq("PENDING")
+                                        .or(task_dsl::state.eq("RUNNING")),
+                                ),
                         )
                         .set((
                             task_dsl::state.eq("FAILED"),
