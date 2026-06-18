@@ -7565,8 +7565,21 @@ impl Worker {
         let workflow_cache = Arc::clone(&self.workflow_cache);
 
         // Workflow-task timeout (issue #494): only apply to workflow tasks.
+        // Local activities execute inline inside the workflow task, so the
+        // effective budget must be at least as large as
+        // max_local_activity_start_to_close to avoid prematurely killing a
+        // workflow that is legitimately waiting for an in-progress local
+        // activity.  When workflow_task_timeout is 0 the feature is disabled.
         let workflow_task_timeout = match kind {
-            ClaimedTaskKind::Workflow => self.config.workflow_task_timeout,
+            ClaimedTaskKind::Workflow => {
+                if self.config.workflow_task_timeout.is_zero() {
+                    Duration::ZERO
+                } else {
+                    self.config
+                        .workflow_task_timeout
+                        .max(self.config.max_local_activity_start_to_close)
+                }
+            }
             ClaimedTaskKind::Activity => Duration::ZERO,
         };
         let poison_pill_threshold = self.config.poison_pill_threshold;
@@ -7576,7 +7589,7 @@ impl Worker {
 
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
-            let Ok(_permit) = semaphore.acquire().await else {
+            let Ok(permit) = semaphore.acquire().await else {
                 tracing::error!(task_id = %task_id, "semaphore closed");
                 return;
             };
@@ -7636,10 +7649,14 @@ impl Worker {
                         );
                     }
                     Err(_elapsed) => {
-                        // The dispatch did not complete or suspend within the
-                        // budget. The permit is dropped automatically (the
-                        // task future was cancelled), freeing the concurrency
-                        // slot for new tasks.
+                        // Release the concurrency slot immediately so other
+                        // tasks can be dispatched while we do recovery I/O
+                        // (metric DB lookup + reset/quarantine).  The
+                        // `process_task` future was already cancelled by
+                        // tokio::time::timeout, but `permit` lives in this
+                        // outer scope and would otherwise be held until the
+                        // recovery awaits complete.
+                        drop(permit);
                         let timeout_secs = workflow_task_timeout.as_secs();
                         let new_strikes = exec_id_for_timeout.map_or(1, |exec_id| {
                             let mut guard = timeout_strikes
@@ -7911,26 +7928,35 @@ pub async fn quarantine_workflow_task_timeout(
         .flatten()
         .unwrap_or((serde_json::Value::Null, 1));
 
-    // Fetch owner/severity from the execution row for the DLQ entry.
-    // Also record whether the execution row exists so we can skip the
-    // event-append path inside the transaction when the row has been
-    // deleted or archived (FK violation would otherwise roll back the
-    // entire quarantine, leaving the task un-quarantined).
+    // Fetch owner/severity/parent_id from the execution row for the DLQ
+    // entry and parent notification.  Also record whether the execution row
+    // exists so we can skip the event-append path inside the transaction when
+    // the row has been deleted or archived (FK violation would otherwise roll
+    // back the entire quarantine, leaving the task un-quarantined).
     let mut exec_exists = false;
+    let mut parent_id_opt: Option<uuid::Uuid> = None;
     let (owner, severity) = match exec_id_opt {
         Some(exec_uuid) => {
             let res = exec_dsl::harvest_workflow_executions
                 .find(exec_uuid)
-                .select((exec_dsl::owner, exec_dsl::severity))
-                .first::<(Option<String>, Option<String>)>(&mut conn)
+                .select((
+                    exec_dsl::owner,
+                    exec_dsl::severity,
+                    exec_dsl::parent_id,
+                ))
+                .first::<(Option<String>, Option<String>, Option<uuid::Uuid>)>(&mut conn)
                 .await
                 .optional()
                 .ok()
                 .flatten();
-            if res.is_some() {
-                exec_exists = true;
+            match res {
+                Some((o, s, p)) => {
+                    exec_exists = true;
+                    parent_id_opt = p;
+                    (o, s)
+                }
+                None => (None, None),
             }
-            res.unwrap_or((None, None))
         }
         None => (None, None),
     };
@@ -7989,6 +8015,20 @@ pub async fn quarantine_workflow_task_timeout(
                         )
                         .await?;
                         deferred.extend(triggers);
+                        // Notify the parent workflow (if any) that this child
+                        // has failed.  Mirrors the path in persist_child_workflow_failure
+                        // so a parent waiting on this child is not left suspended
+                        // indefinitely after a timeout quarantine.
+                        if let Some(parent_uuid) = parent_id_opt {
+                            let parent_exec_id = execution_id_from_uuid(parent_uuid);
+                            let _ = wake_parent_for_child_failure(
+                                conn,
+                                parent_exec_id,
+                                exec_id,
+                                &error_msg,
+                            )
+                            .await;
+                        }
                         (deferred, Some(entry.queue_name.clone()))
                     } else {
                         (Vec::new(), None)
@@ -8036,14 +8076,42 @@ pub async fn quarantine_workflow_task_timeout(
 pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, worker_id: &str) {
     use crate::schema::harvest_task_queue::dsl;
 
-    let mut conn = match pool.get().await {
-        Ok(c) => c,
-        Err(e) => {
+    // Retry acquiring a pool connection: a transient pool saturation during
+    // timeout handling would otherwise leave the task stuck in RUNNING on a
+    // live worker (the orphan reclaimer skips tasks owned by live workers).
+    let mut conn = {
+        let mut last_err = None;
+        let backoff_ms: &[u64] = &[0, 200, 500, 2_000];
+        let mut result = None;
+        for &delay_ms in backoff_ms {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            match pool.get().await {
+                Ok(c) => {
+                    result = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        worker_id = %worker_id,
+                        error = %e,
+                        "workflow task timeout reset: pool unavailable, retrying"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        if let Some(c) = result {
+            c
+        } else {
             tracing::error!(
                 task_id = %task_id,
                 worker_id = %worker_id,
-                error = %e,
-                "workflow task timeout reset: pool exhausted"
+                error = ?last_err,
+                "workflow task timeout reset: pool exhausted after retries; \
+                 task may be stuck RUNNING until worker stops"
             );
             return;
         }
