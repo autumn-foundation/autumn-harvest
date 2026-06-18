@@ -7935,20 +7935,36 @@ pub async fn quarantine_workflow_task_timeout(
     // back the entire quarantine, leaving the task un-quarantined).
     let mut exec_exists = false;
     let mut parent_id_opt: Option<uuid::Uuid> = None;
+    let mut parent_close_policy_opt: Option<String> = None;
+    let mut workflow_id_str = String::new();
     let (owner, severity) = match exec_id_opt {
         Some(exec_uuid) => {
             let res = exec_dsl::harvest_workflow_executions
                 .find(exec_uuid)
-                .select((exec_dsl::owner, exec_dsl::severity, exec_dsl::parent_id))
-                .first::<(Option<String>, Option<String>, Option<uuid::Uuid>)>(&mut conn)
+                .select((
+                    exec_dsl::owner,
+                    exec_dsl::severity,
+                    exec_dsl::parent_id,
+                    exec_dsl::parent_close_policy,
+                    exec_dsl::workflow_id,
+                ))
+                .first::<(
+                    Option<String>,
+                    Option<String>,
+                    Option<uuid::Uuid>,
+                    Option<String>,
+                    String,
+                )>(&mut conn)
                 .await
                 .optional()
                 .ok()
                 .flatten();
             match res {
-                Some((o, s, p)) => {
+                Some((o, s, p, pcp, wid)) => {
                     exec_exists = true;
                     parent_id_opt = p;
+                    parent_close_policy_opt = pcp;
+                    workflow_id_str = wid;
                     (o, s)
                 }
                 None => (None, None),
@@ -7984,6 +8000,27 @@ pub async fn quarantine_workflow_task_timeout(
 
                 let (deferred, queue_used) = if let Some(exec_uuid) = exec_id_opt {
                     if exec_exists {
+                        // Drain sibling tasks (PENDING/RUNNING) so they are not
+                        // claimed and run after the workflow has been terminally
+                        // failed. Mirrors the poison-pill quarantine path.
+                        diesel::update(
+                            task_dsl::harvest_task_queue
+                                .filter(task_dsl::workflow_exec_id.eq(exec_uuid))
+                                .filter(
+                                    task_dsl::state
+                                        .eq("PENDING")
+                                        .or(task_dsl::state.eq("RUNNING")),
+                                ),
+                        )
+                        .set((
+                            task_dsl::state.eq("FAILED"),
+                            task_dsl::error.eq(Some(error_msg.clone())),
+                            task_dsl::completed_at.eq(Some(chrono::Utc::now())),
+                        ))
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+
                         let exec_id = execution_id_from_uuid(exec_uuid);
                         let history = crate::store::load_history(conn, exec_id).await?;
                         crate::store::append_events(
@@ -7995,12 +8032,27 @@ pub async fn quarantine_workflow_task_timeout(
                             history.next_event_id,
                         )
                         .await?;
-                        // update_workflow_execution_failed returns an error when the
-                        // execution is already terminal; ignore it — the DLQ entry
-                        // and event append are the durable record.
+                        // update_workflow_execution_failed only transitions RUNNING
+                        // rows; ignore errors — the DLQ entry and event append are
+                        // the durable record.
                         let _ = update_workflow_execution_failed(
                             conn, exec_id, &worker_id, &error_msg, None,
                         )
+                        .await;
+                        // Also handle the PAUSED → FAILED transition: an operator
+                        // may have paused the execution between dispatch and quarantine.
+                        let _ = diesel::update(
+                            exec_dsl::harvest_workflow_executions
+                                .find(exec_uuid)
+                                .filter(exec_dsl::state.eq("PAUSED")),
+                        )
+                        .set((
+                            exec_dsl::state.eq("FAILED"),
+                            exec_dsl::output.eq(None::<serde_json::Value>),
+                            exec_dsl::error.eq(Some(error_msg.clone())),
+                            exec_dsl::completed_at.eq(Some(chrono::Utc::now())),
+                        ))
+                        .execute(conn)
                         .await;
                         let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
                         let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
@@ -8011,19 +8063,21 @@ pub async fn quarantine_workflow_task_timeout(
                         )
                         .await?;
                         deferred.extend(triggers);
-                        // Notify the parent workflow (if any) that this child
-                        // has failed.  Mirrors the path in persist_child_workflow_failure
-                        // so a parent waiting on this child is not left suspended
-                        // indefinitely after a timeout quarantine.
-                        if let Some(parent_uuid) = parent_id_opt {
-                            let parent_exec_id = execution_id_from_uuid(parent_uuid);
-                            let _ = wake_parent_for_child_failure(
-                                conn,
-                                parent_exec_id,
-                                exec_id,
-                                &error_msg,
-                            )
-                            .await;
+                        // Notify the parent only for awaited children (those without
+                        // a parent_close_policy). Detached children are managed by
+                        // apply_parent_close_cascade above, mirroring the poison-pill
+                        // and timeout paths.
+                        if parent_close_policy_opt.is_none() {
+                            if let Some(parent_uuid) = parent_id_opt {
+                                let parent_exec_id = execution_id_from_uuid(parent_uuid);
+                                let _ = wake_parent_for_child_failure(
+                                    conn,
+                                    parent_exec_id,
+                                    exec_id,
+                                    &error_msg,
+                                )
+                                .await;
+                            }
                         }
                         (deferred, Some(entry.queue_name.clone()))
                     } else {
@@ -8047,6 +8101,20 @@ pub async fn quarantine_workflow_task_timeout(
                     &q,
                     crate::telemetry::WorkflowStatus::Failed,
                 );
+            }
+            // Best-effort: count quarantine failures toward the schedule
+            // auto-pause threshold (mirrors execution-timeout and normal failure
+            // paths). Called after the transaction commits so a counter query
+            // failure cannot roll back the quarantine.
+            #[cfg(feature = "db")]
+            if !workflow_id_str.is_empty() {
+                crate::scheduler::maybe_increment_schedule_failure_counter(
+                    &mut conn,
+                    &workflow_id_str,
+                    workflow_name,
+                    metrics,
+                )
+                .await;
             }
             for start in deferred_starts {
                 start.spawn();
@@ -8123,6 +8191,10 @@ pub async fn reset_timed_out_workflow_task(pool: &DbPool, task_id: uuid::Uuid, w
         dsl::worker_id.eq(None::<String>),
         dsl::started_at.eq(None::<chrono::DateTime<chrono::Utc>>),
         dsl::last_heartbeat_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+        // Clear sticky affinity so any worker can reclaim the task immediately
+        // rather than waiting for the expired lease of the hung worker.
+        dsl::sticky_worker_id.eq(None::<String>),
+        dsl::sticky_until.eq(None::<chrono::DateTime<chrono::Utc>>),
     ))
     .execute(&mut conn)
     .await
