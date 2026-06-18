@@ -91,13 +91,8 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut eq_idx = None;
     let mut in_idx = None;
     let mut in_quotes = None;
-    let token_chars: Vec<char> = token.chars().collect();
-    let token_lower = token.to_lowercase();
-    let token_lower_chars: Vec<char> = token_lower.chars().collect();
 
-    let mut i = 0;
-    while i < token_chars.len() {
-        let c = token_chars[i];
+    for (i, c) in token.char_indices() {
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -109,20 +104,18 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
             '=' if in_quotes.is_none() && eq_idx.is_none() => {
                 eq_idx = Some(i);
             }
-            _ => {
-                if in_quotes.is_none()
-                    && in_idx.is_none()
-                    && i + 3 < token_chars.len()
-                    && token_lower_chars[i] == ' '
-                    && token_lower_chars[i + 1] == 'i'
-                    && token_lower_chars[i + 2] == 'n'
-                    && token_lower_chars[i + 3] == ' '
+            ' ' if in_quotes.is_none() && in_idx.is_none() => {
+                let rest = &token[i..];
+                if rest.starts_with(" in ")
+                    || rest.starts_with(" IN ")
+                    || rest.starts_with(" In ")
+                    || rest.starts_with(" iN ")
                 {
                     in_idx = Some(i);
                 }
             }
+            _ => {}
         }
-        i += 1;
     }
     (eq_idx, in_idx)
 }
@@ -381,5 +374,14 @@ mod tests {
 
         // Empty requirements always match
         assert!(matches_requirements(&[], &labels));
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn havoc_test_parse_requirements_does_not_panic(s in "\\PC*") {
+            let _ = parse_requirements(&s);
+        }
     }
 }
