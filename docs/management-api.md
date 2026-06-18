@@ -177,3 +177,85 @@ The command exits cleanly when the server sends `event: stream-end`.
 | **Traefik** | No special config required. Traefik detects `text/event-stream` and disables response buffering automatically. |
 
 **Important**: SSE requires HTTP/1.1 or HTTP/2. Ensure the proxy does not downgrade the connection to HTTP/1.0, which does not support chunked transfer encoding.
+
+---
+
+## Listing workflows (`GET /workflows`)
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `workflow_name` | string | Filter to a single workflow type by name |
+| `workflow_id` | string | Filter by logical workflow ID |
+| `state` | string | Filter by execution state (e.g. `RUNNING`, `COMPLETED`) |
+| `limit` | integer | Maximum rows to return (default 200, max 200) |
+| `search_attr` | repeated | `key:value` pairs against `search_attrs` JSONB |
+| `no_progress_minutes` | integer | Return stalled workflows with no task activity for N minutes |
+| `sla_breached` | bool | Filter to executions that have breached their SLA |
+| `page_size` | integer | Per-page limit for keyset pagination (1–200; overrides `limit`). Presence activates the opt-in paginated envelope. |
+| `cursor` | string | Opaque continuation token returned by a previous page's `next_cursor`. Presence activates the opt-in paginated envelope. |
+| `order` | `asc` \| `desc` | Walk order on `(created_at, id)`. Default `desc` (newest first). Presence activates the opt-in paginated envelope. |
+| `started_after` | RFC 3339 | Return only executions whose `started_at` is after this timestamp |
+| `started_before` | RFC 3339 | Return only executions whose `started_at` is before this timestamp |
+| `exec_id_prefix` | string | Return only executions whose string-formatted `exec_id` starts with this prefix |
+
+### Response shape — opt-in envelope
+
+When **none** of `page_size`, `cursor`, or `order` are present the endpoint returns a bare JSON array, identical to the pre-pagination behaviour:
+
+```json
+[ { "workflow_id": "...", "state": "RUNNING", ... }, ... ]
+```
+
+When **any** of `page_size`, `cursor`, or `order` are present the endpoint returns a paginated envelope:
+
+```json
+{
+  "workflows": [ { "workflow_id": "...", "state": "RUNNING", ... }, ... ],
+  "next_cursor": "<opaque string or null>"
+}
+```
+
+`next_cursor` is `null` on the last page. Pass it verbatim as the `cursor` query parameter to fetch the next page.
+
+### Keyset cursor semantics
+
+Pagination is keyset-based over `(created_at, id)`:
+
+- The cursor encodes the `(created_at, id)` values of the **last row returned** on the previous page.
+- Each subsequent page request adds `WHERE (created_at, id) < cursor` (for `order=desc`) or `WHERE (created_at, id) > cursor` (for `order=asc`).
+- The cursor is opaque — do not parse or construct it manually.
+- Inserting new rows while paginating does not cause duplicates or skips: the keyset predicate anchors each page to a stable position in the index.
+
+### `order` parameter contract
+
+| Value | Walk direction | Use case |
+|-------|---------------|----------|
+| `desc` (default) | newest first | Browsing the live queue; monitoring dashboards |
+| `asc` | oldest first | Draining a backlog in FIFO order; catch-up processing |
+
+`order=asc` combined with `page_size` and `next_cursor` walks from the oldest execution forward.
+
+### Combining with time-range filters
+
+`started_after` / `started_before` filter on the `started_at` column (when the execution began), while the cursor/sort key is `created_at` (when the row was inserted). The two are closely related but not identical (a workflow can be inserted and queued before it starts). You can combine them freely.
+
+### Example — paginate through all running workflows in pages of 50
+
+```bash
+# First page
+curl "/workflows?state=RUNNING&page_size=50"
+# Response: { "workflows": [...50 rows...], "next_cursor": "abc123" }
+
+# Second page
+curl "/workflows?state=RUNNING&page_size=50&cursor=abc123"
+
+# Keep following next_cursor until it is null
+```
+
+### Notes
+
+- The `no_progress_minutes` (stalled-workflow) filter always returns a bare array regardless of pagination parameters.
+- `page_size` and `limit` are aliases; if both are present `page_size` wins.
+- On a sharded deployment each shard is queried independently with the same cursor and `page_size+1` limit; the results are k-way merged and truncated to `page_size` before the response is returned. See `docs/sharding.md` for the cross-shard keyset contract.

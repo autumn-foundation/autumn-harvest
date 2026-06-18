@@ -33,6 +33,11 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
+/// When `HARVEST_TEST_PG_URL` is set (e.g. in CI without Docker Hub access),
+/// we skip container startup and use an already-running Postgres instance.
+/// Format: `postgres://user:pass@host:port/postgres` (admin database).
+const LOCAL_PG_URL_ENV: &str = "HARVEST_TEST_PG_URL";
+
 const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
@@ -117,7 +122,11 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
     ),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260618000000_harvest_workflow_list_keyset_index/up.sql"
+    )
 );
 
 type HarvestApiApp = axum::Router;
@@ -126,7 +135,35 @@ fn test_app_state_without_database() -> AppState {
     AppState::for_test().with_profile("test")
 }
 
-async fn setup_single_database() -> (String, ContainerAsync<Postgres>) {
+async fn setup_single_database() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(admin_url) = std::env::var(LOCAL_PG_URL_ENV) {
+        // Use a fresh uniquely-named database on the already-running Postgres.
+        let db_name = format!("harvest_test_{}", uuid::Uuid::new_v4().simple());
+        let mut admin_conn = <AsyncPgConnection as AsyncConnection>::establish(&admin_url)
+            .await
+            .expect("failed to connect to local admin postgres");
+        diesel::sql_query(format!("CREATE DATABASE {db_name}"))
+            .execute(&mut admin_conn)
+            .await
+            .expect("failed to create test database");
+
+        // Derive the database URL by replacing the database component.
+        let database_url = {
+            let base = admin_url.trim_end_matches('/');
+            let without_db = base.rsplitn(2, '/').nth(1).unwrap_or(base);
+            format!("{without_db}/{db_name}")
+        };
+
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect to fresh test database");
+        conn.batch_execute(INIT_SQL)
+            .await
+            .expect("failed to apply harvest migrations");
+
+        return (database_url, None);
+    }
+
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
         .with_tag("16")
@@ -144,25 +181,30 @@ async fn setup_single_database() -> (String, ContainerAsync<Postgres>) {
         .expect("failed to get container port");
     let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-    (database_url, container)
+    (database_url, Some(container))
 }
 
-async fn setup_sharded_databases() -> ((String, String), ContainerAsync<Postgres>) {
-    let container = Postgres::default()
-        .with_tag("16")
-        .start()
-        .await
-        .expect("failed to start Postgres container");
+async fn setup_sharded_databases() -> ((String, String), Option<ContainerAsync<Postgres>>) {
+    let (admin_url, container) = if let Ok(local_url) = std::env::var(LOCAL_PG_URL_ENV) {
+        (local_url, None)
+    } else {
+        let container = Postgres::default()
+            .with_tag("16")
+            .start()
+            .await
+            .expect("failed to start Postgres container");
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to get container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("failed to get container port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        (url, Some(container))
+    };
 
-    let host = container
-        .get_host()
-        .await
-        .expect("failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get container port");
-    let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
     let shard0_db = format!("harvest_shard_{}", uuid::Uuid::new_v4().simple());
     let shard1_db = format!("harvest_shard_{}", uuid::Uuid::new_v4().simple());
 
@@ -178,8 +220,14 @@ async fn setup_sharded_databases() -> ((String, String), ContainerAsync<Postgres
         .await
         .expect("failed to create shard 1 database");
 
-    let shard0_url = format!("postgres://postgres:postgres@{host}:{port}/{shard0_db}");
-    let shard1_url = format!("postgres://postgres:postgres@{host}:{port}/{shard1_db}");
+    // Derive the base URL (without database name) to construct shard URLs.
+    let base_url = {
+        let base = admin_url.trim_end_matches('/');
+        let without_db = base.rsplitn(2, '/').nth(1).unwrap_or(base);
+        without_db.to_string()
+    };
+    let shard0_url = format!("{base_url}/{shard0_db}");
+    let shard1_url = format!("{base_url}/{shard1_db}");
 
     for shard_url in [&shard0_url, &shard1_url] {
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(shard_url)
@@ -612,4 +660,382 @@ async fn workflow_list_filter_failure_cause() {
     assert_eq!(status, StatusCode::OK);
     let ids = workflow_ids(&json);
     assert_eq!(ids, vec!["wf-failed-nd".to_string()]);
+}
+
+// ── Issue #498: cursor pagination + time-range filters ───────────────────────
+
+/// Stamp `created_at` directly on an already-inserted execution so tests can
+/// control insertion order without relying on NOW() timing.
+async fn set_created_at(
+    database_url: &str,
+    exec_id: ExecutionId,
+    ts: chrono::DateTime<chrono::Utc>,
+) {
+    use diesel::ExpressionMethods;
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect for set_created_at");
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::created_at.eq(ts))
+        .execute(&mut conn)
+        .await
+        .expect("set_created_at should succeed");
+}
+
+/// Collect `workflow_id` strings from a paginated envelope
+/// `{"workflows":[...], "next_cursor": ...}`.
+fn page_ids(value: &Value) -> Vec<String> {
+    value["workflows"]
+        .as_array()
+        .expect("paginated response must have a 'workflows' array")
+        .iter()
+        .map(|row| {
+            row["workflow_id"]
+                .as_str()
+                .expect("workflow_id must be a string")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Extract the `next_cursor` from a paginated envelope (null → None).
+fn next_cursor(value: &Value) -> Option<String> {
+    value["next_cursor"].as_str().map(str::to_string)
+}
+
+#[tokio::test]
+async fn workflow_list_started_after_before_filters_are_applied() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let old = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-old", None).await;
+    let new_wf = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-new", None).await;
+
+    // Back-date wf-old to 2025.
+    let old_ts = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    set_created_at(&database_url, old, old_ts).await;
+
+    // Also stamp started_at so the filter on started_at works.
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .unwrap();
+        diesel::update(harvest_workflow_executions::table.find(old.as_uuid()))
+            .set(harvest_workflow_executions::started_at.eq(old_ts))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // started_after=2026 should return only the recent workflow.
+    let (status, json) = get_json(&app, "/workflows?started_after=2026-01-01T00:00:00Z").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = workflow_ids(&json);
+    assert_eq!(ids, vec!["wf-new".to_string()]);
+
+    // started_before=2026 should return only the old one.
+    let (status, json) = get_json(&app, "/workflows?started_before=2026-01-01T00:00:00Z").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = workflow_ids(&json);
+    assert_eq!(ids, vec!["wf-old".to_string()]);
+
+    // Invalid RFC 3339 → 400.
+    let (status, _) = get_json(&app, "/workflows?started_after=yesterday").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let _ = new_wf;
+}
+
+#[tokio::test]
+async fn workflow_list_exec_id_prefix_filter_applied() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let exec_id = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "billing",
+        "wf-prefix-test",
+        None,
+    )
+    .await;
+
+    let id_str = exec_id.to_string();
+    let prefix = &id_str[..8];
+
+    // Prefix matches → 1 result.
+    let (status, json) = get_json(&app, &format!("/workflows?exec_id_prefix={prefix}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = workflow_ids(&json);
+    assert_eq!(ids, vec!["wf-prefix-test".to_string()]);
+
+    // Non-matching prefix → 0 results.
+    let (status, json) = get_json(&app, "/workflows?exec_id_prefix=00000000").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn workflow_list_legacy_call_returns_bare_array() {
+    // Callers that pass only limit/state/search_attr must still receive a bare
+    // JSON array — no envelope wrapping.
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let _ = seed_workflow(&database_url, ShardId::new(0), "billing", "wf-leg", None).await;
+
+    // No pagination params → bare array.
+    let (status, json) = get_json(&app, "/workflows?limit=10&state=RUNNING").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json.is_array(), "legacy call must return a bare JSON array");
+}
+
+#[tokio::test]
+async fn workflow_list_pagination_returns_envelope() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    // Seed 5 workflows with controlled created_at order.
+    for i in 0..5u64 {
+        let exec_id = seed_workflow(
+            &database_url,
+            ShardId::new(0),
+            "billing",
+            &format!("wf-p-{i:02}"),
+            None,
+        )
+        .await;
+        let ts = chrono::DateTime::from_timestamp(1_750_000_000 + (i as i64) * 10, 0).unwrap();
+        set_created_at(&database_url, exec_id, ts).await;
+    }
+
+    // Page 1 — page_size=2 desc.
+    let (status, page1) = get_json(&app, "/workflows?page_size=2").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids1 = page_ids(&page1);
+    assert_eq!(ids1.len(), 2, "page 1 must have 2 rows");
+    assert_eq!(ids1[0], "wf-p-04", "desc: newest row first");
+    assert_eq!(ids1[1], "wf-p-03");
+
+    let cursor1 = next_cursor(&page1).expect("page 1 must have next_cursor");
+
+    // Page 2.
+    let (status, page2) = get_json(&app, &format!("/workflows?page_size=2&cursor={cursor1}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids2 = page_ids(&page2);
+    assert_eq!(ids2[0], "wf-p-02");
+    assert_eq!(ids2[1], "wf-p-01");
+
+    let cursor2 = next_cursor(&page2).expect("page 2 must have next_cursor");
+
+    // Page 3 — last page.
+    let (status, page3) = get_json(&app, &format!("/workflows?page_size=2&cursor={cursor2}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids3 = page_ids(&page3);
+    assert_eq!(ids3, vec!["wf-p-00"]);
+    assert!(
+        next_cursor(&page3).is_none(),
+        "last page must have null next_cursor"
+    );
+
+    // No duplicates or skips across all three pages.
+    let mut all: Vec<_> = [ids1, ids2, ids3].concat();
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), 5, "all 5 rows must appear exactly once");
+}
+
+#[tokio::test]
+async fn workflow_list_pagination_asc_order() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    for i in 0..4u64 {
+        let exec_id = seed_workflow(
+            &database_url,
+            ShardId::new(0),
+            "billing",
+            &format!("wf-asc-{i:02}"),
+            None,
+        )
+        .await;
+        let ts = chrono::DateTime::from_timestamp(1_750_000_000 + (i as i64) * 10, 0).unwrap();
+        set_created_at(&database_url, exec_id, ts).await;
+    }
+
+    // Ascending: oldest first.
+    let (status, page1) = get_json(&app, "/workflows?page_size=2&order=asc").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids1 = page_ids(&page1);
+    assert_eq!(ids1[0], "wf-asc-00", "asc: oldest first");
+    assert_eq!(ids1[1], "wf-asc-01");
+
+    let cursor1 = next_cursor(&page1).expect("page 1 must have next_cursor");
+
+    let (status, page2) = get_json(
+        &app,
+        &format!("/workflows?page_size=2&order=asc&cursor={cursor1}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let ids2 = page_ids(&page2);
+    assert_eq!(ids2[0], "wf-asc-02");
+    assert_eq!(ids2[1], "wf-asc-03");
+    assert!(
+        next_cursor(&page2).is_none(),
+        "last page next_cursor must be null"
+    );
+}
+
+#[tokio::test]
+async fn workflow_list_pagination_keyset_stability_under_concurrent_inserts() {
+    // Fetch page 1, insert new rows with newer created_at, then fetch page 2
+    // via cursor. The new rows must NOT appear on page 2 (they'd be on page 0
+    // if re-fetched from scratch) and no rows must be duplicated or skipped.
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    // Seed 4 "old" workflows with ts < 2026.
+    for i in 0..4u64 {
+        let exec_id = seed_workflow(
+            &database_url,
+            ShardId::new(0),
+            "billing",
+            &format!("wf-stab-{i:02}"),
+            None,
+        )
+        .await;
+        let ts = chrono::DateTime::from_timestamp(1_700_000_000 + (i as i64) * 10, 0).unwrap();
+        set_created_at(&database_url, exec_id, ts).await;
+    }
+
+    // Page 1 (desc, page_size=2) → rows 3,2.
+    let (status, page1) = get_json(&app, "/workflows?page_size=2").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids1 = page_ids(&page1);
+    assert_eq!(ids1.len(), 2);
+
+    let cursor1 = next_cursor(&page1).expect("must have next_cursor");
+
+    // Insert 2 "new" rows with future timestamps that would sort before the
+    // cursor, i.e. they'd appear on page 1 if requested fresh.
+    for i in 0..2u64 {
+        let exec_id = seed_workflow(
+            &database_url,
+            ShardId::new(0),
+            "billing",
+            &format!("wf-new-{i}"),
+            None,
+        )
+        .await;
+        let ts = chrono::DateTime::from_timestamp(2_000_000_000 + (i as i64), 0).unwrap();
+        set_created_at(&database_url, exec_id, ts).await;
+    }
+
+    // Page 2 via cursor must return rows 1,0 — the new rows are after the
+    // cursor boundary and must NOT appear here.
+    let (status, page2) = get_json(&app, &format!("/workflows?page_size=2&cursor={cursor1}")).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids2 = page_ids(&page2);
+    assert_eq!(ids2.len(), 2);
+
+    // No duplicates between page 1 and page 2.
+    for id in &ids1 {
+        assert!(!ids2.contains(id), "row {id} duplicated across pages");
+    }
+    // New rows must not appear on page 2.
+    assert!(!ids2.contains(&"wf-new-0".to_string()));
+    assert!(!ids2.contains(&"wf-new-1".to_string()));
+}
+
+#[tokio::test]
+async fn workflow_list_pagination_sharded_global_order() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    // Shard 0: 3 workflows, timestamps t+0, t+20, t+40.
+    // Shard 1: 3 workflows, timestamps t+10, t+30, t+50.
+    // Expected desc order: s1-2(t+50), s0-2(t+40), s1-1(t+30), s0-1(t+20), s1-0(t+10), s0-0(t+0).
+    let base_ts: i64 = 1_750_000_000;
+    for i in 0..3u64 {
+        let exec_id = seed_workflow(
+            &shard0_url,
+            ShardId::new(0),
+            "billing",
+            &format!("wf-s0-{i}"),
+            None,
+        )
+        .await;
+        set_created_at(
+            &shard0_url,
+            exec_id,
+            chrono::DateTime::from_timestamp(base_ts + (i as i64) * 20, 0).unwrap(),
+        )
+        .await;
+    }
+    for i in 0..3u64 {
+        let exec_id = seed_workflow(
+            &shard1_url,
+            ShardId::new(1),
+            "billing",
+            &format!("wf-s1-{i}"),
+            None,
+        )
+        .await;
+        set_created_at(
+            &shard1_url,
+            exec_id,
+            chrono::DateTime::from_timestamp(base_ts + 10 + (i as i64) * 20, 0).unwrap(),
+        )
+        .await;
+    }
+
+    // Page through all 6 with page_size=2.
+    let mut all_ids = Vec::new();
+    let mut url = "/workflows?page_size=2".to_string();
+    loop {
+        let (status, page) = get_json(&app, &url).await;
+        assert_eq!(status, StatusCode::OK);
+        let ids = page_ids(&page);
+        assert!(!ids.is_empty(), "page must be non-empty");
+        all_ids.extend(ids);
+        match next_cursor(&page) {
+            Some(c) => url = format!("/workflows?page_size=2&cursor={c}"),
+            None => break,
+        }
+    }
+
+    // All 6 rows present, no duplicates.
+    assert_eq!(all_ids.len(), 6, "all 6 rows must appear across pages");
+    let mut sorted = all_ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 6, "no row must appear twice");
+
+    // Global order is newest-first (desc).
+    assert_eq!(all_ids[0], "wf-s1-2");
+    assert_eq!(all_ids[1], "wf-s0-2");
+    assert_eq!(all_ids[2], "wf-s1-1");
 }

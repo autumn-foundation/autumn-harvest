@@ -83,3 +83,55 @@ The `harvest.concurrency.in_flight` metric (tagged by concurrency key) is emitte
 ### Adding a shard to a deployment that uses per-key concurrency
 
 Follow the standard add-a-shard procedure in `CLAUDE.md`. The new shard starts with no task queue rows, so the cap is independent from day one. If you need to migrate in-flight workflows to the new shard, that is out of scope (cross-shard rebalancing is not supported).
+
+---
+
+## Cross-shard keyset pagination for `GET /workflows`
+
+When `page_size` (or `cursor` / `order`) is present on a `GET /workflows` request, the engine performs a **k-way merge** across all shards so the caller sees a single globally-ordered result set without knowing which shard each execution lives on.
+
+### Per-shard query
+
+Each shard receives the same keyset predicate and fetches **`page_size + 1`** rows:
+
+```sql
+SELECT *
+FROM   harvest_workflow_executions
+WHERE  <state/workflow_name/time-range filters>
+  AND  (created_at, id) < ($cursor_created_at, $cursor_id)  -- DESC direction
+       -- or (created_at, id) > ($cursor_created_at, $cursor_id)  -- ASC direction
+ORDER  BY created_at DESC, id DESC                           -- or ASC
+LIMIT  $page_size + 1;
+```
+
+The `idx_harvest_we_created_id` index on `(created_at DESC, id DESC)` makes this an O(log n) index scan regardless of how deep into history the operator has paged.
+
+### K-way merge
+
+Results from all N shards are merged in memory by sorting on the same `(created_at DESC, id)` key. The merged list is then evaluated against the overflow probe:
+
+- If `merged_len > page_size`: a next page exists. Truncate to `page_size`, encode the last kept row as `next_cursor`.
+- If `merged_len <= page_size`: this is the last page. `next_cursor = null`.
+
+### Row budget under N shards
+
+Each shard contributes at most `page_size + 1` rows to the merge, so the total rows read across all shards is at most `N * (page_size + 1)`. With `page_size = 50` and `N = 4` shards that is at most 204 rows read to return 50. The full history is reachable across pages — no execution is ever skipped.
+
+### Cursor correctness across shards
+
+The cursor encodes a concrete `(created_at, id)` pair from the **global** top-`page_size` list, not a per-shard position. When that pair falls on shard 2, shards 0, 1, and 3 use the same `(created_at, id)` anchor to exclude rows they already returned — this is safe because `(created_at, id)` is globally unique across all shards (UUID `id` guarantees this). Inserting new rows mid-pagination on any shard does not cause duplicates or gaps: the keyset anchor is immutable once the cursor is issued.
+
+### Filter interaction
+
+`started_after` / `started_before` apply as `WHERE started_at` predicates on every shard before the keyset filter and ORDER BY, so both filters and pagination compose cleanly in a single per-shard query.
+
+### Index
+
+The additive migration `20260618000000_harvest_workflow_list_keyset_index` creates:
+
+```sql
+CREATE INDEX IF NOT EXISTS idx_harvest_we_created_id
+    ON harvest_workflow_executions (created_at DESC, id DESC);
+```
+
+This index must be present on every shard for deep-page performance to remain flat. The migration is idempotent (`IF NOT EXISTS`) and runs automatically with `diesel migration run`.
