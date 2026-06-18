@@ -18,6 +18,8 @@ fn workflow_info_has_concurrency_fields() {
         execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
         max_input_bytes: None,
 
         owner: None,
@@ -43,6 +45,8 @@ fn workflow_info_with_concurrency_policy() {
             key_expr: "input.tenant_id",
             limit: 10,
         }),
+
+        debounce: None,
         max_input_bytes: None,
 
         owner: None,

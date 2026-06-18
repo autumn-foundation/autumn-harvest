@@ -269,6 +269,8 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
         execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -292,6 +294,8 @@ fn wf_info_with_concurrency(
         execution_timeout: None,
         sla: None,
         concurrency: Some(concurrency),
+
+        debounce: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,

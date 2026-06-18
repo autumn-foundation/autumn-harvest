@@ -300,6 +300,9 @@ pub struct HarvestApiState {
     /// Hard ceiling on per-execution event count (issue #493).
     /// `None` = ceiling disabled; executions are terminated when they exceed this count.
     max_workflow_history_events: Arc<Mutex<Option<u64>>>,
+    /// Default max-wait cap for debounced workflow starts (issue #499).
+    /// Applied when `DebouncePolicy.max_wait` is `None`. Defaults to 1 hour.
+    default_debounce_max_wait: Arc<Mutex<std::time::Duration>>,
 }
 
 impl Default for HarvestApiState {
@@ -328,6 +331,7 @@ impl Default for HarvestApiState {
             batch_start_max_bytes: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_BYTES)),
             gate_cache: Arc::new(autumn_harvest::AdmissionGateCache::new()),
             max_workflow_history_events: Arc::new(Mutex::new(None)),
+            default_debounce_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(3600))),
         }
     }
 }
@@ -517,6 +521,31 @@ impl HarvestApiState {
             .max_workflow_start_delay
             .lock()
             .expect("harvest api state lock poisoned")
+    }
+
+    /// Returns the default max-wait cap applied to debounced workflow starts (issue #499).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    #[must_use]
+    pub fn default_debounce_max_wait(&self) -> std::time::Duration {
+        *self
+            .default_debounce_max_wait
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Override the default debounce max-wait cap (issue #499).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub fn set_default_debounce_max_wait(&self, max_wait: std::time::Duration) {
+        *self
+            .default_debounce_max_wait
+            .lock()
+            .expect("harvest api state lock poisoned") = max_wait;
     }
 
     /// Set the hard caps for `POST /workflows/batch_start` (issue #357).
@@ -2270,6 +2299,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
+        .route("/admin/debounce", get(debounce_status))
         .route("/admin/rate-limits", get(list_rate_limits))
         .route(
             "/admin/rate-limits/{key}",
@@ -2539,6 +2569,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("GET", "/admin/concurrency"),
+        ("GET", "/admin/debounce"),
         ("GET", "/admin/rate-limits"),
         ("POST", "/admin/rate-limits/{key}"),
         ("GET", "/admin/circuits"),
@@ -3168,6 +3199,7 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),
         ("GET", "/admin/concurrency", None), // Vec<ConcurrencyKeyStats> (external model)
+        ("GET", "/admin/debounce", None),    // Vec<PendingDebounceRecord> (external model)
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
         ("GET", "/admin/circuits", None), // Vec<CircuitSnapshot> (external model)
@@ -5773,6 +5805,79 @@ async fn start_workflow(
             let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
             (key, Some(policy.limit))
         });
+
+    // Debounce admission gate (issue #499): collapse trigger bursts into one run.
+    // Check the WorkflowInfo debounce policy. If a policy applies and the key
+    // resolves, upsert a pending-debounce record and return 202 Accepted.
+    if let Some((debounce_policy, resolved_key)) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.debounce.as_ref())
+        .and_then(|policy| {
+            autumn_harvest::debounce::resolve_debounce_key(policy.key_expr, &input)
+                .map(|key| (policy, key))
+        })
+    {
+        // Route to the shard that owns this debounce key (shard-local, consistent with #247).
+        let debounce_shard = runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, &resolved_key);
+        let mut debounce_conn = match db_conn_for_shard(&api_state, debounce_shard).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+
+        let effective_max_wait = debounce_policy
+            .max_wait
+            .unwrap_or_else(|| api_state.default_debounce_max_wait());
+
+        let admit_params = autumn_harvest::debounce::AdmitDebounceParams {
+            workflow_name: &workflow_name,
+            debounce_key: &resolved_key,
+            workflow_id: &workflow_id,
+            queue_name: &queue_name,
+            last_input: input.clone(),
+            window: debounce_policy.window,
+            max_wait: effective_max_wait,
+            shard_id: debounce_shard.as_i32(),
+            start_options: autumn_harvest::debounce::DebounceStartOptions {
+                reuse_policy: request.reuse_policy.clone(),
+                execution_timeout_secs: request.execution_timeout_secs,
+                memo: request.memo.clone(),
+                search_attrs: request.search_attrs.clone(),
+                sla_secs: request.sla_secs,
+                context_headers: None,
+                priority: None,
+                concurrency_key: concurrency_key.clone(),
+                concurrency_limit,
+            },
+        };
+
+        match autumn_harvest::debounce::admit_debounced_start(&mut debounce_conn, admit_params)
+            .await
+        {
+            Ok(outcome) => {
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_workflow_debounced(&workflow_name, &resolved_key);
+                return (
+                    axum::http::StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "debounced": true,
+                        "debounce_key": outcome.debounce_key,
+                        "fire_at": outcome.fire_at,
+                        "pending_count": outcome.pending_count,
+                    })),
+                )
+                    .into_response();
+            }
+            Err(e) => return map_error(e).into_response(),
+        }
+    }
+    // Key resolved to None or no policy — fall through to the normal start path unchanged.
 
     // shard computed above (before gate check); reuse it here.
     let exec_id = ExecutionId::new_for_shard(shard);
@@ -13482,6 +13587,33 @@ async fn concurrency_status(
     Ok(Json(result))
 }
 
+// ── Debounce Management (issue #499) ──────────────────────────────────────
+
+async fn debounce_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<autumn_harvest::debounce::PendingDebounceRecord>>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut all_records: Vec<autumn_harvest::debounce::PendingDebounceRecord> = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let records = autumn_harvest::debounce::list_pending_debounce(&mut conn)
+            .await
+            .map_err(map_error)?;
+        all_records.extend(records);
+    }
+
+    // Sort by workflow_name, then debounce_key for deterministic operator view.
+    all_records.sort_by(|a, b| {
+        a.workflow_name
+            .cmp(&b.workflow_name)
+            .then(a.debounce_key.cmp(&b.debounce_key))
+    });
+
+    Ok(Json(all_records))
+}
+
 // ── Rate Limit Management ──────────────────────────────────────────────────
 
 async fn list_rate_limits(
@@ -18764,6 +18896,8 @@ mod tests {
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
                 sla: None,
                 owner: None,
@@ -20025,6 +20159,8 @@ mod tests {
                     handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                     execution_timeout: None,
                     concurrency: None,
+
+                    debounce: None,
                     max_input_bytes: None,
                     sla: None,
                     owner: None,
@@ -20041,6 +20177,8 @@ mod tests {
                     handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                     execution_timeout: None,
                     concurrency: None,
+
+                    debounce: None,
                     max_input_bytes: None,
                     sla: None,
                     owner: None,

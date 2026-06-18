@@ -170,6 +170,12 @@ pub struct WorkflowInfo {
     ///
     /// `None` = no per-key cap; only the worker-level semaphore applies.
     pub concurrency: Option<crate::concurrency::ConcurrencyPolicy>,
+    /// Optional debounce policy for collapsing trigger bursts into one run (issue #499).
+    ///
+    /// When set, each qualifying start request for the resolved key (re)sets the
+    /// fire deadline to `now + window`; exactly one execution is started after the
+    /// burst settles. `None` = no debounce; start behavior is byte-for-byte unchanged.
+    pub debounce: Option<crate::debounce::DebouncePolicy>,
     /// Per-workflow-type override for the workflow-input size cap (issue #252).
     ///
     /// When set, this raises (never lowers) the global `max_workflow_input_bytes`
@@ -204,6 +210,27 @@ pub struct WorkflowInfo {
 }
 
 impl WorkflowInfo {
+    /// Attach a debounce policy to collapse trigger bursts into one run (issue #499).
+    ///
+    /// Fluent builder method — call after the companion function:
+    /// ```rust,ignore
+    /// use autumn_harvest::debounce::DebouncePolicy;
+    /// use std::time::Duration;
+    ///
+    /// .workflows(vec![
+    ///     webhook_handler_info().with_debounce(DebouncePolicy {
+    ///         key_expr: "input.user_id",
+    ///         window: Duration::from_secs(30),
+    ///         max_wait: Some(Duration::from_secs(300)),
+    ///     })
+    /// ])
+    /// ```
+    #[must_use]
+    pub const fn with_debounce(mut self, policy: crate::debounce::DebouncePolicy) -> Self {
+        self.debounce = Some(policy);
+        self
+    }
+
     /// Attach a human-readable description to this workflow.
     ///
     /// Fluent builder method — call after the companion function:
@@ -777,6 +804,8 @@ impl DagInfo {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: self.owner,
             runbook_url: self.runbook_url,
@@ -798,6 +827,7 @@ impl std::fmt::Debug for WorkflowInfo {
             .field("execution_timeout", &self.execution_timeout)
             .field("sla", &self.sla)
             .field("concurrency", &self.concurrency)
+            .field("debounce", &self.debounce)
             .field("max_input_bytes", &self.max_input_bytes)
             .field("owner", &self.owner)
             .field("runbook_url", &self.runbook_url)
@@ -899,6 +929,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -923,6 +955,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -944,6 +978,8 @@ mod tests {
             execution_timeout: None,
             sla: Some(std::time::Duration::from_secs(7_200)),
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -965,6 +1001,8 @@ mod tests {
             execution_timeout: Some(std::time::Duration::from_secs(86_400)),
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -991,6 +1029,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1015,6 +1055,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1056,6 +1098,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1089,6 +1133,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1119,6 +1165,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1157,6 +1205,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1188,6 +1238,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1214,6 +1266,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1434,6 +1488,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

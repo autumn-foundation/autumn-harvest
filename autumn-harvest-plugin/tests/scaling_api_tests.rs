@@ -112,6 +112,8 @@ fn workflow_info() -> WorkflowInfo {
         execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,

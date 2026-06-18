@@ -260,6 +260,20 @@ pub const METRIC_CIRCUIT_TRIPPED: &str = "harvest.activity.circuit.tripped";
 /// Labeled by `activity.name`. `execution.id` stays span-only per ADR-0001 §7.
 pub const METRIC_CIRCUIT_CLOSED: &str = "harvest.activity.circuit.closed";
 
+/// Counter: incremented each time a start request is admitted to a debounce
+/// pending record — i.e. the burst is absorbed without starting a run (issue #499).
+///
+/// Labeled by `workflow` (workflow type name) and `debounce_key` (resolved key).
+/// Per ADR-0001 §7, `execution.id` is span-only and must never appear here.
+pub const METRIC_WORKFLOW_DEBOUNCED: &str = "harvest.workflow.debounced";
+
+/// Counter: incremented each time the debounce scanner fires a pending record
+/// and starts exactly one workflow execution (issue #499).
+///
+/// Labeled by `workflow` (workflow type name) and `queue` (task queue name).
+/// Per ADR-0001 §7, `execution.id` is span-only and must never appear here.
+pub const METRIC_DEBOUNCE_FIRED: &str = "harvest.workflow.debounce_fired";
+
 /// Histogram: observed payload size in bytes at each write boundary (issue #252).
 ///
 /// Emitted for every payload written to `harvest_events`, regardless of whether
@@ -1071,6 +1085,22 @@ pub trait MetricsRecorder: Send + Sync {
     /// Record one external cancel dispatch outcome (`outcome`: `"delivered"` / `"failed"`).
     fn record_external_cancel_sent(&self, outcome: &str, reason_code: Option<&str>) {
         let _ = (outcome, reason_code);
+    }
+
+    /// A start request was absorbed by a debounce pending record (issue #499).
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_DEBOUNCED`] with labels
+    /// `workflow` and `debounce_key`.
+    fn record_workflow_debounced(&self, workflow_name: &str, debounce_key: &str) {
+        let _ = (workflow_name, debounce_key);
+    }
+
+    /// The debounce scanner fired a pending record and started one execution (issue #499).
+    ///
+    /// Maps to the counter [`METRIC_DEBOUNCE_FIRED`] with labels
+    /// `workflow` and `queue`.
+    fn record_debounce_fired(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
     }
 }
 

@@ -18,12 +18,21 @@ struct ConcurrencyArgs {
     limit: u32,
 }
 
+struct DebounceArgs {
+    key_expr: String,
+    window: String,
+    max_wait: Option<String>,
+}
+
 struct WorkflowAttrs {
     execution_timeout: Option<String>,
     /// Soft SLA budget (issue #487). Parsed from `#[workflow(sla = "2h")]`.
     /// Stored as `WorkflowInfo::sla: Option<Duration>`.
     sla: Option<String>,
     concurrency: Option<ConcurrencyArgs>,
+    /// Trailing-edge debounce policy (issue #499). Parsed from
+    /// `#[workflow(debounce(key = "input.tenant_id", window = "30s", max_wait = "5m"))]`.
+    debounce: Option<DebounceArgs>,
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
     max_input_bytes: Option<u64>,
@@ -42,6 +51,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         execution_timeout: None,
         sla: None,
         concurrency: None,
+        debounce: None,
         max_input_bytes: None,
         owner: None,
         runbook: None,
@@ -93,6 +103,41 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             })?;
             result.concurrency = Some(ConcurrencyArgs { key_expr, limit });
             Ok(())
+        } else if meta.path.is_ident("debounce") {
+            let mut key_expr: Option<String> = None;
+            let mut window: Option<String> = None;
+            let mut max_wait: Option<String> = None;
+            meta.parse_nested_meta(|inner| {
+                if inner.path.is_ident("key") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    key_expr = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("window") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    window = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("max_wait") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    max_wait = Some(value.value());
+                    Ok(())
+                } else {
+                    Err(inner.error("expected `key`, `window`, or `max_wait`"))
+                }
+            })?;
+            let key_expr = key_expr.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "debounce requires `key = \"...\"`",
+                )
+            })?;
+            let window = window.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "debounce requires `window = \"...\"` (e.g. `window = \"30s\"`)",
+                )
+            })?;
+            result.debounce = Some(DebounceArgs { key_expr, window, max_wait });
+            Ok(())
         } else if meta.path.is_ident("allow_nondeterministic_apis") {
             if meta.input.peek(syn::Token![=]) {
                 let value: syn::LitBool = meta.value()?.parse()?;
@@ -135,7 +180,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, or `allow_nondeterministic_apis`",
+                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -313,6 +358,31 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Emit debounce as Option<DebouncePolicy> (issue #499).
+    let debounce_expr = match attrs.debounce {
+        None => quote! { ::std::option::Option::None },
+        Some(DebounceArgs {
+            key_expr,
+            window,
+            max_wait,
+        }) => {
+            let max_wait_expr = max_wait.map_or_else(
+                || quote! { ::std::option::Option::None },
+                |s| quote! { ::autumn_harvest::task_duration(#s) },
+            );
+            quote! {
+                ::std::option::Option::Some(
+                    ::autumn_harvest::debounce::DebouncePolicy {
+                        key_expr: #key_expr,
+                        window: ::autumn_harvest::task_duration(#window)
+                            .expect("debounce window must be a valid duration string"),
+                        max_wait: #max_wait_expr,
+                    }
+                )
+            }
+        }
+    };
+
     let max_input_bytes_expr = attrs
         .max_input_bytes
         .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
@@ -365,6 +435,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 execution_timeout: #execution_timeout_expr,
                 sla: #sla_expr,
                 concurrency: #concurrency_expr,
+                debounce: #debounce_expr,
                 max_input_bytes: #max_input_bytes_expr,
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,

@@ -2806,6 +2806,25 @@
     },
     {
       "method": "GET",
+      "path": "/admin/debounce",
+      "category": "admin",
+      "read_only": true,
+      "description": "Return all pending debounce records across all shards. Each record represents a burst of triggers for a (workflow_name, debounce_key) that has not yet fired. Fields: workflow_name, debounce_key, workflow_id, queue_name, effective_fire_at (current projected deadline), max_fire_at (cap), pending_count (number of admitted requests), shard_id, created_at, updated_at.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/queues/scaling",
       "category": "admin",
       "read_only": true,

@@ -70,6 +70,8 @@ pub mod dag_linter;
 pub mod dag_profiler;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
+/// Debounced workflow starts — collapse trigger bursts into one run (issue #499).
+pub mod debounce;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;

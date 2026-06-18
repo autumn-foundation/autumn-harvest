@@ -86,6 +86,12 @@ Follow the standard add-a-shard procedure in `CLAUDE.md`. The new shard starts w
 
 ---
 
+## Debounce coordination is shard-local (issue #499)
+
+Debounce pending-start records (`harvest_debounce`) are routed to the same shard as the debounce key (via `ShardRouter`), matching the per-key concurrency scope above. All burst admissions for the same `(workflow_name, debounce_key)` pair must land on the same shard for the `UNIQUE (workflow_name, debounce_key)` upsert collapse to work. Cross-shard global debounce coordination is **out of scope**: embedders requiring a global cap should ensure all executions for a given debounce key route to a single shard (see the concurrency routing guidance above).
+
+---
+
 ## Cross-shard keyset pagination for `GET /workflows`
 
 When `page_size` (or `cursor` / `order`) is present on a `GET /workflows` request, the engine performs a **k-way merge** across all shards so the caller sees a single globally-ordered result set without knowing which shard each execution lives on.

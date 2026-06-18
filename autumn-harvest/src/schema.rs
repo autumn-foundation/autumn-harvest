@@ -530,6 +530,33 @@ diesel::joinable!(harvest_schedule_decisions -> harvest_schedules (schedule_id))
 // harvest_calendar_exclusions references harvest_calendars(name), not the PK(id),
 // so diesel::joinable! cannot be used here. Queries use explicit filter conditions.
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Pending debounce records — one row per `(workflow_name, debounce_key)` (issue #499).
+    harvest_debounce (id) {
+        id                -> Uuid,
+        workflow_name     -> Text,
+        debounce_key      -> Text,
+        workflow_id       -> Text,
+        queue_name        -> Text,
+        /// Most recent qualifying request's input (last-input-wins on each upsert).
+        last_input        -> Jsonb,
+        /// Serialised start options (`reuse_policy`, timeouts, memo, etc.) — opaque JSONB.
+        start_options     -> Jsonb,
+        /// Trailing-edge fire deadline: `LEAST(now + window, max_fire_at)`. Recomputed on each upsert.
+        effective_fire_at -> Timestamptz,
+        /// Absolute cap: `first_seen + max_wait`. Set once at insert; never updated.
+        max_fire_at       -> Timestamptz,
+        /// Count of qualifying start requests seen since the record was created.
+        pending_count     -> Int4,
+        /// Shard this record was routed to (for operator visibility).
+        shard_id          -> Int4,
+        created_at        -> Timestamptz,
+        updated_at        -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
@@ -552,4 +579,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_triggers,
     harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox,
+    harvest_debounce,
 );

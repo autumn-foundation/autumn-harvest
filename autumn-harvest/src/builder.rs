@@ -49,6 +49,8 @@ pub const DEFAULT_MAX_WORKFLOW_INPUT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 pub const DEFAULT_MAX_WORKFLOW_START_DELAY: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Default bounded-pause ceiling before auto-resume (24 hours, issue #383).
 pub const DEFAULT_MAX_WORKFLOW_PAUSE_DURATION: Duration = Duration::from_secs(24 * 3600);
+/// Default max-wait cap for debounced workflow starts (1 hour, issue #499).
+pub const DEFAULT_DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(3600);
 
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
@@ -1663,6 +1665,14 @@ pub struct WorkerConfig {
     ///
     /// Defaults to `None` (disabled).
     pub max_workflow_history_events: Option<u64>,
+    /// Default maximum wait before a debounced workflow start is forced to fire,
+    /// even if the burst has not settled (issue #499).
+    ///
+    /// Applied when a `DebouncePolicy.max_wait` is `None`. Prevents a
+    /// continuously-retriggered workflow from being deferred indefinitely.
+    ///
+    /// Defaults to **1 hour**. Override via `with_default_debounce_max_wait`.
+    pub default_debounce_max_wait: Duration,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
@@ -1693,6 +1703,7 @@ impl Default for WorkerConfig {
             max_workflow_pause_duration: DEFAULT_MAX_WORKFLOW_PAUSE_DURATION,
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,
+            default_debounce_max_wait: DEFAULT_DEBOUNCE_MAX_WAIT,
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -1964,6 +1975,17 @@ impl WorkerConfig {
         self
     }
 
+    /// Override the default max-wait cap applied to debounced workflow starts
+    /// when `DebouncePolicy.max_wait` is `None` (issue #499).
+    ///
+    /// Prevents a continuously-retriggered workflow from being deferred
+    /// indefinitely. Defaults to **1 hour**.
+    #[must_use]
+    pub const fn with_default_debounce_max_wait(mut self, max_wait: Duration) -> Self {
+        self.default_debounce_max_wait = max_wait;
+        self
+    }
+
     #[cfg(feature = "db")]
     /// Set the sharded database pool for exact shard routing.
     #[must_use]
@@ -1988,6 +2010,8 @@ mod tests {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -2442,6 +2466,8 @@ mod tests {
                     key_expr: "input.tenant_id",
                     limit: 0,
                 }),
+
+                debounce: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -2478,6 +2504,8 @@ mod tests {
                     key_expr: "input.tenant_id",
                     limit: 5,
                 }),
+
+                debounce: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,

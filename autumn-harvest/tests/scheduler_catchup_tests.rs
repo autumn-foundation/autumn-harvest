@@ -194,6 +194,8 @@ fn make_registry(workflow_name: &'static str) -> Arc<HandlerRegistry> {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

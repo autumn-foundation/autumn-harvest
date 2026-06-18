@@ -519,6 +519,8 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,

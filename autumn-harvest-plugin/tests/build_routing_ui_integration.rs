@@ -190,6 +190,8 @@ fn minimal_registry() -> Arc<HandlerRegistry> {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
