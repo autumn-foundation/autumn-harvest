@@ -31,7 +31,7 @@
       "path": "/workflows",
       "category": "workflow",
       "read_only": true,
-      "description": "List workflow executions with optional filters.",
+      "description": "List workflow executions with optional filters. Supports keyset cursor pagination (issue #498).",
       "params": [
         {
           "name": "state",
@@ -56,13 +56,43 @@
           "name": "limit",
           "in": "query",
           "required": false,
-          "description": "Maximum number of results to return."
+          "description": "Maximum number of results to return (legacy; use page_size for paginated access)."
+        },
+        {
+          "name": "page_size",
+          "in": "query",
+          "required": false,
+          "description": "Number of results per page (1–200). Activates the paginated response envelope {workflows, next_cursor}."
         },
         {
           "name": "cursor",
           "in": "query",
           "required": false,
-          "description": "Opaque pagination cursor from a previous response."
+          "description": "Opaque keyset pagination cursor from a previous response's next_cursor field."
+        },
+        {
+          "name": "order",
+          "in": "query",
+          "required": false,
+          "description": "Sort direction: 'asc' (oldest first) or 'desc' (newest first, default). Activates the paginated response envelope."
+        },
+        {
+          "name": "started_after",
+          "in": "query",
+          "required": false,
+          "description": "Filter to executions whose started_at is after this RFC 3339 timestamp (e.g. 2026-01-01T00:00:00Z)."
+        },
+        {
+          "name": "started_before",
+          "in": "query",
+          "required": false,
+          "description": "Filter to executions whose started_at is before this RFC 3339 timestamp."
+        },
+        {
+          "name": "exec_id_prefix",
+          "in": "query",
+          "required": false,
+          "description": "Case-insensitive prefix match on the execution UUID string."
         },
         {
           "name": "sla_breached",
@@ -74,12 +104,13 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "free_form": true
+        "free_form": true,
+        "description": "Without pagination params: bare JSON array of execution objects (backward compatible). With cursor/page_size/order: JSON object {\"workflows\": [...], \"next_cursor\": <string|null>}."
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid filter value."
+          "description": "Invalid filter value, bad RFC 3339 timestamp, or unknown order direction."
         },
         {
           "status": 500,

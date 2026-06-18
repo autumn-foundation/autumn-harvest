@@ -886,7 +886,7 @@ async fn list_workflows_ui(
     filters.started_before = started_before;
     filters.exec_id_prefix = exec_id_search.clone();
 
-    let workflows = load_workflows_from_shards(&api_state, &filters).await?;
+    let (workflows, _next_cursor) = load_workflows_from_shards(&api_state, &filters).await?;
 
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);

@@ -1702,6 +1702,28 @@ const MAX_EXTERNAL_HANDOFF_LIMIT: i64 = 500;
 const DEFAULT_HISTORY_BATCH_EXPORT_LIMIT: usize = 100;
 const MAX_HISTORY_BATCH_EXPORT_LIMIT: usize = 1_000;
 
+/// Sort direction for `GET /workflows` (issue #498).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WorkflowSortOrder {
+    #[default]
+    Desc,
+    Asc,
+}
+
+/// Decoded keyset cursor for `GET /workflows` (issue #498).
+#[derive(Debug, Clone)]
+pub(crate) struct WorkflowListCursor {
+    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) exec_id: uuid::Uuid,
+}
+
+/// Response envelope returned when any pagination param is present (issue #498).
+#[derive(Debug, Serialize)]
+pub struct WorkflowListPage {
+    pub workflows: Vec<StalledWorkflowRow>,
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WorkflowFilters {
     pub(crate) limit: i64,
@@ -1724,6 +1746,13 @@ pub(crate) struct WorkflowFilters {
     pub(crate) sla_breached: bool,
     /// Only return executions with at least this many recorded events (issue #493).
     pub(crate) min_history_events: Option<u64>,
+    /// Sort direction (issue #498). Default: `Desc`.
+    pub(crate) order: WorkflowSortOrder,
+    /// Keyset cursor decoded from the `cursor` query param (issue #498).
+    pub(crate) cursor: Option<WorkflowListCursor>,
+    /// True when any pagination param (`cursor`, `page_size`, `order`) is
+    /// present; drives the opt-in response envelope (issue #498).
+    pub(crate) paginated: bool,
 }
 
 impl WorkflowFilters {
@@ -3854,18 +3883,32 @@ mod stack_state_tests {
 async fn list_workflows(
     Extension(api_state): Extension<HarvestApiState>,
     Query(pairs): Query<Vec<(String, String)>>,
-) -> Result<Json<Vec<StalledWorkflowRow>>, AutumnError> {
+) -> Result<axum::response::Response, AutumnError> {
+    use axum::response::IntoResponse as _;
     let filters = parse_workflow_filters(&pairs)?;
-    let rows = if filters.no_progress_minutes.is_some() {
-        load_stalled_workflows_from_shards(&api_state, &filters).await?
+    if filters.no_progress_minutes.is_some() {
+        // Stalled-workflow discovery (issue #486) always returns a bare array.
+        // Cursor pagination is not supported for this code path.
+        let rows = load_stalled_workflows_from_shards(&api_state, &filters).await?;
+        return Ok(Json(rows).into_response());
+    }
+    let (executions, next_cursor) = load_workflows_from_shards(&api_state, &filters).await?;
+    let rows: Vec<StalledWorkflowRow> = executions
+        .into_iter()
+        .map(StalledWorkflowRow::from)
+        .collect();
+    if filters.paginated {
+        // Opt-in envelope: callers that passed cursor/page_size/order get the
+        // paginated response shape { workflows, next_cursor }.
+        Ok(Json(WorkflowListPage {
+            workflows: rows,
+            next_cursor,
+        })
+        .into_response())
     } else {
-        load_workflows_from_shards(&api_state, &filters)
-            .await?
-            .into_iter()
-            .map(StalledWorkflowRow::from)
-            .collect()
-    };
-    Ok(Json(rows))
+        // Legacy bare-array response for callers using only limit/state/search_attr.
+        Ok(Json(rows).into_response())
+    }
 }
 
 /// `GET /workflows/registered` — list all registered workflow types with
@@ -3927,6 +3970,7 @@ pub(crate) fn parse_workflow_filters(
     pairs: &[(String, String)],
 ) -> Result<WorkflowFilters, AutumnError> {
     let mut limit_raw: Option<i64> = None;
+    let mut page_size_raw: Option<i64> = None;
     let mut filters = WorkflowFilters::default();
 
     for (key, value) in pairs {
@@ -4021,13 +4065,72 @@ pub(crate) fn parse_workflow_filters(
                 })?;
                 filters.min_history_events = Some(parsed);
             }
+            // ── Issue #498: time-range, prefix, and pagination params ────────
+            "started_after" => {
+                let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
+                    .map_err(|_| {
+                        AutumnError::bad_request_msg(format!(
+                            "invalid started_after '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
+                        ))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                filters.started_after = Some(dt);
+            }
+            "started_before" => {
+                let dt = chrono::DateTime::parse_from_rfc3339(value.trim())
+                    .map_err(|_| {
+                        AutumnError::bad_request_msg(format!(
+                            "invalid started_before '{value}'; expected RFC 3339 (e.g. 2026-01-01T00:00:00Z)"
+                        ))
+                    })?
+                    .with_timezone(&chrono::Utc);
+                filters.started_before = Some(dt);
+            }
+            "exec_id_prefix" => {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    filters.exec_id_prefix = Some(trimmed.to_string());
+                }
+            }
+            "order" => {
+                filters.order = match value.trim().to_ascii_lowercase().as_str() {
+                    "asc" => WorkflowSortOrder::Asc,
+                    "desc" => WorkflowSortOrder::Desc,
+                    other => {
+                        return Err(AutumnError::bad_request_msg(format!(
+                            "invalid order '{other}'; expected 'asc' or 'desc'"
+                        )));
+                    }
+                };
+                filters.paginated = true;
+            }
+            "page_size" => {
+                let parsed = value.trim().parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid page_size '{value}'; expected a positive integer"
+                    ))
+                })?;
+                // Tracked separately from `limit` so `page_size` always wins
+                // regardless of query-parameter order (issue #498 review).
+                page_size_raw = Some(parsed);
+                filters.paginated = true;
+            }
+            "cursor" => {
+                let decoded = parse_workflow_cursor(value.trim())?;
+                filters.cursor = Some(decoded);
+                filters.paginated = true;
+            }
             _ => {
                 // Ignore unknown query parameters so future additions stay non-breaking.
             }
         }
     }
 
-    let limit = limit_raw
+    // `page_size` takes precedence over `limit` whenever it is present, so the
+    // documented "page_size overrides limit" contract holds independent of the
+    // order the two parameters appear in the query string.
+    let limit = page_size_raw
+        .or(limit_raw)
         .unwrap_or(DEFAULT_WORKFLOW_LIMIT)
         .clamp(1, MAX_WORKFLOW_LIMIT);
     Ok(filters.with_limit(limit))
@@ -4596,6 +4699,41 @@ fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> String {
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
         row.exec_id
     )
+}
+
+// ── Issue #498: workflow list keyset cursor ──────────────────────────────────
+
+/// Encode a `(created_at, exec_id)` cursor pair into the opaque token format
+/// `"<rfc3339_micros>|<uuid>"`.
+fn encode_workflow_list_cursor_raw(
+    created_at: &chrono::DateTime<chrono::Utc>,
+    exec_id: &uuid::Uuid,
+) -> String {
+    format!(
+        "{}|{}",
+        created_at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+        exec_id
+    )
+}
+
+fn encode_workflow_list_cursor(row: &WorkflowExecution) -> String {
+    encode_workflow_list_cursor_raw(&row.created_at, &row.id)
+}
+
+pub(crate) fn parse_workflow_cursor(raw: &str) -> Result<WorkflowListCursor, AutumnError> {
+    let (ts_part, id_part) = raw.split_once('|').ok_or_else(|| {
+        AutumnError::bad_request_msg("invalid cursor; expected '<created_at>|<exec_id>'")
+    })?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(ts_part)
+        .map_err(|_| AutumnError::bad_request_msg("invalid cursor: bad timestamp"))?
+        .with_timezone(&chrono::Utc);
+    let exec_id = id_part
+        .parse::<uuid::Uuid>()
+        .map_err(|_| AutumnError::bad_request_msg("invalid cursor: bad execution id"))?;
+    Ok(WorkflowListCursor {
+        created_at,
+        exec_id,
+    })
 }
 
 fn workflow_child_status_label(status: &str) -> String {
@@ -13988,12 +14126,54 @@ pub(crate) async fn load_workflows(
     filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<WorkflowExecution>> {
     use diesel::dsl::sql;
-    use diesel::sql_types::{Bool, Jsonb, Text};
+    use diesel::sql_types::{BigInt, Bool, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
 
-    let mut query = harvest_workflow_executions::table
-        .into_boxed()
-        .order(harvest_workflow_executions::created_at.desc())
-        .limit(filters.limit);
+    // Honor `filters.limit` exactly. Direct callers (e.g. the DAG-runs UI loader
+    // `load_dag_runs_from_owning_shard`) render every row returned, so the
+    // overflow probe must NOT be baked in here. `load_workflows_from_shards`
+    // opts into the `+1` over-fetch by passing a probe filter with `limit + 1`.
+    let fetch_limit = filters.limit;
+
+    let mut query = harvest_workflow_executions::table.into_boxed();
+
+    // Apply sort direction (issue #498).
+    query = match filters.order {
+        WorkflowSortOrder::Desc => query
+            .order(harvest_workflow_executions::created_at.desc())
+            .then_order_by(harvest_workflow_executions::id.desc()),
+        WorkflowSortOrder::Asc => query
+            .order(harvest_workflow_executions::created_at.asc())
+            .then_order_by(harvest_workflow_executions::id.asc()),
+    };
+    query = query.limit(fetch_limit);
+
+    // Keyset predicate for cursor-based pagination (issue #498).
+    // Uses explicit OR form so it composes cleanly with the boxed query builder.
+    if let Some(cursor) = &filters.cursor {
+        let ts = cursor.created_at;
+        let id = cursor.exec_id;
+        query = match filters.order {
+            WorkflowSortOrder::Desc => query.filter(
+                sql::<Bool>(
+                    "(harvest_workflow_executions.created_at, harvest_workflow_executions.id) < (",
+                )
+                .bind::<Timestamptz, _>(ts)
+                .sql(", ")
+                .bind::<SqlUuid, _>(id)
+                .sql(")"),
+            ),
+            WorkflowSortOrder::Asc => query.filter(
+                sql::<Bool>(
+                    "(harvest_workflow_executions.created_at, harvest_workflow_executions.id) > (",
+                )
+                .bind::<Timestamptz, _>(ts)
+                .sql(", ")
+                .bind::<SqlUuid, _>(id)
+                .sql(")"),
+            ),
+        };
+    }
+
     if !filters.states.is_empty() {
         query = query.filter(harvest_workflow_executions::state.eq_any(filters.states.clone()));
     }
@@ -14036,7 +14216,6 @@ pub(crate) async fn load_workflows(
         // Correlated subquery: filter to executions with at least `min_events`
         // recorded events. No schema migration is required — the count is
         // computed on read from the existing `harvest_events` table.
-        use diesel::sql_types::BigInt;
         query = query.filter(
             sql::<Bool>(
                 "(SELECT COUNT(*) FROM harvest_events WHERE workflow_exec_id = harvest_workflow_executions.id) >= "
@@ -14050,29 +14229,68 @@ pub(crate) async fn load_workflows(
         .map_err(database_error)
 }
 
+/// Load workflows from all shards with keyset pagination support (issue #498).
+///
+/// Each shard is queried for `limit+1` rows beyond the cursor (the extra row is
+/// the overflow probe).  After the k-way merge, if the total exceeds `limit` a
+/// `next_cursor` is derived from the last kept row and the extra row is dropped.
+/// The full execution set is therefore reachable across successive pages.
+///
+/// Cross-shard contract: with N shards, up to `N * (limit+1)` rows are read per
+/// page but at most `limit` rows are returned.
 pub(crate) async fn load_workflows_from_shards(
     api_state: &HarvestApiState,
     filters: &WorkflowFilters,
-) -> Result<Vec<WorkflowExecution>, AutumnError> {
+) -> Result<(Vec<WorkflowExecution>, Option<String>), AutumnError> {
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut workflows = Vec::new();
 
+    // Over-fetch one extra row per shard so the post-merge step can detect
+    // whether a next page exists. The probe row is dropped after truncation.
+    // `saturating_add` guards against `i64::MAX` overflow.
+    let probe_filters = filters.clone().with_limit(filters.limit.saturating_add(1));
+
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let mut rows = load_workflows(&mut conn, filters)
+        let mut rows = load_workflows(&mut conn, &probe_filters)
             .await
             .map_err(map_error)?;
         workflows.append(&mut rows);
     }
 
-    workflows.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| right.id.cmp(&left.id))
-    });
-    workflows.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
-    Ok(workflows)
+    // Sort by the requested direction; tie-break on id for total ordering.
+    match filters.order {
+        WorkflowSortOrder::Desc => {
+            workflows.sort_by(|left, right| {
+                right
+                    .created_at
+                    .cmp(&left.created_at)
+                    .then_with(|| right.id.cmp(&left.id))
+            });
+        }
+        WorkflowSortOrder::Asc => {
+            workflows.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+    }
+
+    let limit = usize::try_from(filters.limit).unwrap_or(usize::MAX);
+    // Guard `limit > 0` so a hand-built filter with `limit == 0` can never
+    // underflow `limit - 1` (the HTTP path always clamps to >= 1, but this is
+    // a `pub(crate)` entry point).
+    let next_cursor = if limit > 0 && workflows.len() > limit {
+        let last_kept = &workflows[limit - 1];
+        let cursor = encode_workflow_list_cursor(last_kept);
+        workflows.truncate(limit);
+        Some(cursor)
+    } else {
+        None
+    };
+
+    Ok((workflows, next_cursor))
 }
 
 /// Per-shard stall-discovery query (issue #486).
@@ -14095,7 +14313,7 @@ pub(crate) async fn load_stalled_workflows(
     filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<StalledWorkflowRow>> {
     use diesel::dsl::{max, sql};
-    use diesel::sql_types::{BigInt, Bool};
+    use diesel::sql_types::{BigInt, Bool, Text};
     use std::collections::{HashMap, HashSet};
 
     let Some(minutes) = filters.no_progress_minutes else {
@@ -14155,6 +14373,20 @@ pub(crate) async fn load_stalled_workflows(
     // stalled rows because this loader bypasses `load_workflows`.
     if filters.sla_breached {
         query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+    }
+    // Honor the time-range and exec-id-prefix filters (issue #498) on the
+    // stalled path too: without these, `?no_progress_minutes=N&started_after=…`
+    // (or `&exec_id_prefix=…`) would return rows outside the requested bounds
+    // because this loader bypasses `load_workflows`.
+    if let Some(after) = filters.started_after {
+        query = query.filter(harvest_workflow_executions::started_at.ge(after));
+    }
+    if let Some(before) = filters.started_before {
+        query = query.filter(harvest_workflow_executions::started_at.le(before));
+    }
+    if let Some(prefix) = &filters.exec_id_prefix {
+        let pattern = format!("{}%", prefix.to_lowercase());
+        query = query.filter(sql::<Bool>("CAST(id AS TEXT) ILIKE ").bind::<Text, _>(pattern));
     }
 
     if let Some(min_events) = filters.min_history_events {
@@ -19972,6 +20204,177 @@ mod tests {
                 .any(|(m, p, _)| *m == "POST"
                     && *p == "/workflows/{workflow_name}/update-with-start"),
             "POST /workflows/{{workflow_name}}/update-with-start must be in management_api_response_fields"
+        );
+    }
+
+    // ── Issue #498: cursor pagination + time-range filters ──────────────────
+
+    #[test]
+    fn parse_workflow_filters_parses_started_after() {
+        let filters = parse_workflow_filters(&pairs(&[("started_after", "2026-01-01T00:00:00Z")]))
+            .expect("valid RFC 3339 started_after should parse");
+        assert!(filters.started_after.is_some());
+    }
+
+    #[test]
+    fn parse_workflow_filters_parses_started_before() {
+        let filters = parse_workflow_filters(&pairs(&[("started_before", "2026-06-18T12:00:00Z")]))
+            .expect("valid RFC 3339 started_before should parse");
+        assert!(filters.started_before.is_some());
+    }
+
+    #[test]
+    fn parse_workflow_filters_rejects_invalid_started_after() {
+        let err = parse_workflow_filters(&pairs(&[("started_after", "not-a-date")]))
+            .expect_err("invalid started_after must error");
+        assert!(
+            err.to_string().contains("invalid started_after"),
+            "expected helpful error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_workflow_filters_rejects_invalid_started_before() {
+        let err = parse_workflow_filters(&pairs(&[("started_before", "yesterday")]))
+            .expect_err("invalid started_before must error");
+        assert!(err.to_string().contains("invalid started_before"));
+    }
+
+    #[test]
+    fn parse_workflow_filters_parses_exec_id_prefix() {
+        let filters = parse_workflow_filters(&pairs(&[("exec_id_prefix", "abc123")]))
+            .expect("exec_id_prefix should parse");
+        assert_eq!(filters.exec_id_prefix.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn parse_workflow_filters_parses_order_desc() {
+        let filters =
+            parse_workflow_filters(&pairs(&[("order", "desc")])).expect("order=desc should parse");
+        assert!(matches!(filters.order, WorkflowSortOrder::Desc));
+        assert!(filters.paginated, "order param must set paginated=true");
+    }
+
+    #[test]
+    fn parse_workflow_filters_parses_order_asc() {
+        let filters =
+            parse_workflow_filters(&pairs(&[("order", "asc")])).expect("order=asc should parse");
+        assert!(matches!(filters.order, WorkflowSortOrder::Asc));
+        assert!(filters.paginated, "order param must set paginated=true");
+    }
+
+    #[test]
+    fn parse_workflow_filters_parses_order_case_insensitive() {
+        let filters = parse_workflow_filters(&pairs(&[("order", "DESC")]))
+            .expect("order=DESC (uppercase) should parse");
+        assert!(matches!(filters.order, WorkflowSortOrder::Desc));
+    }
+
+    #[test]
+    fn parse_workflow_filters_rejects_unknown_order() {
+        let err = parse_workflow_filters(&pairs(&[("order", "newest_first")]))
+            .expect_err("unknown order value must error");
+        assert!(err.to_string().contains("invalid order"));
+    }
+
+    #[test]
+    fn parse_workflow_filters_parses_page_size() {
+        let filters =
+            parse_workflow_filters(&pairs(&[("page_size", "25")])).expect("page_size should parse");
+        assert_eq!(filters.limit, 25);
+        assert!(filters.paginated, "page_size param must set paginated=true");
+    }
+
+    #[test]
+    fn parse_workflow_filters_clamps_page_size_to_max() {
+        let filters = parse_workflow_filters(&pairs(&[("page_size", "9999")]))
+            .expect("oversize page_size should clamp");
+        assert_eq!(filters.limit, MAX_WORKFLOW_LIMIT);
+    }
+
+    #[test]
+    fn parse_workflow_filters_rejects_invalid_page_size() {
+        let err = parse_workflow_filters(&pairs(&[("page_size", "big")]))
+            .expect_err("non-numeric page_size must error");
+        assert!(err.to_string().contains("invalid page_size"));
+    }
+
+    #[test]
+    fn parse_workflow_filters_page_size_wins_over_limit_regardless_of_order() {
+        // page_size before limit.
+        let a = parse_workflow_filters(&pairs(&[("page_size", "25"), ("limit", "200")]))
+            .expect("should parse");
+        assert_eq!(a.limit, 25, "page_size must override limit");
+        // limit before page_size — page_size must still win.
+        let b = parse_workflow_filters(&pairs(&[("limit", "200"), ("page_size", "25")]))
+            .expect("should parse");
+        assert_eq!(
+            b.limit, 25,
+            "page_size must override limit regardless of order"
+        );
+    }
+
+    #[test]
+    fn parse_workflow_filters_cursor_sets_paginated() {
+        // We don't test the cursor body here (the round-trip test does that),
+        // just that a `cursor` param flips the paginated flag.
+        let encoded = encode_workflow_list_cursor_raw(
+            &chrono::DateTime::parse_from_rfc3339("2026-06-18T10:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            &uuid::Uuid::nil(),
+        );
+        let filters = parse_workflow_filters(&pairs(&[("cursor", &encoded)]))
+            .expect("valid cursor should parse");
+        assert!(filters.paginated, "cursor param must set paginated=true");
+        assert!(filters.cursor.is_some());
+    }
+
+    #[test]
+    fn parse_workflow_filters_cursor_roundtrips() {
+        let created_at = chrono::DateTime::parse_from_rfc3339("2026-06-18T10:00:00.123456Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let exec_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+
+        let encoded = encode_workflow_list_cursor_raw(&created_at, &exec_id);
+        let decoded = parse_workflow_cursor(&encoded).expect("cursor must round-trip");
+        assert_eq!(decoded.created_at, created_at);
+        assert_eq!(decoded.exec_id, exec_id);
+    }
+
+    #[test]
+    fn parse_workflow_cursor_rejects_malformed() {
+        let err = parse_workflow_cursor("not-valid").expect_err("malformed cursor must error");
+        assert!(err.to_string().contains("invalid cursor"));
+    }
+
+    #[test]
+    fn parse_workflow_cursor_rejects_bad_timestamp() {
+        let err = parse_workflow_cursor("not-a-date|550e8400-e29b-41d4-a716-446655440000")
+            .expect_err("bad timestamp must error");
+        assert!(err.to_string().contains("invalid cursor"));
+    }
+
+    #[test]
+    fn parse_workflow_cursor_rejects_bad_uuid() {
+        let err = parse_workflow_cursor("2026-06-18T10:00:00Z|not-a-uuid")
+            .expect_err("bad uuid must error");
+        assert!(err.to_string().contains("invalid cursor"));
+    }
+
+    #[test]
+    fn parse_workflow_filters_without_pagination_params_not_paginated() {
+        // Legacy callers — only limit/state/search_attr — must NOT set paginated.
+        let filters = parse_workflow_filters(&pairs(&[
+            ("limit", "10"),
+            ("state", "RUNNING"),
+            ("search_attr", "tenant:acme"),
+        ]))
+        .expect("legacy params must parse");
+        assert!(
+            !filters.paginated,
+            "no pagination params → paginated must be false"
         );
     }
 }
