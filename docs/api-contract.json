@@ -798,6 +798,60 @@
     },
     {
       "method": "POST",
+      "path": "/workflows/{id}/erase-payloads",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Tombstone all payload-bearing fields (input, output, payload, details, value, last_completion_result) in every event row, the execution row, and signal rows for a terminal workflow execution. Cascades to terminal child executions on the same shard. Requires the execution to be in a terminal state (COMPLETED, FAILED, CANCELLED, TIMED_OUT, CONTINUED_AS_NEW, or TERMINATED).",
+      "idempotency": "Idempotent: re-running on an already-erased execution returns fields_tombstoned=0, no error.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable erasure reason (e.g. GDPR Art. 17 request ID), recorded in audit log."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "execution_id",
+          "events_scrubbed",
+          "fields_tombstoned",
+          "execution_row_scrubbed",
+          "signals_scrubbed",
+          "children",
+          "skipped_children",
+          "failures"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 409,
+          "description": "Execution is not in a terminal state."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/workflows/{id}/reset",
       "category": "workflow",
       "read_only": false,
