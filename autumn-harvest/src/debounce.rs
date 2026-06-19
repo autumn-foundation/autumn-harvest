@@ -637,7 +637,12 @@ async fn fire_claimed_debounce_row(
         scheduled_for: None,
     };
 
-    match crate::execution::start_or_load_workflow_execution_collect(conn, params).await {
+    // `in_outer_transaction = true`: this runs inside the scanner's fire
+    // transaction, so a TerminateIfRunning pre-check cancellation is a savepoint
+    // that rolls back with this transaction on error — the collect fn must not
+    // spawn its follow-ups (they'd be orphaned). Deferred starts returned on
+    // success are spawned by the caller only after the fire transaction commits.
+    match crate::execution::start_or_load_workflow_execution_collect(conn, params, true).await {
         Ok((started, deferred_starts)) => {
             delete_debounce_row(conn, row_id).await?;
             tracing::info!(

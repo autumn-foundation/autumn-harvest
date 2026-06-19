@@ -231,6 +231,16 @@ impl CancelledWorkflowExecution {
 /// | FAILED | return existing | `Err(AlreadyExists)` | start fresh | start fresh |
 /// | CANCELLED | return existing | `Err(AlreadyExists)` | start fresh | start fresh |
 ///
+/// `in_outer_transaction` tells the function whether the caller is running it
+/// inside the caller's own transaction. It matters only for the
+/// `TerminateIfRunning` pre-check cancellation, which commits (Transaction 1)
+/// before the replacement start (Transaction 2): if the replacement start then
+/// fails, the prior run's completion-trigger / parent-close follow-up starts
+/// must still be spawned for a **top-level** caller (`false`), but must be
+/// **suppressed** for a caller inside an outer transaction (`true`) whose
+/// rollback reverts that cancellation. On success the follow-ups are always
+/// returned for the caller to spawn after its outer commit.
+///
 /// # Errors
 ///
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
@@ -240,6 +250,7 @@ impl CancelledWorkflowExecution {
 pub async fn start_or_load_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
+    in_outer_transaction: bool,
 ) -> HarvestResult<(StartedWorkflowExecution, Vec<DeferredTriggerStart>)> {
     let exec_id = request.exec_id;
     let shard_id_value = request.shard_id();
@@ -287,6 +298,14 @@ pub async fn start_or_load_workflow_execution_collect(
         now
     };
 
+    // Look up the active build policy for this queue. If a policy exists, new
+    // executions are stamped with its build_id so workers can enforce routing.
+    // Resolved *before* the TerminateIfRunning pre-check so a build-policy DB
+    // error returns without leaving a committed pre-check cancellation whose
+    // follow-up starts would be lost.
+    let policy = build_routing::get_build_policy(conn, request.queue_name).await?;
+    let assigned_build = policy.map(|p| p.build_id);
+
     // For TerminateIfRunning: if there is an existing RUNNING execution, cancel
     // it (Transaction 1) before the start transaction below (Transaction 2). A
     // crash between the two leaves the prior workflow CANCELLED with no new run;
@@ -322,11 +341,6 @@ pub async fn start_or_load_workflow_execution_collect(
             Err(e) => return Err(e),
         }
     }
-
-    // Look up the active build policy for this queue. If a policy exists, new
-    // executions are stamped with its build_id so workers can enforce routing.
-    let policy = build_routing::get_build_policy(conn, request.queue_name).await?;
-    let assigned_build = policy.map(|p| p.build_id);
 
     // Apply the server-side ceiling (if any) before computing the deadline.
     // The effective timeout is the minimum of the per-call value and the
@@ -399,7 +413,7 @@ pub async fn start_or_load_workflow_execution_collect(
         enqueue.scheduled_at = target_start_time;
     }
 
-    let (cancel_result, mut deferred_starts) = conn
+    let main_result = conn
         .transaction::<(StartedWorkflowExecution, Vec<DeferredTriggerStart>), HarvestError, _>(
             |conn| {
                 let row = row;
@@ -545,12 +559,31 @@ pub async fn start_or_load_workflow_execution_collect(
                 .scope_boxed()
             },
         )
-        .await?;
+        .await;
 
-    // Spawn order: the pre-check cancellation's follow-ups first, then the start's
-    // own deferred follow-ups — all after the outer commit (the caller spawns).
-    pre_check_deferred.append(&mut deferred_starts);
-    Ok((cancel_result, pre_check_deferred))
+    match main_result {
+        Ok((cancel_result, mut deferred_starts)) => {
+            // Spawn order: the pre-check cancellation's follow-ups first, then the
+            // start's own deferred follow-ups — all returned for the caller to spawn
+            // after its outer commit.
+            pre_check_deferred.append(&mut deferred_starts);
+            Ok((cancel_result, pre_check_deferred))
+        }
+        Err(e) => {
+            // The replacement start failed. A TerminateIfRunning pre-check cancel may
+            // already be durable (Transaction 1 committed): for a top-level caller we
+            // spawn its follow-ups now, since the cancellation is permanent even
+            // though no new run started. For a caller inside an outer transaction the
+            // cancellation will be rolled back with that transaction, so we suppress
+            // the spawn and let the caller's rollback revert everything.
+            if !in_outer_transaction {
+                for start in pre_check_deferred {
+                    start.spawn();
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Start a workflow execution or load the existing one, applying the caller's
@@ -584,7 +617,11 @@ pub async fn start_or_load_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
 ) -> HarvestResult<StartedWorkflowExecution> {
-    let (result, deferred_starts) = start_or_load_workflow_execution_collect(conn, request).await?;
+    // Top-level caller (`in_outer_transaction = false`): if a TerminateIfRunning
+    // pre-check cancellation commits and the replacement start then fails, the
+    // collect fn spawns the cancellation's follow-ups itself before returning Err.
+    let (result, deferred_starts) =
+        start_or_load_workflow_execution_collect(conn, request, false).await?;
     for start in deferred_starts {
         start.spawn();
     }

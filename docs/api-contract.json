@@ -428,22 +428,30 @@
       },
       "success_response": {
         "status": 201,
-        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one.",
+        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499) — the run is deferred until the quiet window elapses.",
         "fields": [
           "execution_id",
           "workflow_name",
           "workflow_id",
-          "state"
+          "state",
+          "debounced",
+          "debounce_key",
+          "fire_at",
+          "pending_count"
         ]
       },
       "error_responses": [
         {
           "status": 400,
-          "description": "Invalid request body or workflow name."
+          "description": "Invalid request body or workflow name. Also returned when start_at/delay is combined with a debounce policy, or when input exceeds the workflow input cap."
         },
         {
           "status": 409,
           "description": "Duplicate workflow_id with conflicting reuse policy."
+        },
+        {
+          "status": 503,
+          "description": "Admission blocked by an active gate (including the debounce-key shard gate for debounced starts)."
         },
         {
           "status": 500,

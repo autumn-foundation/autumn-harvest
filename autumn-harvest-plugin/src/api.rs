@@ -2953,7 +2953,19 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/{workflow_name}/start",
-            Some(&["execution_id", "workflow_name", "workflow_id", "state"]),
+            // Normal start returns 200/201 with execution_id/workflow_name/workflow_id/state.
+            // A debounced workflow (issue #499) instead returns 202 Accepted with the
+            // debounce fields below (no execution_id exists until the scanner fires).
+            Some(&[
+                "execution_id",
+                "workflow_name",
+                "workflow_id",
+                "state",
+                "debounced",
+                "debounce_key",
+                "fire_at",
+                "pending_count",
+            ]),
         ),
         (
             "POST",
@@ -5440,6 +5452,28 @@ pub(crate) fn clamp_info_default_sla(
         })
 }
 
+/// Whether `workflow_name` has a debounce policy whose key resolves for `input`.
+///
+/// Debounce admission (issue #499) is owned exclusively by
+/// `POST /workflows/{name}/start`. The other start entry points
+/// (signal-with-start, update-with-start, `batch_start`) and the typed client
+/// stubs reject debounced workflows rather than silently bypassing the
+/// quiet-window collapse — there is no coherent way to defer an atomic
+/// start+signal/start+update or a bulk start through the trailing-edge gate.
+fn workflow_has_resolving_debounce(
+    registry: &HandlerRegistry,
+    workflow_name: &str,
+    input: &Value,
+) -> bool {
+    registry
+        .workflows
+        .get(workflow_name)
+        .and_then(|info| info.debounce.as_ref())
+        .is_some_and(|policy| {
+            autumn_harvest::debounce::resolve_debounce_key(policy.key_expr, input).is_some()
+        })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
@@ -5553,8 +5587,19 @@ async fn start_workflow(
         .router
         .pick_for_new_workflow(&workflow_name, &workflow_id);
 
+    // A debounced start's execution lands on the debounce-key's shard, not this
+    // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced
+    // starts so a gate on that shard can't reject a request whose work would be
+    // created elsewhere; the debounce block below enforces the gate on the
+    // correct (debounce-key) shard transactionally. This is safe: a debounced
+    // request only creates NEW work on the debounce shard — the fall-through to
+    // the normal start path happens solely for an already-live execution
+    // (idempotent return, no new work) (issue #499).
+    let is_debounced_start =
+        workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &input);
+
     // issue #377: check admission gates before touching the DB.
-    {
+    if !is_debounced_start {
         let wf_owner = runtime
             .registry
             .workflows
@@ -6046,6 +6091,23 @@ async fn start_workflow(
                         .telemetry()
                         .metrics
                         .record_admission_blocked(scope_kind, reason_label);
+                    // Parity with the normal gate-rejection path: record a failed
+                    // workflow.start audit row so debounce-shard gate denials are not
+                    // invisible in harvest_audit_log. Written on the debounce conn.
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_WORKFLOW_START,
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(workflow_name.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: STATUS_FAILED,
+                        error_summary: Some("admission blocked by gate"),
+                        shard_id: Some(debounce_shard.as_i32()),
+                        source: &source,
+                    };
+                    let _ = audit::insert_audit(&mut debounce_conn, &ar).await;
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(serde_json::json!({
@@ -6395,6 +6457,17 @@ async fn batch_start_workflows(
         } else if runtime.is_registered_dag(&item.workflow_name) {
             Some(format!(
                 "workflow '{}' is a registered DAG; use POST /dags/{{name}}/trigger",
+                item.workflow_name
+            ))
+        } else if workflow_has_resolving_debounce(
+            &runtime.registry,
+            &item.workflow_name,
+            item.input.as_ref().unwrap_or(&Value::Null),
+        ) {
+            // Debounce admission is owned by POST /workflows/{name}/start; batch
+            // start has no quiet-window collapse path (issue #499).
+            Some(format!(
+                "workflow '{0}' has a debounce policy; use POST /workflows/{0}/start (batch_start does not support debounce)",
                 item.workflow_name
             ))
         } else {
@@ -7161,6 +7234,18 @@ async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
+    // Debounce admission is owned by POST /workflows/{name}/start; an atomic
+    // start+signal cannot be deferred through the trailing-edge gate (the signal
+    // would have nowhere to land). Reject debounced workflows here rather than
+    // bypassing the quiet-window collapse (issue #499).
+    if workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &start_input) {
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' has a debounce policy; debounced starts must use \
+             POST /workflows/{workflow_name}/start (signal-with-start does not support debounce)"
+        ))
+        .into_response();
+    }
+
     // Issue #252: resolve cap values. Both caps are enforced inside
     // signal_with_start_workflow_execution — after idempotency dedupe and
     // only on the fresh-start path for start_input — to avoid spurious 413s
@@ -7650,6 +7735,17 @@ async fn update_with_start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let start_input = request.start_input.unwrap_or(Value::Null);
     let update_args = request.update_args.unwrap_or(Value::Null);
+
+    // Debounce admission is owned by POST /workflows/{name}/start; an atomic
+    // start+update cannot be deferred through the trailing-edge gate. Reject
+    // debounced workflows here rather than bypassing the collapse (issue #499).
+    if workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &start_input) {
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' has a debounce policy; debounced starts must use \
+             POST /workflows/{workflow_name}/start (update-with-start does not support debounce)"
+        ))
+        .into_response();
+    }
 
     let effective_wf_cap = runtime
         .registry
