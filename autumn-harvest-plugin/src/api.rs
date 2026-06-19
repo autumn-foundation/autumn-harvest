@@ -5819,6 +5819,61 @@ async fn start_workflow(
                 .map(|key| (policy, key))
         })
     {
+        // Debounce defers the start until the burst settles, so an explicit
+        // scheduled start (`start_at`/`delay`) is contradictory — the requested
+        // timing would be silently dropped at fire time. Reject the combination.
+        if request.start_at.is_some() || delay.is_some() {
+            return AutumnError::bad_request_msg(
+                "debounce cannot be combined with start_at or delay",
+            )
+            .into_response();
+        }
+
+        // Resolve the same effective operator metadata / timeout defaults the
+        // normal start path resolves below, so a debounced run is not a
+        // second-class start: the fire path (in core) has no registry access,
+        // so these must be captured at admission time.
+        let (info_owner, info_runbook, info_severity, info_sla, info_execution_timeout) = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .map_or((None, None, None, None, None), |info| {
+                (
+                    info.owner,
+                    info.runbook_url,
+                    info.severity,
+                    info.sla,
+                    info.execution_timeout,
+                )
+            });
+
+        // Effective SLA: request override → WorkflowInfo default, clamped to the
+        // declared hard execution_timeout (mirrors the normal path).
+        let effective_sla_secs = request
+            .sla_secs
+            .filter(|&secs| secs >= 0)
+            .and_then(chrono::Duration::try_seconds)
+            .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()))
+            .map(|sla| {
+                info_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .map_or(sla, |hard| sla.min(hard))
+            })
+            .map(|d| d.num_seconds());
+
+        // Effective execution timeout: request override → WorkflowInfo default.
+        let effective_execution_timeout_secs = request.execution_timeout_secs.or_else(|| {
+            info_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map(|d| d.num_seconds())
+        });
+
+        // Effective server-side ceiling captured so the fire path can't bypass it.
+        let effective_ceiling_secs = api_state
+            .max_workflow_execution_timeout()
+            .and_then(|d| chrono::Duration::from_std(d).ok())
+            .map(|d| d.num_seconds());
+
         // Route to the shard that owns this debounce key (shard-local, consistent with #247).
         let debounce_shard = runtime
             .router
@@ -5843,14 +5898,19 @@ async fn start_workflow(
             shard_id: debounce_shard.as_i32(),
             start_options: autumn_harvest::debounce::DebounceStartOptions {
                 reuse_policy: request.reuse_policy.clone(),
-                execution_timeout_secs: request.execution_timeout_secs,
+                execution_timeout_secs: effective_execution_timeout_secs,
                 memo: request.memo.clone(),
                 search_attrs: request.search_attrs.clone(),
-                sla_secs: request.sla_secs,
+                sla_secs: effective_sla_secs,
                 context_headers: None,
                 priority: None,
                 concurrency_key: concurrency_key.clone(),
                 concurrency_limit,
+                owner: info_owner.map(str::to_string),
+                runbook_url: info_runbook.map(str::to_string),
+                severity: info_severity.map(str::to_string),
+                max_execution_timeout_ceiling_secs: effective_ceiling_secs,
+                max_workflow_input_bytes: Some(effective_wf_cap),
             },
         };
 
@@ -5862,11 +5922,29 @@ async fn start_workflow(
                     .registry
                     .telemetry()
                     .metrics
-                    .record_workflow_debounced(&workflow_name, &resolved_key);
+                    .record_workflow_debounced(&workflow_name);
+                // Audit the accepted admission so debounced starts are not
+                // invisible in harvest_audit_log (parity with the normal path).
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_SUCCEEDED,
+                    error_summary: None,
+                    shard_id: Some(debounce_shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut debounce_conn, &ar).await;
                 return (
                     axum::http::StatusCode::ACCEPTED,
                     Json(serde_json::json!({
                         "debounced": true,
+                        "workflow_name": workflow_name,
+                        "workflow_id": workflow_id,
                         "debounce_key": outcome.debounce_key,
                         "fire_at": outcome.fire_at,
                         "pending_count": outcome.pending_count,

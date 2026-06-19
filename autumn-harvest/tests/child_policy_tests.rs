@@ -95,7 +95,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
     "\n",
-    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    // issue #499: enforce_timeouts_once now scans harvest_debounce.
+    include_str!("../migrations/20260618000001_harvest_debounce/up.sql")
 );
 
 async fn setup_test_db_url() -> (String, ContainerAsync<Postgres>) {

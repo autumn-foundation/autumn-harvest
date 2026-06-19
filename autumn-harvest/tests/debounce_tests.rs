@@ -1,4 +1,14 @@
 #![cfg(feature = "db")]
+// Test-code style lints (consistent with other integration test files in this crate).
+#![allow(
+    clippy::doc_markdown,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::items_after_statements,
+    clippy::default_trait_access,
+    clippy::significant_drop_tightening
+)]
 //! Debounce integration tests — issue #499.
 //!
 //! Verifies the core debounce ACs against a real Postgres container:
@@ -116,16 +126,16 @@ const INIT_SQL: &str = concat!(
 
 #[derive(Debug, Default)]
 struct RecordingMetrics {
-    debounced: Mutex<Vec<(String, String)>>,
+    debounced: Mutex<Vec<String>>,
     fired: Mutex<Vec<(String, String)>>,
 }
 
 impl MetricsRecorder for RecordingMetrics {
-    fn record_workflow_debounced(&self, workflow_name: &str, debounce_key: &str) {
+    fn record_workflow_debounced(&self, workflow_name: &str) {
         self.debounced
             .lock()
             .unwrap()
-            .push((workflow_name.to_owned(), debounce_key.to_owned()));
+            .push(workflow_name.to_owned());
     }
 
     fn record_debounce_fired(&self, workflow_name: &str, queue: &str) {

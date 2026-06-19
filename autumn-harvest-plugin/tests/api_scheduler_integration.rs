@@ -2844,6 +2844,7 @@ async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn external_runner_processes_workflows_started_via_management_api() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);

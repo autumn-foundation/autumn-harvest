@@ -8528,6 +8528,7 @@ mod tests {
             poison_pill_threshold: 3,
             workflow_task_timeout: Duration::from_secs(10),
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+            default_debounce_max_wait: Duration::from_secs(3600),
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,
             #[cfg(feature = "db")]

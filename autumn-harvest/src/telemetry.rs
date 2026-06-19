@@ -1089,10 +1089,13 @@ pub trait MetricsRecorder: Send + Sync {
 
     /// A start request was absorbed by a debounce pending record (issue #499).
     ///
-    /// Maps to the counter [`METRIC_WORKFLOW_DEBOUNCED`] with labels
-    /// `workflow` and `debounce_key`.
-    fn record_workflow_debounced(&self, workflow_name: &str, debounce_key: &str) {
-        let _ = (workflow_name, debounce_key);
+    /// Maps to the counter [`METRIC_WORKFLOW_DEBOUNCED`] with label `workflow`.
+    /// The debounce key is deliberately **not** a label: it is resolved from
+    /// user/tenant input and would create unbounded metric cardinality
+    /// (ADR-0001 §7). The raw key remains available in logs and the
+    /// `GET /admin/debounce` endpoint.
+    fn record_workflow_debounced(&self, workflow_name: &str) {
+        let _ = workflow_name;
     }
 
     /// The debounce scanner fired a pending record and started one execution (issue #499).

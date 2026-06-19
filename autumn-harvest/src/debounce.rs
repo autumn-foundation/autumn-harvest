@@ -105,11 +105,17 @@ pub fn compute_fire_deadline(
     first_seen: DateTime<Utc>,
     max_wait: Duration,
 ) -> DateTime<Utc> {
-    let window_chrono = chrono::Duration::from_std(window).unwrap_or(chrono::Duration::MAX);
-    let max_wait_chrono = chrono::Duration::from_std(max_wait).unwrap_or(chrono::Duration::MAX);
+    // Clamp absurd/overflowing durations to a large-but-finite value and use
+    // checked addition so an extreme `window`/`max_wait` can never panic.
+    let window_chrono =
+        chrono::Duration::from_std(window).unwrap_or_else(|_| chrono::Duration::days(365 * 100));
+    let max_wait_chrono =
+        chrono::Duration::from_std(max_wait).unwrap_or_else(|_| chrono::Duration::days(365 * 100));
 
-    let trailing_edge = now + window_chrono;
-    let cap = first_seen + max_wait_chrono;
+    let trailing_edge = now.checked_add_signed(window_chrono).unwrap_or(now);
+    let cap = first_seen
+        .checked_add_signed(max_wait_chrono)
+        .unwrap_or(first_seen);
 
     trailing_edge.min(cap)
 }
@@ -142,6 +148,24 @@ pub struct DebounceStartOptions {
     pub concurrency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<u32>,
+    /// Effective owner/runbook/severity resolved from `WorkflowInfo` at admission
+    /// time, so a debounced run carries the same operator metadata as a normal
+    /// start (the fire path has no access to the plugin registry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runbook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    /// Effective server-side execution-timeout ceiling (seconds), captured at
+    /// admission so a debounced start can't bypass the cap the normal path
+    /// enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_execution_timeout_ceiling_secs: Option<i64>,
+    /// Effective workflow-input byte cap, captured at admission so a debounced
+    /// start can't bypass the size limit the normal path enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workflow_input_bytes: Option<u64>,
 }
 
 /// Parameters for [`admit_debounced_start`].
@@ -225,12 +249,18 @@ pub async fn admit_debounced_start(
     }
 
     let now = Utc::now();
-    let window_chrono = chrono::Duration::from_std(params.window).unwrap_or(chrono::Duration::MAX);
-    let max_wait_chrono =
-        chrono::Duration::from_std(params.max_wait).unwrap_or(chrono::Duration::MAX);
+    // Clamp absurd/overflowing durations to a large-but-finite value and use
+    // checked addition so an extreme `window`/`max_wait` can never panic.
+    let window_chrono = chrono::Duration::from_std(params.window)
+        .unwrap_or_else(|_| chrono::Duration::days(365 * 100));
+    let max_wait_chrono = chrono::Duration::from_std(params.max_wait)
+        .unwrap_or_else(|_| chrono::Duration::days(365 * 100));
 
-    let initial_fire_at = (now + window_chrono).min(now + max_wait_chrono);
-    let max_fire_at = now + max_wait_chrono;
+    let max_fire_at = now.checked_add_signed(max_wait_chrono).unwrap_or(now);
+    let initial_fire_at = now
+        .checked_add_signed(window_chrono)
+        .unwrap_or(now)
+        .min(max_fire_at);
 
     let new_id = uuid::Uuid::new_v4();
     let start_options_json = serde_json::to_value(&params.start_options)
@@ -312,10 +342,17 @@ struct FireDueRow {
 
 /// Fire all pending debounce records whose `effective_fire_at` has elapsed.
 ///
-/// For each due row: claims it (`FOR UPDATE SKIP LOCKED`), calls
-/// `start_or_load_workflow_execution` with the stored last-input and options,
-/// then deletes the row. All three steps happen in one transaction so a crash
-/// rolls back and the next scanner tick retries.
+/// The claim (`SELECT ... FOR UPDATE SKIP LOCKED`), the
+/// `start_or_load_workflow_execution` call, and the row `DELETE` all run inside
+/// **one** transaction so the row lock is held from claim through delete. This
+/// is essential: a `FOR UPDATE` lock taken in autocommit mode is released the
+/// instant the `SELECT` completes, which would let a concurrent worker fire the
+/// same key twice and let a concurrent `admit_debounced_start` overwrite the
+/// row (extending the deadline / updating `last_input`) only to have the
+/// scanner fire a stale snapshot and delete the updated row — breaking the
+/// trailing-edge / last-input-wins guarantees. Holding the lock makes a
+/// concurrent upsert block until this transaction commits, after which the row
+/// is gone and the new trigger starts a fresh debounce cycle.
 ///
 /// Called from [`crate::timeout::enforce_timeouts_once`] on the existing
 /// `spawn_timeout_checker` poll interval — no new background task is spawned.
@@ -328,50 +365,77 @@ pub async fn fire_due_debounced_starts(
     conn: &mut diesel_async::AsyncPgConnection,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
-    use diesel_async::RunQueryDsl;
-
-    let now = Utc::now();
-
-    // Claim due rows with SKIP LOCKED so multiple workers never fire the same key.
-    let due_sql = "
-        SELECT id, workflow_name, debounce_key, workflow_id, queue_name,
-               last_input, start_options, shard_id
-        FROM harvest_debounce
-        WHERE effective_fire_at <= $1
-        LIMIT $2
-        FOR UPDATE SKIP LOCKED
-    ";
-
-    let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
-        .bind::<diesel::sql_types::Timestamptz, _>(now)
-        .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    let count = due_rows.len();
-    if count == 0 {
-        return Ok(0);
-    }
-
-    for row in due_rows {
-        fire_single_debounce_row(conn, row, metrics).await?;
-    }
-
-    Ok(count)
-}
-
-/// Fire a single due debounce row: start the execution and delete the record,
-/// all within one transaction. Extracted to keep `fire_due_debounced_starts`
-/// under the 100-line function length limit.
-#[cfg(feature = "db")]
-async fn fire_single_debounce_row(
-    conn: &mut diesel_async::AsyncPgConnection,
-    row: FireDueRow,
-    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-) -> crate::error::HarvestResult<()> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
+    // Claim + fire + delete the whole due batch in one transaction so the
+    // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
+    let fired: Vec<(String, String)> = conn
+        .transaction::<Vec<(String, String)>, crate::error::HarvestError, _>(|conn| {
+            Box::pin(async move {
+                let now = Utc::now();
+                let due_sql = "
+                    SELECT id, workflow_name, debounce_key, workflow_id, queue_name,
+                           last_input, start_options, shard_id
+                    FROM harvest_debounce
+                    WHERE effective_fire_at <= $1
+                    ORDER BY effective_fire_at ASC
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                ";
+
+                let due_rows: Vec<FireDueRow> = diesel::sql_query(due_sql)
+                    .bind::<diesel::sql_types::Timestamptz, _>(now)
+                    .bind::<diesel::sql_types::BigInt, _>(DEBOUNCE_FIRE_BATCH_SIZE)
+                    .load(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+
+                let mut results = Vec::with_capacity(due_rows.len());
+                for row in due_rows {
+                    if let Some(fired) = fire_claimed_debounce_row(conn, row).await? {
+                        results.push(fired);
+                    }
+                }
+                Ok(results)
+            })
+        })
+        .await?;
+
+    for (workflow_name, queue_name) in &fired {
+        metrics.record_debounce_fired(workflow_name, queue_name);
+    }
+
+    Ok(fired.len())
+}
+
+/// Delete a single pending debounce row by id.
+#[cfg(feature = "db")]
+async fn delete_debounce_row(
+    conn: &mut diesel_async::AsyncPgConnection,
+    row_id: uuid::Uuid,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+    diesel::sql_query("DELETE FROM harvest_debounce WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(row_id)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Fire one already-claimed (row-locked) debounce row: start the execution and
+/// delete the record. Must run inside the caller's transaction so the row lock
+/// taken by the claim `SELECT ... FOR UPDATE` is held through the delete.
+///
+/// Returns `Some((workflow_name, queue_name))` when a run was started (so the
+/// caller can record the metric after commit), or `None` when the start was a
+/// no-op (e.g. `AlreadyExists` under a reject/duplicate reuse policy — the row
+/// is deleted so the scanner does not retry the doomed start forever).
+#[cfg(feature = "db")]
+async fn fire_claimed_debounce_row(
+    conn: &mut diesel_async::AsyncPgConnection,
+    row: FireDueRow,
+) -> crate::error::HarvestResult<Option<(String, String)>> {
     let opts: DebounceStartOptions = serde_json::from_value(row.start_options).unwrap_or_default();
 
     let shard = crate::types::ShardId::new(row.shard_id);
@@ -386,11 +450,10 @@ async fn fire_single_debounce_row(
     let execution_timeout = opts
         .execution_timeout_secs
         .and_then(chrono::Duration::try_seconds);
-
     let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
-
-    let concurrency_key = opts.concurrency_key;
-    let concurrency_limit = opts.concurrency_limit;
+    let max_execution_timeout_ceiling = opts
+        .max_execution_timeout_ceiling_secs
+        .and_then(chrono::Duration::try_seconds);
     let priority = opts
         .priority
         .and_then(crate::types::Priority::from_i32)
@@ -401,13 +464,15 @@ async fn fire_single_debounce_row(
     let queue_name = row.queue_name;
     let debounce_key = row.debounce_key;
     let row_id = row.id;
-    let last_input = row.last_input;
+    let owner = opts.owner;
+    let runbook_url = opts.runbook_url;
+    let severity = opts.severity;
 
     let params = crate::execution::StartWorkflowParams {
         workflow_name: &workflow_name,
         workflow_id: &workflow_id,
         exec_id,
-        input: last_input,
+        input: row.last_input,
         parent_id: None,
         queue_name: &queue_name,
         execution_timeout,
@@ -415,57 +480,51 @@ async fn fire_single_debounce_row(
         search_attrs: opts.search_attrs,
         reuse_policy,
         trace_context: None,
-        max_execution_timeout_ceiling: None,
-        concurrency_key,
-        concurrency_limit,
+        max_execution_timeout_ceiling,
+        concurrency_key: opts.concurrency_key,
+        concurrency_limit: opts.concurrency_limit,
         priority,
-        max_workflow_input_bytes: u64::MAX,
+        max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
         start_at: None,
         delay: None,
         max_workflow_start_delay: None,
-        owner: None,
-        runbook_url: None,
-        severity: None,
+        owner: owner.as_deref(),
+        runbook_url: runbook_url.as_deref(),
+        severity: severity.as_deref(),
         context_headers: opts.context_headers,
         sla,
         schedule_id: None,
         scheduled_for: None,
     };
 
-    let started_result = conn
-        .transaction::<crate::execution::StartedWorkflowExecution, crate::error::HarvestError, _>(
-            |conn| {
-                let params = params;
-                let workflow_name = workflow_name.clone();
-                let queue_name = queue_name.clone();
-                let debounce_key = debounce_key.clone();
-                Box::pin(async move {
-                    let started =
-                        crate::execution::start_or_load_workflow_execution(conn, params).await?;
-
-                    // Delete the pending record now that the execution is started.
-                    diesel::sql_query("DELETE FROM harvest_debounce WHERE id = $1")
-                        .bind::<diesel::sql_types::Uuid, _>(row_id)
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
-
-                    tracing::info!(
-                        workflow_name = %workflow_name,
-                        debounce_key = %debounce_key,
-                        exec_id = %started.exec_id,
-                        queue = %queue_name,
-                        "debounced start fired",
-                    );
-
-                    Ok(started)
-                })
-            },
-        )
-        .await?;
-
-    metrics.record_debounce_fired(&started_result.workflow_name, &queue_name);
-    Ok(())
+    match crate::execution::start_or_load_workflow_execution(conn, params).await {
+        Ok(started) => {
+            delete_debounce_row(conn, row_id).await?;
+            tracing::info!(
+                workflow_name = %workflow_name,
+                debounce_key = %debounce_key,
+                exec_id = %started.exec_id,
+                queue = %queue_name,
+                "debounced start fired",
+            );
+            Ok(Some((started.workflow_name, queue_name)))
+        }
+        // The target workflow_id is already taken under the reuse policy, so the
+        // debounce intent can't produce a new run. Drop the record so the
+        // scanner doesn't retry the doomed start on every tick (and block the
+        // rest of the batch).
+        Err(crate::error::HarvestError::AlreadyExists { .. }) => {
+            delete_debounce_row(conn, row_id).await?;
+            tracing::warn!(
+                workflow_name = %workflow_name,
+                debounce_key = %debounce_key,
+                workflow_id = %workflow_id,
+                "debounced start skipped: workflow_id already exists under reuse policy",
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(feature = "db")]
@@ -685,8 +744,8 @@ mod tests {
         let cap = t0 + chrono::Duration::seconds(60);
 
         // Simulate 20 rapid-fire requests
-        for i in 0..20u64 {
-            let now = t0 + chrono::Duration::seconds(i as i64 * 5);
+        for i in 0..20i64 {
+            let now = t0 + chrono::Duration::seconds(i * 5);
             let deadline = compute_fire_deadline(now, window, t0, max_wait);
             assert!(
                 deadline <= cap,

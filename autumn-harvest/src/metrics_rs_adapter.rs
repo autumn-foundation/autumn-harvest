@@ -476,11 +476,12 @@ impl MetricsRecorder for MetricsRsRecorder {
         .set(count as f64);
     }
 
-    fn record_workflow_debounced(&self, workflow_name: &str, debounce_key: &str) {
+    fn record_workflow_debounced(&self, workflow_name: &str) {
+        // `debounce_key` is intentionally not a label (unbounded cardinality —
+        // ADR-0001 §7); it lives in logs and the /admin/debounce endpoint.
         counter!(
             METRIC_WORKFLOW_DEBOUNCED,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            "debounce_key" => debounce_key.to_owned(),
         )
         .increment(1);
     }
