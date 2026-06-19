@@ -6,7 +6,7 @@
 
 use std::time::Duration as StdDuration;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -32,7 +32,50 @@ pub enum TaskType {
     Activity,
 }
 
-const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration = Duration::seconds(5);
+const IMMEDIATE_SCHEDULE_SKEW_SECS: i32 = 5;
+const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
+    Duration::seconds(IMMEDIATE_SCHEDULE_SKEW_SECS as i64);
+
+/// Compute the **DB-clock** portion of schedule-to-start latency in seconds: the
+/// wait from a task's *true* eligibility to when it was claimed (`claimed_at`),
+/// clamped to `0`.
+///
+/// True eligibility is `GREATEST(scheduled_at, created_at)`:
+///
+/// * `EnqueueParams::new` backdates an immediate task's `scheduled_at` to
+///   `NOW() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` so it stays claimable under the
+///   `scheduled_at <= NOW()` predicate even when host and Postgres clocks differ
+///   slightly. Its real eligibility is the insert time `created_at` (the later of
+///   the two), so a promptly-served immediate task reports ~0 — the backdating is
+///   dropped without a fixed-allowance subtraction.
+/// * A genuinely *delayed* or *retried* task sets `scheduled_at` to an explicit
+///   future instant (`>= created_at`, e.g. `requeue_for_retry` uses `NOW() + delay`),
+///   so `GREATEST` selects `scheduled_at` and the full wait is reported with no
+///   discount. The prior fixed-allowance subtraction under-reported these by up to
+///   the allowance and could hide work genuinely over the SLO (issue #501 review).
+///
+/// `created_at` is `None` only for rows enqueued before the column was added; those
+/// fall back to `scheduled_at` (best available) until they drain.
+///
+/// **Clock discipline:** `claimed_at` must be a **Postgres** timestamp (e.g. the
+/// task's `started_at`, stamped by `claim_task`), so this whole expression is
+/// computed in one clock and a host/Postgres skew cannot leak in. The worker then
+/// adds the host-**monotonic** local wait (permit acquisition + setup, measured
+/// with `Instant::elapsed`) to this value — never `Utc::now()`, which would mix the
+/// host wall clock with the Postgres eligibility timestamps (issue #501 review).
+#[must_use]
+pub fn schedule_to_start_secs(
+    scheduled_at: DateTime<Utc>,
+    created_at: Option<DateTime<Utc>>,
+    claimed_at: DateTime<Utc>,
+) -> f64 {
+    let eligible = created_at.map_or(scheduled_at, |c| scheduled_at.max(c));
+    (claimed_at - eligible)
+        .max(Duration::zero())
+        .to_std()
+        .unwrap_or_default()
+        .as_secs_f64()
+}
 
 impl TaskType {
     /// Returns the string representation stored in the `task_type` column.
@@ -877,6 +920,118 @@ pub async fn queue_depths(
     Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
 
+/// Returns the age in seconds of the oldest currently-*claimable* eligible task
+/// per queue.
+///
+/// Mirrors the part of [`claim_task`]'s eligibility predicate that determines
+/// whether a worker is *supposed* to pick a task up: `state = 'PENDING' AND
+/// scheduled_at <= NOW()`, **excluding** (a) tasks whose `schedule_to_close_at`
+/// deadline has already elapsed (issue #378) — `claim_task` skips them too, so a
+/// past-deadline row awaiting the timeout scanner is not claimable and counting
+/// its age would page for work no worker may start; (b) workflow tasks whose
+/// execution is `PAUSED` (issue #383) — a paused execution's parked task is
+/// intentionally not claimable, so counting its age would inflate the saturation
+/// signal and fire false alerts until the workflow is resumed; (c) rate-limited
+/// activity tasks whose token bucket is currently below one token (issue #369) —
+/// `claim_task` skips these until tokens refill, so counting their age would page
+/// for *intended* throttling on a deliberately rate-limited queue (circuit-breaker
+/// activities in `circuit_breaker_activities` skip the claim-time rate-limit gate
+/// entirely, so they are exempt from this exclusion exactly as in `claim_task`); and
+/// (d) tasks behind a saturated per-key concurrency cap (issue #247) — `claim_task`
+/// refuses every worker while `COUNT(RUNNING) >= concurrency_cap`, so a capped hot
+/// tenant's deferred rows are not claimable and counting their age would page for
+/// *intended* fair-share capping until an in-flight task for that key finishes.
+///
+/// The age is measured from each task's *true* eligibility,
+/// `GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))` (see
+/// [`schedule_to_start_secs`]): an immediate task's backdated `scheduled_at` is
+/// corrected to its `created_at` insert time so it reports ~0, while a delayed/retried
+/// task's explicit future `scheduled_at` is used verbatim (no fixed discount that
+/// would under-report a real over-SLO wait). Pre-upgrade rows with NULL `created_at`
+/// fall back to `scheduled_at`. Clamped to `0`.
+///
+/// (The finer-grained claim filters — build-id, sticky routing, capabilities — are
+/// deliberately *not* mirrored here: those gate *which worker* may claim, not whether
+/// the task is work no worker at all may start, so they belong to worker-coverage
+/// signals rather than the queue-age gauge.)
+///
+/// Only queues that have at least one eligible task appear in the result; the
+/// sampler is responsible for resetting the gauge to `0` for queues with no
+/// eligible tasks.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn oldest_pending_ages(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    circuit_breaker_activities: &[String],
+) -> HarvestResult<Vec<(String, f64)>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue_name: String,
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        age_secs: f64,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT queue_name, \
+                GREATEST( \
+                    EXTRACT(EPOCH FROM (NOW() - MIN(GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))))), \
+                    0 \
+                )::DOUBLE PRECISION AS age_secs \
+         FROM harvest_task_queue \
+         WHERE queue_name = ANY($1) \
+           AND state = 'PENDING' \
+           AND scheduled_at <= NOW() \
+           AND ( \
+               schedule_to_close_at IS NULL \
+               OR schedule_to_close_at > NOW() \
+           ) \
+           AND ( \
+               task_type <> 'workflow' \
+               OR workflow_exec_id IS NULL \
+               OR NOT EXISTS ( \
+                   SELECT 1 FROM harvest_workflow_executions e \
+                   WHERE e.id = harvest_task_queue.workflow_exec_id \
+                     AND e.state = 'PAUSED' \
+               ) \
+           ) \
+           AND ( \
+               concurrency_key IS NULL \
+               OR concurrency_cap IS NULL \
+               OR ( \
+                   SELECT COUNT(*) FROM harvest_task_queue inner_q \
+                   WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
+                     AND inner_q.task_type = harvest_task_queue.task_type \
+                     AND inner_q.state = 'RUNNING' \
+                     AND inner_q.worker_id IS NOT NULL \
+               ) < harvest_task_queue.concurrency_cap \
+           ) \
+           AND ( \
+               rate_limit_key IS NULL \
+               OR activity_name = ANY($2) \
+               OR EXISTS ( \
+                   SELECT 1 FROM harvest_rate_limit_buckets b \
+                   WHERE b.key = harvest_task_queue.rate_limit_key \
+                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+               ) \
+           ) \
+         GROUP BY queue_name",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.queue_name, r.age_secs))
+        .collect())
+}
+
 /// Update the `last_heartbeat_at` timestamp and checkpoint payload for a running task.
 ///
 /// # Errors
@@ -1247,6 +1402,15 @@ pub async fn wake_workflow_task(
     // Use raw SQL so we can refresh `sticky_until` from the row's own
     // `sticky_timeout` column atomically in a single UPDATE. Doing this in
     // two trips (SELECT then UPDATE) would race with other wake paths.
+    //
+    // `created_at` is refreshed to `clock_timestamp()` (the wake instant): this
+    // re-pends an *old* parked workflow task with a freshly backdated
+    // `scheduled_at` (= now - skew), so without refreshing `created_at` the
+    // schedule-to-start eligibility floor `GREATEST(scheduled_at, created_at)`
+    // would pick the backdated wake timestamp (the stale insert-time `created_at`
+    // is older) and report ~skew seconds of phantom latency for an immediately
+    // claimed follow-up task (issue #501 review). The wake instant is this cycle's
+    // true eligibility, so an immediately-served wake correctly reports ~0.
     let queue_names: Vec<String> = {
         use diesel::deserialize::QueryableByName;
         use diesel::sql_types::Text;
@@ -1263,6 +1427,7 @@ pub async fn wake_workflow_task(
                  worker_id = NULL, \
                  started_at = NULL, \
                  scheduled_at = $2, \
+                 created_at = clock_timestamp(), \
                  activity_name = NULL, \
                  sticky_until = CASE \
                      WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
@@ -1550,6 +1715,55 @@ mod tests {
         assert_eq!(TaskType::Activity.as_str(), "activity");
         assert_eq!(format!("{}", TaskType::Workflow), "workflow");
         assert_eq!(format!("{}", TaskType::Activity), "activity");
+    }
+
+    #[test]
+    fn schedule_to_start_uses_eligibility_floor() {
+        let now = Utc::now();
+
+        // Immediate task: scheduled_at backdated by the skew allowance, created_at is
+        // the real insert-time eligibility. Claimed instantly it must report ~0, not
+        // the backdating (floor = created_at).
+        let created = now;
+        let immediate_scheduled = now - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
+        assert!(
+            schedule_to_start_secs(immediate_scheduled, Some(created), now) < 0.001,
+            "promptly-served immediate task must not report the skew backdating"
+        );
+
+        // Immediate task that genuinely waited 10s: enqueued (created) 10s ago, with
+        // scheduled_at backdated a further skew. Reports the full 10s (floor = created).
+        let created_10s_ago = now - Duration::seconds(10);
+        let scheduled_backdated = created_10s_ago - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
+        let secs = schedule_to_start_secs(scheduled_backdated, Some(created_10s_ago), now);
+        assert!((secs - 10.0).abs() < 0.05, "expected ~10s wait, got {secs}");
+
+        // Delayed/retried task (issue #501 review): scheduled_at set to an explicit
+        // instant 10s ago with NO backdating, created_at long before. The full 10s
+        // must be reported — the prior fixed discount would have under-reported it.
+        let scheduled_explicit = now - Duration::seconds(10);
+        let created_long_ago = now - Duration::seconds(300);
+        let delayed = schedule_to_start_secs(scheduled_explicit, Some(created_long_ago), now);
+        assert!(
+            (delayed - 10.0).abs() < 0.05,
+            "delayed/retried task must report its full wait with no discount, got {delayed}"
+        );
+
+        // Pre-upgrade row (created_at = None) falls back to scheduled_at.
+        let legacy = schedule_to_start_secs(now - Duration::seconds(7), None, now);
+        assert!(
+            (legacy - 7.0).abs() < 0.05,
+            "None created_at must use scheduled_at, got {legacy}"
+        );
+
+        // Never negative, even if start precedes the eligibility floor.
+        assert!(
+            schedule_to_start_secs(
+                now + Duration::seconds(1),
+                Some(now - Duration::seconds(300)),
+                now
+            ) < f64::EPSILON
+        );
     }
 
     #[test]

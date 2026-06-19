@@ -3950,6 +3950,7 @@ async fn process_activity_task(
     task: &TaskQueueItem,
     worker_id: &str,
     cancellation_grace_period: Duration,
+    dispatched_at: std::time::Instant,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
@@ -4069,6 +4070,25 @@ async fn process_activity_task(
         id
         // conn is dropped here, returning the slot to the pool
     };
+
+    // Schedule-to-start latency (issue #501): record here, once the activity has
+    // genuinely started (ActivityStarted appended). This is *past* the
+    // dispatch-time no-op gates — the rate-limit defer (`defer_rate_limited_task`)
+    // and the already-terminal/cancelled no-op above both return before reaching
+    // this point — so a deferred task no longer inflates the started-task count
+    // and depresses the p99 capacity SLI during throttling. The circuit-breaker
+    // short-circuit path falls through here too: it is a genuine start that fails
+    // fast with CircuitOpen, so it is correctly counted. `schedule_to_start_secs`
+    // measures from task eligibility, so the time the task spent waiting behind
+    // the local concurrency permit in `dispatch_task` is still captured.
+    registry.telemetry().metrics.record_schedule_to_start(
+        &task.queue_name,
+        queue::schedule_to_start_secs(
+            task.scheduled_at,
+            task.created_at,
+            task.started_at.unwrap_or(task.scheduled_at),
+        ) + dispatched_at.elapsed().as_secs_f64(),
+    );
 
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
         opened_at,
@@ -5493,6 +5513,7 @@ async fn process_workflow_task(
     sticky_timeout: Duration,
     max_local_activity_start_to_close: Duration,
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    dispatched_at: std::time::Instant,
 ) -> HarvestResult<()> {
     let mut prepared =
         prepare_workflow_task_with_cache(conn, task, worker_id, &workflow_cache, sticky_timeout)
@@ -5577,6 +5598,25 @@ async fn process_workflow_task(
             .metrics
             .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
     }
+
+    // Schedule-to-start latency (issue #501): record here, at the point the
+    // workflow handler genuinely begins executing, rather than at permit
+    // acquisition in `dispatch_task`. Measuring at handler start keeps this a
+    // true *wait* metric (it does not absorb the handler's own execution time)
+    // while still capturing the local-permit wait, since `schedule_to_start_secs`
+    // measures from task eligibility. The common paused case never reaches here —
+    // `queue::claim_task` skips PAUSED executions — so the only re-park that can
+    // record a sample is the rare claimed-then-paused race below, whose handler
+    // did in fact run.
+    telemetry.metrics.record_schedule_to_start(
+        &task.queue_name,
+        queue::schedule_to_start_secs(
+            task.scheduled_at,
+            task.created_at,
+            task.started_at.unwrap_or(task.scheduled_at),
+        ) + dispatched_at.elapsed().as_secs_f64(),
+    );
+
     let started_at = std::time::Instant::now();
 
     // Drive the workflow in a loop so that local activities can be executed
@@ -6444,6 +6484,7 @@ async fn process_task(
     sticky_timeout: Duration,
     max_local_activity_start_to_close: Duration,
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    dispatched_at: std::time::Instant,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -6458,6 +6499,7 @@ async fn process_task(
                 sticky_timeout,
                 max_local_activity_start_to_close,
                 workflow_cache,
+                dispatched_at,
             )
             .await
         }
@@ -6473,6 +6515,7 @@ async fn process_task(
                 &task,
                 worker_id,
                 cancellation_grace_period,
+                dispatched_at,
             )
             .await
         }
@@ -6483,9 +6526,12 @@ async fn process_task(
 /// configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
 ///
 /// The sampler skips work entirely when the recorder is the default no-op
-/// implementation, so unconfigured deployments pay no DB cost. It queries a
-/// single `GROUP BY queue_name` aggregate per tick — cheap enough to run at
-/// the same cadence as the poll interval.
+/// implementation (`is_enabled() == false`), so unconfigured deployments pay no
+/// DB cost. This matters because the per-tick queries are not free: `queue_depths`
+/// is a `GROUP BY` aggregate and `oldest_pending_ages` scans eligible pending rows
+/// with correlated concurrency / rate-limit checks. Both feed gauges that are
+/// discarded by the no-op recorder, so issuing them would be pure waste (issue #501
+/// review).
 ///
 /// Stops when the cancellation token fires. Queues with zero pending rows are
 /// also reported (as depth 0) so gauges reset cleanly after drains.
@@ -6495,8 +6541,14 @@ fn spawn_queue_depth_sampler(
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     queues: Vec<String>,
     interval: Duration,
+    circuit_breaker_activities: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL. The per-event
+        // `record_*` calls are zero-cost, but these gauge-feeding queries are not.
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -6531,6 +6583,32 @@ fn spawn_queue_depth_sampler(
                 }
                 Err(error) => {
                     tracing::debug!(error = %error, "queue depth sample failed");
+                }
+            }
+
+            // Sample oldest-pending-age gauge alongside queue depth.
+            match queue::oldest_pending_ages(&mut conn, &queues, &circuit_breaker_activities).await
+            {
+                Ok(ages) => {
+                    let mut observed: HashSet<&str> = HashSet::new();
+                    for (queue_name, age_secs) in &ages {
+                        observed.insert(queue_name.as_str());
+                        telemetry
+                            .metrics
+                            .record_queue_oldest_pending_age(queue_name, *age_secs);
+                    }
+                    // Reset queues with no eligible tasks to 0 so stale gauge
+                    // values do not linger after a queue drains.
+                    for queue_name in &queues {
+                        if !observed.contains(queue_name.as_str()) {
+                            telemetry
+                                .metrics
+                                .record_queue_oldest_pending_age(queue_name, 0.0);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "oldest pending age sample failed");
                 }
             }
 
@@ -7081,6 +7159,7 @@ impl Worker {
         tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_monitoring_tasks(&self, pool: &DbPool) -> WorkerMonitoringHandles {
         let queue_depth_sampler = spawn_queue_depth_sampler(
             pool.clone(),
@@ -7088,6 +7167,10 @@ impl Worker {
             self.registry.telemetry().clone(),
             self.config.queues.clone(),
             self.config.poll_interval,
+            self.registry
+                .circuit_breakers()
+                .tracked_activity_names()
+                .to_vec(),
         );
         let concurrency_sampler = spawn_concurrency_sampler(
             pool.clone(),
@@ -7510,6 +7593,16 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task"
                 );
+                // schedule-to-start latency is recorded once the handler
+                // genuinely begins (in `process_workflow_task` /
+                // `process_activity_task`, past the dispatch-time defer/no-op
+                // gates), not here at claim time: the worker can over-claim past
+                // `max_concurrent_*` (the semaphore gates execution, not
+                // claiming), so measuring at claim would hide the time a task
+                // spends waiting behind a local permit on a saturated worker —
+                // exactly the capacity bottleneck the SLI is meant to page on.
+                // `schedule_to_start_secs` measures from task eligibility, so that
+                // permit wait is still captured in the recorded sample.
                 self.dispatch_task(task, pool);
                 true
             }
@@ -7587,12 +7680,28 @@ impl Worker {
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
 
+        // Monotonic instant captured the moment this worker received the claimed
+        // task, before acquiring the local concurrency permit. The schedule-to-start
+        // sample combines the DB-clock queue wait (claim time − eligibility, both
+        // Postgres timestamps) with this host-monotonic local wait
+        // (`dispatched_at.elapsed()` = permit wait + setup), so a host/Postgres
+        // clock skew never leaks into the sample (issue #501 review).
+        let dispatched_at = std::time::Instant::now();
+
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
             let Ok(permit) = semaphore.acquire().await else {
                 tracing::error!(task_id = %task_id, "semaphore closed");
                 return;
             };
+
+            // schedule-to-start latency is recorded inside `process_workflow_task`
+            // / `process_activity_task` at the point the handler genuinely begins
+            // — *after* the dispatch-time defer/no-op gates (rate-limit defer,
+            // claimed-then-paused re-park). Recording it here, before those gates,
+            // would count a rate-limit deferral as a started task and depress the
+            // p99 capacity SLI during throttling (issue #501). The sample still
+            // captures the local-permit wait above via `dispatched_at`.
 
             tracing::info!(
                 task_id = %task_id,
@@ -7616,6 +7725,7 @@ impl Worker {
                         sticky_timeout,
                         max_local_activity_start_to_close,
                         workflow_cache,
+                        dispatched_at,
                     ),
                 )
                 .await
@@ -7750,6 +7860,7 @@ impl Worker {
                     sticky_timeout,
                     max_local_activity_start_to_close,
                     workflow_cache,
+                    dispatched_at,
                 )
                 .await
                 {

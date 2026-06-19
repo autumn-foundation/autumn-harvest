@@ -7556,6 +7556,7 @@ mod tests {
             schedule_to_close_at: None,
             required_capabilities: None,
             context_headers: None,
+            created_at: Some(now),
         }
     }
 

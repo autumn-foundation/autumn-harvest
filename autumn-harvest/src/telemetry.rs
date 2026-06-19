@@ -117,6 +117,29 @@ pub const METRIC_TIMER_DURATION: &str = "harvest.timer.duration";
 /// Gauge: current number of pending (unclaimed) tasks in a queue.
 pub const METRIC_QUEUE_DEPTH: &str = "harvest.queue.depth";
 
+/// Histogram: wall-clock seconds a task waited between becoming eligible
+/// (`scheduled_at`) and being claimed by a worker (`started_at`).
+///
+/// Recorded at claim time on the existing `claim_task` path. Labels:
+///   - `"queue"` — the task queue name (bounded cardinality).
+///
+/// Use this as the canonical "do I need more workers?" SLI: page when the
+/// p99 exceeds your per-queue SLA (e.g. `histogram_quantile(0.99, …) > 30`).
+/// Per ADR-0001 §7, `execution.id` / `activity.id` are span-only and MUST NOT
+/// appear as metric labels here.
+pub const METRIC_QUEUE_SCHEDULE_TO_START: &str = "harvest.queue.schedule_to_start";
+
+/// Gauge: age in seconds of the oldest currently-unclaimed eligible task in a
+/// queue, sampled on the same cadence as `harvest.queue.depth`.
+///
+/// "Eligible" means `state = 'PENDING' AND scheduled_at <= NOW()` — the same
+/// slice that `claim_task` competes over. Labels:
+///   - `"queue"` — the task queue name (bounded cardinality).
+///
+/// Reports `0` when no eligible tasks are queued, preventing stale gauge values
+/// from lingering after a queue drains.
+pub const METRIC_QUEUE_OLDEST_PENDING_AGE: &str = "harvest.queue.oldest_pending_age";
+
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
@@ -799,6 +822,22 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (queue_name, depth);
     }
 
+    /// Wall-clock seconds a task waited between becoming eligible
+    /// (`scheduled_at`) and being claimed by a worker (`started_at`).
+    ///
+    /// Recorded at claim time. Only `queue_name` is used as a label;
+    /// `execution.id` / `activity.id` are span-only per ADR-0001 §7.
+    fn record_schedule_to_start(&self, queue_name: &str, wait_secs: f64) {
+        let _ = (queue_name, wait_secs);
+    }
+
+    /// Age in seconds of the oldest currently-unclaimed eligible task in a
+    /// queue. Sampled alongside `record_queue_depth`. Reports `0` when the
+    /// queue is drained so stale gauge values do not linger.
+    fn record_queue_oldest_pending_age(&self, queue_name: &str, age_secs: f64) {
+        let _ = (queue_name, age_secs);
+    }
+
     /// Results of one retention-janitor tick on a shard.
     fn record_retention_tick(
         &self,
@@ -1105,13 +1144,29 @@ pub trait MetricsRecorder: Send + Sync {
     fn record_debounce_fired(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
     }
+
+    /// Whether this recorder actually forwards samples anywhere.
+    ///
+    /// Defaults to `true` for every real recorder. [`NoOpMetrics`] overrides it to
+    /// `false` so callers can skip *expensive sample-production work* (e.g. the
+    /// per-poll-interval `oldest_pending_ages` / `queue_depths` sampler SQL) when
+    /// no recorder is configured — the per-event `record_*` calls are already
+    /// zero-cost, but the queries that feed gauges are not. Treat this as a hint
+    /// for guarding observation work, never for changing engine behavior.
+    fn is_enabled(&self) -> bool {
+        true
+    }
 }
 
 /// Default metrics recorder that discards every sample.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoOpMetrics;
 
-impl MetricsRecorder for NoOpMetrics {}
+impl MetricsRecorder for NoOpMetrics {
+    fn is_enabled(&self) -> bool {
+        false
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Telemetry bundle
@@ -1279,6 +1334,14 @@ mod tests {
         assert_eq!(
             METRIC_WORKFLOW_TASK_TIMEOUT,
             "harvest.workflow.task_timeout"
+        );
+        assert_eq!(
+            METRIC_QUEUE_SCHEDULE_TO_START,
+            "harvest.queue.schedule_to_start"
+        );
+        assert_eq!(
+            METRIC_QUEUE_OLDEST_PENDING_AGE,
+            "harvest.queue.oldest_pending_age"
         );
     }
 
@@ -1569,6 +1632,8 @@ mod tests {
         rec.record_schedule_skipped("workflow", "daily_digest", "paused");
         rec.record_retention_tick(0, 100, 50, 0.02);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
+        rec.record_schedule_to_start("default", 1.5);
+        rec.record_queue_oldest_pending_age("default", 30.0);
         // If any method silently accepted execution.id we'd see it here.
     }
 
@@ -1607,6 +1672,17 @@ mod tests {
         );
         telemetry.metrics.record_timer_started(5.0);
         telemetry.metrics.record_queue_depth("default", 0);
+    }
+
+    #[test]
+    fn queue_latency_metrics_have_noop_defaults() {
+        let rec = NoOpMetrics;
+        // Both new queue latency methods must compile with only queue_name and
+        // the value (no execution.id) and must not panic on the no-op recorder.
+        rec.record_schedule_to_start("default", 0.0);
+        rec.record_schedule_to_start("priority", 1.234);
+        rec.record_queue_oldest_pending_age("default", 0.0);
+        rec.record_queue_oldest_pending_age("priority", 42.5);
     }
 
     #[test]

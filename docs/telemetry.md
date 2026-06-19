@@ -20,10 +20,58 @@ Then install an exporter and wire the recorder before starting any workers:
 ```rust
 use autumn_harvest::metrics_rs_adapter::MetricsRsRecorder;
 use autumn_harvest::telemetry::TelemetryConfig;
+use metrics_exporter_prometheus::Matcher;
 use std::sync::Arc;
 
 // 1. Install the Prometheus exporter (do this once at process start).
+//
+//    `metrics-exporter-prometheus` renders every histogram as a Prometheus
+//    *summary* (client-side quantiles) UNLESS you configure explicit bucket
+//    boundaries. The starter alert pack pages on
+//    `histogram_quantile(0.99, rate(harvest_queue_schedule_to_start_bucket[5m]))`,
+//    which only exists when buckets are set — and server-side `_bucket` series
+//    are the only form you can aggregate across replicas.
+//
+//    Scope the seconds-oriented boundaries to the *latency* histograms with
+//    `set_buckets_for_metric` rather than the global `set_buckets`. A global
+//    bucket set is applied to every histogram, including non-duration ones such
+//    as `harvest.workflow.history_size` (durable event counts, soft threshold
+//    10k) and the payload-size histogram (bytes) — seconds buckets would dump
+//    every sample above 600 into `+Inf` and break count/byte dashboards.
+//
+//    NOTE: `Matcher::Full` is matched against the *sanitized* metric name —
+//    `metrics-exporter-prometheus` calls `sanitize_metric_name` before looking up
+//    the per-metric distribution — so the matcher must use the Prometheus form
+//    with underscores (`harvest_queue_schedule_to_start`), NOT the dotted name
+//    registered via the `metrics` macros. A dotted matcher silently fails to match
+//    and the metric falls back to a summary (no `_bucket` series).
+const LATENCY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+    10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+];
 metrics_exporter_prometheus::PrometheusBuilder::new()
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_queue_schedule_to_start".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_workflow_duration".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_activity_duration".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
+    // history-size is a *count* histogram (durable events), not seconds — give
+    // it its own boundaries so it stays usable for count dashboards/alerts.
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_workflow_history_size".into()),
+        &[10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0],
+    )
+    .expect("valid bucket boundaries")
     .install()
     .expect("failed to install Prometheus exporter");
 
@@ -84,6 +132,8 @@ metric is emitted in the source code.
 | `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion |
 | `harvest.timer.started` | Counter | `worker.rs` — `persist_timer_command`, when a durable timer is written |
 | `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default) |
+| `harvest.queue.schedule_to_start` | Histogram | `worker.rs` — `dispatch_task`, recorded after the concurrency permit is acquired so it captures worker-local backpressure; skew-discounted (issue #501) |
+| `harvest.queue.oldest_pending_age` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, alongside depth; excludes PAUSED executions, skew-discounted, periodic (5 s default) (issue #501) |
 | `harvest.dlq.entries` | Gauge | `worker.rs` — `spawn_dlq_depth_sampler`, periodic (5 s default) |
 | `harvest.schedule.runs` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, on successful dispatch |
 | `harvest.schedule.skipped` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, when a run is skipped |
@@ -98,6 +148,8 @@ metric is emitted in the source code.
 | `harvest.activity.duration` | `activity`, `queue`, `status` (`completed\|failed`) |
 | `harvest.timer.started` | _(none)_ |
 | `harvest.queue.depth` | `queue` |
+| `harvest.queue.schedule_to_start` | `queue` |
+| `harvest.queue.oldest_pending_age` | `queue` |
 | `harvest.dlq.entries` | `shard` |
 | `harvest.schedule.runs` | `kind` (`workflow\|dag`), `name` |
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
@@ -117,6 +169,12 @@ rate(harvest_activity_duration_count{status="failed"}[5m])
 
 # Current queue backlog
 harvest_queue_depth{queue="default"}
+
+# p99 schedule-to-start latency per queue (canonical worker-capacity SLI, issue #501)
+histogram_quantile(0.99, sum by (le, queue) (rate(harvest_queue_schedule_to_start_bucket[5m])))
+
+# Age of the oldest unclaimed eligible task per queue (fast-detection gauge, issue #501)
+harvest_queue_oldest_pending_age{queue="default"}
 
 # DLQ depth per shard
 harvest_dlq_entries{shard="0"}
