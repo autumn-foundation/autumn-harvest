@@ -368,7 +368,14 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }) => {
             let max_wait_expr = max_wait.map_or_else(
                 || quote! { ::std::option::Option::None },
-                |s| quote! { ::autumn_harvest::task_duration(#s) },
+                |s| {
+                    quote! {
+                        ::std::option::Option::Some(
+                            ::autumn_harvest::task_duration(#s)
+                                .expect("debounce max_wait must be a valid duration string")
+                        )
+                    }
+                },
             );
             quote! {
                 ::std::option::Option::Some(
