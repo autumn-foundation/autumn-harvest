@@ -26,6 +26,8 @@ fn metrics_rs_recorder_implements_metrics_recorder_trait() {
     recorder.record_retention_tick(0, 100, 50, 0.01);
     recorder.record_concurrency_key_in_flight("email-cap", 3);
     recorder.record_concurrency_key_deferred("email-cap", 1);
+    recorder.record_schedule_to_start("default", 1.5);
+    recorder.record_queue_oldest_pending_age("default", 30.0);
 }
 
 #[test]

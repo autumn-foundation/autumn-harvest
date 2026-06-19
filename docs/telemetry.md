@@ -84,6 +84,8 @@ metric is emitted in the source code.
 | `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion |
 | `harvest.timer.started` | Counter | `worker.rs` — `persist_timer_command`, when a durable timer is written |
 | `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default) |
+| `harvest.queue.schedule_to_start` | Histogram | `worker.rs` — claim path (`poll_once`), recorded at claim time (issue #501) |
+| `harvest.queue.oldest_pending_age` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, alongside depth, periodic (5 s default) (issue #501) |
 | `harvest.dlq.entries` | Gauge | `worker.rs` — `spawn_dlq_depth_sampler`, periodic (5 s default) |
 | `harvest.schedule.runs` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, on successful dispatch |
 | `harvest.schedule.skipped` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, when a run is skipped |
@@ -98,6 +100,8 @@ metric is emitted in the source code.
 | `harvest.activity.duration` | `activity`, `queue`, `status` (`completed\|failed`) |
 | `harvest.timer.started` | _(none)_ |
 | `harvest.queue.depth` | `queue` |
+| `harvest.queue.schedule_to_start` | `queue` |
+| `harvest.queue.oldest_pending_age` | `queue` |
 | `harvest.dlq.entries` | `shard` |
 | `harvest.schedule.runs` | `kind` (`workflow\|dag`), `name` |
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
@@ -117,6 +121,12 @@ rate(harvest_activity_duration_count{status="failed"}[5m])
 
 # Current queue backlog
 harvest_queue_depth{queue="default"}
+
+# p99 schedule-to-start latency per queue (canonical worker-capacity SLI, issue #501)
+histogram_quantile(0.99, sum by (le, queue) (rate(harvest_queue_schedule_to_start_bucket[5m])))
+
+# Age of the oldest unclaimed eligible task per queue (fast-detection gauge, issue #501)
+harvest_queue_oldest_pending_age{queue="default"}
 
 # DLQ depth per shard
 harvest_dlq_entries{shard="0"}

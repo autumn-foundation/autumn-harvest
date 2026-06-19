@@ -6534,6 +6534,31 @@ fn spawn_queue_depth_sampler(
                 }
             }
 
+            // Sample oldest-pending-age gauge alongside queue depth.
+            match queue::oldest_pending_ages(&mut conn, &queues).await {
+                Ok(ages) => {
+                    let mut observed: HashSet<&str> = HashSet::new();
+                    for (queue_name, age_secs) in &ages {
+                        observed.insert(queue_name.as_str());
+                        telemetry
+                            .metrics
+                            .record_queue_oldest_pending_age(queue_name, *age_secs);
+                    }
+                    // Reset queues with no eligible tasks to 0 so stale gauge
+                    // values do not linger after a queue drains.
+                    for queue_name in &queues {
+                        if !observed.contains(queue_name.as_str()) {
+                            telemetry
+                                .metrics
+                                .record_queue_oldest_pending_age(queue_name, 0.0);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(error = %error, "oldest pending age sample failed");
+                }
+            }
+
             if cancel.is_cancelled() {
                 break;
             }
@@ -7510,6 +7535,20 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task"
                 );
+                // Record schedule-to-start latency: wall-clock seconds between
+                // the task becoming eligible (scheduled_at) and this worker
+                // claiming it (started_at, set to NOW() in the claim CTE).
+                // Clamped to 0 to guard against sub-millisecond clock skew.
+                let started = task.started_at.unwrap_or_else(chrono::Utc::now);
+                let wait_secs = (started - task.scheduled_at)
+                    .max(chrono::Duration::zero())
+                    .to_std()
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                self.registry
+                    .telemetry()
+                    .metrics
+                    .record_schedule_to_start(&task.queue_name, wait_secs);
                 self.dispatch_task(task, pool);
                 true
             }

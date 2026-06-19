@@ -28,6 +28,7 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
+    METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START,
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
     METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_STARTED, MetricsRecorder, TelemetryConfig,
     WorkflowStatus,
@@ -228,6 +229,26 @@ impl MetricsRecorder for RecordingMetrics {
             vec![
                 ("depth", depth.to_string()),
                 ("queue", queue_name.to_owned()),
+            ],
+        );
+    }
+
+    fn record_schedule_to_start(&self, queue_name: &str, wait_secs: f64) {
+        self.push(
+            METRIC_QUEUE_SCHEDULE_TO_START,
+            vec![
+                ("queue", queue_name.to_owned()),
+                ("wait_secs", format!("{wait_secs:.3}")),
+            ],
+        );
+    }
+
+    fn record_queue_oldest_pending_age(&self, queue_name: &str, age_secs: f64) {
+        self.push(
+            METRIC_QUEUE_OLDEST_PENDING_AGE,
+            vec![
+                ("queue", queue_name.to_owned()),
+                ("age_secs", format!("{age_secs:.3}")),
             ],
         );
     }
@@ -2289,4 +2310,244 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         "non_deterministic_test_workflow"
     );
     assert_eq!(search_attrs["build_id"], "test-build-v999");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #501: schedule-to-start latency + oldest-pending-age metrics
+// ---------------------------------------------------------------------------
+
+/// Verifies that `harvest.queue.schedule_to_start` is emitted when a worker
+/// claims and completes a task, labeled by `queue`, with a non-negative value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn schedule_to_start_histogram_emitted_at_claim_time() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({"msg": "sts test"});
+
+    let exec_row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "sts_test_workflow",
+        workflow_id: &format!("sts-{}", Uuid::new_v4()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: workflow_input.clone(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&exec_row)
+        .execute(&mut conn)
+        .await
+        .expect("insert workflow execution failed");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    // Enqueue with scheduled_at in the past to guarantee a measurable wait.
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::milliseconds(200);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+
+    fn sts_test_workflow<'a>(
+        _ctx: &'a autumn_harvest::WorkflowContext,
+        _input: serde_json::Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(serde_json::Value::Null) })
+    }
+
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![WorkflowInfo {
+            name: "sts_test_workflow",
+            module: "metrics_integration",
+            handler: sts_test_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+
+    let worker = build_worker("sts-worker-1", registry);
+    let pool = build_test_pool(&database_url);
+
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    wait_for_completed(&database_url, exec_id).await;
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let emissions = recording.drain();
+    let sts = emissions
+        .iter()
+        .find(|e| e.name == METRIC_QUEUE_SCHEDULE_TO_START)
+        .expect("harvest.queue.schedule_to_start must be emitted");
+    assert!(
+        sts.labels_debug.contains("queue=default"),
+        "emission must be labeled by queue; got: {}",
+        sts.labels_debug
+    );
+    // wait_secs should be ≥ 0 (we recorded it as a formatted f64 string).
+    let wait_secs: f64 = sts
+        .labels_debug
+        .split(',')
+        .find(|s| s.starts_with("wait_secs="))
+        .and_then(|s| s.strip_prefix("wait_secs="))
+        .and_then(|v| v.parse().ok())
+        .expect("wait_secs label must be present and parseable");
+    assert!(
+        wait_secs >= 0.0,
+        "wait_secs must be non-negative; got {wait_secs}"
+    );
+}
+
+/// Verifies that `oldest_pending_ages` returns a positive age when there are
+/// eligible pending tasks, and returns an empty slice when the queue is drained
+/// (which is what causes the sampler to reset the gauge to 0).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn oldest_pending_age_query_positive_then_zero_after_drain() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({"msg": "age test"});
+
+    let exec_row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "age_test_workflow",
+        workflow_id: &format!("age-{}", Uuid::new_v4()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: workflow_input.clone(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&exec_row)
+        .execute(&mut conn)
+        .await
+        .expect("insert workflow execution failed");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    // Enqueue with scheduled_at 1 second in the past so it's immediately eligible.
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let queues = vec!["default".to_string()];
+
+    // Phase 1: there is an eligible task — age must be > 0.
+    let ages = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues)
+        .await
+        .expect("oldest_pending_ages query must succeed");
+    assert_eq!(ages.len(), 1, "expected one queue with an eligible task");
+    let (queue_name, age_secs) = &ages[0];
+    assert_eq!(queue_name, "default");
+    assert!(*age_secs > 0.0, "age_secs must be positive; got {age_secs}");
+
+    // Phase 2: mark the task FAILED (simulating drain) and re-query.
+    diesel::update(
+        queue_dsl::harvest_task_queue
+            .filter(queue_dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(queue_dsl::state.eq("PENDING")),
+    )
+    .set(queue_dsl::state.eq("FAILED"))
+    .execute(&mut conn)
+    .await
+    .expect("update task to FAILED failed");
+
+    let ages_after_drain = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues)
+        .await
+        .expect("oldest_pending_ages query must succeed after drain");
+    assert!(
+        ages_after_drain.is_empty(),
+        "no eligible tasks remain — result must be empty (sampler resets gauge to 0)"
+    );
 }

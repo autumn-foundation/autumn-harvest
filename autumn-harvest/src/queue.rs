@@ -877,6 +877,49 @@ pub async fn queue_depths(
     Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
 
+/// Returns the age in seconds of the oldest currently-unclaimed eligible task
+/// per queue.
+///
+/// Uses the same eligibility predicate as [`queue_depths`] and [`claim_task`]:
+/// `state = 'PENDING' AND scheduled_at <= NOW()`. Only queues that have at
+/// least one eligible task appear in the result; the sampler is responsible for
+/// resetting the gauge to `0` for queues with no eligible tasks.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn oldest_pending_ages(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+) -> HarvestResult<Vec<(String, f64)>> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue_name: String,
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        age_secs: f64,
+    }
+
+    let rows: Vec<Row> = diesel::sql_query(
+        "SELECT queue_name, \
+                EXTRACT(EPOCH FROM (NOW() - MIN(scheduled_at)))::DOUBLE PRECISION AS age_secs \
+         FROM harvest_task_queue \
+         WHERE queue_name = ANY($1) \
+           AND state = 'PENDING' \
+           AND scheduled_at <= NOW() \
+         GROUP BY queue_name",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.queue_name, r.age_secs))
+        .collect())
+}
+
 /// Update the `last_heartbeat_at` timestamp and checkpoint payload for a running task.
 ///
 /// # Errors
