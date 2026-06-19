@@ -5946,6 +5946,39 @@ async fn start_workflow(
                 }
             }
 
+            // Validate a supplied execution_timeout_secs at admission: it is stored
+            // as a raw i64 and the fire path converts it with `try_seconds`, which
+            // silently yields `None` for an out-of-range value — dropping both the
+            // requested timeout and the workflow default (and the ceiling can't clamp
+            // `None`). Reject the bad value here instead (issue #499). Negative is
+            // also rejected; a non-positive deadline is never a meaningful timeout.
+            if let Some(secs) = request.execution_timeout_secs
+                && (secs < 0 || chrono::Duration::try_seconds(secs).is_none())
+            {
+                if let Ok(pool) = api_state.storage_pool()
+                    && let Ok(mut c) = acquire_conn(pool.default_pool()).await
+                {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_WORKFLOW_START,
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(workflow_name.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: STATUS_FAILED,
+                        error_summary: Some("invalid execution_timeout_secs"),
+                        shard_id: None,
+                        source: &source,
+                    };
+                    let _ = audit::insert_audit(&mut c, &ar).await;
+                }
+                return AutumnError::bad_request_msg(format!(
+                    "execution_timeout_secs ({secs}) is out of range or negative",
+                ))
+                .into_response();
+            }
+
             // Resolve the same effective operator metadata / timeout defaults the
             // normal start path resolves below, so a debounced run is not a
             // second-class start: the fire path (in core) has no registry access,
@@ -7514,6 +7547,21 @@ async fn signal_with_start_workflow(
     .await;
 
     if let Err(HarvestError::DebounceFreshStart { .. }) = &result {
+        // Failed-start audit (parity with the match arms below).
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_SIGNAL_WITH_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(workflow_name.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: request.idempotency_key.as_deref(),
+            status: STATUS_FAILED,
+            error_summary: Some("debounced workflow: fresh start rejected"),
+            shard_id: Some(shard.as_i32()),
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
         return AutumnError::bad_request_msg(format!(
             "workflow '{workflow_name}' has a debounce policy; a fresh start must use \
              POST /workflows/{workflow_name}/start (signal-with-start can only attach a \
@@ -8021,6 +8069,21 @@ async fn update_with_start_workflow(
     let result = update_with_start_workflow_execution(&mut conn, params).await;
 
     if let Err(HarvestError::DebounceFreshStart { .. }) = &result {
+        // Failed-start audit (parity with the match arms below).
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_UPDATE_WITH_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(workflow_name.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: request.idempotency_key.as_deref(),
+            status: STATUS_FAILED,
+            error_summary: Some("debounced workflow: fresh start rejected"),
+            shard_id: Some(shard.as_i32()),
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
         return AutumnError::bad_request_msg(format!(
             "workflow '{workflow_name}' has a debounce policy; a fresh start must use \
              POST /workflows/{workflow_name}/start (update-with-start can only attach an \

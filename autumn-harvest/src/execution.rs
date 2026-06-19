@@ -1967,13 +1967,20 @@ pub async fn signal_with_start_workflow_execution(
             // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
             // when the prior run is terminal so the signal always lands on a live
             // execution ("no signal silently dropped" invariant from issue #244).
-            let effective_policy = resolve_effective_signal_with_start_policy(
-                conn,
-                request.workflow_name,
-                request.workflow_id,
-                request.reuse_policy,
-            )
-            .await?;
+            // For a debounced workflow, skip the upgrade: a terminal prior must not
+            // be escalated to a fresh start here — the reject check below routes it
+            // to debounce admission instead.
+            let effective_policy = if request.reject_fresh_if_debounced {
+                request.reuse_policy
+            } else {
+                resolve_effective_signal_with_start_policy(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    request.reuse_policy,
+                )
+                .await?
+            };
 
             let build_start_request =
                 |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
@@ -2005,11 +2012,31 @@ pub async fn signal_with_start_workflow_execution(
                     scheduled_for: None,
                 };
 
-            let started = start_or_load_workflow_execution(
-                conn,
-                build_start_request(request.exec_id, effective_policy),
-            )
-            .await?;
+            // For a debounced workflow, route the start through the no-spawn collect
+            // path with reject_fresh: a fresh start (including a TerminateIfRunning
+            // cancel+replace) returns DebounceFreshStart and rolls back WITHOUT
+            // cancelling a prior or spawning completion-trigger/parent-close
+            // follow-ups (issue #499). An attach returns the existing live run;
+            // its deferred list is empty and spawned defensively.
+            let started = if request.reject_fresh_if_debounced {
+                let (s, deferred) = start_or_load_workflow_execution_collect(
+                    conn,
+                    build_start_request(request.exec_id, effective_policy),
+                    true,
+                    true,
+                )
+                .await?;
+                for d in deferred {
+                    d.spawn();
+                }
+                s
+            } else {
+                start_or_load_workflow_execution(
+                    conn,
+                    build_start_request(request.exec_id, effective_policy),
+                )
+                .await?
+            };
 
             // On fresh start only: enforce workflow input cap (tx rollback on error).
             if started.created {
@@ -2453,11 +2480,29 @@ pub async fn update_with_start_workflow_execution(
                     scheduled_for: None,
                 };
 
-            let started = start_or_load_workflow_execution(
-                conn,
-                build_start_request(request.exec_id, effective_policy),
-            )
-            .await?;
+            // Debounced workflow: route through the no-spawn collect path with
+            // reject_fresh so a fresh start (incl. TerminateIfRunning cancel+replace)
+            // rolls back via DebounceFreshStart without cancelling/spawning before
+            // the rejection (issue #499). Attach returns the existing live run.
+            let started = if request.reject_fresh_if_debounced {
+                let (s, deferred) = start_or_load_workflow_execution_collect(
+                    conn,
+                    build_start_request(request.exec_id, effective_policy),
+                    true,
+                    true,
+                )
+                .await?;
+                for d in deferred {
+                    d.spawn();
+                }
+                s
+            } else {
+                start_or_load_workflow_execution(
+                    conn,
+                    build_start_request(request.exec_id, effective_policy),
+                )
+                .await?
+            };
 
             // Enforce workflow input cap on fresh start.
             if started.created {
