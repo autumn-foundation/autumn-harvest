@@ -40,7 +40,10 @@ pub const DEFAULT_BACKFILL_MAX_COUNT: usize = 1_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackfillPlanError {
     /// The window contains more timestamps than the caller-supplied limit.
-    LimitExceeded { limit: usize },
+    LimitExceeded {
+        /// The maximum number of timestamps that was allowed.
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for BackfillPlanError {

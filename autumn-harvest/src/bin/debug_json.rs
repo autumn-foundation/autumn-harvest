@@ -1,3 +1,18 @@
+//! A diagnostic tool for printing JSON representations of workflow events.
+//!
+//! When developing clients in other languages (or testing the raw REST API),
+//! you often need exact JSON payloads for the `WorkflowEvent` variants. This
+//! binary generates properly structured and `serde`-serialized JSON output
+//! for core event types so you don't have to guess the field names.
+//!
+//! ## Examples
+//!
+//! Run the tool to see the serialized output for external signals:
+//!
+//! ```bash
+//! cargo run -p autumn-harvest --bin debug_json
+//! ```
+
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::ExternalSignalId;
 

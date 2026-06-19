@@ -52,15 +52,23 @@ pub struct RetirementCheckFilters {
 /// before retiring the old branch."
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct RetirementCheckShardRow {
+    /// The name of the workflow execution taking the old branch.
     pub workflow_name: String,
+    /// The ID of the change being retired.
     pub change_id: String,
+    /// The specific recorded version (which is less than `min_safe_version`).
     pub recorded_version: u32,
+    /// Count of currently running executions blocking retirement.
     pub active_executions: i64,
+    /// Count of completed/failed executions that took this branch.
     pub terminal_executions: i64,
+    /// The start time of the oldest execution blocking retirement.
     pub oldest_blocker_started_at: DateTime<Utc>,
+    /// The start time of the most recent execution blocking retirement.
     pub newest_blocker_started_at: DateTime<Utc>,
     /// Up to 10 active (non-terminal) execution IDs for manual investigation.
     pub sample_active_execution_ids: Vec<Uuid>,
+    /// The database shard where these executions reside.
     pub shard_id: i32,
 }
 
