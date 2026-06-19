@@ -505,17 +505,82 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let info = #public_info_name();
                     // Issue #499: a debounced start is deferred until the burst
                     // settles, so no execution (and therefore no exec_id-keyed
-                    // handle) exists yet. The typed client's immediate-start
-                    // contract can't express that, so refuse explicitly instead
-                    // of silently bypassing the debounce policy (split-brain).
-                    if let ::std::option::Option::Some(policy) = info.debounce {
-                        if ::autumn_harvest::debounce::resolve_debounce_key(policy.key_expr, &input).is_some() {
-                            return ::std::result::Result::Err(::autumn_harvest::error::HarvestError::Config(
-                                ::std::format!(
-                                    "workflow '{}' declares a debounce policy; the typed client's immediate-start API cannot express a deferred debounced start — start it via the HTTP route POST /workflows/{}/start, which routes through the debounce admission gate",
-                                    info.name, info.name,
-                                ),
-                            ));
+                    // handle) exists yet. Route through the debounce admission
+                    // gate and return HarvestError::Debounced so callers can
+                    // correlate the eventual run via workflow_id.
+                    //
+                    // Shard note: `conn` is the connection for the
+                    // workflow_id-derived shard. In a single-shard deployment
+                    // this is always correct. In a multi-shard deployment the
+                    // caller must supply the debounce-key's shard connection;
+                    // this is documented as shard-local (consistent with #247).
+                    if let ::std::option::Option::Some(debounce_policy) = info.debounce {
+                        if let ::std::option::Option::Some(ref debounce_key) =
+                            ::autumn_harvest::debounce::resolve_debounce_key(debounce_policy.key_expr, &input)
+                        {
+                            let effective_max_wait = debounce_policy.max_wait
+                                .unwrap_or_else(|| client.default_debounce_max_wait());
+                            let (concurrency_key, concurrency_limit) = if let Some(ref cpolicy) = info.concurrency {
+                                let key = ::autumn_harvest::concurrency::resolve_concurrency_key(&cpolicy.key_expr, &input);
+                                (key, ::std::option::Option::Some(cpolicy.limit))
+                            } else {
+                                (::std::option::Option::None, ::std::option::Option::None)
+                            };
+                            let execution_timeout_secs = opts.execution_timeout
+                                .or(info.execution_timeout)
+                                .and_then(|d| ::autumn_harvest::chrono::Duration::from_std(d).ok())
+                                .map(|d| d.num_seconds());
+                            let sla_secs = opts.sla
+                                .and_then(|d| ::autumn_harvest::chrono::Duration::from_std(d).ok())
+                                .map(|d| d.num_seconds());
+                            let max_execution_timeout_ceiling_secs = client
+                                .max_workflow_execution_timeout()
+                                .and_then(|d| ::autumn_harvest::chrono::Duration::from_std(d).ok())
+                                .map(|d| d.num_seconds());
+                            let admit_params = ::autumn_harvest::debounce::AdmitDebounceParams {
+                                workflow_name: info.name,
+                                debounce_key,
+                                workflow_id: &workflow_id,
+                                queue_name: opts.queue_name.as_deref().unwrap_or("default"),
+                                last_input: input.clone(),
+                                window: debounce_policy.window,
+                                max_wait: effective_max_wait,
+                                shard_id: 0,
+                                start_options: ::autumn_harvest::debounce::DebounceStartOptions {
+                                    reuse_policy: opts.reuse_policy.as_ref().and_then(|p| {
+                                        ::autumn_harvest::serde_json::to_value(p)
+                                            .ok()
+                                            .and_then(|v| v.as_str().map(str::to_string))
+                                    }),
+                                    execution_timeout_secs,
+                                    memo: opts.memo.clone(),
+                                    search_attrs: opts.search_attrs.clone(),
+                                    sla_secs,
+                                    context_headers: opts.context_headers.clone(),
+                                    priority: opts.priority.map(|p| p.as_i32()),
+                                    concurrency_key,
+                                    concurrency_limit,
+                                    owner: info.owner.map(str::to_string),
+                                    runbook_url: info.runbook_url.map(str::to_string),
+                                    severity: info.severity.map(str::to_string),
+                                    max_execution_timeout_ceiling_secs,
+                                    max_workflow_input_bytes: ::std::option::Option::Some(
+                                        client.max_workflow_input_bytes(info.max_input_bytes)
+                                    ),
+                                },
+                            };
+                            let outcome = ::autumn_harvest::debounce::admit_debounced_start(
+                                conn, admit_params
+                            ).await?;
+                            return ::std::result::Result::Err(
+                                ::autumn_harvest::error::HarvestError::Debounced {
+                                    workflow_name: info.name.to_string(),
+                                    workflow_id: outcome.workflow_id,
+                                    debounce_key: outcome.debounce_key,
+                                    fire_at: outcome.fire_at,
+                                    pending_count: outcome.pending_count,
+                                }
+                            );
                         }
                     }
                     let exec_id = opts.exec_id.unwrap_or_else(|| {

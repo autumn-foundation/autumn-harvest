@@ -327,6 +327,42 @@ pub async fn admit_debounced_start(
     })
 }
 
+/// Return `true` when a pending debounce record exists for the given key.
+///
+/// Used by the admission gate bypass: when a burst update arrives for a key
+/// that already has a pending record, it is updating deadline/count on an
+/// existing tracked row rather than creating new execution load, so an
+/// active rate-limit gate should be bypassed.
+///
+/// Returns `false` on any DB error (fail-open: let the upsert decide).
+#[cfg(feature = "db")]
+pub async fn has_pending_debounce(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_name: &str,
+    debounce_key: &str,
+) -> bool {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct ExistsRow {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        exists: bool,
+    }
+
+    let sql = "SELECT EXISTS(
+        SELECT 1 FROM harvest_debounce
+        WHERE workflow_name = $1 AND debounce_key = $2
+    ) AS exists";
+
+    diesel::sql_query(sql)
+        .bind::<diesel::sql_types::Text, _>(workflow_name)
+        .bind::<diesel::sql_types::Text, _>(debounce_key)
+        .get_result::<ExistsRow>(conn)
+        .await
+        .map(|r| r.exists)
+        .unwrap_or(false)
+}
+
 /// Maximum number of debounce rows fired per scanner tick.
 /// Prevents a single shard from being overwhelmed if many keys come due simultaneously.
 pub const DEBOUNCE_FIRE_BATCH_SIZE: i64 = 100;

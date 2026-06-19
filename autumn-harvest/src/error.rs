@@ -397,6 +397,30 @@ pub enum HarvestError {
         /// Machine-readable failure reason (`"target_unknown"` or `"self_cancel"`).
         reason_code: String,
     },
+
+    /// A debounced start was admitted — the execution will be created once
+    /// the debounce window elapses with no further qualifying requests.
+    ///
+    /// The typed client's `start`/`start_with_options` return this instead of
+    /// a [`TypedWorkflowHandle`](crate::handle_typed::TypedWorkflowHandle) because
+    /// no `ExecutionId` exists until the scanner fires. Use `workflow_id` to
+    /// correlate the eventual run once `fire_at` has passed.
+    #[error(
+        "debounced: workflow '{workflow_name}' (workflow_id '{workflow_id}', \
+         key '{debounce_key}') fires at {fire_at} ({pending_count} pending)"
+    )]
+    Debounced {
+        /// The workflow type name.
+        workflow_name: String,
+        /// The stable `workflow_id` the eventual run will be created with.
+        workflow_id: String,
+        /// The resolved debounce key that collapsed this burst.
+        debounce_key: String,
+        /// When the run is expected to start (trailing-edge window expiry).
+        fire_at: chrono::DateTime<chrono::Utc>,
+        /// Number of requests collapsed into this pending debounce record.
+        pending_count: i32,
+    },
 }
 
 impl HarvestError {

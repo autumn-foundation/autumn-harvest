@@ -5895,9 +5895,19 @@ async fn start_workflow(
             .router
             .pick_for_new_workflow(&workflow_name, &resolved_key);
 
+        // Acquire the debounce-shard connection early so the gate bypass check
+        // and the subsequent upsert share the same pool slot.
+        let mut debounce_conn = match db_conn_for_shard(&api_state, debounce_shard).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+
         // Re-run the admission-gate check against the debounce key's shard: the
         // earlier gate check used the workflow_id-derived shard, but a debounced
         // run lands on debounce_shard, so a shard-scoped gate there must apply.
+        // Bypass: if a pending debounce record already exists for this key, this
+        // request extends the deadline/count of an already-tracked row — it adds
+        // no new execution load, so the gate should not block it.
         {
             let wf_owner = runtime
                 .registry
@@ -5910,31 +5920,34 @@ async fn start_workflow(
                 debounce_shard.as_i32(),
                 wf_owner,
             ) {
-                let reason_label = match reason.char_indices().nth(64) {
-                    Some((idx, _)) => &reason[..idx],
-                    None => &reason,
-                };
-                runtime
-                    .registry
-                    .telemetry()
-                    .metrics
-                    .record_admission_blocked(scope_kind, reason_label);
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "error": "admission blocked",
-                        "gate_id": gate_id,
-                        "reason": reason,
-                    })),
+                let is_burst_update = autumn_harvest::debounce::has_pending_debounce(
+                    &mut debounce_conn,
+                    &workflow_name,
+                    &resolved_key,
                 )
-                    .into_response();
+                .await;
+                if !is_burst_update {
+                    let reason_label = match reason.char_indices().nth(64) {
+                        Some((idx, _)) => &reason[..idx],
+                        None => &reason,
+                    };
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_admission_blocked(scope_kind, reason_label);
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": "admission blocked",
+                            "gate_id": gate_id,
+                            "reason": reason,
+                        })),
+                    )
+                        .into_response();
+                }
             }
         }
-
-        let mut debounce_conn = match db_conn_for_shard(&api_state, debounce_shard).await {
-            Ok(c) => c,
-            Err(e) => return e.into_response(),
-        };
 
         let effective_max_wait = debounce_policy
             .max_wait
