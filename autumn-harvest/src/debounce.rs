@@ -559,7 +559,25 @@ pub async fn fire_due_debounced_starts(
     shard_assignments: &[crate::types::ShardId],
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
-    let mut fired_all: Vec<FiredDebounce> = Vec::new();
+    // Spawn a shard's fired follow-ups + record metrics, returning the count.
+    // Done per-shard immediately after that shard's claim transaction commits, so
+    // an error on a *later* shard can never drop an earlier shard's already-
+    // committed completion-trigger/parent-close follow-ups (Codex 580).
+    fn spawn_fired(
+        fired: Vec<FiredDebounce>,
+        metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    ) -> usize {
+        let count = fired.len();
+        for (workflow_name, queue_name, deferred_starts) in fired {
+            for start in deferred_starts {
+                start.spawn();
+            }
+            metrics.record_debounce_fired(&workflow_name, &queue_name);
+        }
+        count
+    }
+
+    let mut fired_count = 0usize;
 
     match sharded_pool {
         // Multi-shard: scan each assigned shard's own harvest_debounce table.
@@ -577,23 +595,18 @@ pub async fn fire_due_debounced_starts(
                         continue;
                     }
                 };
-                let mut fired = fire_due_on_conn(&mut shard_conn).await?;
-                fired_all.append(&mut fired);
+                // Spawn this shard's results before moving on; on this shard's own
+                // error the transaction rolled back, so there is nothing committed
+                // to drain and propagating is safe.
+                let fired = fire_due_on_conn(&mut shard_conn).await?;
+                fired_count += spawn_fired(fired, metrics);
             }
         }
         // Single-shard / no sharded pool: the passed connection is the only shard.
         _ => {
-            let mut fired = fire_due_on_conn(conn).await?;
-            fired_all.append(&mut fired);
+            let fired = fire_due_on_conn(conn).await?;
+            fired_count += spawn_fired(fired, metrics);
         }
-    }
-
-    let fired_count = fired_all.len();
-    for (workflow_name, queue_name, deferred_starts) in fired_all {
-        for start in deferred_starts {
-            start.spawn();
-        }
-        metrics.record_debounce_fired(&workflow_name, &queue_name);
     }
 
     Ok(fired_count)
