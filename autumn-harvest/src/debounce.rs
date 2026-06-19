@@ -190,6 +190,10 @@ pub struct AdmitDebounceParams<'a> {
 pub struct DebounceAdmitOutcome {
     /// The resolved debounce key used for the upsert.
     pub debounce_key: String,
+    /// The stable `workflow_id` the eventual run will be created with. This is
+    /// the **first** request's id for the key (kept across retriggers), which
+    /// the caller should echo instead of its own generated id.
+    pub workflow_id: String,
     /// Current fire deadline after this admission.
     pub fire_at: DateTime<Utc>,
     /// Total qualifying requests seen for this key since the record was created.
@@ -221,9 +225,12 @@ pub struct PendingDebounceRecord {
 /// `max_fire_at = now + max_wait`.
 ///
 /// On **subsequent requests**, updates `effective_fire_at = min(now + window,
-/// existing max_fire_at)`, increments `pending_count`, and overwrites
-/// `last_input` and `start_options` with the most recent request's values
-/// (**last-input-wins**).
+/// existing max_fire_at)`, increments `pending_count`, refreshes `queue_name`,
+/// and overwrites `last_input` and `start_options` with the most recent
+/// request's values (**last-input-wins**). The `workflow_id` is **kept from the
+/// first request** so the stable id echoed in every `202` response is the one
+/// the run will actually be created with; the stored id is returned so the
+/// caller can echo it rather than its own (possibly-discarded) generated id.
 ///
 /// Returns the current state of the record after the upsert.
 ///
@@ -240,6 +247,8 @@ pub async fn admit_debounced_start(
     struct UpsertRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
         debounce_key: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        workflow_id: String,
         #[diesel(sql_type = diesel::sql_types::Timestamptz)]
         effective_fire_at: DateTime<Utc>,
         #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -277,7 +286,9 @@ pub async fn admit_debounced_start(
         VALUES
             ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, NOW(), NOW())
         ON CONFLICT (workflow_name, debounce_key) DO UPDATE SET
-            workflow_id       = EXCLUDED.workflow_id,
+            -- workflow_id is intentionally NOT overwritten: the first request's
+            -- id is the one the run is created with, and every 202 echoes it.
+            queue_name        = EXCLUDED.queue_name,
             last_input        = EXCLUDED.last_input,
             start_options     = EXCLUDED.start_options,
             effective_fire_at = LEAST($8, harvest_debounce.max_fire_at),
@@ -285,6 +296,7 @@ pub async fn admit_debounced_start(
             updated_at        = NOW()
         RETURNING
             debounce_key,
+            workflow_id,
             effective_fire_at,
             pending_count,
             -- xmax = 0 means the row was just inserted (not updated)
@@ -308,6 +320,7 @@ pub async fn admit_debounced_start(
 
     Ok(DebounceAdmitOutcome {
         debounce_key: row.debounce_key,
+        workflow_id: row.workflow_id,
         fire_at: row.effective_fire_at,
         pending_count: row.pending_count,
         is_new_record: row.is_new_record,
@@ -366,6 +379,25 @@ pub async fn fire_due_debounced_starts(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> crate::error::HarvestResult<usize> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
+
+    // Tolerate a missing `harvest_debounce` table (mixed-schema test fixtures
+    // that exercise unrelated timeout behaviour, or a deployment that hasn't run
+    // the migration yet). `to_regclass` returns NULL instead of erroring, so a
+    // cheap catalog lookup lets the rest of the timeout sweep proceed rather
+    // than aborting the whole pass. In production the table always exists.
+    #[derive(diesel::QueryableByName)]
+    struct TableExists {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        present: bool,
+    }
+    let exists: TableExists =
+        diesel::sql_query("SELECT to_regclass('harvest_debounce') IS NOT NULL AS present")
+            .get_result(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    if !exists.present {
+        return Ok(0);
+    }
 
     // Claim + fire + delete the whole due batch in one transaction so the
     // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
