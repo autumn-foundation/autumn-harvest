@@ -6000,26 +6000,14 @@ async fn start_workflow(
                 .router
                 .pick_for_new_workflow(&workflow_name, &resolved_key);
 
-            // Acquire the debounce-shard connection early so the gate bypass check
-            // and the subsequent upsert share the same pool slot.
-            let mut debounce_conn = match db_conn_for_shard(&api_state, debounce_shard).await {
-                Ok(c) => c,
-                Err(e) => return e.into_response(),
-            };
-
-            // Re-run the admission-gate check against the debounce key's shard: the
-            // earlier gate check used the workflow_id-derived shard, but a debounced
-            // run lands on debounce_shard, so a shard-scoped gate there must apply.
-            // Bypass: a request that merely extends an already-tracked pending row
-            // (a burst update) adds no new execution load and must not be blocked.
-            //
-            // The bypass decision is made *after* the upsert from its atomic
-            // `is_new_record` flag rather than from a pre-upsert existence probe:
-            // a concurrent scanner deleting-then-committing the row between a probe
-            // and the upsert could otherwise let a brand-new admission slip past an
-            // active gate. So here we only capture whether a gate is active; the
-            // enforcement happens below once the upsert tells us if the row is new.
-            let gate_block = {
+            // Admission-gate check against the debounce key's shard, BEFORE acquiring
+            // the shard connection: a debounced admission is always rejected when its
+            // scope is gated, so compute and return the gate rejection up front (the
+            // normal start path's gate-before-DB behavior). Acquiring the connection
+            // first would surface a raw pool error during an incident instead of the
+            // gate rejection + metric/audit (issue #499). The in-memory gate check is
+            // the same one the normal path uses before touching the DB.
+            if let Some((gate_id, reason, scope_kind)) = {
                 let wf_owner = runtime
                     .registry
                     .workflows
@@ -6031,6 +6019,50 @@ async fn start_workflow(
                     debounce_shard.as_i32(),
                     wf_owner,
                 )
+            } {
+                let reason_label = match reason.char_indices().nth(64) {
+                    Some((idx, _)) => &reason[..idx],
+                    None => &reason,
+                };
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_admission_blocked(scope_kind, reason_label);
+                // Best-effort failed-start audit (parity with the normal gate path).
+                // Acquired only for the audit; a pool failure here must not mask the
+                // gate rejection, so the result is ignored.
+                if let Ok(mut audit_conn) = db_conn_for_shard(&api_state, debounce_shard).await {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_WORKFLOW_START,
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(workflow_name.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: STATUS_FAILED,
+                        error_summary: Some("admission blocked by gate"),
+                        shard_id: Some(debounce_shard.as_i32()),
+                        source: &source,
+                    };
+                    let _ = audit::insert_audit(&mut audit_conn, &ar).await;
+                }
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "admission blocked",
+                        "gate_id": gate_id,
+                        "reason": reason,
+                    })),
+                )
+                    .into_response();
+            }
+
+            // Not gated — acquire the debounce-shard connection for the upsert.
+            let mut debounce_conn = match db_conn_for_shard(&api_state, debounce_shard).await {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
             };
 
             let effective_max_wait = debounce_policy
@@ -6065,58 +6097,24 @@ async fn start_workflow(
                 },
             };
 
-            // The gate decision is enforced atomically *inside* the upsert
-            // transaction: when a gate is active, admit_debounced_start rolls the
-            // upsert back (so no row is ever committed) and returns Ok(None). This
-            // closes the race where a post-commit cleanup could delete a row a
-            // concurrent admission had already accepted, and a gated burst update is
-            // rolled back without losing the prior committed row.
+            // Gate already enforced before the connection was acquired (above), so
+            // pass gate_active = false here: the upsert always proceeds. `Ok(None)`
+            // (the gate-rollback signal) is therefore unreachable on this path.
             match autumn_harvest::debounce::admit_debounced_start(
                 &mut debounce_conn,
                 admit_params,
-                gate_block.is_some(),
+                false,
             )
             .await
             {
                 Ok(None) => {
-                    // Rolled back by the active gate — reject with the gate details.
-                    let (gate_id, reason, scope_kind) =
-                        gate_block.expect("gate_block is Some when admission is gated");
-                    let reason_label = match reason.char_indices().nth(64) {
-                        Some((idx, _)) => &reason[..idx],
-                        None => &reason,
-                    };
-                    runtime
-                        .registry
-                        .telemetry()
-                        .metrics
-                        .record_admission_blocked(scope_kind, reason_label);
-                    // Parity with the normal gate-rejection path: record a failed
-                    // workflow.start audit row so debounce-shard gate denials are not
-                    // invisible in harvest_audit_log. Written on the debounce conn.
-                    let ar = NewAuditRecord {
-                        actor: &actor,
-                        operation: OP_WORKFLOW_START,
-                        target_type: TARGET_WORKFLOW,
-                        target_id: Some(workflow_name.as_str()),
-                        route_or_command: route,
-                        request_id: request_id.as_deref(),
-                        idempotency_key: None,
-                        status: STATUS_FAILED,
-                        error_summary: Some("admission blocked by gate"),
-                        shard_id: Some(debounce_shard.as_i32()),
-                        source: &source,
-                    };
-                    let _ = audit::insert_audit(&mut debounce_conn, &ar).await;
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(serde_json::json!({
-                            "error": "admission blocked",
-                            "gate_id": gate_id,
-                            "reason": reason,
-                        })),
+                    // Defensive: gate_active was false, so admit cannot roll back for a
+                    // gate. Treat an unexpected None as an internal error rather than
+                    // silently dropping the request.
+                    return AutumnError::internal_server_error_msg(
+                        "debounce admission returned no record unexpectedly",
                     )
-                        .into_response();
+                    .into_response();
                 }
                 Ok(Some(outcome)) => {
                     runtime
