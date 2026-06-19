@@ -5892,19 +5892,19 @@ async fn start_workflow(
         // workflow_id that is already active. This guard only runs when a
         // debounce policy exists and the key resolves, so it does not add a
         // DB query to every workflow start.
-        // `terminate_if_running` is excluded from this bypass: that policy asks
-        // for the new request to *replace* any live run, but for a debounced
-        // workflow the replacement must still settle through the quiet window —
-        // otherwise every retrigger in a burst would terminate+restart a run
-        // immediately, defeating debounce for exactly the replacement policy. So
-        // only the non-terminating policies (AllowDuplicate / RejectDuplicate /
-        // AllowDuplicateFailedOnly) bypass debounce when a live execution exists,
-        // where the normal start path is the correct idempotent answer (return
-        // the live run, or 409). terminate_if_running falls through to debounce
-        // admission and the eventual fired run applies the replacement.
-        let reuse_is_terminating = matches!(
+        // Only the *non-replacing* reuse policies may bypass debounce on an
+        // observed-live execution: under AllowDuplicate the normal start returns
+        // the existing run and under RejectDuplicate it returns 409 — neither can
+        // create a fresh run, so the bypass is the correct idempotent answer.
+        // AllowDuplicateFailedOnly (replaces a just-failed prior) and
+        // terminate_if_running (replaces a running prior) are excluded: a live→
+        // terminal race between this unlocked probe and the normal start's lock
+        // could otherwise turn the bypass into a fresh start that skips the
+        // debounce window. Those policies fall through to debounce admission, and
+        // the fired run applies the replacement after the quiet window (issue #499).
+        let reuse_can_bypass = matches!(
             request.reuse_policy.as_deref(),
-            Some("terminate_if_running")
+            None | Some("allow_duplicate" | "reject_duplicate")
         );
         // A generated workflow_id (caller omitted one) is a fresh UUID that
         // cannot collide with an existing execution, so the live-execution probe
@@ -5912,7 +5912,7 @@ async fn start_workflow(
         // shard for it would let an unrelated outage on that shard fail an
         // otherwise-valid debounced start whose record lives on the (healthy)
         // debounce-key shard. Only probe when the caller supplied the id.
-        let debounce_skip_for_live_execution = !reuse_is_terminating && explicit_workflow_id && {
+        let debounce_skip_for_live_execution = reuse_can_bypass && explicit_workflow_id && {
             let mut id_check_conn = match db_conn_for_shard(&api_state, shard).await {
                 Ok(c) => c,
                 Err(e) => return e.into_response(),
