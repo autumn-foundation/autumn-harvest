@@ -572,8 +572,7 @@ pub async fn start_or_load_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
 ) -> HarvestResult<StartedWorkflowExecution> {
-    let (result, deferred_starts) =
-        start_or_load_workflow_execution_collect(conn, request).await?;
+    let (result, deferred_starts) = start_or_load_workflow_execution_collect(conn, request).await?;
     for start in deferred_starts {
         start.spawn();
     }

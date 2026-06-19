@@ -473,8 +473,16 @@ pub async fn fire_due_debounced_starts(
     // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
     // Deferred trigger-starts are collected and spawned *after* the transaction
     // commits so a rollback can't leave orphaned completion-trigger workflows.
-    let fired: Vec<(String, String, Vec<crate::completion_trigger::DeferredTriggerStart>)> = conn
-        .transaction::<Vec<(String, String, Vec<crate::completion_trigger::DeferredTriggerStart>)>, crate::error::HarvestError, _>(|conn| {
+    let fired: Vec<(
+        String,
+        String,
+        Vec<crate::completion_trigger::DeferredTriggerStart>,
+    )> = conn
+        .transaction::<Vec<(
+            String,
+            String,
+            Vec<crate::completion_trigger::DeferredTriggerStart>,
+        )>, crate::error::HarvestError, _>(|conn| {
             Box::pin(async move {
                 let now = Utc::now();
                 let due_sql = "
@@ -545,7 +553,11 @@ async fn fire_claimed_debounce_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueRow,
 ) -> crate::error::HarvestResult<
-    Option<(String, String, Vec<crate::completion_trigger::DeferredTriggerStart>)>,
+    Option<(
+        String,
+        String,
+        Vec<crate::completion_trigger::DeferredTriggerStart>,
+    )>,
 > {
     let opts: DebounceStartOptions = serde_json::from_value(row.start_options).unwrap_or_default();
 
