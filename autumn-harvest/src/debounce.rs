@@ -461,10 +461,19 @@ struct FireDueRow {
 /// # Errors
 /// Returns `HarvestError` if the database query or any execution start fails.
 #[cfg(feature = "db")]
-pub async fn fire_due_debounced_starts(
+type FiredDebounce = (
+    String,
+    String,
+    Vec<crate::completion_trigger::DeferredTriggerStart>,
+);
+
+/// Scan and fire due debounce rows on a single shard connection. Returns the
+/// fired records (`workflow_name`, `queue_name`, deferred trigger-starts) for the
+/// caller to spawn + record metrics after all shards are processed.
+#[cfg(feature = "db")]
+async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
-    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
-) -> crate::error::HarvestResult<usize> {
+) -> crate::error::HarvestResult<Vec<FiredDebounce>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
     // Tolerate a missing `harvest_debounce` table (mixed-schema test fixtures
@@ -483,23 +492,15 @@ pub async fn fire_due_debounced_starts(
             .await
             .map_err(crate::error::database_error)?;
     if !exists.present {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     // Claim + fire + delete the whole due batch in one transaction so the
     // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
     // Deferred trigger-starts are collected and spawned *after* the transaction
     // commits so a rollback can't leave orphaned completion-trigger workflows.
-    let fired: Vec<(
-        String,
-        String,
-        Vec<crate::completion_trigger::DeferredTriggerStart>,
-    )> = conn
-        .transaction::<Vec<(
-            String,
-            String,
-            Vec<crate::completion_trigger::DeferredTriggerStart>,
-        )>, crate::error::HarvestError, _>(|conn| {
+    let fired: Vec<FiredDebounce> = conn
+        .transaction::<Vec<FiredDebounce>, crate::error::HarvestError, _>(|conn| {
             Box::pin(async move {
                 let now = Utc::now();
                 let due_sql = "
@@ -530,8 +531,65 @@ pub async fn fire_due_debounced_starts(
         })
         .await?;
 
-    let fired_count = fired.len();
-    for (workflow_name, queue_name, deferred_starts) in fired {
+    Ok(fired)
+}
+
+/// Fire all due debounced starts across every assigned shard.
+///
+/// Spawns deferred trigger-starts and records the `debounce_fired` metric after
+/// each shard's claim transaction commits, and returns the number of executions
+/// started.
+///
+/// **Sharding:** `harvest_debounce` rows are stored on the *debounce-key* shard
+/// (`start_workflow` routes them there), so a single-connection scan would never
+/// fire rows on non-default shards. This iterates `shard_assignments` against
+/// `sharded_pool` (mirroring the per-shard model the outbox scanners use). When
+/// no sharded pool is configured (single-shard deployments), it scans the passed
+/// default `conn`, which is the only shard.
+///
+/// Called from [`crate::timeout::enforce_timeouts_once`] on the existing
+/// `spawn_timeout_checker` poll interval — no new background task is spawned.
+///
+/// # Errors
+/// Returns `HarvestError` if a database query or any execution start fails.
+#[cfg(feature = "db")]
+pub async fn fire_due_debounced_starts(
+    conn: &mut diesel_async::AsyncPgConnection,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+) -> crate::error::HarvestResult<usize> {
+    let mut fired_all: Vec<FiredDebounce> = Vec::new();
+
+    match sharded_pool {
+        // Multi-shard: scan each assigned shard's own harvest_debounce table.
+        Some(sp) if !shard_assignments.is_empty() => {
+            for shard in shard_assignments {
+                let Some(pool) = sp.exact_pool_for(*shard).cloned() else {
+                    continue;
+                };
+                let mut shard_conn = match pool.get().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(
+                            "[debounce] failed to get connection to shard {shard:?}: {e:?}"
+                        );
+                        continue;
+                    }
+                };
+                let mut fired = fire_due_on_conn(&mut shard_conn).await?;
+                fired_all.append(&mut fired);
+            }
+        }
+        // Single-shard / no sharded pool: the passed connection is the only shard.
+        _ => {
+            let mut fired = fire_due_on_conn(conn).await?;
+            fired_all.append(&mut fired);
+        }
+    }
+
+    let fired_count = fired_all.len();
+    for (workflow_name, queue_name, deferred_starts) in fired_all {
         for start in deferred_starts {
             start.spawn();
         }

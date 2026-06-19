@@ -276,7 +276,7 @@ async fn burst_collapse_k_upserts_produce_one_row_and_one_execution() {
     // Wait for the window to definitely elapse, then fire
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     let metrics = no_op_metrics();
-    let fired = fire_due_debounced_starts(&mut conn, &metrics)
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
         .await
         .expect("fire");
     assert_eq!(fired, 1);
@@ -341,7 +341,7 @@ async fn trailing_edge_extends_deadline_and_scanner_respects_it() {
     );
 
     // Scanner called before the extended deadline should fire nothing
-    let fired_early = fire_due_debounced_starts(&mut conn, &metrics)
+    let fired_early = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
         .await
         .expect("early fire");
     assert_eq!(
@@ -351,7 +351,7 @@ async fn trailing_edge_extends_deadline_and_scanner_respects_it() {
 
     // Wait for the full window to elapse after the second admission
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    let fired_late = fire_due_debounced_starts(&mut conn, &metrics)
+    let fired_late = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
         .await
         .expect("late fire");
     assert_eq!(
@@ -412,7 +412,7 @@ async fn last_input_wins() {
     // Fire and verify the execution was created with that input
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     let metrics = no_op_metrics();
-    let fired = fire_due_debounced_starts(&mut conn, &metrics)
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
         .await
         .expect("fire");
     assert_eq!(fired, 1);
@@ -486,7 +486,7 @@ async fn independent_keys_produce_independent_executions() {
     // Fire both
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     let metrics = no_op_metrics();
-    let fired = fire_due_debounced_starts(&mut conn, &metrics)
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
         .await
         .expect("fire");
     assert_eq!(fired, 2, "two keys → two executions fired");
@@ -579,7 +579,7 @@ async fn max_wait_cap_prevents_endless_deferral() {
     // After the cap elapses the scanner fires
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     let metrics = no_op_metrics();
-    let fired = fire_due_debounced_starts(&mut conn, &metrics)
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
         .await
         .expect("fire");
     assert_eq!(fired, 1, "scanner must fire after max_wait elapses");
@@ -747,7 +747,7 @@ async fn thousand_upserts_produce_exactly_one_execution() {
 
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     let metrics = no_op_metrics();
-    let fired = fire_due_debounced_starts(&mut conn, &metrics)
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
         .await
         .expect("fire");
     assert_eq!(fired, 1);
@@ -776,7 +776,7 @@ async fn fire_emits_debounce_fired_metric() {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     let metrics = RecordingMetrics::default();
-    let fired = fire_due_debounced_starts(&mut conn, &metrics)
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
         .await
         .expect("fire");
     assert_eq!(fired, 1);

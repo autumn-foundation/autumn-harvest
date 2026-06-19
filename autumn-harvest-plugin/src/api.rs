@@ -6489,8 +6489,26 @@ async fn batch_start_workflows(
                 "workflow '{}' is a registered DAG; use POST /dags/{{name}}/trigger",
                 item.workflow_name
             ))
+        } else if item.workflow_id.is_none()
+            && workflow_has_resolving_debounce(
+                &runtime.registry,
+                &item.workflow_name,
+                item.input.as_ref().unwrap_or(&Value::Null),
+            )
+        {
+            // A debounced item with no explicit workflow_id is *definitely* a fresh
+            // start (a generated id can't collide), which batch cannot debounce-admit.
+            // Reject it in pre-validation so an atomic batch aborts before any earlier
+            // item is started + committed (Codex 6929). A debounced item *with* a
+            // workflow_id may attach to an existing run, so it is resolved per-item
+            // below (reject_fresh_if_debounced rejects only the fresh case).
+            Some(format!(
+                "workflow '{0}' has a debounce policy and no workflow_id; a fresh \
+                 debounced start must use POST /workflows/{0}/start",
+                item.workflow_name
+            ))
         } else {
-            // Debounce for a debounced item is NOT rejected here: an idempotent
+            // Debounce for an explicit-id item is NOT rejected here: an idempotent
             // retry (existing workflow_id) must still return the existing run.
             // The per-item start below passes reject_fresh_if_debounced so only a
             // *fresh* start is rejected, under the start's lock (issue #499).
