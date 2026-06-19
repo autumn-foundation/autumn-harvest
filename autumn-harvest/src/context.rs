@@ -1640,16 +1640,12 @@ impl WorkflowContext {
                 let output = serde_json::to_value(&result)?;
 
                 // Enforce side-effect payload cap before recording.
-                let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-                if observed > self.payload_max_side_effect {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::SideEffectValue,
-                        observed_bytes: observed,
-                        cap_bytes: self.payload_max_side_effect,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: None,
-                    });
-                }
+                self.check_payload_cap(
+                    &output,
+                    self.payload_max_side_effect,
+                    PayloadKind::SideEffectValue,
+                    None,
+                )?;
 
                 self.push_command(WorkflowCommand::RecordSideEffect {
                     kind: crate::event::SideEffectKind::Custom,
@@ -2139,16 +2135,12 @@ impl WorkflowContext {
                         .copied()
                         .map_or(global, |ov| global.max(ov))
                 };
-                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if effective_cap > 0 && observed > effective_cap {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::ActivityInput,
-                        observed_bytes: observed,
-                        cap_bytes: effective_cap,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: Some(name.to_string()),
-                    });
-                }
+                self.check_payload_cap(
+                    &input,
+                    effective_cap,
+                    PayloadKind::ActivityInput,
+                    Some(name.to_string()),
+                )?;
 
                 // Live execution: emit a ScheduleActivity command and suspend
                 // until the worker sends the result through the oneshot channel.
@@ -2263,16 +2255,12 @@ impl WorkflowContext {
                         .copied()
                         .map_or(global, |ov| global.max(ov))
                 };
-                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if effective_cap > 0 && observed > effective_cap {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::ActivityInput,
-                        observed_bytes: observed,
-                        cap_bytes: effective_cap,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: Some(name.to_string()),
-                    });
-                }
+                self.check_payload_cap(
+                    &input,
+                    effective_cap,
+                    PayloadKind::ActivityInput,
+                    Some(name.to_string()),
+                )?;
 
                 let activity_id = self.next_activity_id();
                 let (tx, rx) = oneshot::channel();
@@ -2448,16 +2436,12 @@ impl WorkflowContext {
                         .copied()
                         .map_or(global, |ov| global.max(ov))
                 };
-                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if effective_cap > 0 && observed > effective_cap {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::ActivityInput,
-                        observed_bytes: observed,
-                        cap_bytes: effective_cap,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: Some(name.to_string()),
-                    });
-                }
+                self.check_payload_cap(
+                    &input,
+                    effective_cap,
+                    PayloadKind::ActivityInput,
+                    Some(name.to_string()),
+                )?;
 
                 let activity_id = self.next_activity_id();
                 let (tx, rx) = oneshot::channel();
@@ -2657,17 +2641,12 @@ impl WorkflowContext {
                 ))?;
 
                 // Enforce child-workflow input payload cap before scheduling.
-                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
-                {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::ChildWorkflowInput,
-                        observed_bytes: observed,
-                        cap_bytes: self.payload_max_workflow_input,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: None,
-                    });
-                }
+                self.check_payload_cap(
+                    &input,
+                    self.payload_max_workflow_input,
+                    PayloadKind::ChildWorkflowInput,
+                    None,
+                )?;
 
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::StartChildWorkflow {
@@ -2753,17 +2732,12 @@ impl WorkflowContext {
                 ))?;
 
                 // Enforce child-workflow input payload cap before scheduling.
-                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
-                {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::ChildWorkflowInput,
-                        observed_bytes: observed,
-                        cap_bytes: self.payload_max_workflow_input,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: None,
-                    });
-                }
+                self.check_payload_cap(
+                    &input,
+                    self.payload_max_workflow_input,
+                    PayloadKind::ChildWorkflowInput,
+                    None,
+                )?;
 
                 let child_id = ExecutionId::new_for_shard(self.exec_id.shard());
                 self.push_command(WorkflowCommand::SpawnDetachedChildWorkflow {
@@ -3331,16 +3305,12 @@ impl WorkflowContext {
                     "ExternalSignalRequested(target={target}, signal={signal_name})"
                 ))?;
                 let payload_json = serde_json::to_value(&payload)?;
-                let observed = serde_json::to_string(&payload_json).map_or(0, |s| s.len() as u64);
-                if self.payload_max_signal > 0 && observed > self.payload_max_signal {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: crate::error::PayloadKind::SignalPayload,
-                        observed_bytes: observed,
-                        cap_bytes: self.payload_max_signal,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: None,
-                    });
-                }
+                self.check_payload_cap(
+                    &payload_json,
+                    self.payload_max_signal,
+                    PayloadKind::SignalPayload,
+                    None,
+                )?;
                 self.dispatch_signal_command(
                     target,
                     signal_name,
@@ -4103,17 +4073,12 @@ impl WorkflowContext {
             }
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match("ContinueAsNew")?;
-                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
-                {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: crate::error::PayloadKind::WorkflowInput,
-                        observed_bytes: observed,
-                        cap_bytes: self.payload_max_workflow_input,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: None,
-                    });
-                }
+                self.check_payload_cap(
+                    &input,
+                    self.payload_max_workflow_input,
+                    PayloadKind::WorkflowInput,
+                    None,
+                )?;
                 self.push_command(WorkflowCommand::ContinueAsNew { input });
                 park_until_dropped().await
             }
@@ -4615,6 +4580,26 @@ impl WorkflowContext {
         });
 
         result
+    }
+
+    fn check_payload_cap(
+        &self,
+        value: &serde_json::Value,
+        cap: u64,
+        kind: crate::error::PayloadKind,
+        activity_name: Option<String>,
+    ) -> HarvestResult<()> {
+        let observed = serde_json::to_string(value).map_or(0, |s| s.len() as u64);
+        if cap > 0 && observed > cap {
+            return Err(HarvestError::PayloadTooLarge {
+                kind,
+                observed_bytes: observed,
+                cap_bytes: cap,
+                workflow_type: self.workflow_name.clone(),
+                activity_name,
+            });
+        }
+        Ok(())
     }
 
     // ── Command drain ─────────────────────────────────────────────────
