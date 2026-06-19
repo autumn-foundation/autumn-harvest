@@ -713,6 +713,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         sla: opts.sla.or(info.sla).and_then(|d|
                             ::autumn_harvest::chrono::Duration::from_std(d).ok()
                         ),
+                        // Typed stubs already reject debounced workflows up front.
+                        reject_fresh_if_debounced: false,
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

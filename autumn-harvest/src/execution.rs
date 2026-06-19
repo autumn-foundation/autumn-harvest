@@ -241,9 +241,19 @@ impl CancelledWorkflowExecution {
 /// rollback reverts that cancellation. On success the follow-ups are always
 /// returned for the caller to spawn after its outer commit.
 ///
+/// `reject_fresh_if_debounced`, when `true`, makes the function return
+/// [`HarvestError::DebounceFreshStart`] (rolling the transaction back) if the
+/// reuse-policy decision under the `FOR UPDATE` lock would create a **fresh**
+/// execution (insert, or a `replace_execution` seal+insert). An attach /
+/// return-existing decision proceeds normally. This is the atomic gate the
+/// debounce-aware HTTP entry points use to allow attach/idempotent calls while
+/// routing or rejecting true fresh starts without a TOCTOU (issue #499).
+///
 /// # Errors
 ///
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
+/// - [`HarvestError::DebounceFreshStart`] when a fresh start is gated by
+///   `reject_fresh_if_debounced`.
 /// - [`HarvestError::Database`] for insert/query failures.
 /// - Propagates queue/event-store failures from the start transaction.
 #[allow(clippy::too_many_lines)]
@@ -251,6 +261,7 @@ pub async fn start_or_load_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
     in_outer_transaction: bool,
+    reject_fresh_if_debounced: bool,
 ) -> HarvestResult<(StartedWorkflowExecution, Vec<DeferredTriggerStart>)> {
     let exec_id = request.exec_id;
     let shard_id_value = request.shard_id();
@@ -321,6 +332,10 @@ pub async fn start_or_load_workflow_execution_collect(
     // deferred list so the caller spawns them only after its outer commit.
     let mut pre_check_deferred: Vec<DeferredTriggerStart> = Vec::new();
     if request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
+        // Skip the pre-check cancellation when we're going to reject this fresh
+        // start for a debounced workflow — otherwise we'd cancel the prior run
+        // (Transaction 1) and then reject, leaving it cancelled with no successor.
+        && !reject_fresh_if_debounced
         && let Some(existing) =
             try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
         && matches!(existing.state.as_str(), "RUNNING" | "PAUSED")
@@ -437,6 +452,16 @@ pub async fn start_or_load_workflow_execution_collect(
                         .map_err(database_error)?;
 
                     if let Some(execution) = inserted {
+                        // Atomic debounce gate: this INSERT is a fresh start. For a
+                        // debounced workflow that must go through debounce admission,
+                        // roll it back and signal the caller (no TOCTOU — decided here
+                        // under the inserted row, not via an unlocked pre-scan).
+                        if reject_fresh_if_debounced {
+                            return Err(HarvestError::DebounceFreshStart {
+                                workflow_name: request.workflow_name.to_string(),
+                                workflow_id: request.workflow_id.to_string(),
+                            });
+                        }
                         if request.start_at.is_some_and(|sa| sa < now) {
                             return Err(HarvestError::Config(
                                 "Requested start_at is in the past".to_string(),
@@ -514,6 +539,13 @@ pub async fn start_or_load_workflow_execution_collect(
                         WorkflowIdReusePolicy::AllowDuplicateFailedOnly => {
                             match existing.state.as_str() {
                                 "FAILED" | "CANCELLED" => {
+                                    // Replacing a terminal prior is a fresh start.
+                                    if reject_fresh_if_debounced {
+                                        return Err(HarvestError::DebounceFreshStart {
+                                            workflow_name: request.workflow_name.to_string(),
+                                            workflow_id: request.workflow_id.to_string(),
+                                        });
+                                    }
                                     // Only these two explicitly abnormal states start fresh.
                                     replace_execution(
                                         conn, existing, &row, &enqueue, exec_id, &request, now,
@@ -532,6 +564,15 @@ pub async fn start_or_load_workflow_execution_collect(
                         }
 
                         WorkflowIdReusePolicy::TerminateIfRunning => {
+                            // TerminateIfRunning always starts fresh (cancel + replace).
+                            // Gate it before cancelling anything so a debounced workflow
+                            // is routed to admission instead.
+                            if reject_fresh_if_debounced {
+                                return Err(HarvestError::DebounceFreshStart {
+                                    workflow_name: request.workflow_name.to_string(),
+                                    workflow_id: request.workflow_id.to_string(),
+                                });
+                            }
                             // The pre-check above cancelled any active prior execution
                             // (Transaction 1). By the time we reach this point the prior
                             // execution's state is CANCELLED, FAILED, COMPLETED, or —
@@ -621,7 +662,7 @@ pub async fn start_or_load_workflow_execution(
     // pre-check cancellation commits and the replacement start then fails, the
     // collect fn spawns the cancellation's follow-ups itself before returning Err.
     let (result, deferred_starts) =
-        start_or_load_workflow_execution_collect(conn, request, false).await?;
+        start_or_load_workflow_execution_collect(conn, request, false, false).await?;
     for start in deferred_starts {
         start.spawn();
     }
@@ -1782,6 +1823,12 @@ pub struct SignalWithStartParams<'a> {
     pub context_headers: Option<std::collections::HashMap<String, String>>,
     /// Soft SLA budget forwarded to [`StartWorkflowParams::sla`] (issue #487).
     pub sla: Option<chrono::Duration>,
+    /// When `true`, reject (with [`HarvestError::DebounceFreshStart`]) any call
+    /// that would create a **fresh** execution rather than attach to a live
+    /// (RUNNING/PAUSED) prior. Set by the HTTP handler for a debounced workflow
+    /// so an attach/idempotent call is preserved while a fresh start is rejected
+    /// — decided atomically under this call's lock (issue #499).
+    pub reject_fresh_if_debounced: bool,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -1982,6 +2029,10 @@ pub async fn signal_with_start_workflow_execution(
             // RUNNING here so a signal-with-start attaches to (and buffers the
             // signal for) the paused run instead of cancelling and replacing it.
             let started = if !matches!(started.state.as_str(), "RUNNING" | "PAUSED")
+                // For a debounced workflow, never escalate a terminal prior to a
+                // fresh start here — that fresh start must go through debounce
+                // admission. The reject check below catches the non-live outcome.
+                && !request.reject_fresh_if_debounced
                 && matches!(
                     request.reuse_policy,
                     WorkflowIdReusePolicy::AllowDuplicate
@@ -2005,6 +2056,20 @@ pub async fn signal_with_start_workflow_execution(
             } else {
                 started
             };
+
+            // Atomic debounce gate (issue #499): under this transaction's lock, a
+            // debounced workflow may only *attach* to a live (RUNNING/PAUSED) prior.
+            // Any other outcome — a fresh insert (`created`) or a non-live prior the
+            // signal can't land on — would be a fresh start, so reject it and let the
+            // caller route to debounce admission. Rolls back any fresh insert above.
+            if request.reject_fresh_if_debounced
+                && (started.created || !matches!(started.state.as_str(), "RUNNING" | "PAUSED"))
+            {
+                return Err(HarvestError::DebounceFreshStart {
+                    workflow_name: request.workflow_name.to_string(),
+                    workflow_id: request.workflow_id.to_string(),
+                });
+            }
 
             // Check signal payload cap here — after start/attach/AlreadyExists
             // resolution — so RejectDuplicate conflicts surface as 409 AlreadyExists
@@ -2250,6 +2315,12 @@ pub struct UpdateWithStartParams<'a> {
     pub context_headers: Option<std::collections::HashMap<String, String>>,
     /// Soft SLA budget forwarded to [`StartWorkflowParams::sla`] (issue #487).
     pub sla: Option<chrono::Duration>,
+    /// When `true`, reject (with [`HarvestError::DebounceFreshStart`]) any call
+    /// that would create a **fresh** execution rather than attach to a live
+    /// (RUNNING/PAUSED) prior. Set by the HTTP handler for a debounced workflow
+    /// so an attach/idempotent call is preserved while a fresh start is rejected
+    /// — decided atomically under this call's lock (issue #499).
+    pub reject_fresh_if_debounced: bool,
 }
 
 /// Result of an [`update_with_start_workflow_execution`] call.
@@ -2337,13 +2408,20 @@ pub async fn update_with_start_workflow_execution(
             // Upgrade AllowDuplicate / AllowDuplicateFailedOnly to TerminateIfRunning
             // when the prior run is terminal so the update always lands on a live
             // execution (mirrors the signal-with-start "no signal dropped" invariant).
-            let effective_policy = resolve_effective_signal_with_start_policy(
-                conn,
-                request.workflow_name,
-                request.workflow_id,
-                request.reuse_policy,
-            )
-            .await?;
+            // For a debounced workflow, skip the upgrade: we must not escalate a
+            // terminal prior to a fresh start here — the reject check below routes it
+            // to debounce admission instead.
+            let effective_policy = if request.reject_fresh_if_debounced {
+                request.reuse_policy
+            } else {
+                resolve_effective_signal_with_start_policy(
+                    conn,
+                    request.workflow_name,
+                    request.workflow_id,
+                    request.reuse_policy,
+                )
+                .await?
+            };
 
             let build_start_request =
                 |exec_id: ExecutionId, policy: WorkflowIdReusePolicy| StartWorkflowParams {
@@ -2397,6 +2475,9 @@ pub async fn update_with_start_workflow_execution(
             // defensive). PAUSED is a non-terminal active state; the update will be
             // rejected by admit_update_event below (WorkflowPaused), rolling back.
             let started = if !matches!(started.state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED")
+                // Debounced workflow: never escalate a terminal prior to a fresh
+                // start here — route it to debounce admission via the check below.
+                && !request.reject_fresh_if_debounced
                 && matches!(
                     request.reuse_policy,
                     WorkflowIdReusePolicy::AllowDuplicate
@@ -2420,6 +2501,20 @@ pub async fn update_with_start_workflow_execution(
             } else {
                 started
             };
+
+            // Atomic debounce gate (issue #499): a debounced workflow may only
+            // *attach* to a live (RUNNING/SUSPENDED/PAUSED) prior. A fresh insert
+            // (`created`) or a non-live prior would be a fresh start — reject and let
+            // the caller route to debounce admission. Rolls back any fresh insert.
+            if request.reject_fresh_if_debounced
+                && (started.created
+                    || !matches!(started.state.as_str(), "RUNNING" | "SUSPENDED" | "PAUSED"))
+            {
+                return Err(HarvestError::DebounceFreshStart {
+                    workflow_name: request.workflow_name.to_string(),
+                    workflow_id: request.workflow_id.to_string(),
+                });
+            }
 
             // Post-lock idempotency re-check: two concurrent calls with the same
             // idempotency_key may both pass the early dedupe query (which runs before

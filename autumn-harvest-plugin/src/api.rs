@@ -6459,18 +6459,11 @@ async fn batch_start_workflows(
                 "workflow '{}' is a registered DAG; use POST /dags/{{name}}/trigger",
                 item.workflow_name
             ))
-        } else if workflow_has_resolving_debounce(
-            &runtime.registry,
-            &item.workflow_name,
-            item.input.as_ref().unwrap_or(&Value::Null),
-        ) {
-            // Debounce admission is owned by POST /workflows/{name}/start; batch
-            // start has no quiet-window collapse path (issue #499).
-            Some(format!(
-                "workflow '{0}' has a debounce policy; use POST /workflows/{0}/start (batch_start does not support debounce)",
-                item.workflow_name
-            ))
         } else {
+            // Debounce for a debounced item is NOT rejected here: an idempotent
+            // retry (existing workflow_id) must still return the existing run.
+            // The per-item start below passes reject_fresh_if_debounced so only a
+            // *fresh* start is rejected, under the start's lock (issue #499).
             None
         };
         if let Some(reason) = err {
@@ -6897,7 +6890,14 @@ async fn batch_start_workflows(
                 });
             let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
-            let start_result = start_or_load_workflow_execution(
+            // Debounced item: AllowDuplicate returns an existing run unchanged
+            // (idempotent retry — allowed), but a *fresh* start must go through
+            // debounce admission. reject_fresh_if_debounced makes the start path
+            // reject the fresh case under its lock; we map that to a per-item
+            // rejection below (issue #499).
+            let item_reject_fresh =
+                workflow_has_resolving_debounce(&runtime.registry, &item.workflow_name, &input);
+            let start_result = autumn_harvest::execution::start_or_load_workflow_execution_collect(
                 &mut conn,
                 StartWorkflowParams {
                     workflow_name: &item.workflow_name,
@@ -6927,8 +6927,16 @@ async fn batch_start_workflows(
                     schedule_id: None,
                     scheduled_for: None,
                 },
+                false,
+                item_reject_fresh,
             )
-            .await;
+            .await
+            .map(|(started, deferred)| {
+                for start in deferred {
+                    start.spawn();
+                }
+                started
+            });
 
             match start_result {
                 Ok(started) => {
@@ -7235,16 +7243,12 @@ async fn signal_with_start_workflow(
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
     // Debounce admission is owned by POST /workflows/{name}/start; an atomic
-    // start+signal cannot be deferred through the trailing-edge gate (the signal
-    // would have nowhere to land). Reject debounced workflows here rather than
-    // bypassing the quiet-window collapse (issue #499).
-    if workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &start_input) {
-        return AutumnError::bad_request_msg(format!(
-            "workflow '{workflow_name}' has a debounce policy; debounced starts must use \
-             POST /workflows/{workflow_name}/start (signal-with-start does not support debounce)"
-        ))
-        .into_response();
-    }
+    // start+signal cannot be deferred through the trailing-edge gate. Rather than
+    // rejecting up front (which would block legitimate *attach* calls to a live
+    // run), we ask the core primitive to reject only a **fresh start** under its
+    // lock, so an attach/idempotent signal-with-start still succeeds (issue #499).
+    let reject_fresh_if_debounced =
+        workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &start_input);
 
     // Issue #252: resolve cap values. Both caps are enforced inside
     // signal_with_start_workflow_execution — after idempotency dedupe and
@@ -7507,9 +7511,19 @@ async fn signal_with_start_workflow(
             severity,
             context_headers: None,
             sla,
+            reject_fresh_if_debounced,
         },
     )
     .await;
+
+    if let Err(HarvestError::DebounceFreshStart { .. }) = &result {
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' has a debounce policy; a fresh start must use \
+             POST /workflows/{workflow_name}/start (signal-with-start can only attach a \
+             signal to an existing run for a debounced workflow)"
+        ))
+        .into_response();
+    }
 
     match result {
         Err(HarvestError::AlreadyExists {
@@ -7736,16 +7750,11 @@ async fn update_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let update_args = request.update_args.unwrap_or(Value::Null);
 
-    // Debounce admission is owned by POST /workflows/{name}/start; an atomic
-    // start+update cannot be deferred through the trailing-edge gate. Reject
-    // debounced workflows here rather than bypassing the collapse (issue #499).
-    if workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &start_input) {
-        return AutumnError::bad_request_msg(format!(
-            "workflow '{workflow_name}' has a debounce policy; debounced starts must use \
-             POST /workflows/{workflow_name}/start (update-with-start does not support debounce)"
-        ))
-        .into_response();
-    }
+    // Debounce admission is owned by POST /workflows/{name}/start. Ask the core
+    // primitive to reject only a *fresh start* under its lock so an attach /
+    // idempotent update-with-start to a live run still succeeds (issue #499).
+    let reject_fresh_if_debounced =
+        workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &start_input);
 
     let effective_wf_cap = runtime
         .registry
@@ -8009,9 +8018,19 @@ async fn update_with_start_workflow(
         severity,
         context_headers: None,
         sla,
+        reject_fresh_if_debounced,
     };
 
     let result = update_with_start_workflow_execution(&mut conn, params).await;
+
+    if let Err(HarvestError::DebounceFreshStart { .. }) = &result {
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' has a debounce policy; a fresh start must use \
+             POST /workflows/{workflow_name}/start (update-with-start can only attach an \
+             update to an existing run for a debounced workflow)"
+        ))
+        .into_response();
+    }
 
     match result {
         Err(HarvestError::AlreadyExists {

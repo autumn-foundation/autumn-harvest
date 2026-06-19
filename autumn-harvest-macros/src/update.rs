@@ -337,6 +337,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             sla: opts.sla.or_else(|| Self::info().sla).and_then(|d|
                                 ::autumn_harvest::chrono::Duration::from_std(d).ok()
                             ),
+                            // Typed stubs already reject debounced workflows up front.
+                            reject_fresh_if_debounced: false,
                         };
                         let _ = client;
                         ::autumn_harvest::update_with_start_workflow_execution(conn, params).await
@@ -484,6 +486,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 sla: opts.sla.or_else(|| Self::info().sla).and_then(|d|
                                     ::autumn_harvest::chrono::Duration::from_std(d).ok()
                                 ),
+                                // Typed stubs already reject debounced workflows up front.
+                                reject_fresh_if_debounced: false,
                             };
                             let _ = client;
                             ::autumn_harvest::update_with_start_workflow_execution(conn, params).await

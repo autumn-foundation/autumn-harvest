@@ -134,6 +134,7 @@ fn params<'a>(
         context_headers: None,
 
         sla: None,
+        reject_fresh_if_debounced: false,
     }
 }
 

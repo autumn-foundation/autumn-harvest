@@ -157,6 +157,7 @@ async fn add_item_atomic(
             context_headers: None,
 
             sla: None,
+            reject_fresh_if_debounced: false,
         },
     )
     .await?;
