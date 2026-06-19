@@ -5879,67 +5879,66 @@ async fn start_workflow(
         // scheduled start (`start_at`/`delay`) is contradictory — the requested
         // timing would be silently dropped at fire time. Reject the combination.
         if request.start_at.is_some() || delay.is_some() {
+            // Failed-start audit (parity with the normal delayed-start validation).
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut c) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("debounce cannot be combined with start_at or delay"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut c, &ar).await;
+            }
             return AutumnError::bad_request_msg(
                 "debounce cannot be combined with start_at or delay",
             )
             .into_response();
         }
 
-        // Idempotency guard: if a live execution already exists for this
-        // workflow_id, fall through to the normal start path so AllowDuplicate
-        // returns the existing run and RejectDuplicate returns 409 — rather
-        // than deferring into the debounce queue and returning 202 for a
-        // workflow_id that is already active. This guard only runs when a
-        // debounce policy exists and the key resolves, so it does not add a
-        // DB query to every workflow start.
-        // Only the *non-replacing* reuse policies may bypass debounce on an
-        // observed-live execution: under AllowDuplicate the normal start returns
-        // the existing run and under RejectDuplicate it returns 409 — neither can
-        // create a fresh run, so the bypass is the correct idempotent answer.
-        // AllowDuplicateFailedOnly (replaces a just-failed prior) and
-        // terminate_if_running (replaces a running prior) are excluded: a live→
-        // terminal race between this unlocked probe and the normal start's lock
-        // could otherwise turn the bypass into a fresh start that skips the
-        // debounce window. Those policies fall through to debounce admission, and
-        // the fired run applies the replacement after the quiet window (issue #499).
-        let reuse_can_bypass = matches!(
-            request.reuse_policy.as_deref(),
-            None | Some("allow_duplicate" | "reject_duplicate")
-        );
-        // A generated workflow_id (caller omitted one) is a fresh UUID that
-        // cannot collide with an existing execution, so the live-execution probe
-        // is pointless — and opening a connection to the workflow_id-derived
-        // shard for it would let an unrelated outage on that shard fail an
-        // otherwise-valid debounced start whose record lives on the (healthy)
-        // debounce-key shard. Only probe when the caller supplied the id.
-        let debounce_skip_for_live_execution = reuse_can_bypass && explicit_workflow_id && {
-            let mut id_check_conn = match db_conn_for_shard(&api_state, shard).await {
-                Ok(c) => c,
-                Err(e) => return e.into_response(),
-            };
-            match autumn_harvest::execution::try_load_by_key(
-                &mut id_check_conn,
-                &workflow_name,
-                &workflow_id,
-            )
-            .await
-            {
-                Ok(Some(ex)) => matches!(ex.state.as_str(), "RUNNING" | "PAUSED" | "SUSPENDED"),
-                Ok(None) => false,
-                // Fail closed: a transient probe failure must not be folded into
-                // "no live execution" and silently deferred into the debounce queue
-                // (a phantom 202 instead of the normal idempotent/conflict answer).
-                Err(e) => return map_error(e).into_response(),
-            }
-        };
-
-        if !debounce_skip_for_live_execution {
+        // No pre-admission idempotency bypass for debounced starts: a debounced
+        // start always goes through admission and returns 202. Reuse-policy
+        // idempotency is resolved correctly at *fire time* on the debounce-key
+        // shard — the scanner calls start_or_load with the stored workflow_id and
+        // applies the policy (AllowDuplicate returns the existing run; an
+        // AlreadyExists conflict under RejectDuplicate deletes the pending row). A
+        // pre-admission probe was both shard-wrong (debounced runs live on the
+        // debounce-key shard, not the workflow-id shard — Codex 5916) and
+        // state-incomplete (Codex 5927), so it is omitted (issue #499).
+        {
             // Reject an oversized input at admission (mirrors the cap the core start
             // path enforces) so it fails fast with 400 here instead of being
             // persisted and then failing on every scanner tick at fire time.
             if effective_wf_cap > 0 {
                 let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
                 if observed > effective_wf_cap {
+                    // Failed-start audit (parity with the normal start path).
+                    if let Ok(pool) = api_state.storage_pool()
+                        && let Ok(mut c) = acquire_conn(pool.default_pool()).await
+                    {
+                        let ar = NewAuditRecord {
+                            actor: &actor,
+                            operation: OP_WORKFLOW_START,
+                            target_type: TARGET_WORKFLOW,
+                            target_id: Some(workflow_name.as_str()),
+                            route_or_command: route,
+                            request_id: request_id.as_deref(),
+                            idempotency_key: None,
+                            status: STATUS_FAILED,
+                            error_summary: Some("workflow input exceeds cap"),
+                            shard_id: None,
+                            source: &source,
+                        };
+                        let _ = audit::insert_audit(&mut c, &ar).await;
+                    }
                     return AutumnError::bad_request_msg(format!(
                         "workflow input ({observed} bytes) exceeds cap ({effective_wf_cap} bytes)",
                     ))
@@ -6167,7 +6166,7 @@ async fn start_workflow(
                 }
                 Err(e) => return map_error(e).into_response(),
             }
-        } // end if !debounce_skip_for_live_execution
+        } // end debounce admission block
     }
     // Key resolved to None, no policy, or live execution exists — fall through to the normal start path.
 
