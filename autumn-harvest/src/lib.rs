@@ -70,6 +70,8 @@ pub mod dag_linter;
 pub mod dag_profiler;
 #[cfg(any(test, feature = "testing"))]
 pub mod dag_simulator;
+#[cfg(feature = "testing")]
+pub mod dag_trace;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;
@@ -212,6 +214,8 @@ pub use dag_linter::{
 pub use dag_profiler::{DagProfile, DagProfiler, ProfilerEvent, ProfilerEventKind};
 #[cfg(any(test, feature = "testing"))]
 pub use dag_simulator::{DagSimulator, DagSimulatorResult};
+#[cfg(feature = "testing")]
+pub use dag_trace::export_trace_json;
 pub use det_check::{
     DetCheckReport, DetFinding, DetLocation, DetSeverity, DetSuppression, check_dir, check_file,
     check_source,
