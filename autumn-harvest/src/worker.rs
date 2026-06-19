@@ -3950,6 +3950,7 @@ async fn process_activity_task(
     task: &TaskQueueItem,
     worker_id: &str,
     cancellation_grace_period: Duration,
+    dispatched_at: std::time::Instant,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
@@ -4082,7 +4083,11 @@ async fn process_activity_task(
     // the local concurrency permit in `dispatch_task` is still captured.
     registry.telemetry().metrics.record_schedule_to_start(
         &task.queue_name,
-        queue::schedule_to_start_secs(task.scheduled_at, task.created_at, chrono::Utc::now()),
+        queue::schedule_to_start_secs(
+            task.scheduled_at,
+            task.created_at,
+            task.started_at.unwrap_or(task.scheduled_at),
+        ) + dispatched_at.elapsed().as_secs_f64(),
     );
 
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
@@ -5508,6 +5513,7 @@ async fn process_workflow_task(
     sticky_timeout: Duration,
     max_local_activity_start_to_close: Duration,
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    dispatched_at: std::time::Instant,
 ) -> HarvestResult<()> {
     let mut prepared =
         prepare_workflow_task_with_cache(conn, task, worker_id, &workflow_cache, sticky_timeout)
@@ -5604,7 +5610,11 @@ async fn process_workflow_task(
     // did in fact run.
     telemetry.metrics.record_schedule_to_start(
         &task.queue_name,
-        queue::schedule_to_start_secs(task.scheduled_at, task.created_at, chrono::Utc::now()),
+        queue::schedule_to_start_secs(
+            task.scheduled_at,
+            task.created_at,
+            task.started_at.unwrap_or(task.scheduled_at),
+        ) + dispatched_at.elapsed().as_secs_f64(),
     );
 
     let started_at = std::time::Instant::now();
@@ -6474,6 +6484,7 @@ async fn process_task(
     sticky_timeout: Duration,
     max_local_activity_start_to_close: Duration,
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    dispatched_at: std::time::Instant,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -6488,6 +6499,7 @@ async fn process_task(
                 sticky_timeout,
                 max_local_activity_start_to_close,
                 workflow_cache,
+                dispatched_at,
             )
             .await
         }
@@ -6503,6 +6515,7 @@ async fn process_task(
                 &task,
                 worker_id,
                 cancellation_grace_period,
+                dispatched_at,
             )
             .await
         }
@@ -6513,9 +6526,12 @@ async fn process_task(
 /// configured [`MetricsRecorder`](crate::telemetry::MetricsRecorder).
 ///
 /// The sampler skips work entirely when the recorder is the default no-op
-/// implementation, so unconfigured deployments pay no DB cost. It queries a
-/// single `GROUP BY queue_name` aggregate per tick — cheap enough to run at
-/// the same cadence as the poll interval.
+/// implementation (`is_enabled() == false`), so unconfigured deployments pay no
+/// DB cost. This matters because the per-tick queries are not free: `queue_depths`
+/// is a `GROUP BY` aggregate and `oldest_pending_ages` scans eligible pending rows
+/// with correlated concurrency / rate-limit checks. Both feed gauges that are
+/// discarded by the no-op recorder, so issuing them would be pure waste (issue #501
+/// review).
 ///
 /// Stops when the cancellation token fires. Queues with zero pending rows are
 /// also reported (as depth 0) so gauges reset cleanly after drains.
@@ -6528,6 +6544,11 @@ fn spawn_queue_depth_sampler(
     circuit_breaker_activities: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // No recorder configured: never issue the sampler SQL. The per-event
+        // `record_*` calls are zero-cost, but these gauge-feeding queries are not.
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -7659,6 +7680,14 @@ impl Worker {
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
 
+        // Monotonic instant captured the moment this worker received the claimed
+        // task, before acquiring the local concurrency permit. The schedule-to-start
+        // sample combines the DB-clock queue wait (claim time − eligibility, both
+        // Postgres timestamps) with this host-monotonic local wait
+        // (`dispatched_at.elapsed()` = permit wait + setup), so a host/Postgres
+        // clock skew never leaks into the sample (issue #501 review).
+        let dispatched_at = std::time::Instant::now();
+
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
             let Ok(permit) = semaphore.acquire().await else {
@@ -7672,8 +7701,7 @@ impl Worker {
             // claimed-then-paused re-park). Recording it here, before those gates,
             // would count a rate-limit deferral as a started task and depress the
             // p99 capacity SLI during throttling (issue #501). The sample still
-            // captures the local-permit wait above because `schedule_to_start_secs`
-            // measures from task eligibility, not from this `acquire()`.
+            // captures the local-permit wait above via `dispatched_at`.
 
             tracing::info!(
                 task_id = %task_id,
@@ -7697,6 +7725,7 @@ impl Worker {
                         sticky_timeout,
                         max_local_activity_start_to_close,
                         workflow_cache,
+                        dispatched_at,
                     ),
                 )
                 .await
@@ -7831,6 +7860,7 @@ impl Worker {
                     sticky_timeout,
                     max_local_activity_start_to_close,
                     workflow_cache,
+                    dispatched_at,
                 )
                 .await
                 {

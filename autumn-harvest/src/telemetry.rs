@@ -1111,13 +1111,29 @@ pub trait MetricsRecorder: Send + Sync {
     fn record_external_cancel_sent(&self, outcome: &str, reason_code: Option<&str>) {
         let _ = (outcome, reason_code);
     }
+
+    /// Whether this recorder actually forwards samples anywhere.
+    ///
+    /// Defaults to `true` for every real recorder. [`NoOpMetrics`] overrides it to
+    /// `false` so callers can skip *expensive sample-production work* (e.g. the
+    /// per-poll-interval `oldest_pending_ages` / `queue_depths` sampler SQL) when
+    /// no recorder is configured — the per-event `record_*` calls are already
+    /// zero-cost, but the queries that feed gauges are not. Treat this as a hint
+    /// for guarding observation work, never for changing engine behavior.
+    fn is_enabled(&self) -> bool {
+        true
+    }
 }
 
 /// Default metrics recorder that discards every sample.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoOpMetrics;
 
-impl MetricsRecorder for NoOpMetrics {}
+impl MetricsRecorder for NoOpMetrics {
+    fn is_enabled(&self) -> bool {
+        false
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Telemetry bundle

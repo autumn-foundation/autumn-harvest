@@ -36,8 +36,9 @@ const IMMEDIATE_SCHEDULE_SKEW_SECS: i32 = 5;
 const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
     Duration::seconds(IMMEDIATE_SCHEDULE_SKEW_SECS as i64);
 
-/// Compute schedule-to-start latency in seconds for a task: wall-clock from the
-/// task's *true* eligibility to `start`, clamped to `0`.
+/// Compute the **DB-clock** portion of schedule-to-start latency in seconds: the
+/// wait from a task's *true* eligibility to when it was claimed (`claimed_at`),
+/// clamped to `0`.
 ///
 /// True eligibility is `GREATEST(scheduled_at, created_at)`:
 ///
@@ -55,14 +56,21 @@ const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
 ///
 /// `created_at` is `None` only for rows enqueued before the column was added; those
 /// fall back to `scheduled_at` (best available) until they drain.
+///
+/// **Clock discipline:** `claimed_at` must be a **Postgres** timestamp (e.g. the
+/// task's `started_at`, stamped by `claim_task`), so this whole expression is
+/// computed in one clock and a host/Postgres skew cannot leak in. The worker then
+/// adds the host-**monotonic** local wait (permit acquisition + setup, measured
+/// with `Instant::elapsed`) to this value — never `Utc::now()`, which would mix the
+/// host wall clock with the Postgres eligibility timestamps (issue #501 review).
 #[must_use]
 pub fn schedule_to_start_secs(
     scheduled_at: DateTime<Utc>,
     created_at: Option<DateTime<Utc>>,
-    start: DateTime<Utc>,
+    claimed_at: DateTime<Utc>,
 ) -> f64 {
     let eligible = created_at.map_or(scheduled_at, |c| scheduled_at.max(c));
-    (start - eligible)
+    (claimed_at - eligible)
         .max(Duration::zero())
         .to_std()
         .unwrap_or_default()
@@ -1394,6 +1402,15 @@ pub async fn wake_workflow_task(
     // Use raw SQL so we can refresh `sticky_until` from the row's own
     // `sticky_timeout` column atomically in a single UPDATE. Doing this in
     // two trips (SELECT then UPDATE) would race with other wake paths.
+    //
+    // `created_at` is refreshed to `clock_timestamp()` (the wake instant): this
+    // re-pends an *old* parked workflow task with a freshly backdated
+    // `scheduled_at` (= now - skew), so without refreshing `created_at` the
+    // schedule-to-start eligibility floor `GREATEST(scheduled_at, created_at)`
+    // would pick the backdated wake timestamp (the stale insert-time `created_at`
+    // is older) and report ~skew seconds of phantom latency for an immediately
+    // claimed follow-up task (issue #501 review). The wake instant is this cycle's
+    // true eligibility, so an immediately-served wake correctly reports ~0.
     let queue_names: Vec<String> = {
         use diesel::deserialize::QueryableByName;
         use diesel::sql_types::Text;
@@ -1410,6 +1427,7 @@ pub async fn wake_workflow_task(
                  worker_id = NULL, \
                  started_at = NULL, \
                  scheduled_at = $2, \
+                 created_at = clock_timestamp(), \
                  activity_name = NULL, \
                  sticky_until = CASE \
                      WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \

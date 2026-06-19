@@ -8,8 +8,12 @@
 -- explicit time for a delayed/retried one.
 --
 -- Added nullable with NO default first (instant, no table rewrite / ACCESS
--- EXCLUSIVE lock on a hot queue), then SET DEFAULT NOW() so only future inserts
--- are stamped. Pre-upgrade PENDING rows keep created_at = NULL and the SLI falls
--- back to scheduled_at via COALESCE until they drain.
+-- EXCLUSIVE lock on a hot queue), then SET DEFAULT clock_timestamp() so only
+-- future inserts are stamped. clock_timestamp() (not NOW()/transaction_timestamp())
+-- is the actual statement-execution wall clock, so a task inserted late inside a
+-- large workflow-persistence transaction is stamped at its real insert time rather
+-- than the transaction's start — avoiding inflated schedule-to-start / oldest-age
+-- readings. Pre-upgrade PENDING rows keep created_at = NULL and the SLI falls back
+-- to scheduled_at via COALESCE until they drain.
 ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
-ALTER TABLE harvest_task_queue ALTER COLUMN created_at SET DEFAULT NOW();
+ALTER TABLE harvest_task_queue ALTER COLUMN created_at SET DEFAULT clock_timestamp();
