@@ -2316,9 +2316,17 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
 // Issue #501: schedule-to-start latency + oldest-pending-age metrics
 // ---------------------------------------------------------------------------
 
+fn sts_test_workflow<'a>(
+    _ctx: &'a autumn_harvest::WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::Value::Null) })
+}
+
 /// Verifies that `harvest.queue.schedule_to_start` is emitted when a worker
 /// claims and completes a task, labeled by `queue`, with a non-negative value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn schedule_to_start_histogram_emitted_at_claim_time() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = AsyncPgConnection::establish(&database_url)
@@ -2387,14 +2395,6 @@ async fn schedule_to_start_histogram_emitted_at_claim_time() {
             .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
             .build(),
     );
-
-    fn sts_test_workflow<'a>(
-        _ctx: &'a autumn_harvest::WorkflowContext,
-        _input: serde_json::Value,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>
-    {
-        Box::pin(async move { Ok(serde_json::Value::Null) })
-    }
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
