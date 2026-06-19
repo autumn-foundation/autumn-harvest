@@ -166,6 +166,10 @@ pub struct DebounceStartOptions {
     /// start can't bypass the size limit the normal path enforces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_workflow_input_bytes: Option<u64>,
+    /// W3C trace context captured at admission time, restored at fire time so
+    /// debounced runs carry parent trace linkage (ADR-0001 §3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_context: Option<crate::telemetry::TraceContextCarrier>,
 }
 
 /// Parameters for [`admit_debounced_start`].
@@ -241,8 +245,6 @@ pub async fn admit_debounced_start(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitDebounceParams<'_>,
 ) -> crate::error::HarvestResult<DebounceAdmitOutcome> {
-    use diesel_async::RunQueryDsl;
-
     #[derive(diesel::QueryableByName)]
     struct UpsertRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -255,6 +257,17 @@ pub async fn admit_debounced_start(
         pending_count: i32,
         #[diesel(sql_type = diesel::sql_types::Bool)]
         is_new_record: bool,
+    }
+
+    use diesel_async::RunQueryDsl;
+
+    if params.debounce_key.len() > DEBOUNCE_KEY_MAX_BYTES {
+        return Err(crate::error::HarvestError::Config(format!(
+            "debounce key length {} bytes exceeds maximum {} bytes; \
+             use a shorter key_expr or hash the value before using it as a key",
+            params.debounce_key.len(),
+            DEBOUNCE_KEY_MAX_BYTES
+        )));
     }
 
     let now = Utc::now();
@@ -359,13 +372,21 @@ pub async fn has_pending_debounce(
         .bind::<diesel::sql_types::Text, _>(debounce_key)
         .get_result::<ExistsRow>(conn)
         .await
-        .map(|r| r.exists)
-        .unwrap_or(false)
+        .is_ok_and(|r| r.exists)
 }
 
 /// Maximum number of debounce rows fired per scanner tick.
 /// Prevents a single shard from being overwhelmed if many keys come due simultaneously.
 pub const DEBOUNCE_FIRE_BATCH_SIZE: i64 = 100;
+
+/// Maximum allowed byte length for a debounce key.
+///
+/// Keys that exceed this limit are rejected at admission time with
+/// [`crate::error::HarvestError::Config`] rather than being persisted and
+/// subsequently failing with a Postgres constraint violation (VARCHAR index
+/// limit). Embedders with long natural keys should hash or truncate them before
+/// use.
+pub const DEBOUNCE_KEY_MAX_BYTES: usize = 2048;
 
 /// Internal row type returned by the debounce fire query.
 #[cfg(feature = "db")]
@@ -392,16 +413,29 @@ struct FireDueRow {
 /// Fire all pending debounce records whose `effective_fire_at` has elapsed.
 ///
 /// The claim (`SELECT ... FOR UPDATE SKIP LOCKED`), the
-/// `start_or_load_workflow_execution` call, and the row `DELETE` all run inside
-/// **one** transaction so the row lock is held from claim through delete. This
-/// is essential: a `FOR UPDATE` lock taken in autocommit mode is released the
-/// instant the `SELECT` completes, which would let a concurrent worker fire the
-/// same key twice and let a concurrent `admit_debounced_start` overwrite the
+/// `start_or_load_workflow_execution_collect` call, and the row `DELETE` all run
+/// inside **one** transaction so the row lock is held from claim through delete.
+/// This is essential: a `FOR UPDATE` lock taken in autocommit mode is released
+/// the instant the `SELECT` completes, which would let a concurrent worker fire
+/// the same key twice and let a concurrent `admit_debounced_start` overwrite the
 /// row (extending the deadline / updating `last_input`) only to have the
 /// scanner fire a stale snapshot and delete the updated row — breaking the
 /// trailing-edge / last-input-wins guarantees. Holding the lock makes a
 /// concurrent upsert block until this transaction commits, after which the row
 /// is gone and the new trigger starts a fresh debounce cycle.
+///
+/// Deferred completion-trigger starts (from `start_or_load_workflow_execution_collect`)
+/// are spawned **after** the outer transaction commits so a rollback on a later
+/// row can never leave orphaned completion-trigger workflows started for a start
+/// that did not become durable.
+///
+/// # Note: scanner gate limitation
+///
+/// The scanner fires via the core start path (`start_or_load_workflow_execution_collect`)
+/// and has no access to plugin-level admission gates set after debounce admission.
+/// Gates are evaluated at HTTP admission time; any gate changes between admission
+/// and fire are not checked. This is a documented limitation of shard-local debounce
+/// (consistent with #247).
 ///
 /// Called from [`crate::timeout::enforce_timeouts_once`] on the existing
 /// `spawn_timeout_checker` poll interval — no new background task is spawned.
@@ -437,8 +471,10 @@ pub async fn fire_due_debounced_starts(
 
     // Claim + fire + delete the whole due batch in one transaction so the
     // `FOR UPDATE SKIP LOCKED` locks are held until each row is deleted.
-    let fired: Vec<(String, String)> = conn
-        .transaction::<Vec<(String, String)>, crate::error::HarvestError, _>(|conn| {
+    // Deferred trigger-starts are collected and spawned *after* the transaction
+    // commits so a rollback can't leave orphaned completion-trigger workflows.
+    let fired: Vec<(String, String, Vec<crate::completion_trigger::DeferredTriggerStart>)> = conn
+        .transaction::<Vec<(String, String, Vec<crate::completion_trigger::DeferredTriggerStart>)>, crate::error::HarvestError, _>(|conn| {
             Box::pin(async move {
                 let now = Utc::now();
                 let due_sql = "
@@ -460,8 +496,8 @@ pub async fn fire_due_debounced_starts(
 
                 let mut results = Vec::with_capacity(due_rows.len());
                 for row in due_rows {
-                    if let Some(fired) = fire_claimed_debounce_row(conn, row).await? {
-                        results.push(fired);
+                    if let Some(item) = fire_claimed_debounce_row(conn, row).await? {
+                        results.push(item);
                     }
                 }
                 Ok(results)
@@ -469,11 +505,15 @@ pub async fn fire_due_debounced_starts(
         })
         .await?;
 
-    for (workflow_name, queue_name) in &fired {
-        metrics.record_debounce_fired(workflow_name, queue_name);
+    let fired_count = fired.len();
+    for (workflow_name, queue_name, deferred_starts) in fired {
+        for start in deferred_starts {
+            start.spawn();
+        }
+        metrics.record_debounce_fired(&workflow_name, &queue_name);
     }
 
-    Ok(fired.len())
+    Ok(fired_count)
 }
 
 /// Delete a single pending debounce row by id.
@@ -495,15 +535,18 @@ async fn delete_debounce_row(
 /// delete the record. Must run inside the caller's transaction so the row lock
 /// taken by the claim `SELECT ... FOR UPDATE` is held through the delete.
 ///
-/// Returns `Some((workflow_name, queue_name))` when a run was started (so the
-/// caller can record the metric after commit), or `None` when the start was a
+/// Returns `Some((workflow_name, queue_name, deferred_starts))` when a run was
+/// started (so the caller can spawn deferred trigger-starts and record the
+/// metric after the outer transaction commits), or `None` when the start was a
 /// no-op (e.g. `AlreadyExists` under a reject/duplicate reuse policy — the row
 /// is deleted so the scanner does not retry the doomed start forever).
 #[cfg(feature = "db")]
 async fn fire_claimed_debounce_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueRow,
-) -> crate::error::HarvestResult<Option<(String, String)>> {
+) -> crate::error::HarvestResult<
+    Option<(String, String, Vec<crate::completion_trigger::DeferredTriggerStart>)>,
+> {
     let opts: DebounceStartOptions = serde_json::from_value(row.start_options).unwrap_or_default();
 
     let shard = crate::types::ShardId::new(row.shard_id);
@@ -547,7 +590,7 @@ async fn fire_claimed_debounce_row(
         memo: opts.memo,
         search_attrs: opts.search_attrs,
         reuse_policy,
-        trace_context: None,
+        trace_context: opts.trace_context,
         max_execution_timeout_ceiling,
         concurrency_key: opts.concurrency_key,
         concurrency_limit: opts.concurrency_limit,
@@ -565,8 +608,8 @@ async fn fire_claimed_debounce_row(
         scheduled_for: None,
     };
 
-    match crate::execution::start_or_load_workflow_execution(conn, params).await {
-        Ok(started) => {
+    match crate::execution::start_or_load_workflow_execution_collect(conn, params).await {
+        Ok((started, deferred_starts)) => {
             delete_debounce_row(conn, row_id).await?;
             tracing::info!(
                 workflow_name = %workflow_name,
@@ -575,7 +618,7 @@ async fn fire_claimed_debounce_row(
                 queue = %queue_name,
                 "debounced start fired",
             );
-            Ok(Some((started.workflow_name, queue_name)))
+            Ok(Some((started.workflow_name, queue_name, deferred_starts)))
         }
         // The target workflow_id is already taken under the reuse policy, so the
         // debounce intent can't produce a new run. Drop the record so the

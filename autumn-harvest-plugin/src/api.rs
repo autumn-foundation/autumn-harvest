@@ -5806,6 +5806,10 @@ async fn start_workflow(
             (key, Some(policy.limit))
         });
 
+    // Capture trace context for debounced starts — must be before the debounce
+    // branch returns 202 since the normal path captures it inside a later OTel span.
+    let debounce_trace_ctx = runtime.registry.telemetry().capture_trace_context();
+
     // Debounce admission gate (issue #499): collapse trigger bursts into one run.
     // Check the WorkflowInfo debounce policy. If a policy applies and the key
     // resolves, upsert a pending-debounce record and return 202 Accepted.
@@ -5829,6 +5833,30 @@ async fn start_workflow(
             .into_response();
         }
 
+        // Idempotency guard: if a live execution already exists for this
+        // workflow_id, fall through to the normal start path so AllowDuplicate
+        // returns the existing run and RejectDuplicate returns 409 — rather
+        // than deferring into the debounce queue and returning 202 for a
+        // workflow_id that is already active. This guard only runs when a
+        // debounce policy exists and the key resolves, so it does not add a
+        // DB query to every workflow start.
+        let debounce_skip_for_live_execution = {
+            let mut id_check_conn = match db_conn_for_shard(&api_state, shard).await {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+            matches!(
+                autumn_harvest::execution::try_load_by_key(
+                    &mut id_check_conn,
+                    &workflow_name,
+                    &workflow_id,
+                )
+                .await,
+                Ok(Some(ref ex)) if matches!(ex.state.as_str(), "RUNNING" | "PAUSED" | "SUSPENDED")
+            )
+        };
+
+        if !debounce_skip_for_live_execution {
         // Reject an oversized input at admission (mirrors the cap the core start
         // path enforces) so it fails fast with 400 here instead of being
         // persisted and then failing on every scanner tick at fire time.
@@ -5977,6 +6005,7 @@ async fn start_workflow(
                 severity: info_severity.map(str::to_string),
                 max_execution_timeout_ceiling_secs: effective_ceiling_secs,
                 max_workflow_input_bytes: Some(effective_wf_cap),
+                trace_context: debounce_trace_ctx,
             },
         };
 
@@ -6022,8 +6051,9 @@ async fn start_workflow(
             }
             Err(e) => return map_error(e).into_response(),
         }
+        } // end if !debounce_skip_for_live_execution
     }
-    // Key resolved to None or no policy — fall through to the normal start path unchanged.
+    // Key resolved to None, no policy, or live execution exists — fall through to the normal start path.
 
     // shard computed above (before gate check); reuse it here.
     let exec_id = ExecutionId::new_for_shard(shard);

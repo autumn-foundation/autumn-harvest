@@ -210,9 +210,16 @@ impl CancelledWorkflowExecution {
     }
 }
 
-/// Start a workflow execution or load the existing one, applying the caller's
-/// [`WorkflowIdReusePolicy`] when a duplicate `(workflow_name, workflow_id)`
-/// collision occurs.
+/// Start a workflow execution or load the existing one, returning both the result
+/// and any deferred completion-trigger starts **without spawning them**.
+///
+/// This is the low-level primitive for callers that run the start inside a
+/// larger outer transaction: the `DeferredTriggerStart`s must only be spawned
+/// *after* that outer transaction commits, otherwise trigger workflows could
+/// start for a start that later rolls back (issue #499 debounce scanner).
+///
+/// The plain [`start_or_load_workflow_execution`] wrapper spawns them itself for
+/// the common standalone case.
 ///
 /// ## Policy behaviour
 ///
@@ -224,21 +231,16 @@ impl CancelledWorkflowExecution {
 /// | FAILED | return existing | `Err(AlreadyExists)` | start fresh | start fresh |
 /// | CANCELLED | return existing | `Err(AlreadyExists)` | start fresh | start fresh |
 ///
-/// For `TerminateIfRunning` + RUNNING the cancel is performed in a separate
-/// transaction (Transaction 1) before the start transaction (Transaction 2). A
-/// failure between the two leaves the prior workflow CANCELLED with no new run
-/// started; the caller can retry with the same policy to get a fresh run.
-///
 /// # Errors
 ///
 /// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
 /// - [`HarvestError::Database`] for insert/query failures.
 /// - Propagates queue/event-store failures from the start transaction.
 #[allow(clippy::too_many_lines)]
-pub async fn start_or_load_workflow_execution(
+pub async fn start_or_load_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     request: StartWorkflowParams<'_>,
-) -> HarvestResult<StartedWorkflowExecution> {
+) -> HarvestResult<(StartedWorkflowExecution, Vec<DeferredTriggerStart>)> {
     let exec_id = request.exec_id;
     let shard_id_value = request.shard_id();
 
@@ -536,11 +538,46 @@ pub async fn start_or_load_workflow_execution(
         )
         .await?;
 
+    Ok((cancel_result, deferred_starts))
+}
+
+/// Start a workflow execution or load the existing one, applying the caller's
+/// [`WorkflowIdReusePolicy`] when a duplicate `(workflow_name, workflow_id)`
+/// collision occurs.
+///
+/// Thin wrapper around [`start_or_load_workflow_execution_collect`] that spawns
+/// any deferred completion-trigger starts before returning.
+///
+/// ## Policy behaviour
+///
+/// | Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
+/// |-------------|------------------|-------------------|---------------------------|----------------------|
+/// | none | create | create | create | create |
+/// | RUNNING | return existing | `Err(AlreadyExists)` | return existing | cancel + start fresh |
+/// | COMPLETED | return existing | `Err(AlreadyExists)` | return existing | start fresh |
+/// | FAILED | return existing | `Err(AlreadyExists)` | start fresh | start fresh |
+/// | CANCELLED | return existing | `Err(AlreadyExists)` | start fresh | start fresh |
+///
+/// For `TerminateIfRunning` + RUNNING the cancel is performed in a separate
+/// transaction (Transaction 1) before the start transaction (Transaction 2). A
+/// failure between the two leaves the prior workflow CANCELLED with no new run
+/// started; the caller can retry with the same policy to get a fresh run.
+///
+/// # Errors
+///
+/// - [`HarvestError::AlreadyExists`] when `RejectDuplicate` rejects.
+/// - [`HarvestError::Database`] for insert/query failures.
+/// - Propagates queue/event-store failures from the start transaction.
+pub async fn start_or_load_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+) -> HarvestResult<StartedWorkflowExecution> {
+    let (result, deferred_starts) =
+        start_or_load_workflow_execution_collect(conn, request).await?;
     for start in deferred_starts {
         start.spawn();
     }
-
-    Ok(cancel_result)
+    Ok(result)
 }
 
 /// Transition `existing` to `CONTINUED_AS_NEW` (releasing the partial unique
@@ -1631,7 +1668,7 @@ pub async fn terminate_workflow_execution(
 
 /// Non-locking lookup used for the `TerminateIfRunning` pre-check outside any
 /// transaction. Returns `None` if no active execution exists.
-async fn try_load_by_key(
+pub async fn try_load_by_key(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
     workflow_id: &str,

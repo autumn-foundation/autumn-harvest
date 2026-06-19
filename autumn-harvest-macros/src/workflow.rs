@@ -567,6 +567,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     max_workflow_input_bytes: ::std::option::Option::Some(
                                         client.max_workflow_input_bytes(info.max_input_bytes)
                                     ),
+                                    trace_context: opts.trace_context.clone(),
                                 },
                             };
                             let outcome = ::autumn_harvest::debounce::admit_debounced_start(
