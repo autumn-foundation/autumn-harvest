@@ -5854,7 +5854,13 @@ async fn start_workflow(
             request.reuse_policy.as_deref(),
             Some("terminate_if_running")
         );
-        let debounce_skip_for_live_execution = !reuse_is_terminating && {
+        // A generated workflow_id (caller omitted one) is a fresh UUID that
+        // cannot collide with an existing execution, so the live-execution probe
+        // is pointless — and opening a connection to the workflow_id-derived
+        // shard for it would let an unrelated outage on that shard fail an
+        // otherwise-valid debounced start whose record lives on the (healthy)
+        // debounce-key shard. Only probe when the caller supplied the id.
+        let debounce_skip_for_live_execution = !reuse_is_terminating && explicit_workflow_id && {
             let mut id_check_conn = match db_conn_for_shard(&api_state, shard).await {
                 Ok(c) => c,
                 Err(e) => return e.into_response(),
@@ -5947,49 +5953,28 @@ async fn start_workflow(
             // Re-run the admission-gate check against the debounce key's shard: the
             // earlier gate check used the workflow_id-derived shard, but a debounced
             // run lands on debounce_shard, so a shard-scoped gate there must apply.
-            // Bypass: if a pending debounce record already exists for this key, this
-            // request extends the deadline/count of an already-tracked row — it adds
-            // no new execution load, so the gate should not block it.
-            {
+            // Bypass: a request that merely extends an already-tracked pending row
+            // (a burst update) adds no new execution load and must not be blocked.
+            //
+            // The bypass decision is made *after* the upsert from its atomic
+            // `is_new_record` flag rather than from a pre-upsert existence probe:
+            // a concurrent scanner deleting-then-committing the row between a probe
+            // and the upsert could otherwise let a brand-new admission slip past an
+            // active gate. So here we only capture whether a gate is active; the
+            // enforcement happens below once the upsert tells us if the row is new.
+            let gate_block = {
                 let wf_owner = runtime
                     .registry
                     .workflows
                     .get(&workflow_name)
                     .and_then(|i| i.owner);
-                if let Some((gate_id, reason, scope_kind)) = api_state.gate_cache().check(
+                api_state.gate_cache().check(
                     &workflow_name,
                     &queue_name,
                     debounce_shard.as_i32(),
                     wf_owner,
-                ) {
-                    let is_burst_update = autumn_harvest::debounce::has_pending_debounce(
-                        &mut debounce_conn,
-                        &workflow_name,
-                        &resolved_key,
-                    )
-                    .await;
-                    if !is_burst_update {
-                        let reason_label = match reason.char_indices().nth(64) {
-                            Some((idx, _)) => &reason[..idx],
-                            None => &reason,
-                        };
-                        runtime
-                            .registry
-                            .telemetry()
-                            .metrics
-                            .record_admission_blocked(scope_kind, reason_label);
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            Json(serde_json::json!({
-                                "error": "admission blocked",
-                                "gate_id": gate_id,
-                                "reason": reason,
-                            })),
-                        )
-                            .into_response();
-                    }
-                }
-            }
+                )
+            };
 
             let effective_max_wait = debounce_policy
                 .max_wait
@@ -6027,6 +6012,46 @@ async fn start_workflow(
                 .await
             {
                 Ok(outcome) => {
+                    // Enforce the gate now that the atomic upsert has told us whether
+                    // this admission created a brand-new pending row. A burst update
+                    // (is_new_record == false) extends an already-tracked row and is
+                    // always allowed; a fresh row under an active gate is new load
+                    // that should have been blocked, so roll it back and reject.
+                    if let Some((gate_id, reason, scope_kind)) = gate_block
+                        && outcome.is_new_record
+                    {
+                        if let Err(del_err) = autumn_harvest::debounce::delete_pending_debounce(
+                            &mut debounce_conn,
+                            &workflow_name,
+                            &resolved_key,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                error = %del_err,
+                                "failed to roll back gated debounce admission"
+                            );
+                        }
+                        let reason_label = match reason.char_indices().nth(64) {
+                            Some((idx, _)) => &reason[..idx],
+                            None => &reason,
+                        };
+                        runtime
+                            .registry
+                            .telemetry()
+                            .metrics
+                            .record_admission_blocked(scope_kind, reason_label);
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "admission blocked",
+                                "gate_id": gate_id,
+                                "reason": reason,
+                            })),
+                        )
+                            .into_response();
+                    }
+
                     runtime
                         .registry
                         .telemetry()
@@ -6049,7 +6074,19 @@ async fn start_workflow(
                         shard_id: Some(debounce_shard.as_i32()),
                         source: &source,
                     };
-                    let _ = audit::insert_audit(&mut debounce_conn, &ar).await;
+                    // Parity with the normal start path: a successful admission must
+                    // have a succeeded audit record, so a failed audit write makes the
+                    // admission non-successful (503) rather than silently returning 202.
+                    if let Err(audit_err) = audit::insert_audit(&mut debounce_conn, &ar).await {
+                        tracing::error!(
+                            error = %audit_err,
+                            "audit insert failed for debounced workflow.start"
+                        );
+                        return AutumnError::service_unavailable_msg(format!(
+                            "audit insert failed: {audit_err}"
+                        ))
+                        .into_response();
+                    }
                     return (
                         axum::http::StatusCode::ACCEPTED,
                         Json(serde_json::json!({

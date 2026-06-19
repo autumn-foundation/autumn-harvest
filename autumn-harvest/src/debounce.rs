@@ -340,39 +340,33 @@ pub async fn admit_debounced_start(
     })
 }
 
-/// Return `true` when a pending debounce record exists for the given key.
+/// Delete a pending debounce record by its collapse key.
 ///
-/// Used by the admission gate bypass: when a burst update arrives for a key
-/// that already has a pending record, it is updating deadline/count on an
-/// existing tracked row rather than creating new execution load, so an
-/// active rate-limit gate should be bypassed.
+/// Used to roll back a brand-new admission that an active admission gate should
+/// have blocked: the gate decision is made post-upsert from the atomic
+/// `is_new_record` flag (avoiding the TOCTOU of a pre-upsert existence probe),
+/// so when a gate is active and the upsert created a fresh row, that row is
+/// removed here and the request is rejected.
 ///
-/// Returns `false` on any DB error (fail-open: let the upsert decide).
+/// # Errors
+/// Returns `HarvestError` if the delete fails.
 #[cfg(feature = "db")]
-pub async fn has_pending_debounce(
+pub async fn delete_pending_debounce(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_name: &str,
     debounce_key: &str,
-) -> bool {
+) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
-    #[derive(diesel::QueryableByName)]
-    struct ExistsRow {
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        exists: bool,
-    }
-
-    let sql = "SELECT EXISTS(
-        SELECT 1 FROM harvest_debounce
-        WHERE workflow_name = $1 AND debounce_key = $2
-    ) AS exists";
-
-    diesel::sql_query(sql)
-        .bind::<diesel::sql_types::Text, _>(workflow_name)
-        .bind::<diesel::sql_types::Text, _>(debounce_key)
-        .get_result::<ExistsRow>(conn)
-        .await
-        .is_ok_and(|r| r.exists)
+    diesel::sql_query(
+        "DELETE FROM harvest_debounce WHERE workflow_name = $1 AND debounce_key = $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(workflow_name)
+    .bind::<diesel::sql_types::Text, _>(debounce_key)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
 }
 
 /// Maximum number of debounce rows fired per scanner tick.
