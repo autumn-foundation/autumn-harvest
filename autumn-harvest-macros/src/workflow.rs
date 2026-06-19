@@ -9,6 +9,52 @@ use syn::{ItemFn, LitStr, parse::Parser as _};
 
 use crate::parse_byte_size_macro;
 
+/// Compile-time check that a duration literal is parseable by the runtime
+/// `::autumn_harvest::task_duration` helper (`<digits><s|m|h|d>` runs, non-zero).
+///
+/// Mirrors `autumn_harvest::task_duration`'s accepted format so an invalid
+/// `#[workflow(debounce(window = ..., max_wait = ...))]` literal is rejected as a
+/// build error rather than panicking at registration via the emitted `.expect`.
+/// Kept intentionally permissive/identical to the runtime parser; the runtime
+/// `.expect` remains as a defensive backstop.
+fn is_valid_task_duration(s: &str) -> bool {
+    let mut total_secs = 0u64;
+    let mut current_num = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            if current_num == "0" {
+                current_num.clear();
+            }
+            if current_num.len() > 20 {
+                return false;
+            }
+            current_num.push(ch);
+        } else if ch.is_ascii_alphabetic() {
+            let Ok(num) = current_num.parse::<u64>() else {
+                return false;
+            };
+            current_num.clear();
+            let mult = match ch {
+                's' => 1,
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86400,
+                _ => return false,
+            };
+            match num
+                .checked_mul(mult)
+                .and_then(|v| total_secs.checked_add(v))
+            {
+                Some(v) => total_secs = v,
+                None => return false,
+            }
+        } else if ch != ' ' {
+            return false;
+        }
+    }
+    current_num.is_empty() && total_secs != 0
+}
+
 // ---------------------------------------------------------------------------
 // Attribute parsing
 // ---------------------------------------------------------------------------
@@ -114,10 +160,24 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     Ok(())
                 } else if inner.path.is_ident("window") {
                     let value: LitStr = inner.value()?.parse()?;
+                    // Validate at compile time so a typo is a build error, not a
+                    // registration-time panic from the emitted `.expect(...)`.
+                    if !is_valid_task_duration(&value.value()) {
+                        return Err(syn::Error::new_spanned(
+                            &value,
+                            "invalid debounce `window` duration; expected e.g. \"30s\", \"5m\", \"1h\", \"2d\"",
+                        ));
+                    }
                     window = Some(value.value());
                     Ok(())
                 } else if inner.path.is_ident("max_wait") {
                     let value: LitStr = inner.value()?.parse()?;
+                    if !is_valid_task_duration(&value.value()) {
+                        return Err(syn::Error::new_spanned(
+                            &value,
+                            "invalid debounce `max_wait` duration; expected e.g. \"30s\", \"5m\", \"1h\", \"2d\"",
+                        ));
+                    }
                     max_wait = Some(value.value());
                     Ok(())
                 } else {
@@ -731,4 +791,32 @@ fn to_pascal_case(s: &str) -> String {
 
 fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
     crate::extract_ok_type(output)
+}
+
+#[cfg(test)]
+mod duration_validation_tests {
+    use super::is_valid_task_duration;
+
+    #[test]
+    fn accepts_valid_durations() {
+        for s in ["30s", "5m", "1h", "2d", "1h30m", "90s", "0s5s"] {
+            assert!(is_valid_task_duration(s), "should accept '{s}'");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_durations() {
+        // empty, zero, unknown unit, missing unit, trailing digits, garbage.
+        for s in [
+            "", "0s", "0", "5minutes", "5", "30", "abc", "5x", "-5s", "5s ",
+        ] {
+            // note: "5s " has a trailing space which task_duration tolerates, so
+            // exclude it from the reject set below by testing it separately.
+            if s == "5s " {
+                assert!(is_valid_task_duration(s), "trailing space is tolerated");
+                continue;
+            }
+            assert!(!is_valid_task_duration(s), "should reject '{s}'");
+        }
+    }
 }
