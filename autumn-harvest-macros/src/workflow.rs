@@ -629,6 +629,28 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let workflow_id = workflow_id.into();
                     let input = #serialize_args;
                     let info = #public_info_name();
+                    // Issue #499: debounce admission is owned exclusively by the HTTP
+                    // start route (see `start_with_options` for the rationale). A
+                    // debounced workflow must not be started — or signal-with-started —
+                    // through the typed client, which cannot route to the debounce-key
+                    // shard or admit through the gate. Reject with a pointer to HTTP.
+                    if let ::std::option::Option::Some(debounce_policy) = info.debounce {
+                        if ::autumn_harvest::debounce::resolve_debounce_key(
+                            debounce_policy.key_expr,
+                            &input,
+                        )
+                        .is_some()
+                        {
+                            return ::std::result::Result::Err(
+                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                    "workflow '{0}' has a debounce policy; debounced starts \
+                                     must use the HTTP start route POST /workflows/{0}/start \
+                                     (the typed client cannot express a deferred debounced start)",
+                                    info.name,
+                                )),
+                            );
+                        }
+                    }
                     let exec_id = opts.exec_id.unwrap_or_else(|| {
                         let shard = client.pick_shard_for_new_workflow(info.name, &workflow_id);
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)

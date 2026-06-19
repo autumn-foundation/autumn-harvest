@@ -292,6 +292,15 @@ pub async fn start_or_load_workflow_execution_collect(
     // crash between the two leaves the prior workflow CANCELLED with no new run;
     // retrying with the same policy starts fresh on the next attempt because the
     // CANCELLED row is treated as "start fresh" by TerminateIfRunning.
+    // Deferred follow-up starts produced by the TerminateIfRunning pre-check's
+    // cancellation (the prior run's completion-trigger / parent-close cascade).
+    // Collected here via the no-spawn cancel variant rather than spawned inline:
+    // this collect function may itself run inside a caller's transaction (e.g. the
+    // debounce scanner's fire transaction), where the spawning wrapper
+    // `cancel_workflow_execution` would launch follow-ups that a later rollback of
+    // that outer transaction could orphan. They are appended to the returned
+    // deferred list so the caller spawns them only after its outer commit.
+    let mut pre_check_deferred: Vec<DeferredTriggerStart> = Vec::new();
     if request.reuse_policy == WorkflowIdReusePolicy::TerminateIfRunning
         && let Some(existing) =
             try_load_by_key(conn, request.workflow_name, request.workflow_id).await?
@@ -301,15 +310,15 @@ pub async fn start_or_load_workflow_execution_collect(
         // Ignore Config errors: the execution may have transitioned to a terminal
         // state between the pre-check and the cancel lock. In that race the prior
         // run is already done, so we just continue to the start transaction below.
-        match cancel_workflow_execution(
+        match cancel_workflow_execution_collect(
             conn,
             existing_exec_id,
             "terminated to start new execution",
-            &crate::telemetry::NoOpMetrics,
         )
         .await
         {
-            Ok(_) | Err(HarvestError::Config(_)) => {}
+            Ok((_, mut deferred)) => pre_check_deferred.append(&mut deferred),
+            Err(HarvestError::Config(_)) => {}
             Err(e) => return Err(e),
         }
     }
@@ -390,7 +399,7 @@ pub async fn start_or_load_workflow_execution_collect(
         enqueue.scheduled_at = target_start_time;
     }
 
-    let (cancel_result, deferred_starts) = conn
+    let (cancel_result, mut deferred_starts) = conn
         .transaction::<(StartedWorkflowExecution, Vec<DeferredTriggerStart>), HarvestError, _>(
             |conn| {
                 let row = row;
@@ -538,7 +547,10 @@ pub async fn start_or_load_workflow_execution_collect(
         )
         .await?;
 
-    Ok((cancel_result, deferred_starts))
+    // Spawn order: the pre-check cancellation's follow-ups first, then the start's
+    // own deferred follow-ups — all after the outer commit (the caller spawns).
+    pre_check_deferred.append(&mut deferred_starts);
+    Ok((cancel_result, pre_check_deferred))
 }
 
 /// Start a workflow execution or load the existing one, applying the caller's

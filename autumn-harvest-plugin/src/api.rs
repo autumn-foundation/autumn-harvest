@@ -2299,7 +2299,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
-        .route("/admin/debounce", get(debounce_status))
+        .route(
+            "/admin/debounce",
+            // Admin-gated: the response includes raw debounce_key values, which
+            // resolve from user/tenant-derived fields (e.g. input.user_id). Without
+            // this layer a non-admin caller could enumerate pending tenant keys
+            // across shards. Parity with other sensitive management reads.
+            get(debounce_status).route_layer(require_admin.clone()),
+        )
         .route("/admin/rate-limits", get(list_rate_limits))
         .route(
             "/admin/rate-limits/{key}",
@@ -5865,15 +5872,20 @@ async fn start_workflow(
                 Ok(c) => c,
                 Err(e) => return e.into_response(),
             };
-            matches!(
-                autumn_harvest::execution::try_load_by_key(
-                    &mut id_check_conn,
-                    &workflow_name,
-                    &workflow_id,
-                )
-                .await,
-                Ok(Some(ref ex)) if matches!(ex.state.as_str(), "RUNNING" | "PAUSED" | "SUSPENDED")
+            match autumn_harvest::execution::try_load_by_key(
+                &mut id_check_conn,
+                &workflow_name,
+                &workflow_id,
             )
+            .await
+            {
+                Ok(Some(ex)) => matches!(ex.state.as_str(), "RUNNING" | "PAUSED" | "SUSPENDED"),
+                Ok(None) => false,
+                // Fail closed: a transient probe failure must not be folded into
+                // "no live execution" and silently deferred into the debounce queue
+                // (a phantom 202 instead of the normal idempotent/conflict answer).
+                Err(e) => return map_error(e).into_response(),
+            }
         };
 
         if !debounce_skip_for_live_execution {
@@ -6008,50 +6020,43 @@ async fn start_workflow(
                 },
             };
 
-            match autumn_harvest::debounce::admit_debounced_start(&mut debounce_conn, admit_params)
-                .await
+            // The gate decision is enforced atomically *inside* the upsert
+            // transaction: when a gate is active, admit_debounced_start rolls the
+            // upsert back (so no row is ever committed) and returns Ok(None). This
+            // closes the race where a post-commit cleanup could delete a row a
+            // concurrent admission had already accepted, and a gated burst update is
+            // rolled back without losing the prior committed row.
+            match autumn_harvest::debounce::admit_debounced_start(
+                &mut debounce_conn,
+                admit_params,
+                gate_block.is_some(),
+            )
+            .await
             {
-                Ok(outcome) => {
-                    // Enforce the gate now that the atomic upsert has told us whether
-                    // this admission created a brand-new pending row. A burst update
-                    // (is_new_record == false) extends an already-tracked row and is
-                    // always allowed; a fresh row under an active gate is new load
-                    // that should have been blocked, so roll it back and reject.
-                    if let Some((gate_id, reason, scope_kind)) = gate_block
-                        && outcome.is_new_record
-                    {
-                        if let Err(del_err) = autumn_harvest::debounce::delete_pending_debounce(
-                            &mut debounce_conn,
-                            &workflow_name,
-                            &resolved_key,
-                        )
-                        .await
-                        {
-                            tracing::error!(
-                                error = %del_err,
-                                "failed to roll back gated debounce admission"
-                            );
-                        }
-                        let reason_label = match reason.char_indices().nth(64) {
-                            Some((idx, _)) => &reason[..idx],
-                            None => &reason,
-                        };
-                        runtime
-                            .registry
-                            .telemetry()
-                            .metrics
-                            .record_admission_blocked(scope_kind, reason_label);
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            Json(serde_json::json!({
-                                "error": "admission blocked",
-                                "gate_id": gate_id,
-                                "reason": reason,
-                            })),
-                        )
-                            .into_response();
-                    }
-
+                Ok(None) => {
+                    // Rolled back by the active gate — reject with the gate details.
+                    let (gate_id, reason, scope_kind) =
+                        gate_block.expect("gate_block is Some when admission is gated");
+                    let reason_label = match reason.char_indices().nth(64) {
+                        Some((idx, _)) => &reason[..idx],
+                        None => &reason,
+                    };
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_admission_blocked(scope_kind, reason_label);
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": "admission blocked",
+                            "gate_id": gate_id,
+                            "reason": reason,
+                        })),
+                    )
+                        .into_response();
+                }
+                Ok(Some(outcome)) => {
                     runtime
                         .registry
                         .telemetry()

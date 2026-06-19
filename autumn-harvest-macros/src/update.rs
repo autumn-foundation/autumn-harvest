@@ -251,6 +251,26 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     {
                         let workflow_id = workflow_id.into();
                         let update_args = #serialize_payload;
+                        // Issue #499: a debounced workflow cannot be started through the
+                        // typed client (it can't route to the debounce-key shard or admit
+                        // through the gate); debounce admission is HTTP-only. Reject early.
+                        if let ::std::option::Option::Some(debounce_policy) = Self::info().debounce {
+                            if ::autumn_harvest::debounce::resolve_debounce_key(
+                                debounce_policy.key_expr,
+                                &start_input,
+                            )
+                            .is_some()
+                            {
+                                return ::std::result::Result::Err(
+                                    ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                        "workflow '{0}' has a debounce policy; debounced starts \
+                                         must use the HTTP start route POST /workflows/{0}/start \
+                                         (the typed client cannot express a deferred debounced start)",
+                                        #workflow_simple_name,
+                                    )),
+                                );
+                            }
+                        }
                         let update_id = opts.idempotency_key.as_ref().map_or_else(
                             ::autumn_harvest::types::UpdateId::new,
                             |key| {
@@ -378,6 +398,26 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         {
                             let workflow_id = workflow_id.into();
                             let update_args = #serialize_payload;
+                            // Issue #499: a debounced workflow cannot be started through the
+                            // typed client (it can't route to the debounce-key shard or admit
+                            // through the gate); debounce admission is HTTP-only. Reject early.
+                            if let ::std::option::Option::Some(debounce_policy) = Self::info().debounce {
+                                if ::autumn_harvest::debounce::resolve_debounce_key(
+                                    debounce_policy.key_expr,
+                                    &start_input,
+                                )
+                                .is_some()
+                                {
+                                    return ::std::result::Result::Err(
+                                        ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                            "workflow '{0}' has a debounce policy; debounced starts \
+                                             must use the HTTP start route POST /workflows/{0}/start \
+                                             (the typed client cannot express a deferred debounced start)",
+                                            #workflow_simple_name,
+                                        )),
+                                    );
+                                }
+                            }
                             let update_id = opts.idempotency_key.as_ref().map_or_else(
                                 ::autumn_harvest::types::UpdateId::new,
                                 |key| {

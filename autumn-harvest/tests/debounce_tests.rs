@@ -212,6 +212,19 @@ fn no_op_metrics() -> RecordingMetrics {
     RecordingMetrics::default()
 }
 
+// Admit with no active gate (the common case these tests exercise). Mirrors the
+// pre-gate call shape so `.await.expect(..)` still yields the outcome: passes
+// `gate_active = false` and unwraps the `Option` (a non-gated admission is always
+// `Some`). The gated/`None` path is covered by the plugin HTTP integration tests.
+async fn admit_debounced_start_ungated(
+    conn: &mut AsyncPgConnection,
+    params: AdmitDebounceParams<'_>,
+) -> autumn_harvest::error::HarvestResult<autumn_harvest::debounce::DebounceAdmitOutcome> {
+    Ok(admit_debounced_start(conn, params, false)
+        .await?
+        .expect("non-gated admission must return Some"))
+}
+
 fn admit_params<'a>(
     wf: &'a str,
     key: &'a str,
@@ -248,7 +261,7 @@ async fn burst_collapse_k_upserts_produce_one_row_and_one_execution() {
     // K = 5 admissions for the same (workflow_name, debounce_key)
     for i in 0u32..5 {
         let input = serde_json::json!({ "seq": i });
-        let outcome = admit_debounced_start(
+        let outcome = admit_debounced_start_ungated(
             &mut conn,
             admit_params(wf, key, wf_id, input, window, max_wait),
         )
@@ -289,7 +302,7 @@ async fn trailing_edge_extends_deadline_and_scanner_respects_it() {
     let metrics = no_op_metrics();
 
     // First admission
-    let first_outcome = admit_debounced_start(
+    let first_outcome = admit_debounced_start_ungated(
         &mut conn,
         admit_params(
             wf,
@@ -305,7 +318,7 @@ async fn trailing_edge_extends_deadline_and_scanner_respects_it() {
 
     // Second admission while still within the window extends the deadline
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let second_outcome = admit_debounced_start(
+    let second_outcome = admit_debounced_start_ungated(
         &mut conn,
         admit_params(
             wf,
@@ -366,7 +379,7 @@ async fn last_input_wins() {
 
     for i in 0u32..3 {
         let input = serde_json::json!({ "value": i });
-        admit_debounced_start(
+        admit_debounced_start_ungated(
             &mut conn,
             admit_params(wf, key, wf_id, input, window, max_wait),
         )
@@ -445,7 +458,7 @@ async fn independent_keys_produce_independent_executions() {
     // Two distinct debounce keys
     for key in &["tenant:key-alpha", "tenant:key-beta"] {
         let wf_id = format!("independent-{key}");
-        admit_debounced_start(
+        admit_debounced_start_ungated(
             &mut conn,
             admit_params(wf, key, &wf_id, serde_json::json!({}), window, max_wait),
         )
@@ -509,7 +522,7 @@ async fn max_wait_cap_prevents_endless_deferral() {
     let max_wait = Duration::from_millis(50); // but short cap
 
     // First admission establishes max_fire_at = now + 50ms
-    let first = admit_debounced_start(
+    let first = admit_debounced_start_ungated(
         &mut conn,
         admit_params(wf, key, wf_id, serde_json::json!({}), window, max_wait),
     )
@@ -536,7 +549,7 @@ async fn max_wait_cap_prevents_endless_deferral() {
 
     // Multiple subsequent admissions should never push effective_fire_at past max_fire_at
     for i in 1u32..5 {
-        let outcome = admit_debounced_start(
+        let outcome = admit_debounced_start_ungated(
             &mut conn,
             admit_params(
                 wf,
@@ -655,7 +668,7 @@ async fn list_pending_debounce_surfaces_pending_records() {
     let window = Duration::from_secs(60);
     let max_wait = Duration::from_secs(3600);
 
-    admit_debounced_start(
+    admit_debounced_start_ungated(
         &mut conn,
         admit_params(
             wf,
@@ -670,7 +683,7 @@ async fn list_pending_debounce_surfaces_pending_records() {
     .expect("admit");
 
     // Upsert again to get pending_count = 2
-    admit_debounced_start(
+    admit_debounced_start_ungated(
         &mut conn,
         admit_params(
             wf,
@@ -721,7 +734,7 @@ async fn thousand_upserts_produce_exactly_one_execution() {
 
     for i in 0u32..1_000 {
         let input = serde_json::json!({ "seq": i });
-        admit_debounced_start(
+        admit_debounced_start_ungated(
             &mut conn,
             admit_params(wf, key, wf_id, input, window, max_wait),
         )
@@ -753,7 +766,7 @@ async fn fire_emits_debounce_fired_metric() {
     let window = Duration::from_millis(1);
     let max_wait = Duration::from_secs(60);
 
-    admit_debounced_start(
+    admit_debounced_start_ungated(
         &mut conn,
         admit_params(wf, key, wf_id, serde_json::json!({}), window, max_wait),
     )

@@ -240,11 +240,37 @@ pub struct PendingDebounceRecord {
 ///
 /// # Errors
 /// Returns `HarvestError` if the database upsert fails.
+///
+/// `gate_active` carries the caller's admission-gate decision for this request's
+/// scope. The upsert and the gate decision run in **one transaction**: when the
+/// gate is active the transaction is rolled back so the row is never committed
+/// and `Ok(None)` is returned. This is the authoritative gate enforcement —
+/// doing it post-commit (delete after the upsert is visible) is racy, because a
+/// concurrent request for the same key could observe the row, update it, and be
+/// accepted, only for this cleanup to then delete the shared row and drop that
+/// accepted retrigger. Rolling back also preserves a pre-existing pending row
+/// (a gated *update* leaves the prior committed row intact), and blocks a
+/// burst update that would mutate a gate-relevant field (e.g. `queue_name`)
+/// into the gated scope. `Ok(Some(outcome))` is returned when admitted.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 pub async fn admit_debounced_start(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitDebounceParams<'_>,
-) -> crate::error::HarvestResult<DebounceAdmitOutcome> {
+    gate_active: bool,
+) -> crate::error::HarvestResult<Option<DebounceAdmitOutcome>> {
+    // Sentinel error used to roll the transaction back when the gate is active
+    // (an Ok return would commit). Distinguished from a real DB error below.
+    enum AdmitTxnErr {
+        Gated,
+        Db(diesel::result::Error),
+    }
+    impl From<diesel::result::Error> for AdmitTxnErr {
+        fn from(e: diesel::result::Error) -> Self {
+            Self::Db(e)
+        }
+    }
+
     #[derive(diesel::QueryableByName)]
     struct UpsertRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -259,7 +285,7 @@ pub async fn admit_debounced_start(
         is_new_record: bool,
     }
 
-    use diesel_async::RunQueryDsl;
+    use diesel_async::{AsyncConnection, RunQueryDsl};
 
     if params.debounce_key.len() > DEBOUNCE_KEY_MAX_BYTES {
         return Err(crate::error::HarvestError::Config(format!(
@@ -316,57 +342,54 @@ pub async fn admit_debounced_start(
             (xmax = 0) AS is_new_record
     ";
 
-    let row: UpsertRow = diesel::sql_query(sql)
-        .bind::<diesel::sql_types::Uuid, _>(new_id)
-        .bind::<diesel::sql_types::Text, _>(params.workflow_name)
-        .bind::<diesel::sql_types::Text, _>(&params.debounce_key)
-        .bind::<diesel::sql_types::Text, _>(&params.workflow_id)
-        .bind::<diesel::sql_types::Text, _>(params.queue_name)
-        .bind::<diesel::sql_types::Jsonb, _>(params.last_input)
-        .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
-        .bind::<diesel::sql_types::Timestamptz, _>(initial_fire_at)
-        .bind::<diesel::sql_types::Timestamptz, _>(max_fire_at)
-        .bind::<diesel::sql_types::Integer, _>(params.shard_id)
-        .get_result(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let last_input = params.last_input;
+    let workflow_name = params.workflow_name;
+    let debounce_key = params.debounce_key;
+    let workflow_id = params.workflow_id;
+    let queue_name = params.queue_name;
+    let shard_id = params.shard_id;
 
-    Ok(DebounceAdmitOutcome {
-        debounce_key: row.debounce_key,
-        workflow_id: row.workflow_id,
-        fire_at: row.effective_fire_at,
-        pending_count: row.pending_count,
-        is_new_record: row.is_new_record,
-    })
-}
+    let txn = conn
+        .transaction::<DebounceAdmitOutcome, AdmitTxnErr, _>(|conn| {
+            Box::pin(async move {
+                let row: UpsertRow = diesel::sql_query(sql)
+                    .bind::<diesel::sql_types::Uuid, _>(new_id)
+                    .bind::<diesel::sql_types::Text, _>(workflow_name)
+                    .bind::<diesel::sql_types::Text, _>(debounce_key)
+                    .bind::<diesel::sql_types::Text, _>(workflow_id)
+                    .bind::<diesel::sql_types::Text, _>(queue_name)
+                    .bind::<diesel::sql_types::Jsonb, _>(last_input)
+                    .bind::<diesel::sql_types::Jsonb, _>(start_options_json)
+                    .bind::<diesel::sql_types::Timestamptz, _>(initial_fire_at)
+                    .bind::<diesel::sql_types::Timestamptz, _>(max_fire_at)
+                    .bind::<diesel::sql_types::Integer, _>(shard_id)
+                    .get_result(conn)
+                    .await?;
 
-/// Delete a pending debounce record by its collapse key.
-///
-/// Used to roll back a brand-new admission that an active admission gate should
-/// have blocked: the gate decision is made post-upsert from the atomic
-/// `is_new_record` flag (avoiding the TOCTOU of a pre-upsert existence probe),
-/// so when a gate is active and the upsert created a fresh row, that row is
-/// removed here and the request is rejected.
-///
-/// # Errors
-/// Returns `HarvestError` if the delete fails.
-#[cfg(feature = "db")]
-pub async fn delete_pending_debounce(
-    conn: &mut diesel_async::AsyncPgConnection,
-    workflow_name: &str,
-    debounce_key: &str,
-) -> crate::error::HarvestResult<()> {
-    use diesel_async::RunQueryDsl;
+                // Roll back: a gated admission must not leave a committed row. The
+                // upsert held a row lock for the duration of this transaction, so a
+                // concurrent admission for the same key serialized behind it and
+                // never observed the rolled-back row.
+                if gate_active {
+                    return Err(AdmitTxnErr::Gated);
+                }
 
-    diesel::sql_query(
-        "DELETE FROM harvest_debounce WHERE workflow_name = $1 AND debounce_key = $2",
-    )
-    .bind::<diesel::sql_types::Text, _>(workflow_name)
-    .bind::<diesel::sql_types::Text, _>(debounce_key)
-    .execute(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-    Ok(())
+                Ok(DebounceAdmitOutcome {
+                    debounce_key: row.debounce_key,
+                    workflow_id: row.workflow_id,
+                    fire_at: row.effective_fire_at,
+                    pending_count: row.pending_count,
+                    is_new_record: row.is_new_record,
+                })
+            })
+        })
+        .await;
+
+    match txn {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(AdmitTxnErr::Gated) => Ok(None),
+        Err(AdmitTxnErr::Db(e)) => Err(crate::error::database_error(e)),
+    }
 }
 
 /// Maximum number of debounce rows fired per scanner tick.
