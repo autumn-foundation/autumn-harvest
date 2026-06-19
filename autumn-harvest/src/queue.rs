@@ -6,7 +6,7 @@
 
 use std::time::Duration as StdDuration;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -32,7 +32,34 @@ pub enum TaskType {
     Activity,
 }
 
-const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration = Duration::seconds(5);
+const IMMEDIATE_SCHEDULE_SKEW_SECS: i32 = 5;
+const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
+    Duration::seconds(IMMEDIATE_SCHEDULE_SKEW_SECS as i64);
+
+/// Compute schedule-to-start latency in seconds for a task, discounting the
+/// immediate-task clock-skew backdating applied by [`EnqueueParams::new`].
+///
+/// `EnqueueParams::new` sets `scheduled_at = NOW() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE`
+/// so immediate tasks are claimable under the `scheduled_at <= NOW()` predicate
+/// even when host and Postgres clocks differ slightly. Measuring latency
+/// straight off `scheduled_at` would therefore add that fixed allowance to every
+/// immediate task. We subtract it back out and clamp to `0` so a promptly-served
+/// immediate task reports ~0 rather than the skew allowance.
+///
+/// Trade-off: a genuinely *delayed* or *retried* task (whose `scheduled_at` was
+/// set to an explicit future instant with no skew) that is then served within
+/// the allowance window will under-report by up to the allowance. This is
+/// deliberate — the SLI exists to page on the long-wait tail (p99 well above the
+/// allowance), where the fixed offset is negligible, and a constant positive
+/// bias on every immediate task (the common case) would be far more misleading.
+#[must_use]
+pub fn schedule_to_start_secs(scheduled_at: DateTime<Utc>, start: DateTime<Utc>) -> f64 {
+    (start - scheduled_at - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE)
+        .max(Duration::zero())
+        .to_std()
+        .unwrap_or_default()
+        .as_secs_f64()
+}
 
 impl TaskType {
     /// Returns the string representation stored in the `task_type` column.
@@ -877,13 +904,26 @@ pub async fn queue_depths(
     Ok(rows.into_iter().map(|r| (r.queue_name, r.depth)).collect())
 }
 
-/// Returns the age in seconds of the oldest currently-unclaimed eligible task
+/// Returns the age in seconds of the oldest currently-*claimable* eligible task
 /// per queue.
 ///
-/// Uses the same eligibility predicate as [`queue_depths`] and [`claim_task`]:
-/// `state = 'PENDING' AND scheduled_at <= NOW()`. Only queues that have at
-/// least one eligible task appear in the result; the sampler is responsible for
-/// resetting the gauge to `0` for queues with no eligible tasks.
+/// Mirrors the part of [`claim_task`]'s eligibility predicate that determines
+/// whether a worker is *supposed* to pick a task up: `state = 'PENDING' AND
+/// scheduled_at <= NOW()`, **excluding** workflow tasks whose execution is
+/// `PAUSED` (issue #383) — a paused execution's parked task is intentionally not
+/// claimable, so counting its age would inflate the saturation signal and fire
+/// false alerts until the workflow is resumed. The age also discounts the
+/// `IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` backdating (see [`schedule_to_start_secs`])
+/// so a freshly-enqueued immediate task reports ~0, and is clamped to `0`.
+///
+/// (The finer-grained claim filters — build-id, concurrency cap, rate limit,
+/// sticky routing, capabilities — are deliberately *not* mirrored here: those
+/// gate *which worker* may claim, not whether the task is work that needs doing,
+/// so they belong to worker-coverage signals rather than the queue-age gauge.)
+///
+/// Only queues that have at least one eligible task appear in the result; the
+/// sampler is responsible for resetting the gauge to `0` for queues with no
+/// eligible tasks.
 ///
 /// # Errors
 ///
@@ -902,14 +942,27 @@ pub async fn oldest_pending_ages(
 
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT queue_name, \
-                EXTRACT(EPOCH FROM (NOW() - MIN(scheduled_at)))::DOUBLE PRECISION AS age_secs \
+                GREATEST( \
+                    EXTRACT(EPOCH FROM (NOW() - MIN(scheduled_at))) - $2, \
+                    0 \
+                )::DOUBLE PRECISION AS age_secs \
          FROM harvest_task_queue \
          WHERE queue_name = ANY($1) \
            AND state = 'PENDING' \
            AND scheduled_at <= NOW() \
+           AND ( \
+               task_type <> 'workflow' \
+               OR workflow_exec_id IS NULL \
+               OR NOT EXISTS ( \
+                   SELECT 1 FROM harvest_workflow_executions e \
+                   WHERE e.id = harvest_task_queue.workflow_exec_id \
+                     AND e.state = 'PAUSED' \
+               ) \
+           ) \
          GROUP BY queue_name",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+    .bind::<diesel::sql_types::Double, _>(f64::from(IMMEDIATE_SCHEDULE_SKEW_SECS))
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -1593,6 +1646,30 @@ mod tests {
         assert_eq!(TaskType::Activity.as_str(), "activity");
         assert_eq!(format!("{}", TaskType::Workflow), "workflow");
         assert_eq!(format!("{}", TaskType::Activity), "activity");
+    }
+
+    #[test]
+    fn schedule_to_start_discounts_skew_allowance() {
+        let now = Utc::now();
+
+        // Immediate task (EnqueueParams::new backdates scheduled_at by the skew
+        // allowance) claimed instantly should report ~0, not the allowance.
+        let immediate = now - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
+        assert!(
+            schedule_to_start_secs(immediate, now) < 0.001,
+            "promptly-served immediate task must not report the skew allowance"
+        );
+
+        // A real wait beyond the allowance is reported net of the allowance.
+        let waited = now - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE - Duration::seconds(10);
+        let secs = schedule_to_start_secs(waited, now);
+        assert!(
+            (secs - 10.0).abs() < 0.01,
+            "expected ~10s net wait, got {secs}"
+        );
+
+        // Never negative, even if start precedes scheduled_at (clock skew).
+        assert!(schedule_to_start_secs(now + Duration::seconds(1), now) < f64::EPSILON);
     }
 
     #[test]

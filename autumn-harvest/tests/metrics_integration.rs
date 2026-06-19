@@ -2324,10 +2324,11 @@ fn sts_test_workflow<'a>(
 }
 
 /// Verifies that `harvest.queue.schedule_to_start` is emitted when a worker
-/// claims and completes a task, labeled by `queue`, with a non-negative value.
+/// picks up and runs a task, labeled by `queue`, with a wait value that reflects
+/// real queue time net of the immediate-enqueue skew allowance (issue #501).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
-async fn schedule_to_start_histogram_emitted_at_claim_time() {
+async fn schedule_to_start_histogram_emitted_at_dispatch() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = AsyncPgConnection::establish(&database_url)
         .await
@@ -2380,11 +2381,13 @@ async fn schedule_to_start_histogram_emitted_at_claim_time() {
     .await
     .expect("append WorkflowStarted failed");
 
-    // Enqueue with scheduled_at in the past to guarantee a measurable wait.
+    // Enqueue with scheduled_at well past the 5s skew allowance so the recorded
+    // wait is measurably positive *after* skew correction (issue #501): a 13s
+    // backdated schedule yields a >= 8s net wait.
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::milliseconds(200);
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(13);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -2441,7 +2444,10 @@ async fn schedule_to_start_histogram_emitted_at_claim_time() {
         "emission must be labeled by queue; got: {}",
         sts.labels_debug
     );
-    // wait_secs should be ≥ 0 (we recorded it as a formatted f64 string).
+    // wait_secs is recorded as a formatted f64 string. With a 13s backdated
+    // schedule and the 5s skew allowance discounted, the net wait must be a
+    // robustly positive value (>= 8s, growing with claim/dispatch delay) — this
+    // proves skew correction did not zero out a real wait.
     let wait_secs: f64 = sts
         .labels_debug
         .split(',')
@@ -2450,8 +2456,8 @@ async fn schedule_to_start_histogram_emitted_at_claim_time() {
         .and_then(|v| v.parse().ok())
         .expect("wait_secs label must be present and parseable");
     assert!(
-        wait_secs >= 0.0,
-        "wait_secs must be non-negative; got {wait_secs}"
+        wait_secs >= 5.0,
+        "wait_secs must reflect real wait net of skew allowance; got {wait_secs}"
     );
 }
 
@@ -2512,11 +2518,12 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     .await
     .expect("append WorkflowStarted failed");
 
-    // Enqueue with scheduled_at 1 second in the past so it's immediately eligible.
+    // Enqueue with scheduled_at well past the 5s skew allowance so the reported
+    // age is positive after skew correction (issue #501): 13s backdated → >= 8s.
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
-    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(13);
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
@@ -2549,5 +2556,99 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     assert!(
         ages_after_drain.is_empty(),
         "no eligible tasks remain — result must be empty (sampler resets gauge to 0)"
+    );
+}
+
+/// Verifies that `oldest_pending_ages` excludes a pending workflow task whose
+/// execution is PAUSED, mirroring `claim_task`'s pause gating (issue #383 / #501
+/// review): a paused execution is intentionally not claimable, so counting its
+/// age would inflate the saturation signal and fire false alerts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn oldest_pending_age_excludes_paused_executions() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({"msg": "paused age test"});
+
+    let exec_row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "paused_age_test_workflow",
+        workflow_id: &format!("paused-age-{}", Uuid::new_v4()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: workflow_input.clone(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&exec_row)
+        .execute(&mut conn)
+        .await
+        .expect("insert workflow execution failed");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    // Enqueue an eligible workflow task aged well past the skew allowance.
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(13);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let queues = vec!["default".to_string()];
+
+    // While the execution is RUNNING the task is counted.
+    let ages = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues)
+        .await
+        .expect("oldest_pending_ages query must succeed");
+    assert_eq!(ages.len(), 1, "running execution's task must be counted");
+
+    // Pause the execution — the parked task must now be excluded.
+    diesel::update(
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid())),
+    )
+    .set(harvest_workflow_executions::state.eq("PAUSED"))
+    .execute(&mut conn)
+    .await
+    .expect("pause execution failed");
+
+    let ages_paused = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues)
+        .await
+        .expect("oldest_pending_ages query must succeed while paused");
+    assert!(
+        ages_paused.is_empty(),
+        "paused execution's task must be excluded; got {ages_paused:?}"
     );
 }

@@ -7535,20 +7535,13 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task"
                 );
-                // Record schedule-to-start latency: wall-clock seconds between
-                // the task becoming eligible (scheduled_at) and this worker
-                // claiming it (started_at, set to NOW() in the claim CTE).
-                // Clamped to 0 to guard against sub-millisecond clock skew.
-                let started = task.started_at.unwrap_or_else(chrono::Utc::now);
-                let wait_secs = (started - task.scheduled_at)
-                    .max(chrono::Duration::zero())
-                    .to_std()
-                    .unwrap_or_default()
-                    .as_secs_f64();
-                self.registry
-                    .telemetry()
-                    .metrics
-                    .record_schedule_to_start(&task.queue_name, wait_secs);
+                // schedule-to-start latency is recorded in `dispatch_task` after
+                // the local concurrency permit is acquired, not here at claim
+                // time: the worker can over-claim past `max_concurrent_*` (the
+                // semaphore gates execution, not claiming), so measuring at claim
+                // would hide the time a task spends waiting behind a local permit
+                // on a saturated worker — exactly the capacity bottleneck the SLI
+                // is meant to page on.
                 self.dispatch_task(task, pool);
                 true
             }
@@ -7625,6 +7618,10 @@ impl Worker {
         let timeout_strikes = Arc::clone(&self.workflow_task_timeout_strikes);
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
+        // Captured for the schedule-to-start histogram, recorded below once the
+        // concurrency permit is held (issue #501).
+        let sts_scheduled_at = task.scheduled_at;
+        let sts_queue_name = task.queue_name.clone();
 
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
@@ -7632,6 +7629,18 @@ impl Worker {
                 tracing::error!(task_id = %task_id, "semaphore closed");
                 return;
             };
+
+            // Record schedule-to-start latency now that the task is about to
+            // execute: wall-clock seconds from eligibility to local-capacity
+            // acquisition. Recording here (rather than at claim time) captures
+            // time spent waiting behind the concurrency permit on a saturated
+            // worker. `schedule_to_start_secs` discounts the immediate-task skew
+            // allowance and clamps to 0 (issue #501).
+            let wait_secs = queue::schedule_to_start_secs(sts_scheduled_at, chrono::Utc::now());
+            registry
+                .telemetry()
+                .metrics
+                .record_schedule_to_start(&sts_queue_name, wait_secs);
 
             tracing::info!(
                 task_id = %task_id,
