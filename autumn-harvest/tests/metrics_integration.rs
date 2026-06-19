@@ -2786,3 +2786,116 @@ async fn oldest_pending_age_excludes_rate_limited_tasks() {
         "circuit-breaker activity skips the rate-limit gate and must be counted; got {ages_cb_exempt:?}"
     );
 }
+
+/// Verifies that `oldest_pending_ages` excludes a task behind a saturated per-key
+/// concurrency cap, mirroring `claim_task`'s cap gating (issue #247 / #501 review):
+/// while `COUNT(RUNNING for key) >= concurrency_cap` no worker may claim more work
+/// for that key, so counting a deferred row's age would page for *intended*
+/// fair-share capping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[allow(clippy::too_many_lines)]
+async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({"msg": "concurrency cap age test"});
+
+    let exec_row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "cap_age_test_workflow",
+        workflow_id: &format!("cap-age-{}", Uuid::new_v4()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: workflow_input.clone(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&exec_row)
+        .execute(&mut conn)
+        .await
+        .expect("insert workflow execution failed");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    // Enqueue a PENDING activity task with a per-key concurrency cap of 1.
+    let concurrency_key = format!("ck-age-{}", Uuid::new_v4());
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Activity, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.activity_name = Some("capped_activity".to_string());
+    enqueue_params.activity_id = Some(Uuid::new_v4());
+    enqueue_params.concurrency_key = Some(concurrency_key.clone());
+    enqueue_params.max_concurrent = Some(1);
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(13);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let queues = vec!["default".to_string()];
+
+    // No RUNNING task for the key yet → cap not saturated → counted.
+    let ages = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues, &[])
+        .await
+        .expect("oldest_pending_ages query must succeed");
+    assert_eq!(
+        ages.len(),
+        1,
+        "task under an unsaturated cap must be counted; got {ages:?}"
+    );
+
+    // Insert a RUNNING sibling for the same key, saturating the cap of 1.
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+            (id, queue_name, task_type, workflow_exec_id, activity_name, activity_id, input, \
+             state, priority, worker_id, attempt, max_attempts, scheduled_at, \
+             concurrency_key, concurrency_cap) \
+         VALUES ($1, 'default', 'activity', $2, 'capped_activity', $3, '{}'::jsonb, \
+                 'RUNNING', 0, 'worker-sat', 1, 3, NOW(), $4, 1)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
+    .bind::<diesel::sql_types::Text, _>(&concurrency_key)
+    .execute(&mut conn)
+    .await
+    .expect("insert RUNNING sibling failed");
+
+    // Cap saturated (COUNT(RUNNING) = 1 >= cap 1) → no worker may claim → excluded.
+    let ages_saturated = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues, &[])
+        .await
+        .expect("oldest_pending_ages query must succeed while capped");
+    assert!(
+        ages_saturated.is_empty(),
+        "task behind a saturated concurrency cap must be excluded; got {ages_saturated:?}"
+    );
+}

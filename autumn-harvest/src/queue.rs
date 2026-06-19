@@ -915,20 +915,24 @@ pub async fn queue_depths(
 /// its age would page for work no worker may start; (b) workflow tasks whose
 /// execution is `PAUSED` (issue #383) — a paused execution's parked task is
 /// intentionally not claimable, so counting its age would inflate the saturation
-/// signal and fire false alerts until the workflow is resumed; and (c) rate-limited
+/// signal and fire false alerts until the workflow is resumed; (c) rate-limited
 /// activity tasks whose token bucket is currently below one token (issue #369) —
 /// `claim_task` skips these until tokens refill, so counting their age would page
-/// for *intended* throttling on a deliberately rate-limited queue. Circuit-breaker
-/// activities (`circuit_breaker_activities`) skip the claim-time rate-limit gate
-/// entirely, so they are exempt from this exclusion exactly as in `claim_task`. The
+/// for *intended* throttling on a deliberately rate-limited queue (circuit-breaker
+/// activities in `circuit_breaker_activities` skip the claim-time rate-limit gate
+/// entirely, so they are exempt from this exclusion exactly as in `claim_task`); and
+/// (d) tasks behind a saturated per-key concurrency cap (issue #247) — `claim_task`
+/// refuses every worker while `COUNT(RUNNING) >= concurrency_cap`, so a capped hot
+/// tenant's deferred rows are not claimable and counting their age would page for
+/// *intended* fair-share capping until an in-flight task for that key finishes. The
 /// age also discounts the
 /// `IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` backdating (see [`schedule_to_start_secs`])
 /// so a freshly-enqueued immediate task reports ~0, and is clamped to `0`.
 ///
-/// (The finer-grained claim filters — build-id, concurrency cap, sticky routing,
-/// capabilities — are deliberately *not* mirrored here: those gate *which worker*
-/// may claim, not whether the task is work that needs doing, so they belong to
-/// worker-coverage signals rather than the queue-age gauge.)
+/// (The finer-grained claim filters — build-id, sticky routing, capabilities — are
+/// deliberately *not* mirrored here: those gate *which worker* may claim, not whether
+/// the task is work no worker at all may start, so they belong to worker-coverage
+/// signals rather than the queue-age gauge.)
 ///
 /// Only queues that have at least one eligible task appear in the result; the
 /// sampler is responsible for resetting the gauge to `0` for queues with no
@@ -972,6 +976,17 @@ pub async fn oldest_pending_ages(
                    WHERE e.id = harvest_task_queue.workflow_exec_id \
                      AND e.state = 'PAUSED' \
                ) \
+           ) \
+           AND ( \
+               concurrency_key IS NULL \
+               OR concurrency_cap IS NULL \
+               OR ( \
+                   SELECT COUNT(*) FROM harvest_task_queue inner_q \
+                   WHERE inner_q.concurrency_key = harvest_task_queue.concurrency_key \
+                     AND inner_q.task_type = harvest_task_queue.task_type \
+                     AND inner_q.state = 'RUNNING' \
+                     AND inner_q.worker_id IS NOT NULL \
+               ) < harvest_task_queue.concurrency_cap \
            ) \
            AND ( \
                rate_limit_key IS NULL \

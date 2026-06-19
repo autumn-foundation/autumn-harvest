@@ -38,30 +38,37 @@ use std::sync::Arc;
 //    as `harvest.workflow.history_size` (durable event counts, soft threshold
 //    10k) and the payload-size histogram (bytes) — seconds buckets would dump
 //    every sample above 600 into `+Inf` and break count/byte dashboards.
+//
+//    NOTE: `Matcher::Full` is matched against the *sanitized* metric name —
+//    `metrics-exporter-prometheus` calls `sanitize_metric_name` before looking up
+//    the per-metric distribution — so the matcher must use the Prometheus form
+//    with underscores (`harvest_queue_schedule_to_start`), NOT the dotted name
+//    registered via the `metrics` macros. A dotted matcher silently fails to match
+//    and the metric falls back to a summary (no `_bucket` series).
 const LATENCY_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
     10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
 ];
 metrics_exporter_prometheus::PrometheusBuilder::new()
     .set_buckets_for_metric(
-        Matcher::Full("harvest.queue.schedule_to_start".into()),
+        Matcher::Full("harvest_queue_schedule_to_start".into()),
         LATENCY_BUCKETS,
     )
     .expect("valid bucket boundaries")
     .set_buckets_for_metric(
-        Matcher::Full("harvest.workflow.duration".into()),
+        Matcher::Full("harvest_workflow_duration".into()),
         LATENCY_BUCKETS,
     )
     .expect("valid bucket boundaries")
     .set_buckets_for_metric(
-        Matcher::Full("harvest.activity.duration".into()),
+        Matcher::Full("harvest_activity_duration".into()),
         LATENCY_BUCKETS,
     )
     .expect("valid bucket boundaries")
     // history-size is a *count* histogram (durable events), not seconds — give
     // it its own boundaries so it stays usable for count dashboards/alerts.
     .set_buckets_for_metric(
-        Matcher::Full("harvest.workflow.history_size".into()),
+        Matcher::Full("harvest_workflow_history_size".into()),
         &[10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0],
     )
     .expect("valid bucket boundaries")
