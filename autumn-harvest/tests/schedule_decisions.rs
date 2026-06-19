@@ -18,6 +18,8 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
+    include_str!("../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
+    "\n",
     include_str!("../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
     "\n",
     include_str!("../migrations/20260501000000_harvest_workers/up.sql"),

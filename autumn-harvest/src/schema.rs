@@ -134,6 +134,9 @@ diesel::table! {
         required_capabilities -> Nullable<Jsonb>,
         /// Per-execution ambient context headers propagated from the parent workflow (issue #481).
         context_headers -> Nullable<Jsonb>,
+        /// Row insert time (issue #501 review). Nullable: pre-upgrade rows are NULL
+        /// and the schedule-to-start SLI falls back to `scheduled_at` via COALESCE.
+        created_at -> Nullable<Timestamptz>,
     }
 }
 

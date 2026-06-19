@@ -102,7 +102,56 @@ incident is worse than retrying the work.
 Escalate when all workers for a required queue are stale or draining, or when
 deferred concurrency work grows while downstream owners report elevated errors.
 
+## harvest_queue_schedule_to_start_high
+
+**Primary queue-saturation page** (issue #501). Fires when p99
+`harvest.queue.schedule_to_start` for a queue exceeds your configured SLA
+threshold (default 30 s). This is the canonical "do I need more workers?"
+signal — it measures actual wait time rather than a depth heuristic.
+
+### Triage steps
+
+1. Check the `queue` label in the alert to identify the saturated queue.
+2. Run `harvest worker health --output json` — look for stale heartbeats or
+   workers draining.
+3. Run `harvest worker list --queue <queue> --output json` — verify workers are
+   claiming tasks. Zero claimers means workers are absent or filtered by build-id.
+4. Run `harvest concurrency status --output json` — a concurrency cap at 100%
+   will stall claims even when workers are healthy.
+5. Check `harvest_queue_oldest_pending_age{queue=…}` — a large value here
+   confirms a task has been stuck longer than the histogram quantile.
+6. For a sample stuck execution, run `harvest workflow stack <execution_id>`.
+
+### Likely causes
+
+Worker count too low for current throughput, workers cannot claim the queue
+(build-id mismatch, concurrency cap saturated, activity circuit breaker open),
+downstream dependency latency inflating per-task duration and reducing worker
+throughput, shard readiness issues, or a schedule burst flooding the queue.
+
+### False positives
+
+Planned maintenance windows, expected burst periods, or a very small number
+of tasks with unusually large payloads that temporarily saturate workers. Alert
+only when the p99 sustains above threshold for the full rule window.
+
+### Safe actions
+
+Scale the worker pool, roll back the deployment that changed queue assignment,
+temporarily raise a proven concurrency cap, or pause a schedule that is flooding
+the queue. Prefer pausing producers over replaying DLQ entries into an already
+saturated queue.
+
+### Escalation criteria
+
+Escalate if wait times persist for two alert windows after fresh workers are
+added, or if the queue backs a customer-facing workflow with a breached SLA.
+
 ## harvest_queue_backlog_growth
+
+**Secondary signal** — superseded as the primary page by
+`harvest_queue_schedule_to_start_high` (#501). Use this as a corroborating
+signal or as a fallback when histogram metrics are not yet wired.
 
 ### Triage steps
 

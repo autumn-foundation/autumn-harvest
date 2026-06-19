@@ -52,11 +52,12 @@ use crate::telemetry::{
     METRIC_LABEL_NON_RETRYABLE, METRIC_LABEL_OUTCOME, METRIC_LABEL_QUERY, METRIC_LABEL_QUEUE,
     METRIC_LABEL_REASON, METRIC_LABEL_REASON_CODE, METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD,
     METRIC_LABEL_STATUS, METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
-    METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_RATE_LIMIT_REFILL_RATE,
-    METRIC_RATE_LIMIT_THROTTLED, METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED,
-    METRIC_SCHEDULE_AUTO_PAUSED, METRIC_SCHEDULE_DECISION_WRITE_FAILED,
-    METRIC_SCHEDULE_FIRE_ATTEMPTS, METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS,
-    METRIC_SCHEDULE_SKIPPED, METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
+    METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_OLDEST_PENDING_AGE,
+    METRIC_QUEUE_SCHEDULE_TO_START, METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED,
+    METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED, METRIC_SCHEDULE_AUTO_PAUSED,
+    METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_FIRE_ATTEMPTS,
+    METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED,
+    METRIC_TASK_QUARANTINED, METRIC_TIMER_DURATION, METRIC_TIMER_STARTED,
     METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CONTINUE_AS_NEW,
     METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
     METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
@@ -203,6 +204,22 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_QUEUE => queue_name.to_owned(),
         )
         .set(depth as f64);
+    }
+
+    fn record_schedule_to_start(&self, queue_name: &str, wait_secs: f64) {
+        histogram!(
+            METRIC_QUEUE_SCHEDULE_TO_START,
+            METRIC_LABEL_QUEUE => queue_name.to_owned(),
+        )
+        .record(wait_secs);
+    }
+
+    fn record_queue_oldest_pending_age(&self, queue_name: &str, age_secs: f64) {
+        gauge!(
+            METRIC_QUEUE_OLDEST_PENDING_AGE,
+            METRIC_LABEL_QUEUE => queue_name.to_owned(),
+        )
+        .set(age_secs);
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -528,6 +545,8 @@ mod tests {
         rec.record_rate_limit_refill_rate("rl", 2.0);
         rec.record_rate_limit_throttled("rl");
         rec.record_workflow_non_determinism("wf", "build-123");
+        rec.record_schedule_to_start("q", 1.5);
+        rec.record_queue_oldest_pending_age("q", 30.0);
     }
 
     // -----------------------------------------------------------------------

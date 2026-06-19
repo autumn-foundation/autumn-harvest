@@ -100,13 +100,63 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_worker_saturation"
     },
     {
-      "id": "harvest_queue_backlog_growth",
+      "id": "harvest_queue_schedule_to_start_high",
       "status": "enforceable",
-      "signal_source": "ADR-0001/#138 gauge harvest.queue.depth sampled per configured queue.",
-      "default_threshold": "Page when queue depth stays above 100 pending tasks and continues growing for 10 minutes. Tune absolute depth per queue throughput.",
+      "signal_source": "ADR-0001/#501 histogram harvest.queue.schedule_to_start recorded per claim on the existing claim path (worker.rs). Label: queue (bounded).",
+      "default_threshold": "Page when p99 schedule-to-start latency for any queue exceeds 30 seconds over a 5-minute window. Tune the threshold to match your per-queue SLA.",
       "severity": "page",
       "owner_persona": "workflow on-call",
-      "description": "Pending task count is growing faster than workers can claim and complete work.",
+      "description": "Tasks are waiting too long between becoming eligible and being claimed by a worker — the canonical signal that worker capacity is insufficient for current load.",
+      "first_action": "harvest worker health --output json",
+      "dependencies": [
+        {
+          "ref": "#501",
+          "status": "shipped",
+          "surface": "METRIC_QUEUE_SCHEDULE_TO_START / harvest.queue.schedule_to_start"
+        },
+        {
+          "ref": "ADR-0001",
+          "status": "accepted",
+          "surface": "bounded metric labels: queue; execution.id / activity.id are span-only"
+        },
+        {
+          "ref": "#100",
+          "status": "shipped",
+          "surface": "worker health API for first triage"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "harvest.queue.schedule_to_start is exposed as harvest_queue_schedule_to_start_{bucket,count,sum} ONLY when the Prometheus exporter is configured with histogram bucket boundaries (PrometheusBuilder::set_buckets, see docs/telemetry.md). Without buckets, metrics-exporter-prometheus emits a summary (no _bucket series) and this histogram_quantile rule will not evaluate. Use histogram_quantile(0.99, ...) for the p99. Replace the queue label value with your actual queue name.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "histogram_quantile(0.99, sum by (le, queue) (rate(harvest_queue_schedule_to_start_bucket{queue=\"default\"}[5m]))) > 30"
+          },
+          {
+            "kind": "promql",
+            "expr": "harvest_queue_oldest_pending_age{queue=\"default\"} > 30",
+            "note": "Companion oldest-pending-age gauge fires within one sampler interval (≤15 s) when a task is stuck; useful as a fast-detection complement to the p99 histogram."
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest worker health --output json",
+        "harvest worker list --queue <queue> --output json",
+        "harvest concurrency status --output json",
+        "GET /api/harvest/workers/health",
+        "GET /api/harvest/admin/concurrency"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_queue_schedule_to_start_high"
+    },
+    {
+      "id": "harvest_queue_backlog_growth",
+      "status": "enforceable",
+      "signal_source": "ADR-0001/#138 gauge harvest.queue.depth sampled per configured queue. Secondary signal — superseded as primary page by harvest_queue_schedule_to_start_high (#501).",
+      "default_threshold": "Ticket when queue depth stays above 100 pending tasks and continues growing for 10 minutes. Tune absolute depth per queue throughput. Prefer the schedule-to-start p99 alert as the primary page.",
+      "severity": "ticket",
+      "owner_persona": "workflow on-call",
+      "description": "Pending task count is growing faster than workers can claim and complete work. Use this as a secondary/corroborating signal; the schedule-to-start p99 alert is the primary capacity page.",
       "first_action": "harvest worker health --output json",
       "dependencies": [
         {
@@ -127,7 +177,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Prometheus exporters commonly expose harvest.queue.depth as harvest_queue_depth. Label only by bounded queue names.",
+        "notes": "Prometheus exporters commonly expose harvest.queue.depth as harvest_queue_depth. Label only by bounded queue names. This depth+derivative heuristic is throughput-specific; use harvest_queue_schedule_to_start_high for the latency-based primary page.",
         "expressions": [
           {
             "kind": "promql",
