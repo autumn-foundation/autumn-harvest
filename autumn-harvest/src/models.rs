@@ -276,6 +276,13 @@ pub struct TaskQueueItem {
     /// Ambient context headers propagated from the parent workflow (issue #481).
     #[serde(skip)]
     pub context_headers: Option<serde_json::Value>,
+    /// Row insert time (issue #501 review). `None` for pre-upgrade rows; the
+    /// schedule-to-start SLI uses `GREATEST(scheduled_at, created_at)` as the true
+    /// eligibility (an immediate task's backdated `scheduled_at` is corrected to its
+    /// insert time, a delayed/retried task keeps its explicit future `scheduled_at`)
+    /// and falls back to `scheduled_at` when this is `None`.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 /// Insert struct for enqueuing a new task.

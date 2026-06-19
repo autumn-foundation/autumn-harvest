@@ -36,25 +36,33 @@ const IMMEDIATE_SCHEDULE_SKEW_SECS: i32 = 5;
 const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration =
     Duration::seconds(IMMEDIATE_SCHEDULE_SKEW_SECS as i64);
 
-/// Compute schedule-to-start latency in seconds for a task, discounting the
-/// immediate-task clock-skew backdating applied by [`EnqueueParams::new`].
+/// Compute schedule-to-start latency in seconds for a task: wall-clock from the
+/// task's *true* eligibility to `start`, clamped to `0`.
 ///
-/// `EnqueueParams::new` sets `scheduled_at = NOW() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE`
-/// so immediate tasks are claimable under the `scheduled_at <= NOW()` predicate
-/// even when host and Postgres clocks differ slightly. Measuring latency
-/// straight off `scheduled_at` would therefore add that fixed allowance to every
-/// immediate task. We subtract it back out and clamp to `0` so a promptly-served
-/// immediate task reports ~0 rather than the skew allowance.
+/// True eligibility is `GREATEST(scheduled_at, created_at)`:
 ///
-/// Trade-off: a genuinely *delayed* or *retried* task (whose `scheduled_at` was
-/// set to an explicit future instant with no skew) that is then served within
-/// the allowance window will under-report by up to the allowance. This is
-/// deliberate — the SLI exists to page on the long-wait tail (p99 well above the
-/// allowance), where the fixed offset is negligible, and a constant positive
-/// bias on every immediate task (the common case) would be far more misleading.
+/// * `EnqueueParams::new` backdates an immediate task's `scheduled_at` to
+///   `NOW() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` so it stays claimable under the
+///   `scheduled_at <= NOW()` predicate even when host and Postgres clocks differ
+///   slightly. Its real eligibility is the insert time `created_at` (the later of
+///   the two), so a promptly-served immediate task reports ~0 — the backdating is
+///   dropped without a fixed-allowance subtraction.
+/// * A genuinely *delayed* or *retried* task sets `scheduled_at` to an explicit
+///   future instant (`>= created_at`, e.g. `requeue_for_retry` uses `NOW() + delay`),
+///   so `GREATEST` selects `scheduled_at` and the full wait is reported with no
+///   discount. The prior fixed-allowance subtraction under-reported these by up to
+///   the allowance and could hide work genuinely over the SLO (issue #501 review).
+///
+/// `created_at` is `None` only for rows enqueued before the column was added; those
+/// fall back to `scheduled_at` (best available) until they drain.
 #[must_use]
-pub fn schedule_to_start_secs(scheduled_at: DateTime<Utc>, start: DateTime<Utc>) -> f64 {
-    (start - scheduled_at - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE)
+pub fn schedule_to_start_secs(
+    scheduled_at: DateTime<Utc>,
+    created_at: Option<DateTime<Utc>>,
+    start: DateTime<Utc>,
+) -> f64 {
+    let eligible = created_at.map_or(scheduled_at, |c| scheduled_at.max(c));
+    (start - eligible)
         .max(Duration::zero())
         .to_std()
         .unwrap_or_default()
@@ -924,10 +932,15 @@ pub async fn queue_depths(
 /// (d) tasks behind a saturated per-key concurrency cap (issue #247) — `claim_task`
 /// refuses every worker while `COUNT(RUNNING) >= concurrency_cap`, so a capped hot
 /// tenant's deferred rows are not claimable and counting their age would page for
-/// *intended* fair-share capping until an in-flight task for that key finishes. The
-/// age also discounts the
-/// `IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` backdating (see [`schedule_to_start_secs`])
-/// so a freshly-enqueued immediate task reports ~0, and is clamped to `0`.
+/// *intended* fair-share capping until an in-flight task for that key finishes.
+///
+/// The age is measured from each task's *true* eligibility,
+/// `GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))` (see
+/// [`schedule_to_start_secs`]): an immediate task's backdated `scheduled_at` is
+/// corrected to its `created_at` insert time so it reports ~0, while a delayed/retried
+/// task's explicit future `scheduled_at` is used verbatim (no fixed discount that
+/// would under-report a real over-SLO wait). Pre-upgrade rows with NULL `created_at`
+/// fall back to `scheduled_at`. Clamped to `0`.
 ///
 /// (The finer-grained claim filters — build-id, sticky routing, capabilities — are
 /// deliberately *not* mirrored here: those gate *which worker* may claim, not whether
@@ -957,7 +970,7 @@ pub async fn oldest_pending_ages(
     let rows: Vec<Row> = diesel::sql_query(
         "SELECT queue_name, \
                 GREATEST( \
-                    EXTRACT(EPOCH FROM (NOW() - MIN(scheduled_at))) - $2, \
+                    EXTRACT(EPOCH FROM (NOW() - MIN(GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))))), \
                     0 \
                 )::DOUBLE PRECISION AS age_secs \
          FROM harvest_task_queue \
@@ -990,7 +1003,7 @@ pub async fn oldest_pending_ages(
            ) \
            AND ( \
                rate_limit_key IS NULL \
-               OR activity_name = ANY($3) \
+               OR activity_name = ANY($2) \
                OR EXISTS ( \
                    SELECT 1 FROM harvest_rate_limit_buckets b \
                    WHERE b.key = harvest_task_queue.rate_limit_key \
@@ -1000,7 +1013,6 @@ pub async fn oldest_pending_ages(
          GROUP BY queue_name",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-    .bind::<diesel::sql_types::Double, _>(f64::from(IMMEDIATE_SCHEDULE_SKEW_SECS))
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
     .load(conn)
     .await
@@ -1688,27 +1700,52 @@ mod tests {
     }
 
     #[test]
-    fn schedule_to_start_discounts_skew_allowance() {
+    fn schedule_to_start_uses_eligibility_floor() {
         let now = Utc::now();
 
-        // Immediate task (EnqueueParams::new backdates scheduled_at by the skew
-        // allowance) claimed instantly should report ~0, not the allowance.
-        let immediate = now - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
+        // Immediate task: scheduled_at backdated by the skew allowance, created_at is
+        // the real insert-time eligibility. Claimed instantly it must report ~0, not
+        // the backdating (floor = created_at).
+        let created = now;
+        let immediate_scheduled = now - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
         assert!(
-            schedule_to_start_secs(immediate, now) < 0.001,
-            "promptly-served immediate task must not report the skew allowance"
+            schedule_to_start_secs(immediate_scheduled, Some(created), now) < 0.001,
+            "promptly-served immediate task must not report the skew backdating"
         );
 
-        // A real wait beyond the allowance is reported net of the allowance.
-        let waited = now - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE - Duration::seconds(10);
-        let secs = schedule_to_start_secs(waited, now);
+        // Immediate task that genuinely waited 10s: enqueued (created) 10s ago, with
+        // scheduled_at backdated a further skew. Reports the full 10s (floor = created).
+        let created_10s_ago = now - Duration::seconds(10);
+        let scheduled_backdated = created_10s_ago - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
+        let secs = schedule_to_start_secs(scheduled_backdated, Some(created_10s_ago), now);
+        assert!((secs - 10.0).abs() < 0.05, "expected ~10s wait, got {secs}");
+
+        // Delayed/retried task (issue #501 review): scheduled_at set to an explicit
+        // instant 10s ago with NO backdating, created_at long before. The full 10s
+        // must be reported — the prior fixed discount would have under-reported it.
+        let scheduled_explicit = now - Duration::seconds(10);
+        let created_long_ago = now - Duration::seconds(300);
+        let delayed = schedule_to_start_secs(scheduled_explicit, Some(created_long_ago), now);
         assert!(
-            (secs - 10.0).abs() < 0.01,
-            "expected ~10s net wait, got {secs}"
+            (delayed - 10.0).abs() < 0.05,
+            "delayed/retried task must report its full wait with no discount, got {delayed}"
         );
 
-        // Never negative, even if start precedes scheduled_at (clock skew).
-        assert!(schedule_to_start_secs(now + Duration::seconds(1), now) < f64::EPSILON);
+        // Pre-upgrade row (created_at = None) falls back to scheduled_at.
+        let legacy = schedule_to_start_secs(now - Duration::seconds(7), None, now);
+        assert!(
+            (legacy - 7.0).abs() < 0.05,
+            "None created_at must use scheduled_at, got {legacy}"
+        );
+
+        // Never negative, even if start precedes the eligibility floor.
+        assert!(
+            schedule_to_start_secs(
+                now + Duration::seconds(1),
+                Some(now - Duration::seconds(300)),
+                now
+            ) < f64::EPSILON
+        );
     }
 
     #[test]

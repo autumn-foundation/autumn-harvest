@@ -44,6 +44,8 @@ static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
+    include_str!("../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
+    "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
     include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),

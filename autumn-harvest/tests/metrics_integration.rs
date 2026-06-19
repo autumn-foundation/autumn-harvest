@@ -48,6 +48,8 @@ use uuid::Uuid;
 const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
     "\n",
+    include_str!("../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
+    "\n",
     include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
     "\n",
     include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
@@ -2381,9 +2383,10 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
     .await
     .expect("append WorkflowStarted failed");
 
-    // Enqueue with scheduled_at well past the 5s skew allowance so the recorded
-    // wait is measurably positive *after* skew correction (issue #501): a 13s
-    // backdated schedule yields a >= 8s net wait.
+    // Enqueue a task that genuinely became eligible 13s ago. The SLI measures from
+    // GREATEST(scheduled_at, created_at) (issue #501 review), so backdate BOTH:
+    // scheduled_at via the param and created_at (DB-defaulted to NOW()) via an
+    // explicit UPDATE. A 13s-old eligibility yields a >= 5s recorded wait.
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
@@ -2391,6 +2394,14 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET created_at = NOW() - INTERVAL '13 seconds' \
+         WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("backdate created_at failed");
 
     let recording = Arc::new(RecordingMetrics::default());
     let telemetry = Arc::new(
@@ -2444,10 +2455,10 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
         "emission must be labeled by queue; got: {}",
         sts.labels_debug
     );
-    // wait_secs is recorded as a formatted f64 string. With a 13s backdated
-    // schedule and the 5s skew allowance discounted, the net wait must be a
-    // robustly positive value (>= 8s, growing with claim/dispatch delay) — this
-    // proves skew correction did not zero out a real wait.
+    // wait_secs is recorded as a formatted f64 string. With eligibility 13s in the
+    // past (GREATEST(scheduled_at, created_at), both backdated 13s), the recorded
+    // wait must be a robustly positive value (>= 5s, growing with claim/dispatch
+    // delay) — proving the SLI reports a real wait from the true eligibility floor.
     let wait_secs: f64 = sts
         .labels_debug
         .split(',')
@@ -2457,7 +2468,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
         .expect("wait_secs label must be present and parseable");
     assert!(
         wait_secs >= 5.0,
-        "wait_secs must reflect real wait net of skew allowance; got {wait_secs}"
+        "wait_secs must reflect the real wait from the eligibility floor; got {wait_secs}"
     );
 }
 
@@ -2518,8 +2529,9 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     .await
     .expect("append WorkflowStarted failed");
 
-    // Enqueue with scheduled_at well past the 5s skew allowance so the reported
-    // age is positive after skew correction (issue #501): 13s backdated → >= 8s.
+    // Enqueue a task eligible 13s ago. The age is measured from
+    // GREATEST(scheduled_at, created_at) (issue #501 review), so backdate both:
+    // scheduled_at via the param and created_at via an explicit UPDATE.
     let mut enqueue_params =
         EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
     enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
@@ -2527,6 +2539,14 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     queue_mod::enqueue(&mut conn, &enqueue_params)
         .await
         .expect("enqueue failed");
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET created_at = NOW() - INTERVAL '13 seconds' \
+         WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("backdate created_at failed");
 
     let queues = vec!["default".to_string()];
 

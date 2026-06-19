@@ -4082,7 +4082,7 @@ async fn process_activity_task(
     // the local concurrency permit in `dispatch_task` is still captured.
     registry.telemetry().metrics.record_schedule_to_start(
         &task.queue_name,
-        queue::schedule_to_start_secs(task.scheduled_at, chrono::Utc::now()),
+        queue::schedule_to_start_secs(task.scheduled_at, task.created_at, chrono::Utc::now()),
     );
 
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
@@ -5604,7 +5604,7 @@ async fn process_workflow_task(
     // did in fact run.
     telemetry.metrics.record_schedule_to_start(
         &task.queue_name,
-        queue::schedule_to_start_secs(task.scheduled_at, chrono::Utc::now()),
+        queue::schedule_to_start_secs(task.scheduled_at, task.created_at, chrono::Utc::now()),
     );
 
     let started_at = std::time::Instant::now();
