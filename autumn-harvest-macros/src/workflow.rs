@@ -496,6 +496,21 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let workflow_id = workflow_id.into();
                     let input = #serialize_args;
                     let info = #public_info_name();
+                    // Issue #499: a debounced start is deferred until the burst
+                    // settles, so no execution (and therefore no exec_id-keyed
+                    // handle) exists yet. The typed client's immediate-start
+                    // contract can't express that, so refuse explicitly instead
+                    // of silently bypassing the debounce policy (split-brain).
+                    if let ::std::option::Option::Some(policy) = info.debounce {
+                        if ::autumn_harvest::debounce::resolve_debounce_key(policy.key_expr, &input).is_some() {
+                            return ::std::result::Result::Err(::autumn_harvest::error::HarvestError::Config(
+                                ::std::format!(
+                                    "workflow '{}' declares a debounce policy; the typed client's immediate-start API cannot express a deferred debounced start — start it via the HTTP route POST /workflows/{}/start, which routes through the debounce admission gate",
+                                    info.name, info.name,
+                                ),
+                            ));
+                        }
+                    }
                     let exec_id = opts.exec_id.unwrap_or_else(|| {
                         let shard = client.pick_shard_for_new_workflow(info.name, &workflow_id);
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
