@@ -20,6 +20,7 @@ Then install an exporter and wire the recorder before starting any workers:
 ```rust
 use autumn_harvest::metrics_rs_adapter::MetricsRsRecorder;
 use autumn_harvest::telemetry::TelemetryConfig;
+use metrics_exporter_prometheus::Matcher;
 use std::sync::Arc;
 
 // 1. Install the Prometheus exporter (do this once at process start).
@@ -29,13 +30,40 @@ use std::sync::Arc;
 //    boundaries. The starter alert pack pages on
 //    `histogram_quantile(0.99, rate(harvest_queue_schedule_to_start_bucket[5m]))`,
 //    which only exists when buckets are set — and server-side `_bucket` series
-//    are the only form you can aggregate across replicas. Configure
-//    seconds-oriented buckets for the harvest histograms so those rules evaluate:
+//    are the only form you can aggregate across replicas.
+//
+//    Scope the seconds-oriented boundaries to the *latency* histograms with
+//    `set_buckets_for_metric` rather than the global `set_buckets`. A global
+//    bucket set is applied to every histogram, including non-duration ones such
+//    as `harvest.workflow.history_size` (durable event counts, soft threshold
+//    10k) and the payload-size histogram (bytes) — seconds buckets would dump
+//    every sample above 600 into `+Inf` and break count/byte dashboards.
+const LATENCY_BUCKETS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+    10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+];
 metrics_exporter_prometheus::PrometheusBuilder::new()
-    .set_buckets(&[
-        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-        10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
-    ])
+    .set_buckets_for_metric(
+        Matcher::Full("harvest.queue.schedule_to_start".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
+    .set_buckets_for_metric(
+        Matcher::Full("harvest.workflow.duration".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
+    .set_buckets_for_metric(
+        Matcher::Full("harvest.activity.duration".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
+    // history-size is a *count* histogram (durable events), not seconds — give
+    // it its own boundaries so it stays usable for count dashboards/alerts.
+    .set_buckets_for_metric(
+        Matcher::Full("harvest.workflow.history_size".into()),
+        &[10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0],
+    )
     .expect("valid bucket boundaries")
     .install()
     .expect("failed to install Prometheus exporter");

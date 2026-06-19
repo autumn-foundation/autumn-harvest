@@ -4070,6 +4070,21 @@ async fn process_activity_task(
         // conn is dropped here, returning the slot to the pool
     };
 
+    // Schedule-to-start latency (issue #501): record here, once the activity has
+    // genuinely started (ActivityStarted appended). This is *past* the
+    // dispatch-time no-op gates — the rate-limit defer (`defer_rate_limited_task`)
+    // and the already-terminal/cancelled no-op above both return before reaching
+    // this point — so a deferred task no longer inflates the started-task count
+    // and depresses the p99 capacity SLI during throttling. The circuit-breaker
+    // short-circuit path falls through here too: it is a genuine start that fails
+    // fast with CircuitOpen, so it is correctly counted. `schedule_to_start_secs`
+    // measures from task eligibility, so the time the task spent waiting behind
+    // the local concurrency permit in `dispatch_task` is still captured.
+    registry.telemetry().metrics.record_schedule_to_start(
+        &task.queue_name,
+        queue::schedule_to_start_secs(task.scheduled_at, chrono::Utc::now()),
+    );
+
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
         opened_at,
         retry_after,
@@ -5577,6 +5592,21 @@ async fn process_workflow_task(
             .metrics
             .record_workflow_started(&prepared.execution.workflow_name, &task.queue_name);
     }
+
+    // Schedule-to-start latency (issue #501): record here, at the point the
+    // workflow handler genuinely begins executing, rather than at permit
+    // acquisition in `dispatch_task`. Measuring at handler start keeps this a
+    // true *wait* metric (it does not absorb the handler's own execution time)
+    // while still capturing the local-permit wait, since `schedule_to_start_secs`
+    // measures from task eligibility. The common paused case never reaches here —
+    // `queue::claim_task` skips PAUSED executions — so the only re-park that can
+    // record a sample is the rare claimed-then-paused race below, whose handler
+    // did in fact run.
+    telemetry.metrics.record_schedule_to_start(
+        &task.queue_name,
+        queue::schedule_to_start_secs(task.scheduled_at, chrono::Utc::now()),
+    );
+
     let started_at = std::time::Instant::now();
 
     // Drive the workflow in a loop so that local activities can be executed
@@ -7535,13 +7565,16 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task"
                 );
-                // schedule-to-start latency is recorded in `dispatch_task` after
-                // the local concurrency permit is acquired, not here at claim
-                // time: the worker can over-claim past `max_concurrent_*` (the
-                // semaphore gates execution, not claiming), so measuring at claim
-                // would hide the time a task spends waiting behind a local permit
-                // on a saturated worker — exactly the capacity bottleneck the SLI
-                // is meant to page on.
+                // schedule-to-start latency is recorded once the handler
+                // genuinely begins (in `process_workflow_task` /
+                // `process_activity_task`, past the dispatch-time defer/no-op
+                // gates), not here at claim time: the worker can over-claim past
+                // `max_concurrent_*` (the semaphore gates execution, not
+                // claiming), so measuring at claim would hide the time a task
+                // spends waiting behind a local permit on a saturated worker —
+                // exactly the capacity bottleneck the SLI is meant to page on.
+                // `schedule_to_start_secs` measures from task eligibility, so that
+                // permit wait is still captured in the recorded sample.
                 self.dispatch_task(task, pool);
                 true
             }
@@ -7618,10 +7651,6 @@ impl Worker {
         let timeout_strikes = Arc::clone(&self.workflow_task_timeout_strikes);
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
-        // Captured for the schedule-to-start histogram, recorded below once the
-        // concurrency permit is held (issue #501).
-        let sts_scheduled_at = task.scheduled_at;
-        let sts_queue_name = task.queue_name.clone();
 
         tokio::spawn(async move {
             // Acquire semaphore permit — blocks if at concurrency limit.
@@ -7630,17 +7659,14 @@ impl Worker {
                 return;
             };
 
-            // Record schedule-to-start latency now that the task is about to
-            // execute: wall-clock seconds from eligibility to local-capacity
-            // acquisition. Recording here (rather than at claim time) captures
-            // time spent waiting behind the concurrency permit on a saturated
-            // worker. `schedule_to_start_secs` discounts the immediate-task skew
-            // allowance and clamps to 0 (issue #501).
-            let wait_secs = queue::schedule_to_start_secs(sts_scheduled_at, chrono::Utc::now());
-            registry
-                .telemetry()
-                .metrics
-                .record_schedule_to_start(&sts_queue_name, wait_secs);
+            // schedule-to-start latency is recorded inside `process_workflow_task`
+            // / `process_activity_task` at the point the handler genuinely begins
+            // — *after* the dispatch-time defer/no-op gates (rate-limit defer,
+            // claimed-then-paused re-park). Recording it here, before those gates,
+            // would count a rate-limit deferral as a started task and depress the
+            // p99 capacity SLI during throttling (issue #501). The sample still
+            // captures the local-permit wait above because `schedule_to_start_secs`
+            // measures from task eligibility, not from this `acquire()`.
 
             tracing::info!(
                 task_id = %task_id,
