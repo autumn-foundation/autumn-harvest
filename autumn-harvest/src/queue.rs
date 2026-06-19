@@ -909,10 +909,14 @@ pub async fn queue_depths(
 ///
 /// Mirrors the part of [`claim_task`]'s eligibility predicate that determines
 /// whether a worker is *supposed* to pick a task up: `state = 'PENDING' AND
-/// scheduled_at <= NOW()`, **excluding** workflow tasks whose execution is
-/// `PAUSED` (issue #383) — a paused execution's parked task is intentionally not
-/// claimable, so counting its age would inflate the saturation signal and fire
-/// false alerts until the workflow is resumed. The age also discounts the
+/// scheduled_at <= NOW()`, **excluding** (a) tasks whose `schedule_to_close_at`
+/// deadline has already elapsed (issue #378) — `claim_task` skips them too, so a
+/// past-deadline row awaiting the timeout scanner is not claimable and counting
+/// its age would page for work no worker may start; and (b) workflow tasks whose
+/// execution is `PAUSED` (issue #383) — a paused execution's parked task is
+/// intentionally not claimable, so counting its age would inflate the saturation
+/// signal and fire false alerts until the workflow is resumed. The age also
+/// discounts the
 /// `IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` backdating (see [`schedule_to_start_secs`])
 /// so a freshly-enqueued immediate task reports ~0, and is clamped to `0`.
 ///
@@ -950,6 +954,10 @@ pub async fn oldest_pending_ages(
          WHERE queue_name = ANY($1) \
            AND state = 'PENDING' \
            AND scheduled_at <= NOW() \
+           AND ( \
+               schedule_to_close_at IS NULL \
+               OR schedule_to_close_at > NOW() \
+           ) \
            AND ( \
                task_type <> 'workflow' \
                OR workflow_exec_id IS NULL \

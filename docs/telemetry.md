@@ -23,7 +23,20 @@ use autumn_harvest::telemetry::TelemetryConfig;
 use std::sync::Arc;
 
 // 1. Install the Prometheus exporter (do this once at process start).
+//
+//    `metrics-exporter-prometheus` renders every histogram as a Prometheus
+//    *summary* (client-side quantiles) UNLESS you configure explicit bucket
+//    boundaries. The starter alert pack pages on
+//    `histogram_quantile(0.99, rate(harvest_queue_schedule_to_start_bucket[5m]))`,
+//    which only exists when buckets are set — and server-side `_bucket` series
+//    are the only form you can aggregate across replicas. Configure
+//    seconds-oriented buckets for the harvest histograms so those rules evaluate:
 metrics_exporter_prometheus::PrometheusBuilder::new()
+    .set_buckets(&[
+        0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+        10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    ])
+    .expect("valid bucket boundaries")
     .install()
     .expect("failed to install Prometheus exporter");
 

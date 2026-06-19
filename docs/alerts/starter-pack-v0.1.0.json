@@ -127,7 +127,7 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "harvest.queue.schedule_to_start is exposed as harvest_queue_schedule_to_start_{bucket,count,sum}. Use histogram_quantile(0.99, ...) for the p99. Replace the queue label value with your actual queue name.",
+        "notes": "harvest.queue.schedule_to_start is exposed as harvest_queue_schedule_to_start_{bucket,count,sum} ONLY when the Prometheus exporter is configured with histogram bucket boundaries (PrometheusBuilder::set_buckets, see docs/telemetry.md). Without buckets, metrics-exporter-prometheus emits a summary (no _bucket series) and this histogram_quantile rule will not evaluate. Use histogram_quantile(0.99, ...) for the p99. Replace the queue label value with your actual queue name.",
         "expressions": [
           {
             "kind": "promql",
