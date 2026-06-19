@@ -6525,6 +6525,7 @@ fn spawn_queue_depth_sampler(
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     queues: Vec<String>,
     interval: Duration,
+    circuit_breaker_activities: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -6565,7 +6566,8 @@ fn spawn_queue_depth_sampler(
             }
 
             // Sample oldest-pending-age gauge alongside queue depth.
-            match queue::oldest_pending_ages(&mut conn, &queues).await {
+            match queue::oldest_pending_ages(&mut conn, &queues, &circuit_breaker_activities).await
+            {
                 Ok(ages) => {
                     let mut observed: HashSet<&str> = HashSet::new();
                     for (queue_name, age_secs) in &ages {
@@ -7136,6 +7138,7 @@ impl Worker {
         tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_monitoring_tasks(&self, pool: &DbPool) -> WorkerMonitoringHandles {
         let queue_depth_sampler = spawn_queue_depth_sampler(
             pool.clone(),
@@ -7143,6 +7146,10 @@ impl Worker {
             self.registry.telemetry().clone(),
             self.config.queues.clone(),
             self.config.poll_interval,
+            self.registry
+                .circuit_breakers()
+                .tracked_activity_names()
+                .to_vec(),
         );
         let concurrency_sampler = spawn_concurrency_sampler(
             pool.clone(),

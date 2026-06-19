@@ -912,18 +912,23 @@ pub async fn queue_depths(
 /// scheduled_at <= NOW()`, **excluding** (a) tasks whose `schedule_to_close_at`
 /// deadline has already elapsed (issue #378) — `claim_task` skips them too, so a
 /// past-deadline row awaiting the timeout scanner is not claimable and counting
-/// its age would page for work no worker may start; and (b) workflow tasks whose
+/// its age would page for work no worker may start; (b) workflow tasks whose
 /// execution is `PAUSED` (issue #383) — a paused execution's parked task is
 /// intentionally not claimable, so counting its age would inflate the saturation
-/// signal and fire false alerts until the workflow is resumed. The age also
-/// discounts the
+/// signal and fire false alerts until the workflow is resumed; and (c) rate-limited
+/// activity tasks whose token bucket is currently below one token (issue #369) —
+/// `claim_task` skips these until tokens refill, so counting their age would page
+/// for *intended* throttling on a deliberately rate-limited queue. Circuit-breaker
+/// activities (`circuit_breaker_activities`) skip the claim-time rate-limit gate
+/// entirely, so they are exempt from this exclusion exactly as in `claim_task`. The
+/// age also discounts the
 /// `IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` backdating (see [`schedule_to_start_secs`])
 /// so a freshly-enqueued immediate task reports ~0, and is clamped to `0`.
 ///
-/// (The finer-grained claim filters — build-id, concurrency cap, rate limit,
-/// sticky routing, capabilities — are deliberately *not* mirrored here: those
-/// gate *which worker* may claim, not whether the task is work that needs doing,
-/// so they belong to worker-coverage signals rather than the queue-age gauge.)
+/// (The finer-grained claim filters — build-id, concurrency cap, sticky routing,
+/// capabilities — are deliberately *not* mirrored here: those gate *which worker*
+/// may claim, not whether the task is work that needs doing, so they belong to
+/// worker-coverage signals rather than the queue-age gauge.)
 ///
 /// Only queues that have at least one eligible task appear in the result; the
 /// sampler is responsible for resetting the gauge to `0` for queues with no
@@ -935,6 +940,7 @@ pub async fn queue_depths(
 pub async fn oldest_pending_ages(
     conn: &mut AsyncPgConnection,
     queues: &[String],
+    circuit_breaker_activities: &[String],
 ) -> HarvestResult<Vec<(String, f64)>> {
     #[derive(diesel::QueryableByName)]
     struct Row {
@@ -967,10 +973,20 @@ pub async fn oldest_pending_ages(
                      AND e.state = 'PAUSED' \
                ) \
            ) \
+           AND ( \
+               rate_limit_key IS NULL \
+               OR activity_name = ANY($3) \
+               OR EXISTS ( \
+                   SELECT 1 FROM harvest_rate_limit_buckets b \
+                   WHERE b.key = harvest_task_queue.rate_limit_key \
+                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+               ) \
+           ) \
          GROUP BY queue_name",
     )
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
     .bind::<diesel::sql_types::Double, _>(f64::from(IMMEDIATE_SCHEDULE_SKEW_SECS))
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;

@@ -2531,7 +2531,7 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     let queues = vec!["default".to_string()];
 
     // Phase 1: there is an eligible task — age must be > 0.
-    let ages = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues)
+    let ages = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues, &[])
         .await
         .expect("oldest_pending_ages query must succeed");
     assert_eq!(ages.len(), 1, "expected one queue with an eligible task");
@@ -2550,7 +2550,7 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
     .await
     .expect("update task to FAILED failed");
 
-    let ages_after_drain = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues)
+    let ages_after_drain = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues, &[])
         .await
         .expect("oldest_pending_ages query must succeed after drain");
     assert!(
@@ -2629,7 +2629,7 @@ async fn oldest_pending_age_excludes_paused_executions() {
     let queues = vec!["default".to_string()];
 
     // While the execution is RUNNING the task is counted.
-    let ages = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues)
+    let ages = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues, &[])
         .await
         .expect("oldest_pending_ages query must succeed");
     assert_eq!(ages.len(), 1, "running execution's task must be counted");
@@ -2644,11 +2644,145 @@ async fn oldest_pending_age_excludes_paused_executions() {
     .await
     .expect("pause execution failed");
 
-    let ages_paused = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues)
+    let ages_paused = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues, &[])
         .await
         .expect("oldest_pending_ages query must succeed while paused");
     assert!(
         ages_paused.is_empty(),
         "paused execution's task must be excluded; got {ages_paused:?}"
+    );
+}
+
+/// Verifies that `oldest_pending_ages` excludes a rate-limited activity task whose
+/// token bucket is below one token, mirroring `claim_task`'s rate-limit gating
+/// (issue #369 / #501 review): a deliberately throttled task is intentionally not
+/// claimable until tokens refill, so counting its age would page for *intended*
+/// rate limiting. A circuit-breaker activity (passed in `circuit_breaker_activities`)
+/// is exempt because it skips the claim-time rate-limit gate, exactly as in
+/// `claim_task`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[allow(clippy::too_many_lines)]
+async fn oldest_pending_age_excludes_rate_limited_tasks() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({"msg": "rate limit age test"});
+
+    let exec_row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "rl_age_test_workflow",
+        workflow_id: &format!("rl-age-{}", Uuid::new_v4()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: workflow_input.clone(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&exec_row)
+        .execute(&mut conn)
+        .await
+        .expect("insert workflow execution failed");
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    // Bucket starts with tokens available (>= 1).
+    let rate_limit_key = format!("rl-age-{}", Uuid::new_v4());
+    diesel::sql_query(
+        "INSERT INTO harvest_rate_limit_buckets \
+            (key, refill_rate, burst, tokens, last_refilled_at, created_at, updated_at) \
+         VALUES ($1, 0.0, 5.0, 5.0, NOW(), NOW(), NOW())",
+    )
+    .bind::<diesel::sql_types::Text, _>(&rate_limit_key)
+    .execute(&mut conn)
+    .await
+    .expect("insert rate-limit bucket failed");
+
+    // Enqueue an eligible, rate-limited activity task aged past the skew allowance.
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Activity, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.activity_name = Some("rl_activity".to_string());
+    enqueue_params.activity_id = Some(Uuid::new_v4());
+    enqueue_params.rate_limit_key = Some(rate_limit_key.clone());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(13);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let queues = vec!["default".to_string()];
+
+    // Tokens available → the task is claimable and counted.
+    let ages = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues, &[])
+        .await
+        .expect("oldest_pending_ages query must succeed");
+    assert_eq!(
+        ages.len(),
+        1,
+        "task with an available rate-limit token must be counted; got {ages:?}"
+    );
+
+    // Drain the bucket below one token (no refill) → claim_task skips it, so the
+    // age query must exclude it too.
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets \
+         SET tokens = 0.0, refill_rate = 0.0, last_refilled_at = NOW() \
+         WHERE key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&rate_limit_key)
+    .execute(&mut conn)
+    .await
+    .expect("drain rate-limit bucket failed");
+
+    let ages_throttled = autumn_harvest::queue::oldest_pending_ages(&mut conn, &queues, &[])
+        .await
+        .expect("oldest_pending_ages query must succeed while throttled");
+    assert!(
+        ages_throttled.is_empty(),
+        "throttled (empty-bucket) task must be excluded; got {ages_throttled:?}"
+    );
+
+    // …but a circuit-breaker activity is exempt from the rate-limit gate, so when
+    // its name is supplied it must be counted again despite the empty bucket.
+    let ages_cb_exempt = autumn_harvest::queue::oldest_pending_ages(
+        &mut conn,
+        &queues,
+        &["rl_activity".to_string()],
+    )
+    .await
+    .expect("oldest_pending_ages query must succeed with circuit-breaker exemption");
+    assert_eq!(
+        ages_cb_exempt.len(),
+        1,
+        "circuit-breaker activity skips the rate-limit gate and must be counted; got {ages_cb_exempt:?}"
     );
 }
