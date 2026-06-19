@@ -503,84 +503,37 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let workflow_id = workflow_id.into();
                     let input = #serialize_args;
                     let info = #public_info_name();
-                    // Issue #499: a debounced start is deferred until the burst
-                    // settles, so no execution (and therefore no exec_id-keyed
-                    // handle) exists yet. Route through the debounce admission
-                    // gate and return HarvestError::Debounced so callers can
-                    // correlate the eventual run via workflow_id.
+                    // Issue #499: debounce admission is owned exclusively by the
+                    // HTTP start route (`POST /workflows/{name}/start`). That route
+                    // has the registry + shard-router context the gate requires:
+                    // it routes the pending record onto the *debounce-key's* shard,
+                    // resolves the effective start options (SLA/timeout defaults +
+                    // server ceilings, operator metadata), enforces the input cap,
+                    // rejects `start_at`/`delay`, and preserves idempotent retries.
                     //
-                    // Shard note: `conn` is the connection for the
-                    // workflow_id-derived shard. In a single-shard deployment
-                    // this is always correct. In a multi-shard deployment the
-                    // caller must supply the debounce-key's shard connection;
-                    // this is documented as shard-local (consistent with #247).
+                    // The typed stub cannot reproduce that correctly: it only
+                    // receives the workflow_id-derived `conn` (not the debounce-key
+                    // shard's connection) and has no registry handle, and a deferred
+                    // debounced start has no exec_id-keyed handle to return anyway.
+                    // So rather than silently bypassing the policy or admitting onto
+                    // the wrong shard, reject early with a clear pointer to the HTTP
+                    // route. (Compile-time `#[workflow(debounce(...))]` is visible
+                    // here via `info.debounce`; a fluent `.with_debounce(...)` policy
+                    // is registry-only and is enforced by the HTTP route instead.)
                     if let ::std::option::Option::Some(debounce_policy) = info.debounce {
-                        if let ::std::option::Option::Some(ref debounce_key) =
-                            ::autumn_harvest::debounce::resolve_debounce_key(debounce_policy.key_expr, &input)
+                        if ::autumn_harvest::debounce::resolve_debounce_key(
+                            debounce_policy.key_expr,
+                            &input,
+                        )
+                        .is_some()
                         {
-                            let effective_max_wait = debounce_policy.max_wait
-                                .unwrap_or_else(|| client.default_debounce_max_wait());
-                            let (concurrency_key, concurrency_limit) = if let Some(ref cpolicy) = info.concurrency {
-                                let key = ::autumn_harvest::concurrency::resolve_concurrency_key(&cpolicy.key_expr, &input);
-                                (key, ::std::option::Option::Some(cpolicy.limit))
-                            } else {
-                                (::std::option::Option::None, ::std::option::Option::None)
-                            };
-                            let execution_timeout_secs = opts.execution_timeout
-                                .or(info.execution_timeout)
-                                .and_then(|d| ::autumn_harvest::chrono::Duration::from_std(d).ok())
-                                .map(|d| d.num_seconds());
-                            let sla_secs = opts.sla
-                                .and_then(|d| ::autumn_harvest::chrono::Duration::from_std(d).ok())
-                                .map(|d| d.num_seconds());
-                            let max_execution_timeout_ceiling_secs = client
-                                .max_workflow_execution_timeout()
-                                .and_then(|d| ::autumn_harvest::chrono::Duration::from_std(d).ok())
-                                .map(|d| d.num_seconds());
-                            let admit_params = ::autumn_harvest::debounce::AdmitDebounceParams {
-                                workflow_name: info.name,
-                                debounce_key,
-                                workflow_id: &workflow_id,
-                                queue_name: opts.queue_name.as_deref().unwrap_or("default"),
-                                last_input: input.clone(),
-                                window: debounce_policy.window,
-                                max_wait: effective_max_wait,
-                                shard_id: 0,
-                                start_options: ::autumn_harvest::debounce::DebounceStartOptions {
-                                    reuse_policy: opts.reuse_policy.as_ref().and_then(|p| {
-                                        ::autumn_harvest::serde_json::to_value(p)
-                                            .ok()
-                                            .and_then(|v| v.as_str().map(str::to_string))
-                                    }),
-                                    execution_timeout_secs,
-                                    memo: opts.memo.clone(),
-                                    search_attrs: opts.search_attrs.clone(),
-                                    sla_secs,
-                                    context_headers: opts.context_headers.clone(),
-                                    priority: opts.priority.map(|p| p.as_i32()),
-                                    concurrency_key,
-                                    concurrency_limit,
-                                    owner: info.owner.map(str::to_string),
-                                    runbook_url: info.runbook_url.map(str::to_string),
-                                    severity: info.severity.map(str::to_string),
-                                    max_execution_timeout_ceiling_secs,
-                                    max_workflow_input_bytes: ::std::option::Option::Some(
-                                        client.max_workflow_input_bytes(info.max_input_bytes)
-                                    ),
-                                    trace_context: opts.trace_context.clone(),
-                                },
-                            };
-                            let outcome = ::autumn_harvest::debounce::admit_debounced_start(
-                                conn, admit_params
-                            ).await?;
                             return ::std::result::Result::Err(
-                                ::autumn_harvest::error::HarvestError::Debounced {
-                                    workflow_name: info.name.to_string(),
-                                    workflow_id: outcome.workflow_id,
-                                    debounce_key: outcome.debounce_key,
-                                    fire_at: outcome.fire_at,
-                                    pending_count: outcome.pending_count,
-                                }
+                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                    "workflow '{0}' has a debounce policy; debounced starts \
+                                     must use the HTTP start route POST /workflows/{0}/start \
+                                     (the typed client cannot express a deferred debounced start)",
+                                    info.name,
+                                )),
                             );
                         }
                     }

@@ -5840,7 +5840,21 @@ async fn start_workflow(
         // workflow_id that is already active. This guard only runs when a
         // debounce policy exists and the key resolves, so it does not add a
         // DB query to every workflow start.
-        let debounce_skip_for_live_execution = {
+        // `terminate_if_running` is excluded from this bypass: that policy asks
+        // for the new request to *replace* any live run, but for a debounced
+        // workflow the replacement must still settle through the quiet window —
+        // otherwise every retrigger in a burst would terminate+restart a run
+        // immediately, defeating debounce for exactly the replacement policy. So
+        // only the non-terminating policies (AllowDuplicate / RejectDuplicate /
+        // AllowDuplicateFailedOnly) bypass debounce when a live execution exists,
+        // where the normal start path is the correct idempotent answer (return
+        // the live run, or 409). terminate_if_running falls through to debounce
+        // admission and the eventual fired run applies the replacement.
+        let reuse_is_terminating = matches!(
+            request.reuse_policy.as_deref(),
+            Some("terminate_if_running")
+        );
+        let debounce_skip_for_live_execution = !reuse_is_terminating && {
             let mut id_check_conn = match db_conn_for_shard(&api_state, shard).await {
                 Ok(c) => c,
                 Err(e) => return e.into_response(),
