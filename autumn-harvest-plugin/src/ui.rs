@@ -274,10 +274,16 @@ struct BlockedOnData {
     external_tasks: Vec<ExternalTask>,
     timers: Vec<HarvestTimer>,
     signals: Vec<HarvestSignal>,
-    /// Response-side byte cap applied to each pending activity's heartbeat
-    /// checkpoint payload before rendering (#252 activity-result cap, #503).
-    /// `0` = uncapped.
+    /// Default response-side byte cap applied to a pending activity's heartbeat
+    /// checkpoint payload before rendering (global #252 activity-result cap,
+    /// #503). `0` = uncapped. Used when no per-activity override applies.
     heartbeat_details_cap: u64,
+    /// Per-activity effective heartbeat checkpoint cap, keyed by activity name
+    /// (per-activity `max_result_bytes` raised against the global ceiling),
+    /// matching the API stack handler so configured large-payload activities
+    /// keep full checkpoint visibility (#503 review). Missing names fall back to
+    /// `heartbeat_details_cap`.
+    heartbeat_caps: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1020,13 +1026,14 @@ async fn workflow_detail_ui(
         autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
         |r| r.registry().max_activity_result_bytes,
     );
-    let blocked_on = load_blocked_on_data(
+    let mut blocked_on = load_blocked_on_data(
         &mut conn,
         exec_uuid,
         &execution.state,
         heartbeat_details_cap,
     )
     .await?;
+    resolve_blocked_on_heartbeat_caps(&api_state, &mut blocked_on);
 
     // Resolve the continue-as-new threshold from the runtime registry if available.
     // This is a lightweight read of an in-memory value — no extra DB query.
@@ -1070,6 +1077,7 @@ async fn load_blocked_on_data(
             timers: vec![],
             signals: vec![],
             heartbeat_details_cap,
+            heartbeat_caps: std::collections::HashMap::new(),
         });
     }
 
@@ -1131,7 +1139,28 @@ async fn load_blocked_on_data(
         timers,
         signals,
         heartbeat_details_cap,
+        heartbeat_caps: std::collections::HashMap::new(),
     })
+}
+
+/// Resolve each pending activity's effective heartbeat checkpoint cap
+/// (per-activity `max_result_bytes` raised against the global ceiling),
+/// mirroring the stack API so a configured large-payload activity keeps full
+/// checkpoint visibility in the UI too (#503 review). No-op when no runtime is
+/// installed (the global default cap then applies at render time).
+fn resolve_blocked_on_heartbeat_caps(api_state: &HarvestApiState, blocked_on: &mut BlockedOnData) {
+    if let Ok(rt) = api_state.runtime() {
+        let registry = rt.registry();
+        blocked_on.heartbeat_caps = blocked_on
+            .activities
+            .iter()
+            .filter_map(|t| t.activity_name.clone())
+            .map(|name| {
+                let cap = registry.activity_result_cap(&name);
+                (name, cap)
+            })
+            .collect();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3970,6 +3999,42 @@ fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, cap: u64) -> Markup {
     }
 }
 
+/// Render the "Pending activities" table, including each activity's latest
+/// heartbeat checkpoint judged against its effective (per-activity) cap (#503).
+fn render_pending_activities_table(blocked_on: &BlockedOnData) -> Markup {
+    html! {
+        table {
+            thead {
+                tr {
+                    th { "Activity" }
+                    th { "State" }
+                    th { "Attempt" }
+                    th { "Scheduled" }
+                    th { "Last heartbeat" }
+                    th { "Checkpoint" }
+                }
+            }
+            tbody {
+                @for item in &blocked_on.activities {
+                    @let cap = item
+                        .activity_name
+                        .as_deref()
+                        .and_then(|n| blocked_on.heartbeat_caps.get(n).copied())
+                        .unwrap_or(blocked_on.heartbeat_details_cap);
+                    tr {
+                        td { (item.activity_name.as_deref().unwrap_or("—")) }
+                        td { code { (&item.state) } }
+                        td { (item.attempt) }
+                        td { (format_timestamp(Some(item.scheduled_at))) }
+                        td { (format_timestamp(item.last_heartbeat_at)) }
+                        td { (render_heartbeat_checkpoint_cell(item, cap)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
     let has_anything = !blocked_on.activities.is_empty()
         || !blocked_on.external_tasks.is_empty()
@@ -3984,30 +4049,7 @@ fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
             } @else {
                 @if !blocked_on.activities.is_empty() {
                     h3 style="margin-top:8px" { "Pending activities" }
-                    table {
-                        thead {
-                            tr {
-                                th { "Activity" }
-                                th { "State" }
-                                th { "Attempt" }
-                                th { "Scheduled" }
-                                th { "Last heartbeat" }
-                                th { "Checkpoint" }
-                            }
-                        }
-                        tbody {
-                            @for item in &blocked_on.activities {
-                                tr {
-                                    td { (item.activity_name.as_deref().unwrap_or("—")) }
-                                    td { code { (&item.state) } }
-                                    td { (item.attempt) }
-                                    td { (format_timestamp(Some(item.scheduled_at))) }
-                                    td { (format_timestamp(item.last_heartbeat_at)) }
-                                    td { (render_heartbeat_checkpoint_cell(item, blocked_on.heartbeat_details_cap)) }
-                                }
-                            }
-                        }
-                    }
+                    (render_pending_activities_table(blocked_on))
                 }
                 @if !blocked_on.external_tasks.is_empty() {
                     h3 style="margin-top:8px" { "Pending external activities" }
@@ -7756,6 +7798,7 @@ mod tests {
             timers: vec![],
             signals: vec![],
             heartbeat_details_cap: 0,
+            heartbeat_caps: std::collections::HashMap::new(),
         }
     }
 

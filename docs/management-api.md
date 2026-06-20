@@ -286,7 +286,7 @@ from a single API call, with zero direct database access.
 |-------|------|---------|
 | `last_heartbeat_at` | timestamp \| null | When the most recent heartbeat was flushed. |
 | `heartbeat_details` | JSON \| null | The latest checkpoint payload, verbatim as the activity reported it. `null` when no heartbeat has been flushed, **or** when the payload exceeded the response size cap (see `heartbeat_details_truncated`). |
-| `heartbeat_details_truncated` | bool | `true` when the stored payload exceeded the activity-result payload cap (issue #252, default **2 MiB**) and was withheld from the response. |
+| `heartbeat_details_truncated` | bool | `true` when the stored payload exceeded the activity's effective result-payload cap (issue #252) and was withheld from the response. |
 | `heartbeat_details_bytes` | integer \| null | Observed serialized byte size of the stored payload, when one exists. With `heartbeat_details_truncated: true` this is the size of the withheld blob. |
 
 Notes:
@@ -300,8 +300,11 @@ Notes:
 - **Shard-correct.** The handler routes by the execution's encoded shard; the
   heartbeat column lives on the same shard as the task row, so no cross-shard
   fan-out is introduced.
-- **Size-bounded.** The 2 MiB ceiling reuses the existing activity-result
-  payload cap rather than a new limit, so a pathological heartbeat payload
+- **Size-bounded.** The guard reuses the activity's effective result-payload
+  cap rather than a new limit: the per-activity `max_result_bytes` override
+  raised against the global ceiling (`override.max(global)`, default global
+  **2 MiB**), matching the worker. An activity configured to allow large
+  results keeps full checkpoint visibility, while a pathological payload still
   cannot bloat the describe response.
 
 ### Example

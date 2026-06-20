@@ -1075,6 +1075,22 @@ struct PendingActivity {
     heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// A `std::io::Write` sink that counts bytes and discards them. Used to measure
+/// the serialized size of a heartbeat checkpoint without allocating a full copy
+/// of a potentially pathological (multi-MiB) payload (#503 review).
+struct ByteCountWriter(u64);
+
+impl std::io::Write for ByteCountWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Compute the cap decision for a stored heartbeat checkpoint payload from a
 /// borrow, without cloning. Returns `(truncated, bytes)`: `truncated` is `true`
 /// when a payload exists and exceeds `cap`; `bytes` is the observed serialized
@@ -1082,13 +1098,16 @@ struct PendingActivity {
 ///
 /// This is the borrow-based core shared by the API response projection
 /// (`project_heartbeat_details`) and the UI cell renderer so neither path
-/// clones an over-cap payload merely to discard it.
+/// clones an over-cap payload merely to discard it. The serialized size is
+/// measured with a non-allocating counting writer so an oversized checkpoint
+/// is never materialized into a second buffer just to be withheld.
 pub(crate) fn heartbeat_details_truncation(
     value: Option<&serde_json::Value>,
     cap: u64,
 ) -> (bool, Option<u64>) {
     value.map_or((false, None), |v| {
-        let bytes = serde_json::to_string(v).map_or(0, |s| s.len() as u64);
+        let mut counter = ByteCountWriter(0);
+        let bytes = serde_json::to_writer(&mut counter, v).map_or(0, |()| counter.0);
         (cap > 0 && bytes > cap, Some(bytes))
     })
 }
@@ -5234,8 +5253,11 @@ async fn get_workflow_stack(
 
     // Reuse the #252 activity-result payload cap as the response-side guard for
     // heartbeat checkpoints (issue #503); fall back to the documented default
-    // when no runtime is installed (read-only mount).
-    let heartbeat_details_cap = api_state.runtime().ok().map_or(
+    // when no runtime is installed (read-only mount). The effective cap is
+    // resolved per-activity below so an activity configured with a higher
+    // `max_result_bytes` keeps full checkpoint visibility.
+    let stack_runtime = api_state.runtime().ok();
+    let default_heartbeat_cap = stack_runtime.as_ref().map_or(
         autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
         |rt| rt.registry.max_activity_result_bytes,
     );
@@ -5256,8 +5278,18 @@ async fn get_workflow_stack(
                 t.state
             };
 
+            // Judge the checkpoint against this activity's effective result cap
+            // (per-activity override raised against the global ceiling), matching
+            // the worker, so configured large-payload activities aren't wrongly
+            // truncated (#503 review).
+            let heartbeat_cap = stack_runtime
+                .as_ref()
+                .zip(t.activity_name.as_deref())
+                .map_or(default_heartbeat_cap, |(rt, name)| {
+                    rt.registry.activity_result_cap(name)
+                });
             let (heartbeat_details, heartbeat_details_truncated, heartbeat_details_bytes) =
-                project_heartbeat_details(t.heartbeat_details, heartbeat_details_cap);
+                project_heartbeat_details(t.heartbeat_details, heartbeat_cap);
             PendingActivity {
                 activity_exec_id: t.id.to_string(),
                 activity_name: t.activity_name.unwrap_or_default(),

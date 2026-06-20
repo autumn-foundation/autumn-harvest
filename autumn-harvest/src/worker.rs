@@ -413,6 +413,26 @@ impl HandlerRegistry {
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
         self.history_policy
     }
+
+    /// Effective result-payload byte cap for the named activity (issue #252).
+    ///
+    /// Returns the per-activity `max_result_bytes` override raised against the
+    /// global `max_activity_result_bytes` ceiling (`override.max(global)`),
+    /// mirroring the worker's `effective_result_cap` resolution. Unknown
+    /// activities fall back to the global cap. Read-only.
+    ///
+    /// Used by the management stack endpoint (issue #503) so a heartbeat
+    /// checkpoint is judged against the same effective cap the activity's
+    /// result would be, rather than the global default only.
+    #[must_use]
+    pub fn activity_result_cap(&self, name: &str) -> u64 {
+        self.activities
+            .get(name)
+            .and_then(|a| a.max_result_bytes)
+            .map_or(self.max_activity_result_bytes, |per| {
+                per.max(self.max_activity_result_bytes)
+            })
+    }
 }
 
 impl std::fmt::Debug for HandlerRegistry {
@@ -8727,6 +8747,52 @@ mod tests {
         };
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
         assert!(Worker::new(cfg, registry).is_err());
+    }
+
+    #[test]
+    fn activity_result_cap_resolves_per_activity_override() {
+        fn act(name: &'static str, max_result_bytes: Option<u64>) -> ActivityInfo {
+            ActivityInfo {
+                name,
+                module: "test",
+                default_retry_policy: None,
+                default_start_to_close: None,
+                default_heartbeat_timeout: None,
+                default_schedule_to_start: None,
+                default_schedule_to_close: None,
+                default_queue: None,
+                max_concurrent: None,
+                concurrency_key: None,
+                is_local: false,
+                max_input_bytes: None,
+                max_result_bytes,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
+                circuit_breaker: None,
+                requires: None,
+                handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            }
+        }
+
+        let global = crate::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
+        let registry = HandlerRegistry::new(
+            vec![],
+            vec![
+                act("plain", None),
+                act("big", Some(global * 4)),
+                act("tiny", Some(1024)),
+            ],
+        );
+
+        // No override -> global cap.
+        assert_eq!(registry.activity_result_cap("plain"), global);
+        // Higher override -> raised cap (full checkpoint visibility, #503).
+        assert_eq!(registry.activity_result_cap("big"), global * 4);
+        // Lower override -> never lowers below the global ceiling.
+        assert_eq!(registry.activity_result_cap("tiny"), global);
+        // Unknown activity -> global cap.
+        assert_eq!(registry.activity_result_cap("nonexistent"), global);
     }
 
     #[test]
