@@ -3974,34 +3974,103 @@ fn render_workflow_detail(
     layout(&title, &body, "../")
 }
 
+/// Per-row checkpoint rendering decision for the pending-activities table, after
+/// applying both the per-activity cap and the cumulative per-page budget (#503
+/// review). Carries the observed byte size for the marker text.
+#[derive(Clone, Copy)]
+enum CheckpointCellState {
+    /// No heartbeat checkpoint has been flushed.
+    Absent,
+    /// Render the checkpoint JSON (within its cap and the page budget).
+    Show,
+    /// Withheld because this payload's own size exceeded its activity cap.
+    Truncated(u64),
+    /// Withheld because the cumulative per-page checkpoint budget was exhausted.
+    OmittedForBudget(u64),
+}
+
+/// Build the per-row checkpoint decisions for the pending-activities table,
+/// mirroring the stack API (#503 review): each checkpoint is judged against its
+/// activity's effective cap (per-activity `max_result_bytes` raised against the
+/// global ceiling), then a cumulative per-page budget — the global cap — bounds
+/// the total rendered bytes so a large fan-out can't generate a huge HTML page.
+/// The first payload-bearing checkpoint is always shown. The byte size is
+/// measured once here via the shared non-allocating counter; the renderer reads
+/// the resulting state without re-serializing.
+fn plan_checkpoint_cells(blocked_on: &BlockedOnData) -> Vec<CheckpointCellState> {
+    let per_item: Vec<(bool, Option<u64>)> = blocked_on
+        .activities
+        .iter()
+        .map(|item| {
+            let cap = item
+                .activity_name
+                .as_deref()
+                .and_then(|n| blocked_on.heartbeat_caps.get(n).copied())
+                .unwrap_or(blocked_on.heartbeat_details_cap);
+            crate::api::heartbeat_details_truncation(item.heartbeat_details.as_ref(), cap)
+        })
+        .collect();
+    // Only present, not-individually-truncated checkpoints participate in the
+    // cumulative budget.
+    let sizes: Vec<Option<u64>> = per_item
+        .iter()
+        .map(|(truncated, bytes)| match bytes {
+            Some(b) if !truncated => Some(*b),
+            _ => None,
+        })
+        .collect();
+    let omit = crate::api::checkpoint_budget_decisions(&sizes, blocked_on.heartbeat_details_cap);
+    per_item
+        .iter()
+        .zip(omit)
+        .map(
+            |((truncated, bytes), omit_budget)| match (bytes, truncated, omit_budget) {
+                (None, _, _) => CheckpointCellState::Absent,
+                (Some(b), true, _) => CheckpointCellState::Truncated(*b),
+                (Some(b), false, true) => CheckpointCellState::OmittedForBudget(*b),
+                (Some(_), false, false) => CheckpointCellState::Show,
+            },
+        )
+        .collect()
+}
+
 /// Render the latest heartbeat checkpoint payload for a pending activity as a
-/// collapsible JSON cell, bounded by the response-side payload cap (#503). Shows
-/// `"—"` when no checkpoint has been flushed and a truncation marker when the
-/// stored payload exceeds the cap.
-fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, cap: u64) -> Markup {
-    // Borrow-based cap check — never clones the payload, so an over-cap blob is
-    // not copied onto the heap merely to be discarded (#503 PR review).
-    let (truncated, bytes) =
-        crate::api::heartbeat_details_truncation(item.heartbeat_details.as_ref(), cap);
+/// collapsible JSON cell, from the precomputed [`CheckpointCellState`] (#503).
+/// Shows `"—"` when absent, a truncation marker when over the activity cap, and
+/// an omission marker when withheld by the per-page budget.
+fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, state: CheckpointCellState) -> Markup {
     html! {
-        @if truncated {
-            span title="heartbeat payload exceeds the response size cap" {
-                "truncated (" (bytes.unwrap_or(0)) " bytes)"
+        @match state {
+            CheckpointCellState::Absent => "—",
+            CheckpointCellState::Show => {
+                @if let Some(value) = item.heartbeat_details.as_ref() {
+                    details {
+                        summary { "checkpoint" }
+                        pre { (pretty_json(value)) }
+                    }
+                } @else {
+                    "—"
+                }
             }
-        } @else if let Some(value) = item.heartbeat_details.as_ref() {
-            details {
-                summary { "checkpoint" }
-                pre { (pretty_json(value)) }
+            CheckpointCellState::Truncated(bytes) => {
+                span title="heartbeat payload exceeds the response size cap" {
+                    "truncated (" (bytes) " bytes)"
+                }
             }
-        } @else {
-            "—"
+            CheckpointCellState::OmittedForBudget(bytes) => {
+                span title="omitted: per-page checkpoint budget exceeded" {
+                    "omitted (" (bytes) " bytes)"
+                }
+            }
         }
     }
 }
 
 /// Render the "Pending activities" table, including each activity's latest
-/// heartbeat checkpoint judged against its effective (per-activity) cap (#503).
+/// heartbeat checkpoint judged against its effective (per-activity) cap and the
+/// cumulative per-page checkpoint budget (#503).
 fn render_pending_activities_table(blocked_on: &BlockedOnData) -> Markup {
+    let cell_states = plan_checkpoint_cells(blocked_on);
     html! {
         table {
             thead {
@@ -4015,19 +4084,14 @@ fn render_pending_activities_table(blocked_on: &BlockedOnData) -> Markup {
                 }
             }
             tbody {
-                @for item in &blocked_on.activities {
-                    @let cap = item
-                        .activity_name
-                        .as_deref()
-                        .and_then(|n| blocked_on.heartbeat_caps.get(n).copied())
-                        .unwrap_or(blocked_on.heartbeat_details_cap);
+                @for (item, state) in blocked_on.activities.iter().zip(cell_states) {
                     tr {
                         td { (item.activity_name.as_deref().unwrap_or("—")) }
                         td { code { (&item.state) } }
                         td { (item.attempt) }
                         td { (format_timestamp(Some(item.scheduled_at))) }
                         td { (format_timestamp(item.last_heartbeat_at)) }
-                        td { (render_heartbeat_checkpoint_cell(item, cap)) }
+                        td { (render_heartbeat_checkpoint_cell(item, state)) }
                     }
                 }
             }

@@ -1144,38 +1144,59 @@ pub(crate) fn project_heartbeat_details(
     (payload, truncated, bytes)
 }
 
-/// Apply a single cumulative checkpoint-byte budget across all pending
-/// activities in one stack response so a fan-out workflow with many
-/// heartbeating activities can't return roughly `count × cap` bytes (#503
-/// review). Walks the activities in order, summing the size of each *included*
-/// checkpoint; once the running total would exceed `budget`, later checkpoints
-/// are withheld (`heartbeat_details = None`, `heartbeat_details_omitted_for_budget
-/// = true`) while their `heartbeat_details_bytes` size is still reported.
+/// Pure cumulative checkpoint-budget core, shared by the stack API and the
+/// Vantage detail UI (#503 review). Given each entry's *included-checkpoint*
+/// byte size in order (`None` = no payload to budget — absent or already
+/// withheld by its own per-activity cap), return per-entry omit-for-budget
+/// decisions under a single cumulative `budget`.
 ///
-/// The first payload-bearing checkpoint is always kept, even if it alone
-/// exceeds the budget, so a single legitimately large checkpoint from an
-/// activity with a raised per-activity cap stays visible (preserving the #1
-/// per-activity-cap fix). A `budget` of `0` disables the response budget.
-/// Returns `true` when at least one checkpoint was withheld for budget.
-fn apply_checkpoint_response_budget(activities: &mut [PendingActivity], budget: u64) -> bool {
-    if budget == 0 {
-        return false;
-    }
+/// The first payload-bearing entry is always kept (decision `false`), even if
+/// it alone exceeds the budget, so a single legitimately large checkpoint from
+/// an activity with a raised per-activity cap stays visible. A `budget` of `0`
+/// disables budgeting (all decisions `false`).
+pub(crate) fn checkpoint_budget_decisions(sizes: &[Option<u64>], budget: u64) -> Vec<bool> {
     let mut running: u64 = 0;
+    sizes
+        .iter()
+        .copied()
+        .map(|size| {
+            size.is_some_and(|s| {
+                let over = budget > 0 && running > 0 && running.saturating_add(s) > budget;
+                if !over {
+                    running = running.saturating_add(s);
+                }
+                over
+            })
+        })
+        .collect()
+}
+
+/// Apply [`checkpoint_budget_decisions`] to a stack response so a fan-out
+/// workflow with many heartbeating activities can't return roughly
+/// `count × cap` bytes (#503 review). Withheld checkpoints get
+/// `heartbeat_details = None` + `heartbeat_details_omitted_for_budget = true`,
+/// while their `heartbeat_details_bytes` size is still reported. Returns `true`
+/// when at least one checkpoint was withheld for budget.
+fn apply_checkpoint_response_budget(activities: &mut [PendingActivity], budget: u64) -> bool {
+    // Only entries with an included payload participate in the budget; absent or
+    // individually-truncated entries (`heartbeat_details == None`) map to `None`.
+    let sizes: Vec<Option<u64>> = activities
+        .iter()
+        .map(|pa| {
+            pa.heartbeat_details
+                .is_some()
+                .then(|| pa.heartbeat_details_bytes.unwrap_or(0))
+        })
+        .collect();
     let mut any_withheld = false;
-    for pa in activities.iter_mut() {
-        // Skip entries with no included payload (absent, or already withheld by
-        // their own per-activity cap) — they contribute nothing to the budget.
-        if pa.heartbeat_details.is_none() {
-            continue;
-        }
-        let size = pa.heartbeat_details_bytes.unwrap_or(0);
-        if running > 0 && running.saturating_add(size) > budget {
+    for (pa, omit) in activities
+        .iter_mut()
+        .zip(checkpoint_budget_decisions(&sizes, budget))
+    {
+        if omit {
             pa.heartbeat_details = None;
             pa.heartbeat_details_omitted_for_budget = true;
             any_withheld = true;
-        } else {
-            running = running.saturating_add(size);
         }
     }
     any_withheld
@@ -19614,6 +19635,35 @@ mod tests {
         assert!(!withheld, "200 bytes of payload fit within 250");
         assert!(items[1].heartbeat_details.is_some());
         assert!(items[2].heartbeat_details.is_some());
+    }
+
+    #[test]
+    fn checkpoint_budget_decisions_core() {
+        // Disabled.
+        assert_eq!(
+            checkpoint_budget_decisions(&[Some(100), Some(100)], 0),
+            vec![false, false]
+        );
+        // Within budget.
+        assert_eq!(
+            checkpoint_budget_decisions(&[Some(100), Some(100)], 1000),
+            vec![false, false]
+        );
+        // Over budget: third withheld; first two fit.
+        assert_eq!(
+            checkpoint_budget_decisions(&[Some(100), Some(100), Some(100)], 250),
+            vec![false, false, true]
+        );
+        // First always kept even if oversized; rest withheld.
+        assert_eq!(
+            checkpoint_budget_decisions(&[Some(10_000), Some(10)], 1000),
+            vec![false, true]
+        );
+        // None entries (absent / individually truncated) never count or omit.
+        assert_eq!(
+            checkpoint_budget_decisions(&[None, Some(100), None, Some(200)], 250),
+            vec![false, false, false, true]
+        );
     }
 
     #[test]
