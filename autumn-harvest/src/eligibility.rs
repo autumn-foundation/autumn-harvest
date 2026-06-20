@@ -92,8 +92,7 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut in_idx = None;
     let mut in_quotes = None;
 
-    let mut char_indices = token.char_indices();
-    while let Some((byte_idx, c)) = char_indices.next() {
+    for (byte_idx, c) in token.char_indices() {
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -111,9 +110,7 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
                     || remaining.starts_with(" IN ")
                     || remaining.starts_with(" In ")
                     || remaining.starts_with(" iN ")
-                {
-                    in_idx = Some(byte_idx);
-                } else if remaining == " in"
+                    || remaining == " in"
                     || remaining == " IN"
                     || remaining == " In"
                     || remaining == " iN"
