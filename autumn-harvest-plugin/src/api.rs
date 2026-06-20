@@ -1075,6 +1075,24 @@ struct PendingActivity {
     heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Compute the cap decision for a stored heartbeat checkpoint payload from a
+/// borrow, without cloning. Returns `(truncated, bytes)`: `truncated` is `true`
+/// when a payload exists and exceeds `cap`; `bytes` is the observed serialized
+/// size whenever a payload exists. A `cap` of `0` means uncapped. Pure (#503).
+///
+/// This is the borrow-based core shared by the API response projection
+/// (`project_heartbeat_details`) and the UI cell renderer so neither path
+/// clones an over-cap payload merely to discard it.
+pub(crate) fn heartbeat_details_truncation(
+    value: Option<&serde_json::Value>,
+    cap: u64,
+) -> (bool, Option<u64>) {
+    value.map_or((false, None), |v| {
+        let bytes = serde_json::to_string(v).map_or(0, |s| s.len() as u64);
+        (cap > 0 && bytes > cap, Some(bytes))
+    })
+}
+
 /// Project a stored heartbeat checkpoint payload onto the describe response,
 /// bounded by the activity-result payload cap (#252) so a pathological payload
 /// cannot bloat the stack response. Returns `(payload, truncated, bytes)`:
@@ -1082,18 +1100,17 @@ struct PendingActivity {
 /// when absent or over-cap; `truncated` is `true` only in the over-cap case;
 /// `bytes` is the observed serialized size whenever a payload exists. A `cap`
 /// of `0` means uncapped. Pure and strictly non-mutating (issue #503).
+///
+/// Takes the payload by value so the owned value flows through to the response
+/// with **zero clones** on the API hot path (returned when within the cap,
+/// dropped when over-cap).
 pub(crate) fn project_heartbeat_details(
     details: Option<serde_json::Value>,
     cap: u64,
 ) -> (Option<serde_json::Value>, bool, Option<u64>) {
-    details.map_or((None, false, None), |value| {
-        let bytes = serde_json::to_string(&value).map_or(0, |s| s.len() as u64);
-        if cap > 0 && bytes > cap {
-            (None, true, Some(bytes))
-        } else {
-            (Some(value), false, Some(bytes))
-        }
-    })
+    let (truncated, bytes) = heartbeat_details_truncation(details.as_ref(), cap);
+    let payload = if truncated { None } else { details };
+    (payload, truncated, bytes)
 }
 
 #[derive(Debug, Serialize)]
@@ -19360,6 +19377,27 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn heartbeat_details_truncation_borrow_decisions() {
+        // Absent payload.
+        assert_eq!(heartbeat_details_truncation(None, 1024), (false, None));
+        // Within cap.
+        let small = serde_json::json!({"processed": 4500, "total": 10000});
+        let (truncated, bytes) = heartbeat_details_truncation(Some(&small), 1024);
+        assert!(!truncated);
+        assert_eq!(
+            bytes,
+            Some(serde_json::to_string(&small).unwrap().len() as u64)
+        );
+        // Over cap.
+        let big = serde_json::json!({"blob": "x".repeat(100)});
+        let (truncated, bytes) = heartbeat_details_truncation(Some(&big), 16);
+        assert!(truncated);
+        assert!(bytes.unwrap() > 16);
+        // Zero cap is uncapped.
+        assert!(!heartbeat_details_truncation(Some(&big), 0).0);
     }
 
     #[test]

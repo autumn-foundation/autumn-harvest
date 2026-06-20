@@ -3950,17 +3950,19 @@ fn render_workflow_detail(
 /// `"—"` when no checkpoint has been flushed and a truncation marker when the
 /// stored payload exceeds the cap.
 fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, cap: u64) -> Markup {
-    let (payload, truncated, bytes) =
-        crate::api::project_heartbeat_details(item.heartbeat_details.clone(), cap);
+    // Borrow-based cap check — never clones the payload, so an over-cap blob is
+    // not copied onto the heap merely to be discarded (#503 PR review).
+    let (truncated, bytes) =
+        crate::api::heartbeat_details_truncation(item.heartbeat_details.as_ref(), cap);
     html! {
-        @if let Some(ref value) = payload {
+        @if truncated {
+            span title="heartbeat payload exceeds the response size cap" {
+                "truncated (" (bytes.unwrap_or(0)) " bytes)"
+            }
+        } @else if let Some(value) = item.heartbeat_details.as_ref() {
             details {
                 summary { "checkpoint" }
                 pre { (pretty_json(value)) }
-            }
-        } @else if truncated {
-            span title="heartbeat payload exceeds the response size cap" {
-                "truncated (" (bytes.unwrap_or(0)) " bytes)"
             }
         } @else {
             "—"
