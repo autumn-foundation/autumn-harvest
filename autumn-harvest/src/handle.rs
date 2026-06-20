@@ -166,6 +166,8 @@ struct WorkflowHandleClientInner {
     max_signal_payload_bytes: u64,
     query_timeout: Duration,
     history_policy: crate::context::WorkflowHistoryPolicy,
+    /// Default max-wait cap for debounced starts when the policy omits `max_wait`.
+    default_debounce_max_wait: Duration,
 }
 
 impl std::fmt::Debug for WorkflowHandleClientInner {
@@ -190,6 +192,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("query_timeout", &self.query_timeout)
             .field("history_policy", &self.history_policy)
+            .field("default_debounce_max_wait", &self.default_debounce_max_wait)
             .finish()
     }
 }
@@ -248,6 +251,7 @@ impl WorkflowHandleClient {
                 max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
                 query_timeout: Duration::from_secs(5),
                 history_policy: crate::context::WorkflowHistoryPolicy::default(),
+                default_debounce_max_wait: crate::builder::DEFAULT_DEBOUNCE_MAX_WAIT,
             }),
         }
     }
@@ -349,6 +353,26 @@ impl WorkflowHandleClient {
             inner: Arc::new(inner),
         }
     }
+    /// Set the default max-wait cap for debounced starts.
+    ///
+    /// Applied when a `DebouncePolicy.max_wait` is `None`. Mirrors
+    /// [`WorkerConfig::with_default_debounce_max_wait`](crate::builder::WorkerConfig::with_default_debounce_max_wait).
+    /// Defaults to 1 hour.
+    #[must_use]
+    pub fn with_default_debounce_max_wait(self, max_wait: Duration) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.default_debounce_max_wait = max_wait;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Get the default debounce max-wait cap.
+    #[must_use]
+    pub fn default_debounce_max_wait(&self) -> Duration {
+        self.inner.default_debounce_max_wait
+    }
+
     /// Get the maximum allowed execution timeout.
     #[must_use]
     pub fn max_workflow_execution_timeout(&self) -> Option<Duration> {

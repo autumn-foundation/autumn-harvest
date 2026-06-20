@@ -9,6 +9,52 @@ use syn::{ItemFn, LitStr, parse::Parser as _};
 
 use crate::parse_byte_size_macro;
 
+/// Compile-time check that a duration literal is parseable by the runtime
+/// `::autumn_harvest::task_duration` helper (`<digits><s|m|h|d>` runs, non-zero).
+///
+/// Mirrors `autumn_harvest::task_duration`'s accepted format so an invalid
+/// `#[workflow(debounce(window = ..., max_wait = ...))]` literal is rejected as a
+/// build error rather than panicking at registration via the emitted `.expect`.
+/// Kept intentionally permissive/identical to the runtime parser; the runtime
+/// `.expect` remains as a defensive backstop.
+fn is_valid_task_duration(s: &str) -> bool {
+    let mut total_secs = 0u64;
+    let mut current_num = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            if current_num == "0" {
+                current_num.clear();
+            }
+            if current_num.len() > 20 {
+                return false;
+            }
+            current_num.push(ch);
+        } else if ch.is_ascii_alphabetic() {
+            let Ok(num) = current_num.parse::<u64>() else {
+                return false;
+            };
+            current_num.clear();
+            let mult = match ch {
+                's' => 1,
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86400,
+                _ => return false,
+            };
+            match num
+                .checked_mul(mult)
+                .and_then(|v| total_secs.checked_add(v))
+            {
+                Some(v) => total_secs = v,
+                None => return false,
+            }
+        } else if ch != ' ' {
+            return false;
+        }
+    }
+    current_num.is_empty() && total_secs != 0
+}
+
 // ---------------------------------------------------------------------------
 // Attribute parsing
 // ---------------------------------------------------------------------------
@@ -18,12 +64,21 @@ struct ConcurrencyArgs {
     limit: u32,
 }
 
+struct DebounceArgs {
+    key_expr: String,
+    window: String,
+    max_wait: Option<String>,
+}
+
 struct WorkflowAttrs {
     execution_timeout: Option<String>,
     /// Soft SLA budget (issue #487). Parsed from `#[workflow(sla = "2h")]`.
     /// Stored as `WorkflowInfo::sla: Option<Duration>`.
     sla: Option<String>,
     concurrency: Option<ConcurrencyArgs>,
+    /// Trailing-edge debounce policy (issue #499). Parsed from
+    /// `#[workflow(debounce(key = "input.tenant_id", window = "30s", max_wait = "5m"))]`.
+    debounce: Option<DebounceArgs>,
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
     max_input_bytes: Option<u64>,
@@ -42,6 +97,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         execution_timeout: None,
         sla: None,
         concurrency: None,
+        debounce: None,
         max_input_bytes: None,
         owner: None,
         runbook: None,
@@ -93,6 +149,55 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             })?;
             result.concurrency = Some(ConcurrencyArgs { key_expr, limit });
             Ok(())
+        } else if meta.path.is_ident("debounce") {
+            let mut key_expr: Option<String> = None;
+            let mut window: Option<String> = None;
+            let mut max_wait: Option<String> = None;
+            meta.parse_nested_meta(|inner| {
+                if inner.path.is_ident("key") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    key_expr = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("window") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    // Validate at compile time so a typo is a build error, not a
+                    // registration-time panic from the emitted `.expect(...)`.
+                    if !is_valid_task_duration(&value.value()) {
+                        return Err(syn::Error::new_spanned(
+                            &value,
+                            "invalid debounce `window` duration; expected e.g. \"30s\", \"5m\", \"1h\", \"2d\"",
+                        ));
+                    }
+                    window = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("max_wait") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    if !is_valid_task_duration(&value.value()) {
+                        return Err(syn::Error::new_spanned(
+                            &value,
+                            "invalid debounce `max_wait` duration; expected e.g. \"30s\", \"5m\", \"1h\", \"2d\"",
+                        ));
+                    }
+                    max_wait = Some(value.value());
+                    Ok(())
+                } else {
+                    Err(inner.error("expected `key`, `window`, or `max_wait`"))
+                }
+            })?;
+            let key_expr = key_expr.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "debounce requires `key = \"...\"`",
+                )
+            })?;
+            let window = window.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "debounce requires `window = \"...\"` (e.g. `window = \"30s\"`)",
+                )
+            })?;
+            result.debounce = Some(DebounceArgs { key_expr, window, max_wait });
+            Ok(())
         } else if meta.path.is_ident("allow_nondeterministic_apis") {
             if meta.input.peek(syn::Token![=]) {
                 let value: syn::LitBool = meta.value()?.parse()?;
@@ -135,7 +240,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, or `allow_nondeterministic_apis`",
+                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -313,6 +418,38 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Emit debounce as Option<DebouncePolicy> (issue #499).
+    let debounce_expr = match attrs.debounce {
+        None => quote! { ::std::option::Option::None },
+        Some(DebounceArgs {
+            key_expr,
+            window,
+            max_wait,
+        }) => {
+            let max_wait_expr = max_wait.map_or_else(
+                || quote! { ::std::option::Option::None },
+                |s| {
+                    quote! {
+                        ::std::option::Option::Some(
+                            ::autumn_harvest::task_duration(#s)
+                                .expect("debounce max_wait must be a valid duration string")
+                        )
+                    }
+                },
+            );
+            quote! {
+                ::std::option::Option::Some(
+                    ::autumn_harvest::debounce::DebouncePolicy {
+                        key_expr: #key_expr,
+                        window: ::autumn_harvest::task_duration(#window)
+                            .expect("debounce window must be a valid duration string"),
+                        max_wait: #max_wait_expr,
+                    }
+                )
+            }
+        }
+    };
+
     let max_input_bytes_expr = attrs
         .max_input_bytes
         .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
@@ -365,6 +502,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 execution_timeout: #execution_timeout_expr,
                 sla: #sla_expr,
                 concurrency: #concurrency_expr,
+                debounce: #debounce_expr,
                 max_input_bytes: #max_input_bytes_expr,
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,
@@ -425,6 +563,40 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let workflow_id = workflow_id.into();
                     let input = #serialize_args;
                     let info = #public_info_name();
+                    // Issue #499: debounce admission is owned exclusively by the
+                    // HTTP start route (`POST /workflows/{name}/start`). That route
+                    // has the registry + shard-router context the gate requires:
+                    // it routes the pending record onto the *debounce-key's* shard,
+                    // resolves the effective start options (SLA/timeout defaults +
+                    // server ceilings, operator metadata), enforces the input cap,
+                    // rejects `start_at`/`delay`, and preserves idempotent retries.
+                    //
+                    // The typed stub cannot reproduce that correctly: it only
+                    // receives the workflow_id-derived `conn` (not the debounce-key
+                    // shard's connection) and has no registry handle, and a deferred
+                    // debounced start has no exec_id-keyed handle to return anyway.
+                    // So rather than silently bypassing the policy or admitting onto
+                    // the wrong shard, reject early with a clear pointer to the HTTP
+                    // route. (Compile-time `#[workflow(debounce(...))]` is visible
+                    // here via `info.debounce`; a fluent `.with_debounce(...)` policy
+                    // is registry-only and is enforced by the HTTP route instead.)
+                    if let ::std::option::Option::Some(debounce_policy) = info.debounce {
+                        if ::autumn_harvest::debounce::resolve_debounce_key(
+                            debounce_policy.key_expr,
+                            &input,
+                        )
+                        .is_some()
+                        {
+                            return ::std::result::Result::Err(
+                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                    "workflow '{0}' has a debounce policy; debounced starts \
+                                     must use the HTTP start route POST /workflows/{0}/start \
+                                     (the typed client cannot express a deferred debounced start)",
+                                    info.name,
+                                )),
+                            );
+                        }
+                    }
                     let exec_id = opts.exec_id.unwrap_or_else(|| {
                         let shard = client.pick_shard_for_new_workflow(info.name, &workflow_id);
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
@@ -517,6 +689,28 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let workflow_id = workflow_id.into();
                     let input = #serialize_args;
                     let info = #public_info_name();
+                    // Issue #499: debounce admission is owned exclusively by the HTTP
+                    // start route (see `start_with_options` for the rationale). A
+                    // debounced workflow must not be started — or signal-with-started —
+                    // through the typed client, which cannot route to the debounce-key
+                    // shard or admit through the gate. Reject with a pointer to HTTP.
+                    if let ::std::option::Option::Some(debounce_policy) = info.debounce {
+                        if ::autumn_harvest::debounce::resolve_debounce_key(
+                            debounce_policy.key_expr,
+                            &input,
+                        )
+                        .is_some()
+                        {
+                            return ::std::result::Result::Err(
+                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                    "workflow '{0}' has a debounce policy; debounced starts \
+                                     must use the HTTP start route POST /workflows/{0}/start \
+                                     (the typed client cannot express a deferred debounced start)",
+                                    info.name,
+                                )),
+                            );
+                        }
+                    }
                     let exec_id = opts.exec_id.unwrap_or_else(|| {
                         let shard = client.pick_shard_for_new_workflow(info.name, &workflow_id);
                         ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
@@ -579,6 +773,8 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         sla: opts.sla.or(info.sla).and_then(|d|
                             ::autumn_harvest::chrono::Duration::from_std(d).ok()
                         ),
+                        // Typed stubs already reject debounced workflows up front.
+                        reject_fresh_if_debounced: false,
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;
@@ -595,4 +791,32 @@ fn to_pascal_case(s: &str) -> String {
 
 fn extract_ok_type(output: &syn::ReturnType) -> syn::Type {
     crate::extract_ok_type(output)
+}
+
+#[cfg(test)]
+mod duration_validation_tests {
+    use super::is_valid_task_duration;
+
+    #[test]
+    fn accepts_valid_durations() {
+        for s in ["30s", "5m", "1h", "2d", "1h30m", "90s", "0s5s"] {
+            assert!(is_valid_task_duration(s), "should accept '{s}'");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_durations() {
+        // empty, zero, unknown unit, missing unit, trailing digits, garbage.
+        for s in [
+            "", "0s", "0", "5minutes", "5", "30", "abc", "5x", "-5s", "5s ",
+        ] {
+            // note: "5s " has a trailing space which task_duration tolerates, so
+            // exclude it from the reject set below by testing it separately.
+            if s == "5s " {
+                assert!(is_valid_task_duration(s), "trailing space is tolerated");
+                continue;
+            }
+            assert!(!is_valid_task_duration(s), "should reject '{s}'");
+        }
+    }
 }

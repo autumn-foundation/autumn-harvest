@@ -300,6 +300,9 @@ pub struct HarvestApiState {
     /// Hard ceiling on per-execution event count (issue #493).
     /// `None` = ceiling disabled; executions are terminated when they exceed this count.
     max_workflow_history_events: Arc<Mutex<Option<u64>>>,
+    /// Default max-wait cap for debounced workflow starts (issue #499).
+    /// Applied when `DebouncePolicy.max_wait` is `None`. Defaults to 1 hour.
+    default_debounce_max_wait: Arc<Mutex<std::time::Duration>>,
 }
 
 impl Default for HarvestApiState {
@@ -328,6 +331,7 @@ impl Default for HarvestApiState {
             batch_start_max_bytes: Arc::new(Mutex::new(DEFAULT_BATCH_START_MAX_BYTES)),
             gate_cache: Arc::new(autumn_harvest::AdmissionGateCache::new()),
             max_workflow_history_events: Arc::new(Mutex::new(None)),
+            default_debounce_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(3600))),
         }
     }
 }
@@ -517,6 +521,31 @@ impl HarvestApiState {
             .max_workflow_start_delay
             .lock()
             .expect("harvest api state lock poisoned")
+    }
+
+    /// Returns the default max-wait cap applied to debounced workflow starts (issue #499).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    #[must_use]
+    pub fn default_debounce_max_wait(&self) -> std::time::Duration {
+        *self
+            .default_debounce_max_wait
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Override the default debounce max-wait cap (issue #499).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub fn set_default_debounce_max_wait(&self, max_wait: std::time::Duration) {
+        *self
+            .default_debounce_max_wait
+            .lock()
+            .expect("harvest api state lock poisoned") = max_wait;
     }
 
     /// Set the hard caps for `POST /workflows/batch_start` (issue #357).
@@ -2270,6 +2299,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/admin/retention", get(retention_status))
         .route("/admin/retention/run-now", post(retention_run_now))
         .route("/admin/concurrency", get(concurrency_status))
+        .route(
+            "/admin/debounce",
+            // Admin-gated: the response includes raw debounce_key values, which
+            // resolve from user/tenant-derived fields (e.g. input.user_id). Without
+            // this layer a non-admin caller could enumerate pending tenant keys
+            // across shards. Parity with other sensitive management reads.
+            get(debounce_status).route_layer(require_admin.clone()),
+        )
         .route("/admin/rate-limits", get(list_rate_limits))
         .route(
             "/admin/rate-limits/{key}",
@@ -2539,6 +2576,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("GET", "/admin/concurrency"),
+        ("GET", "/admin/debounce"),
         ("GET", "/admin/rate-limits"),
         ("POST", "/admin/rate-limits/{key}"),
         ("GET", "/admin/circuits"),
@@ -2915,7 +2953,19 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/{workflow_name}/start",
-            Some(&["execution_id", "workflow_name", "workflow_id", "state"]),
+            // Normal start returns 200/201 with execution_id/workflow_name/workflow_id/state.
+            // A debounced workflow (issue #499) instead returns 202 Accepted with the
+            // debounce fields below (no execution_id exists until the scanner fires).
+            Some(&[
+                "execution_id",
+                "workflow_name",
+                "workflow_id",
+                "state",
+                "debounced",
+                "debounce_key",
+                "fire_at",
+                "pending_count",
+            ]),
         ),
         (
             "POST",
@@ -3168,6 +3218,7 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),
         ("GET", "/admin/concurrency", None), // Vec<ConcurrencyKeyStats> (external model)
+        ("GET", "/admin/debounce", None),    // Vec<PendingDebounceRecord> (external model)
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
         ("GET", "/admin/circuits", None), // Vec<CircuitSnapshot> (external model)
@@ -5401,6 +5452,28 @@ pub(crate) fn clamp_info_default_sla(
         })
 }
 
+/// Whether `workflow_name` has a debounce policy whose key resolves for `input`.
+///
+/// Debounce admission (issue #499) is owned exclusively by
+/// `POST /workflows/{name}/start`. The other start entry points
+/// (signal-with-start, update-with-start, `batch_start`) and the typed client
+/// stubs reject debounced workflows rather than silently bypassing the
+/// quiet-window collapse — there is no coherent way to defer an atomic
+/// start+signal/start+update or a bulk start through the trailing-edge gate.
+fn workflow_has_resolving_debounce(
+    registry: &HandlerRegistry,
+    workflow_name: &str,
+    input: &Value,
+) -> bool {
+    registry
+        .workflows
+        .get(workflow_name)
+        .and_then(|info| info.debounce.as_ref())
+        .is_some_and(|policy| {
+            autumn_harvest::debounce::resolve_debounce_key(policy.key_expr, input).is_some()
+        })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
@@ -5514,8 +5587,19 @@ async fn start_workflow(
         .router
         .pick_for_new_workflow(&workflow_name, &workflow_id);
 
+    // A debounced start's execution lands on the debounce-key's shard, not this
+    // workflow-id-derived `shard`. Skip the workflow-id-shard gate for debounced
+    // starts so a gate on that shard can't reject a request whose work would be
+    // created elsewhere; the debounce block below enforces the gate on the
+    // correct (debounce-key) shard transactionally. This is safe: a debounced
+    // request only creates NEW work on the debounce shard — the fall-through to
+    // the normal start path happens solely for an already-live execution
+    // (idempotent return, no new work) (issue #499).
+    let is_debounced_start =
+        workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &input);
+
     // issue #377: check admission gates before touching the DB.
-    {
+    if !is_debounced_start {
         let wf_owner = runtime
             .registry
             .workflows
@@ -5773,6 +5857,351 @@ async fn start_workflow(
             let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
             (key, Some(policy.limit))
         });
+
+    // Capture trace context for debounced starts — must be before the debounce
+    // branch returns 202 since the normal path captures it inside a later OTel span.
+    let debounce_trace_ctx = runtime.registry.telemetry().capture_trace_context();
+
+    // Debounce admission gate (issue #499): collapse trigger bursts into one run.
+    // Check the WorkflowInfo debounce policy. If a policy applies and the key
+    // resolves, upsert a pending-debounce record and return 202 Accepted.
+    if let Some((debounce_policy, resolved_key)) = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.debounce.as_ref())
+        .and_then(|policy| {
+            autumn_harvest::debounce::resolve_debounce_key(policy.key_expr, &input)
+                .map(|key| (policy, key))
+        })
+    {
+        // Debounce defers the start until the burst settles, so an explicit
+        // scheduled start (`start_at`/`delay`) is contradictory — the requested
+        // timing would be silently dropped at fire time. Reject the combination.
+        if request.start_at.is_some() || delay.is_some() {
+            // Failed-start audit (parity with the normal delayed-start validation).
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut c) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("debounce cannot be combined with start_at or delay"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut c, &ar).await;
+            }
+            return AutumnError::bad_request_msg(
+                "debounce cannot be combined with start_at or delay",
+            )
+            .into_response();
+        }
+
+        // No pre-admission idempotency bypass for debounced starts: a debounced
+        // start always goes through admission and returns 202. Reuse-policy
+        // idempotency is resolved correctly at *fire time* on the debounce-key
+        // shard — the scanner calls start_or_load with the stored workflow_id and
+        // applies the policy (AllowDuplicate returns the existing run; an
+        // AlreadyExists conflict under RejectDuplicate deletes the pending row). A
+        // pre-admission probe was both shard-wrong (debounced runs live on the
+        // debounce-key shard, not the workflow-id shard — Codex 5916) and
+        // state-incomplete (Codex 5927), so it is omitted (issue #499).
+        {
+            // Reject an oversized input at admission (mirrors the cap the core start
+            // path enforces) so it fails fast with 400 here instead of being
+            // persisted and then failing on every scanner tick at fire time.
+            if effective_wf_cap > 0 {
+                let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+                if observed > effective_wf_cap {
+                    // Failed-start audit (parity with the normal start path).
+                    if let Ok(pool) = api_state.storage_pool()
+                        && let Ok(mut c) = acquire_conn(pool.default_pool()).await
+                    {
+                        let ar = NewAuditRecord {
+                            actor: &actor,
+                            operation: OP_WORKFLOW_START,
+                            target_type: TARGET_WORKFLOW,
+                            target_id: Some(workflow_name.as_str()),
+                            route_or_command: route,
+                            request_id: request_id.as_deref(),
+                            idempotency_key: None,
+                            status: STATUS_FAILED,
+                            error_summary: Some("workflow input exceeds cap"),
+                            shard_id: None,
+                            source: &source,
+                        };
+                        let _ = audit::insert_audit(&mut c, &ar).await;
+                    }
+                    return AutumnError::bad_request_msg(format!(
+                        "workflow input ({observed} bytes) exceeds cap ({effective_wf_cap} bytes)",
+                    ))
+                    .into_response();
+                }
+            }
+
+            // Validate a supplied execution_timeout_secs at admission: it is stored
+            // as a raw i64 and the fire path converts it with `try_seconds`, which
+            // silently yields `None` for an out-of-range value — dropping both the
+            // requested timeout and the workflow default (and the ceiling can't clamp
+            // `None`). Reject the bad value here instead (issue #499). Negative is
+            // also rejected; a non-positive deadline is never a meaningful timeout.
+            if let Some(secs) = request.execution_timeout_secs
+                && (secs < 0 || chrono::Duration::try_seconds(secs).is_none())
+            {
+                if let Ok(pool) = api_state.storage_pool()
+                    && let Ok(mut c) = acquire_conn(pool.default_pool()).await
+                {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_WORKFLOW_START,
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(workflow_name.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: STATUS_FAILED,
+                        error_summary: Some("invalid execution_timeout_secs"),
+                        shard_id: None,
+                        source: &source,
+                    };
+                    let _ = audit::insert_audit(&mut c, &ar).await;
+                }
+                return AutumnError::bad_request_msg(format!(
+                    "execution_timeout_secs ({secs}) is out of range or negative",
+                ))
+                .into_response();
+            }
+
+            // Resolve the same effective operator metadata / timeout defaults the
+            // normal start path resolves below, so a debounced run is not a
+            // second-class start: the fire path (in core) has no registry access,
+            // so these must be captured at admission time.
+            let (info_owner, info_runbook, info_severity, info_sla, info_execution_timeout) =
+                runtime.registry.workflows.get(&workflow_name).map_or(
+                    (None, None, None, None, None),
+                    |info| {
+                        (
+                            info.owner,
+                            info.runbook_url,
+                            info.severity,
+                            info.sla,
+                            info.execution_timeout,
+                        )
+                    },
+                );
+
+            // Effective SLA: request override → WorkflowInfo default, clamped to the
+            // declared hard execution_timeout (mirrors the normal path).
+            let effective_sla_secs = request
+                .sla_secs
+                .filter(|&secs| secs >= 0)
+                .and_then(chrono::Duration::try_seconds)
+                .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()))
+                .map(|sla| {
+                    info_execution_timeout
+                        .and_then(|d| chrono::Duration::from_std(d).ok())
+                        .map_or(sla, |hard| sla.min(hard))
+                })
+                .map(|d| d.num_seconds());
+
+            // Effective execution timeout: request override → WorkflowInfo default.
+            let effective_execution_timeout_secs = request.execution_timeout_secs.or_else(|| {
+                info_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .map(|d| d.num_seconds())
+            });
+
+            // Effective server-side ceiling captured so the fire path can't bypass it.
+            let effective_ceiling_secs = api_state
+                .max_workflow_execution_timeout()
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map(|d| d.num_seconds());
+
+            // Route to the shard that owns this debounce key (shard-local, consistent with #247).
+            // The eventual execution is created on this shard, so it — not the
+            // workflow_id-derived shard checked earlier — is the authoritative shard
+            // for a debounced run's home and identity.
+            let debounce_shard = runtime
+                .router
+                .pick_for_new_workflow(&workflow_name, &resolved_key);
+
+            // Admission-gate check against the debounce key's shard, BEFORE acquiring
+            // the shard connection: a debounced admission is always rejected when its
+            // scope is gated, so compute and return the gate rejection up front (the
+            // normal start path's gate-before-DB behavior). Acquiring the connection
+            // first would surface a raw pool error during an incident instead of the
+            // gate rejection + metric/audit (issue #499). The in-memory gate check is
+            // the same one the normal path uses before touching the DB.
+            if let Some((gate_id, reason, scope_kind)) = {
+                let wf_owner = runtime
+                    .registry
+                    .workflows
+                    .get(&workflow_name)
+                    .and_then(|i| i.owner);
+                api_state.gate_cache().check(
+                    &workflow_name,
+                    &queue_name,
+                    debounce_shard.as_i32(),
+                    wf_owner,
+                )
+            } {
+                let reason_label = match reason.char_indices().nth(64) {
+                    Some((idx, _)) => &reason[..idx],
+                    None => &reason,
+                };
+                runtime
+                    .registry
+                    .telemetry()
+                    .metrics
+                    .record_admission_blocked(scope_kind, reason_label);
+                // Best-effort failed-start audit (parity with the normal gate path).
+                // Acquired only for the audit; a pool failure here must not mask the
+                // gate rejection, so the result is ignored.
+                if let Ok(mut audit_conn) = db_conn_for_shard(&api_state, debounce_shard).await {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_WORKFLOW_START,
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(workflow_name.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: STATUS_FAILED,
+                        error_summary: Some("admission blocked by gate"),
+                        shard_id: Some(debounce_shard.as_i32()),
+                        source: &source,
+                    };
+                    let _ = audit::insert_audit(&mut audit_conn, &ar).await;
+                }
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": "admission blocked",
+                        "gate_id": gate_id,
+                        "reason": reason,
+                    })),
+                )
+                    .into_response();
+            }
+
+            // Not gated — acquire the debounce-shard connection for the upsert.
+            let mut debounce_conn = match db_conn_for_shard(&api_state, debounce_shard).await {
+                Ok(c) => c,
+                Err(e) => return e.into_response(),
+            };
+
+            let effective_max_wait = debounce_policy
+                .max_wait
+                .unwrap_or_else(|| api_state.default_debounce_max_wait());
+
+            let admit_params = autumn_harvest::debounce::AdmitDebounceParams {
+                workflow_name: &workflow_name,
+                debounce_key: &resolved_key,
+                workflow_id: &workflow_id,
+                queue_name: &queue_name,
+                last_input: input.clone(),
+                window: debounce_policy.window,
+                max_wait: effective_max_wait,
+                shard_id: debounce_shard.as_i32(),
+                start_options: autumn_harvest::debounce::DebounceStartOptions {
+                    reuse_policy: request.reuse_policy.clone(),
+                    execution_timeout_secs: effective_execution_timeout_secs,
+                    memo: request.memo.clone(),
+                    search_attrs: request.search_attrs.clone(),
+                    sla_secs: effective_sla_secs,
+                    context_headers: None,
+                    priority: None,
+                    concurrency_key: concurrency_key.clone(),
+                    concurrency_limit,
+                    owner: info_owner.map(str::to_string),
+                    runbook_url: info_runbook.map(str::to_string),
+                    severity: info_severity.map(str::to_string),
+                    max_execution_timeout_ceiling_secs: effective_ceiling_secs,
+                    max_workflow_input_bytes: Some(effective_wf_cap),
+                    trace_context: debounce_trace_ctx,
+                },
+            };
+
+            // Gate already enforced before the connection was acquired (above), so
+            // pass gate_active = false here: the upsert always proceeds. `Ok(None)`
+            // (the gate-rollback signal) is therefore unreachable on this path.
+            match autumn_harvest::debounce::admit_debounced_start(
+                &mut debounce_conn,
+                admit_params,
+                false,
+            )
+            .await
+            {
+                Ok(None) => {
+                    // Defensive: gate_active was false, so admit cannot roll back for a
+                    // gate. Treat an unexpected None as an internal error rather than
+                    // silently dropping the request.
+                    return AutumnError::internal_server_error_msg(
+                        "debounce admission returned no record unexpectedly",
+                    )
+                    .into_response();
+                }
+                Ok(Some(outcome)) => {
+                    runtime
+                        .registry
+                        .telemetry()
+                        .metrics
+                        .record_workflow_debounced(&workflow_name);
+                    // Audit the accepted admission so debounced starts are not
+                    // invisible in harvest_audit_log (parity with the normal path).
+                    // Use the stored (first-request) workflow_id — the stable id the
+                    // run will actually be created with.
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_WORKFLOW_START,
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(outcome.workflow_id.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: STATUS_SUCCEEDED,
+                        error_summary: None,
+                        shard_id: Some(debounce_shard.as_i32()),
+                        source: &source,
+                    };
+                    // Parity with the normal start path: a successful admission must
+                    // have a succeeded audit record, so a failed audit write makes the
+                    // admission non-successful (503) rather than silently returning 202.
+                    if let Err(audit_err) = audit::insert_audit(&mut debounce_conn, &ar).await {
+                        tracing::error!(
+                            error = %audit_err,
+                            "audit insert failed for debounced workflow.start"
+                        );
+                        return AutumnError::service_unavailable_msg(format!(
+                            "audit insert failed: {audit_err}"
+                        ))
+                        .into_response();
+                    }
+                    return (
+                        axum::http::StatusCode::ACCEPTED,
+                        Json(serde_json::json!({
+                            "debounced": true,
+                            "workflow_name": workflow_name,
+                            "workflow_id": outcome.workflow_id,
+                            "debounce_key": outcome.debounce_key,
+                            "fire_at": outcome.fire_at,
+                            "pending_count": outcome.pending_count,
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(e) => return map_error(e).into_response(),
+            }
+        } // end debounce admission block
+    }
+    // Key resolved to None, no policy, or live execution exists — fall through to the normal start path.
 
     // shard computed above (before gate check); reuse it here.
     let exec_id = ExecutionId::new_for_shard(shard);
@@ -6060,7 +6489,29 @@ async fn batch_start_workflows(
                 "workflow '{}' is a registered DAG; use POST /dags/{{name}}/trigger",
                 item.workflow_name
             ))
+        } else if item.workflow_id.is_none()
+            && workflow_has_resolving_debounce(
+                &runtime.registry,
+                &item.workflow_name,
+                item.input.as_ref().unwrap_or(&Value::Null),
+            )
+        {
+            // A debounced item with no explicit workflow_id is *definitely* a fresh
+            // start (a generated id can't collide), which batch cannot debounce-admit.
+            // Reject it in pre-validation so an atomic batch aborts before any earlier
+            // item is started + committed (Codex 6929). A debounced item *with* a
+            // workflow_id may attach to an existing run, so it is resolved per-item
+            // below (reject_fresh_if_debounced rejects only the fresh case).
+            Some(format!(
+                "workflow '{0}' has a debounce policy and no workflow_id; a fresh \
+                 debounced start must use POST /workflows/{0}/start",
+                item.workflow_name
+            ))
         } else {
+            // Debounce for an explicit-id item is NOT rejected here: an idempotent
+            // retry (existing workflow_id) must still return the existing run.
+            // The per-item start below passes reject_fresh_if_debounced so only a
+            // *fresh* start is rejected, under the start's lock (issue #499).
             None
         };
         if let Some(reason) = err {
@@ -6487,7 +6938,14 @@ async fn batch_start_workflows(
                 });
             let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
 
-            let start_result = start_or_load_workflow_execution(
+            // Debounced item: AllowDuplicate returns an existing run unchanged
+            // (idempotent retry — allowed), but a *fresh* start must go through
+            // debounce admission. reject_fresh_if_debounced makes the start path
+            // reject the fresh case under its lock; we map that to a per-item
+            // rejection below (issue #499).
+            let item_reject_fresh =
+                workflow_has_resolving_debounce(&runtime.registry, &item.workflow_name, &input);
+            let start_result = autumn_harvest::execution::start_or_load_workflow_execution_collect(
                 &mut conn,
                 StartWorkflowParams {
                     workflow_name: &item.workflow_name,
@@ -6517,8 +6975,16 @@ async fn batch_start_workflows(
                     schedule_id: None,
                     scheduled_for: None,
                 },
+                false,
+                item_reject_fresh,
             )
-            .await;
+            .await
+            .map(|(started, deferred)| {
+                for start in deferred {
+                    start.spawn();
+                }
+                started
+            });
 
             match start_result {
                 Ok(started) => {
@@ -6824,6 +7290,14 @@ async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
+    // Debounce admission is owned by POST /workflows/{name}/start; an atomic
+    // start+signal cannot be deferred through the trailing-edge gate. Rather than
+    // rejecting up front (which would block legitimate *attach* calls to a live
+    // run), we ask the core primitive to reject only a **fresh start** under its
+    // lock, so an attach/idempotent signal-with-start still succeeds (issue #499).
+    let reject_fresh_if_debounced =
+        workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &start_input);
+
     // Issue #252: resolve cap values. Both caps are enforced inside
     // signal_with_start_workflow_execution — after idempotency dedupe and
     // only on the fresh-start path for start_input — to avoid spurious 413s
@@ -7085,9 +7559,34 @@ async fn signal_with_start_workflow(
             severity,
             context_headers: None,
             sla,
+            reject_fresh_if_debounced,
         },
     )
     .await;
+
+    if let Err(HarvestError::DebounceFreshStart { .. }) = &result {
+        // Failed-start audit (parity with the match arms below).
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_SIGNAL_WITH_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(workflow_name.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: request.idempotency_key.as_deref(),
+            status: STATUS_FAILED,
+            error_summary: Some("debounced workflow: fresh start rejected"),
+            shard_id: Some(shard.as_i32()),
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' has a debounce policy; a fresh start must use \
+             POST /workflows/{workflow_name}/start (signal-with-start can only attach a \
+             signal to an existing run for a debounced workflow)"
+        ))
+        .into_response();
+    }
 
     match result {
         Err(HarvestError::AlreadyExists {
@@ -7313,6 +7812,12 @@ async fn update_with_start_workflow(
         .unwrap_or_else(|| "default".to_string());
     let start_input = request.start_input.unwrap_or(Value::Null);
     let update_args = request.update_args.unwrap_or(Value::Null);
+
+    // Debounce admission is owned by POST /workflows/{name}/start. Ask the core
+    // primitive to reject only a *fresh start* under its lock so an attach /
+    // idempotent update-with-start to a live run still succeeds (issue #499).
+    let reject_fresh_if_debounced =
+        workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &start_input);
 
     let effective_wf_cap = runtime
         .registry
@@ -7576,9 +8081,34 @@ async fn update_with_start_workflow(
         severity,
         context_headers: None,
         sla,
+        reject_fresh_if_debounced,
     };
 
     let result = update_with_start_workflow_execution(&mut conn, params).await;
+
+    if let Err(HarvestError::DebounceFreshStart { .. }) = &result {
+        // Failed-start audit (parity with the match arms below).
+        let ar = NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_UPDATE_WITH_START,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(workflow_name.as_str()),
+            route_or_command: route,
+            request_id: request_id.as_deref(),
+            idempotency_key: request.idempotency_key.as_deref(),
+            status: STATUS_FAILED,
+            error_summary: Some("debounced workflow: fresh start rejected"),
+            shard_id: Some(shard.as_i32()),
+            source: &source,
+        };
+        let _ = audit::insert_audit(&mut conn, &ar).await;
+        return AutumnError::bad_request_msg(format!(
+            "workflow '{workflow_name}' has a debounce policy; a fresh start must use \
+             POST /workflows/{workflow_name}/start (update-with-start can only attach an \
+             update to an existing run for a debounced workflow)"
+        ))
+        .into_response();
+    }
 
     match result {
         Err(HarvestError::AlreadyExists {
@@ -13482,6 +14012,33 @@ async fn concurrency_status(
     Ok(Json(result))
 }
 
+// ── Debounce Management (issue #499) ──────────────────────────────────────
+
+async fn debounce_status(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<autumn_harvest::debounce::PendingDebounceRecord>>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut all_records: Vec<autumn_harvest::debounce::PendingDebounceRecord> = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let records = autumn_harvest::debounce::list_pending_debounce(&mut conn)
+            .await
+            .map_err(map_error)?;
+        all_records.extend(records);
+    }
+
+    // Sort by workflow_name, then debounce_key for deterministic operator view.
+    all_records.sort_by(|a, b| {
+        a.workflow_name
+            .cmp(&b.workflow_name)
+            .then(a.debounce_key.cmp(&b.debounce_key))
+    });
+
+    Ok(Json(all_records))
+}
+
 // ── Rate Limit Management ──────────────────────────────────────────────────
 
 async fn list_rate_limits(
@@ -18764,6 +19321,8 @@ mod tests {
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                 execution_timeout: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
                 sla: None,
                 owner: None,
@@ -20025,6 +20584,8 @@ mod tests {
                     handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                     execution_timeout: None,
                     concurrency: None,
+
+                    debounce: None,
                     max_input_bytes: None,
                     sla: None,
                     owner: None,
@@ -20041,6 +20602,8 @@ mod tests {
                     handler: |_ctx, input| Box::pin(async move { Ok(input) }),
                     execution_timeout: None,
                     concurrency: None,
+
+                    debounce: None,
                     max_input_bytes: None,
                     sla: None,
                     owner: None,

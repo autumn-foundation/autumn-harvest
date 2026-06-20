@@ -111,6 +111,7 @@ async fn handle_webhook_after(
             context_headers: None,
 
             sla: None,
+            reject_fresh_if_debounced: false,
         },
     )
     .await?;

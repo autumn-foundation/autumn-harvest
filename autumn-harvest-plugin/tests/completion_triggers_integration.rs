@@ -255,6 +255,8 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
@@ -271,6 +273,8 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: None,
@@ -287,6 +291,8 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
                 description: None,
                 input_schema: Some(target_schema_fn),

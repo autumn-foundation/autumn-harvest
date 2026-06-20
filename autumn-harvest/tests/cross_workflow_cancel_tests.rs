@@ -271,6 +271,8 @@ async fn test_same_shard_live_cancel() {
         execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -287,6 +289,8 @@ async fn test_same_shard_live_cancel() {
         execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -402,6 +406,8 @@ async fn test_already_terminal_target_is_no_op_success() {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -418,6 +424,8 @@ async fn test_already_terminal_target_is_no_op_success() {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -544,6 +552,8 @@ async fn test_grace_window_expiry_unknown_target() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -651,6 +661,8 @@ async fn test_cross_shard_cancel_via_outbox() {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -667,6 +679,8 @@ async fn test_cross_shard_cancel_via_outbox() {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,

@@ -176,7 +176,11 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
     ),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    // enforce_timeouts_once now scans harvest_debounce (issue #499); include the
+    // migration so the timeout pass doesn't fail with "relation does not exist".
+    include_str!("../../autumn-harvest/migrations/20260618000001_harvest_debounce/up.sql")
 );
 type HarvestApiApp = axum::Router;
 
@@ -400,6 +404,8 @@ fn approval_registry() -> Arc<HandlerRegistry> {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -424,6 +430,8 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -441,6 +449,8 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -1951,6 +1961,8 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
         execution_timeout: None,
         sla: None,
         concurrency: None,
+
+        debounce: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -2840,6 +2852,7 @@ async fn harvest_api_cancels_workflows_and_rejects_late_signals() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn external_runner_processes_workflows_started_via_management_api() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -2854,6 +2867,8 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2890,6 +2905,8 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2969,6 +2986,8 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3024,6 +3043,8 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3088,6 +3109,8 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3139,6 +3162,8 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3199,6 +3224,8 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3824,6 +3851,8 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -4752,6 +4781,8 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -4861,6 +4892,8 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,

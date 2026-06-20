@@ -130,7 +130,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
     "\n",
-    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    // issue #499: enforce_timeouts_once now scans harvest_debounce.
+    include_str!("../migrations/20260618000001_harvest_debounce/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -790,6 +793,8 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -807,6 +812,8 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -832,6 +839,8 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -849,6 +858,8 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -1326,6 +1337,8 @@ async fn worker_completes_workflow_task_and_persists_result() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -1447,6 +1460,8 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -1581,6 +1596,8 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -1732,6 +1749,8 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -2115,6 +2134,8 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     execution_timeout: None,
                     sla: None,
                     concurrency: None,
+
+                    debounce: None,
                     max_input_bytes: None,
 
                     owner: None,
@@ -2270,6 +2291,8 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                     execution_timeout: None,
                     sla: None,
                     concurrency: None,
+
+                    debounce: None,
                     max_input_bytes: None,
 
                     owner: None,
@@ -2535,6 +2558,8 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2552,6 +2577,8 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2569,6 +2596,8 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2699,6 +2728,8 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3208,6 +3239,8 @@ async fn worker_completes_workflow_after_signal_delivery() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3330,6 +3363,8 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3770,6 +3805,8 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3879,6 +3916,8 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -4780,6 +4819,7 @@ fn slow_workflow<'a>(
 /// 10-second window and each execution carries the deterministic `workflow_id`
 /// `sched:{name}:{ts}`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     use autumn_harvest::schema::harvest_workflow_executions::dsl as exec_dsl;
 
@@ -4794,6 +4834,8 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -4912,6 +4954,8 @@ async fn workflow_schedule_max_active_runs_enforced() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -5017,6 +5061,8 @@ async fn workflow_schedule_pause_and_resume() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -5301,6 +5347,8 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -5460,6 +5508,8 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -5559,6 +5609,8 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -5916,6 +5968,8 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6065,6 +6119,8 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -6196,6 +6252,8 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6344,6 +6402,8 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6415,6 +6475,8 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6495,6 +6557,8 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6579,6 +6643,8 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6658,6 +6724,8 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6729,6 +6797,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
 /// Phase 2 — Exec#1 is terminated to free capacity.  Scheduler B starts.  Its
 /// drain pass sees `running = 0` and `buffered_runs` non-empty → dispatches exec#2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn overlap_policy_buffer_one_survives_scheduler_restart() {
     let (database_url, _container) = setup_test_database_url().await;
     let wf_name = "overlap_restart_wf";
@@ -6740,6 +6809,8 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -7346,6 +7417,8 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

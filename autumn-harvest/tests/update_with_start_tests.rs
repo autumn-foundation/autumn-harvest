@@ -44,6 +44,7 @@ fn update_with_start_params_is_cloneable_and_debug() {
         context_headers: None,
 
         sla: None,
+        reject_fresh_if_debounced: false,
     };
 
     let _cloned = params.clone();
@@ -109,6 +110,7 @@ fn update_with_start_outcome_idempotency_key_roundtrip() {
         context_headers: None,
 
         sla: None,
+        reject_fresh_if_debounced: false,
     };
     assert_eq!(
         params.idempotency_key.as_deref(),
@@ -267,6 +269,7 @@ mod db_tests {
             context_headers: None,
 
             sla: None,
+            reject_fresh_if_debounced: false,
         }
     }
 

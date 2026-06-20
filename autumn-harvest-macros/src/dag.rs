@@ -720,6 +720,7 @@ fn emit_workflow_companion(
                 execution_timeout: None,
                 sla: ::std::option::Option::None,
                 concurrency: ::std::option::Option::None,
+                debounce: ::std::option::Option::None,
                 max_input_bytes: ::std::option::Option::None,
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,

@@ -178,6 +178,26 @@ pub enum HarvestError {
     #[error("workflow paused: {0}")]
     WorkflowPaused(ExecutionId),
 
+    /// Returned (under the start transaction's `FOR UPDATE` lock) when a start
+    /// would create a **fresh** execution for a workflow that has a debounce
+    /// policy, via an entry point that does not itself perform debounce
+    /// admission (the fresh path of plain start, signal-with-start,
+    /// update-with-start, or batch start). The caller routes this to debounce
+    /// admission (plain start) or rejects the request (signal/update/batch).
+    /// Because the decision is made under the lock, an attach/idempotent call
+    /// (no fresh execution created) never raises it — closing the TOCTOU of an
+    /// unlocked pre-scan (issue #499).
+    #[error(
+        "workflow '{workflow_name}' (id '{workflow_id}') has a debounce policy; \
+         a fresh start must go through debounce admission, not this endpoint"
+    )]
+    DebounceFreshStart {
+        /// The workflow type name.
+        workflow_name: String,
+        /// The requested workflow id.
+        workflow_id: String,
+    },
+
     /// A Saga compensation sequence failed while trying to rollback.
     #[error(
         "saga compensation failed after original error: {original}; compensation errors: {compensation_errors:?}"

@@ -283,6 +283,8 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -2699,6 +2701,8 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
                 execution_timeout: None,
                 sla: None,
                 concurrency: None,
+
+                debounce: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2832,6 +2836,8 @@ async fn ui_trigger_preserves_dag_metadata() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

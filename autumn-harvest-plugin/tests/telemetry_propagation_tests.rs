@@ -254,6 +254,8 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,
@@ -353,6 +355,8 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
             execution_timeout: None,
             sla: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
 
             owner: None,

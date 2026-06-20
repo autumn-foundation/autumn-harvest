@@ -328,6 +328,8 @@ async fn start_harvest_runtime(
     );
     // Propagate the server-side start delay ceiling (issue #322).
     api_state.set_max_workflow_start_delay(built.worker_config().max_workflow_start_delay);
+    // Propagate the default debounce max-wait cap (issue #499).
+    api_state.set_default_debounce_max_wait(built.worker_config().default_debounce_max_wait);
     // Propagate batch start caps from builder config (issue #357).
     api_state.set_batch_start_config(&built.batch_start_config);
 
@@ -353,6 +355,7 @@ async fn start_harvest_runtime(
     let max_workflow_start_delay = built.max_workflow_start_delay;
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
     let query_timeout = built.worker_config().query_timeout;
+    let default_debounce_max_wait = built.worker_config().default_debounce_max_wait;
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
     let harvest_db_pool = runner.storage_pool();
     let workflow_handle_client = WorkflowHandleClient::new(
@@ -371,7 +374,8 @@ async fn start_harvest_runtime(
     .with_max_workflow_start_delay(max_workflow_start_delay)
     .with_max_signal_payload_bytes(max_signal_payload_bytes)
     .with_query_timeout(query_timeout)
-    .with_history_policy(runner.api_runtime().registry().history_policy());
+    .with_history_policy(runner.api_runtime().registry().history_policy())
+    .with_default_debounce_max_wait(default_debounce_max_wait);
     state.insert_extension(harvest_db_pool.clone());
     state.insert_extension(runner.api_runtime().registry().clone());
 
@@ -724,6 +728,8 @@ mod tests {
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
             execution_timeout: None,
             concurrency: None,
+
+            debounce: None,
             max_input_bytes: None,
             sla: None,
             owner: None,
