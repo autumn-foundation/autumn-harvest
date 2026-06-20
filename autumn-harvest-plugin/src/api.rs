@@ -1001,6 +1001,11 @@ struct WorkflowStackResponse {
     pending_signals: Vec<PendingSignal>,
     buffered_signals: Vec<BufferedSignal>,
     pending_child_workflows: Vec<PendingChildWorkflow>,
+    /// `true` when one or more pending-activity heartbeat checkpoints were
+    /// withheld because the cumulative per-response checkpoint budget was
+    /// exhausted (#503 review). Affected entries carry
+    /// `heartbeat_details_omitted_for_budget: true`.
+    checkpoints_truncated_for_budget: bool,
     last_event_id: i64,
 }
 
@@ -1044,7 +1049,7 @@ impl From<WorkflowExecution> for StalledWorkflowRow {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct PendingActivity {
     activity_exec_id: String,
     activity_name: String,
@@ -1063,10 +1068,17 @@ struct PendingActivity {
     /// Read-only: surfacing this never mutates the column or affects
     /// retry-resume semantics.
     heartbeat_details: Option<serde_json::Value>,
-    /// `true` when the stored heartbeat payload exceeded the configured
-    /// activity-result payload cap (#252) and was withheld from the response;
-    /// inspect `heartbeat_details_bytes` for the size.
+    /// `true` when the stored heartbeat payload exceeded this activity's
+    /// effective result-payload cap (#252) and was withheld from the response;
+    /// inspect `heartbeat_details_bytes` for the size. This reflects the
+    /// *individual* payload's own size only — see `heartbeat_details_omitted_for_budget`
+    /// for the cross-activity response budget.
     heartbeat_details_truncated: bool,
+    /// `true` when this checkpoint was within its own cap but was withheld
+    /// because the cumulative per-response checkpoint budget was already
+    /// exhausted by earlier activities (#503 review). `heartbeat_details_bytes`
+    /// still reports its size.
+    heartbeat_details_omitted_for_budget: bool,
     /// Observed byte size of the stored heartbeat payload, when one exists.
     heartbeat_details_bytes: Option<u64>,
     next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1130,6 +1142,43 @@ pub(crate) fn project_heartbeat_details(
     let (truncated, bytes) = heartbeat_details_truncation(details.as_ref(), cap);
     let payload = if truncated { None } else { details };
     (payload, truncated, bytes)
+}
+
+/// Apply a single cumulative checkpoint-byte budget across all pending
+/// activities in one stack response so a fan-out workflow with many
+/// heartbeating activities can't return roughly `count × cap` bytes (#503
+/// review). Walks the activities in order, summing the size of each *included*
+/// checkpoint; once the running total would exceed `budget`, later checkpoints
+/// are withheld (`heartbeat_details = None`, `heartbeat_details_omitted_for_budget
+/// = true`) while their `heartbeat_details_bytes` size is still reported.
+///
+/// The first payload-bearing checkpoint is always kept, even if it alone
+/// exceeds the budget, so a single legitimately large checkpoint from an
+/// activity with a raised per-activity cap stays visible (preserving the #1
+/// per-activity-cap fix). A `budget` of `0` disables the response budget.
+/// Returns `true` when at least one checkpoint was withheld for budget.
+fn apply_checkpoint_response_budget(activities: &mut [PendingActivity], budget: u64) -> bool {
+    if budget == 0 {
+        return false;
+    }
+    let mut running: u64 = 0;
+    let mut any_withheld = false;
+    for pa in activities.iter_mut() {
+        // Skip entries with no included payload (absent, or already withheld by
+        // their own per-activity cap) — they contribute nothing to the budget.
+        if pa.heartbeat_details.is_none() {
+            continue;
+        }
+        let size = pa.heartbeat_details_bytes.unwrap_or(0);
+        if running > 0 && running.saturating_add(size) > budget {
+            pa.heartbeat_details = None;
+            pa.heartbeat_details_omitted_for_budget = true;
+            any_withheld = true;
+        } else {
+            running = running.saturating_add(size);
+        }
+    }
+    any_withheld
 }
 
 #[derive(Debug, Serialize)]
@@ -5210,6 +5259,7 @@ async fn get_workflow_stack(
             pending_signals: Vec::new(),
             buffered_signals: Vec::new(),
             pending_child_workflows: Vec::new(),
+            checkpoints_truncated_for_budget: false,
             last_event_id,
         }));
     }
@@ -5302,6 +5352,7 @@ async fn get_workflow_stack(
                 last_heartbeat_at: t.last_heartbeat_at,
                 heartbeat_details,
                 heartbeat_details_truncated,
+                heartbeat_details_omitted_for_budget: false,
                 heartbeat_details_bytes,
                 next_retry_at: None,
                 schedule_to_start_deadline: t.schedule_to_start.map(|d| t.scheduled_at + d),
@@ -5336,6 +5387,7 @@ async fn get_workflow_stack(
             last_heartbeat_at: None,
             heartbeat_details: None,
             heartbeat_details_truncated: false,
+            heartbeat_details_omitted_for_budget: false,
             heartbeat_details_bytes: None,
             next_retry_at: None,
             schedule_to_start_deadline: None,
@@ -5349,6 +5401,11 @@ async fn get_workflow_stack(
         .collect::<Vec<_>>();
     let mut pending_activities = pending_activities;
     pending_activities.extend(external_pending);
+    // Bound the total checkpoint bytes returned across all pending activities so
+    // a large fan-out can't return roughly `count × cap` bytes (#503 review).
+    // The per-response budget reuses the global activity-result cap.
+    let checkpoints_truncated_for_budget =
+        apply_checkpoint_response_budget(&mut pending_activities, default_heartbeat_cap);
     let pending_local_activities = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_uuid))
         .filter(harvest_events::event_type.eq_any([
@@ -5497,6 +5554,7 @@ async fn get_workflow_stack(
         pending_signals,
         buffered_signals,
         pending_child_workflows,
+        checkpoints_truncated_for_budget,
         last_event_id,
     }))
 }
@@ -19468,6 +19526,94 @@ mod tests {
         assert_eq!(payload, Some(stored));
         assert!(!truncated, "cap of 0 means uncapped passthrough");
         assert!(bytes.is_some());
+    }
+
+    fn pending_with_checkpoint(bytes: Option<u64>) -> PendingActivity {
+        PendingActivity {
+            activity_exec_id: "a".to_string(),
+            activity_name: "act".to_string(),
+            queue: "default".to_string(),
+            scheduled_at: chrono::Utc::now(),
+            attempt: 0,
+            max_attempts: 1,
+            task_status: "RUNNING".to_string(),
+            claimed_by_worker_id: None,
+            last_heartbeat_at: None,
+            heartbeat_details: bytes.map(|_| serde_json::json!({"k": "v"})),
+            heartbeat_details_truncated: false,
+            heartbeat_details_omitted_for_budget: false,
+            heartbeat_details_bytes: bytes,
+            next_retry_at: None,
+            schedule_to_start_deadline: None,
+            start_to_close_deadline: None,
+            heartbeat_deadline: None,
+        }
+    }
+
+    #[test]
+    fn checkpoint_budget_zero_is_disabled() {
+        let mut items = vec![pending_with_checkpoint(Some(100)); 5];
+        let withheld = apply_checkpoint_response_budget(&mut items, 0);
+        assert!(!withheld);
+        assert!(items.iter().all(|i| i.heartbeat_details.is_some()));
+    }
+
+    #[test]
+    fn checkpoint_budget_keeps_items_within_total() {
+        let mut items = vec![pending_with_checkpoint(Some(100)); 3];
+        let withheld = apply_checkpoint_response_budget(&mut items, 1000);
+        assert!(!withheld);
+        assert!(items.iter().all(|i| i.heartbeat_details.is_some()));
+        assert!(
+            items
+                .iter()
+                .all(|i| !i.heartbeat_details_omitted_for_budget)
+        );
+    }
+
+    #[test]
+    fn checkpoint_budget_withholds_past_total_in_order() {
+        // Budget 250: first two (100+100) fit; third pushes over and is withheld.
+        let mut items = vec![pending_with_checkpoint(Some(100)); 3];
+        let withheld = apply_checkpoint_response_budget(&mut items, 250);
+        assert!(withheld);
+        assert!(items[0].heartbeat_details.is_some());
+        assert!(items[1].heartbeat_details.is_some());
+        assert!(items[2].heartbeat_details.is_none());
+        assert!(items[2].heartbeat_details_omitted_for_budget);
+        // Size is still reported for the withheld entry, and it is not marked as
+        // individually truncated.
+        assert_eq!(items[2].heartbeat_details_bytes, Some(100));
+        assert!(!items[2].heartbeat_details_truncated);
+    }
+
+    #[test]
+    fn checkpoint_budget_always_keeps_first_even_if_oversized() {
+        // A single checkpoint larger than the whole budget is still shown so a
+        // raised per-activity cap keeps full visibility (#503).
+        let mut items = vec![
+            pending_with_checkpoint(Some(10_000)),
+            pending_with_checkpoint(Some(10)),
+        ];
+        let withheld = apply_checkpoint_response_budget(&mut items, 1000);
+        assert!(items[0].heartbeat_details.is_some(), "first is always kept");
+        assert!(!items[0].heartbeat_details_omitted_for_budget);
+        assert!(items[1].heartbeat_details.is_none());
+        assert!(withheld);
+    }
+
+    #[test]
+    fn checkpoint_budget_skips_absent_payloads() {
+        // Entries with no included payload don't consume budget.
+        let mut items = vec![
+            pending_with_checkpoint(None),
+            pending_with_checkpoint(Some(100)),
+            pending_with_checkpoint(Some(100)),
+        ];
+        let withheld = apply_checkpoint_response_budget(&mut items, 250);
+        assert!(!withheld, "200 bytes of payload fit within 250");
+        assert!(items[1].heartbeat_details.is_some());
+        assert!(items[2].heartbeat_details.is_some());
     }
 
     #[test]

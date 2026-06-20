@@ -2831,6 +2831,9 @@ async fn harvest_api_stack_endpoint_surfaces_heartbeat_checkpoint() {
         pending[0]["last_heartbeat_at"].is_string(),
         "last_heartbeat_at remains present"
     );
+    // A small, in-budget checkpoint is not budget-omitted (#503 review).
+    assert_eq!(pending[0]["heartbeat_details_omitted_for_budget"], false);
+    assert_eq!(payload["checkpoints_truncated_for_budget"], false);
 }
 
 #[tokio::test]
