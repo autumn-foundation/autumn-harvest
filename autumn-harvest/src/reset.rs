@@ -1021,7 +1021,7 @@ async fn reapply_or_drop_signals(
     }
 
     if !signals.is_empty() {
-        let ids = signals.iter().map(|signal| signal.id).collect::<Vec<_>>();
+        let ids = signals.iter().map(|signal| signal.id);
         diesel::update(harvest_signals::table.filter(harvest_signals::id.eq_any(ids)))
             .set(harvest_signals::consumed.eq(true))
             .execute(conn)

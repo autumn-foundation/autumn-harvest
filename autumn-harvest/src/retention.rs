@@ -617,7 +617,7 @@ async fn run_shard_tick(
                 .map_err(database_error)?;
 
                 if !rows.is_empty() {
-                    let ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+                    let ids = rows.iter().map(|r| r.id);
                     diesel::update(
                         harvest_workflow_executions::table
                             .filter(harvest_workflow_executions::id.eq_any(ids)),
@@ -637,7 +637,7 @@ async fn run_shard_tick(
         drop(conn);
 
         if !candidates.is_empty() {
-            let ids: Vec<uuid::Uuid> = candidates.iter().map(|r| r.id).collect();
+            let ids = candidates.iter().map(|r| r.id);
             guard
                 .active_ids
                 .lock()
