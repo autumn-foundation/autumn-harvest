@@ -107,9 +107,17 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
             }
             ' ' if in_quotes.is_none() && in_idx.is_none() => {
                 let remaining = &token[byte_idx..];
-                if remaining.starts_with(" in ") || remaining.starts_with(" IN ") || remaining.starts_with(" In ") || remaining.starts_with(" iN ") {
+                if remaining.starts_with(" in ")
+                    || remaining.starts_with(" IN ")
+                    || remaining.starts_with(" In ")
+                    || remaining.starts_with(" iN ")
+                {
                     in_idx = Some(byte_idx);
-                } else if remaining == " in" || remaining == " IN" || remaining == " In" || remaining == " iN" {
+                } else if remaining == " in"
+                    || remaining == " IN"
+                    || remaining == " In"
+                    || remaining == " iN"
+                {
                     in_idx = Some(byte_idx);
                 }
             }
@@ -137,7 +145,9 @@ fn parse_exact(token: &str, idx: usize) -> Result<Requirement, String> {
 
 fn parse_in(token: &str, idx: usize) -> Result<Requirement, String> {
     if idx + " in ".len() > token.len() {
-        return Err(format!("invalid requirement syntax: '{token}'; expected set items after 'in'"));
+        return Err(format!(
+            "invalid requirement syntax: '{token}'; expected set items after 'in'"
+        ));
     }
     let key_raw = &token[..idx];
     let val_raw = &token[idx + " in ".len()..];
