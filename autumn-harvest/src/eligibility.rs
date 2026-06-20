@@ -91,13 +91,9 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut eq_idx = None;
     let mut in_idx = None;
     let mut in_quotes = None;
-    let token_chars: Vec<char> = token.chars().collect();
-    let token_lower = token.to_lowercase();
-    let token_lower_chars: Vec<char> = token_lower.chars().collect();
 
-    let mut i = 0;
-    while i < token_chars.len() {
-        let c = token_chars[i];
+    let mut char_indices = token.char_indices();
+    while let Some((byte_idx, c)) = char_indices.next() {
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -107,31 +103,27 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
                 }
             }
             '=' if in_quotes.is_none() && eq_idx.is_none() => {
-                eq_idx = Some(i);
+                eq_idx = Some(byte_idx);
             }
-            _ => {
-                if in_quotes.is_none()
-                    && in_idx.is_none()
-                    && i + 3 < token_chars.len()
-                    && token_lower_chars[i] == ' '
-                    && token_lower_chars[i + 1] == 'i'
-                    && token_lower_chars[i + 2] == 'n'
-                    && token_lower_chars[i + 3] == ' '
-                {
-                    in_idx = Some(i);
+            ' ' if in_quotes.is_none() && in_idx.is_none() => {
+                let remaining = &token[byte_idx..];
+                if remaining.starts_with(" in ") || remaining.starts_with(" IN ") || remaining.starts_with(" In ") || remaining.starts_with(" iN ") {
+                    in_idx = Some(byte_idx);
+                } else if remaining == " in" || remaining == " IN" || remaining == " In" || remaining == " iN" {
+                    in_idx = Some(byte_idx);
                 }
             }
+            _ => {}
         }
-        i += 1;
     }
     (eq_idx, in_idx)
 }
 
 fn parse_exact(token: &str, idx: usize) -> Result<Requirement, String> {
     let key_raw = &token[..idx];
-    let mut val_raw = &token[idx + 1..];
+    let mut val_raw = &token[idx + '='.len_utf8()..];
     if val_raw.starts_with('=') {
-        val_raw = &val_raw[1..];
+        val_raw = &val_raw['='.len_utf8()..];
     }
 
     let key = strip_quotes(key_raw).to_string();
@@ -144,8 +136,11 @@ fn parse_exact(token: &str, idx: usize) -> Result<Requirement, String> {
 }
 
 fn parse_in(token: &str, idx: usize) -> Result<Requirement, String> {
+    if idx + " in ".len() > token.len() {
+        return Err(format!("invalid requirement syntax: '{token}'; expected set items after 'in'"));
+    }
     let key_raw = &token[..idx];
-    let val_raw = &token[idx + 4..];
+    let val_raw = &token[idx + " in ".len()..];
 
     let key = strip_quotes(key_raw).to_string();
     if key.is_empty() {

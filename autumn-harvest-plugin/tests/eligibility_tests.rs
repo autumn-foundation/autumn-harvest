@@ -1390,3 +1390,31 @@ async fn test_worker_heartbeat_updates_labels() {
         assert_eq!(worker_labels.get("gpu").map(String::as_str), Some("true"));
     }
 }
+
+#[test]
+fn eligibility_panic_on_multibyte_boundary() {
+    // Tests that parsing a requirement string containing multibyte characters
+    // (e.g., before an operator) correctly determines the byte boundary instead
+    // of slicing into the middle of a multi-byte char causing a panic.
+    let req = autumn_harvest::eligibility::parse_requirements("Ň=b");
+    assert!(req.is_ok());
+    let parsed = req.unwrap();
+    assert_eq!(
+        parsed,
+        vec![autumn_harvest::eligibility::Requirement::Exact {
+            key: "Ň".to_string(),
+            value: "b".to_string()
+        }]
+    );
+
+    let req2 = autumn_harvest::eligibility::parse_requirements("k😊y=value");
+    assert!(req2.is_ok());
+    let parsed2 = req2.unwrap();
+    assert_eq!(
+        parsed2,
+        vec![autumn_harvest::eligibility::Requirement::Exact {
+            key: "k😊y".to_string(),
+            value: "value".to_string()
+        }]
+    );
+}
