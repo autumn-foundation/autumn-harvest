@@ -3088,6 +3088,7 @@ pub const fn management_api_response_fields()
                 "pending_signals",
                 "buffered_signals",
                 "pending_child_workflows",
+                "checkpoints_truncated_for_budget",
                 "last_event_id",
             ]),
         ),
@@ -5289,6 +5290,12 @@ async fn get_workflow_stack(
         .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_uuid)))
         .filter(harvest_task_queue::task_type.eq("activity"))
         .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
+        // Stable ordering so the cumulative checkpoint budget (#503) keeps/omits
+        // the same checkpoints deterministically across calls and query plans.
+        .order((
+            harvest_task_queue::scheduled_at.asc(),
+            harvest_task_queue::id.asc(),
+        ))
         .select(autumn_harvest::models::TaskQueueItem::as_select())
         .load::<autumn_harvest::models::TaskQueueItem>(&mut conn)
         .await

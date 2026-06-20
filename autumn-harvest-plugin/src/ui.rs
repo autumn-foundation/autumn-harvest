@@ -1091,7 +1091,12 @@ async fn load_blocked_on_data(
                 .or(harvest_task_queue::state.eq("BACKOFF")),
         )
         .filter(harvest_task_queue::task_type.eq("activity"))
-        .order(harvest_task_queue::scheduled_at.asc())
+        // Stable ordering (id tiebreaker) so the per-page checkpoint budget
+        // (#503) keeps/omits the same checkpoints deterministically.
+        .order((
+            harvest_task_queue::scheduled_at.asc(),
+            harvest_task_queue::id.asc(),
+        ))
         .limit(20)
         .select(TaskQueueItem::as_select())
         .load::<TaskQueueItem>(conn)

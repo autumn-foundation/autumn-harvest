@@ -341,6 +341,7 @@
           "pending_signals",
           "buffered_signals",
           "pending_child_workflows",
+          "checkpoints_truncated_for_budget",
           "last_event_id"
         ]
       },
