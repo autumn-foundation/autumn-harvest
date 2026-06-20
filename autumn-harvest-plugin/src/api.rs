@@ -1055,10 +1055,45 @@ struct PendingActivity {
     task_status: String,
     claimed_by_worker_id: Option<String>,
     last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Latest heartbeat checkpoint payload reported by the activity via
+    /// `ctx.heartbeat(...)` — the current value of
+    /// `harvest_task_queue.heartbeat_details` (issue #503). `null` when no
+    /// heartbeat payload has been flushed, or when the stored payload exceeds
+    /// the activity-result payload cap (see `heartbeat_details_truncated`).
+    /// Read-only: surfacing this never mutates the column or affects
+    /// retry-resume semantics.
+    heartbeat_details: Option<serde_json::Value>,
+    /// `true` when the stored heartbeat payload exceeded the configured
+    /// activity-result payload cap (#252) and was withheld from the response;
+    /// inspect `heartbeat_details_bytes` for the size.
+    heartbeat_details_truncated: bool,
+    /// Observed byte size of the stored heartbeat payload, when one exists.
+    heartbeat_details_bytes: Option<u64>,
     next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
     schedule_to_start_deadline: Option<chrono::DateTime<chrono::Utc>>,
     start_to_close_deadline: Option<chrono::DateTime<chrono::Utc>>,
     heartbeat_deadline: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Project a stored heartbeat checkpoint payload onto the describe response,
+/// bounded by the activity-result payload cap (#252) so a pathological payload
+/// cannot bloat the stack response. Returns `(payload, truncated, bytes)`:
+/// `payload` is the verbatim value when present and within the cap, or `None`
+/// when absent or over-cap; `truncated` is `true` only in the over-cap case;
+/// `bytes` is the observed serialized size whenever a payload exists. A `cap`
+/// of `0` means uncapped. Pure and strictly non-mutating (issue #503).
+pub(crate) fn project_heartbeat_details(
+    details: Option<serde_json::Value>,
+    cap: u64,
+) -> (Option<serde_json::Value>, bool, Option<u64>) {
+    details.map_or((None, false, None), |value| {
+        let bytes = serde_json::to_string(&value).map_or(0, |s| s.len() as u64);
+        if cap > 0 && bytes > cap {
+            (None, true, Some(bytes))
+        } else {
+            (Some(value), false, Some(bytes))
+        }
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -5180,6 +5215,13 @@ async fn get_workflow_stack(
         }
     }
 
+    // Reuse the #252 activity-result payload cap as the response-side guard for
+    // heartbeat checkpoints (issue #503); fall back to the documented default
+    // when no runtime is installed (read-only mount).
+    let heartbeat_details_cap = api_state.runtime().ok().map_or(
+        autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
+        |rt| rt.registry.max_activity_result_bytes,
+    );
     let pending_activities = tasks
         .into_iter()
         .map(|t| {
@@ -5197,6 +5239,8 @@ async fn get_workflow_stack(
                 t.state
             };
 
+            let (heartbeat_details, heartbeat_details_truncated, heartbeat_details_bytes) =
+                project_heartbeat_details(t.heartbeat_details, heartbeat_details_cap);
             PendingActivity {
                 activity_exec_id: t.id.to_string(),
                 activity_name: t.activity_name.unwrap_or_default(),
@@ -5207,6 +5251,9 @@ async fn get_workflow_stack(
                 task_status,
                 claimed_by_worker_id: t.worker_id,
                 last_heartbeat_at: t.last_heartbeat_at,
+                heartbeat_details,
+                heartbeat_details_truncated,
+                heartbeat_details_bytes,
                 next_retry_at: None,
                 schedule_to_start_deadline: t.schedule_to_start.map(|d| t.scheduled_at + d),
                 start_to_close_deadline: t.started_at.zip(t.start_to_close).map(|(s, d)| s + d),
@@ -5238,6 +5285,9 @@ async fn get_workflow_stack(
             task_status: task.state.clone(),
             claimed_by_worker_id: None,
             last_heartbeat_at: None,
+            heartbeat_details: None,
+            heartbeat_details_truncated: false,
+            heartbeat_details_bytes: None,
             next_retry_at: None,
             schedule_to_start_deadline: None,
             start_to_close_deadline: Some(task.deadline_at),
@@ -19310,6 +19360,44 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn project_heartbeat_details_none_is_absent() {
+        let (payload, truncated, bytes) = project_heartbeat_details(None, 1024);
+        assert!(payload.is_none());
+        assert!(!truncated);
+        assert!(bytes.is_none());
+    }
+
+    #[test]
+    fn project_heartbeat_details_under_cap_is_verbatim() {
+        let stored = serde_json::json!({"processed": 4500, "total": 10000});
+        let (payload, truncated, bytes) = project_heartbeat_details(Some(stored.clone()), 1024);
+        assert_eq!(payload, Some(stored.clone()));
+        assert!(!truncated);
+        let expected = serde_json::to_string(&stored).unwrap().len() as u64;
+        assert_eq!(bytes, Some(expected));
+    }
+
+    #[test]
+    fn project_heartbeat_details_over_cap_is_truncated() {
+        let stored = serde_json::json!({"blob": "x".repeat(100)});
+        let observed = serde_json::to_string(&stored).unwrap().len() as u64;
+        let (payload, truncated, bytes) = project_heartbeat_details(Some(stored), 16);
+        assert!(payload.is_none(), "over-cap payload must be withheld");
+        assert!(truncated);
+        assert_eq!(bytes, Some(observed));
+        assert!(bytes.unwrap() > 16);
+    }
+
+    #[test]
+    fn project_heartbeat_details_zero_cap_is_uncapped() {
+        let stored = serde_json::json!({"blob": "x".repeat(10_000)});
+        let (payload, truncated, bytes) = project_heartbeat_details(Some(stored.clone()), 0);
+        assert_eq!(payload, Some(stored));
+        assert!(!truncated, "cap of 0 means uncapped passthrough");
+        assert!(bytes.is_some());
     }
 
     #[test]

@@ -259,3 +259,71 @@ curl "/workflows?state=RUNNING&page_size=50&cursor=abc123"
 - The `no_progress_minutes` (stalled-workflow) filter always returns a bare array regardless of pagination parameters.
 - `page_size` and `limit` are aliases; if both are present `page_size` wins.
 - On a sharded deployment each shard is queried independently with the same cursor and `page_size+1` limit; the results are k-way merged and truncated to `page_size` before the response is returned. See `docs/sharding.md` for the cross-shard keyset contract.
+
+## Workflow Stack (describe)
+
+### Endpoint
+
+```
+GET /workflows/{exec_id}/stack
+```
+
+Returns a point-in-time "describe" view of an in-flight workflow: its pending
+activities, local activities, external handoffs, timers, signals, buffered
+signals, and child workflows. This is the primary view for triaging a running
+execution. For a terminal execution the pending arrays are empty.
+
+### Pending activity heartbeat checkpoint (issue #503)
+
+Each entry in `pending_activities[]` surfaces the latest **heartbeat checkpoint
+payload** the activity reported via `ctx.heartbeat(...)` — the current value of
+`harvest_task_queue.heartbeat_details` for that task row, alongside the existing
+`last_heartbeat_at` timestamp. This lets an operator answer "how far has this
+in-flight activity progressed?" (e.g. `{"processed": 4500, "total": 10000}`)
+from a single API call, with zero direct database access.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `last_heartbeat_at` | timestamp \| null | When the most recent heartbeat was flushed. |
+| `heartbeat_details` | JSON \| null | The latest checkpoint payload, verbatim as the activity reported it. `null` when no heartbeat has been flushed, **or** when the payload exceeded the response size cap (see `heartbeat_details_truncated`). |
+| `heartbeat_details_truncated` | bool | `true` when the stored payload exceeded the activity-result payload cap (issue #252, default **2 MiB**) and was withheld from the response. |
+| `heartbeat_details_bytes` | integer \| null | Observed serialized byte size of the stored payload, when one exists. With `heartbeat_details_truncated: true` this is the size of the withheld blob. |
+
+Notes:
+
+- **Regular activities only.** Local activities cannot heartbeat
+  (`ctx.heartbeat(...)` returns a `Config` error), so `pending_local_activities[]`
+  has no heartbeat checkpoint field.
+- **Read-only.** Surfacing the checkpoint never writes, clears, or alters the
+  column, and never affects retry-resume semantics
+  (`ActivityContext::heartbeat_details::<T>()` reads the same value unchanged).
+- **Shard-correct.** The handler routes by the execution's encoded shard; the
+  heartbeat column lives on the same shard as the task row, so no cross-shard
+  fan-out is introduced.
+- **Size-bounded.** The 2 MiB ceiling reuses the existing activity-result
+  payload cap rather than a new limit, so a pathological heartbeat payload
+  cannot bloat the describe response.
+
+### Example
+
+```bash
+curl "/api/harvest/workflows/$EXEC_ID/stack"
+```
+
+```json
+{
+  "exec_id": "…",
+  "workflow_name": "etl_pipeline",
+  "state": "RUNNING",
+  "pending_activities": [
+    {
+      "activity_name": "process_batch",
+      "task_status": "RUNNING",
+      "last_heartbeat_at": "2026-05-30T19:00:04Z",
+      "heartbeat_details": { "processed": 4500, "total": 10000 },
+      "heartbeat_details_truncated": false,
+      "heartbeat_details_bytes": 31
+    }
+  ]
+}
+```

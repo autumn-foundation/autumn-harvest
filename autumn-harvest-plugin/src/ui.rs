@@ -274,6 +274,10 @@ struct BlockedOnData {
     external_tasks: Vec<ExternalTask>,
     timers: Vec<HarvestTimer>,
     signals: Vec<HarvestSignal>,
+    /// Response-side byte cap applied to each pending activity's heartbeat
+    /// checkpoint payload before rendering (#252 activity-result cap, #503).
+    /// `0` = uncapped.
+    heartbeat_details_cap: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1009,8 +1013,20 @@ async fn workflow_detail_ui(
         .map_err(database_error)
         .map_err(map_error)?;
 
-    // Load blocked-on data for non-terminal workflows.
-    let blocked_on = load_blocked_on_data(&mut conn, exec_uuid, &execution.state).await?;
+    // Load blocked-on data for non-terminal workflows. Reuse the #252
+    // activity-result payload cap as the response-side guard for heartbeat
+    // checkpoints (#503); fall back to the default when no runtime is installed.
+    let heartbeat_details_cap = api_state.runtime().ok().map_or(
+        autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
+        |r| r.registry().max_activity_result_bytes,
+    );
+    let blocked_on = load_blocked_on_data(
+        &mut conn,
+        exec_uuid,
+        &execution.state,
+        heartbeat_details_cap,
+    )
+    .await?;
 
     // Resolve the continue-as-new threshold from the runtime registry if available.
     // This is a lightweight read of an in-memory value — no extra DB query.
@@ -1045,6 +1061,7 @@ async fn load_blocked_on_data(
     conn: &mut AsyncPgConnection,
     exec_uuid: uuid::Uuid,
     state: &str,
+    heartbeat_details_cap: u64,
 ) -> Result<BlockedOnData, AutumnError> {
     if is_terminal_workflow_state(state) {
         return Ok(BlockedOnData {
@@ -1052,6 +1069,7 @@ async fn load_blocked_on_data(
             external_tasks: vec![],
             timers: vec![],
             signals: vec![],
+            heartbeat_details_cap,
         });
     }
 
@@ -1112,6 +1130,7 @@ async fn load_blocked_on_data(
         external_tasks,
         timers,
         signals,
+        heartbeat_details_cap,
     })
 }
 
@@ -3926,6 +3945,29 @@ fn render_workflow_detail(
     layout(&title, &body, "../")
 }
 
+/// Render the latest heartbeat checkpoint payload for a pending activity as a
+/// collapsible JSON cell, bounded by the response-side payload cap (#503). Shows
+/// `"—"` when no checkpoint has been flushed and a truncation marker when the
+/// stored payload exceeds the cap.
+fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, cap: u64) -> Markup {
+    let (payload, truncated, bytes) =
+        crate::api::project_heartbeat_details(item.heartbeat_details.clone(), cap);
+    html! {
+        @if let Some(ref value) = payload {
+            details {
+                summary { "checkpoint" }
+                pre { (pretty_json(value)) }
+            }
+        } @else if truncated {
+            span title="heartbeat payload exceeds the response size cap" {
+                "truncated (" (bytes.unwrap_or(0)) " bytes)"
+            }
+        } @else {
+            "—"
+        }
+    }
+}
+
 fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
     let has_anything = !blocked_on.activities.is_empty()
         || !blocked_on.external_tasks.is_empty()
@@ -3947,6 +3989,8 @@ fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
                                 th { "State" }
                                 th { "Attempt" }
                                 th { "Scheduled" }
+                                th { "Last heartbeat" }
+                                th { "Checkpoint" }
                             }
                         }
                         tbody {
@@ -3956,6 +4000,8 @@ fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
                                     td { code { (&item.state) } }
                                     td { (item.attempt) }
                                     td { (format_timestamp(Some(item.scheduled_at))) }
+                                    td { (format_timestamp(item.last_heartbeat_at)) }
+                                    td { (render_heartbeat_checkpoint_cell(item, blocked_on.heartbeat_details_cap)) }
                                 }
                             }
                         }
@@ -7707,6 +7753,7 @@ mod tests {
             external_tasks: vec![],
             timers: vec![],
             signals: vec![],
+            heartbeat_details_cap: 0,
         }
     }
 

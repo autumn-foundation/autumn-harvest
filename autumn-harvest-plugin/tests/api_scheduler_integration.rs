@@ -2759,6 +2759,144 @@ async fn harvest_api_stack_endpoint_surfaces_rate_limit_throttling() {
         pending[0]["task_status"],
         "waiting on rate_limit_key=test_rate_limit_bucket"
     );
+    // An activity that has never heartbeated reports a null checkpoint (#503).
+    assert!(
+        pending[0]["heartbeat_details"].is_null(),
+        "heartbeat_details must be null when no checkpoint flushed"
+    );
+    assert_eq!(pending[0]["heartbeat_details_truncated"], false);
+    assert!(pending[0]["heartbeat_details_bytes"].is_null());
+}
+
+#[tokio::test]
+async fn harvest_api_stack_endpoint_surfaces_heartbeat_checkpoint() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "approval_workflow",
+        "stack-hb",
+    )
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for test setup");
+
+    let checkpoint = serde_json::json!({"processed": 4500, "total": 10000});
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue ( \
+            id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, attempt, max_attempts, scheduled_at, started_at, last_heartbeat_at, heartbeat_details \
+         ) VALUES ( \
+            gen_random_uuid(), 'default', 'activity', $1, 'pipeline', '{}'::jsonb, 'RUNNING', 0, 0, 5, NOW(), NOW(), NOW(), $2 \
+         )",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(checkpoint.clone())
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert heartbeating task");
+
+    let (status, payload) = get_json(&app, format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let pending = payload["pending_activities"]
+        .as_array()
+        .expect("pending_activities must be an array");
+    assert_eq!(pending.len(), 1);
+    // The latest checkpoint payload is surfaced verbatim (#503).
+    assert_eq!(pending[0]["heartbeat_details"], checkpoint);
+    assert_eq!(pending[0]["heartbeat_details_truncated"], false);
+    assert!(
+        pending[0]["heartbeat_details_bytes"].as_u64().unwrap() > 0,
+        "byte size must be reported alongside the payload"
+    );
+    assert!(
+        pending[0]["last_heartbeat_at"].is_string(),
+        "last_heartbeat_at remains present"
+    );
+}
+
+#[tokio::test]
+async fn harvest_api_stack_endpoint_truncates_oversized_heartbeat_checkpoint() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Arc::new(Vec::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::single(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "approval_workflow",
+        "stack-hb-big",
+    )
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for test setup");
+
+    // Default activity-result cap is 2 MiB; a 2.1 MiB blob must trip the guard.
+    let big_blob = "x".repeat(2 * 1024 * 1024 + 100 * 1024);
+    let checkpoint = serde_json::json!({ "blob": big_blob });
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue ( \
+            id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, attempt, max_attempts, scheduled_at, started_at, last_heartbeat_at, heartbeat_details \
+         ) VALUES ( \
+            gen_random_uuid(), 'default', 'activity', $1, 'pipeline', '{}'::jsonb, 'RUNNING', 0, 0, 5, NOW(), NOW(), NOW(), $2 \
+         )",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(checkpoint)
+    .execute(&mut conn)
+    .await
+    .expect("failed to insert oversized heartbeating task");
+
+    let (status, payload) = get_json(&app, format!("/workflows/{exec_id}/stack")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let pending = payload["pending_activities"]
+        .as_array()
+        .expect("pending_activities must be an array");
+    assert_eq!(pending.len(), 1);
+    // Over-cap payload is withheld; only the truncation marker + size are returned (#503).
+    assert!(
+        pending[0]["heartbeat_details"].is_null(),
+        "over-cap payload must be withheld"
+    );
+    assert_eq!(pending[0]["heartbeat_details_truncated"], true);
+    assert!(
+        pending[0]["heartbeat_details_bytes"].as_u64().unwrap() > 2 * 1024 * 1024,
+        "reported size must exceed the 2 MiB cap"
+    );
 }
 
 #[tokio::test]

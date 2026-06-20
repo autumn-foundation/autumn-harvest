@@ -2483,6 +2483,43 @@ async fn detail_page_blocked_on_panel_for_running_workflow() {
     );
 }
 
+/// Detail page renders the latest heartbeat checkpoint payload for a running
+/// heartbeating activity (issue #503).
+#[tokio::test]
+async fn detail_page_renders_heartbeat_checkpoint() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id =
+        insert_workflow_on_url(&database_url, ShardId::new(0), "blocked_wf", "blocked-hb").await;
+
+    let mut conn = AsyncPgConnection::establish(&database_url).await.unwrap();
+    let task_id = uuid::Uuid::new_v4();
+    let sql = format!(
+        "INSERT INTO harvest_task_queue \
+            (id, queue_name, task_type, workflow_exec_id, activity_name, input, state, priority, \
+             attempt, max_attempts, scheduled_at, started_at, last_heartbeat_at, heartbeat_details) \
+         VALUES \
+            ('{task_id}', 'default', 'activity', '{exec_uuid}', 'pipeline', \
+             '{{}}', 'RUNNING', 0, 0, 3, NOW(), NOW(), NOW(), \
+             '{{\"processed\": 4500, \"total\": 10000}}'::jsonb)",
+        exec_uuid = exec_id.as_uuid()
+    );
+    conn.batch_execute(&sql)
+        .await
+        .expect("insert heartbeating task");
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("Checkpoint"),
+        "pending-activities table should have a Checkpoint column: {html}"
+    );
+    assert!(
+        html.contains("processed") && html.contains("4500"),
+        "the latest heartbeat checkpoint payload should be rendered: {html}"
+    );
+}
+
 /// Cancel action in the UI redirects back to the detail page with a flash message.
 #[tokio::test]
 async fn detail_page_cancel_action_redirects_with_flash() {
