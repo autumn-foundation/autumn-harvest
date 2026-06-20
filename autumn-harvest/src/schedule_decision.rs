@@ -1,3 +1,16 @@
+//! Schedule decisions tracking.
+//!
+//! When a schedule's cron expression fires or an interval elapses, the engine evaluates whether
+//! to start the target workflow. A schedule decision represents the outcome of this evaluation.
+//! These decisions are persisted to the `harvest_schedule_decisions` table to provide operators
+//! with a durable audit trail of why a scheduled workflow did or did not start at a particular time.
+//!
+//! Reasons for skipping a workflow start include concurrency limits (e.g., `max_active_runs`),
+//! the schedule being paused, or prior runs still being active without a `catchup` policy.
+//!
+//! This module provides functions to safely record these decisions (swallowing database
+//! errors to preserve scheduler progress) and to purge old decisions based on retention policies.
+
 use crate::models::NewScheduleDecision;
 use crate::schema::harvest_schedule_decisions;
 use crate::telemetry::MetricsRecorder;
@@ -53,7 +66,7 @@ pub async fn record_decision_graceful(
 ///
 /// # Errors
 ///
-/// Returns a [`database_error`] if the database query execution fails.
+/// Returns a `database_error` if the database query execution fails.
 pub async fn purge_old_schedule_decisions(
     conn: &mut AsyncPgConnection,
     retention_days: i64,

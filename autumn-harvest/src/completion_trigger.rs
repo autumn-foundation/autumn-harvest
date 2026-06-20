@@ -1,3 +1,15 @@
+//! Cross-workflow and DAG completion triggers.
+//!
+//! Completion triggers allow event-driven continuation by automatically starting
+//! new workflows or DAG runs when a source workflow reaches a terminal state
+//! (e.g., `Completed` or `Failed`).
+//!
+//! This module manages the dispatch of these triggers, handling cross-shard routing
+//! via an outbox pattern (`harvest_completion_trigger_outbox`) and enforcing
+//! concurrency limits and priority inheritance. It allows independent DAGs and
+//! workflows to be loosely coupled, forming larger orchestrations without hardcoded
+//! parent-child dependencies.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;

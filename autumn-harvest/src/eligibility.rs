@@ -1,3 +1,13 @@
+//! Worker capability matching and requirement parsing DSL.
+//!
+//! This module provides a small domain-specific language (DSL) for targeting workflows
+//! and tasks to specific workers based on their capability labels. Workers report
+//! their capabilities (like `gpu=true`, `region=eu-west-1`) on startup, and workflows
+//! declare requirements (like `gpu = true, region in [eu-west-1, us-east-1]`).
+//!
+//! The engine parses these requirement strings at dispatch time using `parse_requirements`
+//! and evaluates them against connected workers using `matches_requirements`.
+
 use std::collections::HashMap;
 
 /// A single capability requirement for task execution.
@@ -27,6 +37,23 @@ fn strip_quotes(s: &str) -> &str {
 /// # Errors
 ///
 /// Returns an error string if the requirement syntax is invalid or if it contains an empty key.
+///
+/// ## Examples
+///
+/// ```
+/// use autumn_harvest::eligibility::{parse_requirements, Requirement};
+///
+/// let reqs = parse_requirements("gpu = true, region in [eu-west-1, us-east-1]").unwrap();
+/// assert_eq!(reqs.len(), 2);
+/// assert!(matches!(
+///     &reqs[0],
+///     Requirement::Exact { key, value } if key == "gpu" && value == "true"
+/// ));
+/// assert!(matches!(
+///     &reqs[1],
+///     Requirement::In { key, values } if key == "region" && values.len() == 2
+/// ));
+/// ```
 pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -191,6 +218,29 @@ fn parse_single_requirement(token: &str) -> Result<Requirement, String> {
 }
 
 /// Evaluates if a worker's capability labels satisfy the requirements.
+///
+/// Returns `true` if all requirements are satisfied by the provided labels. If any
+/// requirement references a key not present in the labels, or if the value does
+/// not match, it returns `false`.
+///
+/// ## Examples
+///
+/// ```
+/// use autumn_harvest::eligibility::{parse_requirements, matches_requirements};
+/// use std::collections::HashMap;
+///
+/// let reqs = parse_requirements("gpu = true, region in [eu-west-1, us-east-1]").unwrap();
+///
+/// let mut matching_worker = HashMap::new();
+/// matching_worker.insert("gpu".to_string(), "true".to_string());
+/// matching_worker.insert("region".to_string(), "eu-west-1".to_string());
+/// assert!(matches_requirements(&reqs, &matching_worker));
+///
+/// let mut rejecting_worker = HashMap::new();
+/// rejecting_worker.insert("gpu".to_string(), "false".to_string());
+/// rejecting_worker.insert("region".to_string(), "eu-west-1".to_string());
+/// assert!(!matches_requirements(&reqs, &rejecting_worker));
+/// ```
 #[must_use]
 pub fn matches_requirements<S: std::hash::BuildHasher>(
     requirements: &[Requirement],
