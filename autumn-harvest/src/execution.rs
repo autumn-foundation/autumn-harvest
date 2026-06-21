@@ -191,6 +191,7 @@ impl CancelledWorkflowExecution {
 
     fn newly_cancelled(
         exec_id: ExecutionId,
+        final_state: &str,
         reason: String,
         failed_task_count: usize,
         workflow_name: String,
@@ -199,7 +200,7 @@ impl CancelledWorkflowExecution {
     ) -> Self {
         Self {
             exec_id,
-            state: "CANCELLED".to_string(),
+            state: final_state.to_string(),
             reason,
             newly_cancelled: true,
             failed_task_count,
@@ -962,6 +963,7 @@ pub async fn cancel_workflow_execution_collect(
                 Ok((
                     CancelledWorkflowExecution::newly_cancelled(
                         exec_id,
+                        "CANCELLED",
                         reason,
                         total_failed_or_deleted,
                         execution.workflow_name.clone(),
@@ -1606,29 +1608,30 @@ async fn cascade_terminate_detached_child(
     Ok((true, deferred))
 }
 
-/// Hard-finalize a workflow execution to `CANCELLED` regardless of its
-/// current state.
+/// Hard-finalize a workflow execution to `TERMINATED` regardless of its
+/// current live state.
 ///
 /// `cancel_workflow_execution` is the graceful path: it requires the
-/// execution to be `RUNNING` and (in Phase 4) will run cancellation
-/// handlers before flipping the state. `terminate_workflow_execution` is
-/// the operator escape hatch — it accepts every non-cancelled state
-/// (including `RUNNING`, `FAILED`, `TIMED_OUT`) and forces the row to
-/// `CANCELLED`. Open task rows are still failed so workers don't keep
-/// chewing on a torn-down execution.
+/// execution to be `RUNNING`/`PAUSED` and the workflow body must observe
+/// the cancellation cooperatively (`is_cancelled`/`check_cancellation`).
+/// `terminate_workflow_execution` is the forceful operator escape hatch —
+/// it seals a live run (`RUNNING`/`SUSPENDED`/`PAUSED`) in the
+/// `TERMINATED` state unilaterally, surfacing to result-awaiting callers as
+/// [`HarvestError::Terminated`] (distinct from a cooperative `CANCELLED`
+/// and from a `FAILED`). Open task rows are still failed so workers don't
+/// keep chewing on a torn-down execution.
 ///
-/// Like the cancel path, this emits a [`WorkflowEvent::WorkflowCancelled`]
-/// (no new event variant — the issue's append-only contract is intact),
-/// records the supplied reason on the row, and is idempotent against an
-/// execution that is already `CANCELLED`.
+/// This emits a [`WorkflowEvent::WorkflowCancelled`] (no new event variant —
+/// the append-only contract is intact) and records the supplied reason on
+/// the row. It is **idempotent against any already-terminal state**
+/// (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`CONTINUED_AS_NEW`/
+/// `TERMINATED`): the call is a non-mutating no-op that appends no second
+/// terminal transition.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`] when the execution does not exist
-/// and [`HarvestError::Database`] for persistence failures. Unlike
-/// `cancel_workflow_execution`, this never returns
-/// [`HarvestError::Config`] for "already terminal" — that's the whole
-/// point of the operator override.
+/// and [`HarvestError::Database`] for persistence failures.
 #[allow(clippy::too_many_lines)]
 pub async fn terminate_workflow_execution(
     conn: &mut AsyncPgConnection,
@@ -1659,7 +1662,11 @@ pub async fn terminate_workflow_execution(
                             HarvestError::NotFound(format!("workflow execution {exec_id}"))
                         })?;
 
-                    if execution.state == "CANCELLED" {
+                    // Idempotent no-op against any already-terminal state
+                    // (issue #504, AC #7): never append a duplicate terminal
+                    // transition. `idempotent` returns the existing state with
+                    // `newly_cancelled = false`.
+                    if crate::erase::is_terminal_state(&execution.state) {
                         return Ok((
                             CancelledWorkflowExecution::idempotent(exec_id, execution),
                             Vec::new(),
@@ -1677,10 +1684,11 @@ pub async fn terminate_workflow_execution(
                     )
                     .await?;
 
-                    // No state-precondition filter: operator override force-writes.
+                    // No state-precondition filter: operator override force-writes
+                    // the live run to the sealed TERMINATED state.
                     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
                         .set((
-                            harvest_workflow_executions::state.eq("CANCELLED"),
+                            harvest_workflow_executions::state.eq("TERMINATED"),
                             harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                             harvest_workflow_executions::error.eq(Some(reason.clone())),
                             harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
@@ -1715,6 +1723,7 @@ pub async fn terminate_workflow_execution(
                     Ok((
                         CancelledWorkflowExecution::newly_cancelled(
                             exec_id,
+                            "TERMINATED",
                             reason,
                             failed_task_count,
                             execution.workflow_name.clone(),

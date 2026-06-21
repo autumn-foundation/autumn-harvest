@@ -42,6 +42,8 @@ pub const OP_WORKFLOW_SIGNAL_WITH_START: &str = "workflow.signal_with_start";
 pub const OP_WORKFLOW_UPDATE_WITH_START: &str = "workflow.update_with_start";
 /// Audit operation: Cancelled a workflow execution.
 pub const OP_WORKFLOW_CANCEL: &str = "workflow.cancel";
+/// Audit operation: Force-terminated a single workflow execution (issue #504).
+pub const OP_WORKFLOW_TERMINATE: &str = "workflow.terminate";
 /// Audit operation: Reset a workflow execution to a previous state.
 pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
 /// Audit operation: Paused an individual workflow execution (issue #383).
@@ -283,6 +285,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         RouteClass::Mutating,
     ),
     ("POST /workflows/{id}/cancel", RouteClass::Mutating),
+    ("POST /workflows/{id}/terminate", RouteClass::Mutating),
     ("POST /workflows/{id}/pause", RouteClass::Mutating),
     ("POST /workflows/{id}/resume", RouteClass::Mutating),
     ("POST /workflows/{id}/reset", RouteClass::Mutating),
@@ -357,6 +360,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_SIGNAL,
     OP_WORKFLOW_SIGNAL_WITH_START,
     OP_WORKFLOW_CANCEL,
+    OP_WORKFLOW_TERMINATE,
     OP_WORKFLOW_PAUSE,
     OP_WORKFLOW_RESUME,
     OP_WORKFLOW_RESET,
@@ -468,6 +472,10 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         Some(OP_WORKFLOW_SIGNAL_WITH_START),
     ),
     ("POST /workflows/{id}/cancel", Some(OP_WORKFLOW_CANCEL)),
+    (
+        "POST /workflows/{id}/terminate",
+        Some(OP_WORKFLOW_TERMINATE),
+    ),
     ("POST /workflows/{id}/pause", Some(OP_WORKFLOW_PAUSE)),
     ("POST /workflows/{id}/resume", Some(OP_WORKFLOW_RESUME)),
     ("POST /workflows/{id}/reset", Some(OP_WORKFLOW_RESET)),

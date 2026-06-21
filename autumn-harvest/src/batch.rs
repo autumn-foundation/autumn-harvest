@@ -527,9 +527,10 @@ mod db {
     /// caller didn't supply one: Cancel/Signal default to the active states
     /// `RUNNING`/`PAUSED` (terminal rows are no-ops, and a paused execution is
     /// still active — cancel accepts it and a signal queues for delivery on
-    /// resume); Terminate defaults to "every non-CANCELLED state" because its
-    /// whole purpose is to bring stuck-non-running rows to a clean terminal
-    /// state.
+    /// resume); Terminate defaults to "every non-terminal-sealed state"
+    /// (excludes `CANCELLED` and `TERMINATED`) because its whole purpose is to
+    /// seal stuck live rows as `TERMINATED` (already-terminal rows are
+    /// idempotent no-ops).
     async fn resolve_targets_on_shard(
         conn: &mut AsyncPgConnection,
         action: BatchAction,
@@ -542,7 +543,12 @@ mod db {
         if filter.states.is_empty() {
             match action {
                 BatchAction::Terminate => {
-                    query = query.filter(harvest_workflow_executions::state.ne("CANCELLED"));
+                    // Terminate seals live runs as TERMINATED; exclude both
+                    // already-sealed terminal states so a re-run never
+                    // re-selects rows this batch already finalized (#504).
+                    query = query.filter(
+                        harvest_workflow_executions::state.ne_all(["CANCELLED", "TERMINATED"]),
+                    );
                 }
                 BatchAction::Cancel | BatchAction::Signal => {
                     query = query
@@ -588,10 +594,9 @@ mod db {
                     .map_err(|e| e.to_string())
             }
             BatchAction::Terminate => {
-                // Hard finalize: accepts any non-cancelled state (including
-                // FAILED / TIMED_OUT) and force-writes CANCELLED. Cancel
-                // would error on those — Terminate is the operator escape
-                // hatch.
+                // Hard finalize: seals a live run as TERMINATED. Idempotent
+                // no-op against any already-terminal state. Cancel would error
+                // on those — Terminate is the operator escape hatch.
                 terminate_workflow_execution(conn, target, "batch terminate requested", metrics)
                     .await
                     .map(|_| ())

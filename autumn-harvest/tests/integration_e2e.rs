@@ -6710,8 +6710,8 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
 }
 
 /// (overlap-c2) `TerminateOther`: in-flight run is force-terminated and the new firing starts
-/// immediately.  `terminate_workflow_execution` writes state CANCELLED (force, regardless of
-/// prior state), then the new firing is dispatched as RUNNING.
+/// immediately.  `terminate_workflow_execution` seals the run in state TERMINATED (force,
+/// regardless of prior state; issue #504), then the new firing is dispatched as RUNNING.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn overlap_policy_terminate_other_terminates_inflight_run() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -6758,9 +6758,9 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
     );
 
     // Poll until the terminate+redispatch cycle completes (up to 12 s).
-    let (cancelled, running) = tokio::time::timeout(Duration::from_secs(12), async {
+    let (terminated, running) = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
-            let c = count_executions_in_state(&database_url, wf_name, "CANCELLED").await;
+            let c = count_executions_in_state(&database_url, wf_name, "TERMINATED").await;
             let r = count_running_executions(&database_url, wf_name).await;
             if c >= 1 && r == 1 {
                 return (c, r);
@@ -6772,8 +6772,8 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
     .expect("TerminateOther: timed out waiting for terminate+redispatch within 12 s");
 
     assert!(
-        cancelled >= 1,
-        "TerminateOther: at least 1 execution must be CANCELLED (terminated), got {cancelled}"
+        terminated >= 1,
+        "TerminateOther: at least 1 execution must be TERMINATED, got {terminated}"
     );
     assert_eq!(
         running, 1,

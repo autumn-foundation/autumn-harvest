@@ -329,3 +329,101 @@ fn workflow_result_from_terminal_execution_is_compact() {
         "result response must stay compact"
     );
 }
+
+#[tokio::test]
+async fn handle_terminate_seals_terminated_and_result_surfaces_terminated() {
+    let (database_url, _container) = setup_database_url().await;
+    let pool = build_pool(&database_url);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("postgres connection");
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let started = start_running_workflow(&mut conn, exec_id).await;
+    let client = WorkflowHandleClient::single(pool, database_url);
+    let handle = client.handle(started.exec_id);
+
+    let outcome = handle
+        .terminate("wedged by handle")
+        .await
+        .expect("terminate must succeed");
+    assert_eq!(outcome.state, "TERMINATED");
+    assert!(outcome.newly_cancelled);
+
+    // A result-awaiting caller observes HarvestError::Terminated (distinct from
+    // a cooperative cancel and from a failure).
+    let error = handle
+        .result_raw()
+        .await
+        .expect_err("terminated workflow surfaces an error");
+    assert!(
+        matches!(error, HarvestError::Terminated(reason) if reason.contains("wedged by handle")),
+        "expected HarvestError::Terminated carrying the reason"
+    );
+}
+
+#[tokio::test]
+async fn handle_terminate_is_idempotent_on_terminal() {
+    let (database_url, _container) = setup_database_url().await;
+    let pool = build_pool(&database_url);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("postgres connection");
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let started = start_running_workflow(&mut conn, exec_id).await;
+    mark_completed(&mut conn, started.exec_id).await;
+    let client = WorkflowHandleClient::single(pool, database_url);
+
+    let outcome = client
+        .handle(started.exec_id)
+        .terminate("too late")
+        .await
+        .expect("terminate must not error on a terminal run");
+    assert!(
+        !outcome.newly_cancelled,
+        "terminating a terminal run is a non-mutating no-op"
+    );
+    assert_eq!(outcome.state, "COMPLETED");
+}
+
+#[tokio::test]
+async fn typed_handle_terminate_delegates_to_inner() {
+    use autumn_harvest::TypedWorkflowHandle;
+
+    let (database_url, _container) = setup_database_url().await;
+    let pool = build_pool(&database_url);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("postgres connection");
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let started = start_running_workflow(&mut conn, exec_id).await;
+    let client = WorkflowHandleClient::single(pool, database_url);
+    let typed: TypedWorkflowHandle<serde_json::Value> =
+        TypedWorkflowHandle::new(client.handle(started.exec_id));
+
+    let outcome = typed
+        .terminate("typed kill")
+        .await
+        .expect("typed terminate must succeed");
+    assert_eq!(outcome.state, "TERMINATED");
+    assert!(outcome.newly_cancelled);
+}
+
+#[tokio::test]
+async fn handle_cancel_seals_cancelled() {
+    let (database_url, _container) = setup_database_url().await;
+    let pool = build_pool(&database_url);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("postgres connection");
+    let exec_id = ExecutionId::new_for_shard(autumn_harvest::ShardId::new(0));
+    let started = start_running_workflow(&mut conn, exec_id).await;
+    let client = WorkflowHandleClient::single(pool, database_url);
+
+    let outcome = client
+        .handle(started.exec_id)
+        .cancel("graceful by handle")
+        .await
+        .expect("cancel must succeed");
+    assert_eq!(outcome.state, "CANCELLED");
+    assert!(outcome.newly_cancelled);
+}

@@ -41,10 +41,10 @@ use autumn_harvest::audit::{
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
     OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
-    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT,
-    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH,
+    TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY,
+    TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -109,7 +109,8 @@ use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, UpdateWithStartOutcome,
     UpdateWithStartParams, WorkflowHandleClient, WorkflowResult, cancel_workflow_execution,
     pause_workflow_execution, resume_workflow_execution, signal_with_start_workflow_execution,
-    start_or_load_workflow_execution, update_with_start_workflow_execution,
+    start_or_load_workflow_execution, terminate_workflow_execution,
+    update_with_start_workflow_execution,
 };
 
 use crate::preflight::{PreflightReport, build_preflight_report};
@@ -1375,6 +1376,16 @@ struct CancelWorkflowResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct TerminateWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    state: String,
+    reason: String,
+    newly_terminated: bool,
+    failed_task_count: usize,
+}
+
+#[derive(Debug, Serialize)]
 struct PauseWorkflowResponse {
     ok: bool,
     execution_id: String,
@@ -1621,6 +1632,11 @@ struct DagTriggerRequest {
 
 #[derive(Debug, Deserialize)]
 struct CancelWorkflowRequest {
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TerminateWorkflowRequest {
     reason: Option<String>,
 }
 
@@ -2366,6 +2382,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(cancel_workflow).route_layer(require_admin.clone()),
         )
         .route(
+            "/workflows/{id}/terminate",
+            post(terminate_workflow).route_layer(require_admin.clone()),
+        )
+        .route(
             "/workflows/{id}/erase-payloads",
             post(erase_workflow_payloads_handler).route_layer(require_admin.clone()),
         )
@@ -2669,6 +2689,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
         ("POST", "/workflows/{id}/cancel"),
+        ("POST", "/workflows/{id}/terminate"),
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
         ("POST", "/workflows/{id}/erase-payloads"),
@@ -2840,6 +2861,7 @@ pub const fn management_api_request_fields()
         // ── batch workflow start (issue #357) ─────────────────────────────────
         ("POST", "/workflows/batch_start", Some(&["items", "atomic"])),
         ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
+        ("POST", "/workflows/{id}/terminate", Some(&["reason"])),
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
         (
@@ -3143,6 +3165,18 @@ pub const fn management_api_response_fields()
                 "state",
                 "reason",
                 "newly_cancelled",
+                "failed_task_count",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/terminate",
+            Some(&[
+                "ok",
+                "execution_id",
+                "state",
+                "reason",
+                "newly_terminated",
                 "failed_task_count",
             ]),
         ),
@@ -8573,6 +8607,113 @@ async fn cancel_workflow(
                     reason: cancelled.reason,
                     newly_cancelled: cancelled.newly_cancelled,
                     failed_task_count: cancelled.failed_task_count,
+                }),
+            ))
+        }
+    }
+}
+
+/// Force-terminate a single workflow execution (issue #504).
+///
+/// The forceful sibling of `cancel_workflow`: it delegates to the
+/// `terminate_workflow_execution` core primitive, sealing a live run in the
+/// `TERMINATED` state without requiring the workflow body to observe
+/// cancellation. Shard-aware (resolves the owning shard from the
+/// `ExecutionId`), audited via `OP_WORKFLOW_TERMINATE`, and idempotent against
+/// an already-terminal execution (non-mutating no-op, `newly_terminated:
+/// false`).
+async fn terminate_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<TerminateWorkflowRequest>,
+) -> Result<(axum::http::StatusCode, Json<TerminateWorkflowResponse>), AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/terminate";
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_TERMINATE,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed execution id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let reason = request
+        .reason
+        .as_deref()
+        .unwrap_or("workflow termination requested");
+    let exec_id_str = exec_id.to_string();
+
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry.telemetry().metrics),
+        );
+    let terminate_result =
+        terminate_workflow_execution(&mut conn, exec_id, reason, metrics_ref.as_ref()).await;
+    match terminate_result {
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_TERMINATE,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            Err(map_error(e))
+        }
+        Ok(terminated) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_TERMINATE,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            audit::insert_audit(&mut conn, &ar)
+                .await
+                .map_err(map_error)?;
+            Ok((
+                axum::http::StatusCode::ACCEPTED,
+                Json(TerminateWorkflowResponse {
+                    ok: true,
+                    execution_id: terminated.exec_id.to_string(),
+                    state: terminated.state,
+                    reason: terminated.reason,
+                    newly_terminated: terminated.newly_cancelled,
+                    failed_task_count: terminated.failed_task_count,
                 }),
             ))
         }
