@@ -8626,10 +8626,16 @@ async fn terminate_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
-    Json(request): Json<TerminateWorkflowRequest>,
+    // The request body is optional (the contract marks it `required: false`):
+    // terminating without an explicit reason is a common operator case, so a
+    // no-body / no-content-type POST must still terminate (with the defaulted
+    // reason) rather than be rejected by a required-`Json` extractor before the
+    // handler runs. Mirrors the cancel/pause ergonomics (#383).
+    request: Option<Json<TerminateWorkflowRequest>>,
 ) -> Result<(axum::http::StatusCode, Json<TerminateWorkflowResponse>), AutumnError> {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/terminate";
+    let request = request.map(|Json(body)| body).unwrap_or_default();
 
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,

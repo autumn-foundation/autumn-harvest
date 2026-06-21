@@ -1710,10 +1710,15 @@ pub async fn terminate_workflow_execution(
                     )
                     .await?;
                     let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    // Force-terminate fires `Terminated` completion triggers, NOT
+                    // `Cancelled` — a force-kill is distinct from a cooperative
+                    // cancellation downstream (issue #504). Operators opt into
+                    // terminate cascades by registering `terminal_states:
+                    // ["Terminated"]`.
                     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                         conn,
                         exec_id,
-                        crate::completion_trigger::TerminalState::Cancelled,
+                        crate::completion_trigger::TerminalState::Terminated,
                         None,
                     )
                     .await?;

@@ -98,6 +98,8 @@ Returns a list of all registered completion triggers in the deployment (read fro
 ### 2. POST `/admin/completion-triggers`
 Dynamically registers or updates a completion trigger. The engine propagates trigger registrations across all shards.
 
+**`terminal_states`** accepts any of: `"Completed"`, `"Failed"`, `"Cancelled"`, `"TimedOut"`, `"Terminated"`. `"Cancelled"` matches a *cooperative* cancel (`POST /workflows/{id}/cancel`); `"Terminated"` matches a *forceful* operator/batch/scheduler terminate (`POST /workflows/{id}/terminate`, issue #504). They are distinct — a force-terminate does **not** fire a `"Cancelled"` trigger, and a cancel does not fire a `"Terminated"` trigger. Register both if you want a downstream workflow on either outcome.
+
 **Request Body**:
 ```json
 {
