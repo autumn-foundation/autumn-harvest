@@ -167,6 +167,132 @@ impl DagProfiler {
     }
 }
 
+/// Exports the given DAG profile as an ASCII Gantt chart.
+///
+/// Returns an empty string if the timeline is empty.
+/// The `max_width` parameter controls the number of characters used for the timeline bar.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+pub fn export_profile_ascii_gantt(
+    profile: &DagProfile,
+    max_width: usize,
+) -> Result<String, std::fmt::Error> {
+    use std::collections::HashMap;
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    if profile.timeline.is_empty() {
+        return Ok(out);
+    }
+
+    let mut starts = HashMap::new();
+    let mut spans = Vec::new();
+
+    for event in &profile.timeline {
+        match &event.kind {
+            ProfilerEventKind::TaskStarted(idx, _name) => {
+                starts.insert(*idx, event.time);
+            }
+            ProfilerEventKind::TaskCompleted(idx, name) => {
+                if let Some(start_time) = starts.remove(idx) {
+                    spans.push((name.clone(), start_time, event.time, *idx));
+                }
+            }
+        }
+    }
+
+    spans.sort_by_key(|s| (s.1, s.3));
+
+    let total_secs = profile.total_duration.as_secs_f64();
+    let max_name_len = spans.iter().map(|s| s.0.len()).max().unwrap_or(0);
+
+    for (name, start, end, _) in spans {
+        let start_secs = start.as_secs_f64();
+        let end_secs = end.as_secs_f64();
+
+        let start_col = if total_secs > 0.0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+            {
+                ((start_secs / total_secs) * max_width as f64).round() as usize
+            }
+        } else {
+            0
+        };
+        let mut end_col = if total_secs > 0.0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+            {
+                ((end_secs / total_secs) * max_width as f64).round() as usize
+            }
+        } else {
+            1
+        };
+
+        if end_col == start_col {
+            end_col += 1;
+        }
+
+        let pre_spaces = " ".repeat(start_col);
+        let bar_len = end_col.saturating_sub(start_col);
+        let bar = "█".repeat(bar_len);
+        let post_spaces = " ".repeat(max_width.saturating_sub(end_col));
+
+        writeln!(
+            &mut out,
+            "{name:>max_name_len$} |{pre_spaces}{bar}{post_spaces}| {start_secs:.2}s - {end_secs:.2}s"
+        )?;
+    }
+
+    Ok(out)
+}
+
+/// Exports the given DAG profile as a Mermaid.js Gantt chart.
+///
+/// Returns an empty string containing only headers if the timeline is empty.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+pub fn export_profile_mermaid_gantt(profile: &DagProfile) -> Result<String, std::fmt::Error> {
+    use std::collections::HashMap;
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    writeln!(out, "gantt")?;
+    writeln!(out, "    title DAG Execution Profile")?;
+    writeln!(out, "    dateFormat  s")?;
+    writeln!(out, "    axisFormat  %S")?;
+
+    if profile.timeline.is_empty() {
+        return Ok(out);
+    }
+
+    let mut starts = HashMap::new();
+    let mut spans = Vec::new();
+
+    for event in &profile.timeline {
+        match &event.kind {
+            ProfilerEventKind::TaskStarted(idx, _) => {
+                starts.insert(*idx, event.time);
+            }
+            ProfilerEventKind::TaskCompleted(idx, name) => {
+                if let Some(start_time) = starts.remove(idx) {
+                    spans.push((name.clone(), start_time, event.time, *idx));
+                }
+            }
+        }
+    }
+
+    spans.sort_by_key(|s| (s.1, s.3));
+
+    for (name, start, end, _) in spans {
+        let start_secs = start.as_secs_f64();
+        let dur_secs = end.as_secs_f64() - start_secs;
+        writeln!(out, "    {name} : {start_secs:.2}, {dur_secs:.2}s")?;
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +361,62 @@ mod tests {
         assert_eq!(profile.total_duration, Duration::from_secs(6));
         // max concurrency is 2 because B and C run at the same time.
         assert_eq!(profile.peak_concurrency, 2);
+    }
+
+    #[test]
+    fn test_export_ascii_gantt() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(activity_a);
+        let _b = builder.activity(activity_b).upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let profiler = DagProfiler::new(dag)
+            .mock_duration("activity_a", Duration::from_secs(2))
+            .mock_duration("activity_b", Duration::from_secs(3));
+
+        let profile = profiler.profile();
+
+        let ascii = export_profile_ascii_gantt(&profile, 40).unwrap();
+        assert!(ascii.contains("activity_a"));
+        assert!(ascii.contains("activity_b"));
+        assert!(ascii.contains("0.00s - 2.00s"));
+        assert!(ascii.contains("2.00s - 5.00s"));
+        assert!(ascii.contains('█'));
+    }
+
+    #[test]
+    fn test_export_mermaid_gantt() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(activity_a);
+        let _b = builder.activity(activity_b).upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let profiler = DagProfiler::new(dag)
+            .mock_duration("activity_a", Duration::from_secs(2))
+            .mock_duration("activity_b", Duration::from_secs(3));
+
+        let profile = profiler.profile();
+
+        let mermaid = export_profile_mermaid_gantt(&profile).unwrap();
+        assert!(mermaid.starts_with("gantt"));
+        assert!(mermaid.contains("title DAG Execution Profile"));
+        assert!(mermaid.contains("activity_a : 0.00, 2.00s"));
+        assert!(mermaid.contains("activity_b : 2.00, 3.00s"));
+    }
+
+    #[test]
+    fn test_export_empty_profile() {
+        let profile = DagProfile {
+            total_duration: Duration::ZERO,
+            peak_concurrency: 0,
+            timeline: Vec::new(),
+        };
+
+        let ascii = export_profile_ascii_gantt(&profile, 40).unwrap();
+        assert_eq!(ascii, "");
+
+        let mermaid = export_profile_mermaid_gantt(&profile).unwrap();
+        assert!(mermaid.starts_with("gantt"));
+        assert!(!mermaid.contains("activity_"));
     }
 }
