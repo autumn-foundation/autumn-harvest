@@ -15953,6 +15953,88 @@ fn terminal_event_type_to_state(event_type: &str) -> &'static str {
     }
 }
 
+/// Pure `stream-end` reason decision: the authoritative execution-row state
+/// wins when terminal; otherwise fall back to the event-derived label.
+///
+/// The `WorkflowCancelled` event is reused for both cooperative cancel
+/// (`CANCELLED`) and force-terminate (`TERMINATED`) (issue #504, no new event
+/// variant), so the event type alone cannot distinguish them — only the
+/// execution-row `state` column can. The event-derived label is used only as a
+/// fallback for the pre-existing not-yet-committed race (a terminal event
+/// observed before the state column flipped) or when the row read fails.
+fn stream_end_reason(authoritative_state: Option<&str>, event_derived: &str) -> String {
+    match authoritative_state {
+        Some(state) if is_terminal_state(state) => state.to_lowercase().replace('_', "-"),
+        _ => event_derived.to_string(),
+    }
+}
+
+/// Resolve the `stream-end` reason from a fresh read of the authoritative
+/// `execution.state`. The terminal event and the state column commit in the
+/// same transaction, so once a terminal event is visible the final state is too.
+async fn resolve_stream_end_reason(
+    api: &HarvestApiState,
+    exec_id: ExecutionId,
+    event_derived: &str,
+) -> String {
+    let state = match db_conn_for_execution(api, exec_id).await {
+        Ok(mut conn) => load_execution(&mut conn, exec_id)
+            .await
+            .ok()
+            .map(|execution| execution.state),
+        Err(_) => None,
+    };
+    stream_end_reason(state.as_deref(), event_derived)
+}
+
+#[cfg(test)]
+mod stream_end_reason_tests {
+    use super::stream_end_reason;
+
+    #[test]
+    fn authoritative_terminated_state_overrides_cancelled_event_label() {
+        // The reused WorkflowCancelled event yields "cancelled", but a force-
+        // terminated run's row state is TERMINATED — the authoritative state
+        // must win so stream-end surfaces "terminated" (issue #504).
+        assert_eq!(
+            stream_end_reason(Some("TERMINATED"), "cancelled"),
+            "terminated"
+        );
+    }
+
+    #[test]
+    fn cooperative_cancel_stays_cancelled() {
+        assert_eq!(
+            stream_end_reason(Some("CANCELLED"), "cancelled"),
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn other_terminal_states_map_from_authoritative_state() {
+        assert_eq!(
+            stream_end_reason(Some("COMPLETED"), "completed"),
+            "completed"
+        );
+        assert_eq!(
+            stream_end_reason(Some("TIMED_OUT"), "timed-out"),
+            "timed-out"
+        );
+        assert_eq!(
+            stream_end_reason(Some("CONTINUED_AS_NEW"), "continued-as-new"),
+            "continued-as-new"
+        );
+    }
+
+    #[test]
+    fn non_terminal_or_missing_state_falls_back_to_event_label() {
+        // Pre-existing not-yet-committed race: a terminal event was observed
+        // before the state column flipped — keep the event-derived label.
+        assert_eq!(stream_end_reason(Some("RUNNING"), "cancelled"), "cancelled");
+        assert_eq!(stream_end_reason(None, "terminated"), "terminated");
+    }
+}
+
 /// `GET /executions/{exec_id}/events/stream`
 ///
 /// Returns a `text/event-stream` response that tails every `WorkflowEvent`
@@ -16197,7 +16279,8 @@ async fn stream_execution_events(
                 None
             });
         if let Some(state) = effective_terminal {
-            let end_data = serde_json::json!({"reason": state}).to_string();
+            let reason = resolve_stream_end_reason(&api_clone, exec_id, state).await;
+            let end_data = serde_json::json!({"reason": reason}).to_string();
             let _ = tx
                 .send(Ok(Event::default().event("stream-end").data(end_data)))
                 .await;
@@ -16258,7 +16341,9 @@ async fn stream_execution_events(
                         }
 
                         if let Some(state) = terminal_state {
-                            let end_data = serde_json::json!({"reason": state}).to_string();
+                            let reason =
+                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
+                            let end_data = serde_json::json!({"reason": reason}).to_string();
                             let _ = tx
                                 .send(Ok(Event::default().event("stream-end").data(end_data)))
                                 .await;
@@ -16301,7 +16386,9 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let end_data = serde_json::json!({"reason": state}).to_string();
+                            let reason =
+                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
+                            let end_data = serde_json::json!({"reason": reason}).to_string();
                             let _ = tx
                                 .send(Ok(Event::default().event("stream-end").data(end_data)))
                                 .await;
@@ -16344,7 +16431,9 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let end_data = serde_json::json!({"reason": state}).to_string();
+                            let reason =
+                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
+                            let end_data = serde_json::json!({"reason": reason}).to_string();
                             let _ = tx
                                 .send(Ok(Event::default().event("stream-end").data(end_data)))
                                 .await;

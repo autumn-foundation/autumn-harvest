@@ -55,7 +55,7 @@ data: {"reason":"completed","execution_id":"<exec_id>","state":"COMPLETED"}
 
 ```
 
-The `reason` field mirrors the terminal event type in lowercase. Receiving `event: stream-end` is the client's signal to **stop reconnecting** — the execution will not produce more events. Contrast this with a transport drop, where the client should reconnect with `Last-Event-ID`.
+The `reason` field is the execution's terminal state, lowercased and hyphenated — one of `completed`, `failed`, `cancelled`, `timed-out`, `terminated`, `continued-as-new`. It is derived from the authoritative `harvest_workflow_executions.state` column (not the event type), so a force-terminated run (issue #504) reports `terminated` even though it reuses the `WorkflowCancelled` event. Receiving `event: stream-end` is the client's signal to **stop reconnecting** — the execution will not produce more events. Contrast this with a transport drop, where the client should reconnect with `Last-Event-ID`.
 
 #### Slow consumer
 
