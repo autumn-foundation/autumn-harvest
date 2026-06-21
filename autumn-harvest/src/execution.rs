@@ -838,16 +838,34 @@ async fn notify_awaited_parent_of_child_terminal(
         && execution.parent_close_policy.is_none()
     {
         let parent_exec_id = ExecutionId::from_uuid(parent_uuid);
-        store::append_single_event(
-            conn,
-            parent_exec_id,
-            WorkflowEvent::ChildWorkflowFailed {
-                child_id: child_exec_id,
-                error,
-            },
-        )
-        .await?;
-        queue::wake_workflow_task(conn, parent_exec_id).await?;
+        // Lock the parent row and skip the wake if it is already terminal (or
+        // gone): an awaited child can outlive its parent (e.g. the parent hit its
+        // execution timeout while the child kept running), and appending a
+        // command-consumable `ChildWorkflowFailed` after the parent's own terminal
+        // event would add replay-visible history past closure. The `FOR UPDATE`
+        // lock serializes against a concurrent parent termination — which holds
+        // the same row lock — so we either observe the parent terminal here and
+        // skip, or append before it seals and the parent consumes the event.
+        let parent_state: Option<String> = harvest_workflow_executions::table
+            .find(parent_exec_id.as_uuid())
+            .select(harvest_workflow_executions::state)
+            .for_update()
+            .first(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        if matches!(parent_state, Some(state) if !crate::erase::is_terminal_state(&state)) {
+            store::append_single_event(
+                conn,
+                parent_exec_id,
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id: child_exec_id,
+                    error,
+                },
+            )
+            .await?;
+            queue::wake_workflow_task(conn, parent_exec_id).await?;
+        }
     }
     Ok(())
 }

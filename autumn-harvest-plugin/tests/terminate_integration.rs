@@ -635,3 +635,49 @@ async fn terminate_with_empty_json_body_returns_202() {
     );
     assert_eq!(state_of(&mut conn, exec_id).await, "TERMINATED");
 }
+
+/// (P2, #787 review) An awaited child can outlive its parent (e.g. the parent
+/// hit its execution timeout). Terminating the child must NOT append a
+/// command-consumable `ChildWorkflowFailed` to the already-terminal parent —
+/// that would add replay-visible history past the parent's closure.
+#[tokio::test]
+async fn terminate_awaited_child_skips_wake_when_parent_terminal() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let parent = seed_running(&mut conn, "parent-timed-out").await;
+    let child = seed_child(&mut conn, "child-outlives-parent", parent, false).await;
+
+    // Parent reaches a terminal state while the awaited child is still running.
+    diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("TIMED_OUT"),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let parent_events_before = event_count(&mut conn, parent).await;
+
+    let (status, _body) = post_json(
+        &app,
+        &format!("/workflows/{child}/terminate"),
+        json!({ "reason": "kill orphaned child" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // The child terminates, but the terminal parent is left untouched.
+    assert_eq!(state_of(&mut conn, child).await, "TERMINATED");
+    assert!(
+        child_failed_events(&mut conn, parent).await.is_empty(),
+        "a terminal parent must not receive a ChildWorkflowFailed wake"
+    );
+    assert_eq!(
+        event_count(&mut conn, parent).await,
+        parent_events_before,
+        "no event may be appended to an already-terminal parent's history"
+    );
+}
