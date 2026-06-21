@@ -467,3 +467,171 @@ async fn terminate_writes_audit_record() {
         .unwrap();
     assert_eq!(audit_count, 1, "exactly one succeeded audit row must exist");
 }
+
+/// Seed a child execution. `detached = false` is an **awaited** child
+/// (`parent_id` set, `parent_close_policy` NULL); `detached = true` sets a
+/// `parent_close_policy` so the row is a detached child.
+async fn seed_child(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+    parent: ExecutionId,
+    detached: bool,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name: "child-wf",
+            workflow_id,
+            exec_id,
+            input: json!({ "n": 1 }),
+            parent_id: Some(parent.as_uuid()),
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: WorkflowIdReusePolicy::default(),
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+        },
+    )
+    .await
+    .expect("seed child");
+    if detached {
+        diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+            .set(harvest_workflow_executions::parent_close_policy.eq(Some("abandon")))
+            .execute(conn)
+            .await
+            .unwrap();
+    }
+    exec_id
+}
+
+/// Collect the `ChildWorkflowFailed` events recorded on an execution's history.
+async fn child_failed_events(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<Value> {
+    let rows: Vec<Value> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(harvest_events::event_data)
+        .load(conn)
+        .await
+        .unwrap();
+    rows.into_iter()
+        .filter(|v| v.get("type").and_then(Value::as_str) == Some("ChildWorkflowFailed"))
+        .collect()
+}
+
+async fn post_empty_json(app: &HarvestApiApp, uri: &str) -> StatusCode {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("x-harvest-admin", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("POST request");
+    response.status()
+}
+
+/// (P1, #787 review) Terminating an **awaited** child wakes the parent: a
+/// `ChildWorkflowFailed` event carrying the termination reason is appended to
+/// the parent's history, so a parent parked on the child's await is not stuck.
+#[tokio::test]
+async fn terminate_awaited_child_notifies_parent() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let parent = seed_running(&mut conn, "parent-await").await;
+    let child = seed_child(&mut conn, "child-await", parent, false).await;
+
+    let (status, _body) = post_json(
+        &app,
+        &format!("/workflows/{child}/terminate"),
+        json!({ "reason": "stuck child" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let parent_events = child_failed_events(&mut conn, parent).await;
+    assert_eq!(
+        parent_events.len(),
+        1,
+        "parent must receive exactly one ChildWorkflowFailed, got {parent_events:?}"
+    );
+    let data = &parent_events[0]["data"];
+    assert_eq!(data["child_id"].as_str(), Some(child.to_string().as_str()));
+    assert!(
+        data["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("terminated"),
+        "child-failed error must carry the terminate reason: {data:?}"
+    );
+}
+
+/// (P1, #787 review) A **detached** child (`parent_close_policy` set) is the
+/// parent-close cascade's responsibility, not this path — terminating it must
+/// NOT append a `ChildWorkflowFailed` to the parent.
+#[tokio::test]
+async fn terminate_detached_child_does_not_notify_parent() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let parent = seed_running(&mut conn, "parent-detached").await;
+    let child = seed_child(&mut conn, "child-detached", parent, true).await;
+
+    let (status, _body) = post_json(
+        &app,
+        &format!("/workflows/{child}/terminate"),
+        json!({ "reason": "kill detached" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    assert!(
+        child_failed_events(&mut conn, parent).await.is_empty(),
+        "a detached child terminate must not notify the parent"
+    );
+}
+
+/// (P2, #787 review) A body-less terminate with `Content-Type: application/json`
+/// and zero bytes must still terminate (defaulted reason), not 422.
+#[tokio::test]
+async fn terminate_with_empty_json_body_returns_202() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "empty-body").await;
+
+    let status = post_empty_json(&app, &format!("/workflows/{exec_id}/terminate")).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "empty JSON body must be accepted"
+    );
+    assert_eq!(state_of(&mut conn, exec_id).await, "TERMINATED");
+}

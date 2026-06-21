@@ -8626,16 +8626,23 @@ async fn terminate_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
-    // The request body is optional (the contract marks it `required: false`):
-    // terminating without an explicit reason is a common operator case, so a
-    // no-body / no-content-type POST must still terminate (with the defaulted
-    // reason) rather than be rejected by a required-`Json` extractor before the
-    // handler runs. Mirrors the cancel/pause ergonomics (#383).
-    request: Option<Json<TerminateWorkflowRequest>>,
+    // The request body is optional (the contract marks it `required: false`).
+    // Take raw `Bytes` rather than `Option<Json<…>>`: axum 0.8's optional-JSON
+    // extractor still parses (and rejects with an EOF error) when a client sends
+    // `Content-Type: application/json` with a zero-byte body, so a body-less
+    // terminate would 422 before the defaulted-reason path runs. Parsing the
+    // bytes ourselves treats both an omitted body and an empty body as the
+    // default reason, and still rejects a genuinely malformed non-empty body.
+    body: axum::body::Bytes,
 ) -> Result<(axum::http::StatusCode, Json<TerminateWorkflowResponse>), AutumnError> {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/terminate";
-    let request = request.map(|Json(body)| body).unwrap_or_default();
+    let request: TerminateWorkflowRequest = if body.is_empty() {
+        TerminateWorkflowRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
+    };
 
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,

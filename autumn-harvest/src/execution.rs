@@ -811,6 +811,47 @@ async fn inline_cancel(
 /// Returns [`HarvestError::NotFound`] when the execution does not exist,
 /// [`HarvestError::Config`] when the execution is already terminal for another
 /// reason, and [`HarvestError::Database`] for persistence failures.
+/// Notify an **awaited** parent that one of its children reached a terminal
+/// state out-of-band (operator cancel/terminate), waking the parked parent.
+///
+/// When a parent blocks on `spawn_child_workflow().await`, the child's terminal
+/// transition is normally propagated to the parent by the worker
+/// (`wake_parent_for_child_failure`). Operator cancel/terminate seal the child
+/// directly, bypassing the worker, so without this the parent parks forever.
+///
+/// Only **awaited** children are handled here (`parent_id` set,
+/// `parent_close_policy` NULL); **detached** children (policy set) are the
+/// `apply_parent_close_cascade` parent→child path's responsibility and are
+/// skipped. There is no `ChildWorkflowCancelled` event variant, so a cancel and
+/// a terminate both surface to the parent as `ChildWorkflowFailed` (the
+/// child-await resolves `Err`) — matching the worker failure path and adding no
+/// new event variant. Awaited children are co-located on the parent's shard
+/// (the worker append-on-child-conn path relies on the same invariant), so this
+/// append on the child's connection targets the correct shard.
+async fn notify_awaited_parent_of_child_terminal(
+    conn: &mut AsyncPgConnection,
+    child_exec_id: ExecutionId,
+    execution: &WorkflowExecution,
+    error: String,
+) -> HarvestResult<()> {
+    if let Some(parent_uuid) = execution.parent_id
+        && execution.parent_close_policy.is_none()
+    {
+        let parent_exec_id = ExecutionId::from_uuid(parent_uuid);
+        store::append_single_event(
+            conn,
+            parent_exec_id,
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: child_exec_id,
+                error,
+            },
+        )
+        .await?;
+        queue::wake_workflow_task(conn, parent_exec_id).await?;
+    }
+    Ok(())
+}
+
 /// Cancel a running workflow execution, returning the deferred completion-trigger
 /// starts to the caller **without spawning them** (and without recording the
 /// terminal metric).
@@ -950,6 +991,15 @@ pub async fn cancel_workflow_execution_collect(
                 .await?;
 
                 let total_failed_or_deleted = deleted_pending + failed_task_count;
+                // Wake a parent blocked on this child's await (#787): cancelling
+                // an awaited child out-of-band must surface to the parent.
+                notify_awaited_parent_of_child_terminal(
+                    conn,
+                    exec_id,
+                    &execution,
+                    format!("child workflow cancelled: {reason}"),
+                )
+                .await?;
                 let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
                 let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                     conn,
@@ -1707,6 +1757,16 @@ pub async fn terminate_workflow_execution(
                         conn,
                         exec_id,
                         &format!("workflow terminated: {reason}"),
+                    )
+                    .await?;
+                    // Wake a parent blocked on this child's await (#787):
+                    // force-terminating an awaited child out-of-band must surface
+                    // to the parent so it does not park forever.
+                    notify_awaited_parent_of_child_terminal(
+                        conn,
+                        exec_id,
+                        &execution,
+                        format!("child workflow terminated: {reason}"),
                     )
                     .await?;
                     let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
