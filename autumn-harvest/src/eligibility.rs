@@ -91,13 +91,8 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut eq_idx = None;
     let mut in_idx = None;
     let mut in_quotes = None;
-    let token_chars: Vec<char> = token.chars().collect();
-    let token_lower = token.to_lowercase();
-    let token_lower_chars: Vec<char> = token_lower.chars().collect();
 
-    let mut i = 0;
-    while i < token_chars.len() {
-        let c = token_chars[i];
+    for (byte_idx, c) in token.char_indices() {
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -107,22 +102,17 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
                 }
             }
             '=' if in_quotes.is_none() && eq_idx.is_none() => {
-                eq_idx = Some(i);
+                eq_idx = Some(byte_idx);
             }
             _ => {
-                if in_quotes.is_none()
-                    && in_idx.is_none()
-                    && i + 3 < token_chars.len()
-                    && token_lower_chars[i] == ' '
-                    && token_lower_chars[i + 1] == 'i'
-                    && token_lower_chars[i + 2] == 'n'
-                    && token_lower_chars[i + 3] == ' '
-                {
-                    in_idx = Some(i);
+                if in_quotes.is_none() && in_idx.is_none() {
+                    let tail = &token[byte_idx..];
+                    if tail.len() >= 4 && tail.as_bytes()[..4].eq_ignore_ascii_case(b" in ") {
+                        in_idx = Some(byte_idx);
+                    }
                 }
             }
         }
-        i += 1;
     }
     (eq_idx, in_idx)
 }
@@ -381,5 +371,23 @@ mod tests {
 
         // Empty requirements always match
         assert!(matches_requirements(&[], &labels));
+    }
+
+    #[test]
+    fn trigger_havoc_find_operator_indices() {
+        let token = "𐍈 in [a,b]";
+        let (_eq, in_op) = find_operator_indices(token);
+        if let Some(idx) = in_op {
+            let key_raw = &token[..idx];
+            assert_eq!(key_raw, "𐍈");
+        }
+    }
+
+    #[test]
+    fn trigger_havoc_parse_requirements() {
+        let token = "𐍈 in [a,b]";
+        let _ = parse_requirements(token).unwrap();
+        let token2 = "𐍈=b";
+        let _ = parse_requirements(token2).unwrap();
     }
 }
