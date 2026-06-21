@@ -274,6 +274,16 @@ struct BlockedOnData {
     external_tasks: Vec<ExternalTask>,
     timers: Vec<HarvestTimer>,
     signals: Vec<HarvestSignal>,
+    /// Default response-side byte cap applied to a pending activity's heartbeat
+    /// checkpoint payload before rendering (global #252 activity-result cap,
+    /// #503). `0` = uncapped. Used when no per-activity override applies.
+    heartbeat_details_cap: u64,
+    /// Per-activity effective heartbeat checkpoint cap, keyed by activity name
+    /// (per-activity `max_result_bytes` raised against the global ceiling),
+    /// matching the API stack handler so configured large-payload activities
+    /// keep full checkpoint visibility (#503 review). Missing names fall back to
+    /// `heartbeat_details_cap`.
+    heartbeat_caps: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1009,8 +1019,21 @@ async fn workflow_detail_ui(
         .map_err(database_error)
         .map_err(map_error)?;
 
-    // Load blocked-on data for non-terminal workflows.
-    let blocked_on = load_blocked_on_data(&mut conn, exec_uuid, &execution.state).await?;
+    // Load blocked-on data for non-terminal workflows. Reuse the #252
+    // activity-result payload cap as the response-side guard for heartbeat
+    // checkpoints (#503); fall back to the default when no runtime is installed.
+    let heartbeat_details_cap = api_state.runtime().ok().map_or(
+        autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
+        |r| r.registry().max_activity_result_bytes,
+    );
+    let mut blocked_on = load_blocked_on_data(
+        &mut conn,
+        exec_uuid,
+        &execution.state,
+        heartbeat_details_cap,
+    )
+    .await?;
+    resolve_blocked_on_heartbeat_caps(&api_state, &mut blocked_on);
 
     // Resolve the continue-as-new threshold from the runtime registry if available.
     // This is a lightweight read of an in-memory value — no extra DB query.
@@ -1045,6 +1068,7 @@ async fn load_blocked_on_data(
     conn: &mut AsyncPgConnection,
     exec_uuid: uuid::Uuid,
     state: &str,
+    heartbeat_details_cap: u64,
 ) -> Result<BlockedOnData, AutumnError> {
     if is_terminal_workflow_state(state) {
         return Ok(BlockedOnData {
@@ -1052,6 +1076,8 @@ async fn load_blocked_on_data(
             external_tasks: vec![],
             timers: vec![],
             signals: vec![],
+            heartbeat_details_cap,
+            heartbeat_caps: std::collections::HashMap::new(),
         });
     }
 
@@ -1065,7 +1091,12 @@ async fn load_blocked_on_data(
                 .or(harvest_task_queue::state.eq("BACKOFF")),
         )
         .filter(harvest_task_queue::task_type.eq("activity"))
-        .order(harvest_task_queue::scheduled_at.asc())
+        // Stable ordering (id tiebreaker) so the per-page checkpoint budget
+        // (#503) keeps/omits the same checkpoints deterministically.
+        .order((
+            harvest_task_queue::scheduled_at.asc(),
+            harvest_task_queue::id.asc(),
+        ))
         .limit(20)
         .select(TaskQueueItem::as_select())
         .load::<TaskQueueItem>(conn)
@@ -1112,7 +1143,29 @@ async fn load_blocked_on_data(
         external_tasks,
         timers,
         signals,
+        heartbeat_details_cap,
+        heartbeat_caps: std::collections::HashMap::new(),
     })
+}
+
+/// Resolve each pending activity's effective heartbeat checkpoint cap
+/// (per-activity `max_result_bytes` raised against the global ceiling),
+/// mirroring the stack API so a configured large-payload activity keeps full
+/// checkpoint visibility in the UI too (#503 review). No-op when no runtime is
+/// installed (the global default cap then applies at render time).
+fn resolve_blocked_on_heartbeat_caps(api_state: &HarvestApiState, blocked_on: &mut BlockedOnData) {
+    if let Ok(rt) = api_state.runtime() {
+        let registry = rt.registry();
+        blocked_on.heartbeat_caps = blocked_on
+            .activities
+            .iter()
+            .filter_map(|t| t.activity_name.clone())
+            .map(|name| {
+                let cap = registry.activity_result_cap(&name);
+                (name, cap)
+            })
+            .collect();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3926,6 +3979,131 @@ fn render_workflow_detail(
     layout(&title, &body, "../")
 }
 
+/// Per-row checkpoint rendering decision for the pending-activities table, after
+/// applying both the per-activity cap and the cumulative per-page budget (#503
+/// review). Carries the observed byte size for the marker text.
+#[derive(Clone, Copy)]
+enum CheckpointCellState {
+    /// No heartbeat checkpoint has been flushed.
+    Absent,
+    /// Render the checkpoint JSON (within its cap and the page budget).
+    Show,
+    /// Withheld because this payload's own size exceeded its activity cap.
+    Truncated(u64),
+    /// Withheld because the cumulative per-page checkpoint budget was exhausted.
+    OmittedForBudget(u64),
+}
+
+/// Build the per-row checkpoint decisions for the pending-activities table,
+/// mirroring the stack API (#503 review): each checkpoint is judged against its
+/// activity's effective cap (per-activity `max_result_bytes` raised against the
+/// global ceiling), then a cumulative per-page budget — the global cap — bounds
+/// the total rendered bytes so a large fan-out can't generate a huge HTML page.
+/// The first payload-bearing checkpoint is always shown. The byte size is
+/// measured once here via the shared non-allocating counter; the renderer reads
+/// the resulting state without re-serializing.
+fn plan_checkpoint_cells(blocked_on: &BlockedOnData) -> Vec<CheckpointCellState> {
+    let per_item: Vec<(bool, Option<u64>)> = blocked_on
+        .activities
+        .iter()
+        .map(|item| {
+            let cap = item
+                .activity_name
+                .as_deref()
+                .and_then(|n| blocked_on.heartbeat_caps.get(n).copied())
+                .unwrap_or(blocked_on.heartbeat_details_cap);
+            crate::api::heartbeat_details_truncation(item.heartbeat_details.as_ref(), cap)
+        })
+        .collect();
+    // Only present, not-individually-truncated checkpoints participate in the
+    // cumulative budget.
+    let sizes: Vec<Option<u64>> = per_item
+        .iter()
+        .map(|(truncated, bytes)| match bytes {
+            Some(b) if !truncated => Some(*b),
+            _ => None,
+        })
+        .collect();
+    let omit = crate::api::checkpoint_budget_decisions(&sizes, blocked_on.heartbeat_details_cap);
+    per_item
+        .iter()
+        .zip(omit)
+        .map(
+            |((truncated, bytes), omit_budget)| match (bytes, truncated, omit_budget) {
+                (None, _, _) => CheckpointCellState::Absent,
+                (Some(b), true, _) => CheckpointCellState::Truncated(*b),
+                (Some(b), false, true) => CheckpointCellState::OmittedForBudget(*b),
+                (Some(_), false, false) => CheckpointCellState::Show,
+            },
+        )
+        .collect()
+}
+
+/// Render the latest heartbeat checkpoint payload for a pending activity as a
+/// collapsible JSON cell, from the precomputed [`CheckpointCellState`] (#503).
+/// Shows `"—"` when absent, a truncation marker when over the activity cap, and
+/// an omission marker when withheld by the per-page budget.
+fn render_heartbeat_checkpoint_cell(item: &TaskQueueItem, state: CheckpointCellState) -> Markup {
+    html! {
+        @match state {
+            CheckpointCellState::Absent => "—",
+            CheckpointCellState::Show => {
+                @if let Some(value) = item.heartbeat_details.as_ref() {
+                    details {
+                        summary { "checkpoint" }
+                        pre { (pretty_json(value)) }
+                    }
+                } @else {
+                    "—"
+                }
+            }
+            CheckpointCellState::Truncated(bytes) => {
+                span title="heartbeat payload exceeds the response size cap" {
+                    "truncated (" (bytes) " bytes)"
+                }
+            }
+            CheckpointCellState::OmittedForBudget(bytes) => {
+                span title="omitted: per-page checkpoint budget exceeded" {
+                    "omitted (" (bytes) " bytes)"
+                }
+            }
+        }
+    }
+}
+
+/// Render the "Pending activities" table, including each activity's latest
+/// heartbeat checkpoint judged against its effective (per-activity) cap and the
+/// cumulative per-page checkpoint budget (#503).
+fn render_pending_activities_table(blocked_on: &BlockedOnData) -> Markup {
+    let cell_states = plan_checkpoint_cells(blocked_on);
+    html! {
+        table {
+            thead {
+                tr {
+                    th { "Activity" }
+                    th { "State" }
+                    th { "Attempt" }
+                    th { "Scheduled" }
+                    th { "Last heartbeat" }
+                    th { "Checkpoint" }
+                }
+            }
+            tbody {
+                @for (item, state) in blocked_on.activities.iter().zip(cell_states) {
+                    tr {
+                        td { (item.activity_name.as_deref().unwrap_or("—")) }
+                        td { code { (&item.state) } }
+                        td { (item.attempt) }
+                        td { (format_timestamp(Some(item.scheduled_at))) }
+                        td { (format_timestamp(item.last_heartbeat_at)) }
+                        td { (render_heartbeat_checkpoint_cell(item, state)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
     let has_anything = !blocked_on.activities.is_empty()
         || !blocked_on.external_tasks.is_empty()
@@ -3940,26 +4118,7 @@ fn render_blocked_on_panel(blocked_on: &BlockedOnData) -> Markup {
             } @else {
                 @if !blocked_on.activities.is_empty() {
                     h3 style="margin-top:8px" { "Pending activities" }
-                    table {
-                        thead {
-                            tr {
-                                th { "Activity" }
-                                th { "State" }
-                                th { "Attempt" }
-                                th { "Scheduled" }
-                            }
-                        }
-                        tbody {
-                            @for item in &blocked_on.activities {
-                                tr {
-                                    td { (item.activity_name.as_deref().unwrap_or("—")) }
-                                    td { code { (&item.state) } }
-                                    td { (item.attempt) }
-                                    td { (format_timestamp(Some(item.scheduled_at))) }
-                                }
-                            }
-                        }
-                    }
+                    (render_pending_activities_table(blocked_on))
                 }
                 @if !blocked_on.external_tasks.is_empty() {
                     h3 style="margin-top:8px" { "Pending external activities" }
@@ -7707,6 +7866,8 @@ mod tests {
             external_tasks: vec![],
             timers: vec![],
             signals: vec![],
+            heartbeat_details_cap: 0,
+            heartbeat_caps: std::collections::HashMap::new(),
         }
     }
 

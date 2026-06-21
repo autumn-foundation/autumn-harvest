@@ -2,6 +2,18 @@
 
 Use this runbook when an alert fires indicating that tasks are sitting in `PENDING` state on a queue while connected workers appear idle.
 
+> **First check for a heartbeating activity.** Before assuming an activity is
+> stalled, confirm it is actually stuck rather than just slow. Call
+> `GET /workflows/{exec_id}/stack` and read the activity's
+> `heartbeat_details` field on `pending_activities[]` (issue #503): it holds the
+> latest progress checkpoint the activity reported via `ctx.heartbeat(...)`
+> (e.g. `{"processed": 4500, "total": 10000}`). If the checkpoint is advancing
+> across successive calls, the activity is making forward progress and no
+> intervention is needed. A stale checkpoint (with a `last_heartbeat_at` far in
+> the past) points to a genuine stall — continue with the eligibility triage
+> below. `heartbeat_details` is `null` for activities that have not yet flushed
+> a heartbeat and for local activities (which do not heartbeat).
+
 To triage eligibility blocks, call the eligibility explainer API:
 
 ```text
