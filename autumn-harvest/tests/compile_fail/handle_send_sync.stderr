@@ -1,0 +1,23 @@
+warning: unused import: `std::thread`
+ --> tests/compile_fail/handle_send_sync.rs:3:5
+  |
+3 | use std::thread;
+  |     ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0277]: `Rc<()>` cannot be sent between threads safely
+ --> tests/compile_fail/handle_send_sync.rs:9:18
+  |
+9 |     require_send(mock_handle);
+  |     ------------ ^^^^^^^^^^^ `Rc<()>` cannot be sent between threads safely
+  |     |
+  |     required by a bound introduced by this call
+  |
+  = help: the trait `std::marker::Send` is not implemented for `Rc<()>`
+  = note: required for `TypedWorkflowHandle<Rc<()>>` to implement `std::marker::Send`
+note: required by a bound in `require_send`
+ --> tests/compile_fail/handle_send_sync.rs:5:20
+  |
+5 | fn require_send<T: Send>(_: T) {}
+  |                    ^^^^ required by this bound in `require_send`

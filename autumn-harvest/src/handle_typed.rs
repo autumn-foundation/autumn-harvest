@@ -33,10 +33,10 @@ pub struct TypedWorkflowHandle<T> {
     _marker: PhantomData<T>,
 }
 
-unsafe impl<T> Send for TypedWorkflowHandle<T> {}
-unsafe impl<T> Sync for TypedWorkflowHandle<T> {}
+unsafe impl<T: Send> Send for TypedWorkflowHandle<T> {}
+unsafe impl<T: Sync> Sync for TypedWorkflowHandle<T> {}
 
-impl<T> TypedWorkflowHandle<T> {
+impl<T: Send + Sync> TypedWorkflowHandle<T> {
     /// Wrap an untyped [`WorkflowHandle`] with type parameter `T` representing
     /// the expected success return type.
     #[must_use]
