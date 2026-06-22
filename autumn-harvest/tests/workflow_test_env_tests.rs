@@ -1190,7 +1190,7 @@ fn scheduled_time_reader_workflow<'a>(
     })
 }
 
-/// No scheduled_time seeded → accessor returns None.
+/// No `scheduled_time` seeded → accessor returns None.
 #[tokio::test]
 async fn test_scheduled_time_none_by_default() {
     let outcome = WorkflowTestEnv::new()
@@ -1199,7 +1199,7 @@ async fn test_scheduled_time_none_by_default() {
     assert_eq!(outcome.result, Ok(json!({ "scheduled_time": null })));
 }
 
-/// Seeded scheduled_time is returned by the accessor.
+/// Seeded `scheduled_time` is returned by the accessor.
 #[tokio::test]
 async fn test_scheduled_time_seeded_value() {
     use chrono::{TimeZone as _, Utc};
@@ -1217,7 +1217,7 @@ async fn test_scheduled_time_seeded_value() {
     }
 }
 
-/// Replay determinism: the seeded scheduled_time replays identically.
+/// Replay determinism: the seeded `scheduled_time` replays identically.
 #[tokio::test]
 async fn test_scheduled_time_replays_deterministically() {
     use chrono::{TimeZone as _, Utc};

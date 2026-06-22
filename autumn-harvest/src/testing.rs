@@ -1876,7 +1876,7 @@ impl WorkflowTestEnv {
     ///
     /// Mirrors `ctx.scheduled_time()` in production scheduled runs (issue #508).
     #[must_use]
-    pub fn with_scheduled_time(mut self, slot: chrono::DateTime<chrono::Utc>) -> Self {
+    pub const fn with_scheduled_time(mut self, slot: chrono::DateTime<chrono::Utc>) -> Self {
         self.scheduled_time = Some(slot);
         self
     }

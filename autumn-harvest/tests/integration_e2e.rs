@@ -1713,6 +1713,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn activity_retry_resumes_from_persisted_heartbeat_details() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
@@ -1961,6 +1962,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)

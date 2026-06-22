@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_harvest::info::WorkflowInfo;
-use autumn_harvest::policy::{OverlapPolicy, Schedule, WorkflowSchedule};
+use autumn_harvest::policy::{Schedule, WorkflowSchedule};
 use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::store;
 use autumn_harvest::testing::WorkflowReplayer;
@@ -295,7 +295,7 @@ async fn scheduled_run_has_correct_scheduled_time() {
         .await
         .expect("load history");
 
-    let scheduled_time = match history.events.first() {
+    let scheduled_time = match <[_]>::first(&history.events) {
         Some(autumn_harvest::event::WorkflowEvent::WorkflowStarted { scheduled_time, .. }) => {
             *scheduled_time
         }
@@ -399,7 +399,7 @@ async fn manual_start_has_no_scheduled_time() {
         .await
         .expect("load history");
 
-    let scheduled_time = match history.events.first() {
+    let scheduled_time = match <[_]>::first(&history.events) {
         Some(autumn_harvest::event::WorkflowEvent::WorkflowStarted { scheduled_time, .. }) => {
             *scheduled_time
         }
@@ -471,7 +471,7 @@ async fn n_slots_produce_n_distinct_scheduled_times() {
             .await
             .expect("load history");
 
-        let scheduled_time = match history.events.first() {
+        let scheduled_time = match <[_]>::first(&history.events) {
             Some(autumn_harvest::event::WorkflowEvent::WorkflowStarted {
                 scheduled_time, ..
             }) => *scheduled_time,
@@ -538,8 +538,7 @@ async fn scheduled_run_replays_deterministically() {
     let report = WorkflowReplayer::new()
         .register_fn(wf_name, scheduled_time_recorder)
         .replay_from_events(history.events)
-        .await
-        .expect("replayer parse");
+        .await;
 
     assert!(
         matches!(
