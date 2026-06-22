@@ -220,7 +220,7 @@ impl std::fmt::Display for ReplayReport {
 ///     workflow_name: "onboarding".to_string(),
 ///     execution_id: ExecutionId::new(),
 ///     events: vec![
-///         WorkflowEvent::WorkflowStarted { input: Value::Null, timestamp: Utc::now() },
+///         WorkflowEvent::WorkflowStarted { input: Value::Null, timestamp: Utc::now(), last_completion_result: None, last_error: None, scheduled_time: None },
 ///     ],
 ///     context_headers: None,
 /// };
@@ -1680,6 +1680,8 @@ pub struct WorkflowTestEnv {
     last_completion_result: Option<serde_json::Value>,
     /// Simulated last-error for testing incremental scheduled jobs (issue #488).
     last_error: Option<String>,
+    /// Simulated scheduled fire-time (logical slot) for testing scheduled workflows (issue #508).
+    scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Default for WorkflowTestEnv {
@@ -1705,6 +1707,7 @@ impl WorkflowTestEnv {
             state: empty_shared_state(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }
     }
 
@@ -1868,6 +1871,16 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Seed the test environment with a nominal scheduled fire-time (logical slot),
+    /// as if this run was fired by the scheduler for a specific time slot.
+    ///
+    /// Mirrors `ctx.scheduled_time()` in production scheduled runs (issue #508).
+    #[must_use]
+    pub fn with_scheduled_time(mut self, slot: chrono::DateTime<chrono::Utc>) -> Self {
+        self.scheduled_time = Some(slot);
+        self
+    }
+
     /// Inject typed shared state accessible via `ctx.state::<T>()` inside the
     /// workflow function.
     ///
@@ -1913,6 +1926,7 @@ impl WorkflowTestEnv {
             timestamp: self.simulated_now,
             last_completion_result: self.last_completion_result.clone(),
             last_error: self.last_error.clone(),
+            scheduled_time: self.scheduled_time,
         }];
         if let Some(reason) = &self.cancellation_reason {
             history.push(WorkflowEvent::WorkflowCancelled {
@@ -2552,6 +2566,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: aid,
@@ -2574,6 +2589,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }];
         let replayer = WorkflowReplayer::new().register_fn("simple", simple_workflow);
         let report = replayer.replay_from_events(events).await;
@@ -2597,6 +2613,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,

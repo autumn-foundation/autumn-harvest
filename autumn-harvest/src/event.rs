@@ -84,6 +84,13 @@ pub enum WorkflowEvent {
         /// and `None` for manual starts. Frozen at workflow start time.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_error: Option<String>,
+        /// The nominal scheduled fire-time (logical slot) this run is responsible for
+        /// (issue #508). `Some` for scheduled / backfilled / caught-up runs; `None` for
+        /// direct/manual API starts, ad-hoc trigger-now, and pre-#508 histories. This is
+        /// the pre-jitter logical slot (`scheduled_for`), NOT `effective_fire_time` and
+        /// NOT the execution start wall-clock (`timestamp`). Frozen at start; replay-stable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scheduled_time: Option<DateTime<Utc>>,
     },
     /// The workflow ran to completion without an error.
     WorkflowCompleted {
@@ -777,11 +784,70 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let json = serde_json::to_string(&event)?;
         let back: WorkflowEvent = serde_json::from_str(&json)?;
         assert!(matches!(back, WorkflowEvent::WorkflowStarted { .. }));
         Ok(())
+    }
+
+    // ── issue #508: scheduled_time field ────────────────────────────────────────
+
+    /// Legacy JSON without `scheduled_time` deserializes to `None` (backward compat).
+    #[test]
+    fn workflow_started_legacy_json_scheduled_time_defaults_to_none() {
+        let legacy_json =
+            r#"{"type":"WorkflowStarted","data":{"input":{},"timestamp":"2026-01-01T00:00:00Z"}}"#;
+        let event: WorkflowEvent = serde_json::from_str(legacy_json).unwrap();
+        match event {
+            WorkflowEvent::WorkflowStarted { scheduled_time, .. } => {
+                assert!(
+                    scheduled_time.is_none(),
+                    "legacy JSON must deserialize to None"
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// `scheduled_time: Some(t)` round-trips correctly through serde.
+    #[test]
+    fn workflow_started_scheduled_time_round_trips() {
+        use chrono::TimeZone as _;
+        let slot = Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap();
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!(null),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: Some(slot),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            WorkflowEvent::WorkflowStarted { scheduled_time, .. } => {
+                assert_eq!(scheduled_time, Some(slot));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// `scheduled_time: None` is omitted from JSON (no key emitted).
+    #[test]
+    fn workflow_started_scheduled_time_none_omitted_from_json() {
+        let event = WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!(null),
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("scheduled_time"),
+            "None should be omitted from JSON, got: {json}"
+        );
     }
 
     #[test]
@@ -877,6 +943,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::Value::Null,

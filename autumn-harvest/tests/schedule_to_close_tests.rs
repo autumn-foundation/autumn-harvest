@@ -177,6 +177,7 @@ async fn scanner_times_out_pending_task_with_expired_schedule_to_close() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -271,6 +272,7 @@ async fn scanner_times_out_running_task_with_expired_schedule_to_close() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -358,6 +360,7 @@ async fn scanner_does_not_affect_tasks_without_schedule_to_close() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -442,6 +445,7 @@ async fn pre_retry_deadline_check_prevents_requeue_when_deadline_exceeded() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -541,6 +545,7 @@ async fn enqueue_params_schedule_to_close_at_persisted_and_not_prematurely_fired
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )

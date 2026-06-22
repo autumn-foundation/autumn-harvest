@@ -117,6 +117,7 @@ fn executor_emits_harvest_workflow_execute_span() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
 
     tokio::runtime::Builder::new_current_thread()
@@ -148,6 +149,7 @@ fn executor_no_longer_emits_old_harvest_workflow_run_span() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
 
     tokio::runtime::Builder::new_current_thread()
@@ -180,6 +182,7 @@ fn executor_span_has_attr_execution_id_field() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
 
     tokio::runtime::Builder::new_current_thread()
@@ -219,6 +222,7 @@ fn replay_executor_emits_harvest_workflow_execute_with_replay_true() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
 
     tokio::runtime::Builder::new_current_thread()
@@ -277,6 +281,7 @@ fn live_executor_span_has_replay_false() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
 
     tokio::runtime::Builder::new_current_thread()

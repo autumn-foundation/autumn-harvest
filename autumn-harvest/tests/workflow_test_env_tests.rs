@@ -1177,3 +1177,60 @@ async fn test_last_completion_result_replays_deterministically() {
         "carryover must replay deterministically:\n{report}"
     );
 }
+
+// ── issue #508: scheduled_time accessor (unit) ────────────────────────────────
+
+fn scheduled_time_reader_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let slot: Option<String> = ctx.scheduled_time().map(|t| t.to_rfc3339());
+        Ok(json!({ "scheduled_time": slot }))
+    })
+}
+
+/// No scheduled_time seeded → accessor returns None.
+#[tokio::test]
+async fn test_scheduled_time_none_by_default() {
+    let outcome = WorkflowTestEnv::new()
+        .run(scheduled_time_reader_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!({ "scheduled_time": null })));
+}
+
+/// Seeded scheduled_time is returned by the accessor.
+#[tokio::test]
+async fn test_scheduled_time_seeded_value() {
+    use chrono::{TimeZone as _, Utc};
+    let slot = Utc.with_ymd_and_hms(2026, 3, 15, 0, 0, 0).unwrap();
+    let outcome = WorkflowTestEnv::new()
+        .with_scheduled_time(slot)
+        .run(scheduled_time_reader_workflow, json!(null))
+        .await;
+    match outcome.result {
+        Ok(v) => {
+            let s = v["scheduled_time"].as_str().expect("expected a string");
+            assert!(s.contains("2026-03-15"), "slot round-trip, got: {s}");
+        }
+        Err(e) => panic!("run failed: {e}"),
+    }
+}
+
+/// Replay determinism: the seeded scheduled_time replays identically.
+#[tokio::test]
+async fn test_scheduled_time_replays_deterministically() {
+    use chrono::{TimeZone as _, Utc};
+    let slot = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+    let outcome = WorkflowTestEnv::new()
+        .with_scheduled_time(slot)
+        .run(scheduled_time_reader_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+
+    let report = outcome.replay_check(scheduled_time_reader_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "scheduled_time must replay deterministically:\n{report}"
+    );
+}

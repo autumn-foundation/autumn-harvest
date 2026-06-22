@@ -539,6 +539,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }];
 
         let outcome = run_workflow(exec_id, history, echo_workflow, input.clone()).await;
@@ -559,6 +560,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }];
 
         let outcome = run_workflow(exec_id, history, failing_workflow, Value::Null).await;
@@ -583,6 +585,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             // The workflow calls system_now() here, but history recorded an
             // activity — a genuine divergence.
@@ -624,6 +627,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }];
 
         let outcome = run_workflow(exec_id, history, activity_workflow, input).await;
@@ -664,6 +668,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }];
 
         let outcome = run_workflow(
@@ -696,6 +701,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,

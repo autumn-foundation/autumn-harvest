@@ -703,6 +703,7 @@ async fn enqueue_started_workflow_task(
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -1181,6 +1182,7 @@ async fn full_workflow_lifecycle() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     let inserted = store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1316,6 +1318,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1439,6 +1442,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1575,6 +1579,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1727,6 +1732,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -1835,6 +1841,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -1971,6 +1978,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -2084,6 +2092,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -2241,6 +2250,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -2706,6 +2716,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -3117,6 +3128,7 @@ async fn event_store_round_trip() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: activity_id_1,
@@ -3217,6 +3229,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -3326,6 +3339,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -3429,6 +3443,7 @@ async fn duplicate_event_id_is_rejected() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
 
     // First insert succeeds
@@ -5948,6 +5963,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -6099,6 +6115,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -6229,6 +6246,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     store::append_events(&mut conn, exec_id, &started_events, 0)
         .await
@@ -6984,6 +7002,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -7387,6 +7406,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )

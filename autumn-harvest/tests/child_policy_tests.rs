@@ -414,6 +414,7 @@ async fn insert_detached_child_execution(
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -1005,6 +1006,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )

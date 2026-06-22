@@ -636,6 +636,10 @@ struct WorkflowTaskPersistence<'a> {
     /// runs. Plaintext here because it comes from the already-decoded replay history.
     carryover_result: Option<serde_json::Value>,
     carryover_error: Option<String>,
+    /// Nominal scheduled fire-time frozen in this execution's `WorkflowStarted` event
+    /// (issue #508). Propagated verbatim to a `continue_as_new` continuation so
+    /// `ctx.scheduled_time()` survives the fork. `None` for non-scheduled runs.
+    carryover_scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl<'a> WorkflowTaskPersistence<'a> {
@@ -3154,6 +3158,7 @@ async fn persist_all_started_child_workflows(
                     timestamp: chrono::Utc::now(),
                     last_completion_result: None,
                     last_error: None,
+                    scheduled_time: None, // child workflows are not scheduler-fired
                 };
                 let mut params = queue::EnqueueParams::new(
                     queue_name.clone(),
@@ -3727,6 +3732,7 @@ async fn create_detached_child_executions(
                 timestamp: chrono::Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None, // child workflows are not scheduler-fired
             }],
             0,
         )
@@ -4903,6 +4909,10 @@ async fn persist_workflow_continue_as_new(
         // than re-resolving (which could pick up a newer sibling fire's output).
         last_completion_result: persistence.carryover_result.clone(),
         last_error: persistence.carryover_error.clone(),
+        // Preserve the nominal scheduled slot across the fork (issue #508): a continued
+        // run is the same logical scheduled run and must see the same slot. The row
+        // already copies `scheduled_for` at the NewWorkflowExecution level (L4940).
+        scheduled_time: persistence.carryover_scheduled_time,
     };
     let continued_event = WorkflowEvent::WorkflowContinuedAsNew {
         new_exec_id,
@@ -6363,21 +6373,28 @@ async fn process_workflow_task(
         Some(None) // terminal — evict
     };
 
-    // Extract this run's frozen carryover (issue #488) from the decoded WorkflowStarted
-    // (history_events[0]) so a continue_as_new continuation can inherit it.
-    // Slice pattern (not .first()) avoids the in-scope Diesel RunQueryDsl::first ambiguity.
-    let (carryover_result, carryover_error) = if let [
+    // Extract this run's frozen carryover (issue #488) and scheduled slot (issue #508) from
+    // the decoded WorkflowStarted (history_events[0]) so a continue_as_new continuation can
+    // inherit them. Slice pattern (not .first()) avoids the in-scope Diesel RunQueryDsl::first
+    // ambiguity.
+    let (carryover_result, carryover_error, carryover_scheduled_time) = if let [
         WorkflowEvent::WorkflowStarted {
             last_completion_result,
             last_error,
+            scheduled_time,
             ..
         },
         ..,
-    ] = history_events.as_slice()
+    ] =
+        history_events.as_slice()
     {
-        (last_completion_result.clone(), last_error.clone())
+        (
+            last_completion_result.clone(),
+            last_error.clone(),
+            *scheduled_time,
+        )
     } else {
-        (None, None)
+        (None, None, None)
     };
     let persistence = WorkflowTaskPersistence {
         task,
@@ -6387,6 +6404,7 @@ async fn process_workflow_task(
         sticky_timeout,
         carryover_result,
         carryover_error,
+        carryover_scheduled_time,
     };
 
     // Issue #383: authoritatively enforce pause across the persistence path.

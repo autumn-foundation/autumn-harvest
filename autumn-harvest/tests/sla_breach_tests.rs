@@ -322,6 +322,7 @@ async fn breach_scan_leaves_harvest_events_untouched() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )

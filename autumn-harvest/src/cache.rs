@@ -305,6 +305,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             }],
             next_event_id: 42,
         };

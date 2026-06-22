@@ -164,6 +164,7 @@ fn canonical_history() -> (ExecutionId, Vec<WorkflowEvent>) {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -283,6 +284,7 @@ async fn replay_jitter_timer_is_exact_and_deterministic() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::TimerStarted {
             timer_id: timer_id.clone(),
@@ -301,6 +303,7 @@ async fn replay_jitter_timer_is_exact_and_deterministic() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::TimerStarted {
             timer_id: TimerId::new(format!("retry_jitter_{attempt}_{seed}")),
@@ -512,6 +515,7 @@ async fn replay_activity_history_for_timer_workflow_detects_timer_mismatch() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         // History has activity first, but timer_first_workflow starts with a timer
         WorkflowEvent::ActivityScheduled {
@@ -597,6 +601,7 @@ async fn replay_activity_with_changed_input_detects_non_determinism() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -733,6 +738,7 @@ async fn replay_new_command_beyond_history_detects_non_determinism() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -809,6 +815,7 @@ fn two_gate_history() -> (ExecutionId, Vec<WorkflowEvent>) {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "version:gate_alpha".into(),
@@ -862,6 +869,7 @@ fn interleaved_gate_history() -> (ExecutionId, Vec<WorkflowEvent>) {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "version:gate_alpha".into(),
@@ -935,6 +943,7 @@ fn history_with_old_gate() -> (ExecutionId, Vec<WorkflowEvent>) {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "version:gate_old".into(),
@@ -986,6 +995,7 @@ async fn replay_history_with_workflow_completed_tail_succeeds() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -1069,6 +1079,7 @@ fn child_spawning_history() -> (ExecutionId, Vec<WorkflowEvent>) {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ChildWorkflowStarted {
             child_id,
@@ -1163,6 +1174,7 @@ fn external_signal_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ExternalSignalRequested {
             signal_id,
@@ -1189,6 +1201,7 @@ fn external_signal_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ExternalSignalRequested {
             signal_id,
@@ -1266,6 +1279,7 @@ async fn replayer_replays_external_signal_delivered_successfully() {
                 timestamp: *timestamp,
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             other => other.clone(),
         })
@@ -1305,6 +1319,7 @@ async fn replayer_detects_external_signal_name_mismatch() {
                 timestamp: *timestamp,
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             other => other.clone(),
         })
@@ -1353,6 +1368,7 @@ async fn replayer_replays_external_signal_failed_history() {
                 timestamp: *timestamp,
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             other => other.clone(),
         })
@@ -1439,6 +1455,7 @@ fn detached_spawn_history(
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ChildWorkflowSpawnedDetached {
             child_id,
@@ -1461,6 +1478,7 @@ fn detached_spawn_then_activity_history() -> (ExecutionId, ExecutionId, Vec<Work
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ChildWorkflowSpawnedDetached {
             child_id,
@@ -1653,6 +1671,7 @@ fn awaited_child_history() -> (ExecutionId, Vec<WorkflowEvent>) {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ChildWorkflowStarted {
             child_id,
@@ -1721,6 +1740,7 @@ fn now_then_activity_history() -> (ExecutionId, Vec<WorkflowEvent>) {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::SideEffectRecorded {
             kind: autumn_harvest::SideEffectKind::Now,
@@ -1774,6 +1794,7 @@ async fn replay_detects_side_effect_drift() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id,
@@ -1839,6 +1860,7 @@ fn signal_branch_fixture() -> Vec<WorkflowEvent> {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::TimerStarted {
             timer_id: TimerId::new("__signal_timeout:1:approval"),
@@ -1862,6 +1884,7 @@ fn timeout_branch_fixture() -> Vec<WorkflowEvent> {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::TimerStarted {
             timer_id: timer_id.clone(),
@@ -1938,6 +1961,7 @@ async fn signal_timeout_timeout_branch_with_ignored_late_signal_replays_succeede
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::TimerStarted {
             timer_id: timer_id.clone(),

@@ -236,6 +236,7 @@ fn first_task_is_cache_miss_subsequent_tasks_on_same_worker_are_hits() {
             timestamp: chrono::Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         2,
     );

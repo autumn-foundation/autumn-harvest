@@ -3686,6 +3686,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }];
 
         let mut matcher = HistoryMatcher::new(events);
@@ -4107,6 +4108,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::json!({"done": true}),
@@ -4546,6 +4548,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::WorkflowExecutionPaused {
                 paused_at: chrono::Utc::now(),
@@ -4616,6 +4619,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -4667,6 +4671,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::WorkflowFailed {
                 error: "boom".into(),
@@ -4696,6 +4701,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::WorkflowFailed {
                 error: "boom".into(),
@@ -4720,6 +4726,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::WorkflowFailed {
                 error: "boom".into(),
