@@ -37,8 +37,9 @@ use autumn_harvest::audit::{
     OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_GATE_LIFT,
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_WORKFLOW_CANCEL, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
-    OP_WORKFLOW_SIGNAL, SOURCE_API, SOURCE_UI, STATUS_FAILED, STATUS_SUCCEEDED,
-    TARGET_BUILD_ROUTING, TARGET_GATE, TARGET_SCHEDULE, TARGET_WORKFLOW, insert_audit,
+    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_TERMINATE, SOURCE_API, SOURCE_UI, STATUS_FAILED,
+    STATUS_SUCCEEDED, TARGET_BUILD_ROUTING, TARGET_GATE, TARGET_SCHEDULE, TARGET_WORKFLOW,
+    insert_audit,
 };
 use autumn_harvest::build_routing::{
     BuildCompatEntry, BuildPolicy, BuildReachability, all_build_reachability, declare_compat,
@@ -68,6 +69,7 @@ use autumn_harvest::types::{
 use autumn_harvest::workers::{WorkerFilters, WorkerHealth, WorkerRow, list_workers};
 use autumn_harvest::{
     cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
+    terminate_workflow_execution,
 };
 
 use crate::api::{
@@ -240,6 +242,12 @@ struct WorkflowCancelForm {
 
 #[derive(Debug, Default, Deserialize)]
 struct WorkflowPauseForm {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WorkflowTerminateForm {
     #[serde(default)]
     reason: Option<String>,
 }
@@ -537,6 +545,7 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows", get(list_workflows_ui))
         .route("/workflows/{id}", get(workflow_detail_ui))
         .route("/workflows/{id}/cancel", post(cancel_workflow_ui))
+        .route("/workflows/{id}/terminate", post(terminate_workflow_ui))
         .route("/workflows/{id}/pause", post(pause_workflow_ui))
         .route("/workflows/{id}/resume", post(resume_workflow_ui))
         .route("/workflows/{id}/signal", post(signal_workflow_ui))
@@ -1210,6 +1219,64 @@ async fn cancel_workflow_ui(
             target_type: TARGET_WORKFLOW,
             target_id: Some(&exec_id_str),
             route_or_command: "POST /workflows/{id}/cancel",
+            request_id: None,
+            idempotency_key: None,
+            status,
+            error_summary: error_summary.as_deref(),
+            shard_id: None,
+            source: SOURCE_UI,
+        },
+    )
+    .await;
+
+    let redirect_url = format!("../../workflows/{id}?flash={flash}");
+    Ok(axum::response::Redirect::to(&redirect_url).into_response())
+}
+
+/// Force-terminate a single workflow execution from the detail page (issue #788).
+///
+/// Mirrors [`cancel_workflow_ui`] exactly — same shard resolution, actor
+/// extraction, metrics fallback, audit plumbing, and detail-page redirect — but
+/// delegates to the forceful [`terminate_workflow_execution`] core path (#504)
+/// and records the `OP_WORKFLOW_TERMINATE` audit op.
+async fn terminate_workflow_ui(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<WorkflowTerminateForm>,
+) -> Result<axum::response::Response, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let actor = api_state.extract_actor(&headers);
+    let exec_id_str = exec_id.as_uuid().to_string();
+    let reason = form.reason.as_deref().unwrap_or("").trim().to_string();
+
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry().telemetry().metrics),
+        );
+    let terminate_result =
+        terminate_workflow_execution(&mut conn, exec_id, &reason, metrics_ref.as_ref()).await;
+    let (status, error_summary, flash) = match &terminate_result {
+        Ok(_) => (STATUS_SUCCEEDED, None, url_encode("Workflow terminated")),
+        Err(e) => {
+            let msg = e.to_string();
+            (
+                STATUS_FAILED,
+                Some(msg.clone()),
+                url_encode(&format!("Terminate failed: {msg}")),
+            )
+        }
+    };
+    let _ = insert_audit(
+        &mut conn,
+        &NewAuditRecord {
+            actor: &actor,
+            operation: OP_WORKFLOW_TERMINATE,
+            target_type: TARGET_WORKFLOW,
+            target_id: Some(&exec_id_str),
+            route_or_command: "POST /workflows/{id}/terminate",
             request_id: None,
             idempotency_key: None,
             status,
@@ -3668,7 +3735,13 @@ fn render_workflow_detail(
                         title=[terminal.then_some("Workflow is terminal")] { "Pause" }
                 }
             }
-            button disabled title="Not yet available" { "Terminate" }
+            // Forceful sibling of Cancel — seals the run TERMINATED (issue #788).
+            // Disabled once the workflow is terminal, exactly like Pause.
+            form method="post" action={ (exec_id_str) "/terminate" }
+                  onsubmit="return confirm('Force-terminate this workflow execution? This seals it as TERMINATED.')" {
+                button.danger type="submit" disabled[terminal]
+                    title=[terminal.then_some("Workflow is terminal")] { "Terminate" }
+            }
             details style="display:inline-block" {
                 summary style="cursor:pointer;color:#93c5fd;font-size:12px;display:inline-block;padding:6px 12px;border:1px solid #2563eb;border-radius:6px" { "Send signal" }
                 form method="post" action={ (exec_id_str) "/signal" } style="margin-top:8px;background:#1e293b;border:1px solid #334155;border-radius:6px;padding:12px;display:flex;flex-direction:column;gap:8px;min-width:280px" {
