@@ -721,17 +721,19 @@ fn apply_redrive_filter<'a>(
 ) -> crate::schema::harvest_dead_letters::BoxedQuery<'a, diesel::pg::Pg> {
     use crate::schema::harvest_dead_letters::dsl;
     use diesel::PgTextExpressionMethods;
-    use diesel::dsl::sql;
-    use diesel::sql_types::{Bool, Text};
 
     if let Some(ref queue) = filter.queue {
         query = query.filter(dsl::queue_name.eq(queue.clone()));
     }
     if let Some(ref wf_name) = filter.workflow_name {
+        use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+        use diesel::NullableExpressionMethods;
         query = query.filter(
-            sql::<Bool>("workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = ")
-                .bind::<Text, _>(wf_name.clone())
-                .sql(")"),
+            dsl::workflow_exec_id.eq_any(
+                exec_dsl::harvest_workflow_executions
+                    .filter(exec_dsl::workflow_name.eq(wf_name.clone()))
+                    .select(exec_dsl::id.nullable()),
+            ),
         );
     }
     if let Some(after) = filter.dead_lettered_after {
@@ -856,51 +858,51 @@ pub async fn redrive_dead_letter(
                         .optional()
                         .map_err(crate::error::database_error)?;
 
-                if let Some((build_id, workflow_name, state)) = row {
-                    match state.as_str() {
-                        // Live execution already owns the work — converge state by
-                        // deleting the stale DLQ row and report a skip rather than
-                        // double-dispatching a second task.
-                        "RUNNING" | "PAUSED" => {
-                            diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
-                                .execute(conn)
-                                .await
-                                .map_err(crate::error::database_error)?;
-                            return Ok(RedriveOutcome::Skipped);
-                        }
-                        // The load-bearing differentiator (AC #7): reopen a run
-                        // sealed FAILED at quarantine time so it can resume.
-                        "FAILED" => {
-                            let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
-                            crate::execution::reactivate_failed_execution(
-                                conn,
-                                exec_id,
-                                dead_letter_id,
-                                reason,
-                            )
-                            .await?;
-                        }
-                        // Non-FAILED terminal states are not resurrectable.
-                        other => {
-                            return Err(HarvestError::Config(format!(
-                                "cannot redrive dead-letter {dead_letter_id}: owning execution \
-                                 {exec_uuid} is {other} (terminal, not resurrectable)"
-                            )));
-                        }
-                    }
+                let (build_id, workflow_name, state) = row.ok_or_else(|| {
+                    HarvestError::NotFound(format!("workflow execution {exec_uuid}"))
+                })?;
 
-                    params.required_build_id = build_id;
-                    if task_type == TaskType::Workflow
-                        && let Some(reg) = registry
-                        && let Some(info) = reg.workflows.get(&workflow_name)
-                        && let Some(policy) = &info.concurrency
-                    {
-                        params.concurrency_key = crate::concurrency::resolve_concurrency_key(
-                            policy.key_expr,
-                            &params.input,
-                        );
-                        params.max_concurrent = Some(policy.limit);
+                match state.as_str() {
+                    // Live execution already owns the work — converge state by
+                    // deleting the stale DLQ row and report a skip rather than
+                    // double-dispatching a second task.
+                    "RUNNING" | "PAUSED" => {
+                        diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
+                            .execute(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
+                        return Ok(RedriveOutcome::Skipped);
                     }
+                    // The load-bearing differentiator (AC #7): reopen a run
+                    // sealed FAILED at quarantine time so it can resume.
+                    "FAILED" => {
+                        let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
+                        crate::execution::reactivate_failed_execution(
+                            conn,
+                            exec_id,
+                            dead_letter_id,
+                            reason,
+                        )
+                        .await?;
+                    }
+                    // Non-FAILED terminal states are not resurrectable.
+                    other => {
+                        return Err(HarvestError::Config(format!(
+                            "cannot redrive dead-letter {dead_letter_id}: owning execution \
+                             {exec_uuid} is {other} (terminal, not resurrectable)"
+                        )));
+                    }
+                }
+
+                params.required_build_id = build_id;
+                if task_type == TaskType::Workflow
+                    && let Some(reg) = registry
+                    && let Some(info) = reg.workflows.get(&workflow_name)
+                    && let Some(policy) = &info.concurrency
+                {
+                    params.concurrency_key =
+                        crate::concurrency::resolve_concurrency_key(policy.key_expr, &params.input);
+                    params.max_concurrent = Some(policy.limit);
                 }
             }
 
