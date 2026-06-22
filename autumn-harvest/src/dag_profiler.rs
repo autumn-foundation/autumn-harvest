@@ -32,6 +32,47 @@ pub struct DagProfile {
     pub timeline: Vec<ProfilerEvent>,
 }
 
+impl DagProfile {
+    /// Exports the DAG execution profile to a Mermaid.js Gantt chart.
+    ///
+    /// The generated string can be rendered in Markdown using ` ```mermaid ` blocks.
+    ///
+    /// # Errors
+    /// Returns `std::fmt::Error` if string formatting fails.
+    pub fn export_mermaid_gantt(&self) -> Result<String, std::fmt::Error> {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        writeln!(out, "gantt")?;
+        writeln!(out, "    title DAG Execution Profile")?;
+        writeln!(out, "    dateFormat  X")?;
+        writeln!(out, "    axisFormat  %s")?;
+
+        let mut start_times = std::collections::HashMap::new();
+
+        for event in &self.timeline {
+            match &event.kind {
+                ProfilerEventKind::TaskStarted(idx, name) => {
+                    start_times.insert(*idx, (name.clone(), event.time));
+                }
+                ProfilerEventKind::TaskCompleted(idx, _) => {
+                    if let Some((name, start_time)) = start_times.remove(idx) {
+                        writeln!(
+                            out,
+                            "    {} :{}, {}",
+                            name,
+                            start_time.as_secs(),
+                            event.time.as_secs()
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(out)
+    }
+}
+
 /// A discrete-event simulator to profile DAG execution.
 pub struct DagProfiler {
     dag: DagDefinition,
@@ -235,5 +276,27 @@ mod tests {
         assert_eq!(profile.total_duration, Duration::from_secs(6));
         // max concurrency is 2 because B and C run at the same time.
         assert_eq!(profile.peak_concurrency, 2);
+    }
+
+    #[test]
+    fn test_export_mermaid_gantt() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(activity_a);
+        let _b = builder.activity(activity_b).upstream(&a);
+        let dag = builder.build().unwrap();
+
+        let profiler = DagProfiler::new(dag)
+            .mock_duration("activity_a", Duration::from_secs(2))
+            .mock_duration("activity_b", Duration::from_secs(3));
+
+        let profile = profiler.profile();
+        let gantt = profile.export_mermaid_gantt().unwrap();
+
+        assert!(gantt.contains("gantt"));
+        assert!(gantt.contains("title DAG Execution Profile"));
+        assert!(gantt.contains("dateFormat  X"));
+        assert!(gantt.contains("axisFormat  %s"));
+        assert!(gantt.contains("activity_a :0, 2"));
+        assert!(gantt.contains("activity_b :2, 5"));
     }
 }
