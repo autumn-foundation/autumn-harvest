@@ -10,6 +10,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::error::TimeoutType;
 use crate::types::{
@@ -585,6 +586,33 @@ pub enum WorkflowEvent {
         /// Machine-readable reason code (`"target_unknown"`).
         reason_code: String,
     },
+
+    // ── DLQ redrive reactivation (issue #510) ─────────────────────────────────
+    /// An operator redrove a dead-lettered task whose owning execution had been
+    /// sealed `FAILED` at quarantine time. This event reopens the execution: it
+    /// is appended **after** the superseded terminal
+    /// [`WorkflowFailed`](Self::WorkflowFailed) and the execution transitions
+    /// `FAILED` → `RUNNING` so the re-enqueued task resumes from existing
+    /// history (append-only; no prior event is rewritten).
+    ///
+    /// ## Replay determinism
+    ///
+    /// `WorkflowRedriven` is a **non-terminal** lifecycle event and is a no-op
+    /// for command dispatch during replay: the
+    /// [`crate::replay::HistoryMatcher`] marks both this event **and** the
+    /// `WorkflowFailed` it supersedes as transparent, so the reconstructed
+    /// command sequence advances past the reopened terminal instead of
+    /// diverging against it. A bare trailing `WorkflowFailed` with no following
+    /// `WorkflowRedriven` stays non-transparent (a genuinely failed run).
+    WorkflowRedriven {
+        /// Wall-clock time the redrive reactivation was applied.
+        redriven_at: DateTime<Utc>,
+        /// The `harvest_dead_letters` row that triggered this reactivation.
+        dead_letter_id: Uuid,
+        /// Optional operator-supplied reason. `None` when no reason was given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 impl WorkflowEvent {
@@ -636,6 +664,7 @@ impl WorkflowEvent {
             Self::ExternalCancelRequested { .. } => "ExternalCancelRequested",
             Self::ExternalCancelDelivered { .. } => "ExternalCancelDelivered",
             Self::ExternalCancelFailed { .. } => "ExternalCancelFailed",
+            Self::WorkflowRedriven { .. } => "WorkflowRedriven",
         }
     }
 
@@ -1347,6 +1376,70 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+        Ok(())
+    }
+
+    // ── WorkflowRedriven (issue #510) ────────────────────────────────────────
+
+    #[test]
+    fn workflow_redriven_type_name_and_not_terminal() {
+        let event = WorkflowEvent::WorkflowRedriven {
+            redriven_at: Utc::now(),
+            dead_letter_id: Uuid::new_v4(),
+            reason: Some("downstream fixed".into()),
+        };
+        assert_eq!(event.type_name(), "WorkflowRedriven");
+        assert!(
+            !event.is_terminal_lifecycle(),
+            "redrive reopens the run and must not be a terminal lifecycle event"
+        );
+    }
+
+    #[test]
+    fn workflow_redriven_round_trips_adjacently_tagged() -> Result<(), serde_json::Error> {
+        let dead_letter_id = Uuid::new_v4();
+        let event = WorkflowEvent::WorkflowRedriven {
+            redriven_at: Utc::now(),
+            dead_letter_id,
+            reason: Some("credential rotated".into()),
+        };
+        let json = serde_json::to_string(&event)?;
+        // Adjacently-tagged: {"type":"WorkflowRedriven","data":{...}}
+        assert!(json.contains("\"type\":\"WorkflowRedriven\""));
+        assert!(json.contains("\"data\""));
+        assert!(json.contains("dead_letter_id"));
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        match back {
+            WorkflowEvent::WorkflowRedriven {
+                dead_letter_id: id,
+                reason,
+                ..
+            } => {
+                assert_eq!(id, dead_letter_id);
+                assert_eq!(reason.as_deref(), Some("credential rotated"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_redriven_omits_reason_when_none() -> Result<(), serde_json::Error> {
+        let event = WorkflowEvent::WorkflowRedriven {
+            redriven_at: Utc::now(),
+            dead_letter_id: Uuid::new_v4(),
+            reason: None,
+        };
+        let json = serde_json::to_string(&event)?;
+        assert!(
+            !json.contains("reason"),
+            "reason must be skipped when None, got {json}"
+        );
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
+        assert!(matches!(
+            back,
+            WorkflowEvent::WorkflowRedriven { reason: None, .. }
+        ));
         Ok(())
     }
 }

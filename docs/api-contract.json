@@ -1835,6 +1835,88 @@
     },
     {
       "method": "POST",
+      "path": "/dlq/redrive",
+      "category": "dlq",
+      "read_only": false,
+      "description": "Redrive (re-enqueue) dead-lettered tasks matching a filter, with a fresh retry budget, after deploying a fix. Owning executions sealed FAILED are reactivated to RUNNING and resume from existing history append-only.",
+      "idempotency": "Idempotent: redriving an already-redriven entry (or one whose execution has progressed) is a no-op reported as skipped, never a duplicate enqueue.",
+      "params": [],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "queue",
+            "required": false,
+            "description": "Filter by the original task queue name."
+          },
+          {
+            "name": "workflow_name",
+            "required": false,
+            "description": "Filter by the owning execution's workflow name."
+          },
+          {
+            "name": "dead_lettered_after",
+            "required": false,
+            "description": "RFC 3339 timestamp — only redrive entries dead-lettered at or after this time."
+          },
+          {
+            "name": "dead_lettered_before",
+            "required": false,
+            "description": "RFC 3339 timestamp — only redrive entries dead-lettered before this time."
+          },
+          {
+            "name": "error_contains",
+            "required": false,
+            "description": "Case-insensitive substring match on the dead-letter error text."
+          },
+          {
+            "name": "dead_letter_ids",
+            "required": false,
+            "description": "Explicit set of dead-letter UUIDs to redrive."
+          },
+          {
+            "name": "max",
+            "required": false,
+            "description": "Maximum number of entries to redrive in this call (default 100, max 1000)."
+          },
+          {
+            "name": "dry_run",
+            "required": false,
+            "description": "When true, return the matched count and a bounded sample without re-enqueuing."
+          },
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Optional operator reason recorded on the WorkflowRedriven event."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "matched",
+          "redriven",
+          "skipped",
+          "failed",
+          "ids",
+          "dry_run",
+          "failures"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Empty or invalid filter."
+        },
+        {
+          "status": 500,
+          "description": "Database error, or all matched entries failed to redrive."
+        }
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/activities/external/{token}/complete",
       "category": "external_activity",
       "read_only": false,

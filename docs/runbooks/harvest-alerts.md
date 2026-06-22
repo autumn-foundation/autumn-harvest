@@ -280,6 +280,69 @@ the workflow owner.
 Escalate immediately for replay determinism failures or customer-visible
 payment, fulfillment, identity, or notification workflows entering DLQ.
 
+### Redrive — getting work back out after a fix (issue #510)
+
+`bulk-replay` re-enqueues a dead-letter row only if its owning execution is
+still `RUNNING`. Almost every real DLQ entry was sealed `FAILED` at quarantine
+time (history cap, poison-pill, workflow-task timeout), so the recovery path is
+**redrive**, which reactivates the `FAILED` execution before re-enqueuing:
+
+```bash
+# 1. Deploy the fix that addresses the root cause first.
+#
+# 2. Preview the blast radius — counts only, no mutation. matched > max means
+#    there is more to do than this call will redrive.
+harvest dlq redrive \
+  --error-contains "stripe: rate limited" \
+  --dead-lettered-after 2026-05-30T00:00:00Z \
+  --max 500 --dry-run
+
+# 3. Redrive for real once the sample looks right. Idempotent: re-running the
+#    same command is a no-op for anything already redriven (reported skipped).
+harvest dlq redrive \
+  --error-contains "stripe: rate limited" \
+  --dead-lettered-after 2026-05-30T00:00:00Z \
+  --max 500 --reason "stripe rate-limit cleared, incident-1234"
+```
+
+The response distinguishes `matched` (total filtered), `redriven`,
+`skipped`, and `failed`. Read it:
+
+- **`redriven < matched`** — the `max` cap stopped early. Re-run to drain the
+  rest (the filter is stable; already-redriven rows skip).
+- **`skipped`** — rows that were already redriven, or whose execution has since
+  progressed past that step. Expected on a re-run; never a duplicate enqueue.
+- **`failed`** — per-row rejections (see `failures[].reason`). The most common
+  is an owning execution in a non-`FAILED` terminal state
+  (`COMPLETED`/`CANCELLED`/`TIMED_OUT`/`TERMINATED`): redrive **refuses to
+  resurrect** these and leaves the row in place rather than silently
+  re-running a finished workflow.
+
+### Verify a redrive
+
+- The owning execution flips `FAILED → RUNNING`
+  (`harvest workflow show <execution_id>`); a single `WorkflowRedriven` event is
+  appended after the superseded `WorkflowFailed`.
+- The `harvest.dlq.redriven{queue, outcome}` counter increments once per row
+  (one of `redriven` / `skipped` / `failed`).
+
+### Guarantees
+
+- **Append-only.** Redrive never rewrites, removes, or reorders an existing
+  event. It appends one `WorkflowRedriven` reactivation marker; the fresh
+  attempt then records new events (e.g. a new `ActivityScheduled`) as the
+  re-enqueued task resumes from existing history. The replay engine treats the
+  `WorkflowRedriven` event and the `WorkflowFailed` it supersedes as
+  transparent, so the run resumes deterministically.
+- **Idempotent.** The DLQ row is deleted on redrive, so redriving the same
+  entry twice (or a row whose execution already progressed) is a no-op reported
+  as `skipped` — never a duplicate side-effect.
+- **Shard-aware.** A filtered redrive fans out across all shards; each row is
+  re-enqueued on the shard that owns its `workflow_exec_id`.
+
+The endpoint backing this is `POST /api/harvest/dlq/redrive` (admin auth,
+audit op `dlq.redrive`).
+
 ## harvest_schedule_missed_runs
 
 ### Triage steps

@@ -74,6 +74,8 @@ pub const OP_DLQ_REPLAY: &str = "dlq.replay";
 pub const OP_DLQ_REPLAY_BULK: &str = "dlq.replay.bulk";
 /// Audit operation: Bulk-discarded dead-letter queue (DLQ) tasks.
 pub const OP_DLQ_DISCARD_BULK: &str = "dlq.discard.bulk";
+/// Audit operation: Redrove (re-enqueued) dead-letter queue (DLQ) tasks (issue #510).
+pub const OP_DLQ_REDRIVE: &str = "dlq.redrive";
 /// Audit operation: Submitted a batch processing job.
 pub const OP_BATCH_SUBMIT: &str = "batch.submit";
 /// Audit operation: Atomically started a batch of workflow executions (issue #357).
@@ -304,6 +306,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /dead-letters/replay", RouteClass::Mutating),
     ("POST /dead-letters/discard", RouteClass::Mutating),
     ("POST /dead-letters/{id}/replay", RouteClass::Mutating),
+    ("POST /dlq/redrive", RouteClass::Mutating),
     ("POST /admin/retention/run-now", RouteClass::Mutating),
     ("POST /admin/schedules/workflow", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/pause", RouteClass::Mutating),
@@ -375,6 +378,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_DLQ_REPLAY,
     OP_DLQ_REPLAY_BULK,
     OP_DLQ_DISCARD_BULK,
+    OP_DLQ_REDRIVE,
     OP_BATCH_SUBMIT,
     OP_BATCH_START,
     OP_RETENTION_RUN_NOW,
@@ -499,6 +503,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("POST /dead-letters/replay", Some(OP_DLQ_REPLAY_BULK)),
     ("POST /dead-letters/discard", Some(OP_DLQ_DISCARD_BULK)),
     ("POST /dead-letters/{id}/replay", Some(OP_DLQ_REPLAY)),
+    ("POST /dlq/redrive", Some(OP_DLQ_REDRIVE)),
     // Health / observability (read-only)
     ("GET /health", None),
     ("GET /admin/preflight", None),

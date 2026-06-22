@@ -1419,6 +1419,94 @@ pub async fn resume_workflow_execution(
     Ok(result)
 }
 
+/// Reactivate a `FAILED` workflow execution so a redriven dead-letter task can
+/// resume from existing history (issue #510).
+///
+/// This is the load-bearing differentiator of redrive over replay: every DLQ
+/// write path seals the owning execution `FAILED` (and appends a terminal
+/// `WorkflowFailed` event) at quarantine time, so a redrive must reopen the run
+/// before re-enqueuing. It:
+///
+/// 1. appends a [`WorkflowEvent::WorkflowRedriven`] event **after** the
+///    superseded terminal `WorkflowFailed` (append-only — no existing event is
+///    rewritten, removed, or reordered), and
+/// 2. transitions the execution `FAILED → RUNNING`, clearing the recorded
+///    failure (`error`/`output`/`completed_at`).
+///
+/// The matcher marks the `WorkflowRedriven` event and the `WorkflowFailed` it
+/// supersedes as transparent, so the re-enqueued task replays existing history
+/// and re-issues the failed step live (see [`crate::replay::HistoryMatcher`]).
+///
+/// Runs on the caller's connection so it **joins the caller's transaction**;
+/// the caller is responsible for re-enqueuing the workflow task. The execution
+/// row should already be locked `FOR UPDATE` by the caller and confirmed
+/// `FAILED`; the guards here are defensive and roll the transaction back if the
+/// state has changed.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`] if the execution does not exist,
+/// [`HarvestError::Config`] if it is not `FAILED`, or [`HarvestError::Database`]
+/// on persistence failure.
+pub async fn reactivate_failed_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    dead_letter_id: Uuid,
+    reason: Option<&str>,
+) -> HarvestResult<()> {
+    let execution = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+
+    if execution.state != "FAILED" {
+        return Err(HarvestError::Config(format!(
+            "cannot redrive: workflow execution {exec_id} is {} (only FAILED is reactivatable)",
+            execution.state
+        )));
+    }
+
+    let history = store::load_history(conn, exec_id).await?;
+    store::append_events(
+        conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowRedriven {
+            redriven_at: Utc::now(),
+            dead_letter_id,
+            reason: reason.map(str::to_string),
+        }],
+        history.next_event_id,
+    )
+    .await?;
+
+    let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .filter(harvest_workflow_executions::state.eq("FAILED"))
+        .set((
+            harvest_workflow_executions::state.eq("RUNNING"),
+            harvest_workflow_executions::error.eq(None::<String>),
+            harvest_workflow_executions::output.eq(None::<serde_json::Value>),
+            harvest_workflow_executions::completed_at.eq(None::<chrono::DateTime<Utc>>),
+        ))
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+
+    if updated == 0 {
+        // The FOR UPDATE-locked row changed state out from under us — roll the
+        // transaction back so the appended WorkflowRedriven event is discarded.
+        return Err(HarvestError::Config(format!(
+            "workflow execution {exec_id} is no longer FAILED"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Auto-resume executions that have been paused longer than `max_pause_duration`
 /// (issue #383, bounded pause).
 ///
