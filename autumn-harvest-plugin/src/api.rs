@@ -41,10 +41,10 @@ use autumn_harvest::audit::{
     OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
     OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
     OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
-    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT,
-    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH,
+    TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY,
+    TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -109,7 +109,8 @@ use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, UpdateWithStartOutcome,
     UpdateWithStartParams, WorkflowHandleClient, WorkflowResult, cancel_workflow_execution,
     pause_workflow_execution, resume_workflow_execution, signal_with_start_workflow_execution,
-    start_or_load_workflow_execution, update_with_start_workflow_execution,
+    start_or_load_workflow_execution, terminate_workflow_execution,
+    update_with_start_workflow_execution,
 };
 
 use crate::preflight::{PreflightReport, build_preflight_report};
@@ -1375,6 +1376,16 @@ struct CancelWorkflowResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct TerminateWorkflowResponse {
+    ok: bool,
+    execution_id: String,
+    state: String,
+    reason: String,
+    newly_terminated: bool,
+    failed_task_count: usize,
+}
+
+#[derive(Debug, Serialize)]
 struct PauseWorkflowResponse {
     ok: bool,
     execution_id: String,
@@ -1621,6 +1632,11 @@ struct DagTriggerRequest {
 
 #[derive(Debug, Deserialize)]
 struct CancelWorkflowRequest {
+    reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TerminateWorkflowRequest {
     reason: Option<String>,
 }
 
@@ -2366,6 +2382,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(cancel_workflow).route_layer(require_admin.clone()),
         )
         .route(
+            "/workflows/{id}/terminate",
+            post(terminate_workflow).route_layer(require_admin.clone()),
+        )
+        .route(
             "/workflows/{id}/erase-payloads",
             post(erase_workflow_payloads_handler).route_layer(require_admin.clone()),
         )
@@ -2669,6 +2689,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
         ("POST", "/workflows/{id}/cancel"),
+        ("POST", "/workflows/{id}/terminate"),
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
         ("POST", "/workflows/{id}/erase-payloads"),
@@ -2840,6 +2861,7 @@ pub const fn management_api_request_fields()
         // ── batch workflow start (issue #357) ─────────────────────────────────
         ("POST", "/workflows/batch_start", Some(&["items", "atomic"])),
         ("POST", "/workflows/{id}/cancel", Some(&["reason"])),
+        ("POST", "/workflows/{id}/terminate", Some(&["reason"])),
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
         (
@@ -3143,6 +3165,18 @@ pub const fn management_api_response_fields()
                 "state",
                 "reason",
                 "newly_cancelled",
+                "failed_task_count",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/terminate",
+            Some(&[
+                "ok",
+                "execution_id",
+                "state",
+                "reason",
+                "newly_terminated",
                 "failed_task_count",
             ]),
         ),
@@ -8573,6 +8607,126 @@ async fn cancel_workflow(
                     reason: cancelled.reason,
                     newly_cancelled: cancelled.newly_cancelled,
                     failed_task_count: cancelled.failed_task_count,
+                }),
+            ))
+        }
+    }
+}
+
+/// Force-terminate a single workflow execution (issue #504).
+///
+/// The forceful sibling of `cancel_workflow`: it delegates to the
+/// `terminate_workflow_execution` core primitive, sealing a live run in the
+/// `TERMINATED` state without requiring the workflow body to observe
+/// cancellation. Shard-aware (resolves the owning shard from the
+/// `ExecutionId`), audited via `OP_WORKFLOW_TERMINATE`, and idempotent against
+/// an already-terminal execution (non-mutating no-op, `newly_terminated:
+/// false`).
+async fn terminate_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    // The request body is optional (the contract marks it `required: false`).
+    // Take raw `Bytes` rather than `Option<Json<…>>`: axum 0.8's optional-JSON
+    // extractor still parses (and rejects with an EOF error) when a client sends
+    // `Content-Type: application/json` with a zero-byte body, so a body-less
+    // terminate would 422 before the defaulted-reason path runs. Parsing the
+    // bytes ourselves treats both an omitted body and an empty body as the
+    // default reason, and still rejects a genuinely malformed non-empty body.
+    body: axum::body::Bytes,
+) -> Result<(axum::http::StatusCode, Json<TerminateWorkflowResponse>), AutumnError> {
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/terminate";
+    let request: TerminateWorkflowRequest = if body.is_empty() {
+        TerminateWorkflowRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
+    };
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_TERMINATE,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed execution id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let reason = request
+        .reason
+        .as_deref()
+        .unwrap_or("workflow termination requested");
+    let exec_id_str = exec_id.to_string();
+
+    let metrics_ref: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
+        api_state.runtime().map_or_else(
+            |_| Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry.telemetry().metrics),
+        );
+    let terminate_result =
+        terminate_workflow_execution(&mut conn, exec_id, reason, metrics_ref.as_ref()).await;
+    match terminate_result {
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_TERMINATE,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            Err(map_error(e))
+        }
+        Ok(terminated) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_TERMINATE,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_SUCCEEDED,
+                error_summary: None,
+                shard_id: None,
+                source: &source,
+            };
+            audit::insert_audit(&mut conn, &ar)
+                .await
+                .map_err(map_error)?;
+            Ok((
+                axum::http::StatusCode::ACCEPTED,
+                Json(TerminateWorkflowResponse {
+                    ok: true,
+                    execution_id: terminated.exec_id.to_string(),
+                    state: terminated.state,
+                    reason: terminated.reason,
+                    newly_terminated: terminated.newly_cancelled,
+                    failed_task_count: terminated.failed_task_count,
                 }),
             ))
         }
@@ -15806,6 +15960,88 @@ fn terminal_event_type_to_state(event_type: &str) -> &'static str {
     }
 }
 
+/// Pure `stream-end` reason decision: the authoritative execution-row state
+/// wins when terminal; otherwise fall back to the event-derived label.
+///
+/// The `WorkflowCancelled` event is reused for both cooperative cancel
+/// (`CANCELLED`) and force-terminate (`TERMINATED`) (issue #504, no new event
+/// variant), so the event type alone cannot distinguish them — only the
+/// execution-row `state` column can. The event-derived label is used only as a
+/// fallback for the pre-existing not-yet-committed race (a terminal event
+/// observed before the state column flipped) or when the row read fails.
+fn stream_end_reason(authoritative_state: Option<&str>, event_derived: &str) -> String {
+    match authoritative_state {
+        Some(state) if is_terminal_state(state) => state.to_lowercase().replace('_', "-"),
+        _ => event_derived.to_string(),
+    }
+}
+
+/// Resolve the `stream-end` reason from a fresh read of the authoritative
+/// `execution.state`. The terminal event and the state column commit in the
+/// same transaction, so once a terminal event is visible the final state is too.
+async fn resolve_stream_end_reason(
+    api: &HarvestApiState,
+    exec_id: ExecutionId,
+    event_derived: &str,
+) -> String {
+    let state = match db_conn_for_execution(api, exec_id).await {
+        Ok(mut conn) => load_execution(&mut conn, exec_id)
+            .await
+            .ok()
+            .map(|execution| execution.state),
+        Err(_) => None,
+    };
+    stream_end_reason(state.as_deref(), event_derived)
+}
+
+#[cfg(test)]
+mod stream_end_reason_tests {
+    use super::stream_end_reason;
+
+    #[test]
+    fn authoritative_terminated_state_overrides_cancelled_event_label() {
+        // The reused WorkflowCancelled event yields "cancelled", but a force-
+        // terminated run's row state is TERMINATED — the authoritative state
+        // must win so stream-end surfaces "terminated" (issue #504).
+        assert_eq!(
+            stream_end_reason(Some("TERMINATED"), "cancelled"),
+            "terminated"
+        );
+    }
+
+    #[test]
+    fn cooperative_cancel_stays_cancelled() {
+        assert_eq!(
+            stream_end_reason(Some("CANCELLED"), "cancelled"),
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn other_terminal_states_map_from_authoritative_state() {
+        assert_eq!(
+            stream_end_reason(Some("COMPLETED"), "completed"),
+            "completed"
+        );
+        assert_eq!(
+            stream_end_reason(Some("TIMED_OUT"), "timed-out"),
+            "timed-out"
+        );
+        assert_eq!(
+            stream_end_reason(Some("CONTINUED_AS_NEW"), "continued-as-new"),
+            "continued-as-new"
+        );
+    }
+
+    #[test]
+    fn non_terminal_or_missing_state_falls_back_to_event_label() {
+        // Pre-existing not-yet-committed race: a terminal event was observed
+        // before the state column flipped — keep the event-derived label.
+        assert_eq!(stream_end_reason(Some("RUNNING"), "cancelled"), "cancelled");
+        assert_eq!(stream_end_reason(None, "terminated"), "terminated");
+    }
+}
+
 /// `GET /executions/{exec_id}/events/stream`
 ///
 /// Returns a `text/event-stream` response that tails every `WorkflowEvent`
@@ -16050,7 +16286,8 @@ async fn stream_execution_events(
                 None
             });
         if let Some(state) = effective_terminal {
-            let end_data = serde_json::json!({"reason": state}).to_string();
+            let reason = resolve_stream_end_reason(&api_clone, exec_id, state).await;
+            let end_data = serde_json::json!({"reason": reason}).to_string();
             let _ = tx
                 .send(Ok(Event::default().event("stream-end").data(end_data)))
                 .await;
@@ -16111,7 +16348,9 @@ async fn stream_execution_events(
                         }
 
                         if let Some(state) = terminal_state {
-                            let end_data = serde_json::json!({"reason": state}).to_string();
+                            let reason =
+                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
+                            let end_data = serde_json::json!({"reason": reason}).to_string();
                             let _ = tx
                                 .send(Ok(Event::default().event("stream-end").data(end_data)))
                                 .await;
@@ -16154,7 +16393,9 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let end_data = serde_json::json!({"reason": state}).to_string();
+                            let reason =
+                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
+                            let end_data = serde_json::json!({"reason": reason}).to_string();
                             let _ = tx
                                 .send(Ok(Event::default().event("stream-end").data(end_data)))
                                 .await;
@@ -16197,7 +16438,9 @@ async fn stream_execution_events(
                             break 'notify;
                         }
                         if let Some(state) = terminal_state {
-                            let end_data = serde_json::json!({"reason": state}).to_string();
+                            let reason =
+                                resolve_stream_end_reason(&api_clone, exec_id, state).await;
+                            let end_data = serde_json::json!({"reason": reason}).to_string();
                             let _ = tx
                                 .send(Ok(Event::default().event("stream-end").data(end_data)))
                                 .await;

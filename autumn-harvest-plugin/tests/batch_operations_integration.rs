@@ -683,7 +683,8 @@ async fn batch_terminate_finalizes_non_running_workflows() {
         .unwrap();
 
     // Terminate without an explicit state filter — the executor's default for
-    // Terminate widens to "every non-CANCELLED state".
+    // Terminate widens to "every non-terminal-sealed state" (excludes both
+    // CANCELLED and TERMINATED).
     let (_, body) = post_json(
         &app,
         "/batch-operations",
@@ -703,22 +704,33 @@ async fn batch_terminate_finalizes_non_running_workflows() {
     let (_, body) = get_json(&app, &format!("/batch-operations/{job_id}")).await;
     assert_eq!(body["status"], "Completed");
     assert_eq!(body["total"], 4);
-    // All four — including FAILED and TIMED_OUT — must be force-finalized.
+    // All four dispatch successfully — including FAILED and TIMED_OUT, which
+    // Cancel would reject outright. Terminate accepts them as an idempotent
+    // no-op (issue #504, AC #7) rather than erroring.
     assert_eq!(
         body["completed"], 4,
-        "Terminate must accept any non-cancelled state: {body}"
+        "Terminate must accept any state Cancel would reject: {body}"
     );
     assert_eq!(body["failed"], 0);
 
-    let states: Vec<String> = harvest_workflow_executions::table
+    // Live runs are sealed TERMINATED; the already-terminal FAILED / TIMED_OUT
+    // runs are left untouched (idempotent no-op, no duplicate transition).
+    let mut states: Vec<String> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq("onboarding"))
         .select(harvest_workflow_executions::state)
         .load(&mut conn)
         .await
         .unwrap();
-    assert!(
-        states.iter().all(|s| s == "CANCELLED"),
-        "Terminate must coerce every match to CANCELLED, got {states:?}"
+    states.sort();
+    assert_eq!(
+        states,
+        vec![
+            "FAILED".to_string(),
+            "TERMINATED".to_string(),
+            "TERMINATED".to_string(),
+            "TIMED_OUT".to_string(),
+        ],
+        "live runs → TERMINATED, already-terminal runs unchanged, got {states:?}"
     );
 }
 

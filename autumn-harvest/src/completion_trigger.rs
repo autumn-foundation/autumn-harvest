@@ -16,6 +16,11 @@ pub enum TerminalState {
     Failed,
     Cancelled,
     TimedOut,
+    /// Force-terminated by an operator (or batch/scheduler). Distinct from
+    /// `Cancelled`: a completion trigger registered for cooperative
+    /// cancellations does **not** fire on a force-terminate, and vice versa
+    /// (issue #504).
+    Terminated,
 }
 
 impl TerminalState {
@@ -26,6 +31,7 @@ impl TerminalState {
             Self::Failed => "FAILED",
             Self::Cancelled => "CANCELLED",
             Self::TimedOut => "TIMED_OUT",
+            Self::Terminated => "TERMINATED",
         }
     }
 
@@ -37,6 +43,7 @@ impl TerminalState {
             "FAILED" => Some(Self::Failed),
             "CANCELLED" => Some(Self::Cancelled),
             "TIMED_OUT" => Some(Self::TimedOut),
+            "TERMINATED" => Some(Self::Terminated),
             _ => None,
         }
     }
@@ -862,5 +869,45 @@ mod tests {
         assert_eq!(project_json_path(&val, "a.b"), json!({"c": 42}));
         assert_eq!(project_json_path(&val, "a.x"), Value::Null);
         assert_eq!(project_json_path(&val, ""), val);
+    }
+
+    #[test]
+    fn terminal_state_terminated_round_trips() {
+        // issue #504: `Terminated` is a distinct terminal class from `Cancelled`.
+        assert_eq!(TerminalState::Terminated.as_str(), "TERMINATED");
+        assert_eq!(
+            TerminalState::from_str("TERMINATED"),
+            Some(TerminalState::Terminated)
+        );
+        assert_ne!(TerminalState::Terminated, TerminalState::Cancelled);
+
+        // String round-trip for every variant, including the new one.
+        for state in [
+            TerminalState::Completed,
+            TerminalState::Failed,
+            TerminalState::Cancelled,
+            TerminalState::TimedOut,
+            TerminalState::Terminated,
+        ] {
+            assert_eq!(TerminalState::from_str(state.as_str()), Some(state));
+        }
+
+        // Pre-#504 stored trigger rows hold only the original four values; the
+        // additive variant must not change their deserialization.
+        let legacy: Vec<TerminalState> =
+            serde_json::from_value(json!(["Completed", "Failed", "Cancelled", "TimedOut"]))
+                .unwrap();
+        assert_eq!(
+            legacy,
+            vec![
+                TerminalState::Completed,
+                TerminalState::Failed,
+                TerminalState::Cancelled,
+                TerminalState::TimedOut,
+            ]
+        );
+        // And the new value is accepted by the same serde path the management API uses.
+        let new: Vec<TerminalState> = serde_json::from_value(json!(["Terminated"])).unwrap();
+        assert_eq!(new, vec![TerminalState::Terminated]);
     }
 }

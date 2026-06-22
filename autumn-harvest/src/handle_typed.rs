@@ -59,6 +59,38 @@ impl<T> TypedWorkflowHandle<T> {
         &self.inner
     }
 
+    /// Gracefully cancel this workflow execution (cooperative path).
+    ///
+    /// Delegates to [`WorkflowHandle::cancel`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when the execution does not exist,
+    /// [`HarvestError::Config`] when the execution is already terminal, and
+    /// [`HarvestError::Database`] for persistence failures.
+    pub async fn cancel(
+        &self,
+        reason: &str,
+    ) -> HarvestResult<crate::execution::CancelledWorkflowExecution> {
+        self.inner.cancel(reason).await
+    }
+
+    /// Forcefully terminate this workflow execution (operator escape hatch).
+    ///
+    /// Delegates to [`WorkflowHandle::terminate`]; seals the run as
+    /// `TERMINATED`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when the execution does not exist and
+    /// [`HarvestError::Database`] for persistence failures.
+    pub async fn terminate(
+        &self,
+        reason: &str,
+    ) -> HarvestResult<crate::execution::CancelledWorkflowExecution> {
+        self.inner.terminate(reason).await
+    }
+
     /// Wait until the workflow reaches a terminal state and deserialize its success
     /// output into `T`. Failure terminal states are returned as typed [`HarvestError`]
     /// variants.

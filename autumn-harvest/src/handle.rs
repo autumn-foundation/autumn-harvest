@@ -18,7 +18,8 @@ use serde_json::Value;
 
 use crate::error::{HarvestError, HarvestResult, TimeoutType, database_error};
 use crate::execution::{
-    StartWorkflowParams, StartedWorkflowExecution, start_or_load_workflow_execution,
+    CancelledWorkflowExecution, StartWorkflowParams, StartedWorkflowExecution,
+    cancel_workflow_execution, start_or_load_workflow_execution, terminate_workflow_execution,
 };
 use crate::models::WorkflowExecution;
 use crate::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
@@ -496,6 +497,68 @@ impl WorkflowHandle {
             )));
         }
         Ok(())
+    }
+
+    /// Gracefully cancel this workflow execution (cooperative path).
+    ///
+    /// Mirrors `POST /workflows/{id}/cancel`: appends a `WorkflowCancelled`
+    /// event and seals the run as `CANCELLED`. The workflow body is expected
+    /// to observe the cancellation via `is_cancelled`/`check_cancellation`.
+    /// Idempotent against an already-cancelled run; returns
+    /// [`HarvestError::Config`] for a run already terminal for another reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when the execution does not exist,
+    /// [`HarvestError::Config`] when the execution is already terminal, and
+    /// [`HarvestError::Database`] for persistence failures.
+    pub async fn cancel(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(self.shard())
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        cancel_workflow_execution(
+            &mut conn,
+            self.exec_id,
+            reason,
+            &crate::telemetry::NoOpMetrics,
+        )
+        .await
+    }
+
+    /// Forcefully terminate this workflow execution (operator escape hatch).
+    ///
+    /// Mirrors `POST /workflows/{id}/terminate`: seals a live run in the
+    /// `TERMINATED` state unilaterally without requiring the workflow body to
+    /// cooperate, fails outstanding task rows, and runs the parent-close
+    /// cascade. A result-awaiting caller observes [`HarvestError::Terminated`]
+    /// (distinct from a cooperative cancel and from a failure). Idempotent
+    /// no-op against any already-terminal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when the execution does not exist and
+    /// [`HarvestError::Database`] for persistence failures.
+    pub async fn terminate(&self, reason: &str) -> HarvestResult<CancelledWorkflowExecution> {
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(self.shard())
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        terminate_workflow_execution(
+            &mut conn,
+            self.exec_id,
+            reason,
+            &crate::telemetry::NoOpMetrics,
+        )
+        .await
     }
 
     /// Return the current compact result snapshot without waiting.

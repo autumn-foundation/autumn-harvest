@@ -22,7 +22,9 @@ use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
 use autumn_harvest::types::{ExecutionId, Priority, ShardId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
-use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
+use autumn_harvest::{
+    StartWorkflowParams, start_or_load_workflow_execution, terminate_workflow_execution,
+};
 use autumn_harvest_plugin::api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
 };
@@ -302,6 +304,63 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 runbook_url: None,
                 severity: None,
             },
+            // Workflows exercised by the terminate-trigger test (issue #504):
+            // a source whose force-terminate fires `Terminated` triggers, plus the
+            // two distinct targets the test registers triggers against.
+            WorkflowInfo {
+                name: "term_source_wf",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
+            WorkflowInfo {
+                name: "on_terminate_wf",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
+            WorkflowInfo {
+                name: "on_cancel_wf",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
         ],
         vec![],
     ))
@@ -522,6 +581,131 @@ async fn test_trigger_evaluations_same_shard() {
     assert_eq!(target_exec.workflow_name, "target_wf");
     assert_eq!(target_exec.input, json!({"result": "done"}));
     assert_eq!(target_exec.state, "RUNNING");
+}
+
+/// issue #504: a force-terminate fires `Terminated` completion triggers, NOT
+/// `Cancelled` ones — terminate is distinct from a cooperative cancellation
+/// downstream.
+#[tokio::test]
+async fn test_terminate_fires_terminated_trigger_not_cancelled() {
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    // A trigger that should fire on terminate, and one that should NOT.
+    let terminated_trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": terminated_trigger_id,
+            "source_workflow_name": "term_source_wf",
+            "terminal_states": ["Terminated"],
+            "target_workflow_name": "on_terminate_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+    let cancelled_trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": cancelled_trigger_id,
+            "source_workflow_name": "term_source_wf",
+            "terminal_states": ["Cancelled"],
+            "target_workflow_name": "on_cancel_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Start a RUNNING source workflow.
+    let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "term_source_wf",
+            workflow_id: "term-source-1",
+            exec_id: source_exec_id,
+            input: json!({"hello": "world"}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Force-terminate it. Same-shard trigger targets are started inline within
+    // the terminate transaction, so we can assert synchronously.
+    terminate_workflow_execution(
+        &mut conn,
+        source_exec_id,
+        "operator kill",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .unwrap();
+
+    let source: WorkflowExecution = harvest_workflow_executions::table
+        .find(source_exec_id.as_uuid())
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(source.state, "TERMINATED");
+
+    // The `["Terminated"]` trigger fired: its target run exists.
+    let terminated_target_id = format!(
+        "completion-trigger-{}-{}",
+        terminated_trigger_id, source_exec_id
+    );
+    let terminated_target: WorkflowExecution = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&terminated_target_id))
+        .first(&mut conn)
+        .await
+        .expect("Terminated trigger must fire on a force-terminate");
+    assert_eq!(terminated_target.workflow_name, "on_terminate_wf");
+    assert_eq!(terminated_target.state, "RUNNING");
+
+    // The `["Cancelled"]` trigger did NOT fire: no target run exists.
+    let cancelled_target_id = format!(
+        "completion-trigger-{}-{}",
+        cancelled_trigger_id, source_exec_id
+    );
+    let cancelled_target = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&cancelled_target_id))
+        .first::<WorkflowExecution>(&mut conn)
+        .await
+        .optional()
+        .unwrap();
+    assert!(
+        cancelled_target.is_none(),
+        "a Cancelled trigger must NOT fire on a force-terminate"
+    );
 }
 
 #[tokio::test]

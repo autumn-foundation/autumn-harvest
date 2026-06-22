@@ -3424,12 +3424,23 @@ fn event_data_u64(event_data: &Value, field: &str) -> Option<u64> {
 }
 
 /// Map a raw `event_type` string to a human-readable label.
-fn event_human_label(event_type: &str, event_data: &Value) -> String {
+///
+/// `execution_state` disambiguates the `WorkflowCancelled` event, which is
+/// reused for force-terminate (issue #504, no new event variant): a terminal
+/// `WorkflowCancelled` on a `TERMINATED` execution is labelled "Workflow
+/// terminated" so the timeline matches the (already correct) state badge.
+fn event_human_label(event_type: &str, event_data: &Value, execution_state: &str) -> String {
     match event_type {
         "WorkflowStarted" => "Workflow started".to_string(),
         "WorkflowCompleted" => "Workflow completed".to_string(),
         "WorkflowFailed" => "Workflow failed".to_string(),
-        "WorkflowCancelled" => "Workflow cancelled".to_string(),
+        "WorkflowCancelled" => {
+            if execution_state == "TERMINATED" {
+                "Workflow terminated".to_string()
+            } else {
+                "Workflow cancelled".to_string()
+            }
+        }
         "WorkflowTerminated" => "Workflow terminated".to_string(),
         "ActivityScheduled" => {
             let name = event_data_field(event_data, "name").unwrap_or("?");
@@ -3871,7 +3882,8 @@ fn render_workflow_detail(
                     }
                     tbody {
                         @for event in signal_update_events {
-                            @let label = event_human_label(&event.event_type, &event.event_data);
+                            @let label =
+                                event_human_label(&event.event_type, &event.event_data, &execution.state);
                             @let name_or_id = event_data_field(&event.event_data, "signal_name")
                                 .or_else(|| event_data_field(&event.event_data, "update_id"))
                                 .unwrap_or("—");
@@ -3924,7 +3936,8 @@ fn render_workflow_detail(
                     }
                     tbody {
                         @for event in page_events {
-                            @let label = event_human_label(&event.event_type, &event.event_data);
+                            @let label =
+                                event_human_label(&event.event_type, &event.event_data, &execution.state);
                             @let ts = format_timestamp(Some(event.timestamp));
                             tr {
                                 td { (event.event_id + 1) }
@@ -7028,6 +7041,22 @@ mod tests {
         assert_eq!(badge_class("CANCELLED"), "CANCELLED");
         assert_eq!(badge_class("TERMINATED"), "TERMINATED");
         assert_eq!(badge_class("MYSTERY"), "UNKNOWN");
+    }
+
+    #[test]
+    fn event_label_disambiguates_terminate_from_cancel() {
+        // The WorkflowCancelled event is reused for force-terminate (#504): the
+        // timeline label must follow the authoritative execution state so a
+        // terminated run reads "Workflow terminated", matching its badge.
+        let data = serde_json::json!({});
+        assert_eq!(
+            event_human_label("WorkflowCancelled", &data, "TERMINATED"),
+            "Workflow terminated"
+        );
+        assert_eq!(
+            event_human_label("WorkflowCancelled", &data, "CANCELLED"),
+            "Workflow cancelled"
+        );
     }
 
     #[test]

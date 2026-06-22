@@ -191,6 +191,7 @@ impl CancelledWorkflowExecution {
 
     fn newly_cancelled(
         exec_id: ExecutionId,
+        final_state: &str,
         reason: String,
         failed_task_count: usize,
         workflow_name: String,
@@ -199,7 +200,7 @@ impl CancelledWorkflowExecution {
     ) -> Self {
         Self {
             exec_id,
-            state: "CANCELLED".to_string(),
+            state: final_state.to_string(),
             reason,
             newly_cancelled: true,
             failed_task_count,
@@ -810,6 +811,65 @@ async fn inline_cancel(
 /// Returns [`HarvestError::NotFound`] when the execution does not exist,
 /// [`HarvestError::Config`] when the execution is already terminal for another
 /// reason, and [`HarvestError::Database`] for persistence failures.
+/// Notify an **awaited** parent that one of its children reached a terminal
+/// state out-of-band (operator cancel/terminate), waking the parked parent.
+///
+/// When a parent blocks on `spawn_child_workflow().await`, the child's terminal
+/// transition is normally propagated to the parent by the worker
+/// (`wake_parent_for_child_failure`). Operator cancel/terminate seal the child
+/// directly, bypassing the worker, so without this the parent parks forever.
+///
+/// Only **awaited** children are handled here (`parent_id` set,
+/// `parent_close_policy` NULL); **detached** children (policy set) are the
+/// `apply_parent_close_cascade` parent→child path's responsibility and are
+/// skipped. There is no `ChildWorkflowCancelled` event variant, so a cancel and
+/// a terminate both surface to the parent as `ChildWorkflowFailed` (the
+/// child-await resolves `Err`) — matching the worker failure path and adding no
+/// new event variant. Awaited children are co-located on the parent's shard
+/// (the worker append-on-child-conn path relies on the same invariant), so this
+/// append on the child's connection targets the correct shard.
+async fn notify_awaited_parent_of_child_terminal(
+    conn: &mut AsyncPgConnection,
+    child_exec_id: ExecutionId,
+    execution: &WorkflowExecution,
+    error: String,
+) -> HarvestResult<()> {
+    if let Some(parent_uuid) = execution.parent_id
+        && execution.parent_close_policy.is_none()
+    {
+        let parent_exec_id = ExecutionId::from_uuid(parent_uuid);
+        // Lock the parent row and skip the wake if it is already terminal (or
+        // gone): an awaited child can outlive its parent (e.g. the parent hit its
+        // execution timeout while the child kept running), and appending a
+        // command-consumable `ChildWorkflowFailed` after the parent's own terminal
+        // event would add replay-visible history past closure. The `FOR UPDATE`
+        // lock serializes against a concurrent parent termination — which holds
+        // the same row lock — so we either observe the parent terminal here and
+        // skip, or append before it seals and the parent consumes the event.
+        let parent_state: Option<String> = harvest_workflow_executions::table
+            .find(parent_exec_id.as_uuid())
+            .select(harvest_workflow_executions::state)
+            .for_update()
+            .first(conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        if matches!(parent_state, Some(state) if !crate::erase::is_terminal_state(&state)) {
+            store::append_single_event(
+                conn,
+                parent_exec_id,
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id: child_exec_id,
+                    error,
+                },
+            )
+            .await?;
+            queue::wake_workflow_task(conn, parent_exec_id).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Cancel a running workflow execution, returning the deferred completion-trigger
 /// starts to the caller **without spawning them** (and without recording the
 /// terminal metric).
@@ -949,6 +1009,15 @@ pub async fn cancel_workflow_execution_collect(
                 .await?;
 
                 let total_failed_or_deleted = deleted_pending + failed_task_count;
+                // Wake a parent blocked on this child's await (#787): cancelling
+                // an awaited child out-of-band must surface to the parent.
+                notify_awaited_parent_of_child_terminal(
+                    conn,
+                    exec_id,
+                    &execution,
+                    format!("child workflow cancelled: {reason}"),
+                )
+                .await?;
                 let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
                 let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                     conn,
@@ -962,6 +1031,7 @@ pub async fn cancel_workflow_execution_collect(
                 Ok((
                     CancelledWorkflowExecution::newly_cancelled(
                         exec_id,
+                        "CANCELLED",
                         reason,
                         total_failed_or_deleted,
                         execution.workflow_name.clone(),
@@ -1606,29 +1676,30 @@ async fn cascade_terminate_detached_child(
     Ok((true, deferred))
 }
 
-/// Hard-finalize a workflow execution to `CANCELLED` regardless of its
-/// current state.
+/// Hard-finalize a workflow execution to `TERMINATED` regardless of its
+/// current live state.
 ///
 /// `cancel_workflow_execution` is the graceful path: it requires the
-/// execution to be `RUNNING` and (in Phase 4) will run cancellation
-/// handlers before flipping the state. `terminate_workflow_execution` is
-/// the operator escape hatch — it accepts every non-cancelled state
-/// (including `RUNNING`, `FAILED`, `TIMED_OUT`) and forces the row to
-/// `CANCELLED`. Open task rows are still failed so workers don't keep
-/// chewing on a torn-down execution.
+/// execution to be `RUNNING`/`PAUSED` and the workflow body must observe
+/// the cancellation cooperatively (`is_cancelled`/`check_cancellation`).
+/// `terminate_workflow_execution` is the forceful operator escape hatch —
+/// it seals a live run (`RUNNING`/`SUSPENDED`/`PAUSED`) in the
+/// `TERMINATED` state unilaterally, surfacing to result-awaiting callers as
+/// [`HarvestError::Terminated`] (distinct from a cooperative `CANCELLED`
+/// and from a `FAILED`). Open task rows are still failed so workers don't
+/// keep chewing on a torn-down execution.
 ///
-/// Like the cancel path, this emits a [`WorkflowEvent::WorkflowCancelled`]
-/// (no new event variant — the issue's append-only contract is intact),
-/// records the supplied reason on the row, and is idempotent against an
-/// execution that is already `CANCELLED`.
+/// This emits a [`WorkflowEvent::WorkflowCancelled`] (no new event variant —
+/// the append-only contract is intact) and records the supplied reason on
+/// the row. It is **idempotent against any already-terminal state**
+/// (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`CONTINUED_AS_NEW`/
+/// `TERMINATED`): the call is a non-mutating no-op that appends no second
+/// terminal transition.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`] when the execution does not exist
-/// and [`HarvestError::Database`] for persistence failures. Unlike
-/// `cancel_workflow_execution`, this never returns
-/// [`HarvestError::Config`] for "already terminal" — that's the whole
-/// point of the operator override.
+/// and [`HarvestError::Database`] for persistence failures.
 #[allow(clippy::too_many_lines)]
 pub async fn terminate_workflow_execution(
     conn: &mut AsyncPgConnection,
@@ -1659,7 +1730,11 @@ pub async fn terminate_workflow_execution(
                             HarvestError::NotFound(format!("workflow execution {exec_id}"))
                         })?;
 
-                    if execution.state == "CANCELLED" {
+                    // Idempotent no-op against any already-terminal state
+                    // (issue #504, AC #7): never append a duplicate terminal
+                    // transition. `idempotent` returns the existing state with
+                    // `newly_cancelled = false`.
+                    if crate::erase::is_terminal_state(&execution.state) {
                         return Ok((
                             CancelledWorkflowExecution::idempotent(exec_id, execution),
                             Vec::new(),
@@ -1677,13 +1752,38 @@ pub async fn terminate_workflow_execution(
                     )
                     .await?;
 
-                    // No state-precondition filter: operator override force-writes.
+                    let completed_at = Utc::now();
+                    // Mirror cancel/resume: if this execution was PAUSED, push
+                    // sla_deadline_at forward by the pause span so the SLA scanner
+                    // does not record a false breach for time spent paused before
+                    // terminate (issue #383 × #487). The scanner judges terminal rows
+                    // by `sla_deadline_at < COALESCE(completed_at, NOW())`, so leaving
+                    // a stale deadline that elapsed during the pause would count a
+                    // suspended-clock run as breached. Only extend a deadline that was
+                    // still ahead when the pause began — a deadline already elapsed
+                    // while RUNNING stays in the past so its breach is still observed.
+                    let new_sla_deadline_at = if execution.state == "PAUSED" {
+                        execution
+                            .sla_deadline_at
+                            .map(|d| match execution.paused_at {
+                                Some(p) if d > p => {
+                                    d + (completed_at - p).max(chrono::Duration::zero())
+                                }
+                                _ => d,
+                            })
+                    } else {
+                        execution.sla_deadline_at
+                    };
+
+                    // No state-precondition filter: operator override force-writes
+                    // the live run to the sealed TERMINATED state.
                     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
                         .set((
-                            harvest_workflow_executions::state.eq("CANCELLED"),
+                            harvest_workflow_executions::state.eq("TERMINATED"),
                             harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                             harvest_workflow_executions::error.eq(Some(reason.clone())),
-                            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                            harvest_workflow_executions::completed_at.eq(Some(completed_at)),
+                            harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
                             // Clear active-pause metadata when terminating a paused
                             // run so it doesn't appear terminal-and-paused (#383).
                             harvest_workflow_executions::paused_at
@@ -1701,11 +1801,26 @@ pub async fn terminate_workflow_execution(
                         &format!("workflow terminated: {reason}"),
                     )
                     .await?;
+                    // Wake a parent blocked on this child's await (#787):
+                    // force-terminating an awaited child out-of-band must surface
+                    // to the parent so it does not park forever.
+                    notify_awaited_parent_of_child_terminal(
+                        conn,
+                        exec_id,
+                        &execution,
+                        format!("child workflow terminated: {reason}"),
+                    )
+                    .await?;
                     let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    // Force-terminate fires `Terminated` completion triggers, NOT
+                    // `Cancelled` — a force-kill is distinct from a cooperative
+                    // cancellation downstream (issue #504). Operators opt into
+                    // terminate cascades by registering `terminal_states:
+                    // ["Terminated"]`.
                     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                         conn,
                         exec_id,
-                        crate::completion_trigger::TerminalState::Cancelled,
+                        crate::completion_trigger::TerminalState::Terminated,
                         None,
                     )
                     .await?;
@@ -1715,6 +1830,7 @@ pub async fn terminate_workflow_execution(
                     Ok((
                         CancelledWorkflowExecution::newly_cancelled(
                             exec_id,
+                            "TERMINATED",
                             reason,
                             failed_task_count,
                             execution.workflow_name.clone(),

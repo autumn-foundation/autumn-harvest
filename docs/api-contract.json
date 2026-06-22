@@ -737,6 +737,54 @@
     },
     {
       "method": "POST",
+      "path": "/workflows/{id}/terminate",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Force-terminate a single workflow execution. The forceful sibling of cancel: seals a live run in the TERMINATED state unilaterally (no workflow-body cooperation required), fails outstanding task-queue rows, and runs the parent-close cascade. Result-awaiting callers observe a terminal failure carrying the supplied reason, distinguishable from a normal FAILED. Interrupting an already-executing hot workflow task is the domain of the workflow-task timeout (#494), not terminate.",
+      "idempotency": "Idempotent: terminating an already-terminal execution (COMPLETED/FAILED/CANCELLED/TIMED_OUT/TERMINATED/CONTINUED_AS_NEW) is a non-mutating no-op that appends no second terminal transition and returns newly_terminated=false.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "reason",
+            "required": false,
+            "description": "Human-readable termination reason recorded on the execution and in the audit log."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "state",
+          "reason",
+          "newly_terminated",
+          "failed_task_count"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/workflows/{id}/pause",
       "category": "workflow",
       "read_only": false,
