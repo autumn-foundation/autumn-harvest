@@ -1320,3 +1320,92 @@ async fn workflow_search_attr_predicate_applies_across_shards_with_pagination() 
         "predicate must select exactly the >10k rows across shards, no dup/skip"
     );
 }
+
+/// Backdate every event of an execution so it appears stalled (no event in the
+/// last N minutes) to the `no_progress_minutes` scanner.
+async fn backdate_events(database_url: &str, exec_id: ExecutionId, minutes: i64) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to backdate events");
+    diesel::sql_query(format!(
+        "UPDATE harvest_events SET timestamp = NOW() - INTERVAL '{minutes} minutes' \
+         WHERE workflow_exec_id = '{}'",
+        exec_id.as_uuid()
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("backdate update should succeed");
+}
+
+/// Regression for issue #506 review finding #1: `search_attr_filter` (and the
+/// legacy `search_attr`) must narrow the stalled-workflow (`no_progress_minutes`)
+/// path, not be silently dropped.
+#[tokio::test]
+async fn stalled_workflow_path_applies_search_attr_predicate() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let blocked = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "payment",
+        "wf-stalled-blocked",
+        Some(json!({ "phase": "blocked", "amount": 50000 })),
+    )
+    .await;
+    let open = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "payment",
+        "wf-stalled-open",
+        Some(json!({ "phase": "open", "amount": 10 })),
+    )
+    .await;
+    // Make both look stalled: no event progress for 10 minutes.
+    backdate_events(&database_url, blocked, 10).await;
+    backdate_events(&database_url, open, 10).await;
+
+    // Typed predicate must narrow the stalled set to only the blocked row.
+    let (status, body) = get_json(
+        &app,
+        "/workflows?no_progress_minutes=5&search_attr_filter=phase:eq:blocked",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        workflow_ids(&body),
+        vec!["wf-stalled-blocked".to_string()],
+        "stalled path must honor search_attr_filter"
+    );
+
+    // Numeric comparison on the stalled path too.
+    let (_, body) = get_json(
+        &app,
+        "/workflows?no_progress_minutes=5&search_attr_filter=amount:gt:1000",
+    )
+    .await;
+    assert_eq!(workflow_ids(&body), vec!["wf-stalled-blocked".to_string()]);
+
+    // Legacy search_attr is also honored on the stalled path now.
+    let (_, body) = get_json(
+        &app,
+        "/workflows?no_progress_minutes=5&search_attr=phase:open",
+    )
+    .await;
+    assert_eq!(workflow_ids(&body), vec!["wf-stalled-open".to_string()]);
+
+    // Sanity: without a predicate, both stalled rows are returned.
+    let (_, body) = get_json(&app, "/workflows?no_progress_minutes=5").await;
+    let mut ids = workflow_ids(&body);
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "wf-stalled-blocked".to_string(),
+            "wf-stalled-open".to_string()
+        ]
+    );
+}

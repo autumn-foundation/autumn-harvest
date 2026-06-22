@@ -257,7 +257,7 @@ curl "/workflows?state=RUNNING&page_size=50&cursor=abc123"
 
 ### Notes
 
-- The `no_progress_minutes` (stalled-workflow) filter always returns a bare array regardless of pagination parameters.
+- The `no_progress_minutes` (stalled-workflow) filter always returns a bare array regardless of pagination parameters (cursor pagination is not supported on this path). The `state`, time-range, `search_attr`, and `search_attr_filter` filters **are** applied on the stalled path, so they compose with `no_progress_minutes`.
 - `page_size` and `limit` are aliases; if both are present `page_size` wins.
 - On a sharded deployment each shard is queried independently with the same cursor and `page_size+1` limit; the results are k-way merged and truncated to `page_size` before the response is returned. See `docs/sharding.md` for the cross-shard keyset contract.
 
