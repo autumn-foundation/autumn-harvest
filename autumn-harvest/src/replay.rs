@@ -288,12 +288,41 @@ impl HistoryMatcher {
         // Pre-mark pause/resume events as consumed so they are transparent to
         // every cursor-based scan (issue #383). They carry no workflow command,
         // so settling them up front keeps the matcher's scan loops unchanged.
-        let transparent_events = events
+        let mut transparent_events: HashSet<usize> = events
             .iter()
             .enumerate()
             .filter(|(_, e)| Self::is_pause_lifecycle_event(e))
             .map(|(i, _)| i)
             .collect();
+        // DLQ redrive (issue #510): a `WorkflowRedriven` event reopens a run that
+        // was sealed `FAILED` at quarantine time. Mark the redrive event AND the
+        // superseded terminal `WorkflowFailed` it sits behind as transparent so
+        // command dispatch advances the cursor past the reopened terminal instead
+        // of diverging when the re-enqueued task re-issues the failed command.
+        //
+        // This is **redrive-anchored**: only a `WorkflowFailed` immediately
+        // preceding a `WorkflowRedriven` (skipping already-transparent events) is
+        // made transparent. A bare trailing `WorkflowFailed` with no following
+        // redrive stays non-transparent — it is a genuinely failed run and its
+        // replay (queries, the replayer harness) must be unaffected.
+        for (i, event) in events.iter().enumerate() {
+            if Self::is_redrive_lifecycle_event(event) {
+                transparent_events.insert(i);
+                // Scan backward to the nearest WorkflowFailed, skipping events
+                // already settled transparent (e.g. an interleaved pause pair).
+                let mut j = i;
+                while j > 0 {
+                    j -= 1;
+                    if transparent_events.contains(&j) {
+                        continue;
+                    }
+                    if matches!(events[j], WorkflowEvent::WorkflowFailed { .. }) {
+                        transparent_events.insert(j);
+                    }
+                    break;
+                }
+            }
+        }
         Self {
             events,
             cursor: 0,
@@ -315,6 +344,13 @@ impl HistoryMatcher {
             WorkflowEvent::WorkflowExecutionPaused { .. }
                 | WorkflowEvent::WorkflowExecutionResumed { .. }
         )
+    }
+
+    /// Returns `true` for the DLQ redrive reactivation event (issue #510), which
+    /// reopens a `FAILED` run and is a transparent no-op for command-dispatch
+    /// replay (together with the `WorkflowFailed` it supersedes).
+    const fn is_redrive_lifecycle_event(event: &WorkflowEvent) -> bool {
+        matches!(event, WorkflowEvent::WorkflowRedriven { .. })
     }
 
     /// Returns `true` if the event at `index` has already been consumed out-of-order.
@@ -4562,6 +4598,144 @@ mod tests {
                 output: serde_json::json!({"charged": true})
             },
             "match_activity must skip pause/resume and find the recorded completion"
+        );
+    }
+
+    // ── DLQ redrive transparency tests (issue #510) ───────────────────────
+
+    #[test]
+    fn redrive_marks_superseded_failed_and_redrive_transparent() {
+        // History: started → activity scheduled+failed → WorkflowFailed (sealed
+        // at quarantine) → WorkflowRedriven (operator reactivation). Both the
+        // superseded WorkflowFailed (index 3) and the WorkflowRedriven (index 4)
+        // must be transparent so command dispatch advances past them.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: "downstream down".into(),
+                attempt: 3,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: false,
+            },
+            WorkflowEvent::WorkflowFailed {
+                error: "downstream down".into(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: Some("downstream fixed".into()),
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            matcher.is_consumed(3),
+            "the WorkflowFailed superseded by a redrive must be transparent"
+        );
+        assert!(
+            matcher.is_consumed(4),
+            "the WorkflowRedriven event must be transparent"
+        );
+        // The unrelated ActivityFailed must NOT be made transparent.
+        assert!(
+            !matcher.is_consumed(2),
+            "only the immediately-preceding WorkflowFailed is superseded"
+        );
+    }
+
+    #[test]
+    fn redrive_pair_passes_unconsumed_check() {
+        // WorkflowRedriven is NOT a terminal-lifecycle event, so without the
+        // transparency marking it would be flagged as unconsumed non-lifecycle
+        // history. The redrive-anchored transparency excuses it.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+            },
+            WorkflowEvent::WorkflowFailed {
+                error: "boom".into(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // past WorkflowStarted
+        assert!(
+            !matcher.has_non_lifecycle_unconsumed(),
+            "a redriven tail must be transparent to the unconsumed-history check"
+        );
+    }
+
+    #[test]
+    fn bare_trailing_failed_stays_non_transparent() {
+        // Regression guard: a genuinely failed run (no following WorkflowRedriven)
+        // must keep its terminal WorkflowFailed non-transparent so the replay of
+        // failed workflows (queries, the replayer harness) is unaffected.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+            },
+            WorkflowEvent::WorkflowFailed {
+                error: "boom".into(),
+            },
+        ];
+        let matcher = HistoryMatcher::new(events);
+        assert!(
+            !matcher.is_consumed(1),
+            "a bare trailing WorkflowFailed must not be marked transparent"
+        );
+    }
+
+    #[test]
+    fn command_dispatch_past_redriven_tail_is_live_not_diverged() {
+        // After a redrive, the re-enqueued task re-issues the next command. With
+        // the redriven tail transparent the cursor runs off the end → not
+        // replaying → NoMatch (execute live), never a divergence against the
+        // reopened terminal.
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+            },
+            WorkflowEvent::WorkflowFailed {
+                error: "boom".into(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: chrono::Utc::now(),
+                dead_letter_id: uuid::Uuid::new_v4(),
+                reason: None,
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        matcher.advance(); // past WorkflowStarted; transparent tail is skipped
+        assert_eq!(
+            matcher.match_activity("retry_me"),
+            HistoryMatch::NoMatch,
+            "a command re-issued past the redriven tail must execute live"
         );
     }
 

@@ -1210,6 +1210,42 @@ enum DeadLetterCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Redrive (re-enqueue) dead-lettered tasks matching a filter after a fix.
+    ///
+    /// Re-enqueues matching entries with a fresh retry budget, reactivating any
+    /// owning execution that was sealed FAILED so it resumes from existing
+    /// history. Idempotent: redriving an already-redriven entry is a no-op
+    /// reported as `skipped`. At least one filter criterion must be provided;
+    /// use --dry-run to preview without writing.
+    Redrive {
+        /// Exact match on the original task queue name.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Exact match on the owning execution's workflow name.
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Inclusive lower bound on `failed_at` (RFC 3339, e.g. `2026-04-27T12:30:00Z`).
+        #[arg(long)]
+        dead_lettered_after: Option<String>,
+        /// Exclusive upper bound on `failed_at` (RFC 3339).
+        #[arg(long)]
+        dead_lettered_before: Option<String>,
+        /// Case-insensitive substring match on the dead-letter error text.
+        #[arg(long)]
+        error_contains: Option<String>,
+        /// Explicit dead-letter IDs to redrive (comma-separated or repeated).
+        #[arg(long = "dead-letter-id", value_delimiter = ',')]
+        dead_letter_ids: Vec<String>,
+        /// Maximum rows to redrive per call (default 100, max 1000).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        max: Option<u32>,
+        /// Optional operator reason recorded on the redrive event.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Preview matching rows without re-enqueuing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Subcommands for `harvest worker` (issue #170).
@@ -3495,6 +3531,7 @@ fn start_batch_request(
     Ok(ApiRequest::post("/workflows/batch_start", Some(body)))
 }
 
+#[allow(clippy::too_many_lines)]
 fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
     match command {
         DeadLetterCommand::List { limit } => ApiRequest::get(path_with_limit(
@@ -3590,7 +3627,62 @@ fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
                 encode_query_params(&params)
             ))
         }
+        DeadLetterCommand::Redrive {
+            queue,
+            workflow_name,
+            dead_lettered_after,
+            dead_lettered_before,
+            error_contains,
+            dead_letter_ids,
+            max,
+            reason,
+            dry_run,
+        } => ApiRequest::post(
+            "/dlq/redrive",
+            Some(build_redrive_dlq_body(
+                queue.as_deref(),
+                workflow_name.as_deref(),
+                dead_lettered_after.as_deref(),
+                dead_lettered_before.as_deref(),
+                error_contains.as_deref(),
+                dead_letter_ids,
+                *max,
+                reason.as_deref(),
+                *dry_run,
+            )),
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_redrive_dlq_body(
+    queue: Option<&str>,
+    workflow_name: Option<&str>,
+    dead_lettered_after: Option<&str>,
+    dead_lettered_before: Option<&str>,
+    error_contains: Option<&str>,
+    dead_letter_ids: &[String],
+    max: Option<u32>,
+    reason: Option<&str>,
+    dry_run: bool,
+) -> Value {
+    let mut body = Map::new();
+    insert_string(&mut body, "queue", queue);
+    insert_string(&mut body, "workflow_name", workflow_name);
+    insert_string(&mut body, "dead_lettered_after", dead_lettered_after);
+    insert_string(&mut body, "dead_lettered_before", dead_lettered_before);
+    insert_string(&mut body, "error_contains", error_contains);
+    insert_string(&mut body, "reason", reason);
+    if !dead_letter_ids.is_empty() {
+        body.insert("dead_letter_ids".to_string(), json!(dead_letter_ids));
+    }
+    if let Some(m) = max {
+        body.insert("max".to_string(), json!(m));
+    }
+    if dry_run {
+        body.insert("dry_run".to_string(), json!(true));
+    }
+    Value::Object(body)
 }
 
 fn build_bulk_dlq_body(

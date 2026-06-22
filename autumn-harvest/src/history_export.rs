@@ -365,7 +365,8 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowResetTerminated { .. }
                 | WorkflowEvent::WorkflowExecutionTimedOut { .. }
                 | WorkflowEvent::WorkflowExecutionPaused { .. }
-                | WorkflowEvent::WorkflowExecutionResumed { .. } => {
+                | WorkflowEvent::WorkflowExecutionResumed { .. }
+                | WorkflowEvent::WorkflowRedriven { .. } => {
                     self.handle_workflow_event(event)?;
                 }
                 WorkflowEvent::ActivityScheduled { .. }
@@ -486,6 +487,20 @@ impl MermaidExporter {
             }
             WorkflowEvent::WorkflowExecutionResumed { actor, .. } => {
                 writeln!(self.out, "    Note over WF: Resumed by {actor}")?;
+            }
+            WorkflowEvent::WorkflowRedriven {
+                dead_letter_id,
+                reason,
+                ..
+            } => {
+                let detail = reason
+                    .as_deref()
+                    .map(|r| format!(": {}", r.replace('\n', " ").replace('"', "'")))
+                    .unwrap_or_default();
+                writeln!(
+                    self.out,
+                    "    Note over WF: Redriven (dlq: {dead_letter_id}){detail}"
+                )?;
             }
             _ => unreachable!(),
         }

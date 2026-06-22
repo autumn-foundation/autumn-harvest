@@ -143,6 +143,11 @@ pub const METRIC_QUEUE_OLDEST_PENDING_AGE: &str = "harvest.queue.oldest_pending_
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
+/// Counter: incremented once per dead-letter entry processed by an operator
+/// redrive (issue #510). Labelled `{queue, outcome}` where `outcome` is one of
+/// `redriven` / `skipped` / `failed`.
+pub const METRIC_DLQ_REDRIVEN: &str = "harvest.dlq.redriven";
+
 /// Counter: incremented each time a scheduled run is dispatched.
 pub const METRIC_SCHEDULE_RUNS: &str = "harvest.schedule.runs";
 
@@ -1052,6 +1057,15 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.task.quarantined{queue, reason}`.
     fn record_task_quarantined(&self, queue: &str, reason: &str) {
         let _ = (queue, reason);
+    }
+
+    /// An operator redrive processed one dead-letter entry (issue #510).
+    ///
+    /// Maps to the counter `harvest.dlq.redriven{queue, outcome}` where
+    /// `outcome` is `redriven` / `skipped` / `failed`. Per the ADR-0001
+    /// cardinality rule, `execution.id` is never a metric label.
+    fn record_dlq_redriven(&self, queue: &str, outcome: &str) {
+        let _ = (queue, outcome);
     }
 
     /// A workflow execution was paused by an operator or the auto-resume

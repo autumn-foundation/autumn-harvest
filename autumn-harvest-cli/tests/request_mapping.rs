@@ -773,6 +773,79 @@ fn dlq_bulk_discard_maps_to_management_route() {
 }
 
 #[test]
+fn dlq_redrive_maps_to_management_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "redrive",
+        "--error-contains",
+        "connection refused",
+        "--dry-run",
+    ])
+    .expect("redrive args should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/dlq/redrive");
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "error_contains": "connection refused",
+            "dry_run": true
+        }))
+    );
+}
+
+#[test]
+fn dlq_redrive_with_all_filters_maps_correctly() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "dlq",
+        "redrive",
+        "--queue",
+        "email-workers",
+        "--workflow-name",
+        "onboarding",
+        "--dead-lettered-after",
+        "2026-04-27T12:30:00Z",
+        "--dead-lettered-before",
+        "2026-04-27T14:30:00Z",
+        "--error-contains",
+        "timeout",
+        "--dead-letter-id",
+        "11111111-1111-1111-1111-111111111111,22222222-2222-2222-2222-222222222222",
+        "--max",
+        "250",
+        "--reason",
+        "downstream fixed",
+    ])
+    .expect("redrive with all filters should parse");
+
+    let request = cli.api_request().expect("request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/dlq/redrive");
+    let body = request.body.expect("should have body");
+    assert_eq!(body["queue"], "email-workers");
+    assert_eq!(body["workflow_name"], "onboarding");
+    assert_eq!(body["dead_lettered_after"], "2026-04-27T12:30:00Z");
+    assert_eq!(body["dead_lettered_before"], "2026-04-27T14:30:00Z");
+    assert_eq!(body["error_contains"], "timeout");
+    assert_eq!(
+        body["dead_letter_ids"],
+        json!([
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222"
+        ])
+    );
+    assert_eq!(body["max"], 250);
+    assert_eq!(body["reason"], "downstream fixed");
+    // dry_run omitted → not present
+    assert!(body.get("dry_run").is_none());
+}
+
+#[test]
 fn dlq_bulk_replay_with_all_filters_maps_correctly() {
     let cli = Cli::try_parse_from([
         "harvest",

@@ -5453,6 +5453,11 @@ async fn move_workflow_to_dlq_for_history_cap(
                     update_workflow_execution_failed(conn, exec_id, worker_id, &reason, None)
                         .await?;
                     queue::fail_task(conn, task.id, &reason).await?;
+                    // Drain any remaining sibling PENDING/RUNNING task rows so
+                    // they are not claimed after a future redrive reactivates the
+                    // execution to RUNNING. Mirrors the poison-pill quarantine and
+                    // workflow-task-timeout seal paths.
+                    queue::fail_open_tasks_for_execution(conn, exec_id, &reason).await?;
                     let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
                     let failed_triggers =
                         crate::completion_trigger::evaluate_triggers_for_execution(

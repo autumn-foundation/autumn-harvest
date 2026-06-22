@@ -99,6 +99,111 @@ pub struct BulkDlqResult {
     pub failures: Vec<BulkDlqFailure>,
 }
 
+// ---------------------------------------------------------------------------
+// Redrive (issue #510)
+// ---------------------------------------------------------------------------
+
+/// Filter for the operator redrive endpoint (`POST /dlq/redrive`, issue #510).
+///
+/// Selects dead-letter rows to re-enqueue with a fresh retry budget. At least
+/// one substantive criterion must be set — a filter with only `max`/`dry_run`
+/// is rejected with 400 at the API layer. The time bounds map onto the
+/// `failed_at` column (`dead_lettered_after` → `>=`, `dead_lettered_before`
+/// → `<`).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct RedriveFilter {
+    /// Exact match on `queue_name`.
+    pub queue: Option<String>,
+    /// Exact match on the workflow name of the owning execution.
+    pub workflow_name: Option<String>,
+    /// Inclusive lower bound on `failed_at`.
+    pub dead_lettered_after: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on `failed_at`.
+    pub dead_lettered_before: Option<DateTime<Utc>>,
+    /// Case-insensitive substring match on the `error` column.
+    pub error_contains: Option<String>,
+    /// Explicit set of dead-letter row IDs to target.
+    pub dead_letter_ids: Option<Vec<Uuid>>,
+    /// Cap on rows redriven per call. Defaults to 100, hard-capped at 1000.
+    pub max: Option<u32>,
+    /// When `true`, return matching rows and count without writing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl RedriveFilter {
+    /// Returns `true` if no substantive filter criterion is specified.
+    ///
+    /// `max` and `dry_run` alone do not count as criteria.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_none()
+            && self.workflow_name.is_none()
+            && self.dead_lettered_after.is_none()
+            && self.dead_lettered_before.is_none()
+            && self.error_contains.is_none()
+            && self.dead_letter_ids.as_ref().is_none_or(Vec::is_empty)
+    }
+
+    /// Effective row cap: the provided `max` clamped to `[1, MAX_BULK_LIMIT]`,
+    /// defaulting to `DEFAULT_BULK_LIMIT`. Zero is treated as 1 so callers never
+    /// get a silent no-op from `LIMIT 0`.
+    #[must_use]
+    pub fn effective_max(&self) -> i64 {
+        i64::from(
+            self.max
+                .unwrap_or(DEFAULT_BULK_LIMIT)
+                .clamp(1, MAX_BULK_LIMIT),
+        )
+    }
+}
+
+/// Structured result of a redrive operation (issue #510).
+///
+/// `matched` vs `redriven` makes silent truncation impossible: when the filter
+/// matches more rows than `max`, the operator sees there is more to do.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RedriveResult {
+    /// Total rows matching the filter across the shard, before the `max` clip.
+    pub matched: usize,
+    /// Rows re-enqueued with a fresh retry budget.
+    pub redriven: usize,
+    /// Rows that matched but were a no-op (already redriven / execution already
+    /// progressed). Reported, never a duplicate enqueue.
+    pub skipped: usize,
+    /// Rows rejected with a clear error (e.g. owning execution is COMPLETED).
+    pub failed: usize,
+    /// IDs of rows actually redriven (in dry-run, the bounded sample that would
+    /// be redriven).
+    pub ids: Vec<String>,
+    /// Whether this was a dry-run (no writes performed).
+    pub dry_run: bool,
+    /// Per-row rejections that did not roll back other rows.
+    pub failures: Vec<BulkDlqFailure>,
+}
+
+/// Outcome of redriving a single dead-letter entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedriveOutcome {
+    /// The entry was re-enqueued; carries the new task-queue row id.
+    Redriven(Uuid),
+    /// The entry was a no-op (missing row, or owning execution already running).
+    Skipped,
+}
+
+/// Escape `%` and `_` so an operator-supplied substring is matched literally by
+/// a SQL `ILIKE` pattern.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Typed dead-letter reason for engine-authored DLQ entries.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -596,6 +701,290 @@ pub async fn bulk_discard_dead_letters(
         acted_on,
         skipped,
         ids: acted_ids,
+        dry_run: false,
+        failures,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Redrive operations (issue #510)
+// ---------------------------------------------------------------------------
+
+/// Apply the redrive filter dimensions to a boxed `harvest_dead_letters` query.
+///
+/// Shared by [`count_redrive_filter_matches`] and
+/// [`query_dead_letters_for_redrive`] so the count and the acted-on set always
+/// see identical predicates.
+fn apply_redrive_filter<'a>(
+    mut query: crate::schema::harvest_dead_letters::BoxedQuery<'a, diesel::pg::Pg>,
+    filter: &RedriveFilter,
+) -> crate::schema::harvest_dead_letters::BoxedQuery<'a, diesel::pg::Pg> {
+    use crate::schema::harvest_dead_letters::dsl;
+    use diesel::PgTextExpressionMethods;
+
+    if let Some(ref queue) = filter.queue {
+        query = query.filter(dsl::queue_name.eq(queue.clone()));
+    }
+    if let Some(ref wf_name) = filter.workflow_name {
+        use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+        use diesel::NullableExpressionMethods;
+        query = query.filter(
+            dsl::workflow_exec_id.eq_any(
+                exec_dsl::harvest_workflow_executions
+                    .filter(exec_dsl::workflow_name.eq(wf_name.clone()))
+                    .select(exec_dsl::id.nullable()),
+            ),
+        );
+    }
+    if let Some(after) = filter.dead_lettered_after {
+        query = query.filter(dsl::failed_at.ge(after));
+    }
+    if let Some(before) = filter.dead_lettered_before {
+        query = query.filter(dsl::failed_at.lt(before));
+    }
+    if let Some(ref needle) = filter.error_contains {
+        query = query.filter(dsl::error.ilike(format!("%{}%", escape_like(needle))));
+    }
+    if let Some(ref ids) = filter.dead_letter_ids {
+        query = query.filter(dsl::id.eq_any(ids.clone()));
+    }
+    query
+}
+
+/// Count dead-letter rows matching `filter` without applying a row cap.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on query failure.
+pub async fn count_redrive_filter_matches(
+    conn: &mut AsyncPgConnection,
+    filter: &RedriveFilter,
+) -> HarvestResult<i64> {
+    use crate::schema::harvest_dead_letters::dsl;
+
+    apply_redrive_filter(dsl::harvest_dead_letters.into_boxed(), filter)
+        .count()
+        .get_result(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Query dead-letter rows matching `filter`, oldest-first, up to
+/// `filter.effective_max()` rows.
+async fn query_dead_letters_for_redrive(
+    conn: &mut AsyncPgConnection,
+    filter: &RedriveFilter,
+) -> HarvestResult<Vec<DeadLetter>> {
+    use crate::schema::harvest_dead_letters::dsl;
+
+    let query = dsl::harvest_dead_letters
+        .into_boxed()
+        .order(dsl::failed_at.asc())
+        .limit(filter.effective_max());
+
+    apply_redrive_filter(query, filter)
+        .select(DeadLetter::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
+/// Redrive a single dead-letter entry (issue #510).
+///
+/// Re-enqueues the dead-lettered task onto its original queue with a fresh
+/// retry budget. Unlike [`replay_dead_letter`], a redrive **reactivates** an
+/// owning execution that was sealed `FAILED` at quarantine time (`FAILED →
+/// RUNNING`, appending a [`WorkflowEvent::WorkflowRedriven`] event so replay
+/// resumes from existing history append-only). The whole operation is one
+/// transaction.
+///
+/// Outcomes:
+/// - Missing DLQ row → `Ok(Skipped)` (idempotent: a second redrive of the same
+///   id is a no-op, since the row is deleted on the first redrive).
+/// - Owning execution `RUNNING` → `Ok(Skipped)` and the row is deleted (the
+///   live execution already owns the work; re-enqueuing would double-dispatch).
+/// - Owning execution `FAILED` → reactivate + re-enqueue → `Ok(Redriven(task))`.
+/// - Owning execution any other terminal state (`COMPLETED`/`CANCELLED`/…) →
+///   `Err` with a clear message; the row is left in place for the operator.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when the owning execution is in a
+/// non-`FAILED` terminal state, or [`HarvestError::Database`] on query failure.
+pub async fn redrive_dead_letter(
+    conn: &mut AsyncPgConnection,
+    dead_letter_id: Uuid,
+    registry: Option<&HandlerRegistry>,
+    reason: Option<&str>,
+) -> HarvestResult<RedriveOutcome> {
+    use crate::schema::harvest_dead_letters::dsl;
+
+    conn.transaction::<RedriveOutcome, HarvestError, _>(|conn| {
+        async move {
+            let Some(entry) = dsl::harvest_dead_letters
+                .find(dead_letter_id)
+                .select(DeadLetter::as_select())
+                .for_update()
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?
+            else {
+                // Already redriven (or discarded): idempotent no-op.
+                return Ok(RedriveOutcome::Skipped);
+            };
+
+            let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
+
+            let mut params =
+                EnqueueParams::new(entry.queue_name.clone(), task_type, entry.input.clone());
+            params.workflow_exec_id = entry.workflow_exec_id;
+            params.activity_name = entry.activity_name.clone();
+            params.max_attempts = entry.attempts.max(1);
+
+            if let Some(exec_uuid) = entry.workflow_exec_id {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                let row: Option<(Option<String>, String, String)> =
+                    exec_dsl::harvest_workflow_executions
+                        .find(exec_uuid)
+                        .select((
+                            exec_dsl::assigned_build_id,
+                            exec_dsl::workflow_name,
+                            exec_dsl::state,
+                        ))
+                        .for_update()
+                        .first(conn)
+                        .await
+                        .optional()
+                        .map_err(crate::error::database_error)?;
+
+                let (build_id, workflow_name, state) = row.ok_or_else(|| {
+                    HarvestError::NotFound(format!("workflow execution {exec_uuid}"))
+                })?;
+
+                match state.as_str() {
+                    // Live execution already owns the work — converge state by
+                    // deleting the stale DLQ row and report a skip rather than
+                    // double-dispatching a second task.
+                    "RUNNING" | "PAUSED" => {
+                        diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
+                            .execute(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
+                        return Ok(RedriveOutcome::Skipped);
+                    }
+                    // The load-bearing differentiator (AC #7): reopen a run
+                    // sealed FAILED at quarantine time so it can resume.
+                    "FAILED" => {
+                        let exec_id = crate::types::ExecutionId::from_uuid(exec_uuid);
+                        crate::execution::reactivate_failed_execution(
+                            conn,
+                            exec_id,
+                            dead_letter_id,
+                            reason,
+                        )
+                        .await?;
+                    }
+                    // Non-FAILED terminal states are not resurrectable.
+                    other => {
+                        return Err(HarvestError::Config(format!(
+                            "cannot redrive dead-letter {dead_letter_id}: owning execution \
+                             {exec_uuid} is {other} (terminal, not resurrectable)"
+                        )));
+                    }
+                }
+
+                params.required_build_id = build_id;
+                if task_type == TaskType::Workflow
+                    && let Some(reg) = registry
+                    && let Some(info) = reg.workflows.get(&workflow_name)
+                    && let Some(policy) = &info.concurrency
+                {
+                    params.concurrency_key =
+                        crate::concurrency::resolve_concurrency_key(policy.key_expr, &params.input);
+                    params.max_concurrent = Some(policy.limit);
+                }
+            }
+
+            let task_id = crate::queue::enqueue(conn, &params).await?;
+            diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
+            Ok(RedriveOutcome::Redriven(task_id))
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Redrive all dead-letter entries matching `filter` (issue #510).
+///
+/// Each row is redriven independently through [`redrive_dead_letter`] so a
+/// per-row rejection never rolls back already-redriven rows. When
+/// `filter.dry_run` is `true`, no writes are performed and `ids` carries the
+/// bounded sample that would be redriven. One `harvest.dlq.redriven{queue,
+/// outcome}` counter increment is emitted per non-dry-run row.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the initial filter query fails.
+/// Per-row rejections are captured in [`RedriveResult::failures`].
+pub async fn redrive_dead_letters(
+    conn: &mut AsyncPgConnection,
+    filter: &RedriveFilter,
+    registry: Option<&HandlerRegistry>,
+    reason: Option<&str>,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+) -> HarvestResult<RedriveResult> {
+    let matched = usize::try_from(count_redrive_filter_matches(conn, filter).await?).unwrap_or(0);
+    let rows = query_dead_letters_for_redrive(conn, filter).await?;
+
+    if filter.dry_run {
+        return Ok(RedriveResult {
+            matched,
+            redriven: 0,
+            skipped: 0,
+            failed: 0,
+            ids: rows.iter().map(|r| r.id.to_string()).collect(),
+            dry_run: true,
+            failures: Vec::new(),
+        });
+    }
+
+    let mut redriven = 0usize;
+    let mut skipped = 0usize;
+    let mut ids: Vec<String> = Vec::with_capacity(rows.len());
+    let mut failures: Vec<BulkDlqFailure> = Vec::new();
+
+    for row in &rows {
+        match redrive_dead_letter(conn, row.id, registry, reason).await {
+            Ok(RedriveOutcome::Redriven(_task_id)) => {
+                redriven += 1;
+                ids.push(row.id.to_string());
+                metrics.record_dlq_redriven(&row.queue_name, "redriven");
+            }
+            Ok(RedriveOutcome::Skipped) => {
+                skipped += 1;
+                metrics.record_dlq_redriven(&row.queue_name, "skipped");
+            }
+            Err(e) => {
+                failures.push(BulkDlqFailure {
+                    id: row.id.to_string(),
+                    reason: e.to_string(),
+                });
+                metrics.record_dlq_redriven(&row.queue_name, "failed");
+            }
+        }
+    }
+
+    Ok(RedriveResult {
+        matched,
+        redriven,
+        skipped,
+        failed: failures.len(),
+        ids,
         dry_run: false,
         failures,
     })
@@ -1316,6 +1705,112 @@ async fn load_workflow_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Redrive filter unit tests (issue #510) ───────────────────────────────
+
+    #[test]
+    fn redrive_filter_is_empty_only_when_no_substantive_criterion() {
+        assert!(RedriveFilter::default().is_empty());
+        // max / dry_run alone do not count.
+        assert!(
+            RedriveFilter {
+                max: Some(10),
+                dry_run: true,
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        // Each substantive field alone is non-empty.
+        assert!(
+            !RedriveFilter {
+                queue: Some("q".into()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !RedriveFilter {
+                workflow_name: Some("wf".into()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !RedriveFilter {
+                error_contains: Some("timeout".into()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !RedriveFilter {
+                dead_lettered_after: Some(Utc::now()),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !RedriveFilter {
+                dead_letter_ids: Some(vec![Uuid::new_v4()]),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        // An empty id vector is not a substantive criterion.
+        assert!(
+            RedriveFilter {
+                dead_letter_ids: Some(vec![]),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn redrive_filter_effective_max_clamps() {
+        assert_eq!(RedriveFilter::default().effective_max(), 100);
+        assert_eq!(
+            RedriveFilter {
+                max: Some(0),
+                ..Default::default()
+            }
+            .effective_max(),
+            1,
+            "zero must clamp to 1, never a silent LIMIT 0"
+        );
+        assert_eq!(
+            RedriveFilter {
+                max: Some(50_000),
+                ..Default::default()
+            }
+            .effective_max(),
+            i64::from(MAX_BULK_LIMIT)
+        );
+        assert_eq!(
+            RedriveFilter {
+                max: Some(250),
+                ..Default::default()
+            }
+            .effective_max(),
+            250
+        );
+    }
+
+    #[test]
+    fn escape_like_escapes_wildcards() {
+        assert_eq!(escape_like("plain"), "plain");
+        assert_eq!(escape_like("50%"), "50\\%");
+        assert_eq!(escape_like("a_b"), "a\\_b");
+        assert_eq!(escape_like("path\\x"), "path\\\\x");
+        assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
+    }
+
+    #[test]
+    fn redrive_outcome_is_copy_eq() {
+        let id = Uuid::new_v4();
+        assert_eq!(RedriveOutcome::Redriven(id), RedriveOutcome::Redriven(id));
+        assert_ne!(RedriveOutcome::Redriven(id), RedriveOutcome::Skipped);
+    }
 
     #[test]
     fn dead_letter_entry_builds() {

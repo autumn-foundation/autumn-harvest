@@ -36,15 +36,16 @@ use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
     OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_CIRCUIT_FORCE_CLOSE,
     OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK,
-    OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL,
-    OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE,
-    OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER,
-    OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
-    OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL,
-    OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
-    OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_BATCH,
-    TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY,
-    TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE,
+    OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW,
+    OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
+    OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET,
+    OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
+    OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED,
+    STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG,
+    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE,
+    TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -2485,6 +2486,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/dead-letters/{id}/replay",
             post(replay_dead_letter).route_layer(require_admin.clone()),
         )
+        .route(
+            "/dlq/redrive",
+            post(redrive_dead_letters_handler).route_layer(require_admin.clone()),
+        )
         .route("/health", get(health))
         .route("/admin/preflight", get(preflight))
         .route("/admin/shards/health", get(shards_health))
@@ -2748,6 +2753,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/dead-letters/replay"),
         ("POST", "/dead-letters/discard"),
         ("POST", "/dead-letters/{id}/replay"),
+        ("POST", "/dlq/redrive"),
         // ── external activity handoff (issue #92) ────────────────────────────
         ("POST", "/activities/external/{token}/complete"),
         ("POST", "/activities/external/{token}/fail"),
@@ -2955,6 +2961,21 @@ pub const fn management_api_request_fields()
             ]),
         ),
         ("POST", "/dead-letters/{id}/replay", Some(&[])),
+        (
+            "POST",
+            "/dlq/redrive",
+            Some(&[
+                "queue",
+                "workflow_name",
+                "dead_lettered_after",
+                "dead_lettered_before",
+                "error_contains",
+                "dead_letter_ids",
+                "max",
+                "dry_run",
+                "reason",
+            ]),
+        ),
         // ── external activity handoff ─────────────────────────────────────────
         (
             "POST",
@@ -3325,6 +3346,13 @@ pub const fn management_api_response_fields()
             "POST",
             "/dead-letters/{id}/replay",
             Some(&["ok", "dead_letter_id", "task_id"]),
+        ),
+        (
+            "POST",
+            "/dlq/redrive",
+            Some(&[
+                "matched", "redriven", "skipped", "failed", "ids", "dry_run", "failures",
+            ]),
         ),
         // ── external activity handoff ─────────────────────────────────────────
         (
@@ -13647,6 +13675,58 @@ impl BulkDlqApiBody {
     }
 }
 
+/// Parsed `POST /dlq/redrive` request (issue #510): the core filter plus the
+/// API-only shard target and reason (which are not part of the shard-local
+/// `RedriveFilter`).
+struct RedriveRequest {
+    filter: dlq::RedriveFilter,
+    shard_id: Option<i32>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RedriveApiBody {
+    #[serde(default)]
+    queue: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    #[serde(default)]
+    dead_lettered_after: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    dead_lettered_before: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    error_contains: Option<String>,
+    #[serde(default)]
+    dead_letter_ids: Option<Vec<uuid::Uuid>>,
+    #[serde(default)]
+    max: Option<u32>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    shard_id: Option<i32>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+impl RedriveApiBody {
+    fn into_request(self) -> RedriveRequest {
+        RedriveRequest {
+            filter: dlq::RedriveFilter {
+                queue: self.queue,
+                workflow_name: self.workflow_name,
+                dead_lettered_after: self.dead_lettered_after,
+                dead_lettered_before: self.dead_lettered_before,
+                error_contains: self.error_contains,
+                dead_letter_ids: self.dead_letter_ids,
+                max: self.max,
+                dry_run: self.dry_run,
+            },
+            shard_id: self.shard_id,
+            reason: self.reason,
+        }
+    }
+}
+
 fn parse_bulk_dlq_request(
     headers: &axum::http::HeaderMap,
     body: &[u8],
@@ -14202,6 +14282,164 @@ async fn bulk_replay_from_shards(
         total.matched += shard_result.matched;
         total.acted_on += shard_result.acted_on;
         total.skipped += shard_result.skipped;
+        total.ids.extend(shard_result.ids);
+        total.failures.extend(shard_result.failures);
+    }
+
+    Ok(total)
+}
+
+/// `POST /dlq/redrive` (issue #510): re-enqueue dead-lettered work matching a
+/// filter, reactivating `FAILED` owning executions. Idempotent and shard-aware.
+async fn redrive_dead_letters_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let request = match serde_json::from_slice::<RedriveApiBody>(&body) {
+        Ok(body) => body.into_request(),
+        Err(e) => {
+            return AutumnError::bad_request_msg(format!("invalid JSON body: {e}")).into_response();
+        }
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /dlq/redrive";
+
+    if request.filter.is_empty() {
+        dlq_bulk_audit_reject_empty_filter(
+            &api_state,
+            &actor,
+            &source,
+            request_id.as_deref(),
+            OP_DLQ_REDRIVE,
+            route,
+        )
+        .await;
+        return AutumnError::bad_request_msg(
+            "redrive filter must set at least one of queue / workflow_name / \
+             dead_lettered_after / dead_lettered_before / error_contains / dead_letter_ids",
+        )
+        .into_response();
+    }
+
+    // Dry-run previews are read-only: no audit record needed.
+    if request.filter.dry_run {
+        return match redrive_from_shards(&api_state, &request).await {
+            Ok(result) => (axum::http::StatusCode::OK, Json(result)).into_response(),
+            Err(e) => map_error(e).into_response(),
+        };
+    }
+
+    let redrive_result = redrive_from_shards(&api_state, &request).await;
+    let audit_ctx = DlqBulkAuditContext {
+        actor: &actor,
+        source: &source,
+        request_id: request_id.as_deref(),
+        operation: OP_DLQ_REDRIVE,
+        route,
+        target_id: None,
+        shard_id: request.shard_id,
+    };
+
+    match redrive_result {
+        Ok(result) => {
+            let status = if result.redriven == 0 && !result.failures.is_empty() {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                axum::http::StatusCode::OK
+            };
+            let (audit_status, audit_error) = if result.failures.is_empty() {
+                (STATUS_SUCCEEDED, None)
+            } else {
+                (
+                    STATUS_FAILED,
+                    Some(format!("{} failures", result.failures.len())),
+                )
+            };
+            if let Err(error) =
+                insert_dlq_bulk_audit(&api_state, &audit_ctx, audit_status, audit_error.as_deref())
+                    .await
+            {
+                return error.into_response();
+            }
+            (status, Json(result)).into_response()
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            let _ = insert_dlq_bulk_audit(
+                &api_state,
+                &audit_ctx,
+                STATUS_FAILED,
+                Some(err_str.as_str()),
+            )
+            .await;
+            map_error(e).into_response()
+        }
+    }
+}
+
+async fn redrive_from_shards(
+    api_state: &HarvestApiState,
+    request: &RedriveRequest,
+) -> Result<dlq::RedriveResult, HarvestError> {
+    let pool = api_state.storage_pool()?;
+    let runtime = api_state.runtime().ok();
+    let registry = runtime.as_ref().map(|r| r.registry().as_ref());
+    let metrics: Arc<dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync> =
+        runtime.as_ref().map_or_else(
+            || Arc::new(autumn_harvest::telemetry::NoOpMetrics) as _,
+            |rt| Arc::clone(&rt.registry.telemetry().metrics),
+        );
+    let reason = request.reason.as_deref();
+
+    let mut total = dlq::RedriveResult {
+        matched: 0,
+        redriven: 0,
+        skipped: 0,
+        failed: 0,
+        ids: Vec::new(),
+        dry_run: request.filter.dry_run,
+        failures: Vec::new(),
+    };
+
+    // Enforce `max` as a global cap across all shards, not per-shard.
+    let mut remaining: u32 =
+        u32::try_from(request.filter.effective_max()).unwrap_or(dlq::DEFAULT_BULK_LIMIT);
+
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        if request
+            .shard_id
+            .is_some_and(|wanted| wanted != shard_id.as_i32())
+        {
+            continue;
+        }
+        let mut conn = shard_pool
+            .get()
+            .await
+            .map_err(|e| HarvestError::Database(e.to_string()))?;
+
+        if remaining == 0 {
+            // Budget exhausted: count-only so `matched` reflects all shards.
+            let shard_matched = dlq::count_redrive_filter_matches(&mut conn, &request.filter)
+                .await
+                .map(|n| usize::try_from(n).unwrap_or(0))?;
+            total.matched += shard_matched;
+            continue;
+        }
+
+        let mut shard_filter = request.filter.clone();
+        shard_filter.max = Some(remaining);
+        let shard_result =
+            dlq::redrive_dead_letters(&mut conn, &shard_filter, registry, reason, metrics.as_ref())
+                .await?;
+        let consumed = shard_result.redriven + shard_result.skipped + shard_result.failed;
+        remaining = remaining.saturating_sub(u32::try_from(consumed).unwrap_or(remaining));
+        total.matched += shard_result.matched;
+        total.redriven += shard_result.redriven;
+        total.skipped += shard_result.skipped;
+        total.failed += shard_result.failed;
         total.ids.extend(shard_result.ids);
         total.failures.extend(shard_result.failures);
     }
