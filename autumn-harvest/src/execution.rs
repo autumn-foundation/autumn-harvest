@@ -1471,12 +1471,21 @@ pub async fn reactivate_failed_execution(
         )));
     }
 
+    // Re-anchor the hard deadline and soft SLA deadline from now so the timeout
+    // and SLA scanners see a fresh window rather than the stale past deadlines
+    // that were set when the execution first started. Without this, a FAILED
+    // execution with a non-NULL `deadline_at` in the past would be immediately
+    // re-killed by `enforce_workflow_execution_timeouts` on the next scan tick.
+    let now = Utc::now();
+    let new_deadline_at = execution.execution_timeout.map(|d| now + d);
+    let new_sla_deadline_at = execution.sla.map(|d| now + d);
+
     let history = store::load_history(conn, exec_id).await?;
     store::append_events(
         conn,
         exec_id,
         &[WorkflowEvent::WorkflowRedriven {
-            redriven_at: Utc::now(),
+            redriven_at: now,
             dead_letter_id,
             reason: reason.map(str::to_string),
         }],
@@ -1491,6 +1500,13 @@ pub async fn reactivate_failed_execution(
             harvest_workflow_executions::error.eq(None::<String>),
             harvest_workflow_executions::output.eq(None::<serde_json::Value>),
             harvest_workflow_executions::completed_at.eq(None::<chrono::DateTime<Utc>>),
+            harvest_workflow_executions::paused_at.eq(None::<chrono::DateTime<Utc>>),
+            harvest_workflow_executions::pause_reason.eq(None::<String>),
+            harvest_workflow_executions::pause_actor.eq(None::<String>),
+            harvest_workflow_executions::deadline_at.eq(new_deadline_at),
+            harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
+            harvest_workflow_executions::sla_breached.eq(false),
+            harvest_workflow_executions::sla_breached_at.eq(None::<chrono::DateTime<Utc>>),
         ))
         .execute(conn)
         .await
