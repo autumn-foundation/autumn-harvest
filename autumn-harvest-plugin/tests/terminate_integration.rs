@@ -183,6 +183,10 @@ fn build_pool(url: &str) -> DbPool {
 
 fn build_app(pool: &DbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    // The admin-gated `POST /workflows/{id}/terminate` route is guarded by
+    // `require_harvest_admin`, which checks session state (not the request
+    // header). Open the boundary so the integration suite can reach the handler.
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),

@@ -1752,6 +1752,29 @@ pub async fn terminate_workflow_execution(
                     )
                     .await?;
 
+                    let completed_at = Utc::now();
+                    // Mirror cancel/resume: if this execution was PAUSED, push
+                    // sla_deadline_at forward by the pause span so the SLA scanner
+                    // does not record a false breach for time spent paused before
+                    // terminate (issue #383 × #487). The scanner judges terminal rows
+                    // by `sla_deadline_at < COALESCE(completed_at, NOW())`, so leaving
+                    // a stale deadline that elapsed during the pause would count a
+                    // suspended-clock run as breached. Only extend a deadline that was
+                    // still ahead when the pause began — a deadline already elapsed
+                    // while RUNNING stays in the past so its breach is still observed.
+                    let new_sla_deadline_at = if execution.state == "PAUSED" {
+                        execution
+                            .sla_deadline_at
+                            .map(|d| match execution.paused_at {
+                                Some(p) if d > p => {
+                                    d + (completed_at - p).max(chrono::Duration::zero())
+                                }
+                                _ => d,
+                            })
+                    } else {
+                        execution.sla_deadline_at
+                    };
+
                     // No state-precondition filter: operator override force-writes
                     // the live run to the sealed TERMINATED state.
                     diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
@@ -1759,7 +1782,8 @@ pub async fn terminate_workflow_execution(
                             harvest_workflow_executions::state.eq("TERMINATED"),
                             harvest_workflow_executions::output.eq(None::<serde_json::Value>),
                             harvest_workflow_executions::error.eq(Some(reason.clone())),
-                            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+                            harvest_workflow_executions::completed_at.eq(Some(completed_at)),
+                            harvest_workflow_executions::sla_deadline_at.eq(new_sla_deadline_at),
                             // Clear active-pause metadata when terminating a paused
                             // run so it doesn't appear terminal-and-paused (#383).
                             harvest_workflow_executions::paused_at
