@@ -214,6 +214,31 @@ fn workflow_list_filters_map_to_query_string() {
 }
 
 #[test]
+fn workflow_list_search_attr_filter_maps_to_query_string() {
+    // Issue #506: typed comparison/set predicates forwarded verbatim to the
+    // `search_attr_filter` API param. The CLI does not transform the value.
+    let list = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "list",
+        "--search-attr-filter",
+        "amount:gt:10000",
+        "--search-attr-filter",
+        "phase:in:blocked,awaiting_approval",
+    ])
+    .expect("predicate list args should parse");
+    let request = list.api_request().expect("list request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/workflows?search_attr_filter=amount:gt:10000\
+         &search_attr_filter=phase:in:blocked,awaiting_approval"
+    );
+    assert_eq!(request.body, None);
+}
+
+#[test]
 fn workflow_list_supports_repeated_and_comma_states() {
     let list = Cli::try_parse_from([
         "harvest",

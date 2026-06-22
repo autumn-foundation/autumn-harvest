@@ -50,7 +50,14 @@
           "in": "query",
           "required": false,
           "repeated": true,
-          "description": "Search attribute filter in key:value form. May be repeated."
+          "description": "Search attribute filter in key:value form (exact-match string equality). May be repeated."
+        },
+        {
+          "name": "search_attr_filter",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Typed comparison/set predicate over search attributes in key:op:value form, op in {eq, ne, gt, gte, lt, lte, in, exists} (issue #506). Repeatable; ANDed. Numeric values compare numerically, booleans as booleans, else strings. Comparison ops require a numeric value. Malformed predicates and nested .-paths return 400. Backed by the existing idx_harvest_we_search GIN index (no migration)."
         },
         {
           "name": "limit",

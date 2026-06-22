@@ -190,7 +190,8 @@ The command exits cleanly when the server sends `event: stream-end`.
 | `workflow_id` | string | Filter by logical workflow ID |
 | `state` | string | Filter by execution state (e.g. `RUNNING`, `COMPLETED`) |
 | `limit` | integer | Maximum rows to return (default 200, max 200) |
-| `search_attr` | repeated | `key:value` pairs against `search_attrs` JSONB |
+| `search_attr` | repeated | `key:value` pairs against `search_attrs` JSONB (exact-match equality; value is always a string) |
+| `search_attr_filter` | repeated | Typed comparison/set predicate `key:op:value` against `search_attrs` JSONB. See [Typed search-attribute predicates](#typed-search-attribute-predicates-getworkflows). |
 | `no_progress_minutes` | integer | Return stalled workflows with no task activity for N minutes |
 | `sla_breached` | bool | Filter to executions that have breached their SLA |
 | `page_size` | integer | Per-page limit for keyset pagination (1–200; overrides `limit`). Presence activates the opt-in paginated envelope. |
@@ -259,6 +260,84 @@ curl "/workflows?state=RUNNING&page_size=50&cursor=abc123"
 - The `no_progress_minutes` (stalled-workflow) filter always returns a bare array regardless of pagination parameters.
 - `page_size` and `limit` are aliases; if both are present `page_size` wins.
 - On a sharded deployment each shard is queried independently with the same cursor and `page_size+1` limit; the results are k-way merged and truncated to `page_size` before the response is returned. See `docs/sharding.md` for the cross-shard keyset contract.
+
+### Typed search-attribute predicates (`GET /workflows`)
+
+> Issue #506. The `search_attr_filter` param adds typed comparison/set filtering
+> over search attributes. The legacy `search_attr=key:value` param is unchanged
+> (exact-match string equality) and stays fully backward compatible.
+
+Each `search_attr_filter` value has the form `key:op:value`. The param is
+repeatable; multiple predicates are combined with **AND** (matching the repeated
+`search_attr` semantics). Disjunction (OR) is out of scope in this slice.
+
+| `op` | Value | Meaning |
+|------|-------|---------|
+| `eq` | scalar | typed equality — `amount:eq:100` matches numeric `100`, not the string `"100"` |
+| `ne` | scalar | key present **and** typed value differs |
+| `gt` `gte` `lt` `lte` | number | numeric comparison; the value must parse as a number |
+| `in` | comma list | membership in a typed set, e.g. `phase:in:blocked,awaiting_approval` |
+| `exists` | *(none)* | key is present with any value |
+
+**Typed coercion (documented, explicit).** The value's text drives the type:
+
+- A value that parses as a JSON number is compared **numerically**, so
+  `amount:gt:20` returns `amount=100` (numeric ordering), not a lexical
+  `"100" < "20"` false negative, and never a string-vs-number false positive.
+- The exact literals `true` / `false` compare as **booleans**.
+- Everything else compares as a **string**.
+
+For `eq` / `ne` / `in` the coerced value is matched against the stored JSONB
+value **by type** (so `phase:eq:blocked` only matches string-typed `"blocked"`,
+and `retry_count:eq:3` only matches number-typed `3`).
+
+**Comparison ops are numeric-only.** `gt` / `gte` / `lt` / `lte` require the
+value to parse as a number — a non-numeric value (e.g. `amount:gt:lots`) returns
+`400`. Numeric comparison matches only rows whose stored attribute is itself
+number-typed; a row whose attribute is stored as a string is **excluded** from a
+numeric comparison (it is a different type), never a false match.
+
+**Top-level keys only.** Filtering operates on top-level search-attribute keys
+(the shape #159 writes). A nested `.`-path (e.g. `a.b:eq:1`) is rejected `400`.
+
+**Error handling.** Malformed predicates — unknown op, missing value where
+required, non-numeric value for a comparison op, nested `.`-path, empty key,
+value supplied to `exists` — return `400` with a message naming the offending
+`search_attr_filter` input. Unknown query params remain ignored (non-breaking).
+
+**Index path.** Every predicate stays on an index path rather than a full
+per-row scan: `eq`/`in`/`exists` and the existence-narrowing leg of `ne` and the
+comparison ops all hit the existing `idx_harvest_we_search` GIN index
+(`USING GIN (search_attrs)`, `jsonb_ops`) via the `@>` (containment) and `?`
+(key-existence) operators; comparison ops then recheck the numeric cast on the
+narrowed candidate set. No new index or migration is required. See
+`docs/sharding.md` for the cross-shard pushdown contract.
+
+**Composition.** `search_attr_filter` composes with `state`, time-range,
+`cursor`, `page_size`, and `order` — every predicate is pushed down to each
+shard's `WHERE` clause and the matching rows are k-way merged exactly as the
+keyset pagination path, with no row duplicated or skipped under concurrent
+inserts.
+
+```bash
+# Numeric range + set, paginated, across shards:
+curl "/workflows?search_attr_filter=amount:gt:10000\
+&search_attr_filter=phase:in:blocked,awaiting_approval&page_size=50"
+
+# Retry cohort intersected with a business phase:
+curl "/workflows?search_attr_filter=retry_count:gte:3&search_attr_filter=phase:eq:blocked"
+
+# Presence check:
+curl "/workflows?search_attr_filter=phase:exists"
+
+# Rejected (400) — non-numeric value for a numeric op:
+curl "/workflows?search_attr_filter=amount:gt:lots"
+```
+
+The `harvest workflow list` CLI accepts the same syntax via the repeatable
+`--search-attr-filter key:op:value` flag (forwarded verbatim to this param). The
+embedded Vantage UI workflows list defers to the equality-only `search_attr`
+filter in this slice; a predicate-aware UI form is a follow-up.
 
 ## Workflow Stack (describe)
 

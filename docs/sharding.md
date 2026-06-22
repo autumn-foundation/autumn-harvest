@@ -141,3 +141,43 @@ CREATE INDEX IF NOT EXISTS idx_harvest_we_created_id
 ```
 
 This index must be present on every shard for deep-page performance to remain flat. The migration is idempotent (`IF NOT EXISTS`) and runs automatically with `diesel migration run`.
+
+## Cross-shard typed search-attribute predicates (`search_attr_filter`, issue #506)
+
+The `search_attr_filter=key:op:value` predicates (comparison/set filtering over
+`search_attrs`) are pushed down to **each shard's `WHERE` clause** and the
+matching rows are k-way merged exactly as the keyset pagination path above — the
+predicate is part of the shared per-shard query, so it composes with `state`,
+time-range, `cursor`, `page_size`, and `order` with no extra round-trips and no
+row duplicated or skipped under concurrent inserts.
+
+### Per-shard SQL and index strategy
+
+Every predicate stays on an index path rather than a full per-row scan by
+reusing the existing `idx_harvest_we_search` GIN index
+(`USING GIN (search_attrs)`, default `jsonb_ops`), which supports both `@>`
+(containment) and `?` (key existence):
+
+| `op` | Per-shard predicate | Index leg |
+|------|--------------------|-----------|
+| `eq` | `search_attrs @> '{"key": <typed>}'` | GIN `@>` |
+| `ne` | `search_attrs ? 'key' AND NOT (search_attrs @> '{"key": <typed>}')` | GIN `?` narrows |
+| `gt`/`gte`/`lt`/`lte` | `search_attrs ? 'key' AND jsonb_typeof(search_attrs -> 'key') = 'number' AND (search_attrs ->> 'key')::numeric <op> $val` | GIN `?` narrows, numeric recheck |
+| `in` | `search_attrs ? 'key' AND search_attrs -> 'key' = ANY($vals::jsonb[])` | GIN `?` narrows |
+| `exists` | `search_attrs ? 'key'` | GIN `?` |
+
+The key is always a **bound** parameter (never string-interpolated), so dynamic
+keys are injection-safe; the comparison operator literal comes from a fixed
+internal enum. Because the existing GIN index already covers `@>` and `?`,
+**no new index and no migration are required** — there is no column change to
+`harvest_workflow_executions`, no `harvest_events` change, and no new
+`WorkflowEvent` variant. This index must be present on every shard (it ships in
+the initial `20260409000000_harvest_initial` migration).
+
+### Typed coercion is shard-stable
+
+The value→type coercion (number / boolean / string) is a pure function of the
+predicate text, so every shard derives the identical typed comparison and the
+merged result is deterministic. Numeric comparison matches only number-typed
+stored values; a value stored as a string on one shard is excluded uniformly on
+all shards, never a partial false match.
