@@ -76,6 +76,8 @@ pub struct WorkerRuntimeConfig {
     pub worker_id: String,
     /// Queue names this worker polls.
     pub queues: Vec<String>,
+    /// Optional per-queue dispatch weights (issue #515). Empty = default unchanged behaviour.
+    pub queue_weights: std::collections::HashMap<String, u32>,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
     /// Maximum concurrent workflow task executions.
@@ -162,6 +164,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
         Self {
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: cfg.queues,
+            queue_weights: cfg.queue_weights,
             notification_database_url: cfg.notification_database_url,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
             max_concurrent_activities: cfg.max_concurrent_activities,
@@ -7618,6 +7621,74 @@ impl Worker {
         let circuit_breakers = self.registry.circuit_breakers();
         let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
 
+        // --- Weighted queue selection (issue #515) ---
+        //
+        // When the operator has configured per-queue weights we compute a
+        // weighted-random permutation of the bound queues and attempt a
+        // single-queue `claim_task` call for each queue in that order,
+        // dispatching the first task found.  This ensures dispatch share tracks
+        // configured weights under sustained saturation while guaranteeing
+        // forward progress for every non-zero-weight queue (no-starvation).
+        //
+        // When no weights are configured (the default) we fall through to the
+        // original single `ANY($2)` claim call — byte-for-byte unchanged.
+        if !self.config.queue_weights.is_empty() {
+            let pairs = crate::queue_fairness::effective_queue_weights(
+                &self.config.queues,
+                &self.config.queue_weights,
+            );
+            let ordered =
+                crate::queue_fairness::weighted_queue_order(&pairs, &mut rand::thread_rng());
+
+            for queue_name in &ordered {
+                let single_queue = std::slice::from_ref(queue_name);
+                match queue::claim_task(
+                    &mut conn,
+                    single_queue,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    self.config.priority_aging_secs,
+                    circuit_breaker_activities,
+                    &self.ineligible_activities,
+                )
+                .await
+                {
+                    Ok(Some(task)) => {
+                        tracing::debug!(
+                            task_id = %task.id,
+                            task_type = %task.task_type,
+                            queue = %task.queue_name,
+                            "claimed task (weighted)"
+                        );
+                        self.dispatch_task(task, pool);
+                        return true;
+                    }
+                    Ok(None) => {
+                        // Nothing in this queue; try the next in the permutation.
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to claim task");
+                        return false;
+                    }
+                }
+            }
+
+            // All queues empty — check throttle keys and report idle.
+            if let Ok(throttled_keys) =
+                queue::check_throttled_keys(&mut conn, &self.config.queues).await
+            {
+                for key in throttled_keys {
+                    self.registry
+                        .telemetry()
+                        .metrics
+                        .record_rate_limit_throttled(&key);
+                }
+            }
+            return false;
+        }
+
+        // --- Default (unweighted) path: original single ANY($2) query ---
         match queue::claim_task(
             &mut conn,
             &self.config.queues,
@@ -7688,6 +7759,12 @@ impl Worker {
             ClaimedTaskKind::Workflow => Arc::clone(&self.workflow_semaphore),
             ClaimedTaskKind::Activity => Arc::clone(&self.activity_semaphore),
         };
+
+        // Per-queue dispatch counter for live split observability (issue #515).
+        self.registry
+            .telemetry()
+            .metrics
+            .record_task_dispatched(&task.queue_name);
 
         let pool = pool.clone();
         let registry = Arc::clone(&self.registry);
@@ -8414,6 +8491,7 @@ mod tests {
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             max_workflow_history_events: None,
             labels: std::collections::HashMap::new(),
+            queue_weights: std::collections::HashMap::new(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -8685,6 +8763,7 @@ mod tests {
             default_debounce_max_wait: Duration::from_secs(3600),
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,
+            queue_weights: std::collections::HashMap::new(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         };

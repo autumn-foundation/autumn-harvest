@@ -1548,6 +1548,20 @@ pub struct StickyRoutingConfig {
 pub struct WorkerConfig {
     /// Queues this worker polls. Defaults to `["default"]`.
     pub queues: Vec<String>,
+    /// Optional per-queue dispatch weights for multi-queue worker fairness (issue #515).
+    ///
+    /// When non-empty, the worker uses weighted-random queue ordering on each
+    /// poll iteration so that dispatch share tracks the configured weights under
+    /// saturation. A queue absent from this map defaults to weight **1**
+    /// (equal share with other un-weighted queues).
+    ///
+    /// A weight of **0** places the queue last (fallthrough-only): it is only
+    /// drained when every positive-weight queue has no available work.
+    ///
+    /// **Default: empty** — the existing single `ANY($2)` claim query runs
+    /// unchanged, preserving today's byte-for-byte behaviour for all workers
+    /// that do not configure weights.
+    pub queue_weights: std::collections::HashMap<String, u32>,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
     /// Maximum concurrent workflow executions on this worker.
@@ -1682,6 +1696,7 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             queues: vec!["default".to_string()],
+            queue_weights: std::collections::HashMap::new(),
             notification_database_url: None,
             max_concurrent_workflows: 20,
             max_concurrent_activities: 50,
@@ -1725,6 +1740,28 @@ impl WorkerConfig {
                 q.to_owned()
             })
             .collect();
+        self
+    }
+
+    /// Set per-queue dispatch weights for multi-queue worker fairness (issue #515).
+    ///
+    /// Each pair `(queue_name, weight)` assigns a relative dispatch probability
+    /// to that queue. Under sustained saturation the empirical dispatch share
+    /// per queue converges to `weight / sum(all_weights)`.
+    ///
+    /// Queues bound via [`with_queues`](Self::with_queues) but absent from this
+    /// map default to weight **1**. A weight of **0** places the queue last
+    /// (fallthrough-only). Calling this method with an empty iterator leaves
+    /// the weight map empty and preserves the default unchanged behaviour.
+    ///
+    /// This method **replaces** any previously configured weights; call it once
+    /// with the full map.
+    #[must_use]
+    pub fn with_queue_weights<S: Into<String>>(
+        mut self,
+        weights: impl IntoIterator<Item = (S, u32)>,
+    ) -> Self {
+        self.queue_weights = weights.into_iter().map(|(k, v)| (k.into(), v)).collect();
         self
     }
 

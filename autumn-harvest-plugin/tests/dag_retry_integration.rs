@@ -276,6 +276,7 @@ fn build_worker() -> Arc<Worker> {
                 poison_pill_threshold: 3,
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,

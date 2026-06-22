@@ -140,6 +140,19 @@ pub const METRIC_QUEUE_SCHEDULE_TO_START: &str = "harvest.queue.schedule_to_star
 /// from lingering after a queue drains.
 pub const METRIC_QUEUE_OLDEST_PENDING_AGE: &str = "harvest.queue.oldest_pending_age";
 
+/// Counter: incremented once each time a task is dispatched from a queue.
+///
+/// This lets operators confirm that the live per-queue dispatch split matches
+/// the configured `queue_weights` (issue #515). The counter is recorded in
+/// `dispatch_task` for both weighted and default paths, so it is always
+/// observable regardless of whether weights are configured.
+///
+/// Labels:
+///   - `"queue"` — the task queue name (bounded cardinality, ADR-0001 §7).
+///
+/// `execution.id` / `activity.id` are span-only and MUST NOT appear as labels.
+pub const METRIC_QUEUE_DISPATCHED: &str = "harvest.queue.dispatched";
+
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
@@ -825,6 +838,15 @@ pub trait MetricsRecorder: Send + Sync {
     /// A periodic snapshot of queued pending task count.
     fn record_queue_depth(&self, queue_name: &str, depth: u64) {
         let _ = (queue_name, depth);
+    }
+
+    /// A task was dispatched from the named queue (issue #515).
+    ///
+    /// Recorded once per `dispatch_task` call. Lets operators confirm the live
+    /// per-queue dispatch split matches `WorkerConfig::queue_weights`.
+    /// Maps to the counter [`METRIC_QUEUE_DISPATCHED`].
+    fn record_task_dispatched(&self, queue_name: &str) {
+        let _ = queue_name;
     }
 
     /// Wall-clock seconds a task waited between becoming eligible

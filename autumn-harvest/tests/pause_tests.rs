@@ -189,6 +189,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             workflow_task_timeout: std::time::Duration::from_secs(10),
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             labels: std::collections::HashMap::new(),
+            queue_weights: std::collections::HashMap::new(),
             max_workflow_history_events: None,
             sharded_pool: None,
         },

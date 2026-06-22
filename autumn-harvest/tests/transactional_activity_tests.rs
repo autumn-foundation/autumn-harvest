@@ -214,6 +214,7 @@ fn make_worker(_db_url: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,

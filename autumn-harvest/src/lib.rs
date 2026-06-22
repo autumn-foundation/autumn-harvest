@@ -115,6 +115,7 @@ pub mod pool;
 pub mod prelude;
 /// Types and definitions for querying workflow state and metadata.
 pub mod query;
+pub mod queue_fairness;
 pub mod replay;
 #[cfg(feature = "db")]
 pub mod reset;
