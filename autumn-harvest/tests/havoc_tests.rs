@@ -60,3 +60,15 @@ fn test_havoc_external_task_duration_panic() {
     });
     assert!(res.is_ok());
 }
+
+#[test]
+fn test_havoc_eligibility_parse() {
+    use autumn_harvest::eligibility::parse_requirements;
+    let res = std::panic::catch_unwind(|| {
+        let _ = parse_requirements("𐮩=\"\"");
+    });
+    assert!(
+        res.is_ok(),
+        "The system still crashes on invalid char boundaries in eligibility parsing!"
+    );
+}
