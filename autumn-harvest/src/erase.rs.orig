@@ -264,9 +264,9 @@ mod db {
             .await
             .map_err(database_error)?;
 
-        let mut children = Vec::with_capacity(child_ids.len());
-        let mut skipped_children = Vec::with_capacity(child_ids.len());
-        let mut failures = Vec::with_capacity(child_ids.len());
+        let mut children = Vec::new();
+        let mut skipped_children = Vec::new();
+        let mut failures = Vec::new();
         for (child_uuid, child_state) in child_ids {
             let child_exec_id = ExecutionId::from_uuid(child_uuid);
             if !is_terminal_state(&child_state) {
