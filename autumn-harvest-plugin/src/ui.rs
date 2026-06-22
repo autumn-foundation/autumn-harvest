@@ -30,6 +30,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use maud::{Markup, PreEscaped, html};
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::warn;
 
 use autumn_harvest::Schedule;
 use autumn_harvest::ShardRouter;
@@ -545,7 +546,10 @@ pub fn harvest_ui_router(api_state: HarvestApiState) -> Router<AppState> {
         .route("/workflows", get(list_workflows_ui))
         .route("/workflows/{id}", get(workflow_detail_ui))
         .route("/workflows/{id}/cancel", post(cancel_workflow_ui))
-        .route("/workflows/{id}/terminate", post(terminate_workflow_ui))
+        .route(
+            "/workflows/{id}/terminate",
+            post(terminate_workflow_ui).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}/pause", post(pause_workflow_ui))
         .route("/workflows/{id}/resume", post(resume_workflow_ui))
         .route("/workflows/{id}/signal", post(signal_workflow_ui))
@@ -1259,7 +1263,12 @@ async fn terminate_workflow_ui(
     let terminate_result =
         terminate_workflow_execution(&mut conn, exec_id, &reason, metrics_ref.as_ref()).await;
     let (status, error_summary, flash) = match &terminate_result {
-        Ok(_) => (STATUS_SUCCEEDED, None, url_encode("Workflow terminated")),
+        Ok(r) if r.newly_cancelled => (STATUS_SUCCEEDED, None, url_encode("Workflow terminated")),
+        Ok(_) => (
+            STATUS_SUCCEEDED,
+            None,
+            url_encode("Workflow was already terminal — no change made"),
+        ),
         Err(e) => {
             let msg = e.to_string();
             (
@@ -1269,7 +1278,7 @@ async fn terminate_workflow_ui(
             )
         }
     };
-    let _ = insert_audit(
+    if let Err(audit_err) = insert_audit(
         &mut conn,
         &NewAuditRecord {
             actor: &actor,
@@ -1285,7 +1294,14 @@ async fn terminate_workflow_ui(
             source: SOURCE_UI,
         },
     )
-    .await;
+    .await
+    {
+        warn!(
+            error = %audit_err,
+            exec_id = %exec_id_str,
+            "audit insert failed for workflow.terminate"
+        );
+    }
 
     let redirect_url = format!("../../workflows/{id}?flash={flash}");
     Ok(axum::response::Redirect::to(&redirect_url).into_response())
