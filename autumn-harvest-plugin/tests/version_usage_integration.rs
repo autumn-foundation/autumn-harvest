@@ -232,6 +232,7 @@ async fn insert_version_execution_with_markers(
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     events.extend(markers.iter().map(|(change_id, recorded_version)| {
         WorkflowEvent::MarkerRecorded {

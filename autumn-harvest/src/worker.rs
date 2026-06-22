@@ -4911,7 +4911,7 @@ async fn persist_workflow_continue_as_new(
         last_error: persistence.carryover_error.clone(),
         // Preserve the nominal scheduled slot across the fork (issue #508): a continued
         // run is the same logical scheduled run and must see the same slot. The row
-        // already copies `scheduled_for` at the NewWorkflowExecution level (L4940).
+        // already copies `scheduled_for` at the NewWorkflowExecution level (L4950).
         scheduled_time: persistence.carryover_scheduled_time,
     };
     let continued_event = WorkflowEvent::WorkflowContinuedAsNew {

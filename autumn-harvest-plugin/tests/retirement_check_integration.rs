@@ -215,6 +215,7 @@ async fn insert_versioned_execution(
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: format!("version:{change_id}"),
@@ -294,6 +295,7 @@ async fn insert_execution_without_marker(
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
     store::append_events(&mut conn, exec_id, &events, 0)
         .await

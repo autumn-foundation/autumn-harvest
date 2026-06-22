@@ -320,6 +320,7 @@ async fn single_full_history_export_returns_replay_fixture_shape() {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -396,6 +397,7 @@ async fn batch_redacted_history_export_filters_and_reports_shard_coverage() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
     )
     .await;
@@ -410,6 +412,7 @@ async fn batch_redacted_history_export_filters_and_reports_shard_coverage() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
     )
     .await;
@@ -460,6 +463,7 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
     )
     .await;
@@ -474,6 +478,7 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
     )
     .await;
@@ -488,6 +493,7 @@ async fn batch_limit_is_applied_after_global_history_timestamp_ordering() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
     )
     .await;
@@ -549,6 +555,7 @@ async fn batch_updated_window_uses_latest_history_event_timestamp() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
     )
     .await;

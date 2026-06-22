@@ -1173,6 +1173,7 @@ async fn seed_scheduled_activity_task_from_url(
                 timestamp: chrono::Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
