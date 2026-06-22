@@ -17,9 +17,6 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
 
     // 1. Initialize TestDb and run pending migrations
     let db = TestDb::shared().await;
-    unsafe {
-        std::env::set_var("AUTUMN_DATABASE__URL", db.url());
-    }
     autumn_web::migrate::run_pending(db.url(), autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .expect("failed to run framework migrations");
     autumn_web::migrate::run_pending(db.url(), autumn_harvest::MIGRATIONS)
@@ -51,7 +48,11 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
         .plugin(webhook_plugin)
         .plugin(
             HarvestPlugin::new()
-                .worker(WorkerConfig::default().with_queues(["webhooks"]))
+                .worker(
+                    WorkerConfig::default()
+                        .with_notification_database_url(db.url())
+                        .with_queues(["webhooks"]),
+                )
                 .api("/api/harvest"),
         )
         .with_db(db.pool());
