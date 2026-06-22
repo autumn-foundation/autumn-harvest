@@ -13,6 +13,7 @@ fn test_integer_overflow_in_event_id_returns_error() {
             timestamp: chrono::Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::WorkflowCompleted {
             output: serde_json::Value::Null,

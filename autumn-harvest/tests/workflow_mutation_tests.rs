@@ -19,6 +19,7 @@ fn make_admitted_history(update_id: UpdateId, name: &str) -> Vec<WorkflowEvent> 
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -364,6 +365,7 @@ fn history_matcher_finds_update_completed() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -399,6 +401,7 @@ fn history_matcher_finds_update_failed() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -434,6 +437,7 @@ fn history_matcher_returns_no_match_for_admitted_without_completion() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -464,6 +468,7 @@ fn history_matcher_returns_no_match_for_unknown_update_id() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::UpdateCompleted {
             update_id: known_id,
@@ -495,6 +500,7 @@ fn update_events_do_not_break_activity_replay() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id,
@@ -542,6 +548,7 @@ fn drain_admitted_updates_returns_pending_update() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id,
@@ -571,6 +578,7 @@ fn drain_admitted_updates_excludes_already_completed() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::UpdateAdmitted {
             update_id: completed_id,

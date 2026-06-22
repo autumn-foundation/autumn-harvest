@@ -122,6 +122,7 @@ async fn replay_two_sequential_activities() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -172,6 +173,7 @@ async fn replay_detects_non_determinism() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -212,6 +214,7 @@ async fn version_gate_routes_code_paths_with_marker() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::MarkerRecorded {
             name: "version:billing_v2".into(),
@@ -240,6 +243,7 @@ async fn version_gate_new_execution_returns_max() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
 
     let outcome = run_workflow(exec_id, history, versioned_workflow, Value::Null).await;
@@ -267,6 +271,7 @@ async fn workflow_suspends_mid_execution() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -313,6 +318,7 @@ async fn replay_handles_failed_activity() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -399,6 +405,7 @@ async fn local_activity_completes_from_full_history() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::LocalActivityScheduled {
             activity_id: local_id,
@@ -442,6 +449,7 @@ async fn local_activity_suspends_when_not_in_history() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     }];
 
     let outcome = run_workflow(exec_id, history, mixed_local_regular_workflow, Value::Null).await;
@@ -477,6 +485,7 @@ async fn local_activity_replays_correctly_across_simulated_worker_restart() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::LocalActivityScheduled {
             activity_id: id1,
@@ -523,6 +532,7 @@ async fn local_activity_with_retry_in_history_replays_final_success() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::LocalActivityScheduled {
             activity_id: id1,
@@ -576,6 +586,7 @@ async fn local_activity_exhausted_retries_fails_the_workflow() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::LocalActivityScheduled {
             activity_id: id,
@@ -686,6 +697,7 @@ async fn replay_await_condition_happy_path_completes_when_predicate_met() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::SignalReceived {
             signal_name: "approved".into(),
@@ -718,6 +730,7 @@ async fn replay_await_condition_happy_path_suspends_when_predicate_not_met() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::SignalReceived {
             signal_name: "approved".into(),
@@ -744,6 +757,7 @@ async fn replay_await_condition_timeout_resolves_true_if_condition_met() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::SignalReceived {
             signal_name: "approved".into(),
@@ -782,6 +796,7 @@ async fn replay_await_condition_timeout_resolves_false_if_timer_fires_first() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::TimerStarted {
             timer_id: TimerId::new("my-timer"),
@@ -845,6 +860,7 @@ async fn replay_await_condition_non_deterministic_divergence_fails() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::TimerStarted {
             timer_id: TimerId::new("subsequent-timer"),

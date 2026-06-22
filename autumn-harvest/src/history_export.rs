@@ -894,6 +894,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -941,6 +942,7 @@ mod tests {
                     timestamp: Utc::now(),
                     last_completion_result: None,
                     last_error: None,
+                    scheduled_time: None,
                 },
                 WorkflowEvent::WorkflowCompleted {
                     output: serde_json::json!({ "ok": true }),
@@ -991,6 +993,7 @@ mod tests {
                     timestamp: Utc::now(),
                     last_completion_result: None,
                     last_error: None,
+                    scheduled_time: None,
                 },
                 WorkflowEvent::ActivityScheduled {
                     activity_id,
@@ -1060,6 +1063,7 @@ mod tests {
                     timestamp: Utc::now(),
                     last_completion_result: None,
                     last_error: None,
+                    scheduled_time: None,
                 },
                 // A custom side_effect that captured a secret in its closure. Pre
                 // #384 this lived under MarkerRecorded.details and was redacted;
@@ -1103,6 +1107,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             }],
             exported_at: Utc::now(),
             payload_policy: HistoryPayloadPolicy::Full,
@@ -1148,6 +1153,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_activity_event(&event);
     }
@@ -1161,6 +1167,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_timer_event(&event);
     }
@@ -1174,6 +1181,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_child_workflow_event(&event);
     }
@@ -1187,6 +1195,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_misc_event(&event);
     }
@@ -1200,6 +1209,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_local_activity_event(&event);
     }
@@ -1213,6 +1223,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_external_activity_event(&event);
     }
@@ -1226,6 +1237,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
         let _ = exporter.handle_update_event(&event);
     }

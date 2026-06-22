@@ -1168,6 +1168,7 @@ mod tests {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }];
 
         let plan = validate_reset_point(&events, 0).expect("workflow start is always valid");
@@ -1185,6 +1186,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id,
@@ -1223,6 +1225,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ExternalCancelRequested { cancel_id, target },
             WorkflowEvent::MarkerRecorded {
@@ -1255,6 +1258,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ExternalCancelRequested { cancel_id, target },
             WorkflowEvent::ExternalCancelDelivered { cancel_id },
@@ -1273,6 +1277,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ChildWorkflowSpawnedDetached {
                 child_id,
@@ -1314,6 +1319,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::TimerStarted {
                 timer_id: timer_id.clone(),
@@ -1351,6 +1357,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::LocalActivityScheduled {
                 activity_id,
@@ -1384,6 +1391,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::LocalActivityScheduled {
                 activity_id,
@@ -1416,6 +1424,7 @@ mod tests {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::WorkflowContinuedAsNew {
                 new_exec_id: ExecutionId::new(),

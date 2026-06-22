@@ -12,6 +12,7 @@ fn test_context() -> WorkflowContext {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
     )
 }
@@ -25,6 +26,7 @@ fn cancelled_context(reason: &str) -> WorkflowContext {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::WorkflowCancelled {
                 reason: reason.to_owned(),
@@ -501,6 +503,7 @@ async fn run_compensated_saga_once(comp_log: Arc<Mutex<Vec<String>>>) {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
     );
     let mut saga = Saga::new(&ctx);

@@ -56,6 +56,7 @@ fn build_history(n: usize) -> (ExecutionId, Vec<WorkflowEvent>) {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     });
 
     for i in 0..n {

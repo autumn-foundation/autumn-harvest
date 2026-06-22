@@ -313,6 +313,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         };
 
         let encoded = codecs.encode_event(&event).expect("encode");

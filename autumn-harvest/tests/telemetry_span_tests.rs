@@ -564,6 +564,7 @@ fn replay_span_has_replay_true_and_no_activity_execute_span() {
                         timestamp: Utc::now(),
                         last_completion_result: None,
                         last_error: None,
+                        scheduled_time: None,
                     },
                     WorkflowEvent::ActivityScheduled {
                         activity_id: act_id,

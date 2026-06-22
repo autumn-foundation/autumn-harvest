@@ -679,6 +679,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -897,6 +898,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -1027,6 +1029,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "already-large".into(),
@@ -1169,6 +1172,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "already-large".into(),
@@ -1310,6 +1314,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                     timestamp: Utc::now(),
                     last_completion_result: None,
                     last_error: None,
+                    scheduled_time: None,
                 },
                 WorkflowEvent::MarkerRecorded {
                     name: "side_effect:near-cap".into(),
@@ -1526,6 +1531,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::MarkerRecorded {
                 name: "side_effect:near-cap-local-retry".into(),
@@ -1701,6 +1707,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -1883,6 +1890,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -2200,6 +2208,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
                 timestamp: Utc::now(),
                 last_completion_result: None,
                 last_error: None,
+                scheduled_time: None,
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
@@ -2401,6 +2410,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -2548,6 +2558,7 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -2656,6 +2667,7 @@ async fn oldest_pending_age_excludes_paused_executions() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -2754,6 +2766,7 @@ async fn oldest_pending_age_excludes_rate_limited_tasks() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )
@@ -2886,6 +2899,7 @@ async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         0,
     )

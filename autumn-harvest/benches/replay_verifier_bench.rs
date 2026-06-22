@@ -43,6 +43,7 @@ fn build_fixture_json(activity_count: usize) -> String {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     });
     for i in 0..activity_count {
         let activity_id = ActivityExecId::new();

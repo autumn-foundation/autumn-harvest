@@ -18,3 +18,14 @@ error: [HVG001] Workflow determinism violation: Reading wall-clock time inside a
   |
 7 |     let _ = Local::now();
   |                    ^^^
+
+error[E0433]: failed to resolve: use of undeclared type `Local`
+ --> tests/compile_fail/hvg001_wallclock.rs:7:13
+  |
+7 |     let _ = Local::now();
+  |             ^^^^^ use of undeclared type `Local`
+  |
+help: consider importing this struct
+  |
+1 + use chrono::Local;
+  |

@@ -76,6 +76,7 @@ fn canonical_snapshot_json(workflow_name: &str) -> String {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id1,
@@ -117,6 +118,7 @@ fn unregistered_snapshot_json() -> String {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         }],
         context_headers: None,
     };

@@ -435,6 +435,7 @@ async fn context_replays_completed_external_activity() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -475,6 +476,7 @@ async fn context_replays_failed_external_activity() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -515,6 +517,7 @@ async fn context_replays_timed_out_external_activity() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -557,6 +560,7 @@ async fn context_awaiting_external_re_emits_same_token_idempotently() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -609,6 +613,7 @@ async fn context_execute_activity_external_detects_non_determinism() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -654,6 +659,7 @@ async fn context_double_complete_is_idempotent_replay() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,
@@ -699,6 +705,7 @@ async fn context_post_restart_while_awaiting_with_deadline_extensions() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityAwaitingExternal {
             activity_id,

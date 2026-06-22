@@ -506,6 +506,7 @@ pub async fn start_or_load_workflow_execution_collect(
                             timestamp: target_start_time,
                             last_completion_result: carryover_result,
                             last_error: carryover_error,
+                            scheduled_time: request.scheduled_for,
                         };
                         store::append_events(conn, exec_id, &[started_event], 0).await?;
                         queue::enqueue(conn, &enqueue).await?;
@@ -741,6 +742,7 @@ async fn replace_execution(
         timestamp: start_timestamp,
         last_completion_result: carryover_result,
         last_error: carryover_error,
+        scheduled_time: request.scheduled_for,
     };
     store::append_events(conn, new_exec_id, &[started_event], 0).await?;
     queue::enqueue(conn, enqueue).await?;

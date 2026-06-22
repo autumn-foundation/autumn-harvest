@@ -987,6 +987,9 @@ struct WorkflowDetailsResponse {
     /// Error from the most recent terminal run if it ended `FAILED` or `TIMED_OUT` (issue #488).
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
+    /// Nominal scheduled fire-time (logical slot) for this run, or `None` for manual starts (issue #508).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3138,6 +3141,7 @@ pub const fn management_api_response_fields()
                 "external_handoffs",
                 "last_completion_result",
                 "last_error",
+                "scheduled_time",
             ]),
         ),
         (
@@ -4779,17 +4783,22 @@ async fn get_workflow(
         .await
         .map_err(map_error)?;
 
-    // Extract carryover from the first (WorkflowStarted) event before consuming the vec.
-    let (last_completion_result, last_error) =
+    // Extract carryover and scheduled_time from the first (WorkflowStarted) event before consuming the vec.
+    let (last_completion_result, last_error, scheduled_time) =
         if let Some(autumn_harvest::event::WorkflowEvent::WorkflowStarted {
             last_completion_result,
             last_error,
+            scheduled_time,
             ..
         }) = history.events.as_slice().first()
         {
-            (last_completion_result.clone(), last_error.clone())
+            (
+                last_completion_result.clone(),
+                last_error.clone(),
+                *scheduled_time,
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
     let events = history
@@ -4818,6 +4827,7 @@ async fn get_workflow(
         external_handoffs,
         last_completion_result,
         last_error,
+        scheduled_time,
     }))
 }
 

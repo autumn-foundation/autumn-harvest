@@ -99,6 +99,7 @@ async fn happy_path_mapped_dag_execution() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_list,
@@ -169,6 +170,7 @@ async fn empty_upstream_collection_mapping() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_list,
@@ -221,6 +223,7 @@ async fn fail_fast_mapped_dag_execution() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_list,
@@ -290,6 +293,7 @@ async fn collect_all_mapped_dag_execution() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_list,
@@ -368,6 +372,7 @@ async fn replay_detects_width_n_mismatch() {
             timestamp: Utc::now(),
             last_completion_result: None,
             last_error: None,
+            scheduled_time: None,
         },
         WorkflowEvent::ActivityScheduled {
             activity_id: id_list,
