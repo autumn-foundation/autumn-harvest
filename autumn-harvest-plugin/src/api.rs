@@ -1896,6 +1896,38 @@ pub(crate) enum WorkflowSortOrder {
     Asc,
 }
 
+/// Numeric comparison operator for a search-attribute predicate (issue #506).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmpOp {
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+}
+
+/// A typed comparison/set predicate over a single top-level search-attribute key
+/// (issue #506). Parsed from a `search_attr_filter=key:op:value` query param.
+#[derive(Debug, Clone)]
+pub(crate) enum SearchAttrPredicate {
+    /// `key:eq:value` — typed equality (numeric/bool/string coercion).
+    Eq { key: String, value: Value },
+    /// `key:ne:value` — key present and typed value differs.
+    Ne { key: String, value: Value },
+    /// `key:{gt,gte,lt,lte}:value` — numeric comparison. `value` is the
+    /// validated, trimmed numeric *text* (not an f64): it is bound and cast
+    /// `::numeric` in SQL so the comparison stays exact even for integers
+    /// beyond f64's 2^53 mantissa (issue #506 review).
+    Cmp {
+        key: String,
+        op: CmpOp,
+        value: String,
+    },
+    /// `key:in:v1,v2,…` — membership in a typed set.
+    In { key: String, values: Vec<Value> },
+    /// `key:exists` — key is present with any value.
+    Exists { key: String },
+}
+
 /// Decoded keyset cursor for `GET /workflows` (issue #498).
 #[derive(Debug, Clone)]
 pub(crate) struct WorkflowListCursor {
@@ -1916,6 +1948,10 @@ pub(crate) struct WorkflowFilters {
     pub(crate) states: Vec<String>,
     pub(crate) workflow_name: Option<String>,
     pub(crate) search_attrs: Vec<Value>,
+    /// Typed comparison/set predicates over search attributes (issue #506).
+    /// Combined with `AND` against each other and against the legacy
+    /// `search_attrs` containment predicates above.
+    pub(crate) search_attr_predicates: Vec<SearchAttrPredicate>,
     pub(crate) started_after: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) started_before: Option<chrono::DateTime<chrono::Utc>>,
     /// Prefix match on the execution UUID cast to text (e.g. "abc123").
@@ -4186,12 +4222,159 @@ async fn get_registered_workflow_schema(
     )
 }
 
+/// Coerce a raw predicate token to a typed JSON scalar (issue #506).
+///
+/// A token that parses as a JSON number becomes a `Number`; the exact literals
+/// `true`/`false` become a `Bool`; everything else stays a `String`. This is the
+/// documented typed-coercion rule that lets `eq`/`ne`/`in` compare against the
+/// stored JSONB value by type (so `amount:eq:100` matches numeric `100`, not the
+/// string `"100"`).
+pub(crate) fn coerce_scalar(raw: &str) -> Value {
+    if let Ok(n) = raw.parse::<i64>() {
+        return Value::Number(n.into());
+    }
+    if let Ok(n) = raw.parse::<u64>() {
+        return Value::Number(n.into());
+    }
+    if let Some(num) = raw
+        .parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+    {
+        return Value::Number(num);
+    }
+    match raw {
+        "true" => Value::Bool(true),
+        "false" => Value::Bool(false),
+        other => Value::String(other.to_string()),
+    }
+}
+
+/// Parse a single `search_attr_filter=key:op:value` query value into a typed
+/// predicate (issue #506).
+///
+/// Format: `key:op[:value]`. The value is the `splitn(3, ':')` remainder so it
+/// may itself contain `:` (RFC 3339 timestamps) and `,` (set members). Only
+/// top-level keys are supported — a `.`-path is rejected. All error paths return
+/// a `400` that names the offending input.
+pub(crate) fn parse_search_attr_filter(raw: &str) -> Result<SearchAttrPredicate, AutumnError> {
+    let mut parts = raw.splitn(3, ':');
+    let key = parts.next().unwrap_or("").trim();
+    let op = parts.next().map(str::trim);
+    let value = parts.next();
+
+    if key.is_empty() {
+        return Err(AutumnError::bad_request_msg(format!(
+            "search_attr_filter '{raw}' is missing a key"
+        )));
+    }
+    if key.contains('.') {
+        return Err(AutumnError::bad_request_msg(format!(
+            "search_attr_filter '{raw}': nested path expressions are not supported; \
+             only top-level search-attribute keys may be filtered"
+        )));
+    }
+    let Some(op) = op else {
+        return Err(AutumnError::bad_request_msg(format!(
+            "search_attr_filter '{raw}'; expected 'key:op:value' \
+             (op ∈ eq, ne, gt, gte, lt, lte, in, exists)"
+        )));
+    };
+
+    // Helper: a value is required for every op except `exists`.
+    let require_value = |raw: &str, op: &str| -> Result<String, AutumnError> {
+        value.map_or_else(
+            || {
+                Err(AutumnError::bad_request_msg(format!(
+                    "search_attr_filter '{raw}': operator '{op}' requires a value"
+                )))
+            },
+            |v| Ok(v.to_string()),
+        )
+    };
+
+    let cmp = |op_name: &str, op: CmpOp| -> Result<SearchAttrPredicate, AutumnError> {
+        let v = require_value(raw, op_name)?;
+        let trimmed = v.trim();
+        // Validate it is a finite number so a bad value fails fast with 400
+        // rather than as a runtime `::numeric` cast error, but keep the original
+        // trimmed text — it is bound and cast `::numeric` in SQL, preserving full
+        // precision for integers beyond f64's 2^53 mantissa.
+        let parsed = trimmed.parse::<f64>().map_err(|_| {
+            AutumnError::bad_request_msg(format!(
+                "search_attr_filter '{raw}': operator '{op_name}' requires a numeric value, got '{v}'"
+            ))
+        })?;
+        if !parsed.is_finite() {
+            return Err(AutumnError::bad_request_msg(format!(
+                "search_attr_filter '{raw}': operator '{op_name}' requires a finite numeric value, got '{v}'"
+            )));
+        }
+        Ok(SearchAttrPredicate::Cmp {
+            key: key.to_string(),
+            op,
+            value: trimmed.to_string(),
+        })
+    };
+
+    match op {
+        // Trim the value before coercion so whitespace can't silently flip the
+        // inferred type (matches the `in`/comparison ops, issue #506 review).
+        "eq" => Ok(SearchAttrPredicate::Eq {
+            key: key.to_string(),
+            value: coerce_scalar(require_value(raw, "eq")?.trim()),
+        }),
+        "ne" => Ok(SearchAttrPredicate::Ne {
+            key: key.to_string(),
+            value: coerce_scalar(require_value(raw, "ne")?.trim()),
+        }),
+        "gt" => cmp("gt", CmpOp::Gt),
+        "gte" => cmp("gte", CmpOp::Gte),
+        "lt" => cmp("lt", CmpOp::Lt),
+        "lte" => cmp("lte", CmpOp::Lte),
+        "in" => {
+            let v = require_value(raw, "in")?;
+            let values: Vec<Value> = v
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(coerce_scalar)
+                .collect();
+            if values.is_empty() {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "search_attr_filter '{raw}': operator 'in' requires a non-empty comma-separated list"
+                )));
+            }
+            Ok(SearchAttrPredicate::In {
+                key: key.to_string(),
+                values,
+            })
+        }
+        "exists" => {
+            if value.is_some() {
+                return Err(AutumnError::bad_request_msg(format!(
+                    "search_attr_filter '{raw}': operator 'exists' takes no value"
+                )));
+            }
+            Ok(SearchAttrPredicate::Exists {
+                key: key.to_string(),
+            })
+        }
+        other => Err(AutumnError::bad_request_msg(format!(
+            "search_attr_filter '{raw}': unknown operator '{other}'; \
+             expected one of eq, ne, gt, gte, lt, lte, in, exists"
+        ))),
+    }
+}
+
 /// Parse the management-API query string into a `WorkflowFilters`.
 ///
 /// State values are comma-separated (or repeated `state=`) and validated
 /// against `KNOWN_WORKFLOW_STATES`. `search_attr=` values must be `key:value`
 /// and are repeatable; each entry contributes a separate JSONB containment
-/// predicate so repeats narrow rather than widen.
+/// predicate so repeats narrow rather than widen. `search_attr_filter=` values
+/// are typed comparison/set predicates (issue #506), also repeatable and
+/// combined with `AND`.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_workflow_filters(
     pairs: &[(String, String)],
@@ -4258,6 +4441,11 @@ pub(crate) fn parse_workflow_filters(
                 let mut object = serde_json::Map::with_capacity(1);
                 object.insert(attr_key.to_string(), Value::String(raw_val.to_string()));
                 filters.search_attrs.push(Value::Object(object));
+            }
+            // Issue #506: typed comparison/set predicates. Repeatable; ANDed.
+            "search_attr_filter" => {
+                let predicate = parse_search_attr_filter(value)?;
+                filters.search_attr_predicates.push(predicate);
             }
             "failure_cause" => {
                 let trimmed = value.trim();
@@ -15017,6 +15205,94 @@ async fn db_conn_for_dag(
     db_conn_for_shard(api_state, runtime.router.pick_for_dag(dag_name)).await
 }
 
+/// Apply the legacy `search_attr` containment predicates and the typed
+/// `search_attr_filter` comparison/set predicates (issue #506) to a boxed
+/// `harvest_workflow_executions` query.
+///
+/// Shared by `load_workflows` and `load_stalled_workflows` so both list code
+/// paths filter identically — without this the `no_progress_minutes` (stalled)
+/// path silently ignored every search-attribute filter (issue #506 review).
+///
+/// Every fragment stays on an index path: `@>` (containment) and `?` (key
+/// existence) both hit the existing `idx_harvest_we_search` GIN index;
+/// comparison ops narrow on `?` then recheck a `::numeric` cast. The key is
+/// always a *bound* `Text` param (never interpolated), so dynamic keys are
+/// injection-safe; the `Cmp` operator literal comes from the fixed `CmpOp` enum.
+/// Columns are qualified with `harvest_workflow_executions.` so the fragments
+/// are unambiguous inside the stalled loader's correlated-subquery context.
+fn apply_search_attr_filters<'a>(
+    mut query: harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
+    legacy: &[Value],
+    predicates: &[SearchAttrPredicate],
+) -> harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
+    use diesel::dsl::sql;
+    use diesel::sql_types::{Array, Bool, Jsonb, Text};
+
+    // Legacy `search_attr=key:value` exact-match containment. Repeated keys
+    // narrow the result set (AND).
+    for predicate in legacy {
+        query = query.filter(
+            sql::<Bool>("harvest_workflow_executions.search_attrs @> ")
+                .bind::<Jsonb, _>(predicate.clone()),
+        );
+    }
+    for predicate in predicates {
+        query = match predicate {
+            SearchAttrPredicate::Eq { key, value } => {
+                let object = serde_json::json!({ key.clone(): value.clone() });
+                query.filter(
+                    sql::<Bool>("harvest_workflow_executions.search_attrs @> ")
+                        .bind::<Jsonb, _>(object),
+                )
+            }
+            SearchAttrPredicate::Ne { key, value } => {
+                let object = serde_json::json!({ key.clone(): value.clone() });
+                query.filter(
+                    sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
+                        .bind::<Text, _>(key.clone())
+                        .sql(" AND NOT (harvest_workflow_executions.search_attrs @> ")
+                        .bind::<Jsonb, _>(object)
+                        .sql("))"),
+                )
+            }
+            SearchAttrPredicate::Cmp { key, op, value } => {
+                let head = sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
+                    .bind::<Text, _>(key.clone())
+                    .sql(" AND jsonb_typeof(harvest_workflow_executions.search_attrs -> ")
+                    .bind::<Text, _>(key.clone())
+                    .sql(") = 'number' AND (harvest_workflow_executions.search_attrs ->> ")
+                    .bind::<Text, _>(key.clone());
+                // Fold the operator (from the fixed `CmpOp` enum) into a single
+                // static literal per branch so the fragment never chains two
+                // raw-SQL pieces back to back. The threshold is bound as text and
+                // cast `::numeric` so the comparison is exact even past 2^53.
+                let body = match op {
+                    CmpOp::Gt => head.sql(")::numeric > "),
+                    CmpOp::Gte => head.sql(")::numeric >= "),
+                    CmpOp::Lt => head.sql(")::numeric < "),
+                    CmpOp::Lte => head.sql(")::numeric <= "),
+                };
+                query.filter(body.bind::<Text, _>(value.clone()).sql("::numeric)"))
+            }
+            SearchAttrPredicate::In { key, values } => query.filter(
+                sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
+                    .bind::<Text, _>(key.clone())
+                    .sql(" AND harvest_workflow_executions.search_attrs -> ")
+                    .bind::<Text, _>(key.clone())
+                    .sql(" = ANY(")
+                    .bind::<Array<Jsonb>, _>(values.clone())
+                    .sql("))"),
+            ),
+            SearchAttrPredicate::Exists { key } => query.filter(
+                sql::<Bool>("harvest_workflow_executions.search_attrs ? ")
+                    .bind::<Text, _>(key.clone()),
+            ),
+        };
+    }
+    query
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn load_workflows(
     conn: &mut AsyncPgConnection,
     filters: &WorkflowFilters,
@@ -15095,12 +15371,14 @@ pub(crate) async fn load_workflows(
     if let Some(severity) = &filters.severity {
         query = query.filter(harvest_workflow_executions::severity.eq(severity.clone()));
     }
-    // Each search_attr filter contributes its own `search_attrs @> {...}` predicate.
-    // The `@>` operator hits the existing `idx_harvest_we_search` GIN index on
-    // `search_attrs`; ANDing predicates means repeated keys narrow the result set.
-    for predicate in &filters.search_attrs {
-        query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate.clone()));
-    }
+    // Legacy `search_attr` containment + typed `search_attr_filter` predicates
+    // (issue #506). Centralized so the stalled-workflow loader applies the exact
+    // same filtering — see `apply_search_attr_filters`.
+    query = apply_search_attr_filters(
+        query,
+        &filters.search_attrs,
+        &filters.search_attr_predicates,
+    );
     if let Some(cause) = &filters.failure_cause {
         let predicate = serde_json::json!({ "failure_cause": cause });
         query = query.filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate));
@@ -15294,6 +15572,16 @@ pub(crate) async fn load_stalled_workflows(
             .bind::<BigInt, _>(i64::try_from(min_events).unwrap_or(i64::MAX)),
         );
     }
+
+    // Honor the search-attribute filters on the stalled path too (issue #506
+    // review): without this, `?no_progress_minutes=N&search_attr_filter=…` (or
+    // the legacy `&search_attr=…`) returned every stalled row because this
+    // loader bypasses `load_workflows`.
+    query = apply_search_attr_filters(
+        query,
+        &filters.search_attrs,
+        &filters.search_attr_predicates,
+    );
 
     if !filters.include_sleeping {
         // Include an execution if it has any non-timer pending work, OR has no
@@ -20062,6 +20350,241 @@ mod tests {
         let err = parse_workflow_filters(&pairs(&[("limit", "abc")]))
             .expect_err("non-numeric limit must error");
         assert!(err.to_string().contains("invalid limit"));
+    }
+
+    // ── Issue #506: typed comparison & set predicates ───────────────────────
+
+    #[test]
+    fn coerce_scalar_infers_number_bool_and_string() {
+        assert_eq!(coerce_scalar("42"), serde_json::json!(42));
+        assert_eq!(coerce_scalar("-7"), serde_json::json!(-7));
+        assert_eq!(coerce_scalar("3.5"), serde_json::json!(3.5));
+        assert_eq!(coerce_scalar("true"), serde_json::json!(true));
+        assert_eq!(coerce_scalar("false"), serde_json::json!(false));
+        assert_eq!(coerce_scalar("blocked"), serde_json::json!("blocked"));
+        // "True" is not an exact bool literal -> string.
+        assert_eq!(coerce_scalar("True"), serde_json::json!("True"));
+    }
+
+    #[test]
+    fn parse_search_attr_filter_eq_coerces_value() {
+        match parse_search_attr_filter("amount:eq:100").expect("eq parses") {
+            SearchAttrPredicate::Eq { key, value } => {
+                assert_eq!(key, "amount");
+                assert_eq!(value, serde_json::json!(100));
+            }
+            other => panic!("expected Eq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_search_attr_filter_ne_coerces_value() {
+        match parse_search_attr_filter("phase:ne:blocked").expect("ne parses") {
+            SearchAttrPredicate::Ne { key, value } => {
+                assert_eq!(key, "phase");
+                assert_eq!(value, serde_json::json!("blocked"));
+            }
+            other => panic!("expected Ne, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_search_attr_filter_comparison_ops_require_numbers() {
+        for (raw, op) in [
+            ("amount:gt:9", CmpOp::Gt),
+            ("amount:gte:9", CmpOp::Gte),
+            ("amount:lt:9", CmpOp::Lt),
+            ("amount:lte:9", CmpOp::Lte),
+        ] {
+            match parse_search_attr_filter(raw).expect("cmp parses") {
+                SearchAttrPredicate::Cmp {
+                    key,
+                    op: got,
+                    value,
+                } => {
+                    assert_eq!(key, "amount");
+                    assert_eq!(got, op);
+                    // Stored as the validated numeric *text* (issue #506 review),
+                    // not an f64 — so precision is preserved for the SQL cast.
+                    assert_eq!(value, "9");
+                }
+                other => panic!("expected Cmp, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_search_attr_filter_comparison_preserves_large_integer_precision() {
+        // 2^53 + 1 — not exactly representable as f64. The predicate must keep
+        // the exact text so the `::numeric` SQL cast compares precisely.
+        match parse_search_attr_filter("amount:gt:9007199254740993").expect("cmp parses") {
+            SearchAttrPredicate::Cmp { value, .. } => {
+                assert_eq!(value, "9007199254740993");
+            }
+            other => panic!("expected Cmp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_search_attr_filter_eq_ne_trim_whitespace_before_coercion() {
+        // Surrounding whitespace must not flip the inferred type (issue #506
+        // review): a trimmed numeric value coerces to a number, not a string.
+        match parse_search_attr_filter("amount:eq: 100").expect("eq parses") {
+            SearchAttrPredicate::Eq { value, .. } => {
+                assert_eq!(value, serde_json::json!(100));
+            }
+            other => panic!("expected Eq, got {other:?}"),
+        }
+        match parse_search_attr_filter("phase:ne: blocked ").expect("ne parses") {
+            SearchAttrPredicate::Ne { value, .. } => {
+                assert_eq!(value, serde_json::json!("blocked"));
+            }
+            other => panic!("expected Ne, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_search_attr_filter_rejects_non_numeric_comparison_value() {
+        let err = parse_search_attr_filter("amount:gt:lots")
+            .expect_err("non-numeric gt value must error");
+        let msg = err.to_string();
+        assert!(msg.contains("gt"), "message should name the op: {msg}");
+        assert!(
+            msg.contains("numeric"),
+            "message should mention numeric: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_search_attr_filter_in_splits_and_coerces() {
+        match parse_search_attr_filter("phase:in:blocked,awaiting_approval").expect("in parses") {
+            SearchAttrPredicate::In { key, values } => {
+                assert_eq!(key, "phase");
+                assert_eq!(
+                    values,
+                    vec![
+                        serde_json::json!("blocked"),
+                        serde_json::json!("awaiting_approval"),
+                    ]
+                );
+            }
+            other => panic!("expected In, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_search_attr_filter_in_coerces_numeric_set() {
+        match parse_search_attr_filter("retry_count:in:1,2,3").expect("numeric in parses") {
+            SearchAttrPredicate::In { values, .. } => {
+                assert_eq!(
+                    values,
+                    vec![
+                        serde_json::json!(1),
+                        serde_json::json!(2),
+                        serde_json::json!(3),
+                    ]
+                );
+            }
+            other => panic!("expected In, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_search_attr_filter_exists_takes_no_value() {
+        match parse_search_attr_filter("phase:exists").expect("exists parses") {
+            SearchAttrPredicate::Exists { key } => assert_eq!(key, "phase"),
+            other => panic!("expected Exists, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_search_attr_filter_rejects_value_on_exists() {
+        let err = parse_search_attr_filter("phase:exists:oops")
+            .expect_err("exists with value must error");
+        assert!(err.to_string().contains("exists"));
+    }
+
+    #[test]
+    fn parse_search_attr_filter_rejects_unknown_op() {
+        let err = parse_search_attr_filter("amount:between:1").expect_err("unknown op must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("between") || msg.contains("operator"),
+            "msg: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_search_attr_filter_rejects_nested_path_key() {
+        let err = parse_search_attr_filter("a.b:eq:1").expect_err("nested path key must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nested") || msg.contains("top-level"),
+            "msg: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_search_attr_filter_rejects_empty_key() {
+        let err = parse_search_attr_filter(":eq:1").expect_err("empty key must error");
+        assert!(err.to_string().contains("key"));
+    }
+
+    #[test]
+    fn parse_search_attr_filter_rejects_missing_value_for_eq() {
+        let err = parse_search_attr_filter("amount:eq").expect_err("eq without value must error");
+        assert!(err.to_string().contains("value") || err.to_string().contains("eq"));
+    }
+
+    #[test]
+    fn parse_search_attr_filter_value_may_contain_colon() {
+        // RFC 3339 timestamps contain ':'; the value is the splitn(3) remainder.
+        match parse_search_attr_filter("ts:eq:2026-01-01T00:00:00Z").expect("colon value parses") {
+            SearchAttrPredicate::Eq { key, value } => {
+                assert_eq!(key, "ts");
+                assert_eq!(value, serde_json::json!("2026-01-01T00:00:00Z"));
+            }
+            other => panic!("expected Eq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_workflow_filters_collects_search_attr_filter_predicates() {
+        let filters = parse_workflow_filters(&pairs(&[
+            ("search_attr_filter", "amount:gt:10000"),
+            ("search_attr_filter", "phase:in:blocked,awaiting_approval"),
+        ]))
+        .expect("predicates parse");
+        assert_eq!(filters.search_attr_predicates.len(), 2);
+        assert!(matches!(
+            filters.search_attr_predicates[0],
+            SearchAttrPredicate::Cmp { op: CmpOp::Gt, .. }
+        ));
+        assert!(matches!(
+            filters.search_attr_predicates[1],
+            SearchAttrPredicate::In { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_workflow_filters_legacy_search_attr_is_unchanged_string_containment() {
+        // Legacy shorthand stays byte-for-byte: value is always a JSON string,
+        // not coerced to a number.
+        let filters = parse_workflow_filters(&pairs(&[("search_attr", "customer_id:42")]))
+            .expect("legacy search_attr parses");
+        assert_eq!(filters.search_attrs.len(), 1);
+        assert_eq!(
+            filters.search_attrs[0]["customer_id"],
+            serde_json::json!("42")
+        );
+        assert!(filters.search_attr_predicates.is_empty());
+    }
+
+    #[test]
+    fn parse_workflow_filters_propagates_search_attr_filter_errors() {
+        let err = parse_workflow_filters(&pairs(&[("search_attr_filter", "amount:gt:nope")]))
+            .expect_err("bad predicate must propagate 400");
+        assert!(err.to_string().contains("numeric"));
     }
 
     #[test]

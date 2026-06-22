@@ -162,6 +162,36 @@ Both forms are equivalent. The attribute map is updated in the database before
 the workflow's next suspension, so filter results reflect the current phase
 within one worker poll cycle (< 1 s p95 under normal load).
 
+### Comparison and set predicates (issue #506)
+
+Equality containment answers "is this attribute exactly X". For range, set, and
+inequality questions, `GET /workflows` also accepts a repeatable
+`search_attr_filter=key:op:value` param, where `op` ∈
+`{eq, ne, gt, gte, lt, lte, in, exists}`:
+
+```bash
+# Numeric range — only runs over $10k:
+GET /workflows?search_attr_filter=amount:gt:10000
+
+# Set membership (union):
+GET /workflows?search_attr_filter=phase:in:blocked,awaiting_approval
+
+# Retry cohort intersected with a phase (AND):
+GET /workflows?search_attr_filter=retry_count:gte:3&search_attr_filter=phase:eq:blocked
+
+# Presence:
+GET /workflows?search_attr_filter=phase:exists
+```
+
+Values that parse as numbers compare numerically (so `amount:gt:20` returns
+`amount=100`, not a lexical false negative); booleans compare as booleans;
+everything else as strings. Comparison ops (`gt`/`gte`/`lt`/`lte`) require a
+numeric value and match only number-typed stored values. Only top-level keys are
+filterable — a nested `.`-path is rejected `400`. Multiple predicates are ANDed.
+The predicates reuse the existing `idx_harvest_we_search` GIN index (no
+migration). See `docs/management-api.md` for the full grammar and
+`docs/sharding.md` for the cross-shard pushdown contract.
+
 ## Durability
 
 Search attributes are stored in the `search_attrs JSONB` column of

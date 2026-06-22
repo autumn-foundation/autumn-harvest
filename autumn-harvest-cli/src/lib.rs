@@ -612,6 +612,13 @@ enum WorkflowCommand {
         /// AND multiple predicates together.
         #[arg(long = "search-attr", value_name = "KEY=VALUE")]
         search_attr: Vec<String>,
+        /// Filter by a typed comparison/set predicate over a search attribute,
+        /// `key:op:value` where op is one of eq, ne, gt, gte, lt, lte, in,
+        /// exists (e.g. `amount:gt:10000`, `phase:in:blocked,awaiting_approval`,
+        /// `phase:exists`). Repeat to AND multiple predicates together. Forwarded
+        /// verbatim to the `search_attr_filter` API param (issue #506).
+        #[arg(long = "search-attr-filter", value_name = "KEY:OP:VALUE")]
+        search_attr_filter: Vec<String>,
         /// Filter by owner (exact match).
         #[arg(long)]
         owner: Option<String>,
@@ -2750,6 +2757,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             state,
             workflow_name,
             search_attr,
+            search_attr_filter,
             owner,
             no_progress_minutes,
             include_sleeping,
@@ -2758,6 +2766,7 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             state,
             workflow_name.as_deref(),
             search_attr,
+            search_attr_filter,
             owner.as_deref(),
             *no_progress_minutes,
             *include_sleeping,
@@ -3863,11 +3872,13 @@ fn build_handoff_list_path(
     format!("/admin/external-handoffs?{query}")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_workflow_list_path(
     limit: Option<i64>,
     states: &[String],
     workflow_name: Option<&str>,
     search_attrs: &[String],
+    search_attr_filters: &[String],
     owner: Option<&str>,
     no_progress_minutes: Option<i64>,
     include_sleeping: bool,
@@ -3889,6 +3900,12 @@ fn build_workflow_list_path(
             .split_once('=')
             .ok_or_else(|| CliError::InvalidSearchAttr { value: raw.clone() })?;
         params.push(("search_attr", format!("{key}:{value}")));
+    }
+    // Issue #506: typed comparison/set predicates forwarded verbatim. The server
+    // owns validation (op grammar, numeric coercion, top-level-key rule), so the
+    // CLI is a thin passthrough and returns the API's `400` message on error.
+    for raw in search_attr_filters {
+        params.push(("search_attr_filter", raw.clone()));
     }
     if let Some(o) = owner {
         params.push(("owner", o.to_string()));

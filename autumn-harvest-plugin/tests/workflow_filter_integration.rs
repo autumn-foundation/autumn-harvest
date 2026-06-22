@@ -1051,3 +1051,361 @@ async fn workflow_list_pagination_sharded_global_order() {
     assert_eq!(all_ids[1], "wf-s0-2");
     assert_eq!(all_ids[2], "wf-s1-1");
 }
+
+// ─── Issue #506: typed comparison & set predicates ──────────────────────────
+
+/// Extract `workflow_id`s from either a bare array or a `{ workflows: [...] }`
+/// pagination envelope (issue #498), so predicate tests can run with or without
+/// pagination params.
+fn workflow_ids_any(value: &Value) -> Vec<String> {
+    let array = value
+        .as_array()
+        .or_else(|| value.get("workflows").and_then(Value::as_array))
+        .expect("expected a workflow array or a paginated envelope");
+    array
+        .iter()
+        .map(|row| {
+            row["workflow_id"]
+                .as_str()
+                .expect("workflow_id must be a string")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Seed a `{ amount, phase, retry_count }` fixture covering numeric and string
+/// attributes, then prove each predicate isolates exactly the right subset.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn workflow_search_attr_predicate_comparison_and_set() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    // amount/phase/retry_count fixtures. `small-amount` deliberately probes the
+    // string-vs-number coercion regression: amount=100 must sort ABOVE amount=20
+    // numerically, not lexically ("100" < "20" as strings).
+    let _big = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "payment",
+        "wf-big",
+        Some(json!({ "amount": 15000, "phase": "blocked", "retry_count": 5 })),
+    )
+    .await;
+    let _mid = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "payment",
+        "wf-mid",
+        Some(json!({ "amount": 100, "phase": "awaiting_approval", "retry_count": 3 })),
+    )
+    .await;
+    let _small = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "payment",
+        "wf-small",
+        Some(json!({ "amount": 20, "phase": "running", "retry_count": 0 })),
+    )
+    .await;
+    // A row whose amount is stored as a STRING — comparison ops must exclude it
+    // (typed numeric comparison only matches number-typed stored values).
+    let _stramount = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "payment",
+        "wf-str-amount",
+        Some(json!({ "amount": "99999", "phase": "blocked", "retry_count": 9 })),
+    )
+    .await;
+
+    // amount > 10000 → only the 15000 row (string "99999" excluded).
+    let (status, body) = get_json(&app, "/workflows?search_attr_filter=amount:gt:10000").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(workflow_ids_any(&body), vec!["wf-big".to_string()]);
+
+    // Numeric regression: amount > 20 → {15000, 100} but NOT 20 and NOT the
+    // string "99999". If this were lexical, "100" > "20" would be false.
+    let (_, body) = get_json(&app, "/workflows?search_attr_filter=amount:gt:20").await;
+    let mut ids = workflow_ids_any(&body);
+    ids.sort();
+    assert_eq!(ids, vec!["wf-big".to_string(), "wf-mid".to_string()]);
+
+    // phase IN (blocked, awaiting_approval) → union (string set).
+    let (_, body) = get_json(
+        &app,
+        "/workflows?search_attr_filter=phase:in:blocked,awaiting_approval",
+    )
+    .await;
+    let mut ids = workflow_ids_any(&body);
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "wf-big".to_string(),
+            "wf-mid".to_string(),
+            "wf-str-amount".to_string(),
+        ]
+    );
+
+    // retry_count >= 3 AND phase = blocked → intersection. Only wf-big
+    // (retry 5, blocked) and wf-str-amount (retry 9, blocked) qualify.
+    let (_, body) = get_json(
+        &app,
+        "/workflows?search_attr_filter=retry_count:gte:3&search_attr_filter=phase:eq:blocked",
+    )
+    .await;
+    let mut ids = workflow_ids_any(&body);
+    ids.sort();
+    assert_eq!(ids, vec!["wf-big".to_string(), "wf-str-amount".to_string()]);
+
+    // phase exists → every row has a phase key (all 4).
+    let (_, body) = get_json(&app, "/workflows?search_attr_filter=phase:exists").await;
+    assert_eq!(workflow_ids_any(&body).len(), 4);
+
+    // amount < 100 → only the 20 row (numeric; string "99999" excluded).
+    let (_, body) = get_json(&app, "/workflows?search_attr_filter=amount:lt:100").await;
+    assert_eq!(workflow_ids_any(&body), vec!["wf-small".to_string()]);
+
+    // phase != blocked → key present and not "blocked": wf-mid + wf-small.
+    let (_, body) = get_json(&app, "/workflows?search_attr_filter=phase:ne:blocked").await;
+    let mut ids = workflow_ids_any(&body);
+    ids.sort();
+    assert_eq!(ids, vec!["wf-mid".to_string(), "wf-small".to_string()]);
+}
+
+/// Malformed predicates return `400` naming the offending param; nested `.`-path
+/// keys are rejected.
+#[tokio::test]
+async fn workflow_search_attr_predicate_invalid_returns_400() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    // Unknown operator.
+    let (status, body) = get_json(&app, "/workflows?search_attr_filter=amount:between:1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.to_string().contains("between"),
+        "error should name the bad op, got {body}"
+    );
+
+    // Non-numeric value for a comparison op.
+    let (status, body) = get_json(&app, "/workflows?search_attr_filter=amount:gt:lots").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.to_string().contains("numeric"),
+        "error should explain numeric requirement, got {body}"
+    );
+
+    // Nested path key.
+    let (status, body) = get_json(&app, "/workflows?search_attr_filter=a.b:eq:1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.to_string().contains("nested") || body.to_string().contains("top-level"),
+        "error should reject nested paths, got {body}"
+    );
+
+    // Missing value for eq.
+    let (status, _) = get_json(&app, "/workflows?search_attr_filter=amount:eq").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A comparison predicate narrows on the `?` key-existence operator, which hits
+/// the existing `idx_harvest_we_search` GIN index — proving the index path
+/// rather than a full per-row scan (issue #506 AC).
+#[tokio::test]
+async fn workflow_search_attr_predicate_comparison_uses_gin_index() {
+    let (database_url, _container) = setup_single_database().await;
+
+    let _seed = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "payment",
+        "wf-explain",
+        Some(json!({ "amount": 15000 })),
+    )
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for EXPLAIN");
+    conn.batch_execute("SET enable_seqscan = off")
+        .await
+        .expect("disable seqscan should succeed");
+
+    // Mirrors the SQL the Cmp predicate builds: existence narrows on GIN, then a
+    // numeric recheck.
+    let plans: Vec<ExplainRow> = diesel::sql_query(
+        "EXPLAIN SELECT id FROM harvest_workflow_executions \
+         WHERE search_attrs ? 'amount' \
+         AND jsonb_typeof(search_attrs -> 'amount') = 'number' \
+         AND (search_attrs ->> 'amount')::numeric > 10000",
+    )
+    .load(&mut conn)
+    .await
+    .expect("EXPLAIN should succeed");
+
+    let plan_text = plans
+        .into_iter()
+        .map(|row| row.plan)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_text.contains("idx_harvest_we_search"),
+        "expected EXPLAIN plan to use idx_harvest_we_search, got:\n{plan_text}"
+    );
+}
+
+/// Predicates push down per shard and the k-way merge composes with keyset
+/// pagination — no row duplicated or skipped (issue #506 cross-shard AC).
+#[tokio::test]
+async fn workflow_search_attr_predicate_applies_across_shards_with_pagination() {
+    let ((shard0_url, shard1_url), _container) = setup_sharded_databases().await;
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(build_two_shard_pool(&shard0_url, &shard1_url));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    // Three matching rows spread across two shards, plus one non-matching row.
+    for (url, shard, id, amount) in [
+        (&shard0_url, ShardId::new(0), "wf-s0-a", 50000),
+        (&shard0_url, ShardId::new(0), "wf-s0-b", 30000),
+        (&shard1_url, ShardId::new(1), "wf-s1-a", 20000),
+        (&shard1_url, ShardId::new(1), "wf-s1-low", 5),
+    ] {
+        let _ = seed_workflow(
+            url,
+            shard,
+            "payment",
+            id,
+            Some(json!({ "amount": amount, "phase": "blocked" })),
+        )
+        .await;
+    }
+
+    // Page through amount > 10000 with page_size=2; expect exactly the 3 >10k
+    // rows across pages, each once, never the amount=5 row.
+    let mut all_ids: Vec<String> = Vec::new();
+    let mut uri =
+        "/workflows?search_attr_filter=amount:gt:10000&page_size=2&order=desc".to_string();
+    loop {
+        let (status, body) = get_json(&app, uri.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        all_ids.extend(workflow_ids_any(&body));
+        match body.get("next_cursor").and_then(Value::as_str) {
+            Some(cursor) => {
+                uri = format!(
+                    "/workflows?search_attr_filter=amount:gt:10000&page_size=2&order=desc&cursor={cursor}"
+                );
+            }
+            None => break,
+        }
+    }
+
+    let mut sorted = all_ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted,
+        vec![
+            "wf-s0-a".to_string(),
+            "wf-s0-b".to_string(),
+            "wf-s1-a".to_string()
+        ],
+        "predicate must select exactly the >10k rows across shards, no dup/skip"
+    );
+}
+
+/// Backdate every event of an execution so it appears stalled (no event in the
+/// last N minutes) to the `no_progress_minutes` scanner.
+async fn backdate_events(database_url: &str, exec_id: ExecutionId, minutes: i64) {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect to backdate events");
+    diesel::sql_query(format!(
+        "UPDATE harvest_events SET timestamp = NOW() - INTERVAL '{minutes} minutes' \
+         WHERE workflow_exec_id = '{}'",
+        exec_id.as_uuid()
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("backdate update should succeed");
+}
+
+/// Regression for issue #506 review finding #1: `search_attr_filter` (and the
+/// legacy `search_attr`) must narrow the stalled-workflow (`no_progress_minutes`)
+/// path, not be silently dropped.
+#[tokio::test]
+async fn stalled_workflow_path_applies_search_attr_predicate() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let blocked = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "payment",
+        "wf-stalled-blocked",
+        Some(json!({ "phase": "blocked", "amount": 50000 })),
+    )
+    .await;
+    let open = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "payment",
+        "wf-stalled-open",
+        Some(json!({ "phase": "open", "amount": 10 })),
+    )
+    .await;
+    // Make both look stalled: no event progress for 10 minutes.
+    backdate_events(&database_url, blocked, 10).await;
+    backdate_events(&database_url, open, 10).await;
+
+    // Typed predicate must narrow the stalled set to only the blocked row.
+    let (status, body) = get_json(
+        &app,
+        "/workflows?no_progress_minutes=5&search_attr_filter=phase:eq:blocked",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        workflow_ids(&body),
+        vec!["wf-stalled-blocked".to_string()],
+        "stalled path must honor search_attr_filter"
+    );
+
+    // Numeric comparison on the stalled path too.
+    let (_, body) = get_json(
+        &app,
+        "/workflows?no_progress_minutes=5&search_attr_filter=amount:gt:1000",
+    )
+    .await;
+    assert_eq!(workflow_ids(&body), vec!["wf-stalled-blocked".to_string()]);
+
+    // Legacy search_attr is also honored on the stalled path now.
+    let (_, body) = get_json(
+        &app,
+        "/workflows?no_progress_minutes=5&search_attr=phase:open",
+    )
+    .await;
+    assert_eq!(workflow_ids(&body), vec!["wf-stalled-open".to_string()]);
+
+    // Sanity: without a predicate, both stalled rows are returned.
+    let (_, body) = get_json(&app, "/workflows?no_progress_minutes=5").await;
+    let mut ids = workflow_ids(&body);
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "wf-stalled-blocked".to_string(),
+            "wf-stalled-open".to_string()
+        ]
+    );
+}
