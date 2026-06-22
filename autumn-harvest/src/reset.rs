@@ -624,6 +624,16 @@ fn validate_source_execution(
         // so RUNNING is no longer required. A non-failure terminal state
         // (COMPLETED / TERMINATED) is still rejected — there is nothing to retry.
         // PAUSED is a non-terminal active state (issue #383) and is resettable.
+        //
+        // TERMINATED is deliberately excluded. Since issue #504 it covers two
+        // origins that are indistinguishable at row level (only a successor-fork
+        // lookup separates them): a reset-sealed source (already re-forked —
+        // re-forking again would duplicate the fork) and a force-terminated run
+        // (`/workflows/{id}/terminate`). Admitting it here would re-open the reset
+        // double-fork the seal exists to block, so both are rejected: terminate is
+        // the forceful/final path, mirroring the cancel(retryable)/terminate(final)
+        // split. A run intended to stay DAG-retryable should be cancelled
+        // (CANCELLED is admitted below), not terminated.
         match execution.state.as_str() {
             "RUNNING" | "PAUSED" | "FAILED" | "CANCELLED" | "TIMED_OUT" => {}
             other => {
