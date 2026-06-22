@@ -2557,6 +2557,170 @@ async fn detail_page_cancel_action_redirects_with_flash() {
     );
 }
 
+/// Read the persisted state of a workflow execution directly from its shard DB.
+async fn read_execution_state(database_url: &str, exec_id: ExecutionId) -> String {
+    let mut conn = AsyncPgConnection::establish(database_url).await.unwrap();
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .first(&mut conn)
+        .await
+        .expect("execution row should exist")
+}
+
+/// Terminate action on a RUNNING execution seals it as TERMINATED and redirects
+/// back to the detail page with a flash message (issue #788).
+#[tokio::test]
+async fn detail_page_terminate_action_seals_terminated() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "terminate_wf",
+        "terminate-1",
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, headers, body) = post_form(
+        &app,
+        &format!("/workflows/{exec_id}/terminate"),
+        "reason=wedged+run",
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "terminate action must redirect (got {status}): {body}"
+    );
+    let location = headers
+        .get("location")
+        .expect("redirect must have Location header")
+        .to_str()
+        .unwrap();
+    assert!(
+        location.contains(&exec_id.to_string()) || location.contains("workflows"),
+        "redirect must go to the workflow detail page: {location}"
+    );
+    assert!(
+        location.contains("flash") && !location.ends_with("flash="),
+        "redirect must carry a non-empty flash message: {location}"
+    );
+
+    let state = read_execution_state(&database_url, exec_id).await;
+    assert_eq!(
+        state, "TERMINATED",
+        "terminate must seal the execution as TERMINATED"
+    );
+}
+
+/// The detail page renders an enabled Terminate form (not the old placeholder)
+/// for a RUNNING execution (issue #788).
+#[tokio::test]
+async fn detail_page_terminate_button_enabled_when_running() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "terminate_wf",
+        "terminate-2",
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    assert!(
+        html.contains("/terminate"),
+        "running execution should expose a Terminate form posting to /terminate: {html}"
+    );
+    assert!(
+        !html.contains("Not yet available"),
+        "the disabled Terminate placeholder must be gone: {html}"
+    );
+}
+
+/// The Terminate button is disabled once the execution is terminal, mirroring
+/// the Pause gate (issue #788).
+#[tokio::test]
+async fn detail_page_terminate_button_disabled_when_terminal() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let exec_id = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "terminate_wf",
+        "terminate-3",
+    )
+    .await;
+
+    // First terminate seals it TERMINATED.
+    let app = build_single_shard_ui_app(&database_url);
+    let _ = post_form(
+        &app,
+        &format!("/workflows/{exec_id}/terminate"),
+        String::new(),
+    )
+    .await;
+    assert_eq!(
+        read_execution_state(&database_url, exec_id).await,
+        "TERMINATED"
+    );
+
+    // Now the detail page must render Terminate as disabled.
+    let (status, html) = fetch_html(&app, &format!("/workflows/{exec_id}")).await;
+    assert_eq!(status, StatusCode::OK, "detail page should render: {html}");
+    let term_idx = html
+        .find(">Terminate<")
+        .or_else(|| html.find("Terminate</button>"))
+        .expect("detail page should contain a Terminate button");
+    // The opening <button ... disabled ...> tag precedes the label; scan back to it.
+    let tag_start = html[..term_idx].rfind("<button").expect("button tag");
+    assert!(
+        html[tag_start..term_idx].contains("disabled"),
+        "Terminate button must be disabled for a terminal execution: {}",
+        &html[tag_start..term_idx]
+    );
+}
+
+/// Terminating one execution does not touch a second concurrent execution
+/// (collateral-isolation parity with #504).
+#[tokio::test]
+async fn detail_page_terminate_only_affects_target() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let target = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "terminate_wf",
+        "terminate-t",
+    )
+    .await;
+    let bystander = insert_workflow_on_url(
+        &database_url,
+        ShardId::new(0),
+        "terminate_wf",
+        "terminate-b",
+    )
+    .await;
+
+    let app = build_single_shard_ui_app(&database_url);
+    let _ = post_form(
+        &app,
+        &format!("/workflows/{target}/terminate"),
+        String::new(),
+    )
+    .await;
+
+    assert_eq!(
+        read_execution_state(&database_url, target).await,
+        "TERMINATED",
+        "target must be terminated"
+    );
+    assert_eq!(
+        read_execution_state(&database_url, bystander).await,
+        "RUNNING",
+        "bystander execution must be untouched"
+    );
+}
+
 /// Send signal action redirects back with flash.
 #[tokio::test]
 async fn detail_page_signal_action_redirects_with_flash() {
