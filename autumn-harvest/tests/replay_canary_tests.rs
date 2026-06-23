@@ -164,6 +164,7 @@ async fn test_replay_canary_simple_pass() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     };
     let event_json = serde_json::to_value(&event).unwrap();
 
@@ -249,6 +250,7 @@ async fn test_replay_canary_suspended_workflow() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     };
     let start_json = serde_json::to_value(&start_event).unwrap();
 
@@ -343,6 +345,7 @@ async fn test_replay_canary_divergent_workflow() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     };
     let start_json = serde_json::to_value(&start_event).unwrap();
 

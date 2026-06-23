@@ -295,6 +295,7 @@ async fn test_replay_canary_api_endpoint_fails_on_divergence() {
         timestamp: Utc::now(),
         last_completion_result: None,
         last_error: None,
+        scheduled_time: None,
     };
     let start_json = serde_json::to_value(&start_event).unwrap();
 
