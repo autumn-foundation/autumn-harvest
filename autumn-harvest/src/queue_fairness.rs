@@ -40,24 +40,24 @@ use std::collections::HashMap;
 ///
 /// Returns a `Vec` in the same order as `queues`. Queues absent from `weights`
 /// get weight `1`; queues present get their configured value (including `0`).
+///
+/// The returned `&str` slices borrow from `queues` — no string clones per poll
+/// in the weighted hot path.
 #[must_use]
-pub fn effective_queue_weights(
-    queues: &[String],
+pub fn effective_queue_weights<'a>(
+    queues: &'a [String],
     weights: &HashMap<String, u32>,
-) -> Vec<(String, u32)> {
+) -> Vec<(&'a str, u32)> {
     queues
         .iter()
-        .map(|q| {
-            let w = weights.get(q).copied().unwrap_or(1);
-            (q.clone(), w)
-        })
+        .map(|q| (q.as_str(), weights.get(q.as_str()).copied().unwrap_or(1)))
         .collect()
 }
 
 /// Produce a weighted-random permutation of queue names.
 ///
 /// The algorithm is weighted-random sampling *without replacement*
-/// (Efraimidis–Spirakis key-based reservoir):
+/// (Efraimidis-Spirakis key-based reservoir):
 /// each queue with `weight > 0` is assigned a key `U^(1/weight)` where `U`
 /// is uniform `(0, 1]`; queues are then sorted descending by key. This gives
 /// exactly the desired first-position frequency proportional to `weight`.
@@ -70,24 +70,24 @@ pub fn effective_queue_weights(
 ///
 /// * `pairs` — output of [`effective_queue_weights`].
 /// * `rng` — any `rand::Rng` (typically `rand::thread_rng()` in production,
-///   a seeded `SmallRng` in tests for reproducibility).
+///   a seeded `StdRng` in tests for reproducibility).
 ///
 /// Returns a permutation of all queue names.
 #[must_use]
-pub fn weighted_queue_order(pairs: &[(String, u32)], rng: &mut impl rand::Rng) -> Vec<String> {
+pub fn weighted_queue_order(pairs: &[(&str, u32)], rng: &mut impl rand::Rng) -> Vec<String> {
     // Separate positive-weight and zero-weight queues.
     let mut positive: Vec<(&str, f64)> = Vec::with_capacity(pairs.len());
     let mut zeros: Vec<&str> = Vec::new();
 
     for (name, weight) in pairs {
         if *weight == 0 {
-            zeros.push(name.as_str());
+            zeros.push(name);
         } else {
-            // Efraimidis–Spirakis: key = U^(1/weight).
-            // Larger weight → key closer to 1 on average → sorts first.
+            // Efraimidis-Spirakis: key = U^(1/weight).
+            // Larger weight -> key closer to 1 on average -> sorts first.
             let u: f64 = rng.gen_range(f64::MIN_POSITIVE..=1.0);
             let key = u.powf(1.0 / f64::from(*weight));
-            positive.push((name.as_str(), key));
+            positive.push((name, key));
         }
     }
 
@@ -123,7 +123,7 @@ mod tests {
         let queues = make_queues(&["a", "b"]);
         let weights = HashMap::new();
         let result = effective_queue_weights(&queues, &weights);
-        assert_eq!(result, vec![("a".to_owned(), 1), ("b".to_owned(), 1)]);
+        assert_eq!(result, vec![("a", 1u32), ("b", 1u32)]);
     }
 
     #[test]
@@ -131,10 +131,7 @@ mod tests {
         let queues = make_queues(&["bulk", "latency"]);
         let weights = make_weights(&[("bulk", 3), ("latency", 1)]);
         let result = effective_queue_weights(&queues, &weights);
-        assert_eq!(
-            result,
-            vec![("bulk".to_owned(), 3), ("latency".to_owned(), 1)]
-        );
+        assert_eq!(result, vec![("bulk", 3u32), ("latency", 1u32)]);
     }
 
     #[test]
@@ -142,7 +139,7 @@ mod tests {
         let queues = make_queues(&["high", "low"]);
         let weights = make_weights(&[("high", 5), ("low", 0)]);
         let result = effective_queue_weights(&queues, &weights);
-        assert_eq!(result, vec![("high".to_owned(), 5), ("low".to_owned(), 0)]);
+        assert_eq!(result, vec![("high", 5u32), ("low", 0u32)]);
     }
 
     #[test]
@@ -157,7 +154,7 @@ mod tests {
 
     #[test]
     fn single_queue_returns_same_queue() {
-        let pairs = vec![("only".to_owned(), 1u32)];
+        let pairs: Vec<(&str, u32)> = vec![("only", 1u32)];
         let mut rng = StdRng::seed_from_u64(42);
         let order = weighted_queue_order(&pairs, &mut rng);
         assert_eq!(order, vec!["only"]);
@@ -165,10 +162,10 @@ mod tests {
 
     #[test]
     fn output_is_a_permutation_no_duplicates_no_missing() {
-        let pairs: Vec<(String, u32)> = vec![
-            ("a".to_owned(), 3),
-            ("b".to_owned(), 1),
-            ("c".to_owned(), 2),
+        let pairs: Vec<(&str, u32)> = vec![
+            ("a", 3u32),
+            ("b", 1u32),
+            ("c", 2u32),
         ];
         let mut rng = StdRng::seed_from_u64(99);
         for _ in 0..200 {
@@ -186,10 +183,10 @@ mod tests {
 
     #[test]
     fn zero_weight_queues_always_appear_last() {
-        let pairs: Vec<(String, u32)> = vec![
-            ("high".to_owned(), 5),
-            ("zero".to_owned(), 0),
-            ("med".to_owned(), 2),
+        let pairs: Vec<(&str, u32)> = vec![
+            ("high", 5u32),
+            ("zero", 0u32),
+            ("med", 2u32),
         ];
         let mut rng = StdRng::seed_from_u64(7);
         for _ in 0..300 {
@@ -206,8 +203,8 @@ mod tests {
 
     #[test]
     fn equal_weights_produce_uniform_first_position_distribution() {
-        // With two queues of equal weight, each should be first ~50% ± 10%.
-        let pairs: Vec<(String, u32)> = vec![("a".to_owned(), 1), ("b".to_owned(), 1)];
+        // With two queues of equal weight, each should be first ~50% +/- 10%.
+        let pairs: Vec<(&str, u32)> = vec![("a", 1u32), ("b", 1u32)];
         let mut rng = StdRng::seed_from_u64(12345);
         let n = 2000u32;
         let mut first_a = 0u32;
@@ -227,8 +224,8 @@ mod tests {
 
     #[test]
     fn three_to_one_weight_produces_correct_first_position_frequency() {
-        // With weight 3:1, the heavy queue should be first ~75% of the time (±10%).
-        let pairs: Vec<(String, u32)> = vec![("bulk".to_owned(), 3), ("latency".to_owned(), 1)];
+        // With weight 3:1, the heavy queue should be first ~75% of the time (+/-10%).
+        let pairs: Vec<(&str, u32)> = vec![("bulk", 3u32), ("latency", 1u32)];
         let mut rng = StdRng::seed_from_u64(777);
         let n = 4000u32;
         let mut bulk_first = 0u32;
@@ -248,10 +245,10 @@ mod tests {
 
     #[test]
     fn all_zero_weights_returns_queues_in_stable_original_order() {
-        let pairs: Vec<(String, u32)> = vec![
-            ("x".to_owned(), 0),
-            ("y".to_owned(), 0),
-            ("z".to_owned(), 0),
+        let pairs: Vec<(&str, u32)> = vec![
+            ("x", 0u32),
+            ("y", 0u32),
+            ("z", 0u32),
         ];
         let mut rng = StdRng::seed_from_u64(1);
         let order = weighted_queue_order(&pairs, &mut rng);
@@ -261,8 +258,9 @@ mod tests {
 
     #[test]
     fn empty_pairs_returns_empty_order() {
+        let pairs: Vec<(&str, u32)> = vec![];
         let mut rng = StdRng::seed_from_u64(0);
-        let order = weighted_queue_order(&[], &mut rng);
+        let order = weighted_queue_order(&pairs, &mut rng);
         assert!(order.is_empty());
     }
 
@@ -271,7 +269,7 @@ mod tests {
     /// — ensuring it can drain when claimed in order.
     #[test]
     fn low_weight_queue_always_present_in_permutation() {
-        let pairs: Vec<(String, u32)> = vec![("heavy".to_owned(), 10), ("light".to_owned(), 1)];
+        let pairs: Vec<(&str, u32)> = vec![("heavy", 10u32), ("light", 1u32)];
         let mut rng = StdRng::seed_from_u64(55);
         for _ in 0..500 {
             let order = weighted_queue_order(&pairs, &mut rng);

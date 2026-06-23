@@ -209,6 +209,13 @@ rate(harvest_queue_dispatched_total[5m])
 Per-worker-process only. Cross-worker or fleet-global queue weighting is out of
 scope. Cross-shard fairness is explicitly a non-goal per `docs/sharding.md`.
 
+**Performance note:** the weighted path makes up to N sequential `claim_task`
+database round-trips per poll (one per queue in permutation order, stopping on
+the first hit), versus 1 round-trip for the default `ANY($queues)` path. With
+2–5 queues and typical poll intervals of 100–500 ms this overhead is negligible.
+If `poll_interval` P99 latency is a concern, benchmark with and without weights
+before deploying.
+
 ---
 
 [← DAGs and schedules](08-dags-and-schedules.md) · [Index](README.md) · [Next: Operating the service →](10-operations.md)
