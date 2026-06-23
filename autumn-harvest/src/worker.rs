@@ -302,7 +302,7 @@ impl HandlerRegistry {
         let circuit_policies: HashMap<String, crate::policy::CircuitBreakerPolicy> = activities
             .iter()
             .filter(|(_, info)| !info.is_local)
-            .filter_map(|(name, info)| info.circuit_breaker.map(|p| (name.clone(), p)))
+            .filter_map(|(name, info)| info.circuit_breaker.as_ref().map(|p| (name.clone(), p.clone())))
             .collect();
         Self {
             workflows,
