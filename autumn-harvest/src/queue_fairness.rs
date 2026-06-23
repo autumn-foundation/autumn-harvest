@@ -92,7 +92,7 @@ pub fn weighted_queue_order(pairs: &[(&str, u32)], rng: &mut impl rand::Rng) -> 
     }
 
     // Sort descending by key so the highest key (highest-priority draw) comes first.
-    positive.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    positive.sort_by(|a, b| b.1.total_cmp(&a.1));
 
     let mut result: Vec<String> = positive.iter().map(|(n, _)| (*n).to_owned()).collect();
     result.extend(zeros.iter().map(|n| (*n).to_owned()));
@@ -162,11 +162,7 @@ mod tests {
 
     #[test]
     fn output_is_a_permutation_no_duplicates_no_missing() {
-        let pairs: Vec<(&str, u32)> = vec![
-            ("a", 3u32),
-            ("b", 1u32),
-            ("c", 2u32),
-        ];
+        let pairs: Vec<(&str, u32)> = vec![("a", 3u32), ("b", 1u32), ("c", 2u32)];
         let mut rng = StdRng::seed_from_u64(99);
         for _ in 0..200 {
             let order = weighted_queue_order(&pairs, &mut rng);
@@ -183,11 +179,7 @@ mod tests {
 
     #[test]
     fn zero_weight_queues_always_appear_last() {
-        let pairs: Vec<(&str, u32)> = vec![
-            ("high", 5u32),
-            ("zero", 0u32),
-            ("med", 2u32),
-        ];
+        let pairs: Vec<(&str, u32)> = vec![("high", 5u32), ("zero", 0u32), ("med", 2u32)];
         let mut rng = StdRng::seed_from_u64(7);
         for _ in 0..300 {
             let order = weighted_queue_order(&pairs, &mut rng);
@@ -245,11 +237,7 @@ mod tests {
 
     #[test]
     fn all_zero_weights_returns_queues_in_stable_original_order() {
-        let pairs: Vec<(&str, u32)> = vec![
-            ("x", 0u32),
-            ("y", 0u32),
-            ("z", 0u32),
-        ];
+        let pairs: Vec<(&str, u32)> = vec![("x", 0u32), ("y", 0u32), ("z", 0u32)];
         let mut rng = StdRng::seed_from_u64(1);
         let order = weighted_queue_order(&pairs, &mut rng);
         // All are zero-weight, so they appear in the zero-queue list in stable order.

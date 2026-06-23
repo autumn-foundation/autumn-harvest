@@ -17,7 +17,6 @@ use autumn_harvest::worker::WorkerRuntimeConfig;
 use autumn_harvest::{WorkerConfig, queue};
 
 use diesel::prelude::*;
-use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
