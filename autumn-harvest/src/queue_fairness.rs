@@ -85,7 +85,10 @@ pub fn weighted_queue_order(pairs: &[(&str, u32)], rng: &mut impl rand::Rng) -> 
         } else {
             // Efraimidis-Spirakis: key = U^(1/weight).
             // Larger weight -> key closer to 1 on average -> sorts first.
-            let u: f64 = rng.gen_range(f64::MIN_POSITIVE..=1.0);
+            // Exclusive upper bound so u is never exactly 1.0: if two queues
+            // both drew 1.0 they would tie at key=1.0 and sort order would
+            // depend on unstable-sort tie-breaking rather than the weights.
+            let u: f64 = rng.gen_range(f64::MIN_POSITIVE..1.0);
             let key = u.powf(1.0 / f64::from(*weight));
             positive.push((name, key));
         }

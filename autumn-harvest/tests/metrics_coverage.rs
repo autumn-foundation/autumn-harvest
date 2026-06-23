@@ -12,10 +12,11 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
-    METRIC_RETENTION_DELETED, METRIC_SCHEDULE_DECISION_WRITE_FAILED, METRIC_SCHEDULE_RUNS,
-    METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED, METRIC_WORKFLOW_CONTINUE_AS_NEW,
-    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics, WorkflowStatus,
+    METRIC_QUEUE_DISPATCHED, METRIC_RETENTION_DELETED, METRIC_SCHEDULE_DECISION_WRITE_FAILED,
+    METRIC_SCHEDULE_RUNS, METRIC_SCHEDULE_SKIPPED, METRIC_TIMER_STARTED,
+    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
+    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, MetricsRecorder, NoOpMetrics,
+    WorkflowStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -181,6 +182,13 @@ impl MetricsRecorder for RecordingMetrics {
             ],
         });
     }
+
+    fn record_task_dispatched(&self, queue_name: &str) {
+        self.samples.lock().unwrap().push(MetricSample {
+            name: METRIC_QUEUE_DISPATCHED,
+            labels: vec![("queue", queue_name.to_owned())],
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +215,7 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     rec.record_schedule_decision_write_failed();
     rec.record_retention_tick(0, 100, 50, 0.01);
     rec.record_workflow_task_timeout("my_workflow", "default");
+    rec.record_task_dispatched("default");
 
     let samples = rec.drain();
     let names: Vec<&str> = samples.iter().map(|s| s.name).collect();
@@ -276,6 +285,10 @@ fn all_catalogue_metrics_are_reachable_via_trait() {
     assert!(
         names.contains(&METRIC_WORKFLOW_TASK_TIMEOUT),
         "harvest.workflow.task_timeout not sampled"
+    );
+    assert!(
+        names.contains(&METRIC_QUEUE_DISPATCHED),
+        "harvest.queue.dispatched not sampled"
     );
 }
 

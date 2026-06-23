@@ -1751,17 +1751,19 @@ impl WorkerConfig {
     ///
     /// Queues bound via [`with_queues`](Self::with_queues) but absent from this
     /// map default to weight **1**. A weight of **0** places the queue last
-    /// (fallthrough-only). Calling this method with an empty iterator leaves
-    /// the weight map empty and preserves the default unchanged behaviour.
+    /// (fallthrough-only). Calling this method with an empty iterator is a
+    /// no-op and preserves the default unchanged behaviour.
     ///
-    /// This method **replaces** any previously configured weights; call it once
-    /// with the full map.
+    /// This method **merges** into any previously configured weights (consistent
+    /// with [`with_labels`](Self::with_labels)). Repeated calls accumulate
+    /// entries; a later entry for the same queue name overwrites the earlier one.
     #[must_use]
     pub fn with_queue_weights<S: Into<String>>(
         mut self,
         weights: impl IntoIterator<Item = (S, u32)>,
     ) -> Self {
-        self.queue_weights = weights.into_iter().map(|(k, v)| (k.into(), v)).collect();
+        self.queue_weights
+            .extend(weights.into_iter().map(|(k, v)| (k.into(), v)));
         self
     }
 

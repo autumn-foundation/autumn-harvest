@@ -149,6 +149,22 @@ impl WorkerRuntimeConfig {
                 "worker must poll at least one queue".into(),
             ));
         }
+        // Warn when queue_weights contains keys that are not in the queues list.
+        // Those entries are silently ignored by effective_queue_weights, which
+        // only iterates over self.queues, so misconfigured keys are invisible
+        // at runtime.
+        if !self.queue_weights.is_empty() {
+            let queue_set: std::collections::HashSet<&str> =
+                self.queues.iter().map(String::as_str).collect();
+            for name in self.queue_weights.keys() {
+                if !queue_set.contains(name.as_str()) {
+                    tracing::warn!(
+                        queue = %name,
+                        "queue_weights entry has no matching bound queue and will be ignored"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -7603,6 +7619,23 @@ impl Worker {
     ///
     /// Gets a connection from the pool, tries to claim a task, dispatches it
     /// if found, or sleeps for `poll_interval` if the queue was empty.
+    /// Emit rate-limit throttle metrics for all bound queues.
+    ///
+    /// Shared between the weighted and unweighted poll paths so that the
+    /// throttle-recording logic only lives in one place.
+    async fn emit_throttle_metrics(&self, conn: &mut AsyncPgConnection) {
+        if let Ok(throttled_keys) =
+            queue::check_throttled_keys(conn, &self.config.queues).await
+        {
+            for key in throttled_keys {
+                self.registry
+                    .telemetry()
+                    .metrics
+                    .record_rate_limit_throttled(&key);
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn poll_once(&self, pool: &DbPool) -> bool {
         let mut conn = match pool.get().await {
@@ -7668,23 +7701,18 @@ impl Worker {
                         // Nothing in this queue; try the next in the permutation.
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "failed to claim task");
-                        return false;
+                        // Log the error and continue to the next queue in the
+                        // permutation. A transient DB error on one queue must
+                        // not starve the remaining queues in the ordered list
+                        // — aborting the whole loop here would break the
+                        // no-starvation guarantee stated in queue_fairness.rs.
+                        tracing::warn!(error = %e, "failed to claim task from queue; trying next in permutation");
                     }
                 }
             }
 
-            // All queues empty — check throttle keys and report idle.
-            if let Ok(throttled_keys) =
-                queue::check_throttled_keys(&mut conn, &self.config.queues).await
-            {
-                for key in throttled_keys {
-                    self.registry
-                        .telemetry()
-                        .metrics
-                        .record_rate_limit_throttled(&key);
-                }
-            }
+            // All queues tried — emit throttle metrics and report idle.
+            self.emit_throttle_metrics(&mut conn).await;
             return false;
         }
 
@@ -7721,16 +7749,7 @@ impl Worker {
                 true
             }
             Ok(None) => {
-                if let Ok(throttled_keys) =
-                    queue::check_throttled_keys(&mut conn, &self.config.queues).await
-                {
-                    for key in throttled_keys {
-                        self.registry
-                            .telemetry()
-                            .metrics
-                            .record_rate_limit_throttled(&key);
-                    }
-                }
+                self.emit_throttle_metrics(&mut conn).await;
                 false
             }
             Err(e) => {
