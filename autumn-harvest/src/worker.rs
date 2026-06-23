@@ -76,6 +76,8 @@ pub struct WorkerRuntimeConfig {
     pub worker_id: String,
     /// Queue names this worker polls.
     pub queues: Vec<String>,
+    /// Optional per-queue dispatch weights (issue #515). Empty = default unchanged behaviour.
+    pub queue_weights: std::collections::HashMap<String, u32>,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
     /// Maximum concurrent workflow task executions.
@@ -147,6 +149,22 @@ impl WorkerRuntimeConfig {
                 "worker must poll at least one queue".into(),
             ));
         }
+        // Warn when queue_weights contains keys that are not in the queues list.
+        // Those entries are silently ignored by effective_queue_weights, which
+        // only iterates over self.queues, so misconfigured keys are invisible
+        // at runtime.
+        if !self.queue_weights.is_empty() {
+            let queue_set: std::collections::HashSet<&str> =
+                self.queues.iter().map(String::as_str).collect();
+            for name in self.queue_weights.keys() {
+                if !queue_set.contains(name.as_str()) {
+                    tracing::warn!(
+                        queue = %name,
+                        "queue_weights entry has no matching bound queue and will be ignored"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -162,6 +180,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
         Self {
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: cfg.queues,
+            queue_weights: cfg.queue_weights,
             notification_database_url: cfg.notification_database_url,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
             max_concurrent_activities: cfg.max_concurrent_activities,
@@ -7596,10 +7615,26 @@ impl Worker {
         }
     }
 
+    /// Emit rate-limit throttle metrics for all bound queues.
+    ///
+    /// Shared between the weighted and unweighted poll paths so that the
+    /// throttle-recording logic only lives in one place.
+    async fn emit_throttle_metrics(&self, conn: &mut AsyncPgConnection) {
+        if let Ok(throttled_keys) = queue::check_throttled_keys(conn, &self.config.queues).await {
+            for key in throttled_keys {
+                self.registry
+                    .telemetry()
+                    .metrics
+                    .record_rate_limit_throttled(&key);
+            }
+        }
+    }
+
     /// Execute a single poll iteration.
     ///
     /// Gets a connection from the pool, tries to claim a task, dispatches it
     /// if found, or sleeps for `poll_interval` if the queue was empty.
+    #[allow(clippy::too_many_lines)]
     async fn poll_once(&self, pool: &DbPool) -> bool {
         let mut conn = match pool.get().await {
             Ok(conn) => conn,
@@ -7618,6 +7653,68 @@ impl Worker {
         let circuit_breakers = self.registry.circuit_breakers();
         let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
 
+        // --- Weighted queue selection (issue #515) ---
+        //
+        // When the operator has configured per-queue weights we compute a
+        // weighted-random permutation of the bound queues and attempt a
+        // single-queue `claim_task` call for each queue in that order,
+        // dispatching the first task found.  This ensures dispatch share tracks
+        // configured weights under sustained saturation while guaranteeing
+        // forward progress for every non-zero-weight queue (no-starvation).
+        //
+        // When no weights are configured (the default) we fall through to the
+        // original single `ANY($2)` claim call — byte-for-byte unchanged.
+        if !self.config.queue_weights.is_empty() {
+            let pairs = crate::queue_fairness::effective_queue_weights(
+                &self.config.queues,
+                &self.config.queue_weights,
+            );
+            let ordered =
+                crate::queue_fairness::weighted_queue_order(&pairs, &mut rand::thread_rng());
+
+            for queue_name in &ordered {
+                let single_queue = std::slice::from_ref(queue_name);
+                match queue::claim_task(
+                    &mut conn,
+                    single_queue,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    self.config.priority_aging_secs,
+                    circuit_breaker_activities,
+                    &self.ineligible_activities,
+                )
+                .await
+                {
+                    Ok(Some(task)) => {
+                        tracing::debug!(
+                            task_id = %task.id,
+                            task_type = %task.task_type,
+                            queue = %task.queue_name,
+                            "claimed task (weighted)"
+                        );
+                        self.dispatch_task(task, pool);
+                        return true;
+                    }
+                    Ok(None) => {
+                        // Nothing in this queue; try the next in the permutation.
+                    }
+                    Err(e) => {
+                        // Log the error and continue to the next queue in the
+                        // permutation. A transient DB error on one queue must
+                        // not starve the remaining queues in the ordered list
+                        // — aborting the whole loop here would break the
+                        // no-starvation guarantee stated in queue_fairness.rs.
+                        tracing::warn!(error = %e, "failed to claim task from queue; trying next in permutation");
+                    }
+                }
+            }
+
+            // All queues tried — emit throttle metrics and report idle.
+            self.emit_throttle_metrics(&mut conn).await;
+            return false;
+        }
+
+        // --- Default (unweighted) path: original single ANY($2) query ---
         match queue::claim_task(
             &mut conn,
             &self.config.queues,
@@ -7650,16 +7747,7 @@ impl Worker {
                 true
             }
             Ok(None) => {
-                if let Ok(throttled_keys) =
-                    queue::check_throttled_keys(&mut conn, &self.config.queues).await
-                {
-                    for key in throttled_keys {
-                        self.registry
-                            .telemetry()
-                            .metrics
-                            .record_rate_limit_throttled(&key);
-                    }
-                }
+                self.emit_throttle_metrics(&mut conn).await;
                 false
             }
             Err(e) => {
@@ -7688,6 +7776,12 @@ impl Worker {
             ClaimedTaskKind::Workflow => Arc::clone(&self.workflow_semaphore),
             ClaimedTaskKind::Activity => Arc::clone(&self.activity_semaphore),
         };
+
+        // Per-queue dispatch counter for live split observability (issue #515).
+        self.registry
+            .telemetry()
+            .metrics
+            .record_task_dispatched(&task.queue_name);
 
         let pool = pool.clone();
         let registry = Arc::clone(&self.registry);
@@ -8414,6 +8508,7 @@ mod tests {
             max_workflow_pause_duration: Duration::from_secs(24 * 3600),
             max_workflow_history_events: None,
             labels: std::collections::HashMap::new(),
+            queue_weights: std::collections::HashMap::new(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -8685,6 +8780,7 @@ mod tests {
             default_debounce_max_wait: Duration::from_secs(3600),
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,
+            queue_weights: std::collections::HashMap::new(),
             #[cfg(feature = "db")]
             sharded_pool: None,
         };

@@ -749,6 +749,7 @@ fn build_runtime_worker(
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
@@ -1378,6 +1379,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
@@ -1502,6 +1504,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
@@ -1659,6 +1662,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
@@ -1881,6 +1885,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
@@ -2133,6 +2138,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
@@ -2291,6 +2297,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
@@ -4908,6 +4915,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
@@ -5027,6 +5035,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
@@ -5135,6 +5144,7 @@ async fn workflow_schedule_pause_and_resume() {
 
                 workflow_task_timeout: std::time::Duration::from_secs(10),
                 labels: std::collections::HashMap::new(),
+                queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
