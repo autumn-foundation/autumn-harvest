@@ -715,7 +715,7 @@ impl WorkflowReplayer {
 
                                 let history = crate::store::load_history(&mut conn, exec.execution_id).await?;
                                 let headers = exec.context_headers.clone().and_then(|v| {
-                                    serde_json::from_value::<HashMap<String, String>>(v)
+                                    serde_json::from_value::<std::collections::HashMap<String, String>>(v)
                                         .map_err(|e| {
                                             tracing::warn!(error = %e, "replay canary: failed to deserialize context headers");
                                             e
@@ -1011,7 +1011,7 @@ async fn load_workflow_name_and_headers(
 
     let headers = raw_headers
         .and_then(|v| {
-            serde_json::from_value::<HashMap<String, String>>(v)
+            serde_json::from_value::<std::collections::HashMap<String, String>>(v)
                 .map_err(|e| {
                     tracing::warn!(error = %e, "replay_from_db: failed to deserialize context headers");
                     e

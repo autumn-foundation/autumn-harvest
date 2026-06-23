@@ -2746,8 +2746,11 @@ pub(crate) async fn has_harvest_admin_access(
         let is_harvest_admin = session
             .get("is_harvest_admin")
             .await
-            .is_some_and(|v| v == "true");
-        let is_admin = session.get("is_admin").await.is_some_and(|v| v == "true");
+            .is_some_and(|v| v == "true" || v == "1");
+        let is_admin = session
+            .get("is_admin")
+            .await
+            .is_some_and(|v| v == "true" || v == "1");
         let role = session.get("role").await;
         let is_admin_role =
             role.as_deref() == Some("admin") || role.as_deref() == Some("harvest_admin");
