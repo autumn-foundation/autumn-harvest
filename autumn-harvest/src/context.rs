@@ -748,6 +748,10 @@ pub struct WorkflowContext {
     /// payload against what was recorded in history, in addition to the name.
     /// Set by the `WorkflowReplayer` to detect non-deterministic input changes.
     strict_replay: bool,
+    /// When `true`, we are replaying a running workflow execution as a deploy-time
+    /// canary, allowing it to suspend at the end of its history without throwing
+    /// non-determinism errors.
+    canary_mode: bool,
     // ── Payload size caps (issue #252) ────────────────────────────────
     /// Logical workflow type name for use in `PayloadTooLarge` errors.
     /// Empty string when not known (legacy contexts, update handlers).
@@ -834,6 +838,9 @@ impl WorkflowContext {
 
     fn check_strict_replay_no_match(&self, actual_event: &str) -> HarvestResult<()> {
         if self.strict_replay {
+            if self.canary_mode && self.match_history(|m| m.position() >= m.len()) {
+                return Ok(());
+            }
             return Err(self.nd_error(
                 format!("early completion mismatch: expected <end of history>, got {actual_event}"),
                 self.match_history(|m| i32::try_from(m.position()).ok()),
@@ -947,6 +954,7 @@ impl WorkflowContext {
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             cancellation_reason,
             strict_replay: false,
+            canary_mode: false,
             workflow_name: String::new(),
             workflow_id: String::new(),
             build_id: None,
@@ -994,6 +1002,19 @@ impl WorkflowContext {
         ctx
     }
 
+    /// Like [`for_replay_strict_with_state`] but also sets `canary_mode` to `true`.
+    #[must_use]
+    pub fn for_replay_canary_with_state(
+        exec_id: ExecutionId,
+        events: Vec<WorkflowEvent>,
+        state: SharedState,
+    ) -> Self {
+        let mut ctx = Self::for_replay_with_state(exec_id, events, state);
+        ctx.strict_replay = true;
+        ctx.canary_mode = true;
+        ctx
+    }
+
     /// Returns `true` if there are unconsumed recorded history events that are
     /// not terminal lifecycle events (`WorkflowCompleted`, `WorkflowFailed`,
     /// `WorkflowCancelled`).
@@ -1038,6 +1059,7 @@ impl WorkflowContext {
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             cancellation_reason,
             strict_replay: false,
+            canary_mode: false,
             workflow_name: String::new(),
             workflow_id: String::new(),
             build_id: None,
@@ -1079,6 +1101,7 @@ impl WorkflowContext {
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
             cancellation_reason: None,
             strict_replay: false,
+            canary_mode: false,
             workflow_name: String::new(),
             workflow_id: String::new(),
             build_id: None,

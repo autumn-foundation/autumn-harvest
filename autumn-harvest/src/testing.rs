@@ -49,7 +49,9 @@ use serde_json::Value;
 
 use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
-use crate::executor::{WorkflowOutcome, run_workflow_strict, run_workflow_with_state};
+use crate::executor::{
+    WorkflowOutcome, run_workflow_canary, run_workflow_strict, run_workflow_with_state,
+};
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
 use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, WorkerId};
 
@@ -61,7 +63,7 @@ use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, WorkerId};
 ///
 /// Each variant maps to a distinct command/event kind so callers can
 /// distinguish (and report on) activity vs timer vs signal divergences.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NonDeterminismKind {
     /// An activity was scheduled with a different name than what history recorded.
     ActivityScheduleMismatch,
@@ -220,7 +222,13 @@ impl std::fmt::Display for ReplayReport {
 ///     workflow_name: "onboarding".to_string(),
 ///     execution_id: ExecutionId::new(),
 ///     events: vec![
-///         WorkflowEvent::WorkflowStarted { input: Value::Null, timestamp: Utc::now(), last_completion_result: None, last_error: None, scheduled_time: None },
+///         WorkflowEvent::WorkflowStarted {
+///             input: Value::Null,
+///             timestamp: Utc::now(),
+///             last_completion_result: None,
+///             last_error: None,
+///             scheduled_time: None,
+///         },
 ///     ],
 ///     context_headers: None,
 /// };
@@ -270,6 +278,15 @@ impl Default for WorkflowReplayer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(feature = "db")]
+struct SampledExecution {
+    shard_id: crate::types::ShardId,
+    execution_id: crate::types::ExecutionId,
+    workflow_name: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    context_headers: Option<serde_json::Value>,
 }
 
 impl WorkflowReplayer {
@@ -398,14 +415,50 @@ impl WorkflowReplayer {
             .unwrap_or_else(|| self.context_headers.clone());
         let outcome = run_workflow_strict(
             exec_id,
-            snapshot.events.clone(),
+            snapshot.events,
             handler,
             input,
             self.state.clone(),
             headers,
         )
         .await;
-        outcome_to_report(exec_id, total_events, &snapshot.events, outcome)
+        outcome_to_report(exec_id, total_events, outcome, false)
+    }
+
+    /// Replay a snapshot in canary mode (used for deploy-time verify).
+    pub async fn replay_canary_snapshot(&self, snapshot: HistorySnapshot) -> ReplayReport {
+        let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
+            return ReplayReport {
+                execution_id: snapshot.execution_id,
+                events_replayed: 0,
+                status: ReplayStatus::WorkflowFailed {
+                    error: format!(
+                        "workflow '{}' not registered in this replayer",
+                        snapshot.workflow_name
+                    ),
+                    event_index: 0,
+                },
+                mismatched_command_summary: None,
+            };
+        };
+
+        let exec_id = snapshot.execution_id;
+        let total_events = snapshot.events.len();
+        let input = extract_input(&snapshot.events);
+
+        let headers = snapshot
+            .context_headers
+            .unwrap_or_else(|| self.context_headers.clone());
+        let outcome = run_workflow_canary(
+            exec_id,
+            snapshot.events,
+            handler,
+            input,
+            self.state.clone(),
+            headers,
+        )
+        .await;
+        outcome_to_report(exec_id, total_events, outcome, true)
     }
 
     /// Replay a raw event list against the **single** registered handler.
@@ -476,14 +529,14 @@ impl WorkflowReplayer {
 
         let outcome = run_workflow_strict(
             exec_id,
-            events.clone(),
+            events,
             handler,
             input,
             self.state.clone(),
             self.context_headers.clone(),
         )
         .await;
-        outcome_to_report(exec_id, total_events, &events, outcome)
+        outcome_to_report(exec_id, total_events, outcome, false)
     }
 
     /// Replay as if the workflow history were reset at `reset_to_event_id`.
@@ -591,6 +644,340 @@ impl WorkflowReplayer {
         };
         Ok(self.replay_from_snapshot(snapshot).await)
     }
+
+    /// Run the replay canary over a sample of running executions.
+    #[cfg(feature = "db")]
+    #[allow(clippy::too_many_lines, clippy::missing_errors_doc)]
+    pub async fn run_canary(
+        &self,
+        pool: &crate::shard::ShardedDbPool,
+        options: ReplayCanaryOptions,
+    ) -> crate::error::HarvestResult<ReplayCanaryReport> {
+        let mut options = options;
+        options.sample_size = options.sample_size.min(1000);
+
+        let mut query_futures = Vec::new();
+        for (shard_id, shard_pool) in pool.iter_shards() {
+            let shard_pool = shard_pool.clone();
+            let options_ref = options.clone();
+            query_futures.push(async move {
+                let mut conn = shard_pool
+                    .get()
+                    .await
+                    .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
+                let executions = query_running_executions(&mut conn, &options_ref).await?;
+                Ok::<_, crate::error::HarvestError>((shard_id, executions))
+            });
+        }
+
+        let query_results = futures::future::try_join_all(query_futures).await?;
+
+        let mut all_executions = Vec::new();
+        for (shard_id, executions) in query_results {
+            for (id, name, created, headers) in executions {
+                all_executions.push(SampledExecution {
+                    shard_id,
+                    execution_id: crate::types::ExecutionId::from_uuid(id),
+                    workflow_name: name,
+                    created_at: created,
+                    context_headers: headers,
+                });
+            }
+        }
+
+        all_executions.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.execution_id.as_uuid().cmp(&a.execution_id.as_uuid()))
+        });
+
+        let total_available = all_executions.len();
+        let truncated = total_available > options.sample_size;
+        if truncated {
+            all_executions.truncate(options.sample_size);
+        }
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(20));
+        let mut replay_futures = Vec::new();
+        for exec in all_executions {
+            let shard_pool = pool.pool_for(exec.shard_id).clone();
+            let replayer_ref = self;
+            let sem = Arc::clone(&semaphore);
+            replay_futures.push(async move {
+                let report = match sem.acquire_owned().await {
+                    Ok(_permit) => {
+                        let load_and_replay = async {
+                            let snapshot = {
+                                let mut conn = shard_pool
+                                    .get()
+                                    .await
+                                    .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
+
+                                let history = crate::store::load_history(&mut conn, exec.execution_id).await?;
+                                let headers = exec.context_headers.clone().and_then(|v| {
+                                    serde_json::from_value::<HashMap<String, String>>(v)
+                                        .map_err(|e| {
+                                            tracing::warn!(error = %e, "replay canary: failed to deserialize context headers");
+                                            e
+                                        })
+                                        .ok()
+                                });
+                                HistorySnapshot {
+                                    workflow_name: exec.workflow_name.clone(),
+                                    execution_id: exec.execution_id,
+                                    events: history.events,
+                                    context_headers: headers,
+                                }
+                            }; // `conn` is dropped here
+
+                            let report = replayer_ref.replay_canary_snapshot(snapshot).await;
+                            Ok::<_, crate::error::HarvestError>(report)
+                        };
+
+                        match load_and_replay.await {
+                            Ok(r) => r,
+                            Err(e) => ReplayReport {
+                                execution_id: exec.execution_id,
+                                events_replayed: 0,
+                                status: ReplayStatus::WorkflowFailed {
+                                    error: format!("canary loading failure: {e}"),
+                                    event_index: 0,
+                                },
+                                mismatched_command_summary: None,
+                            },
+                        }
+                    }
+                    Err(e) => ReplayReport {
+                        execution_id: exec.execution_id,
+                        events_replayed: 0,
+                        status: ReplayStatus::WorkflowFailed {
+                            error: format!("semaphore acquire failed: {e}"),
+                            event_index: 0,
+                        },
+                        mismatched_command_summary: None,
+                    },
+                };
+
+                (exec.workflow_name, exec.execution_id, report)
+            });
+        }
+
+        let replay_results = futures::future::join_all(replay_futures).await;
+
+        let mut sampled = 0;
+        let mut replay_succeeded = 0;
+        let mut replay_failed = 0;
+        let mut details = Vec::new();
+        let mut summary_by_type = std::collections::HashMap::new();
+
+        for (wf_name, exec_id, report) in replay_results {
+            sampled += 1;
+            let type_summary =
+                summary_by_type
+                    .entry(wf_name.clone())
+                    .or_insert_with(|| CanaryTypeSummary {
+                        sampled: 0,
+                        replay_succeeded: 0,
+                        replay_failed: 0,
+                    });
+            type_summary.sampled += 1;
+
+            match report.status {
+                ReplayStatus::ReplaySucceeded => {
+                    replay_succeeded += 1;
+                    type_summary.replay_succeeded += 1;
+                }
+                ReplayStatus::NonDeterminismDetected {
+                    kind,
+                    expected,
+                    actual,
+                    event_index,
+                } => {
+                    replay_failed += 1;
+                    type_summary.replay_failed += 1;
+                    let error = report
+                        .mismatched_command_summary
+                        .clone()
+                        .unwrap_or_else(|| format!("Non-determinism detected: {kind:?}"));
+                    details.push(CanaryFailureDetail {
+                        execution_id: exec_id,
+                        workflow_name: wf_name,
+                        kind: Some(kind),
+                        expected: Some(expected),
+                        actual: Some(actual),
+                        event_index: Some(event_index),
+                        error,
+                    });
+                }
+                ReplayStatus::WorkflowFailed { error, event_index } => {
+                    replay_failed += 1;
+                    type_summary.replay_failed += 1;
+                    details.push(CanaryFailureDetail {
+                        execution_id: exec_id,
+                        workflow_name: wf_name,
+                        kind: None,
+                        expected: None,
+                        actual: None,
+                        event_index: Some(event_index),
+                        error,
+                    });
+                }
+            }
+        }
+
+        let verdict = if replay_failed > 0 {
+            CanaryVerdict::Fail
+        } else {
+            CanaryVerdict::Pass
+        };
+
+        Ok(ReplayCanaryReport {
+            verdict,
+            sampled,
+            replay_succeeded,
+            replay_failed,
+            details,
+            summary_by_type,
+            truncated,
+        })
+    }
+}
+
+#[cfg(feature = "db")]
+async fn query_running_executions(
+    conn: &mut diesel_async::AsyncPgConnection,
+    options: &ReplayCanaryOptions,
+) -> crate::error::HarvestResult<
+    Vec<(
+        uuid::Uuid,
+        String,
+        chrono::DateTime<chrono::Utc>,
+        Option<serde_json::Value>,
+    )>,
+> {
+    use crate::schema::harvest_workflow_executions::dsl::{
+        context_headers, created_at, harvest_workflow_executions, id, queue_name, state,
+        workflow_name,
+    };
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let mut query = harvest_workflow_executions
+        .filter(state.eq("RUNNING".to_string()))
+        .into_boxed();
+
+    if let Some(ref wf_name) = options.workflow_name {
+        query = query.filter(workflow_name.eq(wf_name.clone()));
+    }
+    if let Some(ref q_name) = options.queue_name {
+        query = query.filter(queue_name.eq(q_name.clone()));
+    }
+
+    let rows = query
+        .select((id, workflow_name, created_at, context_headers))
+        .order((created_at.desc(), id.desc()))
+        .limit(i64::try_from(options.sample_size).unwrap_or(i64::MAX))
+        .load::<(
+            uuid::Uuid,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            Option<serde_json::Value>,
+        )>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// ReplayCanary (db feature only)
+// ---------------------------------------------------------------------------
+
+/// Options for running the pre-deploy replay canary.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ReplayCanaryOptions {
+    /// Maximum number of running workflow executions to sample.
+    pub sample_size: usize,
+    /// Optional filter to limit samples to a specific workflow type.
+    pub workflow_name: Option<String>,
+    /// Optional filter to limit samples to a specific task queue.
+    pub queue_name: Option<String>,
+}
+
+#[cfg(feature = "db")]
+impl Default for ReplayCanaryOptions {
+    fn default() -> Self {
+        Self {
+            sample_size: 500,
+            workflow_name: None,
+            queue_name: None,
+        }
+    }
+}
+
+/// The overall pass/fail verdict of the replay canary.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryVerdict {
+    /// All sampled executions successfully replayed without non-determinism.
+    Pass,
+    /// One or more executions failed to replay.
+    Fail,
+}
+
+/// Detailed information about a failed replay canary execution.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CanaryFailureDetail {
+    /// The ID of the failed execution.
+    pub execution_id: ExecutionId,
+    /// The workflow type name.
+    pub workflow_name: String,
+    /// The kind of non-determinism detected (or None if it was a general execution failure).
+    pub kind: Option<NonDeterminismKind>,
+    /// Expected command string.
+    pub expected: Option<String>,
+    /// Actual command string.
+    pub actual: Option<String>,
+    /// Index of the event where the failure occurred.
+    pub event_index: Option<usize>,
+    /// The error message.
+    pub error: String,
+}
+
+/// Aggregated counts by workflow type.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CanaryTypeSummary {
+    /// Number of runs sampled of this type.
+    pub sampled: usize,
+    /// Number of runs of this type that replayed successfully.
+    pub replay_succeeded: usize,
+    /// Number of runs of this type that failed to replay.
+    pub replay_failed: usize,
+}
+
+/// Complete report returned by the replay canary.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReplayCanaryReport {
+    /// Overall verdict (pass if 100% of samples succeed).
+    pub verdict: CanaryVerdict,
+    /// Total number of executions sampled across shards.
+    pub sampled: usize,
+    /// Number of executions that replayed successfully.
+    pub replay_succeeded: usize,
+    /// Number of executions that failed to replay.
+    pub replay_failed: usize,
+    /// Failure details (empty on Pass).
+    pub details: Vec<CanaryFailureDetail>,
+    /// Aggregated summary by workflow type.
+    pub summary_by_type: std::collections::HashMap<String, CanaryTypeSummary>,
+    /// Whether more running executions were available than the sample size.
+    pub truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -655,8 +1042,8 @@ fn extract_input(events: &[WorkflowEvent]) -> Value {
 fn outcome_to_report(
     exec_id: ExecutionId,
     total_events: usize,
-    events: &[WorkflowEvent],
     outcome: WorkflowOutcome,
+    canary_mode: bool,
 ) -> ReplayReport {
     match outcome {
         WorkflowOutcome::Completed { .. } | WorkflowOutcome::ContinuedAsNew { .. } => {
@@ -671,32 +1058,51 @@ fn outcome_to_report(
         // Suspension during strict replay means the workflow tried to issue a
         // new command with no matching history event (the oneshot is never
         // resolved in replay mode, so the 100 ms timeout fires).
-        WorkflowOutcome::Suspended { .. } => ReplayReport {
+        WorkflowOutcome::Suspended { .. } => {
+            if canary_mode {
+                ReplayReport {
+                    execution_id: exec_id,
+                    events_replayed: total_events,
+                    status: ReplayStatus::ReplaySucceeded,
+                    mismatched_command_summary: None,
+                }
+            } else {
+                ReplayReport {
+                    execution_id: exec_id,
+                    events_replayed: total_events,
+                    status: ReplayStatus::NonDeterminismDetected {
+                        kind: NonDeterminismKind::Unknown,
+                        expected: "<workflow to complete replay>".to_string(),
+                        actual: "<workflow suspended — issued new command with no matching history event>"
+                            .to_string(),
+                        event_index: total_events,
+                    },
+                    mismatched_command_summary: Some(
+                        "workflow suspended during replay (new command beyond recorded history)"
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+
+        WorkflowOutcome::Failed {
+            error,
+            non_deterministic_details,
+        } => try_parse_non_determinism(
+            &error,
+            exec_id,
+            total_events,
+            non_deterministic_details.as_ref(),
+        )
+        .unwrap_or(ReplayReport {
             execution_id: exec_id,
             events_replayed: total_events,
-            status: ReplayStatus::NonDeterminismDetected {
-                kind: NonDeterminismKind::Unknown,
-                expected: "<workflow to complete replay>".to_string(),
-                actual: "<workflow suspended — issued new command with no matching history event>"
-                    .to_string(),
+            status: ReplayStatus::WorkflowFailed {
+                error,
                 event_index: total_events,
             },
-            mismatched_command_summary: Some(
-                "workflow suspended during replay (new command beyond recorded history)"
-                    .to_string(),
-            ),
-        },
-
-        WorkflowOutcome::Failed { error, .. } => try_parse_non_determinism(&error, exec_id, events)
-            .unwrap_or(ReplayReport {
-                execution_id: exec_id,
-                events_replayed: total_events,
-                status: ReplayStatus::WorkflowFailed {
-                    error,
-                    event_index: total_events,
-                },
-                mismatched_command_summary: None,
-            }),
+            mismatched_command_summary: None,
+        }),
     }
 }
 
@@ -706,13 +1112,30 @@ fn outcome_to_report(
 fn try_parse_non_determinism(
     error: &str,
     exec_id: ExecutionId,
-    events: &[WorkflowEvent],
+    event_index_fallback: usize,
+    details: Option<&crate::error::NonDeterministicDetails>,
 ) -> Option<ReplayReport> {
     // HarvestError::NonDeterministic formats as "non-deterministic replay: {msg}"
     let msg = error.strip_prefix("non-deterministic replay: ")?;
 
-    let (kind, expected, actual) = parse_nd_message(msg);
-    let event_index = find_event_index(events, &actual);
+    let (kind, expected, actual, event_index) = details.map_or_else(
+        || {
+            let (kind, expected, actual) = parse_nd_message(msg);
+            (kind, expected, actual, event_index_fallback)
+        },
+        |d| {
+            let (kind, _, _) = parse_nd_message(msg);
+            (
+                kind,
+                d.expected.clone().unwrap_or_default(),
+                d.actual.clone().unwrap_or_default(),
+                d.event_index
+                    .and_then(|idx| usize::try_from(idx).ok())
+                    .unwrap_or(event_index_fallback),
+            )
+        },
+    );
+
     let summary = format!("expected \"{expected}\", got \"{actual}\"");
 
     Some(ReplayReport {
@@ -774,17 +1197,6 @@ fn classify_kind(kind_str: &str, actual: &str) -> NonDeterminismKind {
         "early completion" => NonDeterminismKind::EarlyCompletion,
         _ => NonDeterminismKind::Unknown,
     }
-}
-
-/// Find the index of the first event in `events` whose type matches the
-/// event type embedded in `actual` (e.g. `"ActivityScheduled(step_two)"` →
-/// look for `ActivityScheduled`).  Falls back to 0 if not found.
-fn find_event_index(events: &[WorkflowEvent], actual: &str) -> usize {
-    let target = actual.split('(').next().unwrap_or(actual);
-    events
-        .iter()
-        .position(|e| e.type_name() == target)
-        .unwrap_or(0)
 }
 
 // ===========================================================================
@@ -1307,7 +1719,7 @@ impl ReplayVerifier {
     ///
     /// Panics if the internal semaphore is closed, which cannot happen under normal use.
     pub async fn verify_dir(&self, dir: &std::path::Path) -> BatchReplayReport {
-        let files = match collect_json_files(dir) {
+        let files = match collect_json_files(dir).await {
             Ok(f) => f,
             Err(e) => {
                 let result = FixtureResult {
@@ -1404,30 +1816,33 @@ impl ReplayVerifier {
 ///
 /// Returns `Err` if the top-level `dir` cannot be read so the caller can
 /// surface it as a harness error rather than silently returning zero fixtures.
-fn collect_json_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
+async fn collect_json_files(
+    dir: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, std::io::Error> {
     let mut files = Vec::new();
+    let mut dirs_to_visit = vec![dir.to_path_buf()];
+
     // Probe the top-level directory explicitly so a missing/unreadable path
     // is distinguishable from a legitimately empty directory.
-    let top = std::fs::read_dir(dir)?;
-    collect_json_files_from(top, &mut files);
-    files.sort();
-    Ok(files)
-}
+    let _ = tokio::fs::read_dir(dir).await?;
 
-fn collect_json_files_from(entries: std::fs::ReadDir, files: &mut Vec<std::path::PathBuf>) {
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // Use DirEntry::file_type() which does NOT follow symlinks, preventing
-        // infinite recursion on symlink cycles.
-        let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
-        if is_dir {
-            if let Ok(sub) = std::fs::read_dir(&path) {
-                collect_json_files_from(sub, files);
+    while let Some(current_dir) = dirs_to_visit.pop() {
+        if let Ok(mut entries) = tokio::fs::read_dir(&current_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if let Ok(file_type) = entry.file_type().await {
+                    if file_type.is_dir() {
+                        dirs_to_visit.push(path);
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                        files.push(path);
+                    }
+                }
             }
-        } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
-            files.push(path);
         }
     }
+
+    files.sort();
+    Ok(files)
 }
 
 /// Replay a single fixture file and return a [`FixtureResult`].
@@ -1439,7 +1854,7 @@ async fn replay_fixture_file(
     allow_unregistered: bool,
 ) -> FixtureResult {
     // Read file.
-    let json = match std::fs::read_to_string(path) {
+    let json = match tokio::fs::read_to_string(path).await {
         Ok(s) => s,
         Err(e) => {
             return FixtureResult {

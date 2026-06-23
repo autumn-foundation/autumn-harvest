@@ -148,6 +148,7 @@ async fn eris_unauthenticated_start_workflow_terminate_if_running_is_blocked() {
 #[tokio::test]
 async fn eris_start_workflow_terminate_if_running_honors_configured_session_key() {
     let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("dev");
     api_state.set_admin_auth_session_key("operator_id");
     let app = app_with_api_state(api_state);
 
@@ -426,6 +427,7 @@ async fn eris_unauthenticated_vantage_dead_letters_page_is_blocked() {
 #[tokio::test]
 async fn eris_builtin_guard_honors_configured_session_key() {
     let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("dev");
     api_state.set_admin_auth_session_key("operator_id");
     let app = app_with_api_state(api_state);
 
@@ -445,6 +447,7 @@ async fn eris_builtin_guard_honors_configured_session_key() {
 #[tokio::test]
 async fn eris_builtin_guard_does_not_accept_hard_coded_admin_id() {
     let api_state = HarvestApiState::new();
+    api_state.set_deployment_profile("dev");
     api_state.set_admin_auth_session_key("operator_id");
     let app = app_with_api_state(api_state);
 
@@ -515,14 +518,48 @@ async fn eris_unauthenticated_reset_workflow_is_accessible() {
 }
 
 #[tokio::test]
-async fn eris_unauthenticated_retention_run_now_is_accessible() {
+async fn eris_unauthenticated_retention_run_now_is_blocked() {
     let app = unauthenticated_app();
     let res = app
         .oneshot(post_json("/admin/retention/run-now", "{}"))
         .await
         .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_non_admin_session_is_blocked_in_non_dev_profile() {
+    let api_state = HarvestApiState::new();
+    let app = app_with_api_state(api_state);
+
+    let mut request = post_json("/admin/retention/run-now", "{}");
+    let mut data = HashMap::new();
+    data.insert("user_id".to_string(), "some-user".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        data,
+    ));
+
+    let res = app.oneshot(request).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn eris_admin_session_is_allowed_in_non_dev_profile() {
+    let api_state = HarvestApiState::new();
+    let app = app_with_api_state(api_state);
+
+    let mut request = post_json("/admin/retention/run-now", "{}");
+    let mut data = HashMap::new();
+    data.insert("user_id".to_string(), "some-user".to_string());
+    data.insert("role".to_string(), "admin".to_string());
+    request.extensions_mut().insert(Session::new_for_test(
+        "harvest-test-session".to_string(),
+        data,
+    ));
+
+    let res = app.oneshot(request).await.unwrap();
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
-    assert_ne!(res.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

@@ -123,6 +123,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
     "\n",
     include_str!("../migrations/20260618000001_harvest_debounce/up.sql"),
+    "\n",
+    include_str!("../migrations/20260619000000_harvest_task_queue_created_at/up.sql")
 );
 
 // ── Metrics recorder capturing redrive outcomes ──────────────────────────────
@@ -226,6 +228,12 @@ async fn seal_state(
     .execute(conn)
     .await
     .expect("seal state");
+
+    if state == "FAILED" || state == "COMPLETED" || state == "CANCELLED" {
+        autumn_harvest::queue::fail_open_tasks_for_execution(conn, exec_id, "boom")
+            .await
+            .expect("fail open tasks");
+    }
 }
 
 /// Insert a workflow-task DLQ row for `exec_id` and return its id.

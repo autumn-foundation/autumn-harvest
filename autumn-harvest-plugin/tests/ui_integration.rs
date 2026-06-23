@@ -732,6 +732,7 @@ async fn insert_test_worker(
 fn build_single_shard_ui_app(database_url: &str) -> axum::Router {
     let pool = build_test_pool(database_url);
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(HarvestDbPool::from(pool));
     api_state.install(HarvestApiRuntime::new(
         echo_registry(),
@@ -1057,8 +1058,7 @@ async fn ui_dead_letters_summary_invalid_group_by_returns_400() {
     let (database_url, _container) = setup_test_database_url().await;
     let app = build_single_shard_ui_app(&database_url);
 
-    let (status, _body) =
-        fetch_html(&app, "/ui/dead-letters?view=summary&group_by=tenant_id").await;
+    let (status, _body) = fetch_html(&app, "/dead-letters?view=summary&group_by=tenant_id").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -1082,7 +1082,7 @@ async fn ui_dead_letters_summary_regroups_on_selected_dimension() {
     );
     // Seed inserts ACTIVITY on shard0 and WORKFLOW on shard1.
     assert!(
-        html.contains("ACTIVITY") && html.contains("WORKFLOW"),
+        html.contains("activity") && html.contains("workflow"),
         "task_type groups should render both kinds: {html}"
     );
 }

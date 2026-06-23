@@ -17,3 +17,7 @@
 -- to scheduled_at via COALESCE until they drain.
 ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
 ALTER TABLE harvest_task_queue ALTER COLUMN created_at SET DEFAULT clock_timestamp();
+
+CREATE INDEX IF NOT EXISTS idx_harvest_we_canary_order
+    ON harvest_workflow_executions (created_at DESC, id DESC)
+    WHERE state = 'RUNNING';

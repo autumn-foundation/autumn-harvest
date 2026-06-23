@@ -37,6 +37,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
@@ -173,7 +174,14 @@ fn recovery_aware_handler<'a>(
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 async fn setup_db() -> (AsyncPgConnection, String, ContainerAsync<Postgres>) {
-    let container = Postgres::default().start().await.expect("postgres start");
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .await
+        .expect("postgres start");
     let host = container.get_host().await.expect("host");
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@{host}:{port}/postgres");
@@ -489,8 +497,8 @@ async fn last_error_reflects_prior_failure_and_clears_after_recovery() {
     > {
         Box::pin(async move {
             let run_n = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let prev_result: Option<Cursor> = ctx
-                .last_completion_result::<Cursor>()
+            let prev_result: Option<serde_json::Value> = ctx
+                .last_completion_result::<serde_json::Value>()
                 .map_err(|e| e.to_string())?;
             let last_err: Option<String> = ctx.last_error();
             match run_n {

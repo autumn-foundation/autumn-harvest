@@ -3652,6 +3652,7 @@ async fn retention_janitor_deletes_only_rows_older_than_max_age_and_cascades_chi
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
 
     let runner = HarvestRunner::start(
         autumn_harvest::HarvestBuilder::new()

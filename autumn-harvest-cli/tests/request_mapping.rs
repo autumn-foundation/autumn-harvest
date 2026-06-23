@@ -1177,3 +1177,31 @@ fn schedule_backfill_missing_to_is_rejected_by_clap() {
         "--to is required and its absence should be rejected"
     );
 }
+
+#[test]
+fn canary_maps_to_management_api_request() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "canary",
+        "--sample-size",
+        "200",
+        "--workflow-name",
+        "checkout_workflow",
+        "--queue",
+        "orders_queue",
+    ])
+    .expect("canary args should parse");
+
+    let request = cli.api_request().expect("canary request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/workflows/replay-canary");
+    assert_eq!(
+        request.body,
+        Some(json!({
+            "sample_size": 200,
+            "workflow_name": "checkout_workflow",
+            "queue_name": "orders_queue",
+        }))
+    );
+}

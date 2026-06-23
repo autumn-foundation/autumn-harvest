@@ -2038,8 +2038,8 @@ async fn test_exact_pool_routing_cross_shard() {
     .await
     .unwrap();
 
-    // Verify it processed the row (returned count 1, or 1 task was loaded)
-    assert_eq!(sweep_count, 1);
+    // Verify it processed the row (returned count 0 since task was skipped/not processed)
+    assert_eq!(sweep_count, 0);
 
     // Verify outbox row STILL exists in Shard 0 (it was skipped because Shard 1 pool was unavailable!)
     let outbox_rows_after = outbox_dsl::harvest_completion_trigger_outbox
@@ -2062,6 +2062,42 @@ async fn test_runner_startup_fails_on_sync_failure() {
     let bad_pool = build_pool("postgres://postgres:postgres@localhost:12345/non_existent");
 
     let built = autumn_harvest::HarvestBuilder::new()
+        .workflows(vec![
+            autumn_harvest::info::WorkflowInfo {
+                name: "source",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
+            autumn_harvest::info::WorkflowInfo {
+                name: "target",
+                module: "tests",
+                handler: test_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                max_input_bytes: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+            },
+        ])
         .completion_triggers(vec![
             autumn_harvest::completion_trigger::CompletionTrigger {
                 id: uuid::Uuid::new_v4(),

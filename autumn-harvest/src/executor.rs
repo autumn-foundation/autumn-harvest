@@ -236,6 +236,141 @@ pub async fn run_workflow_strict(
     .await
 }
 
+/// Run a workflow function through replay canary mode.
+///
+/// Simulates workflow execution under strict replay, but utilizing a canary
+/// context. If execution reaches the end of the recorded history and suspends,
+/// it returns `WorkflowOutcome::Suspended` rather than a non-determinism error.
+/// If it suspends *before* all events in history are processed, it fails.
+#[allow(clippy::implicit_hasher, clippy::too_many_lines)]
+pub async fn run_workflow_canary(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    state: SharedState,
+    context_headers: std::collections::HashMap<String, String>,
+) -> WorkflowOutcome {
+    let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
+        .with_context_headers(context_headers);
+
+    let span = tracing::info_span!(
+        "harvest.workflow.execute",
+        "otel.kind" = "internal",
+        { ATTR_EXECUTION_ID } = %exec_id,
+        { ATTR_REPLAY } = true,
+    );
+
+    async {
+        let timeout_result = tokio::time::timeout(SUSPENSION_TIMEOUT, handler(&ctx, input)).await;
+        match timeout_result {
+            Ok(Ok(output)) => ctx.take_deferred_nd_error().map_or_else(
+                || {
+                    if ctx.history_has_unconsumed_events() {
+                        let nd = ctx.take_nd_details().or_else(|| {
+                            Some(crate::error::NonDeterministicDetails {
+                                event_index: i32::try_from(ctx.replay_position()).ok(),
+                                expected: Some("<end of history>".to_string()),
+                                actual: Some("<workflow returned early>".to_string()),
+                                workflow_type: Some(ctx.workflow_type().to_string()),
+                                build_id: ctx.build_id().map(String::from),
+                            })
+                        });
+                        WorkflowOutcome::Failed {
+                            error: "non-deterministic replay: early completion mismatch: \
+                                    expected <end of history>, got <workflow returned early>"
+                                .to_string(),
+                            non_deterministic_details: nd,
+                        }
+                    } else if ctx.drain_commands().into_iter().any(|cmd| {
+                        !matches!(
+                            cmd,
+                            WorkflowCommand::UpsertSearchAttributes { .. }
+                                | WorkflowCommand::SetCurrentDetails { .. }
+                        )
+                    }) {
+                        let nd = ctx.take_nd_details().or_else(|| {
+                            Some(crate::error::NonDeterministicDetails {
+                                event_index: i32::try_from(ctx.replay_position()).ok(),
+                                expected: Some("<no new commands>".to_string()),
+                                actual: Some("<new commands emitted>".to_string()),
+                                workflow_type: Some(ctx.workflow_type().to_string()),
+                                build_id: ctx.build_id().map(String::from),
+                            })
+                        });
+                        WorkflowOutcome::Failed {
+                            error: "non-deterministic replay: new commands emitted beyond \
+                                    recorded history"
+                                .to_string(),
+                            non_deterministic_details: nd,
+                        }
+                    } else {
+                        WorkflowOutcome::Completed { output }
+                    }
+                },
+                |nd| {
+                    let details = ctx.take_nd_details();
+                    WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                    }
+                },
+            ),
+            Ok(Err(error)) => {
+                let details = ctx.take_nd_details();
+                ctx.take_deferred_nd_error().map_or(
+                    WorkflowOutcome::Failed {
+                        error,
+                        non_deterministic_details: details.clone(),
+                    },
+                    |nd| WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                    },
+                )
+            }
+            Err(_elapsed) => {
+                if let Some(nd) = ctx.take_deferred_nd_error() {
+                    let details = ctx.take_nd_details();
+                    return WorkflowOutcome::Failed {
+                        error: format!("non-deterministic replay: {nd}"),
+                        non_deterministic_details: details,
+                    };
+                }
+
+                // If history still has unconsumed events when we suspend, that's non-deterministic
+                if ctx.history_has_unconsumed_events() {
+                    let nd = ctx.take_nd_details().or_else(|| {
+                        Some(crate::error::NonDeterministicDetails {
+                            event_index: i32::try_from(ctx.replay_position()).ok(),
+                            expected: Some("<consume all history>".to_string()),
+                            actual: Some("<workflow suspended early>".to_string()),
+                            workflow_type: Some(ctx.workflow_type().to_string()),
+                            build_id: ctx.build_id().map(String::from),
+                        })
+                    });
+                    return WorkflowOutcome::Failed {
+                        error: "non-deterministic replay: workflow suspended before all history events were replayed".to_string(),
+                        non_deterministic_details: nd,
+                    };
+                }
+
+                let mut commands = ctx.drain_commands();
+                if let Some(idx) = commands
+                    .iter()
+                    .rposition(|cmd| matches!(cmd, WorkflowCommand::ContinueAsNew { .. }))
+                    && let WorkflowCommand::ContinueAsNew { input } = commands.swap_remove(idx)
+                {
+                    return WorkflowOutcome::ContinuedAsNew { input };
+                }
+                WorkflowOutcome::Suspended { commands }
+            }
+        }
+    }
+    .instrument(span)
+    .await
+}
+
 /// Run a workflow function through replay and live execution with shared state.
 ///
 /// Returns a triple of `(outcome, pending_commands, span_handle)`:

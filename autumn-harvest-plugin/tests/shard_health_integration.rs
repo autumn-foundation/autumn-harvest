@@ -224,6 +224,7 @@ fn runtime_for(
 
 fn api_state(pool: HarvestDbPool, runtime: HarvestApiRuntime) -> HarvestApiState {
     let state = HarvestApiState::new();
+    state.set_admin_auth_boundary(true);
     state.install_storage_pool(pool);
     state.install(runtime);
     state.set_worker_stale_threshold(Duration::from_secs(10));

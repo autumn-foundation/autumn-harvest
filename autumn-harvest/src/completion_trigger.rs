@@ -725,11 +725,11 @@ pub async fn enforce_completion_triggers_outbox(
         .await
         .map_err(crate::error::database_error)?;
 
-    let count = pending_tasks.len();
-    if count == 0 {
+    if pending_tasks.is_empty() {
         return Ok(0);
     }
 
+    let mut processed_count = 0;
     for task in pending_tasks {
         let target_shard = crate::types::ShardId::new(task.target_shard);
         let Some(target_pool) = sharded_pool
@@ -816,6 +816,7 @@ pub async fn enforce_completion_triggers_outbox(
                     .filter(outbox_dsl::id.eq(task.id))
                     .execute(conn)
                     .await;
+                processed_count += 1;
             }
             Err(crate::error::HarvestError::PayloadTooLarge {
                 kind,
@@ -836,6 +837,7 @@ pub async fn enforce_completion_triggers_outbox(
                     .filter(outbox_dsl::id.eq(task.id))
                     .execute(conn)
                     .await;
+                processed_count += 1;
             }
             Err(e) => {
                 tracing::error!(
@@ -846,7 +848,7 @@ pub async fn enforce_completion_triggers_outbox(
         }
     }
 
-    Ok(count)
+    Ok(processed_count)
 }
 
 #[cfg(test)]
