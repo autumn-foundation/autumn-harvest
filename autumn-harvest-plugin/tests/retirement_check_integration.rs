@@ -113,6 +113,7 @@ fn two_shard_router() -> ShardRouter {
 
 fn build_api_app(pool: HarvestDbPool, router: ShardRouter) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(pool);
     api_state.install(HarvestApiRuntime::new(
         Arc::new(HandlerRegistry::new(vec![], vec![])),

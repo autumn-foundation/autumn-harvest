@@ -210,6 +210,11 @@ fn version_usage_is_covered() {
 }
 
 #[test]
+fn canary_is_covered() {
+    assert_covered(&["canary"]);
+}
+
+#[test]
 fn version_gate_retirement_is_covered() {
     assert_covered(&[
         "version-gate-retirement",
@@ -814,5 +819,18 @@ fn start_batch_atomic_body_fields_are_documented() {
         "--items-json",
         r#"[{"workflow_name":"onboarding"}]"#,
         "--atomic",
+    ]);
+}
+
+#[test]
+fn canary_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "canary",
+        "--sample-size",
+        "20",
+        "--workflow-name",
+        "billing",
+        "--queue",
+        "critical",
     ]);
 }

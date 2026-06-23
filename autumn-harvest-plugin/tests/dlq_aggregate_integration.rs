@@ -557,7 +557,7 @@ async fn aggregate_invalid_group_by_returns_400() {
     let (status, body) = get_json(&app, "/dead-letters/aggregate?group_by=tenant_id").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body["error"]
+        body["detail"]
             .as_str()
             .unwrap_or("")
             .contains("unknown group_by dimension"),
@@ -573,7 +573,7 @@ async fn aggregate_missing_group_by_returns_400() {
     let (status, body) = get_json(&app, "/dead-letters/aggregate?limit_groups=10").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body["error"]
+        body["detail"]
             .as_str()
             .unwrap_or("")
             .contains("at least one group_by"),
@@ -593,7 +593,7 @@ async fn aggregate_limit_groups_out_of_range_returns_400() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body["error"]
+        body["detail"]
             .as_str()
             .unwrap_or("")
             .contains("limit_groups"),

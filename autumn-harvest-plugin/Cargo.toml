@@ -17,7 +17,7 @@ webhooks = ["autumn-harvest/db"]
 
 
 [dependencies]
-autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", features = ["db"] }
+autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", features = ["db", "testing"] }
 autumn-web = "0.5"
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }

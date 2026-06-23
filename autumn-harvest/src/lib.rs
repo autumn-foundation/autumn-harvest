@@ -297,6 +297,10 @@ pub use testing::{
     BatchReplayReport, CiReport, FailOnMode, FixtureResult, FixtureStatus, HarnessErrorKind,
     ReplayVerifier, ReportFormat, TestRunOutcome, WorkflowTestEnv,
 };
+#[cfg(all(feature = "db", any(test, feature = "testing")))]
+pub use testing::{
+    CanaryFailureDetail, CanaryTypeSummary, CanaryVerdict, ReplayCanaryOptions, ReplayCanaryReport,
+};
 #[cfg(any(test, feature = "testing"))]
 pub use testing::{
     HistorySnapshot, NonDeterminismKind, ReplayReport, ReplayStatus, WorkflowReplayer,

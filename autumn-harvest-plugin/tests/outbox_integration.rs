@@ -289,7 +289,7 @@ async fn framework_outbox_retry_delay_tracks_database_clock() {
     assert_eq!(delivered, 0, "failed delivery should not report success");
 
     let delay: DelayRow = diesel::sql_query(
-        "SELECT EXTRACT(EPOCH FROM (next_attempt_at - created_at)) AS seconds \
+        "SELECT EXTRACT(EPOCH FROM (next_attempt_at - created_at))::double precision AS seconds \
          FROM harvest_workflow_outbox \
          WHERE workflow_id = 'post-publication:timezone'",
     )

@@ -947,6 +947,18 @@ impl HistoryMatcher {
         self.cursor
     }
 
+    /// Total number of events in history.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Returns true if history has no events.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
     /// Advance the cursor by one, skipping the current event.
     ///
     /// Use this to skip lifecycle events like `WorkflowStarted` that

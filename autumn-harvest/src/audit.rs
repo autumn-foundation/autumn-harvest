@@ -113,6 +113,8 @@ pub const OP_GATE_LIFT: &str = "gate.lift";
 /// Audit operation: Erased PII payload fields from a completed workflow
 /// execution (issue #495). Terminal-only, irreversible.
 pub const OP_WORKFLOW_ERASE_PAYLOADS: &str = "workflow.erase_payloads";
+/// Audit operation: Ran the replay compatibility canary.
+pub const OP_WORKFLOW_REPLAY_CANARY: &str = "workflow.replay_canary";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -349,6 +351,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("PATCH /tasks/{id}", RouteClass::Mutating),
     // PII erasure (issue #495): admin-only, irreversible, terminal-only.
     ("POST /workflows/{id}/erase-payloads", RouteClass::Mutating),
+    // Replay canary (issue #512): admin-only.
+    ("POST /admin/workflows/replay-canary", RouteClass::Mutating),
 ];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
@@ -396,6 +400,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_TASK_REPRIORITIZE,
     // PII erasure (issue #495)
     OP_WORKFLOW_ERASE_PAYLOADS,
+    OP_WORKFLOW_REPLAY_CANARY,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -592,6 +597,11 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     (
         "POST /workflows/{id}/erase-payloads",
         Some(OP_WORKFLOW_ERASE_PAYLOADS),
+    ),
+    // Replay canary (issue #512)
+    (
+        "POST /admin/workflows/replay-canary",
+        Some(OP_WORKFLOW_REPLAY_CANARY),
     ),
 ];
 
@@ -793,6 +803,30 @@ mod tests {
     #[test]
     fn default_retention_is_90_days() {
         assert_eq!(DEFAULT_AUDIT_RETENTION_DAYS, 90);
+    }
+
+    #[test]
+    fn replay_canary_route_is_classified_correctly() {
+        let route = "POST /admin/workflows/replay-canary";
+        let classification = CLASSIFIED_ROUTES
+            .iter()
+            .find(|(r, _)| *r == route)
+            .map(|(_, c)| *c);
+        assert_eq!(
+            classification,
+            Some(RouteClass::Mutating),
+            "Replay canary route must be classified as Mutating"
+        );
+
+        let mutation_op = ALL_MUTATION_ROUTES
+            .iter()
+            .find(|(r, _)| *r == route)
+            .and_then(|(_, op)| *op);
+        assert_eq!(
+            mutation_op,
+            Some("workflow.replay_canary"),
+            "Replay canary route must have the workflow.replay_canary audit operation"
+        );
     }
 
     // ── Route classification exhaustiveness guards ────────────────────────────

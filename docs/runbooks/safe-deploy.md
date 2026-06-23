@@ -392,3 +392,103 @@ Response fields:
 | Breaking deploy without `ctx.version()` gate | New workers corrupt in-flight histories on replay; use version gates |
 | Rollback without updating the build policy | New starts continue landing on the bad build; set policy back first |
 | Empty `build_id` on new workers | Legacy sentinel — the worker claims any task, bypassing all routing |
+
+---
+
+# Runbook: Pre-Deploy Replay Canary
+
+Use the deploy-time replay canary to verify that a candidate build is compatible with currently running executions before advancing the build policy or declaring compatibility.
+
+**When to use:** before rolling out any new worker deployment where you expect the new code to handle existing in-flight workflow executions (i.e. Scenario A).
+
+**When _not_ to use:** for breaking deploys (Scenario B) where you explicitly do not declare compatibility and instead let old workflows run to completion on old workers.
+
+---
+
+## Concepts
+
+The replay canary performs an in-memory execution audit:
+1. **Zero Mutations:** The canary never executes activities, schedules timers, sends signals, writes events, or mutates any database records.
+2. **Multi-Shard Sampling:** It queries currently `RUNNING` workflow executions across all active shards (using `iter_shards()`).
+3. **In-Memory Replay:** It uses the candidate build's `WorkflowReplayer` and registered workflow definitions to replay those executions' history in-memory from start to current state.
+4. **Compatibility Report:** If any execution fails to replay (due to non-determinism, changed steps, or code panics), the canary returns a `fail` verdict and details the failing execution ID, event index, and expected vs actual mismatch.
+
+---
+
+## Step 1 — Run the Canary Check
+
+Run the canary command from your candidate deployment (or continuous delivery pipeline) targeting the active database:
+
+```bash
+harvest canary --sample-size 500
+```
+
+You can narrow the canary check to a specific workflow name or queue:
+
+```bash
+harvest canary --sample-size 100 --workflow-name billing_checkout --queue default
+```
+
+### Canary Command Output
+
+A successful canary run outputs a summary table:
+
+```text
+Canary Verdict: PASS
+Sampled: 142 (succeeded: 142, failed: 0, truncated: false)
+
+Summary by Workflow Type:
+WORKFLOW TYPE     SAMPLED  SUCCEEDED  FAILED
+billing_checkout  80       80         0
+user_onboarding   62       62         0
+```
+
+If any execution fails to replay, the canary outputs the failure details and exits with exit code `1`:
+
+```text
+Canary Verdict: FAIL
+Sampled: 142 (succeeded: 140, failed: 2, truncated: false)
+
+Summary by Workflow Type:
+WORKFLOW TYPE     SAMPLED  SUCCEEDED  FAILED
+billing_checkout  80       78         2
+user_onboarding   62       62         0
+
+Replay Failures:
+EXECUTION ID                          WORKFLOW TYPE     KIND             EVENT IDX  ERROR
+9bc9759c-6aef-4a1e-8495-2d4e7f91cc09  billing_checkout  missing_command  14         expected ScheduleActivity(charge_card), got ScheduleActivity(charge_card_v2)
+
+Diagnostic details for execution 9bc9759c-6aef-4a1e-8495-2d4e7f91cc09:
+  Expected: ScheduleActivity(charge_card)
+  Actual:   ScheduleActivity(charge_card_v2)
+```
+
+To fetch the raw JSON report (e.g. for custom scripting or diagnostic tools), pass the `--json` flag:
+
+```bash
+harvest canary --sample-size 200 --json
+```
+
+---
+
+## Step 2 — Combine with Build-Id Routing
+
+1. **Verify candidate build compatibility:** Run `harvest canary` before promoting the new build.
+2. **If Canary Passes:** The candidate build is compatible with all sampled running executions. You can safely deploy the new workers, declare compatibility (e.g. `declare_compat("sha-new", "sha-old")`), and advance the routing policy.
+3. **If Canary Fails:** Replay safety is compromised. You must either:
+   - Fix the non-determinism in the candidate build.
+   - Use `ctx.version()` gates to isolate the new behavior.
+   - Run the deploy as a breaking deploy (Scenario B).
+
+---
+
+## Caveats and Statistical Nature
+
+> [!WARNING]
+> The replay canary is **statistical**, not mathematical proof of 100% compatibility.
+> Because it samples up to `sample_size` executions, it may miss rare or edge-case workflow histories that contain compatibility issues.
+> For high-risk deployments:
+> - Keep `sample_size` sufficiently high (e.g., 500 to 1000).
+> - Keep a comprehensive test suite of workflow history replay fixtures (using `harvest history export`).
+> - Combine the canary with gradual rollout of workers and active monitoring of non-determinism alarms.
+

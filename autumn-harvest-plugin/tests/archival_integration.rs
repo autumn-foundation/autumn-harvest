@@ -344,6 +344,7 @@ async fn archival_hook_executes_successfully_and_preserves_on_failure() {
 
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
+    api_state.set_admin_auth_boundary(true);
     let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
 
     // 1. Run retention with archiver returning success.
@@ -486,6 +487,7 @@ async fn archival_hook_times_out_and_preserves_execution() {
 
     api_state.install_storage_pool(runner.storage_pool());
     api_state.install(runner.api_runtime());
+    api_state.set_admin_auth_boundary(true);
     let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
 
     // Trigger retention

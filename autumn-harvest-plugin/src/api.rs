@@ -2494,16 +2494,38 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(redrive_dead_letters_handler).route_layer(require_admin.clone()),
         )
         .route("/health", get(health))
-        .route("/admin/preflight", get(preflight))
-        .route("/admin/shards/health", get(shards_health))
-        .route("/admin/version-gates/usage", get(version_usage))
+        .route(
+            "/admin/preflight",
+            get(preflight).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/shards/health",
+            get(shards_health).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/version-gates/usage",
+            get(version_usage).route_layer(require_admin.clone()),
+        )
         .route(
             "/admin/version-gates/retirement-check",
-            get(version_gate_retirement_check),
+            get(version_gate_retirement_check).route_layer(require_admin.clone()),
         )
-        .route("/admin/retention", get(retention_status))
-        .route("/admin/retention/run-now", post(retention_run_now))
-        .route("/admin/concurrency", get(concurrency_status))
+        .route(
+            "/admin/retention",
+            get(retention_status).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/retention/run-now",
+            post(retention_run_now).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/workflows/replay-canary",
+            post(run_replay_canary_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/concurrency",
+            get(concurrency_status).route_layer(require_admin.clone()),
+        )
         .route(
             "/admin/debounce",
             // Admin-gated: the response includes raw debounce_key values, which
@@ -2512,13 +2534,22 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             // across shards. Parity with other sensitive management reads.
             get(debounce_status).route_layer(require_admin.clone()),
         )
-        .route("/admin/rate-limits", get(list_rate_limits))
+        .route(
+            "/admin/rate-limits",
+            get(list_rate_limits).route_layer(require_admin.clone()),
+        )
         .route(
             "/admin/rate-limits/{key}",
             post(set_rate_limit).route_layer(require_admin.clone()),
         )
-        .route("/admin/circuits", get(list_circuits))
-        .route("/admin/circuits/{activity_name}", get(get_circuit))
+        .route(
+            "/admin/circuits",
+            get(list_circuits).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/circuits/{activity_name}",
+            get(get_circuit).route_layer(require_admin.clone()),
+        )
         .route(
             "/admin/circuits/{activity_name}/force-open",
             post(force_open_circuit).route_layer(require_admin.clone()),
@@ -2704,11 +2735,27 @@ pub(crate) async fn has_harvest_admin_access(
         return true;
     }
 
-    let session_key = api_state.admin_auth_session_key();
-    if let Some(session) = session {
+    let Some(session) = session else {
+        return false;
+    };
+
+    if api_state.deployment_profile() == "dev" {
+        let session_key = api_state.admin_auth_session_key();
         session.contains_key(&session_key).await
     } else {
-        false
+        let is_harvest_admin = session
+            .get("is_harvest_admin")
+            .await
+            .is_some_and(|v| v == "true" || v == "1");
+        let is_admin = session
+            .get("is_admin")
+            .await
+            .is_some_and(|v| v == "true" || v == "1");
+        let role = session.get("role").await;
+        let is_admin_role =
+            role.as_deref() == Some("admin") || role.as_deref() == Some("harvest_admin");
+
+        is_harvest_admin || is_admin || is_admin_role
     }
 }
 
@@ -2782,6 +2829,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/version-gates/retirement-check"),
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
+        ("POST", "/admin/workflows/replay-canary"),
         ("GET", "/admin/concurrency"),
         ("GET", "/admin/debounce"),
         ("GET", "/admin/rate-limits"),
@@ -2909,6 +2957,7 @@ pub const fn management_api_request_fields()
         ("POST", "/workflows/{id}/terminate", Some(&["reason"])),
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
+        ("POST", "/workflows/{id}/erase-payloads", Some(&["reason"])),
         (
             "POST",
             "/workflows/{id}/reset",
@@ -3114,6 +3163,11 @@ pub const fn management_api_request_fields()
             ]),
         ),
         ("DELETE", "/admin/gates/{id}", Some(&[])),
+        (
+            "POST",
+            "/admin/workflows/replay-canary",
+            Some(&["sample_size", "workflow_name", "queue_name"]),
+        ),
     ]
 }
 
@@ -3461,6 +3515,19 @@ pub const fn management_api_response_fields()
         ),
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),
+        (
+            "POST",
+            "/admin/workflows/replay-canary",
+            Some(&[
+                "verdict",
+                "sampled",
+                "replay_succeeded",
+                "replay_failed",
+                "details",
+                "summary_by_type",
+                "truncated",
+            ]),
+        ),
         ("GET", "/admin/concurrency", None), // Vec<ConcurrencyKeyStats> (external model)
         ("GET", "/admin/debounce", None),    // Vec<PendingDebounceRecord> (external model)
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
@@ -14745,6 +14812,85 @@ async fn retention_run_now(
         ))
     })?;
     Ok(Json(BasicAck { ok: true }))
+}
+
+async fn run_replay_canary_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    headers: axum::http::HeaderMap,
+    Json(options): Json<autumn_harvest::testing::ReplayCanaryOptions>,
+) -> Result<Json<autumn_harvest::testing::ReplayCanaryReport>, AutumnError> {
+    use autumn_harvest::audit::{
+        OP_WORKFLOW_REPLAY_CANARY, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_WORKFLOW, insert_audit,
+    };
+    use autumn_harvest::testing::WorkflowReplayer;
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /admin/workflows/replay-canary";
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+    let runtime = api_state.runtime().map_err(map_error)?;
+
+    let mut replayer = WorkflowReplayer::new();
+    for (name, info) in &runtime.registry().workflows {
+        replayer = replayer.register_fn(name.clone(), info.handler);
+    }
+
+    let result = replayer
+        .run_canary(pool.sharded_pool(), options.clone())
+        .await;
+
+    let mut audit_conn = acquire_conn(pool.default_pool()).await?;
+
+    match result {
+        Ok(report) => {
+            let summary = format!(
+                "verdict={:?}, sampled={}, succeeded={}, failed={}, truncated={}",
+                report.verdict,
+                report.sampled,
+                report.replay_succeeded,
+                report.replay_failed,
+                report.truncated
+            );
+            let status = if report.verdict == autumn_harvest::testing::CanaryVerdict::Fail {
+                STATUS_FAILED
+            } else {
+                STATUS_SUCCEEDED
+            };
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_REPLAY_CANARY,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status,
+                error_summary: Some(&summary),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = insert_audit(&mut audit_conn, &ar).await;
+            Ok(Json(report))
+        }
+        Err(e) => {
+            let error_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_REPLAY_CANARY,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some(&error_str),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = insert_audit(&mut audit_conn, &ar).await;
+            Err(map_error(e))
+        }
+    }
 }
 
 async fn concurrency_status(

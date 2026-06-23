@@ -260,6 +260,13 @@ pub enum CliError {
     #[error("shard health readiness gate failed")]
     ShardHealthGate,
 
+    /// Replay canary completed but reported a non-passing verdict.
+    #[error("replay canary gate failed: verdict={verdict}")]
+    CanaryGate {
+        /// Reported canary verdict.
+        verdict: String,
+    },
+
     /// Version-gate guard found active usage or incomplete shard inspection.
     #[error("version usage guard failed")]
     VersionUsageGate,
@@ -468,6 +475,21 @@ enum Commands {
         /// entire batch is rejected with no executions inserted.
         #[arg(long, default_value_t = false)]
         atomic: bool,
+    },
+    /// Run a deploy-time replay canary over live executions.
+    Canary {
+        /// Maximum number of running workflow executions to sample.
+        #[arg(long, default_value = "500")]
+        sample_size: usize,
+        /// Filter samples to a specific workflow type.
+        #[arg(long)]
+        workflow_name: Option<String>,
+        /// Filter samples to a specific task queue.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Output raw JSON instead of the summary table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1394,6 +1416,16 @@ impl Cli {
                 items_json,
                 atomic,
             } => start_batch_request(file.as_deref(), items_json.as_deref(), *atomic),
+            Commands::Canary {
+                sample_size,
+                workflow_name,
+                queue,
+                json: _,
+            } => Ok(canary_request(
+                *sample_size,
+                workflow_name.as_deref(),
+                queue.as_deref(),
+            )),
         }
     }
 }
@@ -1492,6 +1524,14 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     }
     if retirement_check_should_check(&cli) && retirement_check_exit_code(&response) != 0 {
         return Err(CliError::RetirementCheckGate);
+    }
+    if canary_should_gate(&cli) && canary_exit_code(&response) != 0 {
+        let verdict = response
+            .get("verdict")
+            .and_then(Value::as_str)
+            .unwrap_or("fail")
+            .to_string();
+        return Err(CliError::CanaryGate { verdict });
     }
     Ok(())
 }
@@ -1750,6 +1790,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if shard_health_wants_table(cli) {
         return Ok(format_shard_health_table(value));
     }
+    if canary_wants_table(cli) {
+        return Ok(format_canary_table(value));
+    }
     if workflow_children_wants_table(cli) {
         return Ok(format_workflow_children_table(value));
     }
@@ -1778,6 +1821,7 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     let output = if workflow_children_wants_raw_json(cli)
         || handoff_wants_raw_json(cli)
         || dlq_aggregate_wants_raw_json(cli)
+        || canary_wants_raw_json(cli)
     {
         OutputFormat::Json
     } else {
@@ -2040,6 +2084,192 @@ fn format_backfill_table(value: &Value) -> String {
 
 fn preflight_wants_table(cli: &Cli) -> bool {
     matches!(&cli.command, Commands::Preflight) && cli.output == OutputFormat::PrettyJson
+}
+
+fn canary_wants_table(cli: &Cli) -> bool {
+    matches!(&cli.command, Commands::Canary { json: false, .. })
+        && cli.output == OutputFormat::PrettyJson
+}
+
+const fn canary_should_gate(cli: &Cli) -> bool {
+    matches!(&cli.command, Commands::Canary { .. })
+}
+
+const fn canary_wants_raw_json(cli: &Cli) -> bool {
+    matches!(&cli.command, Commands::Canary { json: true, .. })
+}
+
+fn canary_exit_code(value: &Value) -> i32 {
+    match value.get("verdict").and_then(Value::as_str) {
+        Some("pass") => 0,
+        _ => 1,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn format_canary_table(value: &Value) -> String {
+    let verdict = value
+        .get("verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_uppercase();
+    let sampled = value.get("sampled").and_then(Value::as_u64).unwrap_or(0);
+    let succeeded = value
+        .get("replay_succeeded")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let failed = value
+        .get("replay_failed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let truncated = value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Canary Verdict: {verdict}\nSampled: {sampled} (succeeded: {succeeded}, failed: {failed}, truncated: {truncated})"
+    );
+
+    // Summary by type
+    if let Some(summary_map) = value
+        .get("summary_by_type")
+        .and_then(Value::as_object)
+        .filter(|m| !m.is_empty())
+    {
+        let mut rows = Vec::with_capacity(summary_map.len() + 1);
+        rows.push(vec![
+            "WORKFLOW TYPE".to_string(),
+            "SAMPLED".to_string(),
+            "SUCCEEDED".to_string(),
+            "FAILED".to_string(),
+        ]);
+
+        // Sort keys for deterministic output
+        let mut keys: Vec<&String> = summary_map.keys().collect();
+        keys.sort();
+
+        for name in keys {
+            let summary = &summary_map[name];
+            let s_sampled = summary.get("sampled").and_then(Value::as_u64).unwrap_or(0);
+            let s_succeeded = summary
+                .get("replay_succeeded")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let s_failed = summary
+                .get("replay_failed")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            rows.push(vec![
+                name.clone(),
+                s_sampled.to_string(),
+                s_succeeded.to_string(),
+                s_failed.to_string(),
+            ]);
+        }
+
+        let widths = (0..rows[0].len())
+            .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+            .collect::<Vec<_>>();
+        let table = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let _ = writeln!(out, "\nSummary by Workflow Type:\n{table}");
+    }
+
+    // Failure details
+    if let Some(details) = value
+        .get("details")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+    {
+        let mut rows = Vec::with_capacity(details.len() + 1);
+        rows.push(vec![
+            "EXECUTION ID".to_string(),
+            "WORKFLOW TYPE".to_string(),
+            "KIND".to_string(),
+            "EVENT IDX".to_string(),
+            "ERROR".to_string(),
+        ]);
+
+        for failure in details {
+            let execution_id = failure
+                .get("execution_id")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let w_name = failure
+                .get("workflow_name")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let kind = failure.get("kind").and_then(Value::as_str).unwrap_or("-");
+            let event_idx = failure
+                .get("event_index")
+                .and_then(Value::as_u64)
+                .map_or_else(|| "-".to_string(), |idx| idx.to_string());
+            let error = failure.get("error").and_then(Value::as_str).unwrap_or("-");
+
+            rows.push(vec![
+                execution_id.to_string(),
+                w_name.to_string(),
+                kind.to_string(),
+                event_idx,
+                error.to_string(),
+            ]);
+        }
+
+        let widths = (0..rows[0].len())
+            .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+            .collect::<Vec<_>>();
+        let table = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let _ = writeln!(out, "\nReplay Failures:\n{table}");
+
+        // Additional diagnostic details (expected vs actual) if present
+        for failure in details {
+            let expected = failure.get("expected").and_then(Value::as_str);
+            let actual = failure.get("actual").and_then(Value::as_str);
+            if expected.is_some() || actual.is_some() {
+                let exec_id = failure
+                    .get("execution_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-");
+                let _ = writeln!(out, "\nDiagnostic details for execution {exec_id}:");
+                if let Some(exp) = expected {
+                    let _ = writeln!(out, "  Expected: {exp}");
+                }
+                if let Some(act) = actual {
+                    let _ = writeln!(out, "  Actual:   {act}");
+                }
+            }
+        }
+    }
+
+    out
 }
 
 fn shard_health_wants_table(cli: &Cli) -> bool {
@@ -2742,6 +2972,21 @@ fn shard_request(command: &ShardCommand) -> ApiRequest {
             |shard| ApiRequest::get(format!("/admin/shards/health?candidate_shard={shard}")),
         ),
     }
+}
+
+fn canary_request(
+    sample_size: usize,
+    workflow_name: Option<&str>,
+    queue: Option<&str>,
+) -> ApiRequest {
+    ApiRequest::post(
+        "/admin/workflows/replay-canary",
+        Some(json!({
+            "sample_size": sample_size,
+            "workflow_name": workflow_name,
+            "queue_name": queue,
+        })),
+    )
 }
 
 fn version_usage_request(

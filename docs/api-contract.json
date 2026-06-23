@@ -2932,6 +2932,62 @@
       ]
     },
     {
+      "method": "POST",
+      "path": "/admin/workflows/replay-canary",
+      "category": "admin",
+      "read_only": false,
+      "description": "Run the replay canary over a fanned-out sample of currently running executions to verify replay determinism.",
+      "idempotency": "Idempotent: running the canary does not mutate any workflow or system state.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "sample_size",
+            "required": true,
+            "description": "Maximum number of running workflow executions to sample."
+          },
+          {
+            "name": "workflow_name",
+            "required": false,
+            "description": "Optional filter to limit samples to a specific workflow type."
+          },
+          {
+            "name": "queue_name",
+            "required": false,
+            "description": "Optional filter to limit samples to a specific task queue."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "verdict",
+          "sampled",
+          "replay_succeeded",
+          "replay_failed",
+          {
+            "name": "details",
+            "type": "array",
+            "description": "An array of CanaryFailureDetail objects documenting specific replay mismatch details. Each object has: execution_id (string), workflow_name (string), kind (string, optional), expected (string, optional), actual (string, optional), event_index (integer, optional), and error (string)."
+          },
+          {
+            "name": "summary_by_type",
+            "type": "object",
+            "description": "A map from workflow type name to CanaryTypeSummary objects. Each summary object has: sampled (integer), replay_succeeded (integer), and replay_failed (integer)."
+          },
+          "truncated"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database or runtime error."
+        }
+      ]
+    },
+    {
       "method": "GET",
       "path": "/admin/concurrency",
       "category": "admin",
