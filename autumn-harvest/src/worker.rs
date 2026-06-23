@@ -7615,18 +7615,12 @@ impl Worker {
         }
     }
 
-    /// Execute a single poll iteration.
-    ///
-    /// Gets a connection from the pool, tries to claim a task, dispatches it
-    /// if found, or sleeps for `poll_interval` if the queue was empty.
     /// Emit rate-limit throttle metrics for all bound queues.
     ///
     /// Shared between the weighted and unweighted poll paths so that the
     /// throttle-recording logic only lives in one place.
     async fn emit_throttle_metrics(&self, conn: &mut AsyncPgConnection) {
-        if let Ok(throttled_keys) =
-            queue::check_throttled_keys(conn, &self.config.queues).await
-        {
+        if let Ok(throttled_keys) = queue::check_throttled_keys(conn, &self.config.queues).await {
             for key in throttled_keys {
                 self.registry
                     .telemetry()
@@ -7636,6 +7630,10 @@ impl Worker {
         }
     }
 
+    /// Execute a single poll iteration.
+    ///
+    /// Gets a connection from the pool, tries to claim a task, dispatches it
+    /// if found, or sleeps for `poll_interval` if the queue was empty.
     #[allow(clippy::too_many_lines)]
     async fn poll_once(&self, pool: &DbPool) -> bool {
         let mut conn = match pool.get().await {
