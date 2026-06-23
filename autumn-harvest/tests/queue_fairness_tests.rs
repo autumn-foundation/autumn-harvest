@@ -16,7 +16,6 @@ use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::WorkerRuntimeConfig;
 use autumn_harvest::{WorkerConfig, queue};
 
-use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -24,7 +23,6 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -379,7 +377,7 @@ async fn no_starvation_low_weight_queue_drains_to_completion() {
     }
 
     assert!(
-        light_claims >= latency_tasks as u32,
+        light_claims >= u32::try_from(latency_tasks).unwrap(),
         "no-starvation: expected all {latency_tasks} light tasks to be claimed \
          but only got {light_claims}"
     );
