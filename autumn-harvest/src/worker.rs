@@ -7603,6 +7603,7 @@ impl Worker {
     ///
     /// Gets a connection from the pool, tries to claim a task, dispatches it
     /// if found, or sleeps for `poll_interval` if the queue was empty.
+    #[allow(clippy::too_many_lines)]
     async fn poll_once(&self, pool: &DbPool) -> bool {
         let mut conn = match pool.get().await {
             Ok(conn) => conn,
@@ -7665,7 +7666,6 @@ impl Worker {
                     }
                     Ok(None) => {
                         // Nothing in this queue; try the next in the permutation.
-                        continue;
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "failed to claim task");

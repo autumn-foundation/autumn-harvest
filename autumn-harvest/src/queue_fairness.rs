@@ -44,9 +44,9 @@ use std::collections::HashMap;
 /// The returned `&str` slices borrow from `queues` — no string clones per poll
 /// in the weighted hot path.
 #[must_use]
-pub fn effective_queue_weights<'a>(
+pub fn effective_queue_weights<'a, S: std::hash::BuildHasher>(
     queues: &'a [String],
-    weights: &HashMap<String, u32>,
+    weights: &HashMap<String, u32, S>,
 ) -> Vec<(&'a str, u32)> {
     queues
         .iter()
