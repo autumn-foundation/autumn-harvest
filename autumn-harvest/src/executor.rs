@@ -64,7 +64,7 @@ pub struct WorkflowExecuteSpanMeta {
     /// Logical workflow name (recorded as `harvest.workflow.id`).
     pub workflow_name: String,
     /// Business-level workflow identifier (e.g. `"subscription-123"`).
-    /// Forwarded to [`WorkflowContext`] so [`WorkflowLogger`] can tag events.
+    /// Forwarded to [`WorkflowContext`] so `` `WorkflowLogger` `` can tag events.
     pub workflow_id: String,
     /// Shard identifier (recorded as `harvest.shard.id`).
     pub shard_id: i64,
