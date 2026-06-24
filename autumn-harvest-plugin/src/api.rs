@@ -6155,30 +6155,19 @@ async fn start_workflow(
                     .into_response());
             }
 
-            let max_wait = if let Some(ref w_str) = request.batch_max_wait {
-                match autumn_harvest::task_duration(w_str) {
-                    Some(d) => {
-                        if d > std::time::Duration::from_secs(86400) {
-                            return Err((
-                                axum::http::StatusCode::BAD_REQUEST,
-                                Json(serde_json::json!({
-                                    "error": "batch_max_wait cannot exceed 24 hours"
-                                })),
-                            )
-                                .into_response());
-                        }
-                        d
+            let max_wait =
+                if let Some(ref w_str) = request.batch_max_wait {
+                    match autumn_harvest::task_duration(w_str) {
+                        Some(d) => d,
+                        None => return Err((
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": "invalid batch_max_wait duration" })),
+                        )
+                            .into_response()),
                     }
-                    None => return Err((
-                        axum::http::StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": "invalid batch_max_wait duration" })),
-                    )
-                        .into_response()),
-                }
-            } else {
-                macro_policy
-                    .map_or(std::time::Duration::from_secs(10), |p| p.max_wait)
-            };
+                } else {
+                    macro_policy.map_or(std::time::Duration::from_secs(10), |p| p.max_wait)
+                };
 
             if max_wait > std::time::Duration::from_secs(86400) {
                 return Err((

@@ -117,7 +117,12 @@ struct FireDueBatchRow {
 pub async fn admit_batched_start(
     conn: &mut AsyncPgConnection,
     params: AdmitBatchParams,
-) -> HarvestResult<Option<(BatchAdmitOutcome, Vec<crate::completion_trigger::DeferredTriggerStart>)>> {
+) -> HarvestResult<
+    Option<(
+        BatchAdmitOutcome,
+        Vec<crate::completion_trigger::DeferredTriggerStart>,
+    )>,
+> {
     use diesel_async::AsyncConnection;
 
     if params.batch_key.len() > 1024 {
@@ -170,7 +175,10 @@ pub async fn admit_batched_start(
     let max_size = params.max_size;
 
     let outcome = conn
-        .transaction::<(BatchAdmitOutcome, Vec<crate::completion_trigger::DeferredTriggerStart>), HarvestError, _>(|conn| {
+        .transaction::<(
+            BatchAdmitOutcome,
+            Vec<crate::completion_trigger::DeferredTriggerStart>,
+        ), HarvestError, _>(|conn| {
             Box::pin(async move {
                 let row: UpsertBatchRow = diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Uuid, _>(new_id)
@@ -191,7 +199,7 @@ pub async fn admit_batched_start(
                     serde_json::from_value(row.start_options.clone()).unwrap_or_default();
 
                 let max_allowed_bytes = opts.max_workflow_input_bytes.unwrap_or(10 * 1024 * 1024);
-                if row.buffered_bytes > max_allowed_bytes as i32 {
+                if u64::from(row.buffered_bytes.cast_unsigned()) > max_allowed_bytes {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: crate::error::PayloadKind::WorkflowInput,
                         observed_bytes: row.buffered_bytes as u64,
@@ -227,7 +235,9 @@ pub async fn admit_batched_start(
                         workflow_name: &row.workflow_name,
                         workflow_id: &row.workflow_id,
                         exec_id,
-                        input: row.buffered_payloads.unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                        input: row
+                            .buffered_payloads
+                            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
                         parent_id: None,
                         queue_name: &row.queue_name,
                         execution_timeout,
@@ -275,7 +285,7 @@ pub async fn admit_batched_start(
                         workflow_id: row.workflow_id,
                         fire_at: row.fire_at,
                         pending_count: row.current_size,
-                        max_size: row.max_size as usize,
+                        max_size: row.max_size.cast_unsigned() as usize,
                         is_flushed,
                         flushed_execution_id,
                     },
@@ -297,7 +307,10 @@ const fn is_transient_error(e: &HarvestError) -> bool {
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: Option<i32>,
-) -> HarvestResult<(Vec<String>, Vec<crate::completion_trigger::DeferredTriggerStart>)> {
+) -> HarvestResult<(
+    Vec<String>,
+    Vec<crate::completion_trigger::DeferredTriggerStart>,
+)> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
     #[derive(diesel::QueryableByName)]
@@ -341,8 +354,8 @@ async fn fire_due_on_conn(
 
     loop {
         let now = Utc::now();
-        let processed: Option<(String, Vec<crate::completion_trigger::DeferredTriggerStart>)> = conn
-            .transaction(|conn| {
+        let processed: Option<(String, Vec<crate::completion_trigger::DeferredTriggerStart>)> =
+            conn.transaction(|conn| {
                 Box::pin(async move {
                     let due_rows: Vec<FireDueBatchRow> = if let Some(sid) = shard_id {
                         diesel::sql_query(due_sql)
@@ -363,15 +376,9 @@ async fn fire_due_on_conn(
 
                     if let Some(row) = due_rows.into_iter().next() {
                         match fire_claimed_batch_row(conn, row).await {
-                            Ok(Some((exec_id, deferred))) => {
-                                Ok(Some((exec_id, deferred)))
-                            }
-                            Ok(None) => {
-                                Ok(None)
-                            }
-                            Err(e) => {
-                                Err(e)
-                            }
+                            Ok(Some((exec_id, deferred))) => Ok(Some((exec_id, deferred))),
+                            Ok(None) => Ok(None),
+                            Err(e) => Err(e),
                         }
                     } else {
                         Ok(None)
@@ -456,7 +463,8 @@ async fn fire_claimed_batch_row(
         scheduled_for: None,
     };
 
-    let start_res = crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false).await;
+    let start_res =
+        crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false).await;
 
     match start_res {
         Ok((started, deferred_starts)) => {
@@ -546,7 +554,8 @@ pub async fn fire_due_event_batches(
                     .get()
                     .await
                     .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
-                let (fired, deferred) = fire_due_on_conn(&mut shard_conn, Some(shard_id.as_i32())).await?;
+                let (fired, deferred) =
+                    fire_due_on_conn(&mut shard_conn, Some(shard_id.as_i32())).await?;
                 fired_count += fired.len();
                 deferred_to_spawn.extend(deferred);
             }
