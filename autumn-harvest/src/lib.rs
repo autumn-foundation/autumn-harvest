@@ -84,6 +84,8 @@ pub mod eligibility;
 pub mod erase;
 pub mod error;
 pub mod event;
+/// Event-batched workflow starts — fold many triggers into one batched run (issue #518).
+pub mod event_batch;
 #[cfg(feature = "db")]
 #[doc(hidden)]
 pub mod execution;

@@ -479,9 +479,9 @@ async fn start_harvest_runtime(
         match autumn_harvest::admission_gate::db::load_active_gates(&mut boot_conn).await {
             Ok(gates) => {
                 api_state.gate_cache().refresh(gates);
-                tracing::debug!("admission gate cache populated at startup");
+                println!("admission gate cache populated at startup");
             }
-            Err(e) => tracing::warn!(error = %e, "could not load admission gates at startup"),
+            Err(e) => eprintln!("could not load admission gates at startup: {e}"),
         }
     }
 
@@ -730,6 +730,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             sla: None,
             owner: None,

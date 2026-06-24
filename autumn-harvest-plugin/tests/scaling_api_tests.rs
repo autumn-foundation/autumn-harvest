@@ -114,6 +114,7 @@ fn workflow_info() -> WorkflowInfo {
         concurrency: None,
 
         debounce: None,
+        batch: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,

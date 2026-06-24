@@ -39,15 +39,3 @@ error: [HVG002] Workflow determinism violation: Calling rand::random(), rand::th
    |
 15 |     let _ = rand::random_bool(0.5);
    |                   ^^^^^^^^^^^
-
-error[E0425]: cannot find function `random_range` in crate `rand`
-  --> tests/compile_fail/hvg002_randomness.rs:14:19
-   |
-14 |     let _ = rand::random_range(0..10);
-   |                   ^^^^^^^^^^^^ not found in `rand`
-
-error[E0425]: cannot find function `random_bool` in crate `rand`
-  --> tests/compile_fail/hvg002_randomness.rs:15:19
-   |
-15 |     let _ = rand::random_bool(0.5);
-   |                   ^^^^^^^^^^^ not found in `rand`

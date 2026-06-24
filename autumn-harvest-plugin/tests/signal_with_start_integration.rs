@@ -184,6 +184,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,

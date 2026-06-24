@@ -271,6 +271,23 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 );
                             }
                         }
+                        if let ::std::option::Option::Some(batch_policy) = Self::info().batch.as_ref() {
+                            if ::autumn_harvest::concurrency::resolve_concurrency_key(
+                                &batch_policy.key_expr,
+                                &start_input,
+                            )
+                            .is_some()
+                            {
+                                return ::std::result::Result::Err(
+                                    ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                        "workflow '{0}' has an event batching policy; batched starts \
+                                         must use the HTTP start route POST /workflows/{0}/start \
+                                         (the typed client cannot express a deferred batched start)",
+                                        #workflow_simple_name,
+                                    )),
+                                );
+                            }
+                        }
                         let update_id = opts.idempotency_key.as_ref().map_or_else(
                             ::autumn_harvest::types::UpdateId::new,
                             |key| {
@@ -415,6 +432,23 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                             "workflow '{0}' has a debounce policy; debounced starts \
                                              must use the HTTP start route POST /workflows/{0}/start \
                                              (the typed client cannot express a deferred debounced start)",
+                                            #workflow_simple_name,
+                                        )),
+                                    );
+                                }
+                            }
+                            if let ::std::option::Option::Some(batch_policy) = Self::info().batch.as_ref() {
+                                if ::autumn_harvest::concurrency::resolve_concurrency_key(
+                                    &batch_policy.key_expr,
+                                    &start_input,
+                                )
+                                .is_some()
+                                {
+                                    return ::std::result::Result::Err(
+                                        ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                            "workflow '{0}' has an event batching policy; batched starts \
+                                             must use the HTTP start route POST /workflows/{0}/start \
+                                             (the typed client cannot express a deferred batched start)",
                                             #workflow_simple_name,
                                         )),
                                     );

@@ -1507,6 +1507,9 @@ struct StartWorkflowRequest {
     start_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     delay: Option<String>,
+    batch_key: Option<String>,
+    batch_max_size: Option<usize>,
+    batch_max_wait: Option<String>,
 }
 
 /// Response body for a 409 Conflict returned by `RejectDuplicate` policy.
@@ -2377,6 +2380,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
 
     Router::new()
         .route("/workflows", get(list_workflows))
+        .route(
+            "/batches/pending",
+            get(pending_event_batches).route_layer(require_admin.clone()),
+        )
         // Static /workflows/batch_start must be registered before any /workflows/{param}
         // routes so axum does not capture the literal segment as a path parameter.
         // The body limit is raised to the configured max_total_bytes ceiling so
@@ -2817,6 +2824,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workers/{worker_id}/pinned"),
         // ── batch workflow start (issue #357) ─────────────────────────────────
         ("POST", "/workflows/batch_start"),
+        ("GET", "/batches/pending"),
         // ── batch operations (issue #102) ─────────────────────────────────────
         ("GET", "/batch-operations"),
         ("POST", "/batch-operations"),
@@ -2915,6 +2923,9 @@ pub const fn management_api_request_fields()
                 "reuse_policy",
                 "start_at",
                 "delay",
+                "batch_key",
+                "batch_max_size",
+                "batch_max_wait",
             ]),
         ),
         (
@@ -3244,6 +3255,10 @@ pub const fn management_api_response_fields()
                 "debounce_key",
                 "fire_at",
                 "pending_count",
+                "batched",
+                "flushed",
+                "batch_key",
+                "max_size",
             ]),
         ),
         (
@@ -3529,7 +3544,8 @@ pub const fn management_api_response_fields()
             ]),
         ),
         ("GET", "/admin/concurrency", None), // Vec<ConcurrencyKeyStats> (external model)
-        ("GET", "/admin/debounce", None),    // Vec<PendingDebounceRecord> (external model)
+        ("GET", "/batches/pending", None),
+        ("GET", "/admin/debounce", None), // Vec<PendingDebounceRecord> (external model)
         ("GET", "/admin/rate-limits", None), // Vec<RateLimitBucket> (external model)
         ("POST", "/admin/rate-limits/{key}", Some(&["ok"])),
         ("GET", "/admin/circuits", None), // Vec<CircuitSnapshot> (external model)
@@ -5986,7 +6002,7 @@ fn workflow_has_resolving_debounce(
         })
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::result_large_err)]
 async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
@@ -6110,8 +6126,92 @@ async fn start_workflow(
     let is_debounced_start =
         workflow_has_resolving_debounce(&runtime.registry, &workflow_name, &input);
 
+    let batch_settings_res: Result<_, axum::response::Response> = (|| {
+        let macro_policy = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .and_then(|info| info.batch.as_ref());
+
+        let resolved_key = request.batch_key.clone().or_else(|| {
+            macro_policy.and_then(|policy| {
+                autumn_harvest::debounce::resolve_debounce_key(&policy.key_expr, &input)
+            })
+        });
+
+        if let Some(key) = resolved_key {
+            let max_size = request
+                .batch_max_size
+                .or_else(|| macro_policy.map(|p| p.max_size))
+                .unwrap_or(10);
+
+            if !(1..=1000).contains(&max_size) {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("batch_max_size ({max_size}) must be between 1 and 1000")
+                    })),
+                )
+                    .into_response());
+            }
+
+            let max_wait = if let Some(ref w_str) = request.batch_max_wait {
+                match autumn_harvest::task_duration(w_str) {
+                    Some(d) => {
+                        if d > std::time::Duration::from_secs(86400) {
+                            return Err((
+                                axum::http::StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "batch_max_wait cannot exceed 24 hours"
+                                })),
+                            )
+                                .into_response());
+                        }
+                        d
+                    }
+                    None => return Err((
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "invalid batch_max_wait duration" })),
+                    )
+                        .into_response()),
+                }
+            } else {
+                macro_policy
+                    .map_or(std::time::Duration::from_secs(10), |p| p.max_wait)
+            };
+
+            if max_wait > std::time::Duration::from_secs(86400) {
+                return Err((
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "batch_max_wait cannot exceed 24 hours"
+                    })),
+                )
+                    .into_response());
+            }
+
+            Ok((true, Some(key), max_size, max_wait))
+        } else {
+            Ok((false, None, 0, std::time::Duration::ZERO))
+        }
+    })();
+
+    let (has_batch_policy, resolved_batch_key, batch_max_size, batch_max_wait) =
+        match batch_settings_res {
+            Ok(settings) => settings,
+            Err(response) => return response,
+        };
+
+    if is_debounced_start && has_batch_policy {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "debounce and batching are mutually exclusive" })),
+        )
+            .into_response();
+    }
+
     // issue #377: check admission gates before touching the DB.
-    if !is_debounced_start {
+    if !is_debounced_start && !has_batch_policy {
         let wf_owner = runtime
             .registry
             .workflows
@@ -6713,6 +6813,296 @@ async fn start_workflow(
             }
         } // end debounce admission block
     }
+
+    // Event Batch admission gate (issue #518): fold trigger payloads into a single run.
+    if has_batch_policy && let Some(ref resolved_key) = resolved_batch_key {
+        // Debounce/batch cannot be combined with start_at or delay.
+        if request.start_at.is_some() || delay.is_some() {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut c) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("batching cannot be combined with start_at or delay"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut c, &ar).await;
+            }
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "batching cannot be combined with start_at or delay" }))
+            ).into_response();
+        }
+
+        if effective_wf_cap > 0 {
+            let observed = serde_json::to_string(&input).map_or(0u64, |s| s.len() as u64);
+            if observed > effective_wf_cap {
+                if let Ok(pool) = api_state.storage_pool()
+                    && let Ok(mut c) = acquire_conn(pool.default_pool()).await
+                {
+                    let ar = NewAuditRecord {
+                        actor: &actor,
+                        operation: OP_WORKFLOW_START,
+                        target_type: TARGET_WORKFLOW,
+                        target_id: Some(workflow_name.as_str()),
+                        route_or_command: route,
+                        request_id: request_id.as_deref(),
+                        idempotency_key: None,
+                        status: STATUS_FAILED,
+                        error_summary: Some("workflow input exceeds cap"),
+                        shard_id: None,
+                        source: &source,
+                    };
+                    let _ = audit::insert_audit(&mut c, &ar).await;
+                }
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("workflow input ({observed} bytes) exceeds cap ({effective_wf_cap} bytes)")
+                    }))
+                ).into_response();
+            }
+        }
+
+        if let Some(secs) = request.execution_timeout_secs
+            && (secs < 0 || chrono::Duration::try_seconds(secs).is_none())
+        {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut c) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("invalid execution_timeout_secs"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut c, &ar).await;
+            }
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("execution_timeout_secs ({secs}) is out of range or negative")
+                })),
+            )
+                .into_response();
+        }
+
+        let (info_owner, info_runbook, info_severity, info_sla, info_execution_timeout) = runtime
+            .registry
+            .workflows
+            .get(&workflow_name)
+            .map_or((None, None, None, None, None), |info| {
+                (
+                    info.owner,
+                    info.runbook_url,
+                    info.severity,
+                    info.sla,
+                    info.execution_timeout,
+                )
+            });
+
+        let effective_sla_secs = request
+            .sla_secs
+            .filter(|&secs| secs >= 0)
+            .and_then(chrono::Duration::try_seconds)
+            .or_else(|| info_sla.and_then(|d| chrono::Duration::from_std(d).ok()))
+            .map(|sla| {
+                info_execution_timeout
+                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .map_or(sla, |hard| sla.min(hard))
+            })
+            .map(|d| d.num_seconds());
+
+        let effective_execution_timeout_secs = request.execution_timeout_secs.or_else(|| {
+            info_execution_timeout
+                .and_then(|d| chrono::Duration::from_std(d).ok())
+                .map(|d| d.num_seconds())
+        });
+
+        let effective_ceiling_secs = api_state
+            .max_workflow_execution_timeout()
+            .and_then(|d| chrono::Duration::from_std(d).ok())
+            .map(|d| d.num_seconds());
+
+        let batch_shard = runtime
+            .router
+            .pick_for_new_workflow(&workflow_name, resolved_key);
+
+        if let Some((gate_id, reason, scope_kind)) = {
+            let wf_owner = runtime
+                .registry
+                .workflows
+                .get(&workflow_name)
+                .and_then(|i| i.owner);
+            api_state.gate_cache().check(
+                &workflow_name,
+                &queue_name,
+                batch_shard.as_i32(),
+                wf_owner,
+            )
+        } {
+            let reason_label = match reason.char_indices().nth(64) {
+                Some((idx, _)) => &reason[..idx],
+                None => &reason,
+            };
+            runtime
+                .registry
+                .telemetry()
+                .metrics
+                .record_admission_blocked(scope_kind, reason_label);
+            if let Ok(mut audit_conn) = db_conn_for_shard(&api_state, batch_shard).await {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(workflow_name.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("admission blocked by gate"),
+                    shard_id: Some(batch_shard.as_i32()),
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut audit_conn, &ar).await;
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
+
+        let mut batch_conn = match db_conn_for_shard(&api_state, batch_shard).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+
+        let admit_params = autumn_harvest::event_batch::AdmitBatchParams {
+            workflow_name: workflow_name.clone(),
+            batch_key: resolved_key.clone(),
+            workflow_id: workflow_id.clone(),
+            queue_name: queue_name.clone(),
+            payload: input.clone(),
+            max_wait: batch_max_wait,
+            max_size: batch_max_size,
+            shard_id: batch_shard.as_i32(),
+            start_options: autumn_harvest::debounce::DebounceStartOptions {
+                reuse_policy: request.reuse_policy.clone(),
+                execution_timeout_secs: effective_execution_timeout_secs,
+                memo: request.memo.clone(),
+                search_attrs: request.search_attrs.clone(),
+                sla_secs: effective_sla_secs,
+                context_headers: None,
+                priority: None,
+                concurrency_key: concurrency_key.clone(),
+                concurrency_limit,
+                owner: info_owner.map(str::to_string),
+                runbook_url: info_runbook.map(str::to_string),
+                severity: info_severity.map(str::to_string),
+                max_execution_timeout_ceiling_secs: effective_ceiling_secs,
+                max_workflow_input_bytes: Some(effective_wf_cap),
+                trace_context: debounce_trace_ctx,
+            },
+        };
+
+        match autumn_harvest::event_batch::admit_batched_start(&mut batch_conn, admit_params).await
+        {
+            Ok(Some((outcome, deferred_starts))) => {
+                let status = STATUS_SUCCEEDED;
+
+                let audit_target_id = outcome
+                    .flushed_execution_id
+                    .as_deref()
+                    .unwrap_or(outcome.workflow_id.as_str());
+
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_WORKFLOW_START,
+                    target_type: TARGET_WORKFLOW,
+                    target_id: Some(audit_target_id),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status,
+                    error_summary: None,
+                    shard_id: Some(batch_shard.as_i32()),
+                    source: &source,
+                };
+                if let Err(audit_err) = audit::insert_audit(&mut batch_conn, &ar).await {
+                    tracing::error!(
+                        error = %audit_err,
+                        "audit insert failed for batched workflow.start"
+                    );
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+
+                for start in deferred_starts {
+                    start.spawn();
+                }
+
+                if outcome.is_flushed {
+                    return (
+                        axum::http::StatusCode::CREATED,
+                        Json(serde_json::json!({
+                            "batched": true,
+                            "flushed": true,
+                            "execution_id": outcome.flushed_execution_id,
+                            "workflow_name": workflow_name,
+                            "workflow_id": outcome.workflow_id,
+                            "state": "RUNNING",
+                        })),
+                    )
+                        .into_response();
+                }
+
+                return (
+                    axum::http::StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "batched": true,
+                        "flushed": false,
+                        "workflow_name": workflow_name,
+                        "workflow_id": outcome.workflow_id,
+                        "batch_key": outcome.batch_key,
+                        "fire_at": outcome.fire_at,
+                        "pending_count": outcome.pending_count,
+                        "max_size": outcome.max_size,
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                return AutumnError::internal_server_error_msg(
+                    "batch admission returned no record unexpectedly",
+                )
+                .into_response();
+            }
+            Err(e) => return map_error(e).into_response(),
+        }
+    }
+
     // Key resolved to None, no policy, or live execution exists — fall through to the normal start path.
 
     // shard computed above (before gate check); reuse it here.
@@ -14960,6 +15350,31 @@ async fn debounce_status(
     Ok(Json(all_records))
 }
 
+async fn pending_event_batches(
+    Extension(api_state): Extension<HarvestApiState>,
+) -> Result<Json<Vec<autumn_harvest::event_batch::PendingEventBatchRecord>>, AutumnError> {
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    let mut all_records: Vec<autumn_harvest::event_batch::PendingEventBatchRecord> = Vec::new();
+
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let records = autumn_harvest::event_batch::list_pending_event_batches(&mut conn, 1000)
+            .await
+            .map_err(map_error)?;
+        all_records.extend(records);
+    }
+
+    // Sort by workflow_name, then batch_key for deterministic operator view.
+    all_records.sort_by(|a, b| {
+        a.workflow_name
+            .cmp(&b.workflow_name)
+            .then(a.batch_key.cmp(&b.batch_key))
+    });
+
+    Ok(Json(all_records))
+}
+
 // ── Rate Limit Management ──────────────────────────────────────────────────
 
 async fn list_rate_limits(
@@ -20609,6 +21024,7 @@ mod tests {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
                 sla: None,
                 owner: None,
@@ -22107,6 +22523,7 @@ mod tests {
                     concurrency: None,
 
                     debounce: None,
+                    batch: None,
                     max_input_bytes: None,
                     sla: None,
                     owner: None,
@@ -22125,6 +22542,7 @@ mod tests {
                     concurrency: None,
 
                     debounce: None,
+                    batch: None,
                     max_input_bytes: None,
                     sla: None,
                     owner: None,
