@@ -507,29 +507,8 @@ pub async fn count_bulk_filter_matches(
     filter: &BulkDlqFilter,
 ) -> HarvestResult<i64> {
     use crate::schema::harvest_dead_letters::dsl;
-    use diesel::dsl::sql;
-    use diesel::sql_types::{Bool, Text};
 
-    let mut query = dsl::harvest_dead_letters.into_boxed();
-
-    if let Some(ref name) = filter.activity_name {
-        query = query.filter(dsl::activity_name.eq(name.clone()));
-    }
-    if let Some(ref wf_name) = filter.workflow_name {
-        query = query.filter(
-            sql::<Bool>("workflow_exec_id IN (SELECT id FROM harvest_workflow_executions WHERE workflow_name = ")
-                .bind::<Text, _>(wf_name.clone())
-                .sql(")"),
-        );
-    }
-    if let Some(after) = filter.failed_after {
-        query = query.filter(dsl::failed_at.ge(after));
-    }
-    if let Some(before) = filter.failed_before {
-        query = query.filter(dsl::failed_at.lt(before));
-    }
-
-    query
+    apply_bulk_filter(dsl::harvest_dead_letters.into_boxed(), filter)
         .count()
         .get_result(conn)
         .await
@@ -543,13 +522,27 @@ async fn query_dead_letters_for_bulk(
     filter: &BulkDlqFilter,
 ) -> HarvestResult<Vec<DeadLetter>> {
     use crate::schema::harvest_dead_letters::dsl;
+
+    apply_bulk_filter(
+        dsl::harvest_dead_letters
+            .into_boxed()
+            .order(dsl::failed_at.asc())
+            .limit(filter.effective_limit()),
+        filter,
+    )
+    .select(DeadLetter::as_select())
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
+fn apply_bulk_filter<'a>(
+    mut query: crate::schema::harvest_dead_letters::BoxedQuery<'a, diesel::pg::Pg>,
+    filter: &BulkDlqFilter,
+) -> crate::schema::harvest_dead_letters::BoxedQuery<'a, diesel::pg::Pg> {
+    use crate::schema::harvest_dead_letters::dsl;
     use diesel::dsl::sql;
     use diesel::sql_types::{Bool, Text};
-
-    let mut query = dsl::harvest_dead_letters
-        .into_boxed()
-        .order(dsl::failed_at.asc())
-        .limit(filter.effective_limit());
 
     if let Some(ref name) = filter.activity_name {
         query = query.filter(dsl::activity_name.eq(name.clone()));
@@ -569,10 +562,6 @@ async fn query_dead_letters_for_bulk(
     }
 
     query
-        .select(DeadLetter::as_select())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)
 }
 
 /// Bulk replay dead-letter entries matching `filter`.
