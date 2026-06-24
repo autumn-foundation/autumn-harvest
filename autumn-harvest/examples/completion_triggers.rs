@@ -1,4 +1,3 @@
-#![allow(clippy::all, clippy::pedantic, clippy::nursery)]
 //! Declarative completion triggers — two-stage ETL → reporting (issue #517).
 //!
 //! Run workflow **B** *because* workflow **A** finished — without A knowing B
@@ -98,7 +97,7 @@ fn main() {
 
     // Apply the input mapping exactly as the engine does at fire time.
     let target_input = match &trigger.input_mapping {
-        InputMapping::Passthrough => source_output.clone(),
+        InputMapping::Passthrough => source_output,
         InputMapping::Static(v) => v.clone(),
         InputMapping::Projection(path) => project_json_path(&source_output, path),
     };

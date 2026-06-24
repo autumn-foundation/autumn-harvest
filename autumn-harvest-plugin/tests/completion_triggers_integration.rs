@@ -2308,8 +2308,8 @@ async fn test_trigger_evaluations_schema_validation() {
 /// trigger id.
 #[tokio::test]
 async fn test_trigger_emits_fire_metric_outcomes() {
-    /// Minimal capturing `MetricsRecorder` — records only the completion-trigger
-    /// fire outcomes (all other trait methods keep their no-op defaults).
+    // Minimal capturing MetricsRecorder — records only the completion-trigger
+    // fire outcomes (all other trait methods keep their no-op defaults).
     #[derive(Default)]
     struct CapturingMetrics {
         fires: std::sync::Mutex<Vec<(String, String)>>,

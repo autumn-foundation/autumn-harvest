@@ -169,8 +169,8 @@ pub const METRIC_SCHEDULE_SKIPPED: &str = "harvest.schedule.skipped";
 
 /// Counter: incremented when a completion trigger fires (issue #517).
 ///
-/// Attributes: `trigger`, `outcome` (started | skipped | deduped |
-/// validation_failed | payload_too_large).
+/// Attributes: `trigger`, `outcome` (`started` | `skipped` | `deduped` |
+/// `validation_failed` | `payload_too_large`).
 pub const METRIC_COMPLETION_TRIGGER_FIRED: &str = "harvest.completion_trigger.fires";
 
 /// Counter: incremented each time `POST /admin/schedules/{id}/trigger` fires a
