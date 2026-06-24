@@ -134,5 +134,8 @@ fails closed (exit `2`) on `partial`/`unavailable` for exactly this reason.
 - **Read-only and side-effect-free**: no task claims, no state mutation, no
   `WorkflowEvent` appended, no migration.
 - **Same auth as all `/admin/*` routes** (admin boundary).
-- **Sub-1s** for the common case: a single indexed `GROUP BY workflow_name` over
-  non-terminal `harvest_workflow_executions` per shard, fanned out in parallel.
+- **Indexed scan** via `idx_harvest_we_non_terminal_wf_name` (a partial index
+  over non-terminal rows only, added in migration
+  `20260624000001_harvest_non_terminal_reachability_index`): a
+  `GROUP BY workflow_name` over non-terminal `harvest_workflow_executions` per
+  shard, fanned out in parallel.

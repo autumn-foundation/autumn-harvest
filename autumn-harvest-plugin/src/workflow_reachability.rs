@@ -46,6 +46,7 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{HarvestApiState, map_error};
+use crate::shard_fanout::{self, ShardObservation};
 
 /// Query string accepted by `GET /admin/workflow-types/reachability`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -152,37 +153,23 @@ pub struct ReachabilityShardInspection {
     pub error: Option<String>,
 }
 
-#[derive(Debug)]
-struct ShardObservation {
-    shard_id: i32,
-    rows: Vec<WorkflowTypeNonTerminalCount>,
-    error: Option<String>,
-}
-
+/// Per-workflow-type accumulator: aggregates counts across shards.
+///
+/// Only `per_shard` is stored; the total count and oldest start time are
+/// derived on demand so there is no redundant state to drift.
 #[derive(Debug)]
 struct ReachabilityAccumulator {
-    non_terminal_count: i64,
-    oldest_started_at: Option<DateTime<Utc>>,
     per_shard: BTreeMap<i32, (i64, DateTime<Utc>)>,
 }
 
 impl ReachabilityAccumulator {
     const fn empty() -> Self {
         Self {
-            non_terminal_count: 0,
-            oldest_started_at: None,
             per_shard: BTreeMap::new(),
         }
     }
 
     fn add(&mut self, shard_id: i32, row: &WorkflowTypeNonTerminalCount) {
-        self.non_terminal_count += row.non_terminal_count;
-        self.oldest_started_at = Some(
-            self.oldest_started_at
-                .map_or(row.oldest_started_at, |current| {
-                    current.min(row.oldest_started_at)
-                }),
-        );
         self.per_shard
             .entry(shard_id)
             .and_modify(|(count, oldest)| {
@@ -190,6 +177,17 @@ impl ReachabilityAccumulator {
                 *oldest = (*oldest).min(row.oldest_started_at);
             })
             .or_insert((row.non_terminal_count, row.oldest_started_at));
+    }
+
+    fn non_terminal_count(&self) -> i64 {
+        self.per_shard.values().map(|(count, _)| count).sum()
+    }
+
+    fn oldest_started_at(&self) -> Option<DateTime<Utc>> {
+        self.per_shard
+            .values()
+            .map(|(_, oldest)| *oldest)
+            .reduce(DateTime::min)
     }
 }
 
@@ -215,8 +213,19 @@ pub async fn build_workflow_reachability_report(
         .cloned()
         .collect::<BTreeSet<_>>();
 
-    let expected_shards = expected_shards(api_state);
-    let pools = pools_by_shard(api_state);
+    // Only include shards that have a configured pool. A shard the router knows
+    // about but has no pool for (e.g. during a shard-add rollout before the
+    // pool is wired up) must not appear as "unavailable" and make the report
+    // partial — it simply hasn't been added yet.
+    let pools = shard_fanout::pools_by_shard(api_state);
+    let expected_shards: BTreeSet<i32> = if pools.is_empty() {
+        // No pool configured: expose a synthetic shard-0 entry so the report
+        // is well-formed ("unavailable") rather than having an empty shards list.
+        BTreeSet::from([0])
+    } else {
+        pools.keys().copied().collect()
+    };
+
     let filter = query.workflow_type.clone();
 
     let observations = expected_shards
@@ -236,43 +245,11 @@ pub async fn build_workflow_reachability_report(
     ))
 }
 
-fn expected_shards(api_state: &HarvestApiState) -> BTreeSet<i32> {
-    let mut shards = BTreeSet::new();
-    if let Ok(pool) = api_state.storage_pool() {
-        shards.extend(pool.iter_shards().map(|(shard, _)| shard.as_i32()));
-    }
-    if let Ok(runtime) = api_state.runtime() {
-        shards.extend(
-            runtime
-                .router()
-                .readable_shards()
-                .iter()
-                .map(|shard| shard.as_i32()),
-        );
-        shards.insert(runtime.router().default_shard().as_i32());
-    }
-    if shards.is_empty() {
-        shards.insert(0);
-    }
-    shards
-}
-
-fn pools_by_shard(api_state: &HarvestApiState) -> BTreeMap<i32, DbPool> {
-    api_state.storage_pool().map_or_else(
-        |_| BTreeMap::new(),
-        |pool| {
-            pool.iter_shards()
-                .map(|(shard, db_pool)| (shard.as_i32(), db_pool.clone()))
-                .collect()
-        },
-    )
-}
-
 async fn observe_shard(
     shard_id: i32,
     pool: Option<DbPool>,
     filter: Option<String>,
-) -> ShardObservation {
+) -> ShardObservation<WorkflowTypeNonTerminalCount> {
     let Some(pool) = pool else {
         return ShardObservation {
             shard_id,
@@ -307,7 +284,7 @@ fn build_report_from_observations(
     observed_at: DateTime<Utc>,
     filter: Option<String>,
     registered: &BTreeSet<String>,
-    observations: Vec<ShardObservation>,
+    observations: Vec<ShardObservation<WorkflowTypeNonTerminalCount>>,
 ) -> WorkflowReachabilityReport {
     let inspected_shards = observations
         .iter()
@@ -348,17 +325,20 @@ fn build_report_from_observations(
         .map(|workflow_type| {
             let acc = accumulators.get(&workflow_type);
             let is_registered = registered.contains(&workflow_type);
-            let non_terminal_count = acc.map_or(0, |a| a.non_terminal_count);
+            let non_terminal_count = acc.map_or(0, ReachabilityAccumulator::non_terminal_count);
             let oldest_non_terminal_age_secs = acc
-                .and_then(|a| a.oldest_started_at)
-                .map(|started_at| age_secs(observed_at, started_at));
+                .and_then(ReachabilityAccumulator::oldest_started_at)
+                .map(|started_at| shard_fanout::age_secs(observed_at, started_at));
             let shard_breakdown = acc.map_or_else(Vec::new, |a| {
                 a.per_shard
                     .iter()
                     .map(|(shard_id, (count, oldest))| ReachabilityShardCount {
                         shard_id: *shard_id,
                         non_terminal_count: *count,
-                        oldest_non_terminal_age_secs: Some(age_secs(observed_at, *oldest)),
+                        oldest_non_terminal_age_secs: Some(shard_fanout::age_secs(
+                            observed_at,
+                            *oldest,
+                        )),
                     })
                     .collect()
             });
@@ -416,13 +396,6 @@ const fn report_status(no_inspected: bool, has_unavailable: bool) -> Reachabilit
     }
 }
 
-fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
-    observed_at
-        .signed_duration_since(started_at)
-        .num_seconds()
-        .max(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,17 +428,25 @@ mod tests {
             .unwrap_or_else(|| panic!("expected item for {workflow_type}"))
     }
 
+    fn obs(
+        shard_id: i32,
+        rows: Vec<WorkflowTypeNonTerminalCount>,
+        error: Option<&str>,
+    ) -> ShardObservation<WorkflowTypeNonTerminalCount> {
+        ShardObservation {
+            shard_id,
+            rows,
+            error: error.map(ToOwned::to_owned),
+        }
+    }
+
     #[test]
     fn registered_with_no_executions_is_safe_to_remove() {
         let report = build_report_from_observations(
             at(1000),
             None,
             &registered(&["onboarding"]),
-            vec![ShardObservation {
-                shard_id: 0,
-                rows: Vec::new(),
-                error: None,
-            }],
+            vec![obs(0, Vec::new(), None)],
         );
 
         assert_eq!(report.status, ReachabilityReportStatus::Complete);
@@ -483,11 +464,7 @@ mod tests {
             at(1000),
             None,
             &registered(&["onboarding"]),
-            vec![ShardObservation {
-                shard_id: 0,
-                rows: vec![row("onboarding", 3, 400)],
-                error: None,
-            }],
+            vec![obs(0, vec![row("onboarding", 3, 400)], None)],
         );
 
         let onboarding = item(&report, "onboarding");
@@ -505,11 +482,7 @@ mod tests {
             at(1000),
             None,
             &registered(&[]),
-            vec![ShardObservation {
-                shard_id: 0,
-                rows: vec![row("legacy_flow", 1, 0)],
-                error: None,
-            }],
+            vec![obs(0, vec![row("legacy_flow", 1, 0)], None)],
         );
 
         let legacy = item(&report, "legacy_flow");
@@ -524,11 +497,7 @@ mod tests {
             at(1000),
             Some("never_started".to_string()),
             &registered(&["onboarding"]),
-            vec![ShardObservation {
-                shard_id: 0,
-                rows: Vec::new(),
-                error: None,
-            }],
+            vec![obs(0, Vec::new(), None)],
         );
 
         assert_eq!(report.items.len(), 1);
@@ -546,16 +515,8 @@ mod tests {
             None,
             &registered(&["onboarding"]),
             vec![
-                ShardObservation {
-                    shard_id: 0,
-                    rows: vec![row("onboarding", 2, 400)],
-                    error: None,
-                },
-                ShardObservation {
-                    shard_id: 1,
-                    rows: vec![row("onboarding", 5, 100)],
-                    error: None,
-                },
+                obs(0, vec![row("onboarding", 2, 400)], None),
+                obs(1, vec![row("onboarding", 5, 100)], None),
             ],
         );
 
@@ -577,16 +538,8 @@ mod tests {
             None,
             &registered(&["onboarding"]),
             vec![
-                ShardObservation {
-                    shard_id: 0,
-                    rows: vec![row("onboarding", 1, 500)],
-                    error: None,
-                },
-                ShardObservation {
-                    shard_id: 1,
-                    rows: Vec::new(),
-                    error: Some("connection refused".to_string()),
-                },
+                obs(0, vec![row("onboarding", 1, 500)], None),
+                obs(1, Vec::new(), Some("connection refused")),
             ],
         );
 
@@ -607,11 +560,7 @@ mod tests {
             at(1000),
             None,
             &registered(&["onboarding"]),
-            vec![ShardObservation {
-                shard_id: 0,
-                rows: Vec::new(),
-                error: Some("pool missing".to_string()),
-            }],
+            vec![obs(0, Vec::new(), Some("pool missing"))],
         );
 
         assert_eq!(report.status, ReachabilityReportStatus::Unavailable);
@@ -641,11 +590,7 @@ mod tests {
             at(1000),
             None,
             &registered(&["onboarding"]),
-            vec![ShardObservation {
-                shard_id: 0,
-                rows: vec![row("legacy_flow", 2, 0)],
-                error: None,
-            }],
+            vec![obs(0, vec![row("legacy_flow", 2, 0)], None)],
         );
 
         let types: Vec<&str> = report

@@ -12,6 +12,7 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{HarvestApiState, map_error};
+use crate::shard_fanout;
 
 /// Query string accepted by `GET /admin/version-gates/usage`.
 #[derive(Debug, Clone, Deserialize)]
@@ -86,12 +87,7 @@ pub struct VersionUsageShardInspection {
     pub error: Option<String>,
 }
 
-#[derive(Debug)]
-struct ShardObservation {
-    shard_id: i32,
-    rows: Vec<VersionUsageShardRow>,
-    error: Option<String>,
-}
+type ShardObservation = shard_fanout::ShardObservation<VersionUsageShardRow>;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 struct VersionUsageKey {
@@ -134,7 +130,7 @@ pub async fn build_version_usage_report(
         shard_id: query.shard_id,
     };
     let expected_shards = expected_shards(api_state, query.shard_id);
-    let pools = pools_by_shard(api_state);
+    let pools = shard_fanout::pools_by_shard(api_state);
 
     let observations = expected_shards
         .iter()
@@ -183,16 +179,6 @@ fn expected_shards(api_state: &HarvestApiState, shard_filter: Option<i32>) -> BT
     shards
 }
 
-fn pools_by_shard(api_state: &HarvestApiState) -> BTreeMap<i32, DbPool> {
-    api_state.storage_pool().map_or_else(
-        |_| BTreeMap::new(),
-        |pool| {
-            pool.iter_shards()
-                .map(|(shard, db_pool)| (shard.as_i32(), db_pool.clone()))
-                .collect()
-        },
-    )
-}
 
 async fn observe_shard(
     shard_id: i32,
@@ -341,8 +327,8 @@ fn row_from_accumulator(
         terminal_executions: acc.terminal_executions,
         oldest_matching_started_at: acc.oldest_matching_started_at,
         newest_matching_started_at: acc.newest_matching_started_at,
-        oldest_matching_execution_age_secs: age_secs(observed_at, acc.oldest_matching_started_at),
-        newest_matching_execution_age_secs: age_secs(observed_at, acc.newest_matching_started_at),
+        oldest_matching_execution_age_secs: shard_fanout::age_secs(observed_at, acc.oldest_matching_started_at),
+        newest_matching_execution_age_secs: shard_fanout::age_secs(observed_at, acc.newest_matching_started_at),
         shard_coverage: VersionUsageShardCoverage {
             inspected_shards: inspected_shards.iter().copied().collect(),
             matched_shards: acc.matched_shards.iter().copied().collect(),
@@ -351,12 +337,6 @@ fn row_from_accumulator(
     }
 }
 
-fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
-    observed_at
-        .signed_duration_since(started_at)
-        .num_seconds()
-        .max(0)
-}
 
 const fn report_status(
     no_items: bool,
