@@ -5,6 +5,12 @@ All notable changes to autumn-harvest will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Add workflow-type reachability check to gate safe handler removal (issue #520). New read-only `GET /admin/workflow-types/reachability` endpoint and `harvest workflow-types reachability [--type] [--json]` CLI subcommand report, per workflow type, how many non-terminal executions still depend on its handler and a `safe_to_remove` / `in_use` / `orphaned` verdict. The CLI exits `2` when any type is `orphaned` or the cross-shard answer is incomplete, so it is usable as a CI/deploy gate. No new `WorkflowEvent` variant, no migration.
+
 ## [0.4.0] - 2026-06-16
 
 ### Added

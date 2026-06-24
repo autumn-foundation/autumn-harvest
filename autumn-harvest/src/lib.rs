@@ -229,10 +229,11 @@ pub use event::{SideEffectKind, WorkflowEvent};
 pub use execution::{
     CancelledWorkflowExecution, PausedWorkflowExecution, ResumedWorkflowExecution,
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, StartedWorkflowExecution,
-    UpdateWithStartOutcome, UpdateWithStartParams, auto_resume_expired_pauses,
-    cancel_workflow_execution, pause_workflow_execution, resume_workflow_execution,
-    signal_with_start_workflow_execution, start_or_load_workflow_execution,
-    terminate_workflow_execution, update_with_start_workflow_execution,
+    UpdateWithStartOutcome, UpdateWithStartParams, WorkflowTypeNonTerminalCount,
+    auto_resume_expired_pauses, cancel_workflow_execution, non_terminal_counts_by_workflow_name,
+    pause_workflow_execution, resume_workflow_execution, signal_with_start_workflow_execution,
+    start_or_load_workflow_execution, terminate_workflow_execution,
+    update_with_start_workflow_execution,
 };
 pub use executor::{WorkflowOutcome, run_workflow};
 pub use guardrail::{

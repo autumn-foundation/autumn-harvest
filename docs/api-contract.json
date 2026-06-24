@@ -2971,6 +2971,38 @@
     },
     {
       "method": "GET",
+      "path": "/admin/workflow-types/reachability",
+      "category": "admin",
+      "read_only": true,
+      "description": "Report per-workflow-type handler reachability so an operator can gate safe handler removal (issue #520). Counts non-terminal executions per workflow type across all shards and joins against the in-memory handler registry to assign each type a verdict of safe_to_remove, in_use, or orphaned.",
+      "params": [
+        {
+          "name": "workflow_type",
+          "in": "query",
+          "required": false,
+          "description": "Narrow the report to a single workflow type. Still returns the full object (non_terminal_count = 0 + safe_to_remove when none found)."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "observed_at",
+          "filter",
+          "items",
+          "shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Harvest runtime not started (registry unavailable)."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/retention",
       "category": "admin",
       "read_only": true,
