@@ -2299,3 +2299,138 @@ async fn test_trigger_evaluations_schema_validation() {
         .unwrap();
     assert!(target_exec_invalid.is_none());
 }
+
+/// AC #6 (issue #517): a per-trigger fire counter/metric
+/// (`harvest.completion_trigger.fires{trigger, outcome}`) is emitted so
+/// operators can confirm wiring. This drives the completion path twice and
+/// asserts the recorder observes `started` on the first evaluation and
+/// `deduped` on the (idempotent) second evaluation, both tagged with the
+/// trigger id.
+#[tokio::test]
+async fn test_trigger_emits_fire_metric_outcomes() {
+    /// Minimal capturing `MetricsRecorder` — records only the completion-trigger
+    /// fire outcomes (all other trait methods keep their no-op defaults).
+    #[derive(Default)]
+    struct CapturingMetrics {
+        fires: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    impl autumn_harvest::telemetry::MetricsRecorder for CapturingMetrics {
+        fn record_completion_trigger_fired(&self, trigger_id: &str, outcome: &str) {
+            self.fires
+                .lock()
+                .unwrap()
+                .push((trigger_id.to_string(), outcome.to_string()));
+        }
+    }
+
+    let _lock = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = pool.get().await.unwrap();
+
+    let trigger_id = uuid::Uuid::new_v4();
+    post_json(
+        &app,
+        "/admin/completion-triggers",
+        json!({
+            "id": trigger_id,
+            "source_workflow_name": "source_wf",
+            "terminal_states": ["Completed"],
+            "target_workflow_name": "target_wf",
+            "input_mapping": {"type": "Passthrough"}
+        }),
+    )
+    .await;
+
+    // Start + complete a source workflow.
+    let source_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: "source_wf",
+            workflow_id: "source-metric",
+            exec_id: source_exec_id,
+            input: json!({"hello": "metric"}),
+            parent_id: None,
+            queue_name: "default",
+            execution_timeout: None,
+            memo: None,
+            search_attrs: None,
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            trace_context: None,
+            max_execution_timeout_ceiling: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: Priority::default(),
+            max_workflow_input_bytes: 0,
+            start_at: None,
+            delay: None,
+            max_workflow_start_delay: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            context_headers: None,
+            sla: None,
+            schedule_id: None,
+            scheduled_for: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    diesel::update(harvest_workflow_executions::table.find(source_exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("COMPLETED"),
+            harvest_workflow_executions::output.eq(Some(json!({"result": "done"}))),
+            harvest_workflow_executions::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let metrics = CapturingMetrics::default();
+
+    // First evaluation: the target is started → outcome "started".
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_exec_id,
+        TerminalState::Completed,
+        Some(&metrics),
+    )
+    .await
+    .unwrap();
+
+    // Second evaluation of the same (source_exec_id, trigger_id): the dedupe
+    // ledger short-circuits → outcome "deduped". No second target is started.
+    evaluate_triggers_for_execution(
+        &mut conn,
+        source_exec_id,
+        TerminalState::Completed,
+        Some(&metrics),
+    )
+    .await
+    .unwrap();
+
+    let fires = metrics.fires.lock().unwrap().clone();
+    assert_eq!(
+        fires,
+        vec![
+            (trigger_id.to_string(), "started".to_string()),
+            (trigger_id.to_string(), "deduped".to_string()),
+        ],
+        "expected one `started` then one `deduped` fire metric for the trigger, got {fires:?}"
+    );
+
+    // Belt-and-suspenders: exactly one target execution exists despite two evals.
+    let target_workflow_id = format!("completion-trigger-{}-{}", trigger_id, source_exec_id);
+    let target_count: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(target_count, 1);
+}
