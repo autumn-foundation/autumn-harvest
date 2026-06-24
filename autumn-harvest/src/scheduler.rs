@@ -3142,7 +3142,7 @@ pub(crate) struct CatchupPlan {
     pub dropped: u64,
 }
 
-/// Compute the set of fire slots and the dropped count given a [`CatchupPolicy`].
+/// Compute the set of fire slots and the dropped count given a [`crate::policy::CatchupPolicy`].
 ///
 /// This is the policy-aware replacement for the internal `due_run_plan` helper.
 /// The old function is preserved as a thin wrapper for backward-compat so that

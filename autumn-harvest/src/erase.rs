@@ -23,7 +23,7 @@
 //!
 //! ## Scope
 //!
-//! A single call to [`erase_workflow_payloads`] tombstones:
+//! A single call to [`crate::erase::erase_workflow_payloads`] tombstones:
 //! - All payload-bearing fields in `harvest_events.event_data` for the target
 //!   execution (and, recursively, all terminal child executions on the same
 //!   shard).
@@ -32,7 +32,7 @@
 //! - All `harvest_signals.payload` rows associated with the execution.
 //!
 //! Non-terminal child executions are skipped and reported in
-//! [`EraseOutcome::skipped_children`]; they must be erased separately once
+//! `EraseOutcome::skipped_children`; they must be erased separately once
 //! they reach a terminal state.
 
 use serde_json::{Value, json};
@@ -134,7 +134,7 @@ pub struct EraseFailure {
     pub reason: String,
 }
 
-/// Result of a single [`erase_workflow_payloads`] call.
+/// Result of a single [`crate::erase::erase_workflow_payloads`] call.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EraseOutcome {
     /// The execution whose payloads were erased.
