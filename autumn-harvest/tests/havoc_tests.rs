@@ -60,3 +60,15 @@ fn test_havoc_external_task_duration_panic() {
     });
     assert!(res.is_ok());
 }
+
+#[test]
+fn test_havoc_eligibility_char_boundary_panic() {
+    let input = "ⷐ=";
+    let res = std::panic::catch_unwind(|| {
+        let _ = autumn_harvest::eligibility::parse_requirements(input);
+    });
+    assert!(
+        res.is_ok(),
+        "The system still crashes on non-ascii char boundaries during parse_requirements!"
+    );
+}
