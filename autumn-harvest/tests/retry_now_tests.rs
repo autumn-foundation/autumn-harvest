@@ -284,8 +284,7 @@ async fn running_task_returns_conflict_error() {
 
     assert!(
         matches!(result, Err(HarvestError::Config(_))),
-        "RUNNING task should return Config (conflict) error, got: {:?}",
-        result
+        "RUNNING task should return Config (conflict) error, got: {result:?}",
     );
 }
 
@@ -301,8 +300,7 @@ async fn unknown_task_id_returns_not_found() {
 
     assert!(
         matches!(result, Err(HarvestError::NotFound(_))),
-        "unknown task_id should return NotFound, got: {:?}",
-        result
+        "unknown task_id should return NotFound, got: {result:?}",
     );
 }
 
@@ -321,7 +319,6 @@ async fn task_for_different_workflow_returns_not_found() {
 
     assert!(
         matches!(result, Err(HarvestError::NotFound(_))),
-        "task belonging to different workflow should return NotFound, got: {:?}",
-        result
+        "task belonging to different workflow should return NotFound, got: {result:?}",
     );
 }
