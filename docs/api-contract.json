@@ -947,6 +947,58 @@
     },
     {
       "method": "POST",
+      "path": "/workflows/{id}/activities/{activity_exec_id}/retry-now",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Force a backing-off activity to retry immediately by advancing its scheduled_at to NOW() and waking an idle worker via pg_notify. Only PENDING tasks (including those waiting out exponential backoff) can be advanced. Local activities run inline and have no task-queue row — this endpoint does not apply to them.",
+      "idempotency": "Idempotent: calling on an already-eligible task (scheduled_at <= now) returns advanced=false and performs no update. Calling twice after advancing also returns advanced=false on the second call.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Workflow execution UUID."
+        },
+        {
+          "name": "activity_exec_id",
+          "in": "path",
+          "required": true,
+          "description": "Activity execution ID (the task-queue row PK, surfaced as activity_exec_id in GET /workflows/{id}/stack)."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "activity_exec_id",
+          "queue",
+          "next_retry_at",
+          "advanced"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution or activity task not found (including task belonging to a different workflow)."
+        },
+        {
+          "status": 409,
+          "description": "Task is not in PENDING state (e.g. currently RUNNING or already terminal)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
       "path": "/workflows/{id}/reset",
       "category": "workflow",
       "read_only": false,

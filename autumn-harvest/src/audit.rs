@@ -115,6 +115,8 @@ pub const OP_GATE_LIFT: &str = "gate.lift";
 pub const OP_WORKFLOW_ERASE_PAYLOADS: &str = "workflow.erase_payloads";
 /// Audit operation: Ran the replay compatibility canary.
 pub const OP_WORKFLOW_REPLAY_CANARY: &str = "workflow.replay_canary";
+/// Audit operation: Force-retried a backing-off activity task (issue #516).
+pub const OP_ACTIVITY_RETRY_NOW: &str = "activity.retry_now";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -130,6 +132,8 @@ pub const TARGET_DEAD_LETTER: &str = "dead_letter";
 pub const TARGET_BATCH: &str = "batch";
 pub const TARGET_RETENTION: &str = "retention";
 pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
+/// Audit target type for individual activity task operations (issue #516).
+pub const TARGET_ACTIVITY: &str = "activity";
 pub const TARGET_WORKER: &str = "worker";
 pub const TARGET_RATE_LIMIT: &str = "rate_limit";
 pub const TARGET_BUILD_ROUTING: &str = "build_routing";
@@ -353,6 +357,11 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /workflows/{id}/erase-payloads", RouteClass::Mutating),
     // Replay canary (issue #512): admin-only.
     ("POST /admin/workflows/replay-canary", RouteClass::Mutating),
+    // Force-retry backing-off activity (issue #516): admin-only.
+    (
+        "POST /workflows/{id}/activities/{activity_exec_id}/retry-now",
+        RouteClass::Mutating,
+    ),
 ];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
@@ -401,6 +410,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // PII erasure (issue #495)
     OP_WORKFLOW_ERASE_PAYLOADS,
     OP_WORKFLOW_REPLAY_CANARY,
+    // Force-retry backing-off activity (issue #516)
+    OP_ACTIVITY_RETRY_NOW,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -602,6 +613,11 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     (
         "POST /admin/workflows/replay-canary",
         Some(OP_WORKFLOW_REPLAY_CANARY),
+    ),
+    // Force-retry backing-off activity (issue #516)
+    (
+        "POST /workflows/{id}/activities/{activity_exec_id}/retry-now",
+        Some(OP_ACTIVITY_RETRY_NOW),
     ),
 ];
 

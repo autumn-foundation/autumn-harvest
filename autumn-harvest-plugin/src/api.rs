@@ -33,19 +33,19 @@ use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::OP_BATCH_START;
 use autumn_harvest::audit::{
-    self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_BATCH_SUBMIT,
-    OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET, OP_CIRCUIT_FORCE_CLOSE,
-    OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK,
-    OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE,
-    OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW,
-    OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
-    OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN,
-    OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET,
-    OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
-    OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED,
-    STATUS_SUCCEEDED, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT, TARGET_DAG,
-    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE,
-    TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
+    self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_ACTIVITY_RETRY_NOW,
+    OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET,
+    OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
+    OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
+    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_TASK_REPRIORITIZE,
+    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
+    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
+    TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE,
+    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
@@ -1409,6 +1409,17 @@ struct ResumeWorkflowResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct RetryActivityNowResponse {
+    ok: bool,
+    execution_id: String,
+    activity_exec_id: String,
+    queue: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    advanced: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct ResetWorkflowResponse {
     new_exec_id: String,
     reset_from_exec_id: String,
@@ -2430,6 +2441,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(erase_workflow_payloads_handler).route_layer(require_admin.clone()),
         )
         .route(
+            "/workflows/{id}/activities/{activity_exec_id}/retry-now",
+            post(retry_activity_now).route_layer(require_admin.clone()),
+        )
+        .route(
             "/workflows/{id}/pause",
             post(pause_workflow).route_layer(require_admin.clone()),
         )
@@ -2784,6 +2799,10 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/workflows/{id}/pause"),
         ("POST", "/workflows/{id}/resume"),
         ("POST", "/workflows/{id}/erase-payloads"),
+        (
+            "POST",
+            "/workflows/{id}/activities/{activity_exec_id}/retry-now",
+        ),
         ("POST", "/workflows/{id}/reset"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
         ("GET", "/workflows/{id}/queries"),
@@ -2958,6 +2977,11 @@ pub const fn management_api_request_fields()
         ("POST", "/workflows/{id}/pause", Some(&["reason"])),
         ("POST", "/workflows/{id}/resume", Some(&[])),
         ("POST", "/workflows/{id}/erase-payloads", Some(&["reason"])),
+        (
+            "POST",
+            "/workflows/{id}/activities/{activity_exec_id}/retry-now",
+            Some(&[]),
+        ),
         (
             "POST",
             "/workflows/{id}/reset",
@@ -3330,6 +3354,18 @@ pub const fn management_api_response_fields()
                 "children",
                 "skipped_children",
                 "failures",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/activities/{activity_exec_id}/retry-now",
+            Some(&[
+                "ok",
+                "execution_id",
+                "activity_exec_id",
+                "queue",
+                "next_retry_at",
+                "advanced",
             ]),
         ),
         (
@@ -5669,6 +5705,15 @@ async fn get_workflow_stack(
     let pending_activities = tasks
         .into_iter()
         .map(|t| {
+            // Populate next_retry_at for backing-off tasks (issue #516): a
+            // PENDING task whose scheduled_at is in the future is waiting out
+            // a retry backoff. Surface that timestamp so operators can see
+            // exactly when attempt N+1 would naturally fire, and correlate it
+            // with the force-retry endpoint. Must be computed before task_status
+            // moves t.state.
+            let next_retry_at = (t.state == "PENDING" && t.scheduled_at > chrono::Utc::now())
+                .then_some(t.scheduled_at);
+
             let task_status = if t.state == "PENDING" {
                 if let Some(ref key) = t.rate_limit_key {
                     if blocked_keys.contains(key) {
@@ -5709,7 +5754,7 @@ async fn get_workflow_stack(
                 heartbeat_details_truncated,
                 heartbeat_details_omitted_for_budget: false,
                 heartbeat_details_bytes,
-                next_retry_at: None,
+                next_retry_at,
                 schedule_to_start_deadline: t.schedule_to_start.map(|d| t.scheduled_at + d),
                 start_to_close_deadline: t.started_at.zip(t.start_to_close).map(|(s, d)| s + d),
                 heartbeat_deadline: t
@@ -9244,6 +9289,99 @@ async fn erase_workflow_payloads_handler(
 
     match result {
         Ok(outcome) => Ok((axum::http::StatusCode::OK, Json(outcome))),
+        Err(e) => Err(conflict_from(e)),
+    }
+}
+
+/// `POST /workflows/{id}/activities/{activity_exec_id}/retry-now` — skip
+/// remaining backoff for a PENDING activity and make it immediately eligible
+/// for claiming. Admin-guarded. Returns 202 Accepted with `advanced: true`
+/// when the task was advanced, `advanced: false` when it was already eligible
+/// (idempotent no-op). Returns 404 for unknown task IDs or wrong workflow,
+/// 409 for tasks in a non-PENDING state (e.g. RUNNING).
+///
+/// Note: local activities run inline on the workflow worker and have no
+/// `harvest_task_queue` row — `retry-now` does not apply to them.
+async fn retry_activity_now(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((id, activity_exec_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<(axum::http::StatusCode, Json<RetryActivityNowResponse>), AutumnError> {
+    use autumn_harvest::models::NewAuditRecord;
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/activities/{activity_exec_id}/retry-now";
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            if let Ok(pool) = api_state.storage_pool()
+                && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+            {
+                let ar = NewAuditRecord {
+                    actor: &actor,
+                    operation: OP_ACTIVITY_RETRY_NOW,
+                    target_type: TARGET_ACTIVITY,
+                    target_id: Some(id.as_str()),
+                    route_or_command: route,
+                    request_id: request_id.as_deref(),
+                    idempotency_key: None,
+                    status: STATUS_FAILED,
+                    error_summary: Some("malformed execution id"),
+                    shard_id: None,
+                    source: &source,
+                };
+                let _ = audit::insert_audit(&mut conn, &ar).await;
+            }
+            return Err(e);
+        }
+    };
+
+    let Ok(task_id) = uuid::Uuid::parse_str(&activity_exec_id) else {
+        return Err(AutumnError::not_found_msg(format!(
+            "unknown activity_exec_id: {activity_exec_id}"
+        )));
+    };
+
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+
+    let result = queue::force_retry_activity_now(&mut conn, exec_id.as_uuid(), task_id).await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_ACTIVITY_RETRY_NOW,
+        target_type: TARGET_ACTIVITY,
+        target_id: Some(activity_exec_id.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result {
+        Ok(outcome) => {
+            let next_retry_at = outcome.advanced.then_some(outcome.scheduled_at);
+            Ok((
+                axum::http::StatusCode::ACCEPTED,
+                Json(RetryActivityNowResponse {
+                    ok: true,
+                    execution_id: exec_id_str,
+                    activity_exec_id,
+                    queue: outcome.queue_name,
+                    next_retry_at,
+                    advanced: outcome.advanced,
+                }),
+            ))
+        }
         Err(e) => Err(conflict_from(e)),
     }
 }

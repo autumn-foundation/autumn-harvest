@@ -1205,3 +1205,26 @@ fn canary_maps_to_management_api_request() {
         }))
     );
 }
+
+#[test]
+fn workflow_retry_activity_maps_to_post_retry_now_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "retry-activity",
+        "exec-123",
+        "act-456",
+    ])
+    .expect("retry-activity args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("retry-activity request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/exec-123/activities/act-456/retry-now"
+    );
+    assert_eq!(request.body, None, "retry-activity sends no body");
+}
