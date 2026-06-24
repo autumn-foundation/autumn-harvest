@@ -1417,6 +1417,10 @@ struct RetryActivityNowResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     next_retry_at: Option<chrono::DateTime<chrono::Utc>>,
     advanced: bool,
+    /// Only meaningful when `advanced` is `false`. `true` = task was already
+    /// claimable (idempotent no-op). `false` = a concurrent worker claimed the
+    /// task between the eligibility check and the UPDATE (task is now RUNNING).
+    already_eligible: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3366,6 +3370,7 @@ pub const fn management_api_response_fields()
                 "queue",
                 "next_retry_at",
                 "advanced",
+                "already_eligible",
             ]),
         ),
         (
@@ -5702,17 +5707,25 @@ async fn get_workflow_stack(
         autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES,
         |rt| rt.registry.max_activity_result_bytes,
     );
+    // Snapshot the current time once above the loop so all tasks in the same
+    // response are judged against a consistent instant (Finding 7 / #516).
+    let now = chrono::Utc::now();
     let pending_activities = tasks
         .into_iter()
         .map(|t| {
             // Populate next_retry_at for backing-off tasks (issue #516): a
-            // PENDING task whose scheduled_at is in the future is waiting out
-            // a retry backoff. Surface that timestamp so operators can see
-            // exactly when attempt N+1 would naturally fire, and correlate it
-            // with the force-retry endpoint. Must be computed before task_status
-            // moves t.state.
-            let next_retry_at = (t.state == "PENDING" && t.scheduled_at > chrono::Utc::now())
-                .then_some(t.scheduled_at);
+            // PENDING task whose scheduled_at is in the future AND that is not
+            // gated by a rate-limit bucket is waiting out a retry backoff.
+            // Rate-limited tasks show task_status="waiting on rate_limit_key=…"
+            // rather than a retry countdown, so we suppress next_retry_at for
+            // them to avoid misleading the operator. Must be computed before
+            // task_status moves t.state.
+            let next_retry_at = (t.state == "PENDING"
+                && t.scheduled_at > now
+                && t.rate_limit_key
+                    .as_ref()
+                    .is_none_or(|k| !blocked_keys.contains(k)))
+            .then_some(t.scheduled_at);
 
             let task_status = if t.state == "PENDING" {
                 if let Some(ref key) = t.rate_limit_key {
@@ -5773,6 +5786,11 @@ async fn get_workflow_stack(
     let external_handoff_rows = external_task::list_external_handoffs(&mut conn, &handoff_filters)
         .await
         .map_err(map_error)?;
+    // External-handoff rows expose `task.activity_id` (the handoff PK) as
+    // activity_exec_id, which is a different id-space from the task-queue PKs
+    // used by task-queue activities. The `retry-now` endpoint operates on
+    // task-queue PKs only; calling it with an external-handoff activity_id will
+    // return 404 since no harvest_task_queue row matches.
     let external_pending = external_handoff_rows
         .iter()
         .map(|task| PendingActivity {
@@ -9338,6 +9356,26 @@ async fn retry_activity_now(
     };
 
     let Ok(task_id) = uuid::Uuid::parse_str(&activity_exec_id) else {
+        // Write a STATUS_FAILED audit record (symmetric with the malformed `id`
+        // path above) so operators can see the rejected call in the audit log.
+        if let Ok(pool) = api_state.storage_pool()
+            && let Ok(mut audit_conn) = acquire_conn(pool.default_pool()).await
+        {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_ACTIVITY_RETRY_NOW,
+                target_type: TARGET_ACTIVITY,
+                target_id: Some(activity_exec_id.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: None,
+                status: STATUS_FAILED,
+                error_summary: Some("malformed activity_exec_id"),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut audit_conn, &ar).await;
+        }
         return Err(AutumnError::not_found_msg(format!(
             "unknown activity_exec_id: {activity_exec_id}"
         )));
@@ -9369,6 +9407,14 @@ async fn retry_activity_now(
 
     match result {
         Ok(outcome) => {
+            // next_retry_at is the new scheduled_at only when the task was
+            // actually advanced (it will be ≈ now, backdated by the skew
+            // allowance). Omit it for both no-op cases (already eligible or
+            // concurrent claim) so callers can detect the three distinct
+            // outcomes via (advanced, already_eligible):
+            //   (true,  _)     → task was advanced, now immediately eligible
+            //   (false, true)  → was already eligible, no change needed
+            //   (false, false) → concurrent worker claimed it; it is RUNNING
             let next_retry_at = outcome.advanced.then_some(outcome.scheduled_at);
             Ok((
                 axum::http::StatusCode::ACCEPTED,
@@ -9379,6 +9425,7 @@ async fn retry_activity_now(
                     queue: outcome.queue_name,
                     next_retry_at,
                     advanced: outcome.advanced,
+                    already_eligible: outcome.already_eligible,
                 }),
             ))
         }

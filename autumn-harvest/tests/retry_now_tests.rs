@@ -226,6 +226,10 @@ async fn already_eligible_task_is_idempotent_no_op() {
         !outcome.advanced,
         "already-eligible task should return advanced=false (no-op)"
     );
+    assert!(
+        outcome.already_eligible,
+        "already-eligible task should report already_eligible=true"
+    );
 }
 
 #[tokio::test]
@@ -248,6 +252,10 @@ async fn idempotent_second_call_also_succeeds() {
     assert!(
         !second.advanced,
         "second call on already-eligible task should be no-op"
+    );
+    assert!(
+        second.already_eligible,
+        "second call should report already_eligible=true"
     );
 }
 

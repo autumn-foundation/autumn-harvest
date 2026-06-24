@@ -979,13 +979,19 @@
           "activity_exec_id",
           "queue",
           "next_retry_at",
-          "advanced"
-        ]
+          "advanced",
+          "already_eligible"
+        ],
+        "field_notes": {
+          "advanced": "true when scheduled_at was moved to immediate eligibility; false otherwise. Note: advanced=true means scheduled_at was updated, not that the task will be dispatched immediately — per-queue rate-limit buckets and concurrency caps in claim_task can still defer actual dispatch.",
+          "already_eligible": "Only meaningful when advanced=false. true=task was already claimable (idempotent no-op). false=a concurrent worker claimed the task between the SELECT and UPDATE (task is now RUNNING).",
+          "next_retry_at": "The backdated scheduled_at written to the task when advanced=true (immediately claimable). null when advanced=false."
+        }
       },
       "error_responses": [
         {
           "status": 404,
-          "description": "Execution or activity task not found (including task belonging to a different workflow)."
+          "description": "Execution or activity task not found, including task belonging to a different workflow, or activity_exec_id is not a valid UUID. Note: external-handoff activity IDs are a different id-space from task-queue PKs; passing one will return 404."
         },
         {
           "status": 409,

@@ -1130,12 +1130,20 @@ pub struct RetryActivityOutcome {
     pub task_id: Uuid,
     /// The queue this task belongs to.
     pub queue_name: String,
-    /// The effective `scheduled_at` after the operation (≈ `NOW()` when
-    /// `advanced` is `true`, unchanged otherwise).
+    /// The effective `scheduled_at` after the operation (backdated by
+    /// `IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` when `advanced` is `true` so it
+    /// passes the `scheduled_at <= NOW()` predicate in `claim_task` even under
+    /// host/Postgres clock skew; unchanged otherwise).
     pub scheduled_at: DateTime<Utc>,
-    /// `true` when the task's eligibility was advanced to now (it was backing
-    /// off); `false` when it was already eligible (idempotent no-op).
+    /// `true` when the task's eligibility was advanced (it was backing off);
+    /// `false` when the task required no change (see `already_eligible`).
     pub advanced: bool,
+    /// Only meaningful when `advanced` is `false`. `true` means the task was
+    /// already claimable before this call (genuine idempotent no-op). `false`
+    /// means a concurrent worker claimed the task between the SELECT and the
+    /// UPDATE — the task is now `RUNNING`, so the caller's goal (retry it) is
+    /// already achieved.
+    pub already_eligible: bool,
 }
 
 /// Advance a backing-off activity task to be immediately eligible for claim
@@ -1154,14 +1162,24 @@ pub struct RetryActivityOutcome {
 ///   in the DLQ), the call returns `HarvestError::Config` (→ 409 via
 ///   `conflict_from`).
 /// - If `scheduled_at <= NOW()` the task is already eligible; the function
-///   returns `Ok(RetryActivityOutcome { advanced: false })` without touching
-///   the database (idempotent no-op).
+///   returns `Ok(RetryActivityOutcome { advanced: false, already_eligible: true })`
+///   without touching the database (idempotent no-op).
 /// - **The `attempt`/`max_attempts`/`error`/`crash_strikes` columns are never
 ///   modified.** Only `scheduled_at` is updated, so the attempt counter is
 ///   neither reset nor incremented — the forced run is the attempt that was
 ///   already scheduled.
 /// - No new `WorkflowEvent` is appended; the forced attempt produces the same
 ///   `ActivityScheduled`/`ActivityStarted`/… events it would on natural retry.
+///
+/// # Caveat — rate-limit and concurrency caps
+///
+/// `advanced: true` means `scheduled_at` was moved to immediate eligibility; it
+/// does **not** guarantee the task will be claimed on the very next poll. A
+/// per-queue rate-limit bucket (`harvest_rate_limit_buckets`) or a per-key
+/// concurrency cap (`concurrency_key`/`concurrency_cap`) in `claim_task` can
+/// still defer the actual dispatch until capacity is available. Both of those
+/// gates enforce independent admission policies that this function does not
+/// bypass or inspect.
 ///
 /// # Errors
 ///
@@ -1212,20 +1230,27 @@ pub async fn force_retry_activity_now(
             queue_name: row.queue_name,
             scheduled_at: row.scheduled_at,
             advanced: false,
+            already_eligible: true,
         });
     }
 
-    // Advance scheduled_at to now. Only update if still PENDING (guards a
-    // concurrent claim race — a worker that claimed the row between our SELECT
-    // and this UPDATE would have set state='RUNNING'; the WHERE clause then
-    // matches 0 rows and we return a no-op rather than silently succeeding).
+    // Backdate by the skew allowance so the row passes `scheduled_at <= NOW()`
+    // in claim_task's Postgres-side predicate even when the host clock is
+    // slightly ahead of the Postgres server clock. This mirrors what
+    // EnqueueParams::new does for immediately-runnable tasks.
+    let claim_ready_at = now - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
+
+    // Advance scheduled_at. Only update if still PENDING (guards a concurrent
+    // claim race — a worker that claimed the row between our SELECT and this
+    // UPDATE would have set state='RUNNING'; the WHERE clause then matches 0
+    // rows and we return advanced=false rather than silently succeeding).
     let updated_queue_name = diesel::update(
         dsl::harvest_task_queue
             .filter(dsl::id.eq(task_id))
             .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
             .filter(dsl::state.eq("PENDING")),
     )
-    .set(dsl::scheduled_at.eq(now))
+    .set(dsl::scheduled_at.eq(claim_ready_at))
     .returning(dsl::queue_name)
     .get_result::<String>(conn)
     .await
@@ -1234,10 +1259,9 @@ pub async fn force_retry_activity_now(
 
     // If 0 rows were updated a concurrent claim raced us; the task is now
     // RUNNING and the caller's goal (retry it now) is effectively achieved.
-    // Return advanced=false so the caller can distinguish the race from a
-    // genuine no-op (already eligible).
+    // already_eligible=false distinguishes this from the genuine no-op above.
     let (actual_queue, actual_scheduled_at, actually_advanced) = match updated_queue_name {
-        Some(q) => (q, now, true),
+        Some(q) => (q, claim_ready_at, true),
         None => (row.queue_name, row.scheduled_at, false),
     };
 
@@ -1250,6 +1274,7 @@ pub async fn force_retry_activity_now(
         queue_name: actual_queue,
         scheduled_at: actual_scheduled_at,
         advanced: actually_advanced,
+        already_eligible: false,
     })
 }
 
