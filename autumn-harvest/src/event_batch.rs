@@ -508,6 +508,7 @@ async fn fire_claimed_batch_row(
                     .await
                     .map_err(crate::error::database_error)?;
 
+                let err_msg = e.to_string();
                 let ar = crate::models::NewAuditRecord {
                     actor: "system",
                     operation: "workflow.start",
@@ -517,7 +518,7 @@ async fn fire_claimed_batch_row(
                     request_id: None,
                     idempotency_key: None,
                     status: "failed",
-                    error_summary: Some(&e.to_string()),
+                    error_summary: Some(&err_msg),
                     shard_id: Some(row.shard_id),
                     source: "worker",
                 };
