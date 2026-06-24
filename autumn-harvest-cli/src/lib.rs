@@ -754,6 +754,13 @@ enum WorkflowCommand {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Force a backing-off activity to retry immediately, skipping its backoff.
+    RetryActivity {
+        /// Workflow execution ID.
+        workflow_id: String,
+        /// Activity execution ID (the id surfaced by `workflow stack`).
+        activity_exec_id: String,
+    },
     /// Fork a workflow execution at an event boundary.
     Reset {
         /// Workflow execution ID.
@@ -3151,6 +3158,17 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
                 Some(Value::Object(body)),
             ))
         }
+        WorkflowCommand::RetryActivity {
+            workflow_id,
+            activity_exec_id,
+        } => Ok(ApiRequest::post(
+            format!(
+                "/workflows/{}/activities/{}/retry-now",
+                path_segment(workflow_id),
+                path_segment(activity_exec_id)
+            ),
+            None,
+        )),
         WorkflowCommand::Reset {
             execution_id,
             reset_to_event_id,
@@ -5579,6 +5597,34 @@ mod erase_payloads_cli_tests {
         assert!(
             body.get("reason").is_none() || body["reason"].is_null(),
             "omitting --reason must not send the field"
+        );
+    }
+}
+
+#[cfg(test)]
+mod retry_activity_cli_tests {
+    use super::*;
+
+    fn request(args: &[&str]) -> ApiRequest {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn retry_activity_builds_post_request_with_correct_path() {
+        let req = request(&["workflow", "retry-activity", "exec-123", "act-456"]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(req.path, "/workflows/exec-123/activities/act-456/retry-now");
+    }
+
+    #[test]
+    fn retry_activity_sends_no_body() {
+        let req = request(&["workflow", "retry-activity", "exec-123", "act-456"]);
+        assert!(
+            req.body.is_none(),
+            "retry-activity must send no request body"
         );
     }
 }

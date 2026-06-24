@@ -1119,6 +1119,165 @@ pub async fn requeue_for_retry(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// force_retry_activity_now (issue #516)
+// ---------------------------------------------------------------------------
+
+/// Outcome of a [`force_retry_activity_now`] call.
+#[derive(Debug, Clone)]
+pub struct RetryActivityOutcome {
+    /// The task-queue row PK that was (or would have been) advanced.
+    pub task_id: Uuid,
+    /// The queue this task belongs to.
+    pub queue_name: String,
+    /// The effective `scheduled_at` after the operation (backdated by
+    /// `IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE` when `advanced` is `true` so it
+    /// passes the `scheduled_at <= NOW()` predicate in `claim_task` even under
+    /// host/Postgres clock skew; unchanged otherwise).
+    pub scheduled_at: DateTime<Utc>,
+    /// `true` when the task's eligibility was advanced (it was backing off);
+    /// `false` when the task required no change (see `already_eligible`).
+    pub advanced: bool,
+    /// Only meaningful when `advanced` is `false`. `true` means the task was
+    /// already claimable before this call (genuine idempotent no-op). `false`
+    /// means a concurrent worker claimed the task between the SELECT and the
+    /// UPDATE — the task is now `RUNNING`, so the caller's goal (retry it) is
+    /// already achieved.
+    pub already_eligible: bool,
+}
+
+/// Advance a backing-off activity task to be immediately eligible for claim
+/// (issue #516).
+///
+/// A backing-off activity is a `PENDING` `harvest_task_queue` row whose
+/// `scheduled_at` is in the future (set by [`requeue_for_retry`]). This
+/// function advances that timestamp to `NOW()` and wakes an idle worker via
+/// `pg_notify` so dispatch happens within one poll interval.
+///
+/// # Semantics
+///
+/// - Only `task_type = 'activity'` rows owned by `workflow_exec_id` are
+///   matched; a task belonging to a different workflow returns `NotFound`.
+/// - If the row's `state != 'PENDING'` (e.g. `RUNNING`, completed, or already
+///   in the DLQ), the call returns `HarvestError::Config` (→ 409 via
+///   `conflict_from`).
+/// - If `scheduled_at <= NOW()` the task is already eligible; the function
+///   returns `Ok(RetryActivityOutcome { advanced: false, already_eligible: true })`
+///   without touching the database (idempotent no-op).
+/// - **The `attempt`/`max_attempts`/`error`/`crash_strikes` columns are never
+///   modified.** Only `scheduled_at` is updated, so the attempt counter is
+///   neither reset nor incremented — the forced run is the attempt that was
+///   already scheduled.
+/// - No new `WorkflowEvent` is appended; the forced attempt produces the same
+///   `ActivityScheduled`/`ActivityStarted`/… events it would on natural retry.
+///
+/// # Caveat — rate-limit and concurrency caps
+///
+/// `advanced: true` means `scheduled_at` was moved to immediate eligibility; it
+/// does **not** guarantee the task will be claimed on the very next poll. A
+/// per-queue rate-limit bucket (`harvest_rate_limit_buckets`) or a per-key
+/// concurrency cap (`concurrency_key`/`concurrency_cap`) in `claim_task` can
+/// still defer the actual dispatch until capacity is available. Both of those
+/// gates enforce independent admission policies that this function does not
+/// bypass or inspect.
+///
+/// # Errors
+///
+/// - [`crate::error::HarvestError::NotFound`] — no activity-type task with
+///   `id = task_id` and `workflow_exec_id = workflow_exec_id`.
+/// - [`crate::error::HarvestError::Config`] — task exists but is not in
+///   a retryable (`PENDING`) state.
+/// - [`crate::error::HarvestError::Database`] — Postgres error.
+pub async fn force_retry_activity_now(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    task_id: Uuid,
+) -> HarvestResult<RetryActivityOutcome> {
+    use crate::schema::harvest_task_queue::dsl;
+    use diesel::SelectableHelper;
+
+    // Load the row — must belong to this workflow and be an activity task.
+    let row = dsl::harvest_task_queue
+        .filter(dsl::id.eq(task_id))
+        .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
+        .filter(dsl::task_type.eq("activity"))
+        .select(crate::models::TaskQueueItem::as_select())
+        .first::<crate::models::TaskQueueItem>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| {
+            crate::error::HarvestError::NotFound(format!(
+                "activity task {task_id} not found for workflow {workflow_exec_id}"
+            ))
+        })?;
+
+    // Only PENDING tasks are retryable; RUNNING/completed/DLQ'd → conflict.
+    if row.state != "PENDING" {
+        return Err(crate::error::HarvestError::Config(format!(
+            "activity task {task_id} is in state '{}', not PENDING — \
+             only backing-off (PENDING) tasks can be force-retried",
+            row.state
+        )));
+    }
+
+    let now = Utc::now();
+
+    // Already eligible — idempotent no-op, nothing to advance.
+    if row.scheduled_at <= now {
+        return Ok(RetryActivityOutcome {
+            task_id,
+            queue_name: row.queue_name,
+            scheduled_at: row.scheduled_at,
+            advanced: false,
+            already_eligible: true,
+        });
+    }
+
+    // Backdate by the skew allowance so the row passes `scheduled_at <= NOW()`
+    // in claim_task's Postgres-side predicate even when the host clock is
+    // slightly ahead of the Postgres server clock. This mirrors what
+    // EnqueueParams::new does for immediately-runnable tasks.
+    let claim_ready_at = now - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE;
+
+    // Advance scheduled_at. Only update if still PENDING (guards a concurrent
+    // claim race — a worker that claimed the row between our SELECT and this
+    // UPDATE would have set state='RUNNING'; the WHERE clause then matches 0
+    // rows and we return advanced=false rather than silently succeeding).
+    let updated_queue_name = diesel::update(
+        dsl::harvest_task_queue
+            .filter(dsl::id.eq(task_id))
+            .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
+            .filter(dsl::state.eq("PENDING")),
+    )
+    .set(dsl::scheduled_at.eq(claim_ready_at))
+    .returning(dsl::queue_name)
+    .get_result::<String>(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?;
+
+    // If 0 rows were updated a concurrent claim raced us; the task is now
+    // RUNNING and the caller's goal (retry it now) is effectively achieved.
+    // already_eligible=false distinguishes this from the genuine no-op above.
+    let (actual_queue, actual_scheduled_at, actually_advanced) = match updated_queue_name {
+        Some(q) => (q, claim_ready_at, true),
+        None => (row.queue_name, row.scheduled_at, false),
+    };
+
+    if actually_advanced {
+        crate::notify::notify_task_enqueued(conn, &actual_queue, task_id).await?;
+    }
+
+    Ok(RetryActivityOutcome {
+        task_id,
+        queue_name: actual_queue,
+        scheduled_at: actual_scheduled_at,
+        advanced: actually_advanced,
+        already_eligible: false,
+    })
+}
+
 /// Reset a task to `PENDING` at an explicit timestamp.
 ///
 /// Clears only the liveness timestamp for the failed attempt. The heartbeat
