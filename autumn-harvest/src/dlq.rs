@@ -956,7 +956,7 @@ pub async fn redrive_dead_letters(
     let mut redriven = 0usize;
     let mut skipped = 0usize;
     let mut ids: Vec<String> = Vec::with_capacity(rows.len());
-    let mut failures: Vec<BulkDlqFailure> = Vec::new();
+    let mut failures: Vec<BulkDlqFailure> = Vec::with_capacity(rows.len());
 
     for row in &rows {
         match redrive_dead_letter(conn, row.id, registry, reason).await {

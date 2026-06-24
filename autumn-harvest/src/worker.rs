@@ -805,7 +805,7 @@ fn extract_single_command<T>(
 fn extract_all_scheduled_activities(
     commands: &[WorkflowCommand],
 ) -> Option<Vec<ScheduledActivityCommand>> {
-    let mut scheduled = Vec::new();
+    let mut scheduled = Vec::with_capacity(commands.len());
 
     for cmd in commands {
         match cmd {
@@ -845,7 +845,7 @@ fn extract_all_scheduled_activities(
 }
 
 fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<ActivityExecId>> {
-    let mut activity_ids = Vec::new();
+    let mut activity_ids = Vec::with_capacity(commands.len());
 
     for cmd in commands {
         match cmd {
