@@ -103,7 +103,10 @@ fn main() {
         InputMapping::Projection(path) => project_json_path(&source_output, path),
     };
     println!("\nProjected `daily_report` input: {target_input}");
-    assert_eq!(target_input, json!({ "rows": 12_000, "date": "2026-06-24" }));
+    assert_eq!(
+        target_input,
+        json!({ "rows": 12_000, "date": "2026-06-24" })
+    );
 
     // The deterministic target workflow id makes duplicate fires collapse.
     let source_exec_id = "0000abcd-0000-0000-0000-000000000001";
