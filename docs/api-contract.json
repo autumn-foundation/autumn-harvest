@@ -148,7 +148,8 @@
           "history",
           "external_handoffs",
           "last_completion_result",
-          "last_error"
+          "last_error",
+          "scheduled_time"
         ]
       },
       "error_responses": [
@@ -431,12 +432,27 @@
             "name": "delay",
             "required": false,
             "description": "Delay duration before starting the workflow (e.g. \"10s\", \"5m\")."
+          },
+          {
+            "name": "batch_key",
+            "required": false,
+            "description": "Optional event batching group key. Fold trigger starts into a single run inputting a JSON array of all payloads."
+          },
+          {
+            "name": "batch_max_size",
+            "required": false,
+            "description": "Maximum batch size to trigger immediate flush."
+          },
+          {
+            "name": "batch_max_wait",
+            "required": false,
+            "description": "Maximum wait duration from first trigger before flushing the batch (e.g. \"30s\", \"5m\")."
           }
         ]
       },
       "success_response": {
         "status": 201,
-        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499) — the run is deferred until the quiet window elapses.",
+        "note": "Returns 200 when an existing execution is returned via reuse_policy instead of creating a new one. Returns 202 Accepted with {debounced, workflow_name, workflow_id, debounce_key, fire_at, pending_count} (and no execution_id) when the workflow declares a debounce policy whose key resolves (issue #499). Returns 202 Accepted with {batched, flushed, workflow_name, workflow_id, batch_key, fire_at, pending_count, max_size} when the workflow declares a batch policy.",
         "fields": [
           "execution_id",
           "workflow_name",
@@ -445,7 +461,11 @@
           "debounced",
           "debounce_key",
           "fire_at",
-          "pending_count"
+          "pending_count",
+          "batched",
+          "flushed",
+          "batch_key",
+          "max_size"
         ]
       },
       "error_responses": [
@@ -3070,6 +3090,25 @@
       "category": "admin",
       "read_only": true,
       "description": "Return all pending debounce records across all shards. Each record represents a burst of triggers for a (workflow_name, debounce_key) that has not yet fired. Fields: workflow_name, debounce_key, workflow_id, queue_name, effective_fire_at (current projected deadline), max_fire_at (cap), pending_count (number of admitted requests), shard_id, created_at, updated_at.",
+      "params": [],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": true
+      },
+      "error_responses": [
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/batches/pending",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Return all pending event batch records across all shards. Each record represents a pending batch of start triggers for a (workflow_name, batch_key) that has not yet fired. Fields: workflow_name, batch_key, workflow_id, queue_name, current_size, max_size, fire_at (projected deadline), shard_id, created_at, updated_at.",
       "params": [],
       "request_body": null,
       "success_response": {

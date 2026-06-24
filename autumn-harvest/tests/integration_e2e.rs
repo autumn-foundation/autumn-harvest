@@ -797,6 +797,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -816,6 +817,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -843,6 +845,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -862,6 +865,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -1343,6 +1347,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -1468,6 +1473,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -1606,6 +1612,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -1762,6 +1769,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -2153,6 +2161,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     concurrency: None,
 
                     debounce: None,
+                    batch: None,
                     max_input_bytes: None,
 
                     owner: None,
@@ -2312,6 +2321,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                     concurrency: None,
 
                     debounce: None,
+                    batch: None,
                     max_input_bytes: None,
 
                     owner: None,
@@ -2579,6 +2589,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2598,6 +2609,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2617,6 +2629,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -2750,6 +2763,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3263,6 +3277,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3388,6 +3403,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3831,6 +3847,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -3942,6 +3959,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -4860,6 +4878,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -4981,6 +5000,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -5089,6 +5109,7 @@ async fn workflow_schedule_pause_and_resume() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -5376,6 +5397,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -5537,6 +5559,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
 
                 owner: None,
@@ -5638,6 +5661,7 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -5998,6 +6022,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6150,6 +6175,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -6284,6 +6310,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6434,6 +6461,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6507,6 +6535,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6589,6 +6618,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6675,6 +6705,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6756,6 +6787,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -6841,6 +6873,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -7451,6 +7484,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,

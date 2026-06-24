@@ -181,6 +181,8 @@ pub struct TypedStartOptions {
     /// Soft SLA duration: emits `harvest.workflow.sla_breached` once when the run exceeds this
     /// without terminating it. Overrides `WorkflowInfo::sla`; clamped to `execution_timeout`.
     pub sla: Option<Duration>,
+    /// Optional batch policy for this start request. Overrides `WorkflowInfo::batch`.
+    pub batch: Option<crate::event_batch::BatchPolicy>,
 }
 
 /// Optional configurations when invoking an update and starting a workflow atomically.

@@ -560,6 +560,26 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Pending event batch records — one row per `(workflow_name, batch_key)` (issue #518).
+    harvest_event_batches (id) {
+        id                -> Uuid,
+        workflow_name     -> Text,
+        batch_key         -> Text,
+        workflow_id       -> Text,
+        queue_name        -> Text,
+        buffered_payloads -> Jsonb,
+        start_options     -> Jsonb,
+        fire_at           -> Timestamptz,
+        max_size          -> Int4,
+        shard_id          -> Int4,
+        created_at        -> Timestamptz,
+        updated_at        -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
@@ -583,4 +603,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox,
     harvest_debounce,
+    harvest_event_batches,
 );

@@ -70,6 +70,12 @@ struct DebounceArgs {
     max_wait: Option<String>,
 }
 
+struct BatchArgs {
+    key_expr: String,
+    max_size: u32,
+    max_wait: String,
+}
+
 struct WorkflowAttrs {
     execution_timeout: Option<String>,
     /// Soft SLA budget (issue #487). Parsed from `#[workflow(sla = "2h")]`.
@@ -79,6 +85,9 @@ struct WorkflowAttrs {
     /// Trailing-edge debounce policy (issue #499). Parsed from
     /// `#[workflow(debounce(key = "input.tenant_id", window = "30s", max_wait = "5m"))]`.
     debounce: Option<DebounceArgs>,
+    /// Event batching policy (issue #518). Parsed from
+    /// `#[workflow(batch(key = "input.tenant_id", max_size = 10, max_wait = "30s"))]`.
+    batch: Option<BatchArgs>,
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
     max_input_bytes: Option<u64>,
@@ -98,6 +107,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         sla: None,
         concurrency: None,
         debounce: None,
+        batch: None,
         max_input_bytes: None,
         owner: None,
         runbook: None,
@@ -198,6 +208,57 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             })?;
             result.debounce = Some(DebounceArgs { key_expr, window, max_wait });
             Ok(())
+        } else if meta.path.is_ident("batch") {
+            let mut key_expr: Option<String> = None;
+            let mut max_size: Option<u32> = None;
+            let mut max_wait: Option<String> = None;
+            meta.parse_nested_meta(|inner| {
+                if inner.path.is_ident("key") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    key_expr = Some(value.value());
+                    Ok(())
+                } else if inner.path.is_ident("max_size") {
+                    let value: syn::LitInt = inner.value()?.parse()?;
+                    let n: u32 = value.base10_parse()?;
+                    if n == 0 {
+                        return Err(inner.error("batch max_size must be greater than zero"));
+                    }
+                    max_size = Some(n);
+                    Ok(())
+                } else if inner.path.is_ident("max_wait") {
+                    let value: LitStr = inner.value()?.parse()?;
+                    if !is_valid_task_duration(&value.value()) {
+                        return Err(syn::Error::new_spanned(
+                            &value,
+                            "invalid batch `max_wait` duration; expected e.g. \"30s\", \"5m\", \"1h\", \"2d\"",
+                        ));
+                    }
+                    max_wait = Some(value.value());
+                    Ok(())
+                } else {
+                    Err(inner.error("expected `key`, `max_size`, or `max_wait`"))
+                }
+            })?;
+            let key_expr = key_expr.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "batch requires `key = \"...\"`",
+                )
+            })?;
+            let max_size = max_size.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "batch requires `max_size = N`",
+                )
+            })?;
+            let max_wait = max_wait.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "batch requires `max_wait = \"...\"` (e.g. `max_wait = \"10s\"`)",
+                )
+            })?;
+            result.batch = Some(BatchArgs { key_expr, max_size, max_wait });
+            Ok(())
         } else if meta.path.is_ident("allow_nondeterministic_apis") {
             if meta.input.peek(syn::Token![=]) {
                 let value: syn::LitBool = meta.value()?.parse()?;
@@ -240,7 +301,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, or `allow_nondeterministic_apis`",
+                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -450,6 +511,27 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Emit batch as Option<BatchPolicy> (issue #518).
+    let batch_expr = match attrs.batch {
+        None => quote! { ::std::option::Option::None },
+        Some(BatchArgs {
+            key_expr,
+            max_size,
+            max_wait,
+        }) => {
+            quote! {
+                ::std::option::Option::Some(
+                    ::autumn_harvest::event_batch::BatchPolicy {
+                        key_expr: #key_expr.to_string(),
+                        max_size: #max_size as usize,
+                        max_wait: ::autumn_harvest::task_duration(#max_wait)
+                            .expect("batch max_wait must be a valid duration string"),
+                    }
+                )
+            }
+        }
+    };
+
     let max_input_bytes_expr = attrs
         .max_input_bytes
         .map_or_else(|| quote! { None }, |b| quote! { Some(#b) });
@@ -503,6 +585,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 sla: #sla_expr,
                 concurrency: #concurrency_expr,
                 debounce: #debounce_expr,
+                batch: #batch_expr,
                 max_input_bytes: #max_input_bytes_expr,
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,
@@ -596,6 +679,33 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 )),
                             );
                         }
+                    }
+                    if let ::std::option::Option::Some(batch_policy) = info.batch.as_ref() {
+                        if ::autumn_harvest::concurrency::resolve_concurrency_key(
+                            &batch_policy.key_expr,
+                            &input,
+                        )
+                        .is_some()
+                        {
+                            return ::std::result::Result::Err(
+                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                    "workflow '{0}' has an event batching policy; batched starts \
+                                     must use the HTTP start route POST /workflows/{0}/start \
+                                     (the typed client cannot express a deferred batched start)",
+                                    info.name,
+                                )),
+                            );
+                        }
+                    }
+                    if opts.batch.is_some() {
+                        return ::std::result::Result::Err(
+                            ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                "workflow '{0}' start request specified a batch policy; batched starts \
+                                 must use the HTTP start route POST /workflows/{0}/start \
+                                 (the typed client cannot express a deferred batched start)",
+                                info.name,
+                            )),
+                        );
                     }
                     let exec_id = opts.exec_id.unwrap_or_else(|| {
                         let shard = client.pick_shard_for_new_workflow(info.name, &workflow_id);
@@ -706,6 +816,23 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     "workflow '{0}' has a debounce policy; debounced starts \
                                      must use the HTTP start route POST /workflows/{0}/start \
                                      (the typed client cannot express a deferred debounced start)",
+                                    info.name,
+                                )),
+                            );
+                        }
+                    }
+                    if let ::std::option::Option::Some(batch_policy) = info.batch.as_ref() {
+                        if ::autumn_harvest::concurrency::resolve_concurrency_key(
+                            &batch_policy.key_expr,
+                            &input,
+                        )
+                        .is_some()
+                        {
+                            return ::std::result::Result::Err(
+                                ::autumn_harvest::error::HarvestError::Config(::std::format!(
+                                    "workflow '{0}' has an event batching policy; batched starts \
+                                     must use the HTTP start route POST /workflows/{0}/start \
+                                     (the typed client cannot express a deferred batched start)",
                                     info.name,
                                 )),
                             );

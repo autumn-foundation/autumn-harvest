@@ -1571,6 +1571,9 @@ pub async fn enforce_timeouts_once(
     count +=
         crate::debounce::fire_due_debounced_starts(conn, sharded_pool, shard_assignments, metrics)
             .await?;
+    count +=
+        crate::event_batch::fire_due_event_batches(conn, sharded_pool, shard_assignments, metrics)
+            .await?;
     if let Some(ceiling) = max_workflow_history_events {
         count += enforce_workflow_history_ceiling(conn, ceiling, metrics).await?;
     }

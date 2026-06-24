@@ -273,6 +273,7 @@ async fn test_same_shard_live_cancel() {
         concurrency: None,
 
         debounce: None,
+        batch: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -291,6 +292,7 @@ async fn test_same_shard_live_cancel() {
         concurrency: None,
 
         debounce: None,
+        batch: None,
         max_input_bytes: None,
         owner: None,
         runbook_url: None,
@@ -408,6 +410,7 @@ async fn test_already_terminal_target_is_no_op_success() {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -426,6 +429,7 @@ async fn test_already_terminal_target_is_no_op_success() {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -554,6 +558,7 @@ async fn test_grace_window_expiry_unknown_target() {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -663,6 +668,7 @@ async fn test_cross_shard_cancel_via_outbox() {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,
@@ -681,6 +687,7 @@ async fn test_cross_shard_cancel_via_outbox() {
                 concurrency: None,
 
                 debounce: None,
+                batch: None,
                 max_input_bytes: None,
                 owner: None,
                 runbook_url: None,

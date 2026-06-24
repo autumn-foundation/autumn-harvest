@@ -263,6 +263,7 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,
@@ -669,6 +670,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
 
             owner: None,

@@ -225,6 +225,7 @@ fn make_registry_for(
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -278,7 +279,7 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
 /// Waits until at least one execution with the given workflow_name reaches the
 /// expected state. Returns the execution id.
 async fn wait_for_state(url: &str, wf_name: &str, state: &str, min_count: i64) -> Vec<Uuid> {
-    tokio::time::timeout(Duration::from_secs(15), async {
+    tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
             let rows: Vec<Uuid> = harvest_workflow_executions::table

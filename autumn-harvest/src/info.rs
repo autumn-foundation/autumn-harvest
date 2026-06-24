@@ -176,6 +176,8 @@ pub struct WorkflowInfo {
     /// fire deadline to `now + window`; exactly one execution is started after the
     /// burst settles. `None` = no debounce; start behavior is byte-for-byte unchanged.
     pub debounce: Option<crate::debounce::DebouncePolicy>,
+    /// Optional batch policy for folding multiple trigger payloads into a single run (issue #518).
+    pub batch: Option<crate::event_batch::BatchPolicy>,
     /// Per-workflow-type override for the workflow-input size cap (issue #252).
     ///
     /// When set, this raises (never lowers) the global `max_workflow_input_bytes`
@@ -228,6 +230,27 @@ impl WorkflowInfo {
     #[must_use]
     pub const fn with_debounce(mut self, policy: crate::debounce::DebouncePolicy) -> Self {
         self.debounce = Some(policy);
+        self
+    }
+
+    /// Attach a batch policy to fold trigger bursts into one run (issue #518).
+    ///
+    /// Fluent builder method — call after the companion function:
+    /// ```rust,ignore
+    /// use autumn_harvest::event_batch::BatchPolicy;
+    /// use std::time::Duration;
+    ///
+    /// .workflows(vec![
+    ///     webhook_handler_info().with_batch(BatchPolicy {
+    ///         key_expr: "input.user_id".to_string(),
+    ///         max_size: 10,
+    ///         max_wait: Duration::from_secs(30),
+    ///     })
+    /// ])
+    /// ```
+    #[must_use]
+    pub fn with_batch(mut self, policy: crate::event_batch::BatchPolicy) -> Self {
+        self.batch = Some(policy);
         self
     }
 
@@ -806,6 +829,7 @@ impl DagInfo {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: self.owner,
             runbook_url: self.runbook_url,
@@ -828,6 +852,7 @@ impl std::fmt::Debug for WorkflowInfo {
             .field("sla", &self.sla)
             .field("concurrency", &self.concurrency)
             .field("debounce", &self.debounce)
+            .field("batch", &self.batch)
             .field("max_input_bytes", &self.max_input_bytes)
             .field("owner", &self.owner)
             .field("runbook_url", &self.runbook_url)
@@ -931,6 +956,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -957,6 +983,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -980,6 +1007,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1003,6 +1031,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1031,6 +1060,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1057,6 +1087,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1100,6 +1131,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1135,6 +1167,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1167,6 +1200,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1207,6 +1241,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1240,6 +1275,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1268,6 +1304,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
@@ -1490,6 +1527,7 @@ mod tests {
             concurrency: None,
 
             debounce: None,
+            batch: None,
             max_input_bytes: None,
             owner: None,
             runbook_url: None,
