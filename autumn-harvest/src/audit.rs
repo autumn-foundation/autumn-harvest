@@ -260,6 +260,11 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("GET /admin/retention", RouteClass::ReadOnly),
     ("GET /admin/concurrency", RouteClass::ReadOnly),
     ("GET /admin/debounce", RouteClass::ReadOnly),
+    // Workflow-type handler reachability (issue #520): read-only, no state mutation.
+    (
+        "GET /admin/workflow-types/reachability",
+        RouteClass::ReadOnly,
+    ),
     ("GET /admin/history/exports", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs", RouteClass::ReadOnly),
     ("GET /admin/external-handoffs/{token}", RouteClass::ReadOnly),
@@ -530,6 +535,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("POST /admin/retention/run-now", Some(OP_RETENTION_RUN_NOW)),
     ("GET /admin/concurrency", None),
     ("GET /admin/debounce", None),
+    // Workflow-type handler reachability (issue #520): read-only.
+    ("GET /admin/workflow-types/reachability", None),
     ("GET /admin/history/exports", None),
     ("GET /admin/external-handoffs", None),
     ("GET /admin/external-handoffs/{token}", None),

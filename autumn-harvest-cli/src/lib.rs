@@ -2645,9 +2645,18 @@ const fn workflow_reachability_wants_raw_json(cli: &Cli) -> bool {
     )
 }
 
-/// Exit `2` when the report is unsafe to deploy against: any `orphaned` verdict,
-/// or an incomplete (`partial`/`unavailable`) cross-shard answer — a partial
-/// answer must never be mistaken for "safe to remove". Exit `0` otherwise.
+/// Exit `2` when the report is unsafe to deploy against:
+///
+/// - `partial`/`unavailable` cross-shard status: an incomplete answer must never
+///   be mistaken for "safe to remove".
+/// - Any `orphaned` verdict: a handler was already removed but runs are still live.
+/// - When a `--type` filter is active: also block on `in_use`. Without a filter
+///   the command is a fleet-wide monitor; `in_use` is the normal state for any
+///   type with running workflows and should not block. With a filter the operator
+///   is asking "can I delete this specific handler?"; `in_use` means "no" — live
+///   runs would become orphaned the moment the handler is removed.
+///
+/// Exit `0` otherwise.
 fn workflow_reachability_exit_code(value: &Value) -> i32 {
     let status = value
         .get("status")
@@ -2656,15 +2665,26 @@ fn workflow_reachability_exit_code(value: &Value) -> i32 {
     if matches!(status, "partial" | "unavailable") {
         return 2;
     }
-    let any_orphaned = value
+    // `filter` is the echo of the `--type` query param: present → single-type check.
+    let type_filter_active = value.get("filter").and_then(Value::as_str).is_some();
+    let blocking_verdict = if type_filter_active {
+        // Pre-removal check: any non-safe verdict blocks.
+        |v: &str| matches!(v, "orphaned" | "in_use")
+    } else {
+        // Fleet monitor: only already-broken (orphaned) types block.
+        |v: &str| v == "orphaned"
+    };
+    let any_blocking = value
         .get("items")
         .and_then(Value::as_array)
         .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.get("verdict").and_then(Value::as_str) == Some("orphaned"))
+            items.iter().any(|item| {
+                item.get("verdict")
+                    .and_then(Value::as_str)
+                    .is_some_and(blocking_verdict)
+            })
         });
-    if any_orphaned { 2 } else { 0 }
+    if any_blocking { 2 } else { 0 }
 }
 
 fn format_workflow_reachability_table(value: &Value) -> String {

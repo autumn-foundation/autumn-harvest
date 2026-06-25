@@ -187,7 +187,7 @@ impl ReachabilityAccumulator {
         self.per_shard
             .values()
             .map(|(_, oldest)| *oldest)
-            .reduce(DateTime::min)
+            .reduce(std::cmp::min)
     }
 }
 
