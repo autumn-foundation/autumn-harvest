@@ -1815,6 +1815,36 @@ pub async fn try_consume_rate_limit_token(
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// Count the number of tasks that are immediately claimable on this shard.
+///
+/// A task is claimable when `state = 'PENDING'` and `scheduled_at <= NOW()`.
+/// This mirrors the first-level predicate in [`claim_task`] and is used by
+/// the stranded-work sampler (issue #522) to detect claimable tasks on shards
+/// that have no covering live worker.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn claimable_pending_count(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
+    #[derive(diesel::QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        cnt: i64,
+    }
+
+    let row: CountRow = diesel::sql_query(
+        "SELECT COUNT(*)::BIGINT AS cnt \
+         FROM harvest_task_queue \
+         WHERE state = 'PENDING' \
+           AND scheduled_at <= NOW()",
+    )
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(row.cnt)
+}
+
 pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
     diesel::sql_query(
         "UPDATE harvest_rate_limit_buckets \

@@ -143,6 +143,7 @@ const REASON_SCHEMA_UNREADABLE: &str = "schema_unreadable";
 const REASON_SHARD_POOL_MISSING: &str = "shard_pool_missing";
 const REASON_SHARD_UNREACHABLE: &str = "shard_unreachable";
 const REASON_STORAGE_POOL_MISSING: &str = "storage_pool_missing";
+const REASON_NO_LIVE_WORKER: &str = "no_live_worker";
 const REASON_WORKER_COVERAGE_UNREADABLE: &str = "worker_coverage_unreadable";
 const REASON_WORKER_HEALTH_STALE: &str = "worker_health_stale";
 const REASON_WORKER_QUEUE_UNCOVERED: &str = "worker_queue_uncovered";
@@ -273,6 +274,41 @@ fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
     }
 }
 
+/// Gate readiness when a writable shard has claimable work but no live covering
+/// worker (issue #522). A stale (unresponsive) worker does not count.
+fn check_no_live_worker_gate(
+    shard_id: i32,
+    roles: &[ShardRole],
+    queue_depth: &QueueDepthSummary,
+    workers: &Result<Vec<WorkerRow>, String>,
+    reason_codes: &mut Vec<String>,
+    blocking_reasons: &mut Vec<String>,
+) {
+    if !roles.contains(&ShardRole::Writable) || queue_depth.total_pending == 0 {
+        return;
+    }
+    let covering = workers
+        .as_ref()
+        .map(|ws| {
+            ws.iter()
+                .filter(|w| {
+                    worker_assigned_to_shard(w, shard_id)
+                        && w.health == WorkerHealth::Healthy
+                        && w.worker.status == WorkerStatus::Active.as_str()
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    if covering == 0 {
+        push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
+        blocking_reasons.push(format!(
+            "{} claimable task(s) queued but no live worker lists this shard in shard_assignments",
+            queue_depth.total_pending
+        ));
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 async fn observe_shard(
     shard_id: i32,
     shard_pool: &DbPool,
@@ -299,6 +335,7 @@ async fn observe_shard(
     let schedules = load_schedule_probes(&mut conn).await;
     let required_queues = required_queues(runtime, schedules.as_deref().ok());
     let workers = load_workers(&mut conn, freshness_window).await;
+    let workers_snapshot = workers.clone();
     let queue_depth = load_queue_depth(&mut conn).await;
     let dlq = load_dlq(&mut conn).await;
 
@@ -332,6 +369,16 @@ async fn observe_shard(
     if let Some(error) = worker_readiness.error_summary {
         error_summary.get_or_insert(error);
     }
+
+    // Gate: writable shard with claimable work but no live covering worker (issue #522).
+    check_no_live_worker_gate(
+        shard_id,
+        &roles,
+        &queue_depth,
+        &workers_snapshot,
+        &mut reason_codes,
+        &mut blocking_reasons,
+    );
 
     let scheduler_status = scheduler_coverage(
         runtime,
@@ -1000,5 +1047,188 @@ mod tests {
         let queues = required_queues(None, Some(&schedules));
 
         assert!(!queues.contains("default"));
+    }
+
+    // -------------------------------------------------------------------------
+    // no_live_worker gate unit tests (issue #522)
+    // -------------------------------------------------------------------------
+
+    fn make_worker_row(shard_id: i32, status: &str, health: WorkerHealth) -> WorkerRow {
+        use autumn_harvest::models::HarvestWorker;
+        let now = chrono::Utc::now();
+        WorkerRow {
+            worker: HarvestWorker {
+                worker_id: format!("test-worker-{shard_id}"),
+                started_at: now,
+                last_heartbeat_at: now,
+                queues: serde_json::json!(["default"]),
+                shard_assignments: serde_json::json!([shard_id]),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: status.to_string(),
+                drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
+                labels: serde_json::json!({}),
+            },
+            health,
+            active_task_ids: Vec::new(),
+        }
+    }
+
+    fn pending_queue_depth(total: i64) -> QueueDepthSummary {
+        QueueDepthSummary {
+            total_pending: total,
+            by_queue: std::collections::BTreeMap::new(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_writable_pending_and_no_covering_worker() {
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = pending_queue_depth(5);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should emit no_live_worker when no worker covers the shard"
+        );
+        assert!(!blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_healthy_active_worker_covers_shard() {
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = pending_queue_depth(5);
+        let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when a healthy active worker covers the shard"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_shard_is_not_writable() {
+        let roles = vec![ShardRole::Readable];
+        let queue_depth = pending_queue_depth(5);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire for non-writable shards"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_queue_is_empty() {
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = pending_queue_depth(0);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when there is no pending work"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_stale_worker_covers_shard() {
+        // A stale (unresponsive) worker should not count as "live" coverage.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = pending_queue_depth(3);
+        let stale_worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Stale);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![stale_worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "stale worker should not count as live coverage"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_worker_covers_different_shard() {
+        // A healthy active worker assigned to shard 1 should not cover shard 0.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = pending_queue_depth(3);
+        let worker_on_other_shard =
+            make_worker_row(1, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker_on_other_shard]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0, // checking shard 0
+            &roles,
+            &queue_depth,
+            &workers,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "worker on different shard should not count as coverage"
+        );
     }
 }

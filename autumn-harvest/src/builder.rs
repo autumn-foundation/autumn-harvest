@@ -1564,6 +1564,16 @@ pub struct WorkerConfig {
     pub queue_weights: std::collections::HashMap<String, u32>,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
+    /// Optional per-shard LISTEN/NOTIFY database URLs for multi-shard workers
+    /// (issue #522).
+    ///
+    /// When a worker is assigned to multiple shards, each shard can optionally
+    /// have its own notification URL so the worker can use LISTEN/NOTIFY for
+    /// that shard's task queue instead of falling back to polling. Shards
+    /// absent from this map fall back to poll-only behaviour for that shard.
+    ///
+    /// **Default: empty** — all assigned shards use polling.
+    pub shard_notification_database_urls: Vec<(crate::types::ShardId, String)>,
     /// Maximum concurrent workflow executions on this worker.
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity executions on this worker.
@@ -1698,6 +1708,7 @@ impl Default for WorkerConfig {
             queues: vec!["default".to_string()],
             queue_weights: std::collections::HashMap::new(),
             notification_database_url: None,
+            shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 20,
             max_concurrent_activities: 50,
             shutdown_timeout: Duration::from_secs(30),
@@ -1771,6 +1782,24 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_notification_database_url(mut self, database_url: impl Into<String>) -> Self {
         self.notification_database_url = Some(database_url.into());
+        self
+    }
+
+    /// Set per-shard LISTEN/NOTIFY notification URLs for multi-shard workers
+    /// (issue #522).
+    ///
+    /// Each entry maps a shard ID to a Postgres URL. Shards not listed fall
+    /// back to polling. The entries are additive — calling this method
+    /// replaces the full list.
+    #[must_use]
+    pub fn with_shard_notification_database_urls(
+        mut self,
+        urls: impl IntoIterator<Item = (crate::types::ShardId, impl Into<String>)>,
+    ) -> Self {
+        self.shard_notification_database_urls = urls
+            .into_iter()
+            .map(|(shard, url)| (shard, url.into()))
+            .collect();
         self
     }
 
@@ -2142,6 +2171,33 @@ mod tests {
     fn worker_config_builder_adds_queues() {
         let config = WorkerConfig::default().with_queues(["email-workers", "etl"]);
         assert!(config.queues.contains(&"email-workers".to_string()));
+    }
+
+    #[test]
+    fn worker_config_shard_notification_urls_default_empty() {
+        let config = WorkerConfig::default();
+        assert!(
+            config.shard_notification_database_urls.is_empty(),
+            "shard_notification_database_urls must default to empty"
+        );
+    }
+
+    #[test]
+    fn worker_config_with_shard_notification_database_urls_sets_entries() {
+        use crate::types::ShardId;
+        let config = WorkerConfig::default().with_shard_notification_database_urls([
+            (ShardId::new(0), "postgres://host0/harvest"),
+            (ShardId::new(1), "postgres://host1/harvest"),
+        ]);
+        assert_eq!(config.shard_notification_database_urls.len(), 2);
+        assert_eq!(
+            config.shard_notification_database_urls[0].0,
+            ShardId::new(0)
+        );
+        assert_eq!(
+            config.shard_notification_database_urls[1].0,
+            ShardId::new(1)
+        );
     }
 
     #[test]

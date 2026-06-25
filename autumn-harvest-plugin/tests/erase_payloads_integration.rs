@@ -210,6 +210,7 @@ fn build_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 worker_id: "erase-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
+                shard_notification_database_urls: Vec::new(),
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
                 poll_interval: Duration::from_millis(25),

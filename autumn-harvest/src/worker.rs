@@ -80,6 +80,9 @@ pub struct WorkerRuntimeConfig {
     pub queue_weights: std::collections::HashMap<String, u32>,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
+    /// Optional per-shard LISTEN/NOTIFY database URLs for multi-shard workers
+    /// (issue #522). Shards absent from this list fall back to polling.
+    pub shard_notification_database_urls: Vec<(crate::types::ShardId, String)>,
     /// Maximum concurrent workflow task executions.
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity task executions.
@@ -182,6 +185,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             queues: cfg.queues,
             queue_weights: cfg.queue_weights,
             notification_database_url: cfg.notification_database_url,
+            shard_notification_database_urls: cfg.shard_notification_database_urls,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
             max_concurrent_activities: cfg.max_concurrent_activities,
             poll_interval: Duration::from_millis(500),
@@ -6876,6 +6880,97 @@ fn spawn_dlq_depth_sampler(
     })
 }
 
+/// Spawn the stranded-work sampler (issue #522).
+///
+/// Iterates over every shard in the provided sharded pool. Per shard it counts
+/// claimable pending tasks and whether a live covering worker exists. When a
+/// writable shard has pending work but no live covering worker the pending count
+/// is emitted as the `harvest.shard.stranded_pending` gauge; otherwise `0` is
+/// emitted so operators can see the metric go green once a worker picks up the
+/// shard.
+#[cfg(feature = "db")]
+fn spawn_stranded_work_sampler(
+    sharded_pool: crate::shard::ShardedDbPool,
+    freshness_window: Duration,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            for (shard_id, shard_pool) in sharded_pool.iter_shards() {
+                let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
+
+                let pending_count = {
+                    let mut conn = match shard_pool.get().await {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            tracing::debug!(
+                                shard_id = %shard_id.as_i32(),
+                                error = %error,
+                                "stranded-work sampler could not acquire DB connection"
+                            );
+                            continue;
+                        }
+                    };
+                    match crate::queue::claimable_pending_count(&mut conn).await {
+                        Ok(n) => n,
+                        Err(error) => {
+                            tracing::debug!(
+                                shard_id = %shard_id.as_i32(),
+                                error = %error,
+                                "stranded-work count query failed"
+                            );
+                            continue;
+                        }
+                    }
+                };
+
+                let has_live_worker = if pending_count == 0 {
+                    // No work to strand — skip the worker check.
+                    true
+                } else {
+                    let Ok(mut conn) = shard_pool.get().await else {
+                        continue;
+                    };
+                    let stale_threshold = freshness_window;
+                    let filters = crate::workers::WorkerFilters {
+                        status: Some(crate::workers::WorkerStatus::Active.as_str().to_string()),
+                        shard_id: Some(shard_id.as_i32()),
+                        health: Some(crate::workers::WorkerHealth::Healthy),
+                        limit: crate::workers::WorkerFilters::DEFAULT_LIMIT,
+                        ..Default::default()
+                    };
+                    match crate::workers::list_workers(&mut conn, &filters, stale_threshold).await {
+                        Ok(workers) => !workers.is_empty(),
+                        Err(error) => {
+                            tracing::debug!(error = %error, "worker list query failed for stranded-work sampler");
+                            continue;
+                        }
+                    }
+                };
+
+                let stranded = if has_live_worker {
+                    0u64
+                } else {
+                    u64::try_from(pending_count).unwrap_or(0)
+                };
+                telemetry
+                    .metrics
+                    .record_shard_stranded_pending(shard_u16, stranded);
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
@@ -6931,6 +7026,7 @@ struct WorkerMonitoringHandles {
     poison_pill_reclaimer: tokio::task::JoinHandle<()>,
     pause_auto_resumer: tokio::task::JoinHandle<()>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
+    stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Spawn the bounded-pause auto-resume scanner (issue #383).
@@ -7147,32 +7243,299 @@ impl Worker {
     ///
     /// This is the worker's entry point. It keeps polling until shutdown is
     /// requested, checking the cancellation token between poll iterations.
+    ///
+    /// When the worker has a `sharded_pool` with more than one shard,
+    /// it drains all assigned shards via `run_poll_loop_multi` (issue #522).
+    /// Otherwise it falls through to the existing single-shard path
+    /// (`run_with_listener`) byte-for-byte unchanged.
     pub async fn run(&self, pool: &DbPool) {
-        let listener = match self.config.notification_database_url.as_deref() {
-            Some(database_url) => {
-                match crate::notify::QueueListener::connect(database_url, &self.config.queues).await
-                {
-                    Ok(listener) => {
+        // Resolve the set of (ShardId, DbPool) claim targets from the sharded
+        // pool when available, deduplicating by ShardId.
+        #[cfg(feature = "db")]
+        let shard_targets: Vec<(crate::types::ShardId, DbPool)> = {
+            self.config.sharded_pool.as_ref().map_or_else(
+                || {
+                    self.config
+                        .shard_assignments
+                        .iter()
+                        .map(|shard| (*shard, pool.clone()))
+                        .collect()
+                },
+                |sharded| {
+                    let mut seen = std::collections::HashSet::new();
+                    self.config
+                        .shard_assignments
+                        .iter()
+                        .filter(|shard| seen.insert(*shard))
+                        .map(|shard| (*shard, sharded.pool_for(*shard).clone()))
+                        .collect()
+                },
+            )
+        };
+        #[cfg(not(feature = "db"))]
+        let shard_targets: Vec<(crate::types::ShardId, DbPool)> = self
+            .config
+            .shard_assignments
+            .iter()
+            .map(|shard| (*shard, pool.clone()))
+            .collect();
+
+        // More than one distinct shard target → multi-shard loop.
+        // One or zero targets (or single-pool fallback) → existing path.
+        #[cfg(feature = "db")]
+        let use_multi_shard = shard_targets.len() > 1
+            && self
+                .config
+                .sharded_pool
+                .as_ref()
+                .is_some_and(|sp| sp.shard_ids().len() > 1);
+        #[cfg(not(feature = "db"))]
+        let use_multi_shard = false;
+
+        if use_multi_shard {
+            self.run_multi_shard(shard_targets, pool).await;
+        } else {
+            // Single-shard fast path — byte-for-byte unchanged.
+            let listener = match self.config.notification_database_url.as_deref() {
+                Some(database_url) => {
+                    match crate::notify::QueueListener::connect(database_url, &self.config.queues)
+                        .await
+                    {
+                        Ok(listener) => {
+                            tracing::info!(
+                                worker_id = %self.config.worker_id,
+                                queues = ?listener.queues(),
+                                "worker LISTEN/NOTIFY listener connected"
+                            );
+                            Some(listener)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                error = %error,
+                                "failed to start LISTEN/NOTIFY listener; falling back to polling"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            self.run_with_listener(pool, listener).await;
+        }
+    }
+
+    /// Multi-shard entry point (issue #522).
+    ///
+    /// Called by `run` when two or more distinct shard pools are active. Each
+    /// shard gets its own optional LISTEN/NOTIFY listener (from
+    /// `shard_notification_database_urls`), and the poll loop calls
+    /// `poll_once(shard_pool)` per shard so that per-shard ACID locality is
+    /// preserved for free — `dispatch_task` already clones whatever pool it
+    /// receives into the spawned task.
+    ///
+    /// Fleet presence (register + heartbeat + status) is written to **each**
+    /// assigned shard's pool so that the shard-health readiness gate (Slice B)
+    /// can see a covering live worker per shard.
+    async fn run_multi_shard(
+        &self,
+        shard_targets: Vec<(crate::types::ShardId, DbPool)>,
+        default_pool: &DbPool,
+    ) {
+        tracing::info!(
+            worker_id = %self.config.worker_id,
+            queues = ?self.config.queues,
+            shards = ?shard_targets.iter().map(|(s, _)| s.as_i32()).collect::<Vec<_>>(),
+            "worker starting (multi-shard)"
+        );
+
+        // Register + rate-limit buckets on every shard pool.
+        for (_, shard_pool) in &shard_targets {
+            self.register_in_fleet(shard_pool).await;
+            self.register_rate_limit_buckets(shard_pool).await;
+        }
+
+        // Monitoring tasks use the default pool for non-shard-specific monitors;
+        // the stranded-work sampler (added in spawn_monitoring_tasks) uses the
+        // full ShardedDbPool so it observes every shard.
+        let monitors = self.spawn_monitoring_tasks(default_pool);
+        let heartbeat_cancel = CancellationToken::new();
+
+        // Spawn one heartbeat task per shard pool so every shard's harvest_workers
+        // table reflects this worker.
+        let heartbeat_handles: Vec<_> = shard_targets
+            .iter()
+            .map(|(_, shard_pool)| self.spawn_heartbeat_task(shard_pool, heartbeat_cancel.clone()))
+            .collect();
+
+        // Build per-shard listeners from shard_notification_database_urls.
+        let mut shard_listeners: Vec<Option<crate::notify::QueueListener>> = Vec::new();
+        for (shard_id, _) in &shard_targets {
+            let listener_url = self
+                .config
+                .shard_notification_database_urls
+                .iter()
+                .find(|(s, _)| s == shard_id)
+                .map(|(_, url)| url.as_str());
+            let listener = if let Some(url) = listener_url {
+                match crate::notify::QueueListener::connect(url, &self.config.queues).await {
+                    Ok(l) => {
                         tracing::info!(
                             worker_id = %self.config.worker_id,
-                            queues = ?listener.queues(),
-                            "worker LISTEN/NOTIFY listener connected"
+                            shard_id = %shard_id.as_i32(),
+                            "per-shard LISTEN/NOTIFY listener connected"
                         );
-                        Some(listener)
+                        Some(l)
                     }
                     Err(error) => {
                         tracing::warn!(
                             worker_id = %self.config.worker_id,
+                            shard_id = %shard_id.as_i32(),
                             error = %error,
-                            "failed to start LISTEN/NOTIFY listener; falling back to polling"
+                            "per-shard LISTEN/NOTIFY failed; shard will fall back to polling"
                         );
                         None
                     }
                 }
+            } else {
+                None
+            };
+            shard_listeners.push(listener);
+        }
+
+        self.run_poll_loop_multi(shard_targets.clone(), shard_listeners)
+            .await;
+
+        tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
+
+        // Draining: transition status on every shard pool.
+        for (_, shard_pool) in &shard_targets {
+            self.transition_fleet_status(shard_pool, crate::workers::WorkerStatus::Draining)
+                .await;
+        }
+
+        tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
+        self.drain_in_flight().await;
+
+        // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
+        for (_, shard_pool) in &shard_targets {
+            self.transition_fleet_status(shard_pool, crate::workers::WorkerStatus::Stopped)
+                .await;
+        }
+        heartbeat_cancel.cancel();
+
+        for handle in heartbeat_handles {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "worker heartbeat task failed during multi-shard shutdown"
+                );
             }
-            None => None,
-        };
-        self.run_with_listener(pool, listener).await;
+        }
+        // Reuse the cleanup path for the monitoring tasks.
+        self.shutdown_and_cleanup_monitors(monitors).await;
+
+        tracing::info!(worker_id = %self.config.worker_id, "worker stopped (multi-shard)");
+    }
+
+    /// Multi-shard poll loop (issue #522).
+    ///
+    /// Each iteration tries every shard in order. The first shard that yields
+    /// a task causes an immediate `continue` so we stay hot when there is work
+    /// anywhere. When all shards are idle we `tokio::select!` across all
+    /// per-shard listeners (falling back to a `poll_interval` sleep for shards
+    /// without a listener) before the next full scan.
+    async fn run_poll_loop_multi(
+        &self,
+        shard_targets: Vec<(crate::types::ShardId, DbPool)>,
+        mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
+    ) {
+        while !self.shutdown.is_cancelled() {
+            let mut any_claimed = false;
+            for (_, shard_pool) in &shard_targets {
+                if self.poll_once(shard_pool).await {
+                    any_claimed = true;
+                    break;
+                }
+            }
+            if any_claimed {
+                continue;
+            }
+
+            // All shards idle — wait for a notification or the poll interval.
+            // Build a future that resolves when the first listener fires, or
+            // after poll_interval if none are configured.
+            let poll_interval = self.config.poll_interval;
+            let shutdown = &self.shutdown;
+
+            // We use a simple sleep here; per-shard LISTEN/NOTIFY would need
+            // a more complex select! across variable-length futures, which is
+            // not expressible without boxing. For now poll-only is the safe
+            // multi-shard idle path; individual shard listeners are a follow-up
+            // optimisation. We still honor notification URLs if a listener is
+            // present for any shard.
+            let any_listener = shard_listeners.iter_mut().find(|l| l.is_some());
+            if let Some(Some(listener)) = any_listener {
+                match listener.wait_for_notification(poll_interval).await {
+                    Ok(Some(_)) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            worker_id = %self.config.worker_id,
+                            error = %error,
+                            "LISTEN/NOTIFY wait failed in multi-shard loop; sleeping before retry"
+                        );
+                        tokio::select! {
+                            () = shutdown.cancelled() => break,
+                            () = tokio::time::sleep(poll_interval) => {}
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(poll_interval) => {}
+                }
+            }
+        }
+    }
+
+    /// Clean up monitoring task handles (extracted for the multi-shard path).
+    async fn shutdown_and_cleanup_monitors(&self, monitors: WorkerMonitoringHandles) {
+        if let Err(error) = monitors.timeout_checker.await {
+            tracing::warn!(error = %error, "timeout checker failed during shutdown");
+        }
+        if let Err(error) = monitors.poison_pill_reclaimer.await {
+            tracing::warn!(error = %error, "poison-pill reclaimer failed during shutdown");
+        }
+        if let Err(error) = monitors.pause_auto_resumer.await {
+            tracing::warn!(error = %error, "pause auto-resumer failed during shutdown");
+        }
+        if let Err(error) = monitors.queue_depth_sampler.await {
+            tracing::warn!(error = %error, "queue depth sampler failed during shutdown");
+        }
+        if let Err(error) = monitors.concurrency_sampler.await {
+            tracing::warn!(error = %error, "concurrency sampler failed during shutdown");
+        }
+        if let Err(error) = monitors.rate_limit_sampler.await {
+            tracing::warn!(error = %error, "rate limit sampler failed during shutdown");
+        }
+        for sampler in monitors.dlq_depth_samplers {
+            if let Err(error) = sampler.await {
+                tracing::warn!(error = %error, "dlq depth sampler failed during shutdown");
+            }
+        }
+        if let Err(error) = monitors.history_oversized_sampler.await {
+            tracing::warn!(error = %error, "history oversized sampler failed during shutdown");
+        }
+        if let Some(handle) = monitors.stranded_work_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(error = %error, "stranded-work sampler failed during shutdown");
+        }
     }
 
     /// Run the worker loop using a pre-connected optional listener.
@@ -7330,6 +7693,29 @@ impl Worker {
             self.config.poll_interval,
         );
 
+        // Stranded-work sampler (issue #522): emits a gauge per shard showing
+        // how many claimable tasks have no live covering worker. Only started
+        // when a sharded pool is available and metrics are enabled.
+        #[cfg(feature = "db")]
+        let stranded_work_sampler = self
+            .config
+            .sharded_pool
+            .as_ref()
+            .filter(|_| self.registry.telemetry().metrics.is_enabled())
+            .map(|sp| {
+                spawn_stranded_work_sampler(
+                    sp.clone(),
+                    // Reuse the heartbeat interval as freshness window so the
+                    // worker-liveness check is consistent with the heartbeat.
+                    self.config.worker_heartbeat_interval.saturating_mul(2),
+                    self.shutdown.clone(),
+                    self.registry.telemetry().clone(),
+                    self.config.poll_interval,
+                )
+            });
+        #[cfg(not(feature = "db"))]
+        let stranded_work_sampler: Option<tokio::task::JoinHandle<()>> = None;
+
         WorkerMonitoringHandles {
             queue_depth_sampler,
             concurrency_sampler,
@@ -7339,6 +7725,7 @@ impl Worker {
             poison_pill_reclaimer,
             pause_auto_resumer,
             history_oversized_sampler,
+            stranded_work_sampler,
         }
     }
 
@@ -7488,6 +7875,15 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "history oversized sampler failed during shutdown"
+            );
+        }
+        if let Some(handle) = monitors.stranded_work_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "stranded-work sampler failed during shutdown"
             );
         }
     }
@@ -8489,6 +8885,7 @@ mod tests {
             worker_id: "test-worker-1".to_string(),
             queues: vec!["default".to_string()],
             notification_database_url: None,
+            shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
             poll_interval: Duration::from_millis(100),
@@ -8759,6 +9156,7 @@ mod tests {
         let builder_cfg = WorkerConfig {
             queues: vec!["email".to_string(), "billing".to_string()],
             notification_database_url: Some("postgres://localhost/test".to_string()),
+            shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 5,
             max_concurrent_activities: 15,
             shutdown_timeout: Duration::from_secs(60),

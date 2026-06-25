@@ -153,6 +153,13 @@ pub const METRIC_QUEUE_OLDEST_PENDING_AGE: &str = "harvest.queue.oldest_pending_
 /// `execution.id` / `activity.id` are span-only and MUST NOT appear as labels.
 pub const METRIC_QUEUE_DISPATCHED: &str = "harvest.queue.dispatched";
 
+/// Gauge: current number of claimable pending tasks on a shard that has no
+/// covering live worker (issue #522).
+///
+/// Emitted per shard by the stranded-work sampler. Labelled `{shard}`.
+/// A healthy steady state is `0` on every shard.
+pub const METRIC_SHARD_STRANDED_PENDING: &str = "harvest.shard.stranded_pending";
+
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
@@ -928,6 +935,20 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (shard, depth);
     }
 
+    /// Current number of claimable pending tasks on a shard that has no
+    /// covering live worker (issue #522).
+    ///
+    /// Emitted per shard by the stranded-work sampler. When a shard is
+    /// covered by at least one live worker the value is emitted as `0`.
+    /// A non-zero value means work is stranded: workflows rendezvous-hashed
+    /// onto this shard will never reach `RUNNING` until a covering worker is
+    /// started.
+    ///
+    /// Maps to the gauge `METRIC_SHARD_STRANDED_PENDING{shard}`.
+    fn record_shard_stranded_pending(&self, shard: u16, count: u64) {
+        let _ = (shard, count);
+    }
+
     /// A scheduled run was dispatched (either a DAG run or a workflow start).
     ///
     /// `kind` is `"dag"` or `"workflow"`. `name` is the DAG or workflow name.
@@ -1647,6 +1668,20 @@ mod tests {
         let rec = NoOpMetrics;
         rec.record_dlq_entries(0, 0);
         rec.record_dlq_entries(1, 42);
+    }
+
+    #[test]
+    fn shard_stranded_pending_gauge_has_default_noop_impl() {
+        // record_shard_stranded_pending must exist on MetricsRecorder with (shard: u16, count: u64).
+        // METRIC_SHARD_STRANDED_PENDING is the constant; this verifies shape + no-op (issue #522).
+        let rec = NoOpMetrics;
+        rec.record_shard_stranded_pending(0, 0);
+        rec.record_shard_stranded_pending(1, 42);
+        // verify the constant is exported
+        assert_eq!(
+            METRIC_SHARD_STRANDED_PENDING,
+            "harvest.shard.stranded_pending"
+        );
     }
 
     #[test]

@@ -126,6 +126,7 @@ impl PreparedHarvestRuntime {
             compile_dag_catalog(dags)
                 .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
         );
+        let storage_pool = HarvestDbPool::from(resources.harvest_pool);
         let mut worker_runtime_config = WorkerRuntimeConfig::from(worker_config);
         // Builder-level ceiling takes precedence; WorkerConfig ceiling is kept
         // when the builder did not set one (avoids silently disabling a ceiling
@@ -133,6 +134,8 @@ impl PreparedHarvestRuntime {
         if let Some(ceiling) = max_workflow_history_events {
             worker_runtime_config.max_workflow_history_events = Some(ceiling);
         }
+        // Wire the sharded pool so the worker can claim from all assigned shards (issue #522).
+        worker_runtime_config.sharded_pool = Some(storage_pool.sharded_pool().clone());
 
         Ok(Self {
             registry: Arc::new(registry),
@@ -140,7 +143,7 @@ impl PreparedHarvestRuntime {
             registered_dag_names,
             workflow_schedules,
             worker_runtime_config,
-            storage_pool: HarvestDbPool::from(resources.harvest_pool),
+            storage_pool,
             shard_router,
             retention_config,
             history_archiver,

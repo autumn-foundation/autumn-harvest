@@ -259,6 +259,7 @@ fn build_worker() -> Arc<Worker> {
                 worker_id: "dag-retry-worker".to_string(),
                 queues: vec!["default".to_string()],
                 notification_database_url: None,
+                shard_notification_database_urls: Vec::new(),
                 max_concurrent_workflows: 4,
                 max_concurrent_activities: 4,
                 poll_interval: Duration::from_millis(25),
