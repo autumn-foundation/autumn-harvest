@@ -3047,8 +3047,11 @@ struct WorkflowTypeNonTerminalSqlRow {
 /// Read-only `GROUP BY workflow_name` over `harvest_workflow_executions`,
 /// filtered to non-terminal states. The state set is the exact complement of
 /// [`crate::erase::is_terminal_state`]. `$1` optionally narrows to a single
-/// workflow type (still grouped, so the shape is identical to the unfiltered
-/// case). Side-effect-free: no claims, no writes, no events appended.
+/// workflow type; `$2` scopes the query to a single logical shard (mirrors the
+/// `shard_id` predicate in the version-usage query so that two logical shards
+/// sharing the same Postgres database are never double-counted). Both params
+/// are nullable — `NULL` means "no filter". Side-effect-free: no claims, no
+/// writes, no events appended.
 const NON_TERMINAL_COUNTS_SQL: &str = r"
 SELECT
     workflow_name::TEXT AS workflow_name,
@@ -3064,6 +3067,7 @@ WHERE state NOT IN (
         'TERMINATED'
       )
   AND ($1::TEXT IS NULL OR workflow_name = $1::TEXT)
+  AND ($2::INT4 IS NULL OR shard_id = $2::INT4)
 GROUP BY workflow_name
 ORDER BY workflow_name
 ";
@@ -3074,6 +3078,12 @@ ORDER BY workflow_name
 /// execution directly names — via `workflow_name` — the `#[workflow]` handler
 /// its next replay requires, so a non-zero count means deleting or renaming
 /// that handler would strand in-flight runs in permanent replay failure.
+///
+/// `shard_id` scopes the query to a single logical shard. Pass `Some(id)` from
+/// the per-shard fan-out so that two logical shards sharing the same Postgres
+/// database are never double-counted (mirrors the `shard_id` predicate in
+/// `load_version_usage`). Pass `None` only in tests or single-shard contexts
+/// where the database is exclusively owned by one shard.
 ///
 /// The optional `workflow_type` filter narrows to a single type; the result
 /// shape is unchanged (an empty `Vec` when that type has no non-terminal
@@ -3087,10 +3097,12 @@ ORDER BY workflow_name
 /// Returns [`HarvestError::Database`] if the query fails.
 pub async fn non_terminal_counts_by_workflow_name(
     conn: &mut AsyncPgConnection,
+    shard_id: Option<i32>,
     workflow_type: Option<&str>,
 ) -> HarvestResult<Vec<WorkflowTypeNonTerminalCount>> {
     let rows = diesel::sql_query(NON_TERMINAL_COUNTS_SQL)
         .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(workflow_type)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(shard_id)
         .load::<WorkflowTypeNonTerminalSqlRow>(conn)
         .await
         .map_err(database_error)?;

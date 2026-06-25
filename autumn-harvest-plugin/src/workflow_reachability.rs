@@ -266,7 +266,7 @@ async fn observe_shard(
             )),
         };
     };
-    match non_terminal_counts_by_workflow_name(&mut conn, filter.as_deref()).await {
+    match non_terminal_counts_by_workflow_name(&mut conn, Some(shard_id), filter.as_deref()).await {
         Ok(rows) => ShardObservation {
             shard_id,
             rows,
