@@ -179,7 +179,6 @@ fn expected_shards(api_state: &HarvestApiState, shard_filter: Option<i32>) -> BT
     shards
 }
 
-
 async fn observe_shard(
     shard_id: i32,
     pool: Option<DbPool>,
@@ -327,8 +326,14 @@ fn row_from_accumulator(
         terminal_executions: acc.terminal_executions,
         oldest_matching_started_at: acc.oldest_matching_started_at,
         newest_matching_started_at: acc.newest_matching_started_at,
-        oldest_matching_execution_age_secs: shard_fanout::age_secs(observed_at, acc.oldest_matching_started_at),
-        newest_matching_execution_age_secs: shard_fanout::age_secs(observed_at, acc.newest_matching_started_at),
+        oldest_matching_execution_age_secs: shard_fanout::age_secs(
+            observed_at,
+            acc.oldest_matching_started_at,
+        ),
+        newest_matching_execution_age_secs: shard_fanout::age_secs(
+            observed_at,
+            acc.newest_matching_started_at,
+        ),
         shard_coverage: VersionUsageShardCoverage {
             inspected_shards: inspected_shards.iter().copied().collect(),
             matched_shards: acc.matched_shards.iter().copied().collect(),
@@ -336,7 +341,6 @@ fn row_from_accumulator(
         },
     }
 }
-
 
 const fn report_status(
     no_items: bool,

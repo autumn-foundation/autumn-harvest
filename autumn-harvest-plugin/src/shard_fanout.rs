@@ -27,6 +27,7 @@ pub struct ShardObservation<R> {
 /// Collect per-shard connection pools available in `api_state`.
 ///
 /// Returns an empty map when no storage pool is installed.
+#[must_use]
 pub fn pools_by_shard(api_state: &HarvestApiState) -> BTreeMap<i32, DbPool> {
     api_state.storage_pool().map_or_else(
         |_| BTreeMap::new(),
@@ -39,6 +40,7 @@ pub fn pools_by_shard(api_state: &HarvestApiState) -> BTreeMap<i32, DbPool> {
 }
 
 /// Seconds elapsed from `started_at` to `observed_at`, clamped to zero.
+#[must_use]
 pub fn age_secs(observed_at: DateTime<Utc>, started_at: DateTime<Utc>) -> i64 {
     observed_at
         .signed_duration_since(started_at)

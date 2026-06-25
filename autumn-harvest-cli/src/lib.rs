@@ -1536,7 +1536,19 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return run_worker_drain_wait(&cli, worker_id, *wait_timeout_secs).await;
     }
 
-    let response = execute(&cli).await?;
+    let response = match execute(&cli).await {
+        Ok(v) => v,
+        Err(err) => {
+            // Fail closed: a transport/API error on a reachability gate command must
+            // exit 2 (deploy hazard) rather than exit 1 (generic error). Exit 1 is
+            // labelled "transport/usage error" in the runbook and operators may
+            // retry or ignore it; exit 2 unambiguously signals an unsafe answer.
+            if workflow_reachability_should_gate(&cli) {
+                return Err(CliError::WorkflowReachabilityGate);
+            }
+            return Err(err);
+        }
+    };
     let rendered = render_response(&cli, &response)?;
     if let Some(path) = history_output_file(&cli) {
         fs::write(path, &rendered).map_err(|source| CliError::WriteOutput {
@@ -2681,7 +2693,7 @@ fn format_workflow_reachability_table(value: &Value) -> String {
     for item in items {
         rows.push(vec![
             cell_str(item.get("workflow_type")),
-            cell_bool(item.get("registered")),
+            bool_cell(item.get("registered")),
             cell_number(item.get("non_terminal_count")),
             cell_number(item.get("oldest_non_terminal_age_secs")),
             cell_str(item.get("verdict")),
@@ -3013,12 +3025,6 @@ fn cell_number(value: Option<&Value>) -> String {
     value
         .and_then(Value::as_i64)
         .map_or_else(String::new, |number| number.to_string())
-}
-
-fn cell_bool(value: Option<&Value>) -> String {
-    value
-        .and_then(Value::as_bool)
-        .map_or_else(String::new, |flag| flag.to_string())
 }
 
 fn cell_optional_number(value: Option<&Value>) -> String {

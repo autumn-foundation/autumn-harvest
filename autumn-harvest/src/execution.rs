@@ -3106,6 +3106,54 @@ pub async fn non_terminal_counts_by_workflow_name(
 }
 
 #[cfg(test)]
+mod non_terminal_sql_tests {
+    use super::NON_TERMINAL_COUNTS_SQL;
+    use crate::erase::is_terminal_state;
+
+    /// The `NOT IN (...)` state list in `NON_TERMINAL_COUNTS_SQL` must be the
+    /// exact complement of `erase::is_terminal_state`. If a new terminal state is
+    /// added to `is_terminal_state`, this test fails until the SQL is updated,
+    /// preventing the reachability query from counting terminal runs as non-terminal
+    /// and blocking safe handler removal forever.
+    #[test]
+    fn non_terminal_sql_excludes_exactly_terminal_states() {
+        let terminal_states = [
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+            "TERMINATED",
+        ];
+        for state in &terminal_states {
+            assert!(
+                is_terminal_state(state),
+                "State '{state}' is listed in NON_TERMINAL_COUNTS_SQL's NOT IN clause \
+                 but is_terminal_state returns false — update one of them to match"
+            );
+            assert!(
+                NON_TERMINAL_COUNTS_SQL.contains(state),
+                "is_terminal_state returns true for '{state}' but it is missing from \
+                 NON_TERMINAL_COUNTS_SQL's NOT IN clause — add it to keep the lists in sync"
+            );
+        }
+        let candidate_non_terminal = ["RUNNING", "SUSPENDED", "PAUSED"];
+        for state in &candidate_non_terminal {
+            assert!(
+                !is_terminal_state(state),
+                "State '{state}' appears in the non-terminal candidate list \
+                 but is_terminal_state returned true — remove it from this test"
+            );
+            assert!(
+                !NON_TERMINAL_COUNTS_SQL.contains(&format!("'{state}'")),
+                "State '{state}' appears in the NOT IN clause of NON_TERMINAL_COUNTS_SQL \
+                 but should be non-terminal — remove it from the exclusion list"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod pause_helper_tests {
     use super::pause_timeout_exceeded;
     use chrono::{Duration as ChronoDuration, Utc};
