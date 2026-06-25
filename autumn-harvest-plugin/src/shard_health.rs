@@ -287,6 +287,19 @@ fn check_no_live_worker_gate(
     if !roles.contains(&ShardRole::Writable) || queue_depth.total_pending == 0 {
         return;
     }
+
+    // The queues that actually have claimable pending tasks.
+    let pending_queues: std::collections::HashSet<&str> = queue_depth
+        .by_queue
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(q, _)| q.as_str())
+        .collect();
+
+    // A worker "covers" the shard if it is healthy, active, assigned to this
+    // shard, AND services at least one queue that has pending work (fix #8).
+    // A worker that is assigned to the shard but only covers unrelated queues
+    // cannot actually drain the stuck tasks.
     let covering = workers
         .as_ref()
         .map(|ws| {
@@ -295,6 +308,10 @@ fn check_no_live_worker_gate(
                     worker_assigned_to_shard(w, shard_id)
                         && w.health == WorkerHealth::Healthy
                         && w.worker.status == WorkerStatus::Active.as_str()
+                        && w.worker.queues.as_array().is_some_and(|qs| {
+                            qs.iter()
+                                .any(|v| v.as_str().is_some_and(|q| pending_queues.contains(q)))
+                        })
                 })
                 .count()
         })
@@ -302,7 +319,8 @@ fn check_no_live_worker_gate(
     if covering == 0 {
         push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
         blocking_reasons.push(format!(
-            "{} claimable task(s) queued but no live worker lists this shard in shard_assignments",
+            "{} claimable task(s) queued but no live worker covers this shard \
+             and the relevant queue(s) in shard_assignments",
             queue_depth.total_pending
         ));
     }
@@ -1079,9 +1097,15 @@ mod tests {
     }
 
     fn pending_queue_depth(total: i64) -> QueueDepthSummary {
+        // Populate by_queue so the queue-intersection check in
+        // check_no_live_worker_gate can match workers that serve "default".
+        let mut by_queue = std::collections::BTreeMap::new();
+        if total > 0 {
+            by_queue.insert("default".to_string(), total);
+        }
         QueueDepthSummary {
             total_pending: total,
-            by_queue: std::collections::BTreeMap::new(),
+            by_queue,
             error: None,
         }
     }

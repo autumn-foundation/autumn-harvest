@@ -34,6 +34,14 @@ pub struct HarvestRunnerResources {
     app_pool: Option<DbPool>,
     harvest_pool: DbPool,
     shard_router: Option<ShardRouter>,
+    /// Pre-built multi-shard pool for multi-shard deployments (issue #522).
+    ///
+    /// When set, the runtime uses this pool directly instead of deriving a
+    /// single-shard pool from `harvest_pool`. This allows operators to inject
+    /// a `ShardedDbPool` spanning multiple databases so the worker can drain
+    /// all assigned shards. When `None`, the runtime falls back to a
+    /// single-shard wrapper around `harvest_pool`.
+    sharded_pool: Option<ShardedDbPool>,
 }
 
 impl HarvestRunnerResources {
@@ -45,6 +53,7 @@ impl HarvestRunnerResources {
             app_pool: None,
             harvest_pool,
             shard_router: None,
+            sharded_pool: None,
         }
     }
 
@@ -70,6 +79,18 @@ impl HarvestRunnerResources {
     #[must_use]
     pub fn with_shard_router(mut self, router: ShardRouter) -> Self {
         self.shard_router = Some(router);
+        self
+    }
+
+    /// Inject a pre-built multi-shard pool for multi-shard deployments.
+    ///
+    /// When set, this pool is used as the `storage_pool` instead of deriving
+    /// a single-shard pool from `harvest_pool`. Use this when the runtime
+    /// spans multiple Postgres databases and needs to drain tasks from all
+    /// assigned shards (issue #522).
+    #[must_use]
+    pub fn with_sharded_pool(mut self, pool: ShardedDbPool) -> Self {
+        self.sharded_pool = Some(pool);
         self
     }
 }
@@ -126,7 +147,11 @@ impl PreparedHarvestRuntime {
             compile_dag_catalog(dags)
                 .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
         );
-        let storage_pool = HarvestDbPool::from(resources.harvest_pool);
+        let storage_pool = if let Some(sp) = resources.sharded_pool {
+            HarvestDbPool::sharded(sp)
+        } else {
+            HarvestDbPool::from(resources.harvest_pool)
+        };
         let mut worker_runtime_config = WorkerRuntimeConfig::from(worker_config);
         // Builder-level ceiling takes precedence; WorkerConfig ceiling is kept
         // when the builder did not set one (avoids silently disabling a ceiling

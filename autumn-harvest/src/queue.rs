@@ -1832,11 +1832,17 @@ pub async fn claimable_pending_count(conn: &mut AsyncPgConnection) -> HarvestRes
         cnt: i64,
     }
 
+    // Exclude tasks whose owning workflow execution is PAUSED: a paused
+    // execution's pending tasks will not be claimed until the execution is
+    // resumed, so counting them as "stranded" would be a false positive.
+    // This mirrors the PAUSED exclusion in claim_task (fix #7).
     let row: CountRow = diesel::sql_query(
         "SELECT COUNT(*)::BIGINT AS cnt \
-         FROM harvest_task_queue \
-         WHERE state = 'PENDING' \
-           AND scheduled_at <= NOW()",
+         FROM harvest_task_queue tq \
+         LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
+         WHERE tq.state = 'PENDING' \
+           AND tq.scheduled_at <= NOW() \
+           AND (e.id IS NULL OR e.state != 'PAUSED')",
     )
     .get_result(conn)
     .await

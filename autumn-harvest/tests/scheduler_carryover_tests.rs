@@ -268,6 +268,7 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
+                shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
             },
             registry,

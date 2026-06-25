@@ -6891,6 +6891,8 @@ fn spawn_dlq_depth_sampler(
 #[cfg(feature = "db")]
 fn spawn_stranded_work_sampler(
     sharded_pool: crate::shard::ShardedDbPool,
+    // Subset of shards this worker is assigned to (fix #10).
+    assigned_shards: Vec<crate::types::ShardId>,
     freshness_window: Duration,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
@@ -6906,7 +6908,14 @@ fn spawn_stranded_work_sampler(
                 break;
             }
 
-            for (shard_id, shard_pool) in sharded_pool.iter_shards() {
+            // Iterate only the shards this worker is assigned to, not every
+            // shard visible through the pool, so read-only replica shards and
+            // shards owned by other workers don't generate spurious alerts.
+            let shard_iter: Vec<(crate::types::ShardId, DbPool)> = assigned_shards
+                .iter()
+                .filter_map(|s| sharded_pool.exact_pool_for(*s).map(|p| (*s, p.clone())))
+                .collect();
+            for (shard_id, shard_pool) in shard_iter {
                 let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
 
                 let pending_count = {
@@ -7023,8 +7032,8 @@ struct WorkerMonitoringHandles {
     rate_limit_sampler: tokio::task::JoinHandle<()>,
     dlq_depth_samplers: Vec<tokio::task::JoinHandle<()>>,
     timeout_checker: tokio::task::JoinHandle<()>,
-    poison_pill_reclaimer: tokio::task::JoinHandle<()>,
-    pause_auto_resumer: tokio::task::JoinHandle<()>,
+    poison_pill_reclaimers: Vec<tokio::task::JoinHandle<()>>,
+    pause_auto_resumers: Vec<tokio::task::JoinHandle<()>>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
 }
@@ -7267,7 +7276,21 @@ impl Worker {
                         .shard_assignments
                         .iter()
                         .filter(|shard| seen.insert(*shard))
-                        .map(|shard| (*shard, sharded.pool_for(*shard).clone()))
+                        .map(|shard| {
+                            // Warn when an assigned shard has no matching pool entry (fix #9):
+                            // pool_for silently falls back to the default shard, which means
+                            // this worker would claim from the wrong database.
+                            if sharded.exact_pool_for(*shard).is_none() {
+                                tracing::warn!(
+                                    worker_id = %self.config.worker_id,
+                                    shard_id = shard.as_i32(),
+                                    "shard_assignment refers to a shard not present in the \
+                                     sharded_pool; claims for this shard will fall back to the \
+                                     default shard pool — check your ShardedDbPool configuration"
+                                );
+                            }
+                            (*shard, sharded.pool_for(*shard).clone())
+                        })
                         .collect()
                 },
             )
@@ -7451,53 +7474,81 @@ impl Worker {
         shard_targets: Vec<(crate::types::ShardId, DbPool)>,
         mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
     ) {
+        let n = shard_targets.len();
+        // Rotating start index prevents the first shard from being permanently
+        // favoured when multiple shards have work (fix #4).
+        let mut start_idx = 0usize;
+
         while !self.shutdown.is_cancelled() {
             let mut any_claimed = false;
-            for (_, shard_pool) in &shard_targets {
-                if self.poll_once(shard_pool).await {
+            for i in 0..n {
+                let idx = (start_idx + i) % n;
+                if self.poll_once(&shard_targets[idx].1).await {
                     any_claimed = true;
+                    // Advance start past the shard that just claimed so the
+                    // next hot iteration tries the next shard first.
+                    start_idx = (idx + 1) % n;
                     break;
                 }
             }
             if any_claimed {
                 continue;
             }
+            // All idle — rotate start so the next iteration begins at the next
+            // shard in round-robin order regardless of which fired a NOTIFY.
+            start_idx = (start_idx + 1) % n;
 
-            // All shards idle — wait for a notification or the poll interval.
-            // Build a future that resolves when the first listener fires, or
-            // after poll_interval if none are configured.
+            // All shards idle — poll all per-shard listeners in round-robin
+            // with a short per-listener timeout (fix #6). Notifications are
+            // buffered in each listener's channel so no wake-up is lost.
+            // Sequential round-robin avoids borrow-checker issues with
+            // select_all over &mut references while still letting any listener
+            // wake the loop.
             let poll_interval = self.config.poll_interval;
             let shutdown = &self.shutdown;
 
-            // We use a simple sleep here; per-shard LISTEN/NOTIFY would need
-            // a more complex select! across variable-length futures, which is
-            // not expressible without boxing. For now poll-only is the safe
-            // multi-shard idle path; individual shard listeners are a follow-up
-            // optimisation. We still honor notification URLs if a listener is
-            // present for any shard.
-            let any_listener = shard_listeners.iter_mut().find(|l| l.is_some());
-            if let Some(Some(listener)) = any_listener {
-                match listener.wait_for_notification(poll_interval).await {
-                    Ok(Some(_)) => {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            worker_id = %self.config.worker_id,
-                            error = %error,
-                            "LISTEN/NOTIFY wait failed in multi-shard loop; sleeping before retry"
-                        );
-                        tokio::select! {
-                            () = shutdown.cancelled() => break,
-                            () = tokio::time::sleep(poll_interval) => {}
-                        }
-                    }
-                }
-            } else {
+            if shard_listeners.iter().all(Option::is_none) {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(poll_interval) => {}
+                }
+            } else {
+                // Poll each listener with a short cap; overall timeout = poll_interval.
+                let per_check = Duration::from_millis(10).min(poll_interval);
+                let deadline = tokio::time::Instant::now() + poll_interval;
+                let mut notified = false;
+
+                'notify_wait: while tokio::time::Instant::now() < deadline
+                    && !shutdown.is_cancelled()
+                {
+                    let mut broken_idx: Option<usize> = None;
+                    for (i, slot) in shard_listeners.iter_mut().enumerate() {
+                        if let Some(listener) = slot.as_mut() {
+                            match listener.wait_for_notification(per_check).await {
+                                Ok(Some(_)) => {
+                                    notified = true;
+                                    break 'notify_wait;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(
+                                        worker_id = %self.config.worker_id,
+                                        shard_idx = i,
+                                        error = %error,
+                                        "LISTEN/NOTIFY wait failed for shard; removing listener"
+                                    );
+                                    broken_idx = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(i) = broken_idx {
+                        shard_listeners[i] = None;
+                    }
+                }
+                if notified {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
         }
@@ -7508,11 +7559,15 @@ impl Worker {
         if let Err(error) = monitors.timeout_checker.await {
             tracing::warn!(error = %error, "timeout checker failed during shutdown");
         }
-        if let Err(error) = monitors.poison_pill_reclaimer.await {
-            tracing::warn!(error = %error, "poison-pill reclaimer failed during shutdown");
+        for handle in monitors.poison_pill_reclaimers {
+            if let Err(error) = handle.await {
+                tracing::warn!(error = %error, "poison-pill reclaimer failed during shutdown");
+            }
         }
-        if let Err(error) = monitors.pause_auto_resumer.await {
-            tracing::warn!(error = %error, "pause auto-resumer failed during shutdown");
+        for handle in monitors.pause_auto_resumers {
+            if let Err(error) = handle.await {
+                tracing::warn!(error = %error, "pause auto-resumer failed during shutdown");
+            }
         }
         if let Err(error) = monitors.queue_depth_sampler.await {
             tracing::warn!(error = %error, "queue depth sampler failed during shutdown");
@@ -7607,10 +7662,11 @@ impl Worker {
         // DLQ depth gauge — one sampler per shard assignment so every shard
         // this worker owns is reported.  Single-shard deployments get one
         // sampler for shard 0; multi-shard workers (rare) get one per entry.
+        // Each sampler uses the per-shard pool when a ShardedDbPool is available
+        // so it queries the correct database (fix #5).
         let dlq_depth_samplers: Vec<_> = {
             let assignments = &self.config.shard_assignments;
             let shards: &[_] = if assignments.is_empty() {
-                // Fallback: if no explicit assignments, sample with shard 0.
                 &[]
             } else {
                 assignments.as_slice()
@@ -7619,8 +7675,16 @@ impl Worker {
                 .iter()
                 .map(|shard| {
                     let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
+                    #[cfg(feature = "db")]
+                    let shard_pool = self
+                        .config
+                        .sharded_pool
+                        .as_ref()
+                        .map_or_else(|| pool.clone(), |sp| sp.pool_for(*shard).clone());
+                    #[cfg(not(feature = "db"))]
+                    let shard_pool = pool.clone();
                     spawn_dlq_depth_sampler(
-                        pool.clone(),
+                        shard_pool,
                         self.shutdown.clone(),
                         self.registry.telemetry().clone(),
                         shard_id,
@@ -7667,24 +7731,49 @@ impl Worker {
             .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
             .saturating_add(i64::from(doubled.subsec_nanos() > 0))
             .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS);
-        let poison_pill_reclaimer = crate::poison_pill::spawn_poison_pill_reclaimer(
-            pool.clone(),
-            self.shutdown.clone(),
-            // Orphan reclaim is background maintenance: sweep at the heartbeat
-            // cadence rather than the (much shorter) task poll interval to keep
-            // the liveness scan off the hot path.
-            self.config.worker_heartbeat_interval,
-            self.config.poison_pill_threshold,
-            worker_stale_secs,
-            self.registry.telemetry().clone(),
-        );
-        let pause_auto_resumer = spawn_pause_auto_resumer(
-            pool.clone(),
-            self.shutdown.clone(),
-            self.config.worker_heartbeat_interval,
-            self.config.max_workflow_pause_duration,
-            self.registry.telemetry().clone(),
-        );
+        // Poison-pill reclaimer and pause auto-resumer run per-shard so that
+        // orphaned tasks and over-long pauses on every assigned shard are
+        // recovered (fix #3).  When a ShardedDbPool is available each shard
+        // gets its own instance; otherwise the single default pool is used.
+        #[cfg(feature = "db")]
+        let shard_pools_for_monitors: Vec<DbPool> = {
+            let assignments = &self.config.shard_assignments;
+            match (assignments.is_empty(), self.config.sharded_pool.as_ref()) {
+                (false, Some(sp)) => assignments
+                    .iter()
+                    .map(|s| sp.pool_for(*s).clone())
+                    .collect(),
+                _ => vec![pool.clone()],
+            }
+        };
+        #[cfg(not(feature = "db"))]
+        let shard_pools_for_monitors: Vec<DbPool> = vec![pool.clone()];
+
+        let poison_pill_reclaimers: Vec<_> = shard_pools_for_monitors
+            .iter()
+            .map(|shard_pool| {
+                crate::poison_pill::spawn_poison_pill_reclaimer(
+                    shard_pool.clone(),
+                    self.shutdown.clone(),
+                    self.config.worker_heartbeat_interval,
+                    self.config.poison_pill_threshold,
+                    worker_stale_secs,
+                    self.registry.telemetry().clone(),
+                )
+            })
+            .collect();
+        let pause_auto_resumers: Vec<_> = shard_pools_for_monitors
+            .iter()
+            .map(|shard_pool| {
+                spawn_pause_auto_resumer(
+                    shard_pool.clone(),
+                    self.shutdown.clone(),
+                    self.config.worker_heartbeat_interval,
+                    self.config.max_workflow_pause_duration,
+                    self.registry.telemetry().clone(),
+                )
+            })
+            .collect();
         let history_oversized_sampler = spawn_history_oversized_sampler(
             pool.clone(),
             self.shutdown.clone(),
@@ -7693,9 +7782,11 @@ impl Worker {
             self.config.poll_interval,
         );
 
-        // Stranded-work sampler (issue #522): emits a gauge per shard showing
-        // how many claimable tasks have no live covering worker. Only started
-        // when a sharded pool is available and metrics are enabled.
+        // Stranded-work sampler (issue #522): emits a gauge per assigned shard
+        // showing how many claimable tasks have no live covering worker. Only
+        // started when a sharded pool is available and metrics are enabled.
+        // Scoped to assigned shards only (fix #10) so read-only or unassigned
+        // shards never contribute a false-positive stranded-work signal.
         #[cfg(feature = "db")]
         let stranded_work_sampler = self
             .config
@@ -7705,6 +7796,7 @@ impl Worker {
             .map(|sp| {
                 spawn_stranded_work_sampler(
                     sp.clone(),
+                    self.config.shard_assignments.clone(),
                     // Reuse the heartbeat interval as freshness window so the
                     // worker-liveness check is consistent with the heartbeat.
                     self.config.worker_heartbeat_interval.saturating_mul(2),
@@ -7722,8 +7814,8 @@ impl Worker {
             rate_limit_sampler,
             dlq_depth_samplers,
             timeout_checker,
-            poison_pill_reclaimer,
-            pause_auto_resumer,
+            poison_pill_reclaimers,
+            pause_auto_resumers,
             history_oversized_sampler,
             stranded_work_sampler,
         }
@@ -7826,19 +7918,23 @@ impl Worker {
                 "timeout checker task failed during shutdown"
             );
         }
-        if let Err(error) = monitors.poison_pill_reclaimer.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "poison-pill reclaimer task failed during shutdown"
-            );
+        for handle in monitors.poison_pill_reclaimers {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "poison-pill reclaimer task failed during shutdown"
+                );
+            }
         }
-        if let Err(error) = monitors.pause_auto_resumer.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "pause auto-resume scanner failed during shutdown"
-            );
+        for handle in monitors.pause_auto_resumers {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "pause auto-resume scanner failed during shutdown"
+                );
+            }
         }
         if let Err(error) = monitors.queue_depth_sampler.await {
             tracing::warn!(
