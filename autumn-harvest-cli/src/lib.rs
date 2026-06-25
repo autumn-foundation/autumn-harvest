@@ -275,9 +275,16 @@ pub enum CliError {
     #[error("version-gate retirement check failed")]
     RetirementCheckGate,
 
-    /// Workflow-type reachability found an orphaned type or an incomplete report.
-    #[error("workflow-type reachability gate failed")]
-    WorkflowReachabilityGate,
+    /// Workflow-type reachability found an orphaned type, incomplete report, or transport error.
+    ///
+    /// `context` carries either the original transport error (connection failure,
+    /// auth error, server 5xx) so operators can distinguish infra misconfiguration
+    /// from an unsafe-handler-removal verdict.
+    #[error("workflow-type reachability gate failed: {context}")]
+    WorkflowReachabilityGate {
+        /// Human-readable cause: transport error string or verdict summary.
+        context: String,
+    },
 
     /// `--wait` timed out before the worker reached `Stopped`.
     #[error("timed out waiting for worker '{worker_id}' to stop (last status: {last_status})")]
@@ -309,7 +316,7 @@ impl CliError {
             // Issue #520: the reachability gate uses exit code 2 specifically so
             // CI can distinguish "an orphaned/partial deploy hazard" from a
             // generic transport/usage failure (exit 1).
-            Self::WorkflowReachabilityGate => 2,
+            Self::WorkflowReachabilityGate { .. } => 2,
             _ => 1,
         }
     }
@@ -1544,7 +1551,9 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
             // labelled "transport/usage error" in the runbook and operators may
             // retry or ignore it; exit 2 unambiguously signals an unsafe answer.
             if workflow_reachability_should_gate(&cli) {
-                return Err(CliError::WorkflowReachabilityGate);
+                return Err(CliError::WorkflowReachabilityGate {
+                    context: err.to_string(),
+                });
             }
             return Err(err);
         }
@@ -1579,7 +1588,10 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return Err(CliError::RetirementCheckGate);
     }
     if workflow_reachability_should_gate(&cli) && workflow_reachability_exit_code(&response) != 0 {
-        return Err(CliError::WorkflowReachabilityGate);
+        return Err(CliError::WorkflowReachabilityGate {
+            context: "orphaned verdict, in_use with type filter, or incomplete shard report"
+                .to_string(),
+        });
     }
     if canary_should_gate(&cli) && canary_exit_code(&response) != 0 {
         let verdict = response
@@ -5250,7 +5262,13 @@ mod reuse_policy_tests {
 
     #[test]
     fn workflow_reachability_gate_error_uses_exit_code_two() {
-        assert_eq!(CliError::WorkflowReachabilityGate.exit_code(), 2);
+        assert_eq!(
+            CliError::WorkflowReachabilityGate {
+                context: String::new()
+            }
+            .exit_code(),
+            2
+        );
     }
 
     #[test]
