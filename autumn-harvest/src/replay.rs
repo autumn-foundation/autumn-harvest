@@ -36,7 +36,7 @@ pub enum HistoryMatch {
         /// Stable, low-cardinality error-type class recorded with the failure
         /// (issue #227 / #369), e.g. `"CircuitOpen"`. `"Error"` for legacy
         /// `Err(String)` failures. Carried so the consumer can build a typed
-        /// [`HarvestError::ActivityFailed`] without parsing the message.
+        /// [`crate::error::HarvestError::ActivityFailed`] without parsing the message.
         error_type: String,
         /// Optional structured details recorded with a typed failure (e.g.
         /// `retry_after_secs` / `forced` for `CircuitOpen`). `None` otherwise.
