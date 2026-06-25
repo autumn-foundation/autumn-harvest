@@ -1043,7 +1043,8 @@ pub async fn enforce_external_signals_outbox(
                             target,
                             signal_name,
                             payload,
-                        }) => (signal_id, target, signal_name, payload),
+                            idempotency_key,
+                        }) => (signal_id, target, signal_name, payload, idempotency_key),
                         Ok(other) => {
                             tracing::error!(event = ?other, "outbox sweep: query returned non-ExternalSignalRequested event");
                             return Ok(Some((false, Some(row.id))));
@@ -1054,7 +1055,7 @@ pub async fn enforce_external_signals_outbox(
                         }
                     };
 
-                    let (signal_id, target, signal_name, payload) = event;
+                    let (signal_id, target, signal_name, payload, idempotency_key) = event;
 
                     let age = Utc::now() - row.timestamp;
                     let grace_chrono = chrono::Duration::from_std(unknown_target_grace_window)
@@ -1094,15 +1095,18 @@ pub async fn enforce_external_signals_outbox(
                     });
 
                     let terminal_opt = if same_pool {
-                        match crate::signal::send_signal(
+                        match crate::signal::send_signal_idempotent(
                             conn,
                             target,
                             &signal_name,
                             payload.clone(),
+                            idempotency_key.as_deref(),
                         )
                         .await
                         {
-                            Ok(()) => {
+                            // Delivered or deduped (idempotency-key collision):
+                            // both mean the signal landed exactly once (issue #521).
+                            Ok(_delivered_or_deduped) => {
                                 Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
                             }
                             Err(HarvestError::NotFound(_)) => not_found_terminal(),
@@ -1136,15 +1140,18 @@ pub async fn enforce_external_signals_outbox(
                             }
                         };
 
-                        match crate::signal::send_signal(
+                        match crate::signal::send_signal_idempotent(
                             &mut target_conn,
                             target,
                             &signal_name,
                             payload.clone(),
+                            idempotency_key.as_deref(),
                         )
                         .await
                         {
-                            Ok(()) => {
+                            // Delivered or deduped (idempotency-key collision):
+                            // both mean the signal landed exactly once (issue #521).
+                            Ok(_delivered_or_deduped) => {
                                 Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
                             }
                             Err(HarvestError::NotFound(_)) => not_found_terminal(),

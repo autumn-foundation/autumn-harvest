@@ -35,10 +35,52 @@ pub async fn send_signal(
     signal_name: &str,
     payload: serde_json::Value,
 ) -> HarvestResult<()> {
+    // Thin wrapper preserving the pre-#521 at-least-once contract: with no
+    // idempotency key the partial unique index excludes the NULL row, so every
+    // insert succeeds. The delivered/deduped bool is discarded.
+    send_signal_idempotent(conn, exec_id, signal_name, payload, None)
+        .await
+        .map(|_delivered| ())
+}
+
+/// Queue a workflow signal with optional exactly-once delivery (issue #521).
+///
+/// When `idempotency_key` is `Some`, the insert is arbitrated against the
+/// partial unique index `uq_harvest_signals_idem` on
+/// `harvest_signals (workflow_exec_id, idempotency_key) WHERE idempotency_key
+/// IS NOT NULL`. A second call carrying the same key for the same execution is
+/// a no-op: no row is queued and the parked workflow is **not** re-woken.
+///
+/// Returns `Ok(true)` when a signal row was freshly queued (the workflow was
+/// woken), and `Ok(false)` when the key collided with an already-staged signal
+/// (deduplicated — the equivalent signal already landed once). With
+/// `idempotency_key = None` every insert succeeds, so the return is always
+/// `Ok(true)` — byte-for-byte the legacy [`send_signal`] behavior.
+///
+/// Dedupe scope is shard-local and keyed on `(workflow_exec_id,
+/// idempotency_key)`, matching `signal_with_start_workflow_execution` (#244).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::NotFound`](crate::error::HarvestError::NotFound) if
+/// the workflow execution does not exist,
+/// [`HarvestError::Cancelled`](crate::error::HarvestError::Cancelled) or
+/// [`HarvestError::Config`](crate::error::HarvestError::Config) if the
+/// execution is already terminal, and
+/// [`HarvestError::Database`](crate::error::HarvestError::Database) if the
+/// insert or wake fails.
+#[cfg(feature = "db")]
+pub async fn send_signal_idempotent(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    signal_name: &str,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+) -> HarvestResult<bool> {
     use crate::schema::harvest_signals;
     use crate::schema::harvest_workflow_executions;
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
+    conn.transaction::<bool, HarvestError, _>(|conn| {
         async move {
             let execution = harvest_workflow_executions::table
                 .find(exec_id.as_uuid())
@@ -84,16 +126,28 @@ pub async fn send_signal(
                 workflow_exec_id: exec_id.as_uuid(),
                 signal_name,
                 payload,
-                idempotency_key: None,
+                idempotency_key,
             };
 
-            diesel::insert_into(harvest_signals::table)
+            // `on_conflict_do_nothing()` (no explicit target) lets Postgres
+            // arbitrate against the partial unique index `uq_harvest_signals_idem`.
+            // For a NULL key the index excludes the row, so the insert always
+            // succeeds (rows-affected = 1) — identical to the legacy path.
+            let inserted = diesel::insert_into(harvest_signals::table)
                 .values(&row)
+                .on_conflict_do_nothing()
                 .execute(conn)
                 .await
                 .map_err(crate::error::database_error)?;
 
-            crate::queue::wake_workflow_task(conn, exec_id).await
+            if inserted == 0 {
+                // Idempotency-key collision: an equivalent signal is already
+                // queued. Do not re-wake — the original insert already did.
+                return Ok(false);
+            }
+
+            crate::queue::wake_workflow_task(conn, exec_id).await?;
+            Ok(true)
         }
         .scope_boxed()
     })

@@ -169,6 +169,31 @@ and attempts delivery; the terminal outcome (`ExternalSignalDelivered` or
 `ExternalSignalFailed`) is also recorded. On replay the recorded outcome is returned
 immediately without re-issuing any side effect.
 
+#### Exactly-once delivery with an idempotency key (issue #521)
+
+Cross-shard delivery is *at-least-once*: the outbox may re-attempt a delivery
+after a crash, which can land two `SignalReceived` events on the target. When the
+target's handler is not naturally idempotent, supply a delivery key with
+`ctx.signal_external_workflow_with_idempotency`:
+
+```rust
+ctx.signal_external_workflow_with_idempotency(
+    target,
+    "onboarding_outcome",
+    json!({ "cancelled": true }),
+    format!("cancel:{}", target),   // any String or Some(String)
+).await?;
+```
+
+The key is persisted in the `ExternalSignalRequested` event and deduplicated
+against the target's partial unique index, so re-delivery (crash recovery or
+outbox retry) lands **exactly one** `SignalReceived` event. The recorded key is
+reused verbatim on replay, so a later code change to the key expression cannot
+diverge an in-flight delivery. Omitting the key (the plain
+`signal_external_workflow` method) keeps the legacy at-least-once behavior. Dedupe
+scope is shard-local, keyed on `(target_execution_id, idempotency_key)` — the same
+scope as [signal-with-start](../management-api.md).
+
 ### Reason codes
 
 | `reason_code` | Meaning |
@@ -187,6 +212,40 @@ caller's shard) the signal is forwarded through the plugin's outbox worker
 cross-shard transaction. The workflow observes `Ok(())` once the outbox write is
 durable — the signal is guaranteed to reach the target eventually or the outbox
 will surface a permanent failure reason.
+
+## Idempotent standalone signals over HTTP (issue #521)
+
+The management route `POST /api/harvest/workflows/{id}/signal/{signal_name}`
+delivers a signal to an already-running execution. Webhook providers retry
+deliveries, so the same logical event can arrive several times. To collapse
+duplicate deliveries into a single `SignalReceived` event, supply an
+out-of-band exactly-once key — the request body stays the raw signal payload:
+
+- `Idempotency-Key:` HTTP header, **or**
+- `?idempotency_key=` query parameter.
+
+The header wins when both are present. The response reports whether the signal
+was freshly queued:
+
+```bash
+# First delivery — queued.
+curl -X POST '/api/harvest/workflows/<exec-id>/signal/approval' \
+  -H 'Idempotency-Key: evt_abc123' \
+  -H 'Content-Type: application/json' \
+  -d '{"approved": true}'
+# 202 { "ok": true, "signal_delivered": true }
+
+# Retry with the same key — deduplicated, no second handler run.
+curl -X POST '/api/harvest/workflows/<exec-id>/signal/approval' \
+  -H 'Idempotency-Key: evt_abc123' \
+  -H 'Content-Type: application/json' \
+  -d '{"approved": true}'
+# 202 { "ok": true, "signal_delivered": false }
+```
+
+Dedupe scope is shard-local, keyed on `(execution_id, idempotency_key)`
+(matching signal-with-start, #244). Omitting the key reproduces the legacy
+at-least-once behavior exactly — every call delivers a distinct signal event.
 
 ### The saga-choreography example
 

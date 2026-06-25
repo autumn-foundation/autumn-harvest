@@ -1103,8 +1103,8 @@
       "path": "/workflows/{id}/signal/{signal_name}",
       "category": "workflow",
       "read_only": false,
-      "description": "Send a named signal to a running workflow execution. The request body is the signal payload itself (free-form JSON).",
-      "idempotency": "Not idempotent: each call delivers a distinct signal event to the workflow.",
+      "description": "Send a named signal to a running workflow execution. The request body is the signal payload itself (free-form JSON). Supply an exactly-once delivery key out-of-band via the Idempotency-Key header or the idempotency_key query param (issue #521).",
+      "idempotency": "Optional exactly-once delivery: when an Idempotency-Key header (or idempotency_key query param) is supplied, repeated deliveries with the same key for the same execution land exactly one SignalReceived event — the response reports signal_delivered=false for the deduped retries. Dedupe scope is shard-local, keyed on (execution_id, idempotency_key). Omitting the key reproduces the legacy at-least-once behavior (every call delivers a distinct signal event).",
       "params": [
         {
           "name": "id",
@@ -1117,6 +1117,18 @@
           "in": "path",
           "required": true,
           "description": "Registered signal handler name."
+        },
+        {
+          "name": "Idempotency-Key",
+          "in": "header",
+          "required": false,
+          "description": "Exactly-once delivery key (issue #521). Wins over the idempotency_key query param when both are present."
+        },
+        {
+          "name": "idempotency_key",
+          "in": "query",
+          "required": false,
+          "description": "Exactly-once delivery key (issue #521). Lower precedence than the Idempotency-Key header."
         }
       ],
       "request_body": {
@@ -1126,9 +1138,10 @@
         "fields": []
       },
       "success_response": {
-        "status": 200,
+        "status": 202,
         "fields": [
-          "ok"
+          "ok",
+          "signal_delivered"
         ]
       },
       "error_responses": [

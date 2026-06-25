@@ -1344,6 +1344,28 @@ struct BasicAck {
     ok: bool,
 }
 
+/// Query parameters for the standalone signal route (issue #521).
+///
+/// `idempotency_key` is the lower-precedence way to supply the exactly-once
+/// delivery key — the `Idempotency-Key` HTTP header wins when both are present.
+#[derive(Debug, Default, Deserialize)]
+struct SignalQuery {
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// Response for the standalone signal route (issue #521).
+///
+/// `signal_delivered` is `true` when a signal row was freshly queued and
+/// `false` when an idempotency-key collision deduplicated the delivery (the
+/// equivalent signal already landed once). Unkeyed deliveries always report
+/// `true`, matching the legacy at-least-once behavior.
+#[derive(Debug, Serialize)]
+struct SignalAck {
+    ok: bool,
+    signal_delivered: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct DagSummary {
     name: String,
@@ -3419,7 +3441,7 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/{id}/signal/{signal_name}",
-            Some(&["ok"]),
+            Some(&["ok", "signal_delivered"]),
         ),
         ("GET", "/workflows/{id}/queries", None), // Vec<String> query names
         ("GET", "/workflows/{id}/query/{query_name}", None), // opaque handler return
@@ -10332,11 +10354,22 @@ async fn retry_dag_run(
 async fn signal_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, signal_name)): Path<(String, String)>,
+    Query(query): Query<SignalQuery>,
     headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
-) -> Result<(axum::http::StatusCode, Json<BasicAck>), AutumnError> {
+) -> Result<(axum::http::StatusCode, Json<SignalAck>), AutumnError> {
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/signal/{signal_name}";
+
+    // Exactly-once delivery key (issue #521): the `Idempotency-Key` header wins
+    // over the `?idempotency_key=` query param when both are present. Omitting
+    // both reproduces today's at-least-once behavior exactly.
+    let idempotency_key: Option<String> = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(query.idempotency_key.filter(|s| !s.is_empty()));
 
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
@@ -10351,7 +10384,7 @@ async fn signal_workflow(
                     target_id: Some(id.as_str()),
                     route_or_command: route,
                     request_id: request_id.as_deref(),
-                    idempotency_key: None,
+                    idempotency_key: idempotency_key.as_deref(),
                     status: STATUS_FAILED,
                     error_summary: Some("malformed execution id"),
                     shard_id: None,
@@ -10374,7 +10407,7 @@ async fn signal_workflow(
             target_id: Some(exec_id_str.as_str()),
             route_or_command: route,
             request_id: request_id.as_deref(),
-            idempotency_key: None,
+            idempotency_key: idempotency_key.as_deref(),
             status: STATUS_FAILED,
             error_summary: Some(err_str.as_str()),
             shard_id: None,
@@ -10390,26 +10423,36 @@ async fn signal_workflow(
     }
 
     // Signal payload is intentionally not stored in the audit record (no PII).
-    let signal_result = signal::send_signal(&mut conn, exec_id, &signal_name, payload).await;
+    let signal_result = signal::send_signal_idempotent(
+        &mut conn,
+        exec_id,
+        &signal_name,
+        payload,
+        idempotency_key.as_deref(),
+    )
+    .await;
 
-    if let Err(e) = signal_result {
-        let err_str = e.to_string();
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_WORKFLOW_SIGNAL,
-            target_type: TARGET_WORKFLOW,
-            target_id: Some(exec_id_str.as_str()),
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: None,
-            status: STATUS_FAILED,
-            error_summary: Some(err_str.as_str()),
-            shard_id: None,
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        return Err(map_error(e));
-    }
+    let signal_delivered = match signal_result {
+        Ok(delivered) => delivered,
+        Err(e) => {
+            let err_str = e.to_string();
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL,
+                target_type: TARGET_WORKFLOW,
+                target_id: Some(exec_id_str.as_str()),
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some(err_str.as_str()),
+                shard_id: None,
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            return Err(map_error(e));
+        }
+    };
     let ar = NewAuditRecord {
         actor: &actor,
         operation: OP_WORKFLOW_SIGNAL,
@@ -10417,7 +10460,7 @@ async fn signal_workflow(
         target_id: Some(exec_id_str.as_str()),
         route_or_command: route,
         request_id: request_id.as_deref(),
-        idempotency_key: None,
+        idempotency_key: idempotency_key.as_deref(),
         status: STATUS_SUCCEEDED,
         error_summary: None,
         shard_id: None,
@@ -10428,7 +10471,10 @@ async fn signal_workflow(
         .map_err(map_error)?;
     Ok((
         axum::http::StatusCode::ACCEPTED,
-        Json(BasicAck { ok: true }),
+        Json(SignalAck {
+            ok: true,
+            signal_delivered,
+        }),
     ))
 }
 

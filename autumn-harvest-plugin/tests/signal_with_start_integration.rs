@@ -379,3 +379,139 @@ async fn signal_with_start_idempotency_key_dedupes_signal() {
     );
     assert_eq!(b2["execution_id"], b1["execution_id"]);
 }
+
+// ── Standalone signal route idempotency (issue #521) ──────────────────────
+
+/// POST a standalone signal, optionally carrying an `Idempotency-Key` header.
+/// The body is the raw signal payload (free-form). A `?idempotency_key=` query
+/// param can be embedded directly in `uri`.
+async fn post_signal(
+    app: &HarvestApiApp,
+    uri: &str,
+    header_key: Option<&str>,
+    body: Value,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(k) = header_key {
+        builder = builder.header("idempotency-key", k);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .expect("POST signal request");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("response is JSON")
+    };
+    (status, json)
+}
+
+/// Start a fresh RUNNING workflow and return its execution id.
+async fn start_running_workflow(app: &HarvestApiApp, workflow_id: &str) -> String {
+    let (status, body) = post_json(
+        app,
+        "/workflows/onboarding/signal-with-start",
+        json!({
+            "workflow_id": workflow_id,
+            "start_input": {},
+            "signal_name": "bootstrap",
+            "signal_payload": {}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "setup start failed: {body}");
+    body["execution_id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn standalone_signal_same_header_key_dedupes() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec = start_running_workflow(&app, "idem-hdr-1").await;
+    let uri = format!("/workflows/{exec}/signal/approval");
+
+    let (s1, b1) = post_signal(&app, &uri, Some("k1"), json!({"a": 1})).await;
+    assert_eq!(s1, StatusCode::ACCEPTED, "{b1}");
+    assert_eq!(b1["ok"], json!(true));
+    assert_eq!(b1["signal_delivered"], json!(true));
+
+    // Same key → deduped.
+    let (s2, b2) = post_signal(&app, &uri, Some("k1"), json!({"a": 1})).await;
+    assert_eq!(s2, StatusCode::ACCEPTED, "{b2}");
+    assert_eq!(
+        b2["signal_delivered"],
+        json!(false),
+        "second delivery with same header key must dedupe: {b2}"
+    );
+}
+
+#[tokio::test]
+async fn standalone_signal_query_param_dedupes() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec = start_running_workflow(&app, "idem-qry-1").await;
+    let uri = format!("/workflows/{exec}/signal/approval?idempotency_key=q1");
+
+    let (_, b1) = post_signal(&app, &uri, None, json!({})).await;
+    assert_eq!(b1["signal_delivered"], json!(true));
+
+    let (_, b2) = post_signal(&app, &uri, None, json!({})).await;
+    assert_eq!(
+        b2["signal_delivered"],
+        json!(false),
+        "second delivery with same query key must dedupe: {b2}"
+    );
+}
+
+#[tokio::test]
+async fn standalone_signal_header_wins_over_query() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec = start_running_workflow(&app, "idem-prec-1").await;
+
+    // First delivery: header "hk" wins over query "qk" → effective key is "hk".
+    let uri_hk = format!("/workflows/{exec}/signal/approval?idempotency_key=qk");
+    let (_, b1) = post_signal(&app, &uri_hk, Some("hk"), json!({})).await;
+    assert_eq!(b1["signal_delivered"], json!(true));
+
+    // A later call whose *query* key equals the header value "hk" (no header)
+    // collides with the first delivery — proving the header value was the
+    // effective key, not the query value "qk".
+    let uri_proves = format!("/workflows/{exec}/signal/approval?idempotency_key=hk");
+    let (_, b2) = post_signal(&app, &uri_proves, None, json!({})).await;
+    assert_eq!(
+        b2["signal_delivered"],
+        json!(false),
+        "header value 'hk' must have been the effective key: {b2}"
+    );
+}
+
+#[tokio::test]
+async fn standalone_signal_without_key_is_at_least_once() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec = start_running_workflow(&app, "idem-none-1").await;
+    let uri = format!("/workflows/{exec}/signal/approval");
+
+    let (_, b1) = post_signal(&app, &uri, None, json!({})).await;
+    let (_, b2) = post_signal(&app, &uri, None, json!({})).await;
+    assert_eq!(b1["signal_delivered"], json!(true));
+    assert_eq!(
+        b2["signal_delivered"],
+        json!(true),
+        "unkeyed deliveries are at-least-once: both report delivered: {b2}"
+    );
+}

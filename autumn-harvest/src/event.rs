@@ -425,6 +425,18 @@ pub enum WorkflowEvent {
         signal_name: String,
         /// JSON payload to deliver to the receiving workflow.
         payload: serde_json::Value,
+        /// Optional exactly-once delivery key (issue #521). When set, the
+        /// delivery insert is deduplicated against the target's partial unique
+        /// index `uq_harvest_signals_idem`, so a re-issued request (crash
+        /// recovery, outbox retry) lands at most one `SignalReceived` event on
+        /// the target. This is an **additive** field on the existing variant —
+        /// no new `WorkflowEvent` variant is introduced; pre-#521 events
+        /// deserialize with `idempotency_key = None`, preserving the
+        /// append-only invariant. The recorded value is reused verbatim on
+        /// replay/recovery so a later code change to the key literal can never
+        /// diverge an in-flight delivery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     /// The signal was successfully inserted into the target workflow's signal
     /// queue (or durably queued via the outbox for cross-shard delivery).
@@ -1079,6 +1091,7 @@ mod tests {
                 target: ExecutionId::new(),
                 signal_name: "cancel".into(),
                 payload: serde_json::Value::Null,
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalDelivered {
                 signal_id: crate::types::ExternalSignalId::new(),
@@ -1227,6 +1240,7 @@ mod tests {
             target,
             signal_name: "tenant_cancel".into(),
             payload: serde_json::json!({"reason": "billing_lapse"}),
+            idempotency_key: Some("evt_123".into()),
         };
         assert_eq!(event.type_name(), "ExternalSignalRequested");
         let json = serde_json::to_string(&event)?;
@@ -1237,12 +1251,41 @@ mod tests {
                 target: t,
                 signal_name,
                 payload,
+                idempotency_key,
             } => {
                 assert_eq!(sid, signal_id);
                 assert_eq!(t, target);
                 assert_eq!(signal_name, "tenant_cancel");
                 assert_eq!(payload["reason"], "billing_lapse");
+                assert_eq!(idempotency_key.as_deref(), Some("evt_123"));
             }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_requested_pre_521_json_deserializes_without_key()
+    -> Result<(), serde_json::Error> {
+        // A pre-#521 event has no `idempotency_key` field; the additive
+        // `#[serde(default)]` must deserialize it to `None` (append-only
+        // invariant: no new variant, old JSON still loads).
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+        let legacy = serde_json::json!({
+            "type": "ExternalSignalRequested",
+            "data": {
+                "signal_id": signal_id,
+                "target": target,
+                "signal_name": "tenant_cancel",
+                "payload": {"reason": "billing_lapse"}
+            }
+        });
+        let back: WorkflowEvent = serde_json::from_value(legacy)?;
+        match back {
+            WorkflowEvent::ExternalSignalRequested {
+                idempotency_key, ..
+            } => assert_eq!(idempotency_key, None),
             _ => panic!("wrong variant"),
         }
         Ok(())
@@ -1313,6 +1356,7 @@ mod tests {
                 target,
                 signal_name: "x".into(),
                 payload: serde_json::Value::Null,
+                idempotency_key: None,
             }
             .is_terminal_lifecycle()
         );
