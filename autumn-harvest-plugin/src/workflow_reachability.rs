@@ -206,12 +206,19 @@ pub async fn build_workflow_reachability_report(
 
     // The handler registry is the authoritative source for `registered`.
     let runtime = api_state.runtime().map_err(map_error)?;
+    // Union plain workflow handlers with unified-DAG names. In unified-DAG
+    // deployments, live runs are stored in harvest_workflow_executions with
+    // workflow_name = dag name, but those names live in registered_dag_names
+    // rather than registry().workflows. Without the union a registered DAG with
+    // active runs would falsely appear as `orphaned`, causing the CLI monitor
+    // to exit 2 on healthy deployments.
     let registered: BTreeSet<String> = runtime
         .registry()
         .workflows
         .keys()
         .cloned()
-        .collect::<BTreeSet<_>>();
+        .chain(runtime.registered_dag_names().iter().cloned())
+        .collect();
 
     // Build the full expected shard set from both the storage pool AND the
     // router's readable_shards / default_shard. A shard the router knows about

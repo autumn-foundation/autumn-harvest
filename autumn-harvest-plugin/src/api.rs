@@ -239,6 +239,14 @@ impl HarvestApiRuntime {
     pub(crate) fn is_registered_dag(&self, dag_name: &str) -> bool {
         self.registered_dag_names.contains(dag_name)
     }
+
+    /// All registered unified-DAG names (derived from `DagCatalog` + schedule DAG names at
+    /// startup). Used by the reachability report to avoid classifying a registered DAG with
+    /// live executions as `orphaned`.
+    #[must_use]
+    pub(crate) fn registered_dag_names(&self) -> &HashSet<String> {
+        &self.registered_dag_names
+    }
 }
 
 /// A function that extracts an actor identity string from request headers.
