@@ -213,18 +213,21 @@ pub async fn build_workflow_reachability_report(
         .cloned()
         .collect::<BTreeSet<_>>();
 
-    // Only include shards that have a configured pool. A shard the router knows
-    // about but has no pool for (e.g. during a shard-add rollout before the
-    // pool is wired up) must not appear as "unavailable" and make the report
-    // partial — it simply hasn't been added yet.
+    // Build the full expected shard set from both the storage pool AND the
+    // router's readable_shards / default_shard. A shard the router knows about
+    // but for which this process has no pool (e.g. during a mixed-rollout or
+    // shard-add before the pool is wired up) must appear as "unavailable" in
+    // the report rather than being silently dropped — the report status then
+    // becomes "partial" and the CLI fails closed (exit 2), preventing a false
+    // "safe_to_remove" verdict from a shard that was never inspected.
     let pools = shard_fanout::pools_by_shard(api_state);
-    let expected_shards: BTreeSet<i32> = if pools.is_empty() {
-        // No pool configured: expose a synthetic shard-0 entry so the report
-        // is well-formed ("unavailable") rather than having an empty shards list.
-        BTreeSet::from([0])
-    } else {
-        pools.keys().copied().collect()
-    };
+    let mut expected_shards: BTreeSet<i32> = pools.keys().copied().collect();
+    let router = runtime.router();
+    expected_shards.extend(router.readable_shards().iter().map(|s| s.as_i32()));
+    expected_shards.insert(router.default_shard().as_i32());
+    if expected_shards.is_empty() {
+        expected_shards.insert(0);
+    }
 
     let filter = query.workflow_type.clone();
 
