@@ -91,6 +91,57 @@ pub fn export_dot(dag: &DagDefinition) -> Result<String, std::fmt::Error> {
     Ok(out)
 }
 
+#[cfg(feature = "testing")]
+use crate::dag_profiler::{DagProfile, ProfilerEventKind};
+
+/// Exports the DAG execution profile to a Mermaid.js Gantt chart.
+///
+/// Requires the `testing` feature.
+///
+/// # Errors
+/// Returns `std::fmt::Error` if string formatting fails.
+#[cfg(feature = "testing")]
+pub fn export_mermaid_gantt(profile: &DagProfile) -> Result<String, std::fmt::Error> {
+    let mut out = String::new();
+    writeln!(out, "gantt")?;
+    writeln!(out, "    title DAG Execution Timeline")?;
+    writeln!(out, "    dateFormat  X")?;
+    writeln!(out, "    axisFormat %s")?;
+
+    // Group events by task to find start and end times.
+    // Events are chronologically ordered in the timeline.
+    let mut task_starts: std::collections::HashMap<usize, (String, u128)> =
+        std::collections::HashMap::new();
+    let mut tasks = Vec::new();
+
+    for event in &profile.timeline {
+        let time_ms = event.time.as_millis();
+        match &event.kind {
+            ProfilerEventKind::TaskStarted(idx, name) => {
+                task_starts.insert(*idx, (name.clone(), time_ms));
+            }
+            ProfilerEventKind::TaskCompleted(idx, _) => {
+                if let Some((name, start_time)) = task_starts.remove(idx) {
+                    tasks.push((*idx, name, start_time, time_ms));
+                }
+            }
+        }
+    }
+
+    // Sort tasks by start time, then by index for determinism
+    tasks.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+
+    if !tasks.is_empty() {
+        writeln!(out, "    section Tasks")?;
+        for (idx, name, start_time, end_time) in tasks {
+            let duration = end_time.saturating_sub(start_time);
+            writeln!(out, "    {name} : t{idx}, {start_time}, {duration}ms")?;
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +204,47 @@ digraph DAG {
 }
 ";
         assert_eq!(dot, expected_dot);
+    }
+
+    #[cfg(feature = "testing")]
+    #[test]
+    fn test_export_mermaid_gantt() {
+        use crate::dag_profiler::DagProfiler;
+        use std::time::Duration;
+
+        let mut builder = DagBuilder::new();
+        let start = builder.activity(dummy_activity);
+
+        let branch1 = builder.activity(dummy_activity2).upstream(&start);
+        let branch2 = builder.activity(dummy_activity3).upstream(&start);
+
+        let _end = builder
+            .activity(dummy_activity)
+            .upstream(&branch1)
+            .upstream(&branch2);
+
+        let dag = builder.build().unwrap();
+
+        let profiler = DagProfiler::new(dag)
+            .mock_duration("dummy_activity", Duration::from_secs(1))
+            .mock_duration("dummy_activity2", Duration::from_secs(2))
+            .mock_duration("dummy_activity3", Duration::from_secs(1));
+
+        let profile = profiler.profile();
+
+        let gantt = export_mermaid_gantt(&profile).unwrap();
+
+        // Assert basic structure
+        assert!(gantt.contains("gantt"));
+        assert!(gantt.contains("title DAG Execution Timeline"));
+        assert!(gantt.contains("dateFormat  X"));
+        assert!(gantt.contains("axisFormat %s"));
+        assert!(gantt.contains("section Tasks"));
+
+        // Assert tasks present in output format
+        assert!(gantt.contains("dummy_activity : t0, 0, 1000ms"));
+        assert!(gantt.contains("dummy_activity2 : t1, 1000, 2000ms"));
+        assert!(gantt.contains("dummy_activity3 : t2, 1000, 1000ms"));
+        assert!(gantt.contains("dummy_activity : t3, 3000, 1000ms"));
     }
 }
