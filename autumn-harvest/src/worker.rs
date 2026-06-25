@@ -1031,6 +1031,17 @@ fn local_activity_history_cap_reached(next_event_id: i32, cap: Option<u64>) -> O
     (count >= cap).then_some(count)
 }
 
+macro_rules! check_local_history_cap {
+    ($next_event_id:expr, $cap:expr, $events:expr) => {
+        if let Some(event_count) = local_activity_history_cap_reached($next_event_id, $cap) {
+            return Ok(LocalActivityInlineOutcome::HistoryCapReached {
+                events: $events,
+                event_count,
+            });
+        }
+    };
+}
+
 /// Extract a `RunLocalActivity` command from an owned command list.
 ///
 /// Marker and detached-spawn events are split around the local activity command
@@ -1570,14 +1581,7 @@ async fn run_local_activity_inline(
     }
 
     let mut all_new_events = prefix_events;
-    if let Some(event_count) =
-        local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
-    {
-        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
-            events: all_new_events,
-            event_count,
-        });
-    }
+    check_local_history_cap!(*next_event_id, history_event_hard_cap, all_new_events);
 
     let handler = activity.handler;
     let local_idempotency_key = IdempotencyKey::from_activity_exec_id(run.activity_id);
@@ -1641,14 +1645,7 @@ async fn run_local_activity_inline(
                 .await?;
                 *next_event_id += 1;
                 all_new_events.push(completed_event);
-                if let Some(event_count) =
-                    local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
-                {
-                    return Ok(LocalActivityInlineOutcome::HistoryCapReached {
-                        events: all_new_events,
-                        event_count,
-                    });
-                }
+                check_local_history_cap!(*next_event_id, history_event_hard_cap, all_new_events);
                 return Ok(LocalActivityInlineOutcome::Complete(all_new_events));
             }
             Err(error) => {
@@ -1719,14 +1716,11 @@ async fn run_local_activity_inline(
                     *next_event_id += i32::try_from(terminal_pair.len())
                         .map_err(|_| HarvestError::Config("event count overflow".into()))?;
                     all_new_events.extend(terminal_pair);
-                    if let Some(event_count) =
-                        local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
-                    {
-                        return Ok(LocalActivityInlineOutcome::HistoryCapReached {
-                            events: all_new_events,
-                            event_count,
-                        });
-                    }
+                    check_local_history_cap!(
+                        *next_event_id,
+                        history_event_hard_cap,
+                        all_new_events
+                    );
                     // Must return here — without it, when `terminal_attempt` was
                     // set early by `payload_non_retryable` or `policy_non_retryable`
                     // (i.e. `attempt < max_attempts`), the `for` loop would
@@ -1748,14 +1742,7 @@ async fn run_local_activity_inline(
                 all_new_events.push(failed_event);
                 // Capture error for previous_failure() on the next attempt.
                 previous_failure = Some(stored_error.clone());
-                if let Some(event_count) =
-                    local_activity_history_cap_reached(*next_event_id, history_event_hard_cap)
-                {
-                    return Ok(LocalActivityInlineOutcome::HistoryCapReached {
-                        events: all_new_events,
-                        event_count,
-                    });
-                }
+                check_local_history_cap!(*next_event_id, history_event_hard_cap, all_new_events);
 
                 if let Some(delay) = run
                     .retry_policy
@@ -5511,6 +5498,46 @@ async fn move_workflow_to_dlq_for_history_cap(
     Ok(deferred)
 }
 
+struct HistoryCapCheckContext<'a> {
+    conn: &'a mut AsyncPgConnection,
+    registry: &'a HandlerRegistry,
+    telemetry: &'a crate::telemetry::TelemetryConfig,
+    task: &'a TaskQueueItem,
+    execution: &'a WorkflowExecution,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &'a str,
+    started_at: std::time::Instant,
+    current_history_event_count: u64,
+}
+
+async fn check_and_fail_workflow_history_cap(
+    ctx: HistoryCapCheckContext<'_>,
+) -> HarvestResult<bool> {
+    if let Some(cap) = ctx.registry.history_policy().event_hard_cap()
+        && ctx.current_history_event_count >= cap
+    {
+        let deferred = fail_workflow_for_history_cap(
+            ctx.conn,
+            ctx.telemetry,
+            ctx.task,
+            ctx.execution,
+            ctx.exec_id,
+            ctx.next_event_id,
+            ctx.worker_id,
+            ctx.started_at,
+            ctx.current_history_event_count,
+            cap,
+        )
+        .await?;
+        for start in deferred {
+            start.spawn();
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fail_workflow_for_history_cap(
     conn: &mut AsyncPgConnection,
@@ -5825,25 +5852,20 @@ async fn process_workflow_task(
                         history_events.extend(new_events);
                         let current_history_event_count =
                             u64::try_from(history_events.len()).unwrap_or(u64::MAX);
-                        if let Some(cap) = registry.history_policy().event_hard_cap()
-                            && current_history_event_count >= cap
+                        if check_and_fail_workflow_history_cap(HistoryCapCheckContext {
+                            conn,
+                            registry,
+                            telemetry: &telemetry,
+                            task,
+                            execution: &prepared.execution,
+                            exec_id: prepared.exec_id,
+                            next_event_id,
+                            worker_id,
+                            started_at,
+                            current_history_event_count,
+                        })
+                        .await?
                         {
-                            let deferred = fail_workflow_for_history_cap(
-                                conn,
-                                &telemetry,
-                                task,
-                                &prepared.execution,
-                                prepared.exec_id,
-                                next_event_id,
-                                worker_id,
-                                started_at,
-                                current_history_event_count,
-                                cap,
-                            )
-                            .await?;
-                            for start in deferred {
-                                start.spawn();
-                            }
                             return Ok(());
                         }
                     }
@@ -5908,25 +5930,20 @@ async fn process_workflow_task(
                 history_events.extend(new_events);
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
-                if let Some(cap) = registry.history_policy().event_hard_cap()
-                    && current_history_event_count >= cap
+                if check_and_fail_workflow_history_cap(HistoryCapCheckContext {
+                    conn,
+                    registry,
+                    telemetry: &telemetry,
+                    task,
+                    execution: &prepared.execution,
+                    exec_id: prepared.exec_id,
+                    next_event_id,
+                    worker_id,
+                    started_at,
+                    current_history_event_count,
+                })
+                .await?
                 {
-                    let deferred = fail_workflow_for_history_cap(
-                        conn,
-                        &telemetry,
-                        task,
-                        &prepared.execution,
-                        prepared.exec_id,
-                        next_event_id,
-                        worker_id,
-                        started_at,
-                        current_history_event_count,
-                        cap,
-                    )
-                    .await?;
-                    for start in deferred {
-                        start.spawn();
-                    }
                     return Ok(());
                 }
             }
@@ -6002,25 +6019,20 @@ async fn process_workflow_task(
                 history_events.extend(new_events.clone());
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
-                if let Some(cap) = registry.history_policy().event_hard_cap()
-                    && current_history_event_count >= cap
+                if check_and_fail_workflow_history_cap(HistoryCapCheckContext {
+                    conn,
+                    registry,
+                    telemetry: &telemetry,
+                    task,
+                    execution: &prepared.execution,
+                    exec_id: prepared.exec_id,
+                    next_event_id,
+                    worker_id,
+                    started_at,
+                    current_history_event_count,
+                })
+                .await?
                 {
-                    let deferred = fail_workflow_for_history_cap(
-                        conn,
-                        &telemetry,
-                        task,
-                        &prepared.execution,
-                        prepared.exec_id,
-                        next_event_id,
-                        worker_id,
-                        started_at,
-                        current_history_event_count,
-                        cap,
-                    )
-                    .await?;
-                    for start in deferred {
-                        start.spawn();
-                    }
                     return Ok(());
                 }
 
@@ -6165,25 +6177,20 @@ async fn process_workflow_task(
                 history_events.extend(new_events);
                 let current_history_event_count =
                     u64::try_from(history_events.len()).unwrap_or(u64::MAX);
-                if let Some(cap) = registry.history_policy().event_hard_cap()
-                    && current_history_event_count >= cap
+                if check_and_fail_workflow_history_cap(HistoryCapCheckContext {
+                    conn,
+                    registry,
+                    telemetry: &telemetry,
+                    task,
+                    execution: &prepared.execution,
+                    exec_id: prepared.exec_id,
+                    next_event_id,
+                    worker_id,
+                    started_at,
+                    current_history_event_count,
+                })
+                .await?
                 {
-                    let deferred = fail_workflow_for_history_cap(
-                        conn,
-                        &telemetry,
-                        task,
-                        &prepared.execution,
-                        prepared.exec_id,
-                        next_event_id,
-                        worker_id,
-                        started_at,
-                        current_history_event_count,
-                        cap,
-                    )
-                    .await?;
-                    for start in deferred {
-                        start.spawn();
-                    }
                     return Ok(());
                 }
                 // Re-acquire a fresh execute_span so persist_workflow_outcome
@@ -6284,26 +6291,21 @@ async fn process_workflow_task(
         .unwrap_or(u64::MAX)
         .saturating_add(pending_durable_event_count);
 
-    if let Some(cap) = registry.history_policy().event_hard_cap()
-        && current_history_event_count >= cap
-        && !matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. })
-    {
-        let deferred = fail_workflow_for_history_cap(
+    if !matches!(&outcome, WorkflowOutcome::ContinuedAsNew { .. })
+        && check_and_fail_workflow_history_cap(HistoryCapCheckContext {
             conn,
-            &telemetry,
+            registry,
+            telemetry: &telemetry,
             task,
-            &prepared.execution,
-            prepared.exec_id,
+            execution: &prepared.execution,
+            exec_id: prepared.exec_id,
             next_event_id,
             worker_id,
             started_at,
             current_history_event_count,
-            cap,
-        )
-        .await?;
-        for start in deferred {
-            start.spawn();
-        }
+        })
+        .await?
+    {
         return Ok(());
     }
 
