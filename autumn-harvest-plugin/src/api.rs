@@ -119,6 +119,7 @@ use crate::shard_health::{ShardHealthReport, ShardReadiness, build_shard_health_
 use crate::state::HarvestDbPool;
 use crate::version_gate_retirement::{RetirementCheckQuery, build_retirement_check_report};
 use crate::version_usage::{VersionUsageQuery, build_version_usage_report};
+use crate::workflow_reachability::{WorkflowReachabilityQuery, build_workflow_reachability_report};
 
 #[derive(Clone)]
 pub struct HarvestRetentionRuntime {
@@ -237,6 +238,14 @@ impl HarvestApiRuntime {
     #[must_use]
     pub(crate) fn is_registered_dag(&self, dag_name: &str) -> bool {
         self.registered_dag_names.contains(dag_name)
+    }
+
+    /// All registered unified-DAG names (derived from `DagCatalog` + schedule DAG names at
+    /// startup). Used by the reachability report to avoid classifying a registered DAG with
+    /// live executions as `orphaned`.
+    #[must_use]
+    pub(crate) fn registered_dag_names(&self) -> &HashSet<String> {
+        &self.registered_dag_names
     }
 }
 
@@ -2537,6 +2546,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             get(version_gate_retirement_check).route_layer(require_admin.clone()),
         )
         .route(
+            "/admin/workflow-types/reachability",
+            get(workflow_types_reachability).route_layer(require_admin.clone()),
+        )
+        .route(
             "/admin/retention",
             get(retention_status).route_layer(require_admin.clone()),
         )
@@ -2858,6 +2871,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/shards/health"),
         ("GET", "/admin/version-gates/usage"),
         ("GET", "/admin/version-gates/retirement-check"),
+        ("GET", "/admin/workflow-types/reachability"),
         ("GET", "/admin/retention"),
         ("POST", "/admin/retention/run-now"),
         ("POST", "/admin/workflows/replay-canary"),
@@ -3569,6 +3583,11 @@ pub const fn management_api_response_fields()
                 "shards",
             ]),
         ),
+        (
+            "GET",
+            "/admin/workflow-types/reachability",
+            Some(&["status", "observed_at", "filter", "items", "shards"]),
+        ),
         ("GET", "/admin/retention", None), // RetentionStatus (external model)
         ("POST", "/admin/retention/run-now", Some(&["ok"])),
         (
@@ -3936,6 +3955,21 @@ async fn version_gate_retirement_check(
     Query(query): Query<RetirementCheckQuery>,
 ) -> axum::response::Response {
     match build_retirement_check_report(&api_state, query).await {
+        Ok(report) => Json(report).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+/// `GET /admin/workflow-types/reachability` — report per-workflow-type handler
+/// reachability so an operator can gate safe handler removal (issue #520).
+///
+/// Read-only and side-effect-free: counts non-terminal executions per workflow
+/// type across all shards and joins against the in-memory handler registry.
+async fn workflow_types_reachability(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(query): Query<WorkflowReachabilityQuery>,
+) -> axum::response::Response {
+    match build_workflow_reachability_report(&api_state, query).await {
         Ok(report) => Json(report).into_response(),
         Err(error) => error.into_response(),
     }

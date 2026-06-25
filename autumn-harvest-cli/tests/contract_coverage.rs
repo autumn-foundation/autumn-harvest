@@ -210,6 +210,11 @@ fn version_usage_is_covered() {
 }
 
 #[test]
+fn workflow_types_reachability_is_covered() {
+    assert_covered(&["workflow-types", "reachability"]);
+}
+
+#[test]
 fn canary_is_covered() {
     assert_covered(&["canary"]);
 }

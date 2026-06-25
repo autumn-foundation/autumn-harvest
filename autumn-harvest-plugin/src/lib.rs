@@ -8,11 +8,13 @@ pub mod plugin;
 pub mod preflight;
 pub mod prelude;
 pub mod runner;
+pub mod shard_fanout;
 pub mod shard_health;
 pub mod state;
 pub mod ui;
 pub mod version_gate_retirement;
 pub mod version_usage;
+pub mod workflow_reachability;
 
 #[cfg(feature = "webhooks")]
 pub mod webhook;

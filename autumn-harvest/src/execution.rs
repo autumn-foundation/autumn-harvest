@@ -3013,6 +3013,158 @@ async fn resolve_carryover(
     Ok((last_completion_result, last_error))
 }
 
+/// One workflow-type row from the per-shard non-terminal execution count
+/// (issue #520, workflow-type reachability).
+///
+/// Each row groups the **non-terminal** executions on a single shard by
+/// `workflow_name`. A non-terminal execution is one whose state is not in the
+/// terminal set recognised by [`crate::erase::is_terminal_state`]
+/// (`COMPLETED`/`FAILED`/`CANCELLED`/`TIMED_OUT`/`CONTINUED_AS_NEW`/`TERMINATED`)
+/// — i.e. a `RUNNING`, `SUSPENDED`, or `PAUSED` run whose next replay still
+/// requires the `#[workflow]` handler named by `workflow_name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowTypeNonTerminalCount {
+    /// Workflow type name — the handler its non-terminal executions replay against.
+    pub workflow_name: String,
+    /// Count of non-terminal executions of this type on the queried shard.
+    pub non_terminal_count: i64,
+    /// Start time of the oldest non-terminal execution of this type on the shard.
+    pub oldest_started_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, diesel::QueryableByName)]
+struct WorkflowTypeNonTerminalSqlRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_name: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    non_terminal_count: i64,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    oldest_started_at: chrono::DateTime<Utc>,
+}
+
+/// SQL for [`non_terminal_counts_by_workflow_name`].
+///
+/// Read-only `GROUP BY workflow_name` over `harvest_workflow_executions`,
+/// filtered to non-terminal states. The state set is the exact complement of
+/// [`crate::erase::is_terminal_state`]. `$1` optionally narrows to a single
+/// workflow type; `$2` scopes the query to a single logical shard (mirrors the
+/// `shard_id` predicate in the version-usage query so that two logical shards
+/// sharing the same Postgres database are never double-counted). Both params
+/// are nullable — `NULL` means "no filter". Side-effect-free: no claims, no
+/// writes, no events appended.
+const NON_TERMINAL_COUNTS_SQL: &str = r"
+SELECT
+    workflow_name::TEXT AS workflow_name,
+    COUNT(*)::BIGINT AS non_terminal_count,
+    MIN(started_at) AS oldest_started_at
+FROM harvest_workflow_executions
+WHERE state NOT IN (
+        'COMPLETED',
+        'FAILED',
+        'CANCELLED',
+        'TIMED_OUT',
+        'CONTINUED_AS_NEW',
+        'TERMINATED'
+      )
+  AND ($1::TEXT IS NULL OR workflow_name = $1::TEXT)
+  AND ($2::INT4 IS NULL OR shard_id = $2::INT4)
+GROUP BY workflow_name
+ORDER BY workflow_name
+";
+
+/// Count non-terminal workflow executions grouped by `workflow_name` on one shard.
+///
+/// Powers the workflow-type reachability check (issue #520): a non-terminal
+/// execution directly names — via `workflow_name` — the `#[workflow]` handler
+/// its next replay requires, so a non-zero count means deleting or renaming
+/// that handler would strand in-flight runs in permanent replay failure.
+///
+/// `shard_id` scopes the query to a single logical shard. Pass `Some(id)` from
+/// the per-shard fan-out so that two logical shards sharing the same Postgres
+/// database are never double-counted (mirrors the `shard_id` predicate in
+/// `load_version_usage`). Pass `None` only in tests or single-shard contexts
+/// where the database is exclusively owned by one shard.
+///
+/// The optional `workflow_type` filter narrows to a single type; the result
+/// shape is unchanged (an empty `Vec` when that type has no non-terminal
+/// executions on this shard).
+///
+/// This is a read-only query: it claims nothing, mutates no state, and appends
+/// no [`WorkflowEvent`].
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the query fails.
+pub async fn non_terminal_counts_by_workflow_name(
+    conn: &mut AsyncPgConnection,
+    shard_id: Option<i32>,
+    workflow_type: Option<&str>,
+) -> HarvestResult<Vec<WorkflowTypeNonTerminalCount>> {
+    let rows = diesel::sql_query(NON_TERMINAL_COUNTS_SQL)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(workflow_type)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(shard_id)
+        .load::<WorkflowTypeNonTerminalSqlRow>(conn)
+        .await
+        .map_err(database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| WorkflowTypeNonTerminalCount {
+            workflow_name: row.workflow_name,
+            non_terminal_count: row.non_terminal_count,
+            oldest_started_at: row.oldest_started_at,
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod non_terminal_sql_tests {
+    use super::NON_TERMINAL_COUNTS_SQL;
+    use crate::erase::is_terminal_state;
+
+    /// The `NOT IN (...)` state list in `NON_TERMINAL_COUNTS_SQL` must be the
+    /// exact complement of `erase::is_terminal_state`. If a new terminal state is
+    /// added to `is_terminal_state`, this test fails until the SQL is updated,
+    /// preventing the reachability query from counting terminal runs as non-terminal
+    /// and blocking safe handler removal forever.
+    #[test]
+    fn non_terminal_sql_excludes_exactly_terminal_states() {
+        let terminal_states = [
+            "COMPLETED",
+            "FAILED",
+            "CANCELLED",
+            "TIMED_OUT",
+            "CONTINUED_AS_NEW",
+            "TERMINATED",
+        ];
+        for state in &terminal_states {
+            assert!(
+                is_terminal_state(state),
+                "State '{state}' is listed in NON_TERMINAL_COUNTS_SQL's NOT IN clause \
+                 but is_terminal_state returns false — update one of them to match"
+            );
+            assert!(
+                NON_TERMINAL_COUNTS_SQL.contains(state),
+                "is_terminal_state returns true for '{state}' but it is missing from \
+                 NON_TERMINAL_COUNTS_SQL's NOT IN clause — add it to keep the lists in sync"
+            );
+        }
+        let candidate_non_terminal = ["RUNNING", "SUSPENDED", "PAUSED"];
+        for state in &candidate_non_terminal {
+            assert!(
+                !is_terminal_state(state),
+                "State '{state}' appears in the non-terminal candidate list \
+                 but is_terminal_state returned true — remove it from this test"
+            );
+            assert!(
+                !NON_TERMINAL_COUNTS_SQL.contains(&format!("'{state}'")),
+                "State '{state}' appears in the NOT IN clause of NON_TERMINAL_COUNTS_SQL \
+                 but should be non-terminal — remove it from the exclusion list"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod pause_helper_tests {
     use super::pause_timeout_exceeded;

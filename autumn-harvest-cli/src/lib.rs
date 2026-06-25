@@ -275,6 +275,17 @@ pub enum CliError {
     #[error("version-gate retirement check failed")]
     RetirementCheckGate,
 
+    /// Workflow-type reachability found an orphaned type, incomplete report, or transport error.
+    ///
+    /// `context` carries either the original transport error (connection failure,
+    /// auth error, server 5xx) so operators can distinguish infra misconfiguration
+    /// from an unsafe-handler-removal verdict.
+    #[error("workflow-type reachability gate failed: {context}")]
+    WorkflowReachabilityGate {
+        /// Human-readable cause: transport error string or verdict summary.
+        context: String,
+    },
+
     /// `--wait` timed out before the worker reached `Stopped`.
     #[error("timed out waiting for worker '{worker_id}' to stop (last status: {last_status})")]
     DrainWaitTimeout {
@@ -302,6 +313,10 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::PreflightGate { status } if status == "warn" => 2,
+            // Issue #520: the reachability gate uses exit code 2 specifically so
+            // CI can distinguish "an orphaned/partial deploy hazard" from a
+            // generic transport/usage failure (exit 1).
+            Self::WorkflowReachabilityGate { .. } => 2,
             _ => 1,
         }
     }
@@ -435,6 +450,12 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Inspect workflow-type handler reachability for safe handler removal (issue #520).
+    #[command(name = "workflow-types", alias = "workflow-type")]
+    WorkflowTypes {
+        #[command(subcommand)]
+        command: WorkflowTypesCommand,
+    },
     /// Open the TUI dashboard to monitor workflows.
     Tui,
     /// Inspect and drain worker fleet (issue #170).
@@ -487,6 +508,25 @@ enum Commands {
         /// Filter samples to a specific task queue.
         #[arg(long)]
         queue: Option<String>,
+        /// Output raw JSON instead of the summary table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Workflow-type reachability subcommands (issue #520).
+#[derive(Debug, Subcommand)]
+enum WorkflowTypesCommand {
+    /// Report per-workflow-type handler reachability.
+    ///
+    /// Exits `2` when any workflow type is `orphaned` (a non-terminal execution
+    /// still depends on a handler this deployment no longer registers) or when
+    /// the report is incomplete (a shard was unreachable), so it can gate a
+    /// deploy in CI.
+    Reachability {
+        /// Narrow the report to a single workflow type.
+        #[arg(long = "type")]
+        workflow_type: Option<String>,
         /// Output raw JSON instead of the summary table.
         #[arg(long)]
         json: bool,
@@ -1416,6 +1456,7 @@ impl Cli {
                 *state_group,
                 *shard_id,
             )),
+            Commands::WorkflowTypes { command } => Ok(workflow_reachability_request(command)),
             Commands::Tui => unreachable!("Tui command handles its own requests"),
             Commands::Events { .. } => unreachable!("Events command handles its own requests"),
             Commands::StartBatch {
@@ -1502,7 +1543,21 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
         return run_worker_drain_wait(&cli, worker_id, *wait_timeout_secs).await;
     }
 
-    let response = execute(&cli).await?;
+    let response = match execute(&cli).await {
+        Ok(v) => v,
+        Err(err) => {
+            // Fail closed: a transport/API error on a reachability gate command must
+            // exit 2 (deploy hazard) rather than exit 1 (generic error). Exit 1 is
+            // labelled "transport/usage error" in the runbook and operators may
+            // retry or ignore it; exit 2 unambiguously signals an unsafe answer.
+            if workflow_reachability_should_gate(&cli) {
+                return Err(CliError::WorkflowReachabilityGate {
+                    context: err.to_string(),
+                });
+            }
+            return Err(err);
+        }
+    };
     let rendered = render_response(&cli, &response)?;
     if let Some(path) = history_output_file(&cli) {
         fs::write(path, &rendered).map_err(|source| CliError::WriteOutput {
@@ -1531,6 +1586,12 @@ pub async fn run_cli(cli: Cli) -> Result<(), CliError> {
     }
     if retirement_check_should_check(&cli) && retirement_check_exit_code(&response) != 0 {
         return Err(CliError::RetirementCheckGate);
+    }
+    if workflow_reachability_should_gate(&cli) && workflow_reachability_exit_code(&response) != 0 {
+        return Err(CliError::WorkflowReachabilityGate {
+            context: "orphaned verdict, in_use with type filter, or incomplete shard report"
+                .to_string(),
+        });
     }
     if canary_should_gate(&cli) && canary_exit_code(&response) != 0 {
         let verdict = response
@@ -1818,6 +1879,9 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if retirement_check_wants_table(cli) {
         return Ok(format_retirement_check_table(value));
     }
+    if workflow_reachability_wants_table(cli) {
+        return Ok(format_workflow_reachability_table(value));
+    }
     if backfill_wants_table(cli) {
         return Ok(format_backfill_table(value));
     }
@@ -1829,6 +1893,7 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
         || handoff_wants_raw_json(cli)
         || dlq_aggregate_wants_raw_json(cli)
         || canary_wants_raw_json(cli)
+        || workflow_reachability_wants_raw_json(cli)
     {
         OutputFormat::Json
     } else {
@@ -2553,6 +2618,159 @@ fn format_version_usage_table(value: &Value) -> String {
         .join("\n");
 
     format!("status: {status}\nobserved_at: {observed_at}\n\n{table}")
+}
+
+// ─── Workflow-type reachability helpers (issue #520) ──────────────────────────
+
+fn workflow_reachability_request(command: &WorkflowTypesCommand) -> ApiRequest {
+    let WorkflowTypesCommand::Reachability { workflow_type, .. } = command;
+    workflow_type.as_ref().map_or_else(
+        || ApiRequest::get("/admin/workflow-types/reachability"),
+        |value| {
+            ApiRequest::get(format!(
+                "/admin/workflow-types/reachability?workflow_type={}",
+                query_encode(value)
+            ))
+        },
+    )
+}
+
+const fn workflow_reachability_should_gate(cli: &Cli) -> bool {
+    matches!(&cli.command, Commands::WorkflowTypes { .. })
+}
+
+fn workflow_reachability_wants_table(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::WorkflowTypes {
+            command: WorkflowTypesCommand::Reachability { json: false, .. }
+        }
+    ) && cli.output == OutputFormat::PrettyJson
+}
+
+const fn workflow_reachability_wants_raw_json(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Commands::WorkflowTypes {
+            command: WorkflowTypesCommand::Reachability { json: true, .. }
+        }
+    )
+}
+
+/// Exit `2` when the report is unsafe to deploy against:
+///
+/// - `partial`/`unavailable` cross-shard status: an incomplete answer must never
+///   be mistaken for "safe to remove".
+/// - Any `orphaned` verdict: a handler was already removed but runs are still live.
+/// - When a `--type` filter is active: also block on `in_use`. Without a filter
+///   the command is a fleet-wide monitor; `in_use` is the normal state for any
+///   type with running workflows and should not block. With a filter the operator
+///   is asking "can I delete this specific handler?"; `in_use` means "no" — live
+///   runs would become orphaned the moment the handler is removed.
+///
+/// Exit `0` otherwise.
+fn workflow_reachability_exit_code(value: &Value) -> i32 {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unavailable");
+    if matches!(status, "partial" | "unavailable") {
+        return 2;
+    }
+    // `filter` is the echo of the `--type` query param: present → single-type check.
+    let type_filter_active = value.get("filter").and_then(Value::as_str).is_some();
+    let blocking_verdict = if type_filter_active {
+        // Pre-removal check: any non-safe verdict blocks.
+        |v: &str| matches!(v, "orphaned" | "in_use")
+    } else {
+        // Fleet monitor: only already-broken (orphaned) types block.
+        |v: &str| v == "orphaned"
+    };
+    let any_blocking = value
+        .get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("verdict")
+                    .and_then(Value::as_str)
+                    .is_some_and(blocking_verdict)
+            })
+        });
+    if any_blocking { 2 } else { 0 }
+}
+
+fn format_workflow_reachability_table(value: &Value) -> String {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let observed_at = value
+        .get("observed_at")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let Some(items) = value.get("items").and_then(Value::as_array) else {
+        return format!(
+            "status: {status}\nobserved_at: {observed_at}\nNo workflow types returned."
+        );
+    };
+
+    let mut rows = Vec::with_capacity(items.len() + 1);
+    rows.push(vec![
+        "WORKFLOW_TYPE".to_string(),
+        "REGISTERED".to_string(),
+        "NON_TERMINAL".to_string(),
+        "OLDEST_AGE_S".to_string(),
+        "VERDICT".to_string(),
+    ]);
+    for item in items {
+        rows.push(vec![
+            cell_str(item.get("workflow_type")),
+            bool_cell(item.get("registered")),
+            cell_number(item.get("non_terminal_count")),
+            cell_number(item.get("oldest_non_terminal_age_secs")),
+            cell_str(item.get("verdict")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let unavailable = value
+        .get("shards")
+        .and_then(Value::as_array)
+        .map(|shards| {
+            shards
+                .iter()
+                .filter(|shard| shard.get("status").and_then(Value::as_str) == Some("unavailable"))
+                .filter_map(|shard| shard.get("shard_id").and_then(Value::as_i64))
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let footer = if unavailable.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nWARNING: unavailable shards [{}] — verdicts are provisional, not safe-to-remove.",
+            unavailable.join(", ")
+        )
+    };
+
+    format!("status: {status}\nobserved_at: {observed_at}\n\n{table}{footer}")
 }
 
 fn audit_list_wants_table(cli: &Cli) -> bool {
@@ -4986,6 +5204,114 @@ mod reuse_policy_tests {
             "items": []
         });
         assert_eq!(version_usage_guard_exit_code(&partial), 1);
+    }
+
+    // ─── Workflow-type reachability CLI tests (issue #520) ───────────────────
+
+    #[test]
+    fn workflow_reachability_builds_unfiltered_request() {
+        let cli = parse(&["workflow-types", "reachability"]);
+        let req = cli.api_request().expect("request should build");
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/admin/workflow-types/reachability");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn workflow_reachability_threads_type_filter() {
+        let cli = parse(&["workflow-types", "reachability", "--type", "onboarding"]);
+        let req = cli.api_request().expect("request should build");
+        assert_eq!(
+            req.path,
+            "/admin/workflow-types/reachability?workflow_type=onboarding"
+        );
+    }
+
+    #[test]
+    fn workflow_reachability_exit_code_zero_when_all_safe_or_in_use() {
+        let value = json!({
+            "status": "complete",
+            "items": [
+                { "verdict": "safe_to_remove" },
+                { "verdict": "in_use" }
+            ]
+        });
+        assert_eq!(workflow_reachability_exit_code(&value), 0);
+    }
+
+    #[test]
+    fn workflow_reachability_exit_code_two_on_orphaned() {
+        let value = json!({
+            "status": "complete",
+            "items": [
+                { "verdict": "safe_to_remove" },
+                { "verdict": "orphaned" }
+            ]
+        });
+        assert_eq!(workflow_reachability_exit_code(&value), 2);
+    }
+
+    #[test]
+    fn workflow_reachability_exit_code_two_on_partial_report() {
+        // A partial answer must never be mistaken for safe-to-remove: fail closed.
+        let value = json!({ "status": "partial", "items": [] });
+        assert_eq!(workflow_reachability_exit_code(&value), 2);
+        let unavailable = json!({ "status": "unavailable", "items": [] });
+        assert_eq!(workflow_reachability_exit_code(&unavailable), 2);
+    }
+
+    #[test]
+    fn workflow_reachability_gate_error_uses_exit_code_two() {
+        assert_eq!(
+            CliError::WorkflowReachabilityGate {
+                context: String::new()
+            }
+            .exit_code(),
+            2
+        );
+    }
+
+    #[test]
+    fn workflow_reachability_table_renders_rows_and_unavailable_warning() {
+        let cli = parse(&["workflow-types", "reachability"]);
+        let value = json!({
+            "status": "partial",
+            "observed_at": "2026-05-31T00:00:00Z",
+            "filter": null,
+            "items": [
+                {
+                    "workflow_type": "legacy_flow",
+                    "registered": false,
+                    "non_terminal_count": 2,
+                    "oldest_non_terminal_age_secs": 3600,
+                    "verdict": "orphaned",
+                    "shard_breakdown": []
+                }
+            ],
+            "shards": [
+                { "shard_id": 0, "status": "inspected", "error": null },
+                { "shard_id": 1, "status": "unavailable", "error": "connection refused" }
+            ]
+        });
+        let rendered = render_response(&cli, &value).expect("table should render");
+        assert!(rendered.contains("legacy_flow"));
+        assert!(rendered.contains("orphaned"));
+        assert!(rendered.contains("WARNING: unavailable shards [1]"));
+        assert!(!rendered.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn workflow_reachability_json_flag_emits_raw_payload() {
+        let cli = parse(&["workflow-types", "reachability", "--json"]);
+        let value = json!({
+            "status": "complete",
+            "observed_at": "2026-05-31T00:00:00Z",
+            "filter": null,
+            "items": [],
+            "shards": []
+        });
+        let rendered = render_response(&cli, &value).expect("json should render");
+        assert!(rendered.trim_start().starts_with('{'));
     }
 
     // ─── VersionGateRetirement CLI tests ─────────────────────────────────────
