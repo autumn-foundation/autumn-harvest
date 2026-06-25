@@ -99,18 +99,33 @@ at least one non-terminal execution on any shard.
 
 ## Step 3 — Gate the deploy in CI
 
-The CLI exits **`2`** when any type is `orphaned`, or when the report is
-incomplete (a shard was unreachable). Wire it into the rollout:
+Wire the filtered check into the rollout pipeline:
 
 ```bash
-# Fails the pipeline (exit 2) if removing a handler would strand runs,
-# or if a shard could not be inspected (fail closed).
+# Fails the pipeline (exit 2) if the type still has live runs or if a shard
+# could not be inspected (fail closed).
 harvest workflow-types reachability --type legacy_export || exit 1
 ```
 
-Exit codes: `0` = safe (all `safe_to_remove`/`in_use`, every shard inspected),
-`2` = an `orphaned` verdict **or** a partial/unavailable cross-shard answer,
-`1` = a transport/usage error.
+Exit codes differ by mode:
+
+**Filtered (`--type <name>`) — pre-removal safe-removal check:**
+
+| Exit | Meaning |
+|------|---------|
+| `0` | `safe_to_remove` and every shard inspected — handler can be deleted |
+| `2` | `in_use` (live runs exist, drain/wait first), `orphaned`, or a partial/unavailable report |
+| `1` | Transport or usage error |
+
+**Unfiltered (no `--type`) — continuous fleet monitor:**
+
+| Exit | Meaning |
+|------|---------|
+| `0` | No `orphaned` verdicts and every shard inspected |
+| `2` | Any `orphaned` verdict (handler already removed with live runs) **or** a partial/unavailable report |
+| `1` | Transport or usage error |
+
+In unfiltered mode `in_use` is normal (registered handlers with running workflows) and does **not** trigger exit 2.
 
 ---
 
