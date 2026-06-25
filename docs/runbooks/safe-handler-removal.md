@@ -114,18 +114,20 @@ Exit codes differ by mode:
 | Exit | Meaning |
 |------|---------|
 | `0` | `safe_to_remove` and every shard inspected — handler can be deleted |
-| `2` | `in_use` (live runs exist, drain/wait first), `orphaned`, or a partial/unavailable report |
-| `1` | Transport or usage error |
+| `2` | `in_use` (live runs exist, drain/wait first), `orphaned`, partial/unavailable report, **or** transport/auth error (fail-closed: uncertain = unsafe) |
+| `1` | CLI usage error (invalid flags) |
 
 **Unfiltered (no `--type`) — continuous fleet monitor:**
 
 | Exit | Meaning |
 |------|---------|
 | `0` | No `orphaned` verdicts and every shard inspected |
-| `2` | Any `orphaned` verdict (handler already removed with live runs) **or** a partial/unavailable report |
-| `1` | Transport or usage error |
+| `2` | Any `orphaned` verdict, partial/unavailable report, **or** transport/auth error (fail-closed) |
+| `1` | CLI usage error (invalid flags) |
 
 In unfiltered mode `in_use` is normal (registered handlers with running workflows) and does **not** trigger exit 2.
+
+> **Note:** transport and auth errors (bad URL, missing token, server 5xx) deliberately exit `2` rather than `1` so a misconfigured CI environment cannot produce a false "safe" signal. If CI exits `2` unexpectedly, check the Harvest API URL and credentials before concluding that a handler is unsafe to remove.
 
 ---
 
