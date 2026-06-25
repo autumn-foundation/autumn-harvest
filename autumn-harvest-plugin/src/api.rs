@@ -16670,10 +16670,9 @@ pub(crate) async fn load_stalled_workflows(
     // Checking all task_type values mirrors the sleeping-filter predicate so that
     // an execution with a stuck workflow task is not mislabelled no_pending_work.
     let has_activity: HashSet<uuid::Uuid> = harvest_task_queue::table
-        .filter(
-            harvest_task_queue::workflow_exec_id
-                .eq_any(exec_ids.iter().map(|id| Some(*id)).collect::<Vec<_>>()),
-        )
+        // ⚡ Bolt: Pass `&exec_ids` directly instead of collecting into an intermediate `Vec<Option<Uuid>>`.
+        // This avoids an O(N) heap allocation on this hot path.
+        .filter(harvest_task_queue::workflow_exec_id.eq_any(&exec_ids))
         .filter(harvest_task_queue::state.eq_any(["PENDING", "CLAIMED", "RUNNING", "BACKOFF"]))
         .select(harvest_task_queue::workflow_exec_id)
         .distinct()
@@ -16686,10 +16685,9 @@ pub(crate) async fn load_stalled_workflows(
 
     // ── Step 4: non-terminal child workflows ────────────────────────────────
     let has_child: HashSet<uuid::Uuid> = harvest_workflow_executions::table
-        .filter(
-            harvest_workflow_executions::parent_id
-                .eq_any(exec_ids.iter().map(|id| Some(*id)).collect::<Vec<_>>()),
-        )
+        // ⚡ Bolt: Pass `&exec_ids` directly instead of collecting into an intermediate `Vec<Option<Uuid>>`.
+        // This avoids an O(N) heap allocation on this hot path.
+        .filter(harvest_workflow_executions::parent_id.eq_any(&exec_ids))
         .filter(harvest_workflow_executions::state.ne_all([
             "COMPLETED",
             "FAILED",
