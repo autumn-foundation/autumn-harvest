@@ -6913,8 +6913,10 @@ fn spawn_stranded_work_sampler(
             for (shard_id, shard_pool) in sharded_pool.iter_shards() {
                 let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
 
-                // Per-queue claimable pending counts for this shard.
-                let queue_counts: Vec<(String, i64)> = {
+                // Claimable pending demands for this shard, grouped by
+                // (queue, required_capabilities) so coverage can honour the same
+                // label eligibility claim_task enforces (issue #522 review).
+                let demands: Vec<crate::queue::ClaimablePendingDemand> = {
                     let mut conn = match shard_pool.get().await {
                         Ok(conn) => conn,
                         Err(error) => {
@@ -6926,8 +6928,8 @@ fn spawn_stranded_work_sampler(
                             continue;
                         }
                     };
-                    match crate::queue::claimable_pending_count_by_queue(&mut conn).await {
-                        Ok(counts) => counts,
+                    match crate::queue::claimable_pending_demand_by_queue(&mut conn).await {
+                        Ok(demands) => demands,
                         Err(error) => {
                             tracing::debug!(
                                 shard_id = %shard_id.as_i32(),
@@ -6939,7 +6941,7 @@ fn spawn_stranded_work_sampler(
                     }
                 };
 
-                if queue_counts.is_empty() {
+                if demands.is_empty() {
                     // No claimable work — emit 0 so the gauge resets cleanly.
                     telemetry
                         .metrics
@@ -6947,10 +6949,10 @@ fn spawn_stranded_work_sampler(
                     continue;
                 }
 
-                // Queues covered by at least one healthy active worker assigned
-                // to this shard. A queue is covered when any such worker lists
-                // it in its `queues` JSON array.
-                let covered_queues: std::collections::HashSet<String> = {
+                // Healthy active workers assigned to this shard. Kept whole (not
+                // collapsed to queue names) so the capability check below can see
+                // each worker's polled queues *and* labels.
+                let covering_workers: Vec<crate::workers::WorkerRow> = {
                     let Ok(mut conn) = shard_pool.get().await else {
                         continue;
                     };
@@ -6963,17 +6965,7 @@ fn spawn_stranded_work_sampler(
                     };
                     match crate::workers::list_workers(&mut conn, &filters, freshness_window).await
                     {
-                        Ok(workers) => workers
-                            .iter()
-                            .flat_map(|w| {
-                                w.worker
-                                    .queues
-                                    .as_array()
-                                    .into_iter()
-                                    .flatten()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                            })
-                            .collect(),
+                        Ok(workers) => workers,
                         Err(error) => {
                             tracing::debug!(
                                 error = %error,
@@ -6984,11 +6976,38 @@ fn spawn_stranded_work_sampler(
                     }
                 };
 
-                // Sum pending tasks on queues that have no live covering worker.
-                let stranded: u64 = queue_counts
+                // A demand is covered when some covering worker polls its queue
+                // AND satisfies its required_capabilities (the same Exact/In
+                // label match claim_task applies). No requirements ⇒ any worker
+                // polling the queue covers it. Unparseable requirements fall back
+                // to queue-only coverage so the sampler never fabricates a
+                // false-positive stranded signal.
+                let demand_covered = |demand: &crate::queue::ClaimablePendingDemand| -> bool {
+                    let reqs = demand.required_capabilities.as_ref().and_then(|caps| {
+                        serde_json::from_value::<Vec<crate::eligibility::Requirement>>(caps.clone())
+                            .ok()
+                    });
+                    covering_workers.iter().any(|w| {
+                        let polls_queue = w.worker.queues.as_array().is_some_and(|qs| {
+                            qs.iter()
+                                .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
+                        });
+                        if !polls_queue {
+                            return false;
+                        }
+                        reqs.as_ref().is_none_or(|reqs| {
+                            let labels: std::collections::HashMap<String, String> =
+                                serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                            crate::eligibility::matches_requirements(reqs, &labels)
+                        })
+                    })
+                };
+
+                // Sum pending tasks across demands no covering worker can claim.
+                let stranded: u64 = demands
                     .iter()
-                    .filter(|(q, _)| !covered_queues.contains(q.as_str()))
-                    .map(|(_, cnt)| u64::try_from(*cnt).unwrap_or(0))
+                    .filter(|demand| !demand_covered(demand))
+                    .map(|demand| u64::try_from(demand.count).unwrap_or(0))
                     .sum();
                 telemetry
                     .metrics
