@@ -14,8 +14,9 @@ use crate::schema::{
     harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
     harvest_completion_trigger_fires, harvest_completion_trigger_outbox,
     harvest_completion_triggers, harvest_dead_letters, harvest_events, harvest_external_tasks,
-    harvest_rate_limit_buckets, harvest_schedule_decisions, harvest_schedules, harvest_signals,
-    harvest_task_queue, harvest_timers, harvest_workers, harvest_workflow_executions,
+    harvest_payload_refs, harvest_rate_limit_buckets, harvest_schedule_decisions,
+    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
+    harvest_workflow_executions,
 };
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
@@ -220,6 +221,30 @@ pub struct NewHarvestEvent<'a> {
     pub event_id: i32,
     pub event_type: &'a str,
     pub event_data: serde_json::Value,
+}
+
+// ── PayloadRef ────────────────────────────────────────────────────────────────
+
+/// A reference from a workflow execution to an offloaded payload blob (issue #524).
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_payload_refs)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestPayloadRef {
+    pub blob_key: String,
+    pub workflow_exec_id: Uuid,
+    pub store_id: String,
+    pub byte_len: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert struct for recording a new offloaded-payload reference.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_payload_refs)]
+pub struct NewHarvestPayloadRef {
+    pub blob_key: String,
+    pub workflow_exec_id: Uuid,
+    pub store_id: String,
+    pub byte_len: i64,
 }
 
 // ── TaskQueueItem ─────────────────────────────────────────────────────────────

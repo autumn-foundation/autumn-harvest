@@ -589,6 +589,23 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Per-execution references to offloaded payload blobs (issue #524).
+    ///
+    /// One row per `(blob_key, workflow_exec_id)`. `ON DELETE CASCADE` ties the
+    /// reference count to execution lifetime so the retention sweep can GC a
+    /// blob exactly when its last referencing execution is collected.
+    harvest_payload_refs (blob_key, workflow_exec_id) {
+        blob_key         -> Text,
+        workflow_exec_id -> Uuid,
+        store_id         -> Text,
+        byte_len         -> Int8,
+        created_at       -> Timestamptz,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
@@ -613,4 +630,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_completion_trigger_outbox,
     harvest_debounce,
     harvest_event_batches,
+    harvest_payload_refs,
 );

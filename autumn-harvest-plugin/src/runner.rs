@@ -370,6 +370,7 @@ impl HarvestRunner {
                 prepared.retention_config.clone(),
                 Arc::clone(&registry.telemetry().metrics),
                 prepared.history_archiver,
+                registry.payload_offloader_arc(),
             )
         } else {
             tracing::info!(

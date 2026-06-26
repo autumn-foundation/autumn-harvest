@@ -111,6 +111,7 @@ pub mod info;
 #[cfg(feature = "metrics-rs")]
 pub mod metrics_rs_adapter;
 pub mod payload_codec;
+pub mod payload_store;
 pub mod poison_pill;
 pub mod policy;
 pub mod pool;
@@ -260,6 +261,9 @@ pub use info::{
     UpdateHandlerInfo, UpdateValidatorFn, WorkflowHandlerFn, WorkflowInfo,
 };
 pub use payload_codec::{CodecError, IdentityCodec, PayloadCodec, PayloadCodecs};
+pub use payload_store::{
+    OffloadedRef, PayloadOffloader, PayloadStore, PayloadStoreError, PayloadStoreFuture,
+};
 pub use policy::validate_schedule;
 pub use policy::{
     CatchupPolicy, MapFailurePolicy, OverlapPolicy, RetryPolicy, Schedule, SkipPolicy, TaskStatus,

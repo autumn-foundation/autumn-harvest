@@ -255,6 +255,9 @@ pub struct HandlerRegistry {
     /// ceiling. Applied to scheduler-fired starts so automated fires respect
     /// the same operator-configured cap as API/manual starts.
     pub max_workflow_attempts_ceiling: Option<u32>,
+    /// Large-payload offloader (issue #524). `None` = no `PayloadStore`
+    /// registered; all event writes/reads use the plain inline path unchanged.
+    payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
 }
 
 impl HandlerRegistry {
@@ -376,6 +379,7 @@ impl HandlerRegistry {
                 circuit_policies,
             )),
             max_workflow_attempts_ceiling: None,
+            payload_offloader: None,
         }
     }
 
@@ -448,6 +452,29 @@ impl HandlerRegistry {
             *lock = ceiling;
         }
         self
+    }
+
+    /// Attach the large-payload offloader (issue #524).
+    #[must_use]
+    pub fn with_payload_offloader(
+        mut self,
+        offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
+    ) -> Self {
+        self.payload_offloader = offloader;
+        self
+    }
+
+    /// Borrow the configured large-payload offloader, if any (issue #524).
+    #[must_use]
+    pub fn payload_offloader(&self) -> Option<&crate::payload_store::PayloadOffloader> {
+        self.payload_offloader.as_deref()
+    }
+
+    /// Clone the configured large-payload offloader handle for use in a
+    /// `'static` background task (e.g. the retention sweep). Issue #524.
+    #[must_use]
+    pub fn payload_offloader_arc(&self) -> Option<Arc<crate::payload_store::PayloadOffloader>> {
+        self.payload_offloader.clone()
     }
 
     /// Clone the shared state reference for runtime contexts.
@@ -524,6 +551,7 @@ impl std::fmt::Debug for HandlerRegistry {
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
             )
+            .field("payload_offloader", &self.payload_offloader.is_some())
             .finish()
     }
 }
@@ -2301,6 +2329,7 @@ fn resolve_workflow_concurrency(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_workflow_completion(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -2309,6 +2338,7 @@ async fn persist_workflow_completion(
     worker_id: &str,
     output: serde_json::Value,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<()> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
@@ -2317,7 +2347,14 @@ async fn persist_workflow_completion(
         .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
             |conn| {
                 async move {
-                    store::append_events(conn, exec_id, &[event], next_event_id).await?;
+                    store::append_events_offloaded(
+                        conn,
+                        exec_id,
+                        &[event],
+                        next_event_id,
+                        offloader,
+                    )
+                    .await?;
                     update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
                     queue::complete_task(conn, task_id, output).await?;
                     let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
@@ -2992,9 +3029,11 @@ async fn persist_scheduled_activities(
         }
     });
 
+    let offloader = registry.payload_offloader();
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
-            store::append_events(conn, exec_id, &events, next_event_id).await?;
+            store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
+                .await?;
             detached_spawns.persist(conn, commands).await?;
             for params in &enqueued {
                 queue::enqueue(conn, params).await?;
@@ -3449,7 +3488,14 @@ async fn persist_all_started_child_workflows(
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
-                store::append_events(conn, child.child_id, &[child_started_event], 0).await?;
+                store::append_events_offloaded(
+                    conn,
+                    child.child_id,
+                    &[child_started_event],
+                    0,
+                    registry.payload_offloader(),
+                )
+                .await?;
                 queue::enqueue(conn, &params).await?;
             }
 
@@ -3684,6 +3730,7 @@ async fn finalize_activity_completion(
     exec_id: ExecutionId,
     activity_id: ActivityExecId,
     output: serde_json::Value,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<()> {
     let Some(activity_name) = task.activity_name.as_deref() else {
         return Ok(());
@@ -3706,7 +3753,14 @@ async fn finalize_activity_completion(
             if state != "RUNNING" {
                 return Ok(());
             }
-            store::append_events(conn, exec_id, &[completion_event], history.next_event_id).await?;
+            store::append_events_offloaded(
+                conn,
+                exec_id,
+                &[completion_event],
+                history.next_event_id,
+                offloader,
+            )
+            .await?;
             queue::complete_task(conn, task.id, output).await?;
             queue::wake_workflow_task(conn, exec_id).await
         }
@@ -4161,11 +4215,15 @@ async fn handle_activity_result(
     activity_result: Result<serde_json::Value, String>,
     max_result_bytes: u64,
     activity_name_for_cap: &str,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<()> {
     match activity_result {
         Ok(output) => {
             let observed_bytes = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-            if max_result_bytes > 0 && observed_bytes > max_result_bytes {
+            // Issue #524: an over-threshold result will be offloaded into a tiny
+            // reference envelope, so it does not trip the #252 result cap.
+            let offload_applies = offloader.is_some_and(|o| observed_bytes > o.threshold());
+            if max_result_bytes > 0 && observed_bytes > max_result_bytes && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
                     "PayloadTooLarge",
@@ -4177,7 +4235,7 @@ async fn handle_activity_result(
                 .into_error_payload();
                 return finalize_activity_failure(conn, task, exec_id, activity_id, &error).await;
             }
-            finalize_activity_completion(conn, task, exec_id, activity_id, output).await
+            finalize_activity_completion(conn, task, exec_id, activity_id, output, offloader).await
         }
         Err(error) => {
             let delay_result = next_retry_delay(task, &error, retry_policy);
@@ -4447,6 +4505,7 @@ async fn process_activity_task(
             Err(payload),
             0,
             activity_name,
+            registry.payload_offloader(),
         )
         .await;
     }
@@ -4550,10 +4609,16 @@ async fn process_activity_task(
 
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting
     // metrics so that an Ok result above the cap is counted as Failed, not Completed.
+    // Issue #524: skip the cap when the offloader will handle the large payload —
+    // finalize_activity_completion routes through append_events_offloaded, so the
+    // result will be stored as a tiny reference envelope in harvest_events.
     let activity_result = match activity_result {
         Ok(output) if effective_result_cap > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-            if observed > effective_result_cap {
+            let offload_applies = registry
+                .payload_offloader()
+                .is_some_and(|o| observed > o.threshold());
+            if observed > effective_result_cap && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
                     "PayloadTooLarge",
@@ -4671,6 +4736,7 @@ async fn process_activity_task(
         activity_result,
         0,
         activity_name,
+        registry.payload_offloader(),
     )
     .await
 }
@@ -5016,8 +5082,15 @@ async fn load_workflow_replay_state(
     task: &TaskQueueItem,
     worker_id: &str,
     exec_id: ExecutionId,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<(store::EventHistory, Vec<TimerId>, Vec<String>)> {
-    let history_result = store::load_history(conn, exec_id).await;
+    let history_result = store::load_history_inflated(
+        conn,
+        exec_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+        offloader,
+    )
+    .await;
     let initial_history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
 
     // Single chronological ingest: due timer fires and pending signals are
@@ -5028,7 +5101,13 @@ async fn load_workflow_replay_state(
     let (timers_fired, signals_delivered) =
         fail_execution_on_error(conn, task, worker_id, ingest_result).await?;
 
-    let final_history_result = store::load_history(conn, exec_id).await;
+    let final_history_result = store::load_history_inflated(
+        conn,
+        exec_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+        offloader,
+    )
+    .await;
     let final_history =
         fail_execution_on_error(conn, task, worker_id, final_history_result).await?;
     Ok((final_history, timers_fired, signals_delivered))
@@ -5052,6 +5131,7 @@ async fn prepare_workflow_task_with_cache(
     worker_id: &str,
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     sticky_timeout: Duration,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<PreparedWorkflowTask> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let error = HarvestError::Config("workflow task missing workflow_exec_id".into());
@@ -5078,8 +5158,14 @@ async fn prepare_workflow_task_with_cache(
         // cache snapshot (e.g. by timeout.rs/external_task.rs via
         // append_single_event), then ingest timers/signals at the REAL current
         // next_event_id to avoid a unique-constraint collision on event_id.
-        let existing_delta_result =
-            store::load_history_since(conn, exec_id, cached_state.next_event_id).await;
+        let existing_delta_result = store::load_history_since_inflated(
+            conn,
+            exec_id,
+            cached_state.next_event_id,
+            &crate::payload_codec::PayloadCodecs::default(),
+            offloader,
+        )
+        .await;
         let existing_delta =
             fail_execution_on_error(conn, task, worker_id, existing_delta_result).await?;
 
@@ -5091,8 +5177,14 @@ async fn prepare_workflow_task_with_cache(
             fail_execution_on_error(conn, task, worker_id, ingest_result).await?;
 
         // Load events appended by the ingest.
-        let after_ingest_result =
-            store::load_history_since(conn, exec_id, existing_delta.next_event_id).await;
+        let after_ingest_result = store::load_history_since_inflated(
+            conn,
+            exec_id,
+            existing_delta.next_event_id,
+            &crate::payload_codec::PayloadCodecs::default(),
+            offloader,
+        )
+        .await;
         let after_ingest =
             fail_execution_on_error(conn, task, worker_id, after_ingest_result).await?;
 
@@ -5115,7 +5207,7 @@ async fn prepare_workflow_task_with_cache(
     } else {
         // Cache miss path: full history load.
         let (history, timers_fired, signals_delivered) =
-            load_workflow_replay_state(conn, task, worker_id, exec_id).await?;
+            load_workflow_replay_state(conn, task, worker_id, exec_id, offloader).await?;
 
         Ok(PreparedWorkflowTask {
             execution,
@@ -5190,12 +5282,23 @@ async fn persist_workflow_continue_as_new(
     persistence: WorkflowTaskPersistence<'_>,
     execution: &WorkflowExecution,
     input: serde_json::Value,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<()> {
     use crate::schema::{harvest_signals, harvest_workflow_executions};
 
     if reject_child_continue_as_new(conn, &persistence, execution).await? {
         return Ok(());
     }
+
+    // Carry the predecessor's `last_completion_result` forward by its *stored*
+    // representation (issue #524 / #488). If it was offloaded, copy the
+    // reference envelope verbatim and record a new ref for the successor so the
+    // blob is NOT re-uploaded; the offloader skips already-enveloped fields.
+    let raw_carryover = store::load_raw_started_carryover(conn, persistence.exec_id).await?;
+    let carried_lcr_ref = raw_carryover
+        .as_ref()
+        .and_then(crate::payload_store::extract_offload_ref);
+    let carryover_for_event = raw_carryover.or_else(|| persistence.carryover_result.clone());
 
     // The new execution stays on the same shard so all of its event log,
     // queue rows, timers, and signals continue to live in the same Postgres
@@ -5211,7 +5314,7 @@ async fn persist_workflow_continue_as_new(
         // Preserve scheduled carryover across the fork (issue #488): the continuation is
         // the same logical scheduled run, so it must see the same frozen values rather
         // than re-resolving (which could pick up a newer sibling fire's output).
-        last_completion_result: persistence.carryover_result.clone(),
+        last_completion_result: carryover_for_event,
         last_error: persistence.carryover_error.clone(),
         // Preserve the nominal scheduled slot across the fork (issue #508): a continued
         // run is the same logical scheduled run and must see the same slot. The row
@@ -5275,7 +5378,14 @@ async fn persist_workflow_continue_as_new(
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             // Append the terminal continued-as-new marker to the old run.
-            store::append_events(conn, exec_id, &[continued_event], next_event_id).await?;
+            store::append_events_offloaded(
+                conn,
+                exec_id,
+                &[continued_event],
+                next_event_id,
+                offloader,
+            )
+            .await?;
 
             // Seal the old execution. The CHECK constraint allows this state
             // value as of the continue-as-new migration; the partial unique
@@ -5305,7 +5415,14 @@ async fn persist_workflow_continue_as_new(
                 .await
                 .map_err(crate::error::database_error)?;
 
-            store::append_events(conn, new_exec_id, &[started_event], 0).await?;
+            store::append_events_offloaded(conn, new_exec_id, &[started_event], 0, offloader)
+                .await?;
+            // Record the carried-forward blob reference for the successor so the
+            // blob survives until the successor is also retained (issue #524).
+            if let Some(ref carried) = carried_lcr_ref {
+                store::insert_payload_refs(conn, new_exec_id, std::slice::from_ref(carried))
+                    .await?;
+            }
 
             // Reassign unconsumed signals to the new execution so signals
             // delivered while the workflow body was running do not disappear
@@ -5374,6 +5491,7 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 output,
                 Some(registry.telemetry().metrics.as_ref()),
+                registry.payload_offloader(),
             )
             .await;
             if result.is_ok() && update_schedule_counter {
@@ -5479,8 +5597,14 @@ async fn persist_workflow_outcome(
             // task/worker_id are Copy references; capture before persistence is moved.
             let task = persistence.task;
             let worker_id = persistence.worker_id;
-            let result =
-                persist_workflow_continue_as_new(conn, persistence, execution, input).await;
+            let result = persist_workflow_continue_as_new(
+                conn,
+                persistence,
+                execution,
+                input,
+                registry.payload_offloader(),
+            )
+            .await;
             fail_execution_on_error(conn, task, worker_id, result)
                 .await
                 .map(|()| false)
@@ -5901,9 +6025,15 @@ async fn process_workflow_task(
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
     dispatched_at: std::time::Instant,
 ) -> HarvestResult<()> {
-    let mut prepared =
-        prepare_workflow_task_with_cache(conn, task, worker_id, &workflow_cache, sticky_timeout)
-            .await?;
+    let mut prepared = prepare_workflow_task_with_cache(
+        conn,
+        task,
+        worker_id,
+        &workflow_cache,
+        sticky_timeout,
+        registry.payload_offloader(),
+    )
+    .await?;
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
         let error = format!(
             "no workflow handler registered for '{}'",
@@ -6095,6 +6225,9 @@ async fn process_workflow_task(
                     }),
                 registry.max_current_details_bytes,
                 exec_context_headers.clone(),
+                registry
+                    .payload_offloader()
+                    .map(crate::payload_store::PayloadOffloader::threshold),
             )
             .await;
 

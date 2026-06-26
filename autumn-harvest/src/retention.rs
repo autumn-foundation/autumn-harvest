@@ -318,6 +318,7 @@ impl RetentionRuntime {
         config: RetentionConfig,
         metrics: Arc<dyn MetricsRecorder>,
         archiver: Option<Arc<dyn HistoryArchiver>>,
+        offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
     ) -> Option<Self> {
         if !config.enabled() {
             return None;
@@ -347,6 +348,7 @@ impl RetentionRuntime {
                         let config = config.clone();
                         let metrics = Arc::clone(&metrics);
                         let archiver = archiver.clone();
+                        let offloader = offloader.clone();
                         let cursor = scan_cursors.get(&shard).copied().flatten();
                         async move {
                             let started = Instant::now();
@@ -358,6 +360,7 @@ impl RetentionRuntime {
                                 archiver,
                                 cursor,
                                 Arc::clone(&metrics),
+                                offloader,
                             )
                             .await;
                             (shard, started, tick)
@@ -556,6 +559,7 @@ impl Drop for RetentionLeaseGuard {
 
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,
@@ -564,6 +568,7 @@ async fn run_shard_tick(
     archiver: Option<Arc<dyn HistoryArchiver>>,
     start_cursor: Option<RetentionScanCursor>,
     _metrics: Arc<dyn MetricsRecorder>,
+    offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
 ) -> HarvestResult<ShardTickOutcome> {
     let mut outcome = ShardTickOutcome {
         next_cursor: start_cursor,
@@ -715,7 +720,21 @@ async fn run_shard_tick(
             let mut doc = None;
             if !config.dry_run && archiver.is_some() {
                 let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
-                match crate::store::load_history(&mut conn, exec_id).await {
+                // Inflate offloaded envelopes before archiving so the archived
+                // document contains real payloads, not blob references that will
+                // be deleted moments later. Issue #524.
+                let load_result = if offloader.is_some() {
+                    crate::store::load_history_inflated(
+                        &mut conn,
+                        exec_id,
+                        &crate::payload_codec::PayloadCodecs::default(),
+                        offloader.as_deref(),
+                    )
+                    .await
+                } else {
+                    crate::store::load_history(&mut conn, exec_id).await
+                };
+                match load_result {
                     Ok(history) => {
                         let req = crate::history_export::HistoryExportRequest {
                             workflow_name: candidate.workflow_name.clone(),
@@ -816,6 +835,23 @@ async fn run_shard_tick(
                 .await
                 .map_err(|error| HarvestError::Database(error.to_string()))?;
 
+            // Collect the candidate's offloaded blob references BEFORE deletion
+            // (the rows cascade-delete with the execution). Issue #524.
+            let candidate_exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
+            let candidate_blob_refs = if offloader.is_some() {
+                match crate::store::load_payload_refs(&mut conn, candidate_exec_id).await {
+                    Ok(refs) => refs,
+                    Err(err) => {
+                        has_failed = true;
+                        batch_failed = true;
+                        tracing::error!(candidate_id = %candidate.id, error = %err, "failed to load payload refs for blob GC; skipping deletion");
+                        break;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
             if let Err(err) = delete_candidate_execution(&mut conn, candidate.id).await {
                 has_failed = true;
                 batch_failed = true;
@@ -823,6 +859,35 @@ async fn run_shard_tick(
                 break;
             }
             outcome.deleted_count += 1;
+
+            // After the execution row (and its refs) are durably gone, delete any
+            // blob no longer referenced by a surviving execution. A blob still
+            // referenced by e.g. a continue-as-new successor is left intact.
+            // Issue #524.
+            if let Some(offloader) = &offloader
+                && !candidate_blob_refs.is_empty()
+            {
+                let keys: Vec<String> = candidate_blob_refs
+                    .iter()
+                    .map(|b| b.blob_key.clone())
+                    .collect();
+                match crate::store::batch_blob_keys_still_referenced(&mut conn, &keys).await {
+                    Ok(still_referenced) => {
+                        for blob in &candidate_blob_refs {
+                            if !still_referenced.contains(&blob.blob_key)
+                                && let Err(err) = offloader.store().delete(&blob.blob_key).await
+                            {
+                                // Row is already gone; a failed blob delete only leaks
+                                // storage (never a dangling reference). Log and continue.
+                                tracing::warn!(blob_key = %blob.blob_key, error = %err.0, "failed to delete offloaded blob during retention; leaving for a later sweep");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to batch-check residual blob references; leaving all blobs intact");
+                    }
+                }
+            }
 
             {
                 let mut active_guard = guard.active_ids.lock().expect("lease guard lock poisoned");

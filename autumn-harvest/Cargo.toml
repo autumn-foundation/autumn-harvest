@@ -35,6 +35,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = "0.22"
+sha2 = "0.10"
 thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
@@ -77,6 +78,14 @@ required-features = ["testing"]
 [[test]]
 name = "replayer_tests"
 required-features = ["testing"]
+
+[[test]]
+name = "payload_offload_replay_tests"
+required-features = ["testing"]
+
+[[test]]
+name = "payload_offload_db_tests"
+required-features = ["db"]
 
 [[test]]
 name = "workflow_test_env_tests"

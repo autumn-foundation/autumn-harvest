@@ -51,6 +51,12 @@ pub const DEFAULT_MAX_WORKFLOW_START_DELAY: Duration = Duration::from_secs(365 *
 pub const DEFAULT_MAX_WORKFLOW_PAUSE_DURATION: Duration = Duration::from_secs(24 * 3600);
 /// Default max-wait cap for debounced workflow starts (1 hour, issue #499).
 pub const DEFAULT_DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(3600);
+/// Default large-payload offload threshold (issue #524): 256 KiB.
+///
+/// Payload-bearing fields larger than this are offloaded to the configured
+/// [`PayloadStore`](crate::payload_store::PayloadStore). Only takes effect when
+/// a store is registered.
+pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: u64 = 256 * 1024;
 
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
@@ -68,6 +74,10 @@ pub struct HarvestBuilder {
     retention: RetentionConfig,
     history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
     payload_codecs: PayloadCodecs,
+    /// Embedder-supplied external blob store for large-payload offloading (issue #524).
+    payload_store: Option<Arc<dyn crate::payload_store::PayloadStore>>,
+    /// Byte threshold above which payload-bearing fields are offloaded (issue #524).
+    payload_offload_threshold: u64,
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243).
     ///
@@ -126,6 +136,8 @@ impl Default for HarvestBuilder {
             retention: crate::retention::RetentionConfig::default(),
             history_archiver: None,
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
+            payload_store: None,
+            payload_offload_threshold: DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD,
             history_policy: crate::context::WorkflowHistoryPolicy::default(),
             max_workflow_execution_timeout: None,
             max_workflow_history_events: None,
@@ -201,6 +213,8 @@ pub struct BuiltHarvest {
     retention: RetentionConfig,
     history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
     payload_codecs: PayloadCodecs,
+    /// Configured large-payload offloader (issue #524). `None` = no store registered.
+    payload_offloader: Option<Arc<crate::payload_store::PayloadOffloader>>,
     history_policy: WorkflowHistoryPolicy,
     /// Server-side ceiling on `execution_timeout` (issue #243). `None` = no ceiling.
     pub max_workflow_execution_timeout: Option<Duration>,
@@ -510,6 +524,15 @@ impl BuiltHarvest {
         &self.payload_codecs
     }
 
+    /// The configured large-payload offloader, if a [`PayloadStore`] is
+    /// registered (issue #524).
+    ///
+    /// [`PayloadStore`]: crate::payload_store::PayloadStore
+    #[must_use]
+    pub const fn payload_offloader(&self) -> Option<&Arc<crate::payload_store::PayloadOffloader>> {
+        self.payload_offloader.as_ref()
+    }
+
     /// History-size guardrails applied to workflow contexts and workers.
     #[must_use]
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
@@ -656,7 +679,8 @@ impl BuiltHarvest {
                 self.max_signal_payload_bytes,
             )
             .with_current_details_cap(self.max_current_details_bytes)
-            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts),
+            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
+            .with_payload_offloader(self.payload_offloader.clone()),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -693,7 +717,8 @@ impl BuiltHarvest {
                 self.max_signal_payload_bytes,
             )
             .with_current_details_cap(self.max_current_details_bytes)
-            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts),
+            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts)
+            .with_payload_offloader(self.payload_offloader.clone()),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -877,6 +902,31 @@ impl HarvestBuilder {
     #[must_use]
     pub fn payload_codec(mut self, codec: impl PayloadCodec + 'static) -> Self {
         self.payload_codecs.set_default(Arc::new(codec));
+        self
+    }
+
+    /// Register an external [`PayloadStore`](crate::payload_store::PayloadStore)
+    /// for large-payload offloading via claim-check (issue #524).
+    ///
+    /// Once registered, any payload-bearing field larger than
+    /// [`payload_offload_threshold`](HarvestBuilder::payload_offload_threshold)
+    /// is written to the store and replaced inline with a small reference
+    /// envelope, so big blobs flow between steps without bloating
+    /// `harvest_events` or tripping the #252 size cap. With no store registered,
+    /// behaviour is unchanged.
+    #[must_use]
+    pub fn payload_store(mut self, store: impl crate::payload_store::PayloadStore) -> Self {
+        self.payload_store = Some(Arc::new(store));
+        self
+    }
+
+    /// Set the byte threshold above which payload-bearing fields are offloaded
+    /// to the registered [`PayloadStore`](crate::payload_store::PayloadStore)
+    /// (issue #524). Fields at or below the threshold stay inline. Default:
+    /// [`DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD`] (256 KiB). No effect without a store.
+    #[must_use]
+    pub const fn payload_offload_threshold(mut self, bytes: u64) -> Self {
+        self.payload_offload_threshold = bytes;
         self
     }
 
@@ -1161,6 +1211,14 @@ impl HarvestBuilder {
             .unwrap_or(worker_config.unknown_target_grace_window);
         worker_config.unknown_target_grace_window = unknown_target_grace_window;
 
+        let telemetry_arc = Arc::new(self.telemetry.unwrap_or_default());
+        let payload_offloader = self.payload_store.clone().map(|store| {
+            Arc::new(crate::payload_store::PayloadOffloader::new(
+                store,
+                self.payload_offload_threshold,
+                telemetry_arc.metrics.clone(),
+            ))
+        });
         Ok(BuiltHarvest {
             workflows: self.workflows,
             activities: self.activities,
@@ -1170,10 +1228,11 @@ impl HarvestBuilder {
             update_handlers: self.update_handlers,
             worker_config,
             state: self.state,
-            telemetry: Arc::new(self.telemetry.unwrap_or_default()),
+            telemetry: telemetry_arc,
             retention: self.retention,
             history_archiver: self.history_archiver,
             payload_codecs: self.payload_codecs.clone(),
+            payload_offloader,
             history_policy: self.history_policy,
             max_workflow_execution_timeout: self.max_workflow_execution_timeout,
             max_workflow_history_events: self.max_workflow_history_events,

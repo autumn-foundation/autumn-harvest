@@ -272,6 +272,9 @@ pub struct WorkflowReplayer {
     handlers: HashMap<String, WorkflowHandlerFn>,
     state: SharedState,
     context_headers: HashMap<String, String>,
+    /// Optional offloader for inflating offloaded payloads in the fixture
+    /// before replay (issue #524).
+    payload_offloader: Option<std::sync::Arc<crate::payload_store::PayloadOffloader>>,
 }
 
 impl Default for WorkflowReplayer {
@@ -297,6 +300,7 @@ impl WorkflowReplayer {
             handlers: HashMap::new(),
             state: empty_shared_state(),
             context_headers: HashMap::new(),
+            payload_offloader: None,
         }
     }
 
@@ -377,6 +381,38 @@ impl WorkflowReplayer {
         self
     }
 
+    /// Attach a [`PayloadOffloader`](crate::payload_store::PayloadOffloader) so
+    /// a recorded history whose payloads were offloaded (issue #524) is inflated
+    /// from the backing store before replay, reconstructing byte-identical
+    /// inputs/outputs.
+    #[must_use]
+    pub fn with_payload_offloader(
+        mut self,
+        offloader: std::sync::Arc<crate::payload_store::PayloadOffloader>,
+    ) -> Self {
+        self.payload_offloader = Some(offloader);
+        self
+    }
+
+    /// Inflate offloaded payloads in `events` if an offloader is configured.
+    async fn maybe_inflate(
+        &self,
+        events: Vec<WorkflowEvent>,
+    ) -> Result<Vec<WorkflowEvent>, String> {
+        let Some(off) = &self.payload_offloader else {
+            return Ok(events);
+        };
+        let mut out = Vec::with_capacity(events.len());
+        for ev in events {
+            let mut v = serde_json::to_value(&ev).map_err(|e| e.to_string())?;
+            off.inflate_event_value(&mut v)
+                .await
+                .map_err(|e| e.to_string())?;
+            out.push(serde_json::from_value(v).map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
     /// Replay a recorded [`HistorySnapshot`] against the handler registered
     /// for `snapshot.workflow_name`.
     ///
@@ -407,21 +443,28 @@ impl WorkflowReplayer {
         };
 
         let exec_id = snapshot.execution_id;
-        let total_events = snapshot.events.len();
-        let input = extract_input(&snapshot.events);
+        let events = match self.maybe_inflate(snapshot.events).await {
+            Ok(e) => e,
+            Err(error) => {
+                return ReplayReport {
+                    execution_id: exec_id,
+                    events_replayed: 0,
+                    status: ReplayStatus::WorkflowFailed {
+                        error,
+                        event_index: 0,
+                    },
+                    mismatched_command_summary: None,
+                };
+            }
+        };
+        let total_events = events.len();
+        let input = extract_input(&events);
 
         let headers = snapshot
             .context_headers
             .unwrap_or_else(|| self.context_headers.clone());
-        let outcome = run_workflow_strict(
-            exec_id,
-            snapshot.events,
-            handler,
-            input,
-            self.state.clone(),
-            headers,
-        )
-        .await;
+        let outcome =
+            run_workflow_strict(exec_id, events, handler, input, self.state.clone(), headers).await;
         outcome_to_report(exec_id, total_events, outcome, false)
     }
 
@@ -524,6 +567,20 @@ impl WorkflowReplayer {
 
         let (_, &handler) = self.handlers.iter().next().unwrap();
         let exec_id = ExecutionId::new();
+        let events = match self.maybe_inflate(events).await {
+            Ok(e) => e,
+            Err(error) => {
+                return ReplayReport {
+                    execution_id: exec_id,
+                    events_replayed: 0,
+                    status: ReplayStatus::WorkflowFailed {
+                        error,
+                        event_index: 0,
+                    },
+                    mismatched_command_summary: None,
+                };
+            }
+        };
         let total_events = events.len();
         let input = extract_input(&events);
 
@@ -1913,6 +1970,7 @@ async fn replay_fixture_file(
         handlers: handlers.clone(),
         state,
         context_headers: HashMap::new(),
+        payload_offloader: None,
     };
 
     let replay_result =

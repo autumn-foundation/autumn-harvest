@@ -210,15 +210,7 @@ impl PayloadCodecs {
         // WorkflowStarted event for scheduled carryover (issue #488). It must be encoded
         // too so a configured codec encrypts/compresses any secret or PII the prior
         // output carried; it is unique to WorkflowStarted among event variants.
-        let keys = [
-            "input",
-            "output",
-            "payload",
-            "details",
-            "value",
-            "last_completion_result",
-        ];
-        for key in keys {
+        for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
             if let Some(payload) = data.get_mut(key) {
                 if encode {
                     *payload = self.encode_payload(payload)?;
