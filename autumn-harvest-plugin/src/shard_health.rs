@@ -444,7 +444,18 @@ async fn observe_shard(
     let required_queues = required_queues(runtime, schedules.as_deref().ok());
     let workers = load_workers(&mut conn, freshness_window).await;
     let workers_snapshot = workers.clone();
-    let queue_depth = load_queue_depth(&mut conn).await;
+    // Activity names with a circuit-breaker policy skip the rate-limit gate at
+    // claim, so the queue-depth query must exempt them from its rate-limit
+    // filter to match claim_task. Empty when no runtime or no breakers.
+    let circuit_breaker_activities: Vec<String> = runtime
+        .map(|r| {
+            r.registry()
+                .circuit_breakers()
+                .tracked_activity_names()
+                .to_vec()
+        })
+        .unwrap_or_default();
+    let queue_depth = load_queue_depth(&mut conn, &circuit_breaker_activities).await;
     // Build compatibility set for the no_live_worker gate's build-routing check.
     // On load failure fall back to an empty set (exact-match / legacy rules).
     let compat = autumn_harvest::build_routing::load_compat_set(&mut conn)
@@ -891,84 +902,59 @@ fn worker_assigned_to_shard(worker: &WorkerRow, shard_id: i32) -> bool {
         })
 }
 
-#[derive(diesel::QueryableByName)]
-struct QueueDepthRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    queue_name: String,
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    depth: i64,
-}
-
-async fn load_queue_depth(conn: &mut AsyncPgConnection) -> QueueDepthSummary {
-    // Only count rows `claim_task` would actually claim, so the readiness gate
-    // doesn't degrade a shard for work no worker is allowed to take (issue
-    // #522). Mirror two claim-time exclusions:
-    //   - PAUSED workflow tasks (issue #383) — parked until resume.
-    //   - tasks past their `schedule_to_close_at` deadline (issue #378) — the
-    //     timeout scanner will fail them, not a worker.
-    let rows = diesel::sql_query(
-        "SELECT queue_name::TEXT AS queue_name, COUNT(*)::BIGINT AS depth \
-         FROM harvest_task_queue \
-         WHERE state = 'PENDING' \
-           AND scheduled_at <= NOW() \
-           AND ( \
-               schedule_to_close_at IS NULL \
-               OR schedule_to_close_at > NOW() \
-           ) \
-           AND ( \
-               task_type <> 'workflow' \
-               OR workflow_exec_id IS NULL \
-               OR NOT EXISTS ( \
-                   SELECT 1 FROM harvest_workflow_executions e \
-                   WHERE e.id = harvest_task_queue.workflow_exec_id \
-                     AND e.state = 'PAUSED' \
-               ) \
-           ) \
-         GROUP BY queue_name \
-         ORDER BY queue_name",
+async fn load_queue_depth(
+    conn: &mut AsyncPgConnection,
+    circuit_breaker_activities: &[String],
+) -> QueueDepthSummary {
+    // Derive both the per-queue depth and the constraint demands from the single
+    // shared core query, so the basic per-queue coverage check and the
+    // capability/build constraint check see exactly the same claimable rows the
+    // stranded-work sampler sees (issue #522). The query mirrors every claim_task
+    // gate: PAUSED workflow tasks, expired `schedule_to_close_at`, concurrency-cap
+    // saturation, and rate-limit exhaustion (with the circuit-breaker exemption).
+    // A row no worker could claim right now never degrades readiness.
+    let demands = match autumn_harvest::queue::claimable_pending_demand_by_queue(
+        conn,
+        circuit_breaker_activities,
     )
-    .load::<QueueDepthRow>(conn)
-    .await;
-
-    let (total_pending, by_queue, error) = match rows {
-        Err(error) => (0, BTreeMap::new(), Some(error.to_string())),
-        Ok(rows) => {
-            let mut total_pending = 0;
-            let mut by_queue = BTreeMap::new();
-            for row in rows {
-                total_pending += row.depth;
-                by_queue.insert(row.queue_name, row.depth);
-            }
-            (total_pending, by_queue, None)
+    .await
+    {
+        Ok(demands) => demands,
+        Err(error) => {
+            return QueueDepthSummary {
+                total_pending: 0,
+                by_queue: BTreeMap::new(),
+                constraint_demands: Vec::new(),
+                error: Some(error.to_string()),
+            };
         }
     };
 
-    // Distinct constraint demands among claimable pending tasks, reusing the
-    // shared core query so the gate sees exactly what the stranded-work sampler
-    // sees. Keep only the rows that carry a capability OR build-id constraint;
-    // the unconstrained rows are already covered by the basic per-queue check.
-    // On query failure leave demands empty — that check still applies.
-    let constraint_demands = autumn_harvest::queue::claimable_pending_demand_by_queue(conn)
-        .await
-        .map(|demands| {
-            demands
-                .into_iter()
-                .filter(|d| d.required_capabilities.is_some() || d.required_build_id.is_some())
-                .map(|d| ConstraintDemand {
-                    queue_name: d.queue_name,
-                    required_capabilities: d.required_capabilities,
-                    required_build_id: d.required_build_id,
-                    count: d.count,
-                })
-                .collect()
+    let mut total_pending = 0;
+    let mut by_queue: BTreeMap<String, i64> = BTreeMap::new();
+    for demand in &demands {
+        total_pending += demand.count;
+        *by_queue.entry(demand.queue_name.clone()).or_default() += demand.count;
+    }
+
+    // Keep only the rows that carry a capability OR build-id constraint; the
+    // unconstrained rows are already covered by the basic per-queue check.
+    let constraint_demands = demands
+        .into_iter()
+        .filter(|d| d.required_capabilities.is_some() || d.required_build_id.is_some())
+        .map(|d| ConstraintDemand {
+            queue_name: d.queue_name,
+            required_capabilities: d.required_capabilities,
+            required_build_id: d.required_build_id,
+            count: d.count,
         })
-        .unwrap_or_default();
+        .collect();
 
     QueueDepthSummary {
         total_pending,
         by_queue,
         constraint_demands,
-        error,
+        error: None,
     }
 }
 

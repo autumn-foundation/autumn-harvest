@@ -6898,6 +6898,9 @@ fn spawn_stranded_work_sampler(
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
+    // Static set of activity names with a circuit-breaker policy; these skip the
+    // rate-limit gate at claim, so they stay claimable with an empty bucket.
+    circuit_breaker_activities: Vec<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -6929,7 +6932,12 @@ fn spawn_stranded_work_sampler(
                             continue;
                         }
                     };
-                    match crate::queue::claimable_pending_demand_by_queue(&mut conn).await {
+                    match crate::queue::claimable_pending_demand_by_queue(
+                        &mut conn,
+                        &circuit_breaker_activities,
+                    )
+                    .await
+                    {
                         Ok(demands) => demands,
                         Err(error) => {
                             tracing::debug!(
@@ -7915,6 +7923,10 @@ impl Worker {
                     self.shutdown.clone(),
                     self.registry.telemetry().clone(),
                     self.config.poll_interval,
+                    self.registry
+                        .circuit_breakers()
+                        .tracked_activity_names()
+                        .to_vec(),
                 )
             });
         #[cfg(not(feature = "db"))]

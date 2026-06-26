@@ -1815,57 +1815,6 @@ pub async fn try_consume_rate_limit_token(
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-/// Count the number of tasks that are immediately claimable on this shard.
-///
-/// A task is claimable when `state = 'PENDING'`, `scheduled_at <= NOW()`, its
-/// `schedule_to_close_at` deadline has not elapsed, and it is not a PAUSED
-/// execution's parked workflow task. This mirrors the claim-time predicate in
-/// [`claim_task`] and is used by the stranded-work sampler (issue #522) to
-/// detect claimable tasks on shards that have no covering live worker.
-///
-/// # Errors
-///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
-pub async fn claimable_pending_count(conn: &mut AsyncPgConnection) -> HarvestResult<i64> {
-    #[derive(diesel::QueryableByName)]
-    struct CountRow {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        cnt: i64,
-    }
-
-    // Mirror claim_task's exclusions so the count never includes a row a
-    // worker would refuse: tasks past their `schedule_to_close_at` deadline
-    // (issue #378, failed by the timeout scanner) and PAUSED *workflow* tasks
-    // (fix #7). The PAUSED guard is task_type-scoped: claim_task parks a paused
-    // execution's workflow task until resume, but its already-scheduled
-    // activity tasks stay claimable and still need a worker. Dropping those
-    // activities here would make the stranded-work sampler miss an uncovered
-    // shard that has a queued activity on a paused
-    // workflow.
-    let row: CountRow = diesel::sql_query(
-        "SELECT COUNT(*)::BIGINT AS cnt \
-         FROM harvest_task_queue tq \
-         LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
-         WHERE tq.state = 'PENDING' \
-           AND tq.scheduled_at <= NOW() \
-           AND ( \
-               tq.schedule_to_close_at IS NULL \
-               OR tq.schedule_to_close_at > NOW() \
-           ) \
-           AND ( \
-               tq.task_type <> 'workflow' \
-               OR tq.workflow_exec_id IS NULL \
-               OR e.id IS NULL \
-               OR e.state <> 'PAUSED' \
-           )",
-    )
-    .get_result(conn)
-    .await
-    .map_err(crate::error::database_error)?;
-
-    Ok(row.cnt)
-}
-
 /// A distinct claimable-pending demand: how many claimable pending tasks share a
 /// `(queue_name, required_capabilities, required_build_id)` triple.
 ///
@@ -1884,17 +1833,35 @@ pub struct ClaimablePendingDemand {
     pub count: i64,
 }
 
-/// Per-queue, per-constraint variant of [`claimable_pending_count`].
+/// Per-queue, per-constraint claimable-demand breakdown for the stranded-work
+/// sampler and the shard-health coverage gate (issue #522).
 ///
 /// Returns one [`ClaimablePendingDemand`] per distinct
 /// `(queue_name, required_capabilities, required_build_id)` triple among
-/// claimable pending tasks. Applies the same exclusions as `claim_task` (PAUSED
-/// workflow tasks, expired `schedule_to_close_at`) so the counts mirror exactly
-/// what a worker would find claimable. Grouping on the constraint columns lets
-/// the caller apply the same label and build-id eligibility `claim_task`
-/// enforces, rather than collapsing coverage to queue names.
+/// claimable pending tasks. Mirrors **every** claim-time gate in `claim_task` so
+/// the counts never include a row a worker would refuse:
+///   - expired `schedule_to_close_at` (issue #378, failed by the timeout scanner);
+///   - PAUSED *workflow* tasks (task_type-scoped — a paused execution's already
+///     scheduled activity tasks stay claimable, so they are still counted);
+///   - concurrency-cap saturation (the per-key `RUNNING` count is already at the
+///     cap, so the row is throttled — the same recheck subquery `claim_task`
+///     uses); and
+///   - rate-limit exhaustion (the non-circuit bucket has no token), with the
+///     **circuit-breaker exemption**: activities in `circuit_breaker_activities`
+///     skip the rate-limit gate at claim, so they remain claimable even with an
+///     empty bucket and are still counted.
+///
+/// `circuit_breaker_activities` is the static set of activity names with a
+/// circuit-breaker policy (`CircuitBreakerRegistry::tracked_activity_names`),
+/// matching `claim_task`'s `$5` parameter. Pass an empty slice when no breakers
+/// are configured.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
 pub async fn claimable_pending_demand_by_queue(
     conn: &mut AsyncPgConnection,
+    circuit_breaker_activities: &[String],
 ) -> HarvestResult<Vec<ClaimablePendingDemand>> {
     #[derive(diesel::QueryableByName)]
     struct DemandRow {
@@ -1925,8 +1892,29 @@ pub async fn claimable_pending_demand_by_queue(
                OR e.id IS NULL \
                OR e.state <> 'PAUSED' \
            ) \
+           AND ( \
+               tq.concurrency_key IS NULL \
+               OR tq.concurrency_cap IS NULL \
+               OR ( \
+                   SELECT COUNT(*) FROM harvest_task_queue inner_q \
+                   WHERE inner_q.concurrency_key = tq.concurrency_key \
+                     AND inner_q.task_type = tq.task_type \
+                     AND inner_q.state = 'RUNNING' \
+                     AND inner_q.worker_id IS NOT NULL \
+               ) < tq.concurrency_cap \
+           ) \
+           AND ( \
+               tq.rate_limit_key IS NULL \
+               OR tq.activity_name = ANY($1) \
+               OR EXISTS ( \
+                   SELECT 1 FROM harvest_rate_limit_buckets b \
+                   WHERE b.key = tq.rate_limit_key \
+                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+               ) \
+           ) \
          GROUP BY tq.queue_name, tq.required_capabilities, tq.required_build_id",
     )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
     .load(conn)
     .await
     .map_err(crate::error::database_error)?;
