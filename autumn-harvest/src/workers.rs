@@ -391,6 +391,33 @@ pub async fn transition_status(
     Ok(())
 }
 
+/// Transition a worker row from `Active` to `Draining`, leaving rows that are
+/// already `Draining` or `Stopped` untouched.
+///
+/// Used by the heartbeat task to repair shard rows that were still `Active`
+/// because the drain fan-out could not reach the shard (network partition or
+/// transient unavailability).  The `Active`-only guard ensures this never
+/// reverts a row that was already advanced by a concurrent path.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+async fn transition_active_to_draining(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<()> {
+    diesel::update(
+        harvest_workers::table
+            .find(worker_id)
+            .filter(harvest_workers::status.eq(WorkerStatus::Active.as_str())),
+    )
+    .set(harvest_workers::status.eq(WorkerStatus::Draining.as_str()))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
 /// Apply queue, shard, health, and limit filters to an already-loaded worker list.
 ///
 /// The limit is intentionally applied **after** the in-process `retain` passes so
@@ -1046,6 +1073,92 @@ pub async fn drain_preview(
 #[allow(clippy::too_many_arguments)]
 // The shared applied-set uses the worker's own fixed hasher; no need to generalize.
 #[allow(clippy::implicit_hasher)]
+/// Execute one heartbeat DB tick: update `last_heartbeat_at`, handle
+/// re-registration / drain transitions, and refresh the drain deadline.
+async fn do_heartbeat_tick(
+    conn: &mut AsyncPgConnection,
+    registration: &WorkerRegistration,
+    in_flight: i32,
+    labels_json: &serde_json::Value,
+    worker_shutdown: &CancellationToken,
+    drain_deadline_max: &Mutex<Option<DateTime<Utc>>>,
+    remote_drain_deadline: &Mutex<Option<std::time::Instant>>,
+) {
+    match heartbeat_worker(conn, &registration.worker_id, in_flight, labels_json).await {
+        Ok(0) => {
+            if worker_shutdown.is_cancelled() {
+                // Worker is already draining — do not create a new Active row on
+                // a shard that missed the fan-out.  An absent row correctly
+                // reflects no live coverage; re-registering as Active would give
+                // shard health checks a false positive.
+                tracing::debug!(
+                    worker_id = %registration.worker_id,
+                    "worker draining; skipping re-registration for recovered shard"
+                );
+            } else {
+                tracing::info!(worker_id = %registration.worker_id, "worker row missing; re-registering");
+                if let Err(error) = register_worker(
+                    conn,
+                    &registration.worker_id,
+                    &registration.queues,
+                    &registration.shard_assignments,
+                    registration.max_concurrency,
+                    &registration.host,
+                    registration.version.as_deref(),
+                    &registration.build_id,
+                    registration.deployment_name.as_deref(),
+                    &registration.labels,
+                )
+                .await
+                {
+                    tracing::warn!(worker_id = %registration.worker_id, error = %error, "worker re-registration failed");
+                }
+            }
+        }
+        Ok(_) => {
+            if worker_shutdown.is_cancelled() {
+                // Already draining — transition this shard's row to Draining if
+                // the fan-out missed it (e.g. shard recovered after the drain was
+                // issued).  Guarded to Active rows only so it never reverts a row
+                // that already reached Draining or Stopped.
+                if let Err(error) =
+                    transition_active_to_draining(conn, &registration.worker_id).await
+                {
+                    tracing::warn!(
+                        worker_id = %registration.worker_id,
+                        error = %error,
+                        "failed to transition recovered shard row to Draining"
+                    );
+                }
+                // Refresh the stored deadline so an operator-extended window is
+                // picked up by drain_in_flight without restarting the worker.
+                sync_drain_deadline(conn, &registration.worker_id, drain_deadline_max, remote_drain_deadline).await;
+            } else {
+                // Heartbeat succeeded; check whether a remote drain has changed
+                // this worker's status to Draining.  Cancel the worker's
+                // poll-loop token (not the heartbeat token) so the poll loop
+                // stops accepting new work while heartbeats continue until
+                // fully stopped (P1).
+                match read_worker_status(conn, &registration.worker_id).await {
+                    Ok(Some(ref s)) if s == WorkerStatus::Draining.as_str() => {
+                        tracing::info!(
+                            worker_id = %registration.worker_id,
+                            "remote drain detected; triggering graceful shutdown"
+                        );
+                        sync_drain_deadline(conn, &registration.worker_id, drain_deadline_max, remote_drain_deadline).await;
+                        worker_shutdown.cancel();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(worker_id = %registration.worker_id, error = %error, "worker heartbeat write failed");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker_heartbeat(
     pool: DbPool,
     registration: WorkerRegistration,
@@ -1074,96 +1187,19 @@ pub fn spawn_worker_heartbeat(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-
             let in_flight = compute_in_flight(&wf_semaphore, wf_max, &act_semaphore, act_max);
-
             match pool.get().await {
                 Ok(mut conn) => {
-                    match heartbeat_worker(
+                    let () = do_heartbeat_tick(
                         &mut conn,
-                        &registration.worker_id,
+                        &registration,
                         in_flight,
                         &labels_json,
+                        &worker_shutdown,
+                        &drain_deadline_max,
+                        &remote_drain_deadline,
                     )
-                    .await
-                    {
-                        Ok(0) => {
-                            tracing::info!(
-                                worker_id = %registration.worker_id,
-                                "worker row missing; re-registering"
-                            );
-                            if let Err(error) = register_worker(
-                                &mut conn,
-                                &registration.worker_id,
-                                &registration.queues,
-                                &registration.shard_assignments,
-                                registration.max_concurrency,
-                                &registration.host,
-                                registration.version.as_deref(),
-                                &registration.build_id,
-                                registration.deployment_name.as_deref(),
-                                &registration.labels,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    worker_id = %registration.worker_id,
-                                    error = %error,
-                                    "worker re-registration failed"
-                                );
-                            }
-                        }
-                        Ok(_) => {
-                            if worker_shutdown.is_cancelled() {
-                                // Already draining — refresh the stored deadline on
-                                // every heartbeat so an operator-extended window (via
-                                // a second POST .../drain with a later deadline_at)
-                                // is picked up by drain_in_flight without restarting
-                                // the worker.
-                                sync_drain_deadline(
-                                    &mut conn,
-                                    &registration.worker_id,
-                                    &drain_deadline_max,
-                                    &remote_drain_deadline,
-                                )
-                                .await;
-                            } else {
-                                // Heartbeat succeeded; check whether a remote drain
-                                // request has changed this worker's status to Draining.
-                                // Cancel the worker's poll-loop shutdown token (not the
-                                // heartbeat token) so the poll loop stops accepting new
-                                // work within the next heartbeat interval while heartbeats
-                                // continue until the worker is fully stopped (P1).
-                                match read_worker_status(&mut conn, &registration.worker_id).await {
-                                    Ok(Some(ref s)) if s == WorkerStatus::Draining.as_str() => {
-                                        tracing::info!(
-                                            worker_id = %registration.worker_id,
-                                            "remote drain detected; triggering graceful shutdown"
-                                        );
-                                        // Store the operator-supplied deadline as an
-                                        // absolute Instant so drain_in_flight can
-                                        // honour it (P2-B).
-                                        sync_drain_deadline(
-                                            &mut conn,
-                                            &registration.worker_id,
-                                            &drain_deadline_max,
-                                            &remote_drain_deadline,
-                                        )
-                                        .await;
-                                        worker_shutdown.cancel();
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                worker_id = %registration.worker_id,
-                                error = %error,
-                                "worker heartbeat write failed"
-                            );
-                        }
-                    }
+                    .await;
                 }
                 Err(error) => {
                     tracing::warn!(
