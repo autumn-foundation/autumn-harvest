@@ -226,7 +226,7 @@ async fn test_mark_signals_consumed() {
     assert_eq!(pending_signals.len(), 1);
 }
 
-// ── Signal idempotency keys (issue #521) ──────────────────────────────────
+// ── Signal idempotency keys ───────────────────────────────────────────────
 
 /// Insert a fresh RUNNING workflow execution and return its id.
 async fn insert_running_execution(conn: &mut diesel_async::AsyncPgConnection) -> ExecutionId {
@@ -269,7 +269,7 @@ async fn idempotent_signal_with_same_key_lands_exactly_once() {
     let exec_id = insert_running_execution(&mut conn).await;
 
     // Five duplicate deliveries carrying the same idempotency key — the
-    // falsifiable success metric from issue #521.
+    // falsifiable success metric: the signal must land exactly once.
     let mut delivered_flags = Vec::new();
     for _ in 0..5 {
         let delivered = send_signal_idempotent(

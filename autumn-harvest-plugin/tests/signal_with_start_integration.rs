@@ -380,7 +380,7 @@ async fn signal_with_start_idempotency_key_dedupes_signal() {
     assert_eq!(b2["execution_id"], b1["execution_id"]);
 }
 
-// ── Standalone signal route idempotency (issue #521) ──────────────────────
+// ── Standalone signal route idempotency ───────────────────────────────────
 
 /// POST a standalone signal, optionally carrying an `Idempotency-Key` header.
 /// The body is the raw signal payload (free-form). A `?idempotency_key=` query

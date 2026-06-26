@@ -60,6 +60,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = &func.sig.ident;
     let fn_name_str = fn_name.to_string();
     let method_name = format_ident!("signal_{fn_name}");
+    let idem_method_name = format_ident!("signal_{fn_name}_idempotent");
 
     let parsed_path = match crate::parse_and_validate_workflow_path(
         &workflow_name,
@@ -129,39 +130,70 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         tokens
     };
+    // Shared prologue: validate the target type, serialize the payload, and
+    // enforce the signal payload cap before any insert.
+    let cap_check = quote! {
+        handle.validate_workflow_type(conn, #workflow_simple_name).await?;
+        let payload = #serialize_payload;
+        let size = ::autumn_harvest::serde_json::to_string(&payload)
+            .map(|s| s.len() as u64)
+            .unwrap_or(0);
+        let limit = handle.client().max_signal_payload_bytes();
+        if size > limit {
+            return Err(::autumn_harvest::error::HarvestError::PayloadTooLarge {
+                kind: ::autumn_harvest::error::PayloadKind::SignalPayload,
+                observed_bytes: size,
+                cap_bytes: limit,
+                workflow_type: #workflow_simple_name.to_string(),
+                activity_name: None,
+            });
+        }
+    };
+
+    let method_defs = quote! {
+        /// Send a type-safe signal to this workflow execution.
+        pub async fn #method_name(
+            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+            handle: &::autumn_harvest::WorkflowHandle,
+            #(#params),*
+        ) -> ::autumn_harvest::HarvestResult<()> {
+            #cap_check
+            ::autumn_harvest::signal::send_signal(
+                conn,
+                handle.exec_id(),
+                #fn_name_str,
+                payload,
+            )
+            .await
+        }
+
+        /// Send a type-safe signal with an opt-in exactly-once delivery key.
+        ///
+        /// Returns `true` when freshly queued, `false` when the key deduped.
+        pub async fn #idem_method_name(
+            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
+            handle: &::autumn_harvest::WorkflowHandle,
+            #(#params,)*
+            idempotency_key: impl Into<Option<String>>,
+        ) -> ::autumn_harvest::HarvestResult<bool> {
+            #cap_check
+            let __idem_key = idempotency_key.into();
+            ::autumn_harvest::signal::send_signal_idempotent(
+                conn,
+                handle.exec_id(),
+                #fn_name_str,
+                payload,
+                __idem_key.as_deref(),
+            )
+            .await
+        }
+    };
+
     let impl_block = if path_tokens.is_empty() {
         quote! {
             ::autumn_harvest::cfg_db! {
                 impl #stub_ident {
-                    /// Send a type-safe signal to this workflow execution.
-                    pub async fn #method_name(
-                        conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-                        handle: &::autumn_harvest::WorkflowHandle,
-                        #(#params),*
-                    ) -> ::autumn_harvest::HarvestResult<()> {
-                        handle.validate_workflow_type(conn, #workflow_simple_name).await?;
-                        let payload = #serialize_payload;
-                        let size = ::autumn_harvest::serde_json::to_string(&payload)
-                            .map(|s| s.len() as u64)
-                            .unwrap_or(0);
-                        let limit = handle.client().max_signal_payload_bytes();
-                        if size > limit {
-                            return Err(::autumn_harvest::error::HarvestError::PayloadTooLarge {
-                                kind: ::autumn_harvest::error::PayloadKind::SignalPayload,
-                                observed_bytes: size,
-                                cap_bytes: limit,
-                                workflow_type: #workflow_simple_name.to_string(),
-                                activity_name: None,
-                            });
-                        }
-                        ::autumn_harvest::signal::send_signal(
-                            conn,
-                            handle.exec_id(),
-                            #fn_name_str,
-                            payload,
-                        )
-                        .await
-                    }
+                    #method_defs
                 }
             }
         }
@@ -172,35 +204,7 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use super::*;
                     use #leading_colon #(#nested_path_tokens::)*#stub_ident;
                     impl #stub_ident {
-                        /// Send a type-safe signal to this workflow execution.
-                        pub async fn #method_name(
-                            conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
-                            handle: &::autumn_harvest::WorkflowHandle,
-                            #(#params),*
-                        ) -> ::autumn_harvest::HarvestResult<()> {
-                            handle.validate_workflow_type(conn, #workflow_simple_name).await?;
-                            let payload = #serialize_payload;
-                            let size = ::autumn_harvest::serde_json::to_string(&payload)
-                                .map(|s| s.len() as u64)
-                                .unwrap_or(0);
-                            let limit = handle.client().max_signal_payload_bytes();
-                            if size > limit {
-                                return Err(::autumn_harvest::error::HarvestError::PayloadTooLarge {
-                                    kind: ::autumn_harvest::error::PayloadKind::SignalPayload,
-                                    observed_bytes: size,
-                                    cap_bytes: limit,
-                                    workflow_type: #workflow_simple_name.to_string(),
-                                    activity_name: None,
-                                });
-                            }
-                            ::autumn_harvest::signal::send_signal(
-                                conn,
-                                handle.exec_id(),
-                                #fn_name_str,
-                                payload,
-                            )
-                            .await
-                        }
+                        #method_defs
                     }
                 }
             }

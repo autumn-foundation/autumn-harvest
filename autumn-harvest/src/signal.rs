@@ -35,30 +35,19 @@ pub async fn send_signal(
     signal_name: &str,
     payload: serde_json::Value,
 ) -> HarvestResult<()> {
-    // Thin wrapper preserving the pre-#521 at-least-once contract: with no
-    // idempotency key the partial unique index excludes the NULL row, so every
-    // insert succeeds. The delivered/deduped bool is discarded.
+    // With no key the partial unique index excludes the NULL row, so every
+    // insert succeeds — the legacy at-least-once contract. Bool discarded.
     send_signal_idempotent(conn, exec_id, signal_name, payload, None)
         .await
         .map(|_delivered| ())
 }
 
-/// Queue a workflow signal with optional exactly-once delivery (issue #521).
+/// Queue a workflow signal, deduplicating on `idempotency_key` when supplied.
 ///
-/// When `idempotency_key` is `Some`, the insert is arbitrated against the
-/// partial unique index `uq_harvest_signals_idem` on
-/// `harvest_signals (workflow_exec_id, idempotency_key) WHERE idempotency_key
-/// IS NOT NULL`. A second call carrying the same key for the same execution is
-/// a no-op: no row is queued and the parked workflow is **not** re-woken.
-///
-/// Returns `Ok(true)` when a signal row was freshly queued (the workflow was
-/// woken), and `Ok(false)` when the key collided with an already-staged signal
-/// (deduplicated — the equivalent signal already landed once). With
-/// `idempotency_key = None` every insert succeeds, so the return is always
-/// `Ok(true)` — byte-for-byte the legacy [`send_signal`] behavior.
-///
-/// Dedupe scope is shard-local and keyed on `(workflow_exec_id,
-/// idempotency_key)`, matching `signal_with_start_workflow_execution` (#244).
+/// Returns `Ok(true)` when a row was freshly queued (the workflow was woken)
+/// and `Ok(false)` when the key collided with an already-staged signal. A
+/// `None` key always inserts, so the return is always `Ok(true)`. Dedupe scope
+/// is shard-local, keyed on `(workflow_exec_id, idempotency_key)`.
 ///
 /// # Errors
 ///
@@ -92,11 +81,40 @@ pub async fn send_signal_idempotent(
                 .map_err(crate::error::database_error)?
                 .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
 
+            let row = NewHarvestSignal {
+                workflow_exec_id: exec_id.as_uuid(),
+                signal_name,
+                payload,
+                idempotency_key,
+            };
+
+            // Attempt the insert before validating state so a keyed retry that
+            // already landed dedupes to a no-op even after the workflow has gone
+            // terminal. `on_conflict_do_nothing()` (no explicit target) lets
+            // Postgres arbitrate against the partial unique index
+            // `uq_harvest_signals_idem`; a NULL key is excluded from the index,
+            // so the insert always succeeds (rows-affected = 1).
+            let inserted = diesel::insert_into(harvest_signals::table)
+                .values(&row)
+                .on_conflict_do_nothing()
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
+            if inserted == 0 {
+                // Idempotency-key collision: an equivalent signal already landed
+                // once. Idempotent success regardless of current state — do not
+                // re-wake (the original insert already did).
+                return Ok(false);
+            }
+
+            // Fresh row: the execution must be able to accept it. Returning Err
+            // here rolls back the transaction, undoing the insert above.
             match execution.state.as_str() {
-                // PAUSED is a non-terminal active state (issue #383): a paused
-                // workflow waiting on a signal must still accept (buffer) it so
-                // it is delivered on resume. The wake below re-pends the task,
-                // which the claim gate defers until the execution is RUNNING.
+                // PAUSED is a non-terminal active state: a paused workflow
+                // waiting on a signal must still accept (buffer) it so it is
+                // delivered on resume. The wake below re-pends the task, which
+                // the claim gate defers until the execution is RUNNING.
                 "RUNNING" | "PAUSED" => {}
                 "CANCELLED" => {
                     return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
@@ -110,9 +128,9 @@ pub async fn send_signal_idempotent(
                 }
             }
 
-            // ADR-0001 §2.5: harvest.signal.send — PRODUCER, emitted only after
-            // confirming RUNNING state so the span is not created for rejected signals.
-            // in_scope is synchronous so EnteredSpan (!Send) is dropped before any await.
+            // ADR-0001 §2.5: harvest.signal.send — PRODUCER, emitted only for an
+            // accepted signal. in_scope is synchronous so EnteredSpan (!Send) is
+            // dropped before any await.
             tracing::info_span!(
                 "harvest.signal.send",
                 "otel.kind" = "producer",
@@ -121,30 +139,6 @@ pub async fn send_signal_idempotent(
                 signal.name = %signal_name,
             )
             .in_scope(|| {});
-
-            let row = NewHarvestSignal {
-                workflow_exec_id: exec_id.as_uuid(),
-                signal_name,
-                payload,
-                idempotency_key,
-            };
-
-            // `on_conflict_do_nothing()` (no explicit target) lets Postgres
-            // arbitrate against the partial unique index `uq_harvest_signals_idem`.
-            // For a NULL key the index excludes the row, so the insert always
-            // succeeds (rows-affected = 1) — identical to the legacy path.
-            let inserted = diesel::insert_into(harvest_signals::table)
-                .values(&row)
-                .on_conflict_do_nothing()
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-
-            if inserted == 0 {
-                // Idempotency-key collision: an equivalent signal is already
-                // queued. Do not re-wake — the original insert already did.
-                return Ok(false);
-            }
 
             crate::queue::wake_workflow_task(conn, exec_id).await?;
             Ok(true)

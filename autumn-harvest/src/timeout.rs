@@ -1105,7 +1105,7 @@ pub async fn enforce_external_signals_outbox(
                         .await
                         {
                             // Delivered or deduped (idempotency-key collision):
-                            // both mean the signal landed exactly once (issue #521).
+                            // both mean the signal landed exactly once.
                             Ok(_delivered_or_deduped) => {
                                 Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
                             }
@@ -1150,7 +1150,7 @@ pub async fn enforce_external_signals_outbox(
                         .await
                         {
                             // Delivered or deduped (idempotency-key collision):
-                            // both mean the signal landed exactly once (issue #521).
+                            // both mean the signal landed exactly once.
                             Ok(_delivered_or_deduped) => {
                                 Some(WorkflowEvent::ExternalSignalDelivered { signal_id })
                             }

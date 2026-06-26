@@ -164,6 +164,9 @@ pub const HEADER_REQUEST_ID: &str = "x-request-id";
 /// Call-origin hint: `"api"` (default), `"cli"`, or `"ui"`.
 pub const HEADER_SOURCE: &str = "x-harvest-source";
 
+/// Out-of-band exactly-once delivery key for the standalone signal route.
+pub const HEADER_IDEMPOTENCY_KEY: &str = "idempotency-key";
+
 // ── Retention ─────────────────────────────────────────────────────────────────
 
 /// Default audit record retention in days (90 days ≈ 3 months).

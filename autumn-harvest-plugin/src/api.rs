@@ -33,10 +33,10 @@ use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::OP_BATCH_START;
 use autumn_harvest::audit::{
-    self, AuditFilters, HEADER_ACTOR, HEADER_REQUEST_ID, HEADER_SOURCE, OP_ACTIVITY_RETRY_NOW,
-    OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE, OP_BUILD_POLICY_SET,
-    OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
-    OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    self, AuditFilters, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID, HEADER_SOURCE,
+    OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
+    OP_BUILD_POLICY_SET, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY,
+    OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
     OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
     OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
     OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_TASK_REPRIORITIZE,
@@ -1344,7 +1344,7 @@ struct BasicAck {
     ok: bool,
 }
 
-/// Query parameters for the standalone signal route (issue #521).
+/// Query parameters for the standalone signal route.
 ///
 /// `idempotency_key` is the lower-precedence way to supply the exactly-once
 /// delivery key — the `Idempotency-Key` HTTP header wins when both are present.
@@ -1354,12 +1354,11 @@ struct SignalQuery {
     idempotency_key: Option<String>,
 }
 
-/// Response for the standalone signal route (issue #521).
+/// Response for the standalone signal route.
 ///
 /// `signal_delivered` is `true` when a signal row was freshly queued and
-/// `false` when an idempotency-key collision deduplicated the delivery (the
-/// equivalent signal already landed once). Unkeyed deliveries always report
-/// `true`, matching the legacy at-least-once behavior.
+/// `false` when an idempotency-key collision deduplicated the delivery. Unkeyed
+/// deliveries always report `true`, matching the legacy at-least-once behavior.
 #[derive(Debug, Serialize)]
 struct SignalAck {
     ok: bool,
@@ -10351,6 +10350,7 @@ async fn retry_dag_run(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn signal_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, signal_name)): Path<(String, String)>,
@@ -10361,15 +10361,19 @@ async fn signal_workflow(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/signal/{signal_name}";
 
-    // Exactly-once delivery key (issue #521): the `Idempotency-Key` header wins
-    // over the `?idempotency_key=` query param when both are present. Omitting
-    // both reproduces today's at-least-once behavior exactly.
-    let idempotency_key: Option<String> = headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or(query.idempotency_key.filter(|s| !s.is_empty()));
+    // Exactly-once delivery key: a present `Idempotency-Key` header wins
+    // outright — a malformed or empty value yields no key rather than silently
+    // falling through to the `?idempotency_key=` query param. The query param is
+    // consulted only when the header is absent. No key reproduces today's
+    // at-least-once behavior exactly.
+    let idempotency_key: Option<String> = if let Some(raw) = headers.get(HEADER_IDEMPOTENCY_KEY) {
+        raw.to_str()
+            .ok()
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+    } else {
+        query.idempotency_key.filter(|s| !s.is_empty())
+    };
 
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,

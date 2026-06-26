@@ -425,16 +425,8 @@ pub enum WorkflowEvent {
         signal_name: String,
         /// JSON payload to deliver to the receiving workflow.
         payload: serde_json::Value,
-        /// Optional exactly-once delivery key (issue #521). When set, the
-        /// delivery insert is deduplicated against the target's partial unique
-        /// index `uq_harvest_signals_idem`, so a re-issued request (crash
-        /// recovery, outbox retry) lands at most one `SignalReceived` event on
-        /// the target. This is an **additive** field on the existing variant —
-        /// no new `WorkflowEvent` variant is introduced; pre-#521 events
-        /// deserialize with `idempotency_key = None`, preserving the
-        /// append-only invariant. The recorded value is reused verbatim on
-        /// replay/recovery so a later code change to the key literal can never
-        /// diverge an in-flight delivery.
+        /// Additive optional exactly-once delivery key; dedups re-issued
+        /// requests against `uq_harvest_signals_idem`. Older events load as `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
     },
@@ -1267,7 +1259,7 @@ mod tests {
     #[test]
     fn external_signal_requested_pre_521_json_deserializes_without_key()
     -> Result<(), serde_json::Error> {
-        // A pre-#521 event has no `idempotency_key` field; the additive
+        // An older event has no `idempotency_key` field; the additive
         // `#[serde(default)]` must deserialize it to `None` (append-only
         // invariant: no new variant, old JSON still loads).
         let signal_id = crate::types::ExternalSignalId::new();

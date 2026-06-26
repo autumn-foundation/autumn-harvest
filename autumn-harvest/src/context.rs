@@ -394,9 +394,8 @@ pub enum WorkflowCommand {
         /// When `true`, `ExternalSignalRequested` is already in history and must
         /// not be appended again (crash-recovery path).
         already_requested: bool,
-        /// Optional exactly-once delivery key (issue #521). Persisted in the
-        /// `ExternalSignalRequested` event and used to deduplicate the target's
-        /// signal insert. `None` reproduces legacy at-least-once delivery.
+        /// Optional exactly-once delivery key, persisted in the
+        /// `ExternalSignalRequested` event to dedup the target's signal insert.
         idempotency_key: Option<String>,
     },
     /// Request cancellation of a sibling workflow execution (issue #492).
@@ -3353,22 +3352,13 @@ impl WorkflowContext {
     }
 
     /// Send a named signal to another workflow with an opt-in exactly-once
-    /// delivery key (issue #521).
+    /// delivery key.
     ///
-    /// Identical to [`signal_external_workflow`](Self::signal_external_workflow)
-    /// except that when `idempotency_key` is `Some`, the delivery insert on the
-    /// target is deduplicated against its partial unique index
-    /// `uq_harvest_signals_idem`. This makes the at-least-once cross-shard outbox
-    /// path (and any crash-recovery re-delivery) land **at most one**
-    /// `SignalReceived` event on the target — the exactly-once guarantee.
-    ///
-    /// The key is persisted in the durable `ExternalSignalRequested` event and
-    /// reused verbatim on replay/recovery, so a later code change to the key
-    /// expression can never diverge an in-flight delivery. `None` reproduces the
-    /// legacy at-least-once behavior exactly.
-    ///
-    /// `impl Into<Option<String>>` accepts both `"key".to_string()` and
-    /// `Some("key".to_string())` ergonomically.
+    /// When `idempotency_key` is `Some`, the target's delivery insert is
+    /// deduplicated against `uq_harvest_signals_idem`, so the cross-shard outbox
+    /// and any crash-recovery re-delivery land at most one `SignalReceived`
+    /// event. The key is persisted in the `ExternalSignalRequested` event and
+    /// reused verbatim on replay/recovery; `None` is legacy at-least-once.
     ///
     /// # Errors
     ///
@@ -8397,9 +8387,9 @@ mod tests {
 
     #[tokio::test]
     async fn signal_external_workflow_with_idempotency_threads_key_into_command() {
-        // Issue #521: the opt-in key must be carried on the emitted command so
-        // the worker persists it into ExternalSignalRequested and dedupes the
-        // target's signal insert.
+        // The opt-in key must be carried on the emitted command so the worker
+        // persists it into ExternalSignalRequested and dedupes the target's
+        // signal insert.
         let target = ExecutionId::new();
         let cmds = {
             let ctx = WorkflowContext::new_test();
@@ -8454,8 +8444,8 @@ mod tests {
 
     #[tokio::test]
     async fn signal_external_workflow_crash_recovery_reuses_recorded_key() {
-        // Issue #521 replay-safety: ExternalSignalRequested is durable but no
-        // terminal event follows (worker crashed mid-delivery). The re-dispatch
+        // Replay-safety: ExternalSignalRequested is durable but no terminal
+        // event follows (worker crashed mid-delivery). The re-dispatch
         // must reuse the *recorded* key, even if the current code passes a
         // different one — otherwise a code change could diverge an in-flight
         // delivery that the outbox later resolves.

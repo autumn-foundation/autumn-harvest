@@ -194,6 +194,11 @@ diverge an in-flight delivery. Omitting the key (the plain
 scope is shard-local, keyed on `(target_execution_id, idempotency_key)` — the same
 scope as [signal-with-start](../management-api.md).
 
+From a typed client, the `#[signal]` macro generates both a plain
+`signal_[name]` stub method and an idempotent `signal_[name]_idempotent` sibling
+that takes a trailing `idempotency_key: impl Into<Option<String>>` and returns
+`Ok(true)` when freshly queued / `Ok(false)` when the key deduplicated.
+
 ### Reason codes
 
 | `reason_code` | Meaning |
