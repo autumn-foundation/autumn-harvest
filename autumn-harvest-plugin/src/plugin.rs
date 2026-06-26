@@ -406,7 +406,7 @@ async fn start_harvest_runtime(
                                 wf.runbook_url,
                                 wf.severity,
                                 wf.sla,
-                                wf.retry_policy,
+                                wf.retry_policy.clone(),
                             )
                         })
                     })
