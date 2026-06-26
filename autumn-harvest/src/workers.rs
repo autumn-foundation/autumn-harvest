@@ -1033,6 +1033,9 @@ pub fn spawn_worker_heartbeat(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
+        // This shard's last-observed `drain_deadline_at`, used by
+        // `sync_drain_deadline` to detect a real change vs a stale re-read.
+        let mut last_drain_deadline_seen: Option<DateTime<Utc>> = None;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -1087,6 +1090,7 @@ pub fn spawn_worker_heartbeat(
                                 sync_drain_deadline(
                                     &mut conn,
                                     &registration.worker_id,
+                                    &mut last_drain_deadline_seen,
                                     &remote_drain_deadline,
                                 )
                                 .await;
@@ -1109,6 +1113,7 @@ pub fn spawn_worker_heartbeat(
                                         sync_drain_deadline(
                                             &mut conn,
                                             &registration.worker_id,
+                                            &mut last_drain_deadline_seen,
                                             &remote_drain_deadline,
                                         )
                                         .await;
@@ -1147,27 +1152,32 @@ pub fn spawn_worker_heartbeat(
 async fn sync_drain_deadline(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
+    // This heartbeat task's last-observed raw `drain_deadline_at` for its own
+    // shard row. Updated in place; lets the task detect a genuine change.
+    last_seen: &mut Option<DateTime<Utc>>,
     cell: &Mutex<Option<std::time::Instant>>,
 ) {
     if let Ok(Some(deadline)) = read_worker_drain_deadline(conn, worker_id).await {
+        // Change-detection merge across per-shard heartbeats (issue #522 review).
+        // A multi-shard worker runs one heartbeat per assigned shard, all sharing
+        // this `cell`. Push to the shared cell only when THIS shard's stored
+        // `drain_deadline_at` actually changed since we last observed it:
+        //   - A stale shard that recovers re-reads its unchanged (pre-update)
+        //     deadline, so it does NOT overwrite a newer value another shard
+        //     already applied.
+        //   - A deliberate operator change (extend OR shorten) lands on the
+        //     reachable shard rows; that is a real change here and IS applied,
+        //     so an explicit shorter deadline is honoured.
+        if *last_seen == Some(deadline) {
+            return;
+        }
+        *last_seen = Some(deadline);
         let remaining = deadline
             .signed_duration_since(Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO);
-        let candidate = std::time::Instant::now() + remaining;
         if let Ok(mut guard) = cell.lock() {
-            // Monotonic merge across per-shard heartbeats (issue #522 review).
-            // A multi-shard worker runs one heartbeat per assigned shard, all
-            // sharing this cell. If an operator extends the drain while a shard
-            // is unreachable, only the reachable shards' rows get the later
-            // `drain_deadline_at`; when the stale shard recovers, its heartbeat
-            // would otherwise read the old (earlier) deadline and overwrite the
-            // extension, making `drain_in_flight` stop waiting early. Only ever
-            // extend the shared deadline, never shorten it.
-            match *guard {
-                Some(existing) if existing >= candidate => {}
-                _ => *guard = Some(candidate),
-            }
+            *guard = Some(std::time::Instant::now() + remaining);
         }
     }
 }

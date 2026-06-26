@@ -7425,6 +7425,35 @@ impl Worker {
     /// (`run_with_listener`) byte-for-byte unchanged.
     #[allow(clippy::too_many_lines)]
     pub async fn run(&self, pool: &DbPool) {
+        // Refuse to start if ANY assigned shard is missing an exact pool entry
+        // (issue #522 review). Serving only the resolvable shards while the fleet
+        // row still advertises the full assignment list would report coverage for
+        // shards this worker cannot poll or heartbeat, leaving their work
+        // unclaimed behind a misleading fleet/health view. A missing assigned
+        // shard is a ShardedDbPool misconfiguration, so fail fast and loud rather
+        // than partially serving the configured set. (The no-sharded-pool / non-db
+        // paths map every assignment to the default pool, so nothing is missing.)
+        #[cfg(feature = "db")]
+        if let Some(sharded) = self.config.sharded_pool.as_ref() {
+            let missing: Vec<i32> = self
+                .config
+                .shard_assignments
+                .iter()
+                .filter(|shard| sharded.exact_pool_for(**shard).is_none())
+                .map(|shard| shard.as_i32())
+                .collect();
+            if !missing.is_empty() {
+                tracing::error!(
+                    worker_id = %self.config.worker_id,
+                    missing_shards = ?missing,
+                    "one or more shard_assignments are missing from the sharded_pool; refusing to \
+                     start this worker rather than advertising coverage for shards it cannot \
+                     serve — check your ShardedDbPool configuration"
+                );
+                return;
+            }
+        }
+
         // Resolve the set of (ShardId, DbPool) claim targets from the sharded
         // pool when available, deduplicating by ShardId.
         #[cfg(feature = "db")]
@@ -7443,30 +7472,16 @@ impl Worker {
                         .shard_assignments
                         .iter()
                         .filter(|shard| seen.insert(*shard))
-                        .filter_map(|shard| {
-                            // An assigned shard with no exact pool entry is a
-                            // configuration error: pool_for would silently fall
-                            // back to the default shard, so the worker would poll
-                            // and write its fleet row in the *default* database
-                            // while advertising coverage for the missing shard —
-                            // leaving real tasks on that shard unclaimed and fleet
-                            // views misleading (issue #522 review). Drop the
-                            // target instead of using the fallback pool so this
-                            // worker never claims for a shard it cannot reach.
-                            sharded.exact_pool_for(*shard).map_or_else(
-                                || {
-                                    tracing::error!(
-                                        worker_id = %self.config.worker_id,
-                                        shard_id = shard.as_i32(),
-                                        "shard_assignment refers to a shard not present in the \
-                                         sharded_pool; skipping its claim target to avoid polling \
-                                         the default shard under the wrong shard label — check \
-                                         your ShardedDbPool configuration"
-                                    );
-                                    None
-                                },
-                                |shard_pool| Some((*shard, shard_pool.clone())),
-                            )
+                        .map(|shard| {
+                            // Presence of an exact pool entry for every assigned
+                            // shard is guaranteed by the missing-shard guard at
+                            // run() entry, so this never falls back to the default
+                            // pool under the wrong shard label (issue #522 review).
+                            let shard_pool = sharded
+                                .exact_pool_for(*shard)
+                                .expect("assigned shard pool presence verified at run() entry")
+                                .clone();
+                            (*shard, shard_pool)
                         })
                         .collect()
                 },
@@ -7479,30 +7494,6 @@ impl Worker {
             .iter()
             .map(|shard| (*shard, pool.clone()))
             .collect();
-
-        // Refuse to start when shard assignments were configured but every one
-        // was dropped for lacking an exact pool entry above (issue #522 review).
-        // Falling through to the single-shard `[]` arm would silently poll and
-        // register against the *default* database while the assigned shards stay
-        // unserved — hiding the misconfiguration. This only triggers under a
-        // ShardedDbPool: the non-db / no-sharded-pool path maps every assignment
-        // to the default pool, so `shard_targets` is never empty when
-        // assignments are set.
-        if shard_targets.is_empty() && !self.config.shard_assignments.is_empty() {
-            tracing::error!(
-                worker_id = %self.config.worker_id,
-                shard_assignments = ?self
-                    .config
-                    .shard_assignments
-                    .iter()
-                    .map(|s| s.as_i32())
-                    .collect::<Vec<_>>(),
-                "every configured shard_assignment is missing from the sharded_pool; refusing to \
-                 start this worker rather than polling the default shard's database — check your \
-                 ShardedDbPool configuration"
-            );
-            return;
-        }
 
         // More than one distinct shard target → multi-shard loop.
         // One or zero targets (or single-pool fallback) → existing path.
