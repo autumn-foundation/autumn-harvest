@@ -4578,10 +4578,16 @@ async fn process_activity_task(
 
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting
     // metrics so that an Ok result above the cap is counted as Failed, not Completed.
+    // Issue #524: skip the cap when the offloader will handle the large payload —
+    // finalize_activity_completion routes through append_events_offloaded, so the
+    // result will be stored as a tiny reference envelope in harvest_events.
     let activity_result = match activity_result {
         Ok(output) if effective_result_cap > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-            if observed > effective_result_cap {
+            let offload_applies = registry
+                .payload_offloader()
+                .is_some_and(|o| observed > o.threshold());
+            if observed > effective_result_cap && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
                     "PayloadTooLarge",
