@@ -3470,10 +3470,7 @@ impl WorkflowContext {
                 ))?;
                 let payload_json = serde_json::to_value(&payload)?;
                 let observed = serde_json::to_string(&payload_json).map_or(0, |s| s.len() as u64);
-                if self.payload_max_signal > 0
-                    && observed > self.payload_max_signal
-                    && !self.offload_will_apply(observed)
-                {
+                if self.payload_max_signal > 0 && observed > self.payload_max_signal {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: crate::error::PayloadKind::SignalPayload,
                         observed_bytes: observed,

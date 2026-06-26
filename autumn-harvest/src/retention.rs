@@ -850,20 +850,25 @@ async fn run_shard_tick(
             // blob no longer referenced by a surviving execution. A blob still
             // referenced by e.g. a continue-as-new successor is left intact.
             // Issue #524.
-            if let Some(offloader) = &offloader {
-                for blob in &candidate_blob_refs {
-                    match crate::store::blob_key_still_referenced(&mut conn, &blob.blob_key).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if let Err(err) = offloader.store().delete(&blob.blob_key).await {
+            if let Some(offloader) = &offloader
+                && !candidate_blob_refs.is_empty()
+            {
+                let keys: Vec<String> =
+                    candidate_blob_refs.iter().map(|b| b.blob_key.clone()).collect();
+                match crate::store::batch_blob_keys_still_referenced(&mut conn, &keys).await {
+                    Ok(still_referenced) => {
+                        for blob in &candidate_blob_refs {
+                            if !still_referenced.contains(&blob.blob_key)
+                                && let Err(err) = offloader.store().delete(&blob.blob_key).await
+                            {
                                 // Row is already gone; a failed blob delete only leaks
                                 // storage (never a dangling reference). Log and continue.
                                 tracing::warn!(blob_key = %blob.blob_key, error = %err.0, "failed to delete offloaded blob during retention; leaving for a later sweep");
                             }
                         }
-                        Err(err) => {
-                            tracing::warn!(blob_key = %blob.blob_key, error = %err, "failed to check residual blob references; leaving blob intact");
-                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to batch-check residual blob references; leaving all blobs intact");
                     }
                 }
             }

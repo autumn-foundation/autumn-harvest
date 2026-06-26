@@ -231,15 +231,26 @@ pub async fn append_events_offloaded(
         all_refs.extend(refs);
     }
 
-    let inserted = diesel::insert_into(harvest_events::table)
-        .values(&rows)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-    if !all_refs.is_empty() {
-        insert_payload_refs(conn, exec_id, &all_refs).await?;
-    }
+    // Wrap the event INSERT and the ref INSERT in one transaction so that a
+    // failed ref INSERT cannot leave events with offload envelopes but no
+    // corresponding harvest_payload_refs rows (which would make those blobs
+    // permanently invisible to the GC sweep).
+    let inserted = conn
+        .transaction::<usize, crate::error::HarvestError, _>(|conn| {
+            async move {
+                let inserted = diesel::insert_into(harvest_events::table)
+                    .values(&rows)
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+                if !all_refs.is_empty() {
+                    insert_payload_refs(conn, exec_id, &all_refs).await?;
+                }
+                Ok(inserted)
+            }
+            .scope_boxed()
+        })
+        .await?;
 
     if let Some(last_event) = events.last() {
         crate::notify::notify_workflow_events_appended(
@@ -335,6 +346,33 @@ pub async fn blob_key_still_referenced(
         .optional()
         .map_err(crate::error::database_error)?;
     Ok(found.is_some())
+}
+
+/// Return the subset of `blob_keys` that are still referenced by at least one
+/// execution (issue #524).
+///
+/// Used by the retention sweep to batch-check all of a candidate's blobs in a
+/// single query rather than one query per blob, eliminating the N+1 pattern.
+#[cfg(feature = "db")]
+pub async fn batch_blob_keys_still_referenced(
+    conn: &mut AsyncPgConnection,
+    blob_keys: &[String],
+) -> HarvestResult<std::collections::HashSet<String>> {
+    use crate::schema::harvest_payload_refs::dsl;
+
+    if blob_keys.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let still_referenced: Vec<String> = dsl::harvest_payload_refs
+        .filter(dsl::blob_key.eq_any(blob_keys))
+        .select(dsl::blob_key)
+        .distinct()
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(still_referenced.into_iter().collect())
 }
 
 /// Fetch the raw (un-inflated) `data.last_completion_result` of an execution's
@@ -604,12 +642,13 @@ pub async fn load_history_with_codecs(
 pub async fn load_history_inflated(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<EventHistory> {
     use crate::models::HarvestEvent;
 
     let Some(offloader) = offloader else {
-        return load_history(conn, exec_id).await;
+        return load_history_with_codecs(conn, exec_id, codecs).await;
     };
 
     let rows: Vec<HarvestEvent> = harvest_events::table
@@ -621,7 +660,6 @@ pub async fn load_history_inflated(
 
     let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
 
-    let codecs = crate::payload_codec::PayloadCodecs::default();
     let mut events = Vec::with_capacity(rows.len());
     for row in rows {
         let mut data = row.event_data;
@@ -696,13 +734,10 @@ pub async fn load_history_since_inflated(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     from_event_id: i32,
+    codecs: &crate::payload_codec::PayloadCodecs,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<EventHistory> {
     use crate::models::HarvestEvent;
-
-    let Some(offloader) = offloader else {
-        return load_history_since(conn, exec_id, from_event_id).await;
-    };
 
     let rows: Vec<HarvestEvent> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
@@ -716,12 +751,17 @@ pub async fn load_history_since_inflated(
         .last()
         .map_or(from_event_id, |r| r.event_id.saturating_add(1));
 
-    let codecs = crate::payload_codec::PayloadCodecs::default();
     let mut events = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut data = row.event_data;
-        offloader.inflate_event_value(&mut data).await?;
-        events.push(codecs.decode_event(data)?);
+    if let Some(offloader) = offloader {
+        for row in rows {
+            let mut data = row.event_data;
+            offloader.inflate_event_value(&mut data).await?;
+            events.push(codecs.decode_event(data)?);
+        }
+    } else {
+        for row in rows {
+            events.push(codecs.decode_event(row.event_data)?);
+        }
     }
 
     Ok(EventHistory {
