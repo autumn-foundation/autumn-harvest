@@ -1060,10 +1060,12 @@ pub fn spawn_worker_heartbeat(
     // operator-supplied drain_deadline_at, refreshed on every heartbeat tick
     // so that extended deadlines are picked up by drain_in_flight.
     remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
-    // Raw `drain_deadline_at` values already applied to `remote_drain_deadline`,
-    // shared across this worker's per-shard heartbeat tasks so a stale re-read
-    // can be told apart from a genuine new operator command (issue #522 review).
-    drain_deadline_applied: Arc<Mutex<std::collections::HashSet<DateTime<Utc>>>>,
+    // Maximum `drain_deadline_at` value applied to `remote_drain_deadline` so far,
+    // shared across this worker's per-shard heartbeat tasks. Using the maximum
+    // (rather than a full set) prevents a shard whose row was never updated from
+    // the prior deadline from reverting the cell: stale shorter values are rejected
+    // while genuine extensions (newer, later values) always advance the cell.
+    drain_deadline_max: Arc<Mutex<Option<DateTime<Utc>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
@@ -1121,7 +1123,7 @@ pub fn spawn_worker_heartbeat(
                                 sync_drain_deadline(
                                     &mut conn,
                                     &registration.worker_id,
-                                    &drain_deadline_applied,
+                                    &drain_deadline_max,
                                     &remote_drain_deadline,
                                 )
                                 .await;
@@ -1144,7 +1146,7 @@ pub fn spawn_worker_heartbeat(
                                         sync_drain_deadline(
                                             &mut conn,
                                             &registration.worker_id,
-                                            &drain_deadline_applied,
+                                            &drain_deadline_max,
                                             &remote_drain_deadline,
                                         )
                                         .await;
@@ -1184,42 +1186,41 @@ pub fn spawn_worker_heartbeat(
 /// shared effective-deadline cell, recording it as applied when so (issue #522
 /// review).
 ///
-/// Returns `true` for a deadline never applied by any of this worker's per-shard
-/// heartbeats — a genuine operator command (the initial drain, or an
-/// extend/shorten that reached only this shard's row because another shard was
-/// unreachable) — which must be applied even on a shard's first observation
-/// while the cell is already set. Returns `false` for a value some shard already
-/// applied: either the current effective deadline, or a stale value a lagging
-/// shard is only now catching up to, which must not revert a newer value.
+/// Returns `true` when `deadline` is strictly greater than the maximum deadline
+/// applied so far (or when no deadline has been applied yet), advancing `max` in
+/// the process.  Returns `false` for equal or earlier values, which are either
+/// idempotent re-observations of the current deadline or stale values from a
+/// shard row that was not updated when the operator last changed the deadline.
 ///
-/// The one value this cannot re-apply is an operator re-issuing the exact same
-/// absolute instant after moving away from it; re-using an identical past
-/// deadline is implausible and a benign no-op.
-// Internal helper over the worker's own fixed-hasher set; no need to generalize.
-#[allow(clippy::implicit_hasher)]
-fn classify_drain_deadline(
-    applied: &mut std::collections::HashSet<DateTime<Utc>>,
-    deadline: DateTime<Utc>,
-) -> bool {
-    applied.insert(deadline)
+/// Using the strict-max rule prevents a lagging shard from reverting the shared
+/// drain-deadline cell: if shard A was unreachable when the operator extended
+/// T1 → T2 and only A's row still holds T1, A's heartbeat will correctly reject
+/// T1 (T1 < T2 = current max).  Operator-driven shortening is not reflected in
+/// the in-process cell, but the local `shutdown_timeout` fallback still bounds
+/// the drain, and an operator who needs a hard stop can send SIGTERM.
+fn classify_drain_deadline(max: &mut Option<DateTime<Utc>>, deadline: DateTime<Utc>) -> bool {
+    if max.is_none_or(|m| deadline > m) {
+        *max = Some(deadline);
+        true
+    } else {
+        false
+    }
 }
 
-// Internal helper over the worker's own fixed-hasher set; no need to generalize.
-#[allow(clippy::implicit_hasher)]
 async fn sync_drain_deadline(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
-    // Raw `drain_deadline_at` values already applied to `cell` by any of this
-    // worker's per-shard heartbeat tasks (issue #522 review). Shared so a value
-    // can be classified across shards rather than per-heartbeat.
-    applied: &Mutex<std::collections::HashSet<DateTime<Utc>>>,
+    // Maximum `drain_deadline_at` value applied to `cell` so far, shared across
+    // this worker's per-shard heartbeat tasks.  A new deadline is applied only
+    // when it is strictly greater than the current max (issue #522 review).
+    max_applied: &Mutex<Option<DateTime<Utc>>>,
     cell: &Mutex<Option<std::time::Instant>>,
 ) {
     if let Ok(Some(deadline)) = read_worker_drain_deadline(conn, worker_id).await {
-        let Ok(mut applied_guard) = applied.lock() else {
+        let Ok(mut max_guard) = max_applied.lock() else {
             return;
         };
-        if !classify_drain_deadline(&mut applied_guard, deadline) {
+        if !classify_drain_deadline(&mut max_guard, deadline) {
             return;
         }
         let remaining = deadline
@@ -1227,9 +1228,9 @@ async fn sync_drain_deadline(
             .to_std()
             .unwrap_or(Duration::ZERO);
         let candidate = std::time::Instant::now() + remaining;
-        // Update the cell while still holding `applied`, so two shards observing
+        // Update the cell while still holding `max_guard`, so two shards observing
         // distinct new deadlines concurrently can't reorder their writes (lock
-        // order applied→cell is the only place both are held).
+        // order max_applied→cell is the only place both are held).
         if let Ok(mut guard) = cell.lock() {
             *guard = Some(candidate);
         }
