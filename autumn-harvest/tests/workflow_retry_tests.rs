@@ -141,7 +141,7 @@ impl MetricsRecorder for RecordingMetrics {
 
 // ── Shared state for stateful handlers ────────────────────────────────────
 
-/// Shared counter state — passed into worker via HandlerRegistry shared state,
+/// Shared counter state — passed into worker via `HandlerRegistry` shared state,
 /// accessed inside workflow handlers via `ctx.state::<Arc<CallCounter>>()`.
 #[derive(Debug, Default)]
 struct CallCounter {
@@ -394,7 +394,7 @@ async fn get_history(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<
         .events
 }
 
-/// Get execution count for a workflow_id (all attempts).
+/// Get execution count for a `workflow_id` (all attempts).
 async fn count_by_workflow_id(conn: &mut AsyncPgConnection, workflow_id: &str) -> i64 {
     harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
@@ -417,7 +417,7 @@ async fn wait_for_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId, stat
     panic!("execution {exec_id} never reached {states:?}; current state: {state}");
 }
 
-/// Wait until any execution with the given workflow_id is in one of the given states.
+/// Wait until any execution with the given `workflow_id` is in one of the given states.
 async fn wait_for_any_state(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
@@ -481,7 +481,7 @@ fn workflow_info_default_retry_policy_is_none() {
 #[test]
 fn workflow_schedule_with_retry_policy_sets_field() {
     let policy = RetryPolicy::exponential(3, Duration::from_secs(1));
-    let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_retry_policy(policy.clone());
+    let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_retry_policy(policy);
     assert!(sched.retry_policy.is_some());
 }
 
@@ -490,8 +490,8 @@ fn workflow_schedule_with_retry_policy_sets_field() {
 /// AC #1: Workflow fails on attempt 1 (transient error), succeeds on attempt 2.
 /// - Final execution state: COMPLETED.
 /// - Exactly one `harvest.workflow.retries` metric increment.
-/// - The retry execution has attempt=2 and retry_of_exec_id pointing to the first run.
-/// - The failed run's history ends with WorkflowFailed + WorkflowRetryScheduled.
+/// - The retry execution has attempt=2 and `retry_of_exec_id` pointing to the first run.
+/// - The failed run's history ends with `WorkflowFailed` + `WorkflowRetryScheduled`.
 #[tokio::test]
 async fn workflow_retries_on_transient_failure_and_succeeds() {
     let (url, _c) = setup().await;
@@ -585,8 +585,8 @@ async fn workflow_retries_on_transient_failure_and_succeeds() {
     );
 }
 
-/// AC #2: max_attempts exhausted — final run FAILED, schedule counter incremented exactly once.
-/// A workflow with max_attempts=2 that always fails should produce 2 FAILED executions,
+/// AC #2: `max_attempts` exhausted — final run FAILED, schedule counter incremented exactly once.
+/// A workflow with `max_attempts=2` that always fails should produce 2 FAILED executions,
 /// 1 retry metric, and 1 schedule failure counter increment (for the exhausted chain).
 #[tokio::test]
 async fn workflow_retry_exhaustion_counts_as_one_failure() {
@@ -837,7 +837,7 @@ async fn cancelled_workflow_is_not_retried() {
     );
 }
 
-/// AC #5: Server ceiling clamps a misconfigured max_attempts.
+/// AC #5: Server ceiling clamps a misconfigured `max_attempts`.
 #[test]
 fn server_ceiling_clamps_max_attempts() {
     // Simulate ceiling clamping: if policy.max_attempts > ceiling, it should be clamped.
@@ -865,8 +865,8 @@ fn server_ceiling_clamps_max_attempts() {
     assert_eq!(effective_no_ceiling, 100);
 }
 
-/// AC #6: Retry run has fresh history, same workflow_id, and describe API
-/// surfaces workflow_attempt and retry_of_exec_id.
+/// AC #6: Retry run has fresh history, same `workflow_id`, and describe API
+/// surfaces `workflow_attempt` and `retry_of_exec_id`.
 #[tokio::test]
 async fn retry_run_has_fresh_history_and_correct_linkage() {
     let (url, _c) = setup().await;
