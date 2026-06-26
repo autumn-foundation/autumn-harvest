@@ -130,7 +130,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!(
         "../../autumn-harvest/migrations/20260618000000_harvest_workflow_list_keyset_index/up.sql"
-    )
+    ),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 type HarvestApiApp = axum::Router;

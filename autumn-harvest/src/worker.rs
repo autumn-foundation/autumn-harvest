@@ -2403,6 +2403,9 @@ async fn persist_workflow_failure(
                     if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_at))) =
                         (execution, retry_fire_info)
                     {
+                        // The retry execution gets its own workflow_id (rid.to_string()) so
+                        // the original FAILED row is never sealed as CONTINUED_AS_NEW.
+                        // Callers follow the chain via retry_of_exec_id.
                         let retry_workflow_id = rid.to_string();
                         let retry_params = crate::execution::StartWorkflowParams {
                             workflow_name: &exec_ref.workflow_name,
@@ -3914,6 +3917,15 @@ async fn create_detached_child_executions(
                     w.retry_policy.clone(),
                 )
             });
+        // Clamp the detached child's retry policy by the server-side ceiling (issue #523).
+        // Detached children bypass StartWorkflowParams where the ceiling is normally applied,
+        // so we apply it here before serializing the policy to the execution row.
+        let detached_retry_policy = detached_retry_policy.map(|mut p| {
+            if let Some(ceiling) = registry.max_workflow_attempts_ceiling {
+                p.max_attempts = p.max_attempts.min(ceiling);
+            }
+            p
+        });
         let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
         let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
         let child_row = NewWorkflowExecution {

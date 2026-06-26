@@ -443,6 +443,39 @@ async fn wait_for_any_state(
     panic!("no execution with workflow_id={workflow_id} ever reached {states:?}");
 }
 
+/// Wait until a retry execution (`retry_of_exec_id = original_exec_id`) reaches
+/// one of the given states and return its `ExecutionId`.
+///
+/// The retry run has its own unique `workflow_id` (its UUID stringified) so it
+/// cannot be found by polling the original `workflow_id`; poll via the
+/// `retry_of_exec_id` FK instead.
+async fn wait_for_retry_state(
+    conn: &mut AsyncPgConnection,
+    original_exec_id: ExecutionId,
+    states: &[&str],
+) -> ExecutionId {
+    for _ in 0..400 {
+        let rows: Vec<(uuid::Uuid, String)> = harvest_workflow_executions::table
+            .filter(
+                harvest_workflow_executions::retry_of_exec_id.eq(Some(original_exec_id.as_uuid())),
+            )
+            .select((
+                harvest_workflow_executions::id,
+                harvest_workflow_executions::state,
+            ))
+            .load(conn)
+            .await
+            .expect("load retry executions");
+        for (id, state) in &rows {
+            if states.contains(&state.as_str()) {
+                return ExecutionId::from_uuid(*id);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no retry execution with retry_of_exec_id={original_exec_id} ever reached {states:?}");
+}
+
 // ── Unit tests (compile-time assertions) ──────────────────────────────────
 
 /// `METRIC_WORKFLOW_RETRIES` must be defined with the expected value.
@@ -535,8 +568,10 @@ async fn workflow_retries_on_transient_failure_and_succeeds() {
     });
 
     // Wait for the retry execution to reach COMPLETED (on attempt 2).
+    // The retry has its own unique workflow_id (its exec UUID), so look it up
+    // by the retry_of_exec_id FK rather than the original workflow_id.
     let mut check = connect(&url).await;
-    let completed_exec = wait_for_any_state(&mut check, workflow_id, &["COMPLETED"]).await;
+    let completed_exec = wait_for_retry_state(&mut check, exec_id, &["COMPLETED"]).await;
 
     worker.shutdown();
     let _ = worker_handle.await;
@@ -577,11 +612,11 @@ async fn workflow_retries_on_transient_failure_and_succeeds() {
         "exactly one harvest.workflow.retries increment expected"
     );
 
-    // Exactly 2 executions exist for the same workflow_id.
+    // The original execution (FAILED) still has its original workflow_id.
     assert_eq!(
         count_by_workflow_id(&mut check, workflow_id).await,
-        2,
-        "two executions must exist: the original (FAILED) and the retry (COMPLETED)"
+        1,
+        "the original execution is the only one with the original workflow_id"
     );
 }
 
@@ -909,8 +944,10 @@ async fn retry_run_has_fresh_history_and_correct_linkage() {
         let _ = tokio::time::timeout(Duration::from_secs(20), worker_ref.run(&pool)).await;
     });
 
+    // The retry has its own unique workflow_id (its exec UUID), so find it
+    // via retry_of_exec_id FK rather than the original workflow_id.
     let mut check = connect(&url).await;
-    let completed_exec = wait_for_any_state(&mut check, workflow_id, &["COMPLETED"]).await;
+    let completed_exec = wait_for_retry_state(&mut check, original_exec_id, &["COMPLETED"]).await;
 
     worker.shutdown();
     let _ = worker_handle.await;
@@ -926,16 +963,21 @@ async fn retry_run_has_fresh_history_and_correct_linkage() {
     // Retry run has attempt = 2.
     assert_eq!(get_attempt(&mut check, completed_exec).await, 2);
 
-    // Retry run shares the same workflow_id.
+    // Retry run has its own distinct workflow_id (its UUID, not the original's).
     let retry_workflow_id: String = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::id.eq(completed_exec.as_uuid()))
         .select(harvest_workflow_executions::workflow_id)
         .first(&mut check)
         .await
         .expect("load workflow_id");
-    assert_eq!(
+    assert_ne!(
         retry_workflow_id, workflow_id,
-        "retry run must have the same workflow_id as the original"
+        "retry run must have its own workflow_id distinct from the original"
+    );
+    assert_eq!(
+        retry_workflow_id,
+        completed_exec.as_uuid().to_string(),
+        "retry run workflow_id must equal its own exec UUID (rid.to_string())"
     );
 
     // Retry run has its own history (starts with WorkflowStarted, only one).

@@ -124,6 +124,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     // schedule_id column + carryover index (issue #488)
     include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 // ── Domain types ──────────────────────────────────────────────────────────────

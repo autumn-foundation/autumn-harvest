@@ -180,7 +180,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     // enforce_timeouts_once now scans harvest_debounce (issue #499); include the
     // migration so the timeout pass doesn't fail with "relation does not exist".
-    include_str!("../../autumn-harvest/migrations/20260618000001_harvest_debounce/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260618000001_harvest_debounce/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 type HarvestApiApp = axum::Router;
 
