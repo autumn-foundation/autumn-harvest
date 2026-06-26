@@ -12839,11 +12839,19 @@ async fn trigger_schedule_now(
             let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
             (key, Some(policy.limit))
         });
-    let manual_trigger_retry_policy = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .and_then(|info| info.retry_policy.clone());
+    // Schedule-level retry_policy takes precedence over the workflow-type default,
+    // mirroring the automated tick and backfill paths (scheduler.rs).
+    let manual_trigger_retry_policy = schedule
+        .retry_policy
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .or_else(|| {
+            runtime
+                .registry
+                .workflows
+                .get(&workflow_name)
+                .and_then(|info| info.retry_policy.clone())
+        });
 
     let result = start_or_load_workflow_execution(
         &mut exec_conn,

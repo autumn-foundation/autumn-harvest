@@ -9,7 +9,7 @@ use croner::Cron;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
-use diesel::{BoolExpressionMethods, ExpressionMethods, TextExpressionMethods};
+use diesel::{BoolExpressionMethods, ExpressionMethods};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
@@ -1728,15 +1728,19 @@ async fn tick_workflow_schedules(
     Ok(())
 }
 
-/// Cancel the oldest scheduled RUNNING executions for `workflow_name`, up to `max_to_cancel`.
+/// Cancel the oldest scheduled RUNNING executions for `workflow_name` under `schedule_id`,
+/// up to `max_to_cancel`.
 ///
-/// Only cancels executions with a `sched:` workflow ID so operator-triggered manual runs are
-/// not inadvertently cancelled. Orders by `started_at ASC` so the oldest executions are
-/// cancelled first, preserving the most recent progress.
+/// Filters by `schedule_id` rather than the `sched:` workflow-id prefix so that workflow-retry
+/// executions (which carry a UUID `workflow_id` but still link back to the originating schedule via
+/// the `schedule_id` FK) are included, while operator-triggered manual runs (which have
+/// `schedule_id = NULL`) are not inadvertently cancelled.
+/// Orders by `started_at ASC` so the oldest executions are cancelled first.
 #[cfg(feature = "db")]
 async fn cancel_in_flight_runs(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
+    schedule_id: uuid::Uuid,
     reason: &str,
     max_to_cancel: u32,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
@@ -1745,7 +1749,7 @@ async fn cancel_in_flight_runs(
 
     let running_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .filter(harvest_workflow_executions::workflow_id.like("sched:%"))
+        .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .order(harvest_workflow_executions::started_at.asc())
         .select(harvest_workflow_executions::id)
@@ -1773,14 +1777,17 @@ async fn cancel_in_flight_runs(
     Ok(count)
 }
 
-/// Terminate the oldest scheduled RUNNING executions for `workflow_name`, up to `max_to_terminate`.
+/// Terminate the oldest scheduled RUNNING executions for `workflow_name` under `schedule_id`,
+/// up to `max_to_terminate`.
 ///
-/// Only terminates executions with a `sched:` workflow ID. Orders by `started_at ASC` so the
-/// oldest executions are terminated first.
+/// Filters by `schedule_id` (same rationale as `cancel_in_flight_runs`) so workflow-retry
+/// executions are included and manual-trigger runs (`schedule_id` = NULL) are excluded.
+/// Orders by `started_at ASC` so the oldest executions are terminated first.
 #[cfg(feature = "db")]
 async fn terminate_in_flight_runs(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
+    schedule_id: uuid::Uuid,
     reason: &str,
     max_to_terminate: u32,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
@@ -1789,7 +1796,7 @@ async fn terminate_in_flight_runs(
 
     let active_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .filter(harvest_workflow_executions::workflow_id.like("sched:%"))
+        .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .order(harvest_workflow_executions::started_at.asc())
         .select(harvest_workflow_executions::id)
@@ -2549,6 +2556,7 @@ async fn tick_one_workflow_schedule(
                 let cancelled = cancel_in_flight_runs(
                     conn,
                     wf_name,
+                    schedule.id,
                     "overlap policy CancelOther: new firing",
                     needed,
                     metrics.as_ref(),
@@ -2564,6 +2572,7 @@ async fn tick_one_workflow_schedule(
                 let terminated = terminate_in_flight_runs(
                     conn,
                     wf_name,
+                    schedule.id,
                     "overlap policy TerminateOther: new firing",
                     needed,
                     metrics.as_ref(),
