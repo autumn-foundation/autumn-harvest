@@ -2395,7 +2395,12 @@ async fn persist_workflow_failure(
                     update_workflow_execution_failed(conn, exec_id, worker_id, &error, nd_details)
                         .await?;
                     queue::fail_task(conn, task_id, &error).await?;
-                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    // The parent-close cascade is deferred until after the retry decision:
+                    // it must not close detached children on a transient failure that will
+                    // be retried (the retried parent may later succeed). Gated on
+                    // `!retry_committed` below, mirroring the Failed completion triggers.
+                    let mut deferred: Vec<crate::completion_trigger::DeferredTriggerStart> =
+                        Vec::new();
 
                     // Start the retry execution atomically inside this failure transaction.
                     // Use the retry exec_id as workflow_id so the original FAILED row is
@@ -2478,10 +2483,13 @@ async fn persist_workflow_failure(
                         }
                     }
 
-                    // Only evaluate Failed completion triggers on the final failure.
-                    // Triggers must not fire for a transient failure that will be retried —
+                    // Only run the parent-close cascade and evaluate Failed completion
+                    // triggers on the final failure. Neither must fire for a transient
+                    // failure that will be retried — detached children must stay alive and
                     // compensating/alerting workflows should only run when the chain exhausts.
                     if !retry_committed {
+                        let cascade = apply_parent_close_cascade(conn, exec_id).await?;
+                        deferred.extend(cascade);
                         let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                             conn,
                             exec_id,
