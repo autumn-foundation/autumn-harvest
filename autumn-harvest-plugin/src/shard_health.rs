@@ -1248,7 +1248,7 @@ mod tests {
     }
 
     /// An empty build-compatibility set: only exact-build and legacy-worker
-    /// (empty build_id) rules apply, matching a deployment with no declared
+    /// (empty `build_id`) rules apply, matching a deployment with no declared
     /// cross-build compatibility.
     fn empty_compat() -> autumn_harvest::build_routing::BuildCompatibilitySet {
         autumn_harvest::build_routing::BuildCompatibilitySet::default()
