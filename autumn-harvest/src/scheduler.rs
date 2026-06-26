@@ -789,6 +789,10 @@ pub async fn trigger_unified_dag(
             sla: None,
             schedule_id: None, // manual/API DAG trigger, not a scheduler-fired slot
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1239,6 +1243,10 @@ async fn upsert_workflow_schedule(
             // Catchup policy columns (issue #484).
             dsl::catchup_policy.eq(ws.catchup_policy.and_then(|p| p.to_db_columns().0)),
             dsl::catchup_window_secs.eq(ws.catchup_policy.and_then(|p| p.to_db_columns().1)),
+            dsl::retry_policy.eq(ws
+                .retry_policy
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok())),
         ))
         .execute(conn)
         .await
@@ -2786,6 +2794,13 @@ async fn tick_one_workflow_schedule(
                 // Logical slot = the slot encoded in workflow_id (original_slot), so
                 // carryover ordering and the migration backfill agree (issue #488).
                 scheduled_for: Some(*original_slot),
+                workflow_attempt: 1,
+                workflow_retry_policy: schedule
+                    .retry_policy
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
             },
         )
         .await;
@@ -3694,6 +3709,13 @@ async fn drain_buffered_schedule_runs(
                     sla,
                     schedule_id: Some(schedule.id),
                     scheduled_for: Some(scheduled_for),
+                    workflow_attempt: 1,
+                    workflow_retry_policy: schedule
+                        .retry_policy
+                        .as_ref()
+                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: None,
                 },
             )
             .await;

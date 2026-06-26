@@ -366,7 +366,8 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowExecutionTimedOut { .. }
                 | WorkflowEvent::WorkflowExecutionPaused { .. }
                 | WorkflowEvent::WorkflowExecutionResumed { .. }
-                | WorkflowEvent::WorkflowRedriven { .. } => {
+                | WorkflowEvent::WorkflowRedriven { .. }
+                | WorkflowEvent::WorkflowRetryScheduled { .. } => {
                     self.handle_workflow_event(event)?;
                 }
                 WorkflowEvent::ActivityScheduled { .. }
@@ -500,6 +501,16 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note over WF: Redriven (dlq: {dead_letter_id}){detail}"
+                )?;
+            }
+            WorkflowEvent::WorkflowRetryScheduled {
+                attempt,
+                retry_exec_id,
+                ..
+            } => {
+                writeln!(
+                    self.out,
+                    "    Note over WF: Retry Scheduled (attempt: {attempt}, next: {retry_exec_id})"
                 )?;
             }
             _ => unreachable!(),

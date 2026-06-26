@@ -226,6 +226,7 @@ fn workflow_info() -> WorkflowInfo {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 

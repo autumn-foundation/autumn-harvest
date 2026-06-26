@@ -665,6 +665,10 @@ async fn workflow_and_activity_metrics_are_recorded() {
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -723,6 +727,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "metrics_activity",
@@ -887,6 +892,10 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         })
         .execute(&mut conn)
         .await
@@ -941,6 +950,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
         autumn_harvest::context::empty_shared_state(),
@@ -1018,6 +1028,10 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         })
         .execute(&mut conn)
         .await
@@ -1079,6 +1093,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
         autumn_harvest::context::empty_shared_state(),
@@ -1162,6 +1177,10 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         })
         .execute(&mut conn)
         .await
@@ -1224,6 +1243,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }],
             vec![],
         )
@@ -1305,6 +1325,10 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 sla_deadline_at: None,
                 schedule_id: None,
                 scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
             })
             .execute(&mut conn)
             .await
@@ -1370,6 +1394,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "history_cap_never_finishing_child",
@@ -1390,6 +1415,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![ActivityInfo {
@@ -1524,6 +1550,10 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         })
         .execute(&mut conn)
         .await
@@ -1585,6 +1615,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "history_cap_always_failing_local",
@@ -1702,6 +1733,10 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         })
         .execute(&mut conn)
         .await
@@ -1758,6 +1793,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "history_cap_never_finishing_child",
@@ -1778,6 +1814,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![],
@@ -1887,6 +1924,10 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         })
         .execute(&mut conn)
         .await
@@ -1943,6 +1984,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "child_breaches_history_cap_inline",
@@ -1963,6 +2005,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![ActivityInfo {
@@ -2203,6 +2246,10 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -2270,6 +2317,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
         autumn_harvest::context::empty_shared_state(),
@@ -2409,6 +2457,10 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -2476,6 +2528,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
         autumn_harvest::context::empty_shared_state(),
@@ -2558,6 +2611,10 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -2667,6 +2724,10 @@ async fn oldest_pending_age_excludes_paused_executions() {
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -2766,6 +2827,10 @@ async fn oldest_pending_age_excludes_rate_limited_tasks() {
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -2899,6 +2964,10 @@ async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)

@@ -265,6 +265,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -284,6 +285,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -303,6 +305,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: Some(target_schema_fn),
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -325,6 +328,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -344,6 +348,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -363,6 +368,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -547,6 +553,10 @@ async fn test_trigger_evaluations_same_shard() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -661,6 +671,10 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -770,6 +784,10 @@ async fn test_trigger_input_mapping_static_and_projection() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -846,6 +864,10 @@ async fn test_trigger_input_mapping_static_and_projection() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -944,6 +966,10 @@ async fn test_trigger_state_matching_and_deduplication() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1119,6 +1145,10 @@ async fn test_trigger_cross_shard() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1222,6 +1252,10 @@ async fn test_completion_trigger_via_worker_run() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1339,6 +1373,10 @@ async fn test_trigger_with_custom_queue() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1524,6 +1562,10 @@ async fn test_trigger_outbox_retry_and_sweep() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1737,6 +1779,10 @@ async fn test_trigger_cross_shard_queue_preservation() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -2083,6 +2129,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -2101,6 +2148,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -2200,6 +2248,10 @@ async fn test_trigger_evaluations_schema_validation() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -2271,6 +2323,10 @@ async fn test_trigger_evaluations_schema_validation() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -2384,6 +2440,10 @@ async fn test_trigger_emits_fire_metric_outcomes() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await

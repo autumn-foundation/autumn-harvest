@@ -441,6 +441,10 @@ async fn start_harvest_runtime(
                         sla,
                         schedule_id: None,
                         scheduled_for: None,
+                        workflow_attempt: 1,
+                        workflow_retry_policy: None,
+                        retry_of_exec_id: None,
+                        max_workflow_attempts_ceiling: None,
                     };
 
                     let Some(harvest_db) = harvest_db else {
@@ -740,6 +744,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }
     }
 

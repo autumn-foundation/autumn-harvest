@@ -562,6 +562,10 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -622,6 +626,10 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         sla: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -807,6 +815,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "child_echo_workflow",
@@ -827,6 +836,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![],
@@ -855,6 +865,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "child_continue_as_new_workflow",
@@ -875,6 +886,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![],
@@ -1357,6 +1369,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -1483,6 +1496,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -1622,6 +1636,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -1779,6 +1794,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "checkpointed_import",
@@ -2171,6 +2187,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                     input_schema: None,
                     output_schema: None,
                     error_schema: None,
+                    retry_policy: None,
                 }],
                 vec![ActivityInfo {
                     name: "slow_activity",
@@ -2331,6 +2348,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                     input_schema: None,
                     output_schema: None,
                     error_schema: None,
+                    retry_policy: None,
                 }],
                 vec![],
             )),
@@ -2599,6 +2617,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "child_alpha",
@@ -2619,6 +2638,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "child_beta",
@@ -2639,6 +2659,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![],
@@ -2773,6 +2794,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }])
         .activities(vec![ActivityInfo {
             name: "stateful_activity",
@@ -3287,6 +3309,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -3413,6 +3436,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -3552,6 +3576,10 @@ async fn insert_named_workflow_execution(
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -3857,6 +3885,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -3969,6 +3998,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -4100,6 +4130,10 @@ mod reuse_policy_helpers {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         }
     }
 
@@ -4888,6 +4922,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -5010,6 +5045,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -5119,6 +5155,7 @@ async fn workflow_schedule_pause_and_resume() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -5381,6 +5418,10 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -5407,6 +5448,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -5543,6 +5585,10 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -5569,6 +5615,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }],
             vec![],
         ))
@@ -5671,6 +5718,7 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }])
         .workflow_schedule(ws)
         .worker(WorkerConfig::default())
@@ -6032,6 +6080,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -6184,6 +6233,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -6320,6 +6370,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "send_email",
@@ -6471,6 +6522,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -6545,6 +6597,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -6628,6 +6681,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -6715,6 +6769,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -6797,6 +6852,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -6883,6 +6939,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -7031,6 +7088,10 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -7493,6 +7554,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "retry_context_activity",

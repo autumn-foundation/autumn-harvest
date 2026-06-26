@@ -201,6 +201,10 @@ async fn start_workflow(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -286,6 +290,7 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -312,6 +317,7 @@ fn wf_info_with_concurrency(
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -404,6 +410,10 @@ async fn insert_detached_child_execution(
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         })
         .execute(conn)
         .await
@@ -997,6 +1007,10 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         })
         .execute(&mut conn)
         .await

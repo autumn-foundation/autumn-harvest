@@ -7300,6 +7300,10 @@ async fn start_workflow(
             sla: effective_sla,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await;
@@ -7983,6 +7987,10 @@ async fn batch_start_workflows(
                     sla,
                     schedule_id: None,
                     scheduled_for: None,
+                    workflow_attempt: 1,
+                    workflow_retry_policy: None,
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: None,
                 },
                 false,
                 item_reject_fresh,
@@ -12809,6 +12817,10 @@ async fn trigger_schedule_now(
             // fires and backfills carry the lineage; ad-hoc operator fires do not.
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await;
@@ -21298,6 +21310,7 @@ mod tests {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }],
             vec![],
         ));
@@ -22096,6 +22109,10 @@ mod tests {
                 sla: None,
                 schedule_id: None,
                 scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
             },
         )
         .await
@@ -22797,6 +22814,7 @@ mod tests {
                     input_schema: Some(my_input_schema),
                     output_schema: None,
                     error_schema: None,
+                    retry_policy: None,
                 },
                 autumn_harvest::WorkflowInfo {
                     name: "no_schema_wf",
@@ -22816,6 +22834,7 @@ mod tests {
                     input_schema: None,
                     output_schema: None,
                     error_schema: None,
+                    retry_policy: None,
                 },
             ],
             vec![],

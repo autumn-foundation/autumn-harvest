@@ -504,6 +504,10 @@ mod db_tests {
                 sla_deadline_at: None,
                 schedule_id: None,
                 scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
             })
             .execute(conn)
             .await

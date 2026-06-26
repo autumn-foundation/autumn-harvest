@@ -242,6 +242,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "telem_child_wf",
@@ -262,6 +263,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![
@@ -392,6 +394,10 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     sla: None,
                     schedule_id: None,
                     scheduled_for: None,
+                    workflow_attempt: 1,
+                    workflow_retry_policy: None,
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: None,
                 },
             )
             .await

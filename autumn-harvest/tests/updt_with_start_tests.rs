@@ -347,6 +347,10 @@ mod db_tests {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         };
         start_or_load_workflow_execution(&mut conn, first_params)
             .await
@@ -413,6 +417,10 @@ mod db_tests {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         };
         start_or_load_workflow_execution(&mut conn, start_params)
             .await

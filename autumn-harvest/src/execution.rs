@@ -112,6 +112,21 @@ pub struct StartWorkflowParams<'a> {
     /// (overlap / catch-up / backfill) can't roll an incremental cursor backward.
     /// `None` for manual starts and any non-scheduled call site.
     pub scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
+    /// Attempt number for this execution in the retry chain (issue #523). 1 = first attempt.
+    /// Callers starting a fresh workflow pass `1`. The retry hook passes `workflow_attempt + 1`.
+    pub workflow_attempt: u32,
+    /// Effective retry policy frozen at start time (issue #523).
+    ///
+    /// Precedence: per-start override > schedule-default > workflow-type default, then clamped
+    /// by `max_workflow_attempts_ceiling`. `None` = no auto-retry for this execution.
+    pub workflow_retry_policy: Option<crate::policy::RetryPolicy>,
+    /// ID of the prior failed execution this run retries (issue #523). `None` for first attempt.
+    pub retry_of_exec_id: Option<uuid::Uuid>,
+    /// Server-side ceiling on `retry_policy.max_attempts` (issue #523).
+    ///
+    /// When `Some(n)`, the effective max attempts = `min(policy.max_attempts, n)`.
+    /// Typically sourced from `BuiltHarvest::max_workflow_attempts`.
+    pub max_workflow_attempts_ceiling: Option<u32>,
 }
 
 impl StartWorkflowParams<'_> {
@@ -412,6 +427,16 @@ pub async fn start_or_load_workflow_execution_collect(
             .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
         schedule_id: request.schedule_id,
         scheduled_for: request.scheduled_for,
+        workflow_attempt: request.workflow_attempt.cast_signed(),
+        workflow_retry_policy: request.workflow_retry_policy.as_ref().map(|p| {
+            // Clamp max_attempts to ceiling before persisting.
+            let mut p = p.clone();
+            if let Some(ceiling) = request.max_workflow_attempts_ceiling {
+                p.max_attempts = p.max_attempts.min(ceiling);
+            }
+            serde_json::to_value(&p).unwrap_or(serde_json::Value::Null)
+        }),
+        retry_of_exec_id: request.retry_of_exec_id,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -2232,6 +2257,10 @@ pub async fn signal_with_start_workflow_execution(
                     sla: request.sla,
                     schedule_id: None,
                     scheduled_for: None,
+                    workflow_attempt: 1,
+                    workflow_retry_policy: None,
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: None,
                 };
 
             // For a debounced workflow, route the start through the no-spawn collect
@@ -2700,6 +2729,10 @@ pub async fn update_with_start_workflow_execution(
                     sla: request.sla,
                     schedule_id: None,
                     scheduled_for: None,
+                    workflow_attempt: 1,
+                    workflow_retry_policy: None,
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: None,
                 };
 
             // Debounced workflow: route through the no-spawn collect path with

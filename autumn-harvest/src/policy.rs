@@ -908,6 +908,13 @@ pub struct WorkflowSchedule {
     /// no behavior change for unmodified schedules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catchup_policy: Option<CatchupPolicy>,
+    /// Default retry policy for runs started by this schedule (issue #523).
+    ///
+    /// When `Some`, each run started by this schedule uses this as its retry policy
+    /// (unless the workflow type declares its own default or the start API provides
+    /// a per-start override). `None` (the default) disables schedule-level retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_policy: Option<RetryPolicy>,
 }
 
 const fn default_buffer_all_max() -> u32 {
@@ -942,6 +949,7 @@ impl WorkflowSchedule {
             end_at: None,
             max_runs: None,
             catchup_policy: None,
+            retry_policy: None,
         }
     }
 
@@ -1126,6 +1134,16 @@ impl WorkflowSchedule {
     #[must_use]
     pub const fn with_max_runs(mut self, max: u32) -> Self {
         self.max_runs = if max == 0 { None } else { Some(max) };
+        self
+    }
+
+    /// Set a default retry policy for runs started by this schedule (issue #523).
+    ///
+    /// Each run started by this schedule will use this as its retry policy
+    /// (unless overridden by a per-start API call). `None` disables retry.
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
         self
     }
 }

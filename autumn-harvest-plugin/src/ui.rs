@@ -6215,6 +6215,10 @@ async fn execute_schedule_trigger_ui(
             // carry the lineage; ad-hoc operator fires do not.
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await;
@@ -7975,6 +7979,10 @@ mod tests {
             current_details: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         }
     }
 

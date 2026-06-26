@@ -98,6 +98,9 @@ struct WorkflowAttrs {
     /// Parsed from `#[workflow(description = "...")]`.
     description: Option<String>,
     allow_nondeterministic_apis: bool,
+    /// Workflow-level retry policy (issue #523).
+    /// Parsed from `#[workflow(retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]`.
+    retry: Option<syn::Expr>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -114,6 +117,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         severity: None,
         description: None,
         allow_nondeterministic_apis: false,
+        retry: None,
     };
 
     syn::meta::parser(|meta| {
@@ -299,9 +303,13 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             result.description = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("retry") {
+            let value: syn::Expr = meta.value()?.parse()?;
+            result.retry = Some(value);
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, or `allow_nondeterministic_apis`",
+                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -541,6 +549,12 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         |s| quote! { ::std::option::Option::Some(#s) },
     );
 
+    // Emit retry_policy as Option<RetryPolicy> (issue #523).
+    let retry_policy_expr = attrs.retry.as_ref().map_or_else(
+        || quote! { ::std::option::Option::None },
+        |expr| quote! { ::std::option::Option::Some(#expr) },
+    );
+
     let camel_name = to_pascal_case(&fn_name_str);
     let stub_name = format_ident!("{}Stub", camel_name);
     let ok_type = extract_ok_type(&input_fn.sig.output);
@@ -594,6 +608,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 input_schema: ::std::option::Option::None,
                 output_schema: ::std::option::Option::None,
                 error_schema: ::std::option::Option::None,
+                retry_policy: #retry_policy_expr,
             }
         }
 

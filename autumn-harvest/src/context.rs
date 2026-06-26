@@ -9031,6 +9031,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }
     }
 

@@ -263,6 +263,13 @@ pub const METRIC_WORKFLOW_TASK_TIMEOUT: &str = "harvest.workflow.task_timeout";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_SLA_BREACHED: &str = "harvest.workflow.sla_breached";
 
+/// Counter: incremented each time a failed workflow execution is automatically
+/// rescheduled for a retry run (issue #523).
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_RETRIES: &str = "harvest.workflow.retries";
+
 /// Counter: incremented when a replay non-determinism (divergence) failure occurs.
 ///
 /// Labeled by `workflow` (workflow name) and `build_id`.
@@ -1072,6 +1079,13 @@ pub trait MetricsRecorder: Send + Sync {
     ///
     /// Maps to the counter `harvest.workflow.sla_breached{workflow, queue}`.
     fn record_workflow_sla_breach(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
+    }
+
+    /// A failed workflow execution was automatically rescheduled for a retry run (issue #523).
+    ///
+    /// Maps to the counter `harvest.workflow.retries{workflow, queue}`.
+    fn record_workflow_retry(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
     }
 

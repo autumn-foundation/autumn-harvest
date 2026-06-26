@@ -206,6 +206,7 @@ fn minimal_registry() -> Arc<HandlerRegistry> {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ))
@@ -618,6 +619,10 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -912,6 +917,10 @@ async fn two_build_rolling_deploy_full_lifecycle() {
                 sla: None,
                 schedule_id: None,
                 scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
             },
         )
         .await

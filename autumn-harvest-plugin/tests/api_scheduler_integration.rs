@@ -416,6 +416,7 @@ fn approval_registry() -> Arc<HandlerRegistry> {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ))
@@ -443,6 +444,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "timer_then_signal_workflow",
@@ -463,6 +465,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![],
@@ -588,6 +591,10 @@ async fn insert_workflow_on_url(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -670,6 +677,10 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -833,6 +844,10 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         })
         .execute(&mut conn)
         .await
@@ -1163,6 +1178,10 @@ async fn seed_scheduled_activity_task_from_url(
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         })
         .execute(&mut conn)
         .await
@@ -1976,6 +1995,7 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -3025,6 +3045,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }])
             .build(),
         &HarvestRuntimeConfig {
@@ -3064,6 +3085,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }])
             .build(),
         &HarvestRuntimeConfig {
@@ -3146,6 +3168,7 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![
             recording_activity_info("parallel_a"),
@@ -3204,6 +3227,7 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![
             recording_activity_info("parallel_fast"),
@@ -3271,6 +3295,7 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![recording_activity_info("shared_parallel")],
         Arc::new(state),
@@ -3325,6 +3350,7 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![
             recording_activity_info("barrier_first"),
@@ -3388,6 +3414,7 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![blocking_activity_info(
             "timeout_completion_race",
@@ -4017,6 +4044,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -4949,6 +4977,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "interval_step",
@@ -5061,6 +5090,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![recording_activity_info("interval_step")],
         Arc::new(state),

@@ -183,6 +183,7 @@ fn make_registry(workflow_name: &'static str) -> Arc<HandlerRegistry> {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ))

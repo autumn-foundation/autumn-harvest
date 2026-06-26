@@ -295,6 +295,7 @@ fn echo_registry() -> Arc<HandlerRegistry> {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ))
@@ -402,6 +403,10 @@ async fn insert_workflow_on_url(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -2163,6 +2168,10 @@ async fn insert_child_workflow_on_url(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -2915,6 +2924,7 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }],
             vec![],
         )
@@ -3050,6 +3060,7 @@ async fn ui_trigger_preserves_dag_metadata() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));

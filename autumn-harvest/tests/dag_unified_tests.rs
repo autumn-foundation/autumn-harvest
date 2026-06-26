@@ -640,6 +640,7 @@ fn builder_rejects_workflow_name_collision_with_auto_registered_dag() {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     };
 
     let result = HarvestBuilder::new()

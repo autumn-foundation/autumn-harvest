@@ -374,6 +374,10 @@ impl DeferredTriggerStart {
                     sla: self.sla.and_then(|d| chrono::Duration::from_std(d).ok()),
                     schedule_id: None,
                     scheduled_for: None,
+                    workflow_attempt: 1,
+                    workflow_retry_policy: None,
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: None,
                 },
             )
             .await;
@@ -599,6 +603,10 @@ pub fn evaluate_triggers_for_execution<'a>(
                         sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
                         schedule_id: None,
                         scheduled_for: None,
+                        workflow_attempt: 1,
+                        workflow_retry_policy: None,
+                        retry_of_exec_id: None,
+                        max_workflow_attempts_ceiling: None,
                     },
                 )
                 .await
@@ -805,6 +813,10 @@ pub async fn enforce_completion_triggers_outbox(
                 sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
                 schedule_id: None,
                 scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
             },
         )
         .await;

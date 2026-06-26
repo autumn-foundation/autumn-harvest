@@ -189,6 +189,7 @@ fn make_registry(wf_name: &'static str) -> Arc<HandlerRegistry> {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
             sla: None,
         }],
         vec![],
@@ -384,6 +385,10 @@ async fn manual_start_has_no_scheduled_time() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await

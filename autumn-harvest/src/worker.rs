@@ -2288,7 +2288,7 @@ async fn persist_workflow_completion(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn persist_workflow_failure(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -2297,12 +2297,48 @@ async fn persist_workflow_failure(
     worker_id: &str,
     error: &str,
     nd_details: Option<&crate::error::NonDeterministicDetails>,
+    execution: Option<&WorkflowExecution>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
-) -> HarvestResult<()> {
+) -> HarvestResult<bool> {
     let error = error.to_string();
-    let deferred = conn
-        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
+
+    // Pre-compute the retry plan (pure, no DB) before entering the transaction.
+    let retry_plan: Option<(ExecutionId, RetryPolicy, u32, std::time::Duration)> =
+        if nd_details.is_none() {
+            execution.and_then(|exec| {
+                let policy: RetryPolicy = exec
+                    .workflow_retry_policy
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())?;
+                let attempt = exec.workflow_attempt.cast_unsigned();
+                if attempt >= policy.max_attempts {
+                    return None;
+                }
+                if policy.is_non_retryable(None, &error) {
+                    return None;
+                }
+                let delay = crate::policy::compute_retry_delay(
+                    policy.initial_interval,
+                    policy.backoff_coefficient,
+                    policy.max_interval,
+                    attempt,
+                );
+                let retry_exec_id = ExecutionId::new_for_shard(exec_id.shard());
+                Some((retry_exec_id, policy, attempt, delay))
+            })
+        } else {
+            None
+        };
+
+    let (deferred, retry_scheduled) = conn
+        .transaction::<(Vec<crate::completion_trigger::DeferredTriggerStart>, bool), HarvestError, _>(
             |conn| {
+                let error = error.clone();
+                let retry_plan_ref = retry_plan.as_ref().map(|(id, policy, attempt, delay)| {
+                    let fire_at = chrono::Utc::now()
+                        + chrono::Duration::from_std(*delay).unwrap_or_default();
+                    (*id, policy.clone(), *attempt, fire_at)
+                });
                 async move {
                     store::append_events(
                         conn,
@@ -2325,7 +2361,32 @@ async fn persist_workflow_failure(
                     )
                     .await?;
                     deferred.extend(triggers);
-                    Ok(deferred)
+
+                    // Append WorkflowRetryScheduled inside the same transaction.
+                    let mut retry_committed = false;
+                    if let Some((rid, _policy, attempt, fire_at)) = retry_plan_ref {
+                        let append_res = store::append_events(
+                            conn,
+                            exec_id,
+                            &[WorkflowEvent::WorkflowRetryScheduled {
+                                retry_exec_id: rid,
+                                attempt: attempt + 1,
+                                fire_at,
+                            }],
+                            next_event_id + 1, // after WorkflowFailed
+                        )
+                        .await;
+                        retry_committed = append_res.is_ok();
+                        if let Err(e) = append_res {
+                            tracing::warn!(
+                                execution_id = %exec_id,
+                                error = %e,
+                                "harvest: failed to append WorkflowRetryScheduled; not retrying"
+                            );
+                        }
+                    }
+
+                    Ok((deferred, retry_committed))
                 }
                 .scope_boxed()
             },
@@ -2335,7 +2396,81 @@ async fn persist_workflow_failure(
     for start in deferred {
         start.spawn();
     }
-    Ok(())
+
+    // Start the retry execution outside the transaction.
+    // Two nested ifs because Rust's if-let chain requires edition 2024+ guards.
+    #[allow(clippy::collapsible_if)]
+    if retry_scheduled {
+        if let (Some(exec), Some((rid, policy, attempt, delay))) = (
+            execution,
+            retry_plan.as_ref().map(|(id, p, a, d)| (*id, p, *a, *d)),
+        ) {
+            let fire_at =
+                chrono::Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default();
+            let start_at = if delay.is_zero() { None } else { Some(fire_at) };
+            let retry_params = crate::execution::StartWorkflowParams {
+                workflow_name: &exec.workflow_name,
+                workflow_id: &exec.workflow_id,
+                exec_id: rid,
+                input: exec.input.clone(),
+                parent_id: None,
+                queue_name: &exec.queue_name,
+                execution_timeout: exec.execution_timeout,
+                memo: exec.memo.clone(),
+                search_attrs: None,
+                reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: crate::types::Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: exec.owner.as_deref(),
+                runbook_url: exec.runbook_url.as_deref(),
+                severity: exec.severity.as_deref(),
+                context_headers: exec
+                    .context_headers
+                    .clone()
+                    .and_then(|v| serde_json::from_value(v).ok()),
+                sla: None,
+                schedule_id: exec.schedule_id,
+                scheduled_for: exec.scheduled_for,
+                workflow_attempt: attempt + 1,
+                workflow_retry_policy: Some(policy.clone()),
+                retry_of_exec_id: Some(exec_id.as_uuid()),
+                max_workflow_attempts_ceiling: None,
+            };
+
+            match crate::execution::start_or_load_workflow_execution(conn, retry_params).await {
+                Ok(_started) => {
+                    if let Some(m) = metrics {
+                        m.record_workflow_retry(&exec.workflow_name, &exec.queue_name);
+                    }
+                    tracing::info!(
+                        execution_id = %exec_id,
+                        retry_exec_id = %rid,
+                        attempt = attempt + 1,
+                        delay_secs = delay.as_secs(),
+                        "harvest: workflow retry scheduled"
+                    );
+                    return Ok(true);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        execution_id = %exec_id,
+                        error = %e,
+                        "harvest: failed to start retry execution"
+                    );
+                    // Fall through: return false (no retry)
+                }
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Append `UpdateCompleted` or `UpdateFailed` events for each
@@ -3182,6 +3317,9 @@ async fn persist_all_started_child_workflows(
                     context_headers: parent_execution.context_headers.clone(),
                     schedule_id: None, // child workflows are not scheduled fires
                     scheduled_for: None,
+                    workflow_attempt: 1,
+                    workflow_retry_policy: None,
+                    retry_of_exec_id: None,
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
@@ -3429,8 +3567,10 @@ async fn fail_task_and_execution(
         error,
         None,
         None,
+        None,
     )
     .await
+    .map(|_| ())
 }
 
 async fn finalize_activity_completion(
@@ -3674,6 +3814,7 @@ async fn persist_child_workflow_failure(
 ///
 /// Non-detached-spawn commands in `commands` are silently skipped. Already-existing
 /// child rows (idempotent re-run after a crash) are also skipped.
+#[allow(clippy::too_many_lines)]
 async fn create_detached_child_executions(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -3742,6 +3883,9 @@ async fn create_detached_child_executions(
             context_headers: parent_execution.context_headers.clone(),
             schedule_id: None, // detached child workflows are not scheduled fires
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -4702,8 +4846,10 @@ async fn handle_suspended_workflow(
             &error,
             None,
             None,
+            None,
         )
         .await
+        .map(|_| ())
     };
 
     fail_execution_on_error(
@@ -4891,6 +5037,7 @@ async fn reject_child_continue_as_new(
             error,
             None,
             None,
+            None,
         )
         .await?;
     } else {
@@ -4911,6 +5058,7 @@ async fn reject_child_continue_as_new(
     Ok(true)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn persist_workflow_continue_as_new(
     conn: &mut AsyncPgConnection,
     persistence: WorkflowTaskPersistence<'_>,
@@ -4978,6 +5126,11 @@ async fn persist_workflow_continue_as_new(
         // Same logical slot as the predecessor: keep carryover ordering stable so the
         // continuation isn't treated as a brand-new fire (issue #488).
         scheduled_for: execution.scheduled_for,
+        // Continue-as-new starts a fresh run: attempt counter resets to 1,
+        // retry policy is not inherited (the new run can define its own).
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
@@ -5151,19 +5304,25 @@ async fn persist_workflow_outcome(
                 persistence.worker_id,
                 &error,
                 non_deterministic_details.as_ref(),
+                Some(execution),
                 Some(registry.telemetry().metrics.as_ref()),
             )
             .await;
-            if result.is_ok() && update_schedule_counter {
-                crate::scheduler::maybe_increment_schedule_failure_counter(
-                    conn,
-                    &execution.workflow_id,
-                    &execution.workflow_name,
-                    registry.telemetry().metrics.as_ref(),
-                )
-                .await;
+            if update_schedule_counter {
+                match &result {
+                    Ok(retry_scheduled) if !retry_scheduled => {
+                        crate::scheduler::maybe_increment_schedule_failure_counter(
+                            conn,
+                            &execution.workflow_id,
+                            &execution.workflow_name,
+                            registry.telemetry().metrics.as_ref(),
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
             }
-            result
+            result.map(|_| ())
         }
         (WorkflowOutcome::Suspended { commands }, _) => {
             handle_suspended_workflow(
@@ -8840,6 +8999,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
 
         let act = ActivityInfo {

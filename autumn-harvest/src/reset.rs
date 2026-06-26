@@ -864,6 +864,9 @@ async fn insert_fork_execution(
         // reset of an old slot can't roll a later run's incremental cursor backward (#488).
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -1117,6 +1120,10 @@ mod tests {
             current_details: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         }
     }
 

@@ -200,6 +200,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "test_batch_macro",
@@ -222,6 +223,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "test_batch_and_debounce",
@@ -248,6 +250,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![],

@@ -7,7 +7,9 @@
 )]
 
 use crate::debounce::DebounceStartOptions;
+#[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult};
+#[cfg(feature = "db")]
 use crate::types::ExecutionId;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
@@ -260,6 +262,10 @@ pub async fn admit_batched_start(
                         sla,
                         schedule_id: None,
                         scheduled_for: None,
+                        workflow_attempt: 1,
+                        workflow_retry_policy: None,
+                        retry_of_exec_id: None,
+                        max_workflow_attempts_ceiling: None,
                     };
 
                     let (started, deferred_starts) =
@@ -461,6 +467,10 @@ async fn fire_claimed_batch_row(
         sla,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
 
     let start_res =
