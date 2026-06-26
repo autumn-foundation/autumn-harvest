@@ -103,7 +103,7 @@ use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
     DrainPreviewItem, DrainResponse, FleetHealth, PinnedExecutionRow, WorkerFilters, WorkerRow,
     get_worker, list_pinned_executions, list_workers, parse_worker_filters, preview_item_from_row,
-    request_drain,
+    read_worker_drain_deadline, request_drain,
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
@@ -19441,6 +19441,27 @@ async fn request_drain_handler(
             .ok()
             .map(|d| chrono::Utc::now() + d);
         (computed, false)
+    };
+
+    // For non-explicit re-drains (omitted or computed default deadline), reuse the
+    // earliest drain deadline already stored on any Draining shard row for this
+    // worker. A lagging-shard Active row receiving a fresh-computed default would
+    // otherwise extend the drain window: the heartbeat task treats any new
+    // drain_deadline_at value as a new drain command and resets its local
+    // shutdown Instant to the new value, silently pushing the deadline out.
+    let deadline_at = if deadline_is_explicit {
+        deadline_at
+    } else {
+        let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+        for (_, shard_pool) in pool.iter_shards() {
+            let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                continue;
+            };
+            if let Ok(Some(stored)) = read_worker_drain_deadline(&mut conn, &worker_id).await {
+                earliest = Some(earliest.map_or(stored, |e| e.min(stored)));
+            }
+        }
+        earliest.or(deadline_at)
     };
 
     // Fan the drain transition out to EVERY reachable shard that has a row for
