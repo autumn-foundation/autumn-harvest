@@ -124,7 +124,7 @@ impl MemStore {
 }
 
 impl PayloadStore for MemStore {
-    fn store_id(&self) -> &str {
+    fn store_id(&self) -> &'static str {
         "memdb"
     }
     fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {

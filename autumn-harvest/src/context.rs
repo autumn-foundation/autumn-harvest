@@ -2541,10 +2541,10 @@ impl WorkflowContext {
                         .map_or(global, |ov| global.max(ov))
                 };
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if effective_cap > 0
-                    && observed > effective_cap
-                    && !self.offload_will_apply(observed)
-                {
+                // Local activities are written with plain store::append_events (no
+                // offloader), so the offload bypass must NOT apply here even when a
+                // PayloadStore is configured. Always enforce the cap.
+                if effective_cap > 0 && observed > effective_cap {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
                         observed_bytes: observed,

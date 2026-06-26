@@ -48,7 +48,7 @@ pub struct InMemoryStore {
 }
 
 impl PayloadStore for InMemoryStore {
-    fn store_id(&self) -> &str {
+    fn store_id(&self) -> &'static str {
         "in-memory"
     }
 

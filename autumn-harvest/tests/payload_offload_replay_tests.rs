@@ -40,7 +40,7 @@ fn key_for(bytes: &[u8]) -> String {
 }
 
 impl PayloadStore for MemStore {
-    fn store_id(&self) -> &str {
+    fn store_id(&self) -> &'static str {
         "memtest"
     }
     fn put(&self, bytes: &[u8]) -> PayloadStoreFuture<'_, String> {
