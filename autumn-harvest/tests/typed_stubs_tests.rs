@@ -166,6 +166,14 @@ async fn check_progress(_ctx: &WorkflowContext, step: i64) -> Result<String, Str
 #[signal(workflow = "onboarding")]
 fn subscription_active(_ctx: &WorkflowContext, _val: i64) {}
 
+// Regression: a payload parameter literally named `idempotency_key` must not
+// collide with the generated delivery-key argument on the `_idempotent` stub.
+#[allow(dead_code)]
+#[signal(workflow = "onboarding")]
+fn payment_received(_ctx: &WorkflowContext, idempotency_key: String) {
+    let _ = idempotency_key;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]

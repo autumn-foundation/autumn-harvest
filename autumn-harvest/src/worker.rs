@@ -1134,6 +1134,10 @@ struct SignalExternalWorkflowRun {
     /// after appending it but before recording the terminal event. Skip
     /// re-appending and go straight to (re-)attempting delivery.
     already_requested: bool,
+    /// Optional exactly-once delivery key, threaded from the
+    /// `SignalExternalWorkflow` command into the persisted
+    /// `ExternalSignalRequested` event and the delivery insert.
+    idempotency_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1185,6 +1189,7 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
                 payload,
                 result_tx,
                 already_requested,
+                idempotency_key,
             } => {
                 drop(result_tx);
                 items.push(SignalBatchItem::Signal(SignalExternalWorkflowRun {
@@ -1193,6 +1198,7 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
                     signal_name,
                     payload,
                     already_requested,
+                    idempotency_key,
                 }));
             }
             WorkflowCommand::RequestCancelExternalWorkflow {
@@ -1237,6 +1243,7 @@ fn split_mixed_signal_batch(
                 payload,
                 result_tx,
                 already_requested,
+                idempotency_key,
             } => {
                 drop(result_tx);
                 signal_items.push(SignalBatchItem::Signal(SignalExternalWorkflowRun {
@@ -1245,6 +1252,7 @@ fn split_mixed_signal_batch(
                     signal_name,
                     payload,
                     already_requested,
+                    idempotency_key,
                 }));
             }
             WorkflowCommand::RequestCancelExternalWorkflow {
@@ -1280,14 +1288,10 @@ fn split_mixed_signal_batch(
 /// correctly. Returns all newly-appended events in emission order so the caller
 /// can extend its in-memory replay history without a DB round-trip.
 ///
-/// # At-least-once delivery on crash recovery
-///
-/// When `run.already_requested` is `true` the worker crashed after writing
-/// `ExternalSignalRequested` but before the terminal event. Re-calling
-/// `send_signal` may insert a duplicate row into `harvest_signals` if the
-/// original insert committed before the crash. Exact-once delivery requires
-/// storing the `signal_id` as a unique key on `harvest_signals`; that schema
-/// change is deferred to a follow-up migration.
+/// Crash-recovery re-delivery is deduplicated when the request carried an
+/// `idempotency_key`: the partial unique index on `harvest_signals` rejects the
+/// duplicate row, and the recorded key is reused verbatim from history so a
+/// re-dispatch cannot diverge from the original delivery.
 ///
 /// Returned tuple: (new history events, next event id, deferred trigger starts
 /// to spawn after commit, (`workflow_name`, `queue_name`) of targets newly
@@ -1348,6 +1352,7 @@ async fn persist_external_signal_inline(
                                     target: run.target,
                                     signal_name: run.signal_name.clone(),
                                     payload: run.payload.clone(),
+                                    idempotency_key: run.idempotency_key.clone(),
                                 };
                                 store::append_events(
                                     conn,
@@ -1366,18 +1371,24 @@ async fn persist_external_signal_inline(
                                 continue;
                             }
 
-                            // Same-shard delivery attempt
-                            let terminal_opt = match signal::send_signal(
+                            // Same-shard delivery attempt. A deduped insert
+                            // (`Ok(false)`, idempotency-key collision) means the
+                            // signal already landed once — that is success, so
+                            // both outcomes record `ExternalSignalDelivered`.
+                            let terminal_opt = match signal::send_signal_idempotent(
                                 conn,
                                 run.target,
                                 &run.signal_name,
                                 run.payload,
+                                run.idempotency_key.as_deref(),
                             )
                             .await
                             {
-                                Ok(()) => Some(WorkflowEvent::ExternalSignalDelivered {
-                                    signal_id: run.signal_id,
-                                }),
+                                Ok(_delivered_or_deduped) => {
+                                    Some(WorkflowEvent::ExternalSignalDelivered {
+                                        signal_id: run.signal_id,
+                                    })
+                                }
                                 Err(HarvestError::NotFound(_)) => {
                                     // Same-shard target not found: suspend inline
                                     // delivery and leave resolution to outbox.
@@ -6077,6 +6088,7 @@ async fn process_workflow_task(
                                         payload: run.payload,
                                         result_tx: dummy_tx,
                                         already_requested: run.already_requested,
+                                        idempotency_key: run.idempotency_key,
                                     },
                                 );
                             }

@@ -2698,6 +2698,7 @@ impl WorkflowTestEnv {
                 payload,
                 result_tx,
                 already_requested,
+                idempotency_key,
             } => {
                 if !already_requested {
                     history.push(WorkflowEvent::ExternalSignalRequested {
@@ -2705,6 +2706,7 @@ impl WorkflowTestEnv {
                         target,
                         signal_name,
                         payload,
+                        idempotency_key,
                     });
                 }
                 history.push(WorkflowEvent::ExternalSignalDelivered { signal_id });

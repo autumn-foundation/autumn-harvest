@@ -1181,6 +1181,7 @@ fn external_signal_delivered_history() -> (ExecutionId, Vec<WorkflowEvent>) {
             target,
             signal_name: "tenant_cancel".into(),
             payload: serde_json::json!({"reason": "billing_lapse"}),
+            idempotency_key: None,
         },
         WorkflowEvent::ExternalSignalDelivered { signal_id },
         WorkflowEvent::WorkflowCompleted {
@@ -1208,6 +1209,7 @@ fn external_signal_failed_history() -> (ExecutionId, Vec<WorkflowEvent>) {
             target,
             signal_name: "tenant_cancel".into(),
             payload: Value::Null,
+            idempotency_key: None,
         },
         WorkflowEvent::ExternalSignalFailed {
             signal_id,

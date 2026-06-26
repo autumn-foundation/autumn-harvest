@@ -170,6 +170,7 @@ mod tests {
                 target: target_id,
                 signal_name: "onboarding_outcome".to_string(),
                 payload: json!({ "cancelled": true }),
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalDelivered { signal_id },
             WorkflowEvent::WorkflowCompleted {
@@ -196,6 +197,7 @@ mod tests {
                 target: target_id,
                 signal_name: "onboarding_outcome".to_string(),
                 payload: json!({ "cancelled": true }),
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalFailed {
                 signal_id,
