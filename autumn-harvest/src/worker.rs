@@ -2362,19 +2362,25 @@ async fn persist_workflow_failure(
             None
         };
 
-    // Pre-compute fire_at once so the WorkflowRetryScheduled event and the task's
-    // scheduled_at share the same timestamp.
+    // Pre-compute fire_at once for the WorkflowRetryScheduled event (observability).
+    // The retry start itself uses the *relative* delay, not this absolute timestamp:
+    // an absolute `start_at` computed here can fall into the past before the nested
+    // start validates it (millisecond-scale intervals or a slow failure transaction),
+    // and the start path rejects a past `start_at` — which would permanently fail a
+    // workflow that still has attempts remaining. A relative delay is validated as a
+    // duration (never against `now`), so it can never be "in the past".
     #[allow(clippy::type_complexity)]
     let retry_fire_info: Option<(
         ExecutionId,
         RetryPolicy,
         u32,
         chrono::DateTime<chrono::Utc>,
-        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::Duration>,
     )> = retry_plan.as_ref().map(|(rid, policy, attempt, delay)| {
-        let fire_at = chrono::Utc::now() + chrono::Duration::from_std(*delay).unwrap_or_default();
-        let start_at = if delay.is_zero() { None } else { Some(fire_at) };
-        (*rid, policy.clone(), *attempt, fire_at, start_at)
+        let delay_chrono = chrono::Duration::from_std(*delay).unwrap_or_default();
+        let fire_at = chrono::Utc::now() + delay_chrono;
+        let start_delay = (!delay.is_zero()).then_some(delay_chrono);
+        (*rid, policy.clone(), *attempt, fire_at, start_delay)
     });
 
     let (deferred, retry_scheduled) = conn
@@ -2408,7 +2414,7 @@ async fn persist_workflow_failure(
                     // exec_id continue to see FAILED rather than an erroneous "success".
                     // AllowDuplicate is safe because the retry workflow_id is brand-new.
                     let mut retry_committed = false;
-                    if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_at))) =
+                    if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_delay))) =
                         (execution, retry_fire_info)
                     {
                         // The retry execution gets its own workflow_id (rid.to_string()) so
@@ -2432,8 +2438,10 @@ async fn persist_workflow_failure(
                             concurrency_limit,
                             priority,
                             max_workflow_input_bytes: 0,
-                            start_at,
-                            delay: None,
+                            // Relative delay, not an absolute start_at: avoids the
+                            // "start_at in the past" rejection for short retry intervals.
+                            start_at: None,
+                            delay: start_delay,
                             max_workflow_start_delay: None,
                             owner: exec_ref.owner.as_deref(),
                             runbook_url: exec_ref.runbook_url.as_deref(),
