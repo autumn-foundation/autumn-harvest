@@ -6176,11 +6176,24 @@ async fn execute_schedule_trigger_ui(
         }
     };
     // Only registered workflows carry an SLA default; DAGs have no SLA concept.
-    let sla = runtime
-        .registry()
-        .workflows
-        .get(workflow_name)
-        .and_then(|info| crate::api::clamp_info_default_sla(info.sla, info.execution_timeout));
+    let (sla, wf_default_retry_policy) =
+        runtime
+            .registry()
+            .workflows
+            .get(workflow_name)
+            .map_or((None, None), |info| {
+                (
+                    crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
+                    info.retry_policy.clone(),
+                )
+            });
+    // Schedule-level retry_policy takes precedence over the workflow-type default,
+    // mirroring the automated tick, backfill, and API trigger-now paths.
+    let ui_trigger_retry_policy = row
+        .retry_policy
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .or(wf_default_retry_policy);
 
     let result = start_or_load_workflow_execution(
         conn,
@@ -6215,6 +6228,10 @@ async fn execute_schedule_trigger_ui(
             // carry the lineage; ad-hoc operator fires do not.
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: ui_trigger_retry_policy,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
         },
     )
     .await;
@@ -7423,6 +7440,7 @@ mod tests {
             catchup_window_secs: None,
             last_catchup_dropped: 0,
             last_catchup_at: None,
+            retry_policy: None,
         }
     }
 
@@ -7975,6 +7993,9 @@ mod tests {
             current_details: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
         }
     }
 

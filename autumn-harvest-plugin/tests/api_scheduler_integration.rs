@@ -180,7 +180,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     // enforce_timeouts_once now scans harvest_debounce (issue #499); include the
     // migration so the timeout pass doesn't fail with "relation does not exist".
-    include_str!("../../autumn-harvest/migrations/20260618000001_harvest_debounce/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260618000001_harvest_debounce/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 type HarvestApiApp = axum::Router;
 
@@ -416,6 +419,7 @@ fn approval_registry() -> Arc<HandlerRegistry> {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ))
@@ -443,6 +447,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "timer_then_signal_workflow",
@@ -463,6 +468,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ],
         vec![],
@@ -588,6 +594,10 @@ async fn insert_workflow_on_url(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -670,6 +680,10 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -833,6 +847,9 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
         })
         .execute(&mut conn)
         .await
@@ -1163,6 +1180,9 @@ async fn seed_scheduled_activity_task_from_url(
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
         })
         .execute(&mut conn)
         .await
@@ -1976,6 +1996,7 @@ fn workflow_info_named(name: &'static str) -> WorkflowInfo {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -3025,6 +3046,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }])
             .build(),
         &HarvestRuntimeConfig {
@@ -3064,6 +3086,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }])
             .build(),
         &HarvestRuntimeConfig {
@@ -3146,6 +3169,7 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![
             recording_activity_info("parallel_a"),
@@ -3204,6 +3228,7 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![
             recording_activity_info("parallel_fast"),
@@ -3271,6 +3296,7 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![recording_activity_info("shared_parallel")],
         Arc::new(state),
@@ -3325,6 +3351,7 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![
             recording_activity_info("barrier_first"),
@@ -3388,6 +3415,7 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![blocking_activity_info(
             "timeout_completion_race",
@@ -4017,6 +4045,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));
@@ -4290,6 +4319,7 @@ async fn harvest_api_defers_manual_dag_trigger_when_schedule_is_paused() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     let registry = Arc::new(HandlerRegistry::new(
         vec![workflow_info_named(dag_name)],
@@ -4777,6 +4807,7 @@ async fn harvest_api_backfill_matches_fractional_legacy_dag_workflow_id() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
 
     {
@@ -4869,6 +4900,7 @@ async fn harvest_api_rejects_backfill_for_unregistered_dag_schedule_row() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
 
     {
@@ -4949,6 +4981,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![ActivityInfo {
             name: "interval_step",
@@ -5032,6 +5065,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
 async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
@@ -5061,6 +5095,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![recording_activity_info("interval_step")],
         Arc::new(state),
@@ -5244,6 +5279,7 @@ async fn register_workflow_schedules_accepts_unified_dag_schedule_rows() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5283,6 +5319,7 @@ async fn register_workflow_schedules_preserves_existing_dag_marker_for_workflow_
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     let workflow_only_update = WorkflowSchedule::new(
         "preserve_dag_marker",
@@ -5340,6 +5377,7 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: "legacy_workflow_only_dag".to_string(),
@@ -5360,6 +5398,7 @@ async fn register_workflow_schedules_migrates_legacy_workflow_only_dag_row() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5409,6 +5448,7 @@ async fn ensure_dag_schedule_reuses_paused_legacy_workflow_only_dag_row() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     let paused_at = chrono::DateTime::parse_from_rfc3339("2026-05-14T02:00:00.123456Z")
         .expect("fixed pause timestamp should parse")
@@ -5530,6 +5570,7 @@ async fn register_workflow_schedules_reuses_existing_dag_schedule_row_on_upgrade
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5604,6 +5645,7 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: dag_name.to_string(),
@@ -5624,6 +5666,7 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5660,6 +5703,7 @@ async fn register_workflow_schedules_merges_split_legacy_dag_rows_before_upgrade
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split_legacy_rows() {
     let (database_url, _container) = setup_test_database_url().await;
     let dag_name = "split_paused_legacy_dag";
@@ -5711,6 +5755,7 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     let unified_dag_row = WorkflowSchedule {
         workflow_name: dag_name.to_string(),
@@ -5731,6 +5776,7 @@ async fn register_workflow_schedules_preserves_pause_metadata_when_merging_split
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
 
     let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
@@ -5814,6 +5860,7 @@ async fn scheduler_tick_dispatches_scheduled_unified_dag_on_dag_shard() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -5930,6 +5977,7 @@ async fn scheduler_tick_removes_stale_unified_dag_schedule_from_old_shard() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -6033,6 +6081,7 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -6061,6 +6110,7 @@ async fn scheduler_tick_removes_legacy_workflow_only_dag_schedule_from_old_shard
             end_at: None,
             max_runs: None,
             catchup_policy: None,
+            retry_policy: None,
         };
         let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&shard0_url)
             .await
@@ -6154,6 +6204,7 @@ async fn scheduler_tick_removes_stale_classic_dag_schedule_from_old_shard() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     let harvest_pool = build_two_shard_pool(&shard0_url, &shard1_url);
     let registry = Arc::new(HandlerRegistry::new(
@@ -6254,6 +6305,7 @@ async fn scheduler_tick_does_not_dispatch_removed_dag_schedule_rows() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
 
     {
@@ -6718,6 +6770,7 @@ async fn scheduler_tick_preserves_dag_metadata() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
 
     let dag_info = DagInfo {

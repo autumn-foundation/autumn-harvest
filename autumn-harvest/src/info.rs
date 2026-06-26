@@ -209,6 +209,15 @@ pub struct WorkflowInfo {
     pub output_schema: Option<fn() -> serde_json::Value>,
     /// Optional JSON Schema describing the workflow's error type.
     pub error_schema: Option<fn() -> serde_json::Value>,
+    /// Workflow-level retry policy (issue #523).
+    ///
+    /// When set, a failed execution is automatically retried up to `policy.max_attempts`
+    /// times with the configured backoff. `CANCELLED`, `TIMED_OUT`, and `TERMINATED`
+    /// outcomes are never retried. Non-retryable error types (per `policy.non_retryable_errors`)
+    /// are also excluded.
+    ///
+    /// `None` (the default) disables auto-retry — today's behavior.
+    pub retry_policy: Option<crate::policy::RetryPolicy>,
 }
 
 impl WorkflowInfo {
@@ -288,6 +297,20 @@ impl WorkflowInfo {
     #[must_use]
     pub const fn with_error_schema_fn(mut self, f: fn() -> serde_json::Value) -> Self {
         self.error_schema = Some(f);
+        self
+    }
+
+    /// Attach a workflow-level retry policy (issue #523).
+    ///
+    /// When set, a failed execution is automatically retried up to `policy.max_attempts`
+    /// times with the configured backoff. `CANCELLED`, `TIMED_OUT`, and `TERMINATED`
+    /// outcomes are never retried. Non-retryable error types (per `policy.non_retryable_errors`)
+    /// are also excluded.
+    ///
+    /// `None` (the default) disables auto-retry — today's behavior.
+    #[must_use]
+    pub fn with_retry_policy(mut self, policy: crate::policy::RetryPolicy) -> Self {
+        self.retry_policy = Some(policy);
         self
     }
 
@@ -810,6 +833,7 @@ impl DagInfo {
             end_at: None,
             max_runs: None,
             catchup_policy: None,
+            retry_policy: None,
         })
     }
 
@@ -838,6 +862,7 @@ impl DagInfo {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         })
     }
 }
@@ -861,6 +886,7 @@ impl std::fmt::Debug for WorkflowInfo {
             .field("input_schema", &self.input_schema.map(|_| "<fn>"))
             .field("output_schema", &self.output_schema.map(|_| "<fn>"))
             .field("error_schema", &self.error_schema.map(|_| "<fn>"))
+            .field("retry_policy", &self.retry_policy)
             .finish()
     }
 }
@@ -965,6 +991,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         assert_eq!(info.name, "test_workflow");
         assert!(info.execution_timeout.is_none());
@@ -992,6 +1019,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         assert!(info.sla.is_none());
     }
@@ -1016,6 +1044,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         assert_eq!(info.sla, Some(std::time::Duration::from_secs(7_200)));
     }
@@ -1040,6 +1069,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         assert_eq!(
             info.execution_timeout,
@@ -1069,6 +1099,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         assert_eq!(
             info.description,
@@ -1096,6 +1127,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         let info = base.with_description("Processes batch payments");
         assert_eq!(info.description, Some("Processes batch payments"));
@@ -1140,6 +1172,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }
         .with_input_schema_fn(input_schema_fn)
         .with_output_schema_fn(output_schema_fn)
@@ -1176,6 +1209,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         let record = RegisteredWorkflowRecord::from_info(&info);
         let json = serde_json::to_value(&record).unwrap();
@@ -1209,6 +1243,7 @@ mod tests {
             input_schema: Some(my_schema),
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         let record = RegisteredWorkflowRecord::from_info(&info);
         assert_eq!(record.name, "schema_wf");
@@ -1250,6 +1285,7 @@ mod tests {
             input_schema: Some(schema_fn),
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         let valid_input = serde_json::json!({"name": "Alice"});
         assert!(info.validate_input(&valid_input).is_ok());
@@ -1284,6 +1320,7 @@ mod tests {
             input_schema: Some(schema_fn),
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         // Missing required "name" field
         let invalid_input = serde_json::json!({"other": "field"});
@@ -1313,6 +1350,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         // Any input passes when no schema is defined
         let any_input = serde_json::json!({"anything": true});
@@ -1536,6 +1574,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         };
         let debug_str = format!("{workflow_info:?}");
         assert!(debug_str.contains("WorkflowInfo"));

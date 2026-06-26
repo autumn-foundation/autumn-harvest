@@ -207,6 +207,8 @@ pub struct WorkflowMetadata {
     /// Declared soft-SLA default (issue #487), resolved at completion-trigger
     /// start time into a fresh `sla_deadline_at`.
     pub sla: Option<std::time::Duration>,
+    /// Declared workflow-type retry policy default (issue #523).
+    pub retry_policy: Option<crate::policy::RetryPolicy>,
 }
 
 #[cfg(feature = "db")]
@@ -220,6 +222,14 @@ pub static GLOBAL_MAX_WORKFLOW_INPUT_BYTES: std::sync::RwLock<u64> =
 
 #[cfg(feature = "db")]
 pub static GLOBAL_DEFAULT_WORKFLOW_QUEUE: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+/// Server-side ceiling on `workflow_attempt` for completion-trigger-started workflows (issue #523).
+///
+/// Mirrors the per-start ceiling applied on API/scheduler paths. Set at worker startup via
+/// `HandlerRegistry::with_max_workflow_attempts_ceiling`.
+#[cfg(feature = "db")]
+pub static GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING: std::sync::RwLock<Option<u32>> =
     std::sync::RwLock::new(None);
 
 #[cfg(feature = "db")]
@@ -306,6 +316,10 @@ pub struct DeferredTriggerStart {
     pub severity: Option<String>,
     /// Resolved soft-SLA default (issue #487), converted to a fresh deadline at start.
     pub sla: Option<std::time::Duration>,
+    /// Resolved workflow-type retry policy default (issue #523).
+    pub retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Server-side ceiling on `max_attempts` (issue #523). Clamped at start time.
+    pub max_workflow_attempts_ceiling: Option<u32>,
 }
 
 #[cfg(feature = "db")]
@@ -374,6 +388,10 @@ impl DeferredTriggerStart {
                     sla: self.sla.and_then(|d| chrono::Duration::from_std(d).ok()),
                     schedule_id: None,
                     scheduled_for: None,
+                    workflow_attempt: 1,
+                    workflow_retry_policy: self.retry_policy.clone(),
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
                 },
             )
             .await;
@@ -546,21 +564,25 @@ pub fn evaluate_triggers_for_execution<'a>(
                     .map_or(global_default, |per_wf| per_wf.max(global_default))
             };
 
-            // Resolve target metadata (owner, runbook_url, severity, sla)
-            let (target_owner, target_runbook_url, target_severity, target_sla) = {
+            // Resolve target metadata (owner, runbook_url, severity, sla, retry_policy)
+            let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
                 let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
                 lock.as_ref()
                     .and_then(|guard| guard.as_ref())
                     .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
-                    .map_or((None, None, None, None), |meta| {
+                    .map_or((None, None, None, None, None), |meta| {
                         (
                             meta.owner.clone(),
                             meta.runbook_url.clone(),
                             meta.severity.clone(),
                             meta.sla,
+                            meta.retry_policy.clone(),
                         )
                     })
             };
+
+            let max_workflow_attempts_ceiling =
+                GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING.read().ok().and_then(|g| *g);
 
             if target_shard == source_shard {
                 let queue_name = if let Some(ref q) = trigger_db.queue_name {
@@ -599,6 +621,10 @@ pub fn evaluate_triggers_for_execution<'a>(
                         sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
                         schedule_id: None,
                         scheduled_for: None,
+                        workflow_attempt: 1,
+                        workflow_retry_policy: target_retry_policy.clone(),
+                        retry_of_exec_id: None,
+                        max_workflow_attempts_ceiling,
                     },
                 )
                 .await
@@ -684,6 +710,8 @@ pub fn evaluate_triggers_for_execution<'a>(
                     runbook_url: target_runbook_url,
                     severity: target_severity,
                     sla: target_sla,
+                    retry_policy: target_retry_policy,
+                    max_workflow_attempts_ceiling,
                 });
             }
         }
@@ -759,21 +787,25 @@ pub async fn enforce_completion_triggers_outbox(
 
         let priority: Priority = serde_json::from_value(task.priority).unwrap_or_default();
 
-        let (target_owner, target_runbook_url, target_severity, target_sla) = {
+        let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
             let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
             lock.as_ref()
                 .and_then(|guard| guard.as_ref())
                 .and_then(|meta_map| meta_map.get(&task.target_workflow_name))
-                .map_or((None, None, None, None), |meta| {
+                .map_or((None, None, None, None, None), |meta| {
                     (
                         meta.owner.clone(),
                         meta.runbook_url.clone(),
                         meta.severity.clone(),
                         meta.sla,
+                        meta.retry_policy.clone(),
                     )
                 })
         };
-
+        let max_workflow_attempts_ceiling = GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING
+            .read()
+            .ok()
+            .and_then(|g| *g);
         let start_res = crate::execution::start_or_load_workflow_execution(
             &mut target_conn,
             crate::execution::StartWorkflowParams {
@@ -805,6 +837,10 @@ pub async fn enforce_completion_triggers_outbox(
                 sla: target_sla.and_then(|d| chrono::Duration::from_std(d).ok()),
                 schedule_id: None,
                 scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: target_retry_policy,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling,
             },
         )
         .await;

@@ -100,7 +100,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
     "\n",
     // issue #499: enforce_timeouts_once now scans harvest_debounce.
-    include_str!("../migrations/20260618000001_harvest_debounce/up.sql")
+    include_str!("../migrations/20260618000001_harvest_debounce/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 async fn setup_test_db_url() -> (String, ContainerAsync<Postgres>) {
@@ -201,6 +204,10 @@ async fn start_workflow(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -286,6 +293,7 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -312,6 +320,7 @@ fn wf_info_with_concurrency(
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 
@@ -404,6 +413,9 @@ async fn insert_detached_child_execution(
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
         })
         .execute(conn)
         .await
@@ -997,6 +1009,9 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             sla_deadline_at: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
         })
         .execute(&mut conn)
         .await

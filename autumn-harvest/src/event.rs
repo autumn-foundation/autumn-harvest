@@ -624,6 +624,27 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+
+    // ── Workflow-level retry linkage (issue #523) ─────────────────────────────────
+    /// Appended to a sealed `FAILED` execution immediately after `WorkflowFailed`
+    /// when the engine auto-schedules a retry run.
+    ///
+    /// ## Replay determinism
+    ///
+    /// This event lives ONLY in the sealed failed run's history and is appended
+    /// **after** the terminal `WorkflowFailed` event. The
+    /// [`crate::replay::HistoryMatcher`] stops consuming events after a terminal
+    /// lifecycle event, so this trailing event is transparent to replay: the
+    /// failed run is already sealed; its retry is a separate execution.
+    WorkflowRetryScheduled {
+        /// The execution ID of the newly-created retry run.
+        retry_exec_id: ExecutionId,
+        /// Attempt number of the NEW run (= `failed_run.workflow_attempt` + 1).
+        attempt: u32,
+        /// Wall-clock instant when the retry becomes claimable by a worker.
+        /// `Utc::now()` for immediate retries, or `now + backoff` for delayed ones.
+        fire_at: DateTime<Utc>,
+    },
 }
 
 impl WorkflowEvent {
@@ -676,6 +697,7 @@ impl WorkflowEvent {
             Self::ExternalCancelDelivered { .. } => "ExternalCancelDelivered",
             Self::ExternalCancelFailed { .. } => "ExternalCancelFailed",
             Self::WorkflowRedriven { .. } => "WorkflowRedriven",
+            Self::WorkflowRetryScheduled { .. } => "WorkflowRetryScheduled",
         }
     }
 
@@ -696,6 +718,10 @@ impl WorkflowEvent {
                 // never consumed by the workflow function itself, so must be skipped
                 // during unconsumed-event checks to avoid false non-determinism reports.
                 | Self::ChildWorkflowCascadeApplied { .. }
+                // Appended to the failed run's history after WorkflowFailed as a
+                // durable linkage record; the failed run is sealed and the event is
+                // never consumed by its workflow function on replay.
+                | Self::WorkflowRetryScheduled { .. }
         )
     }
 }
@@ -1053,6 +1079,11 @@ mod tests {
                 error: "transient".into(),
                 attempt: 1,
             },
+            WorkflowEvent::LocalActivityExhausted {
+                activity_id: ActivityExecId::new(),
+                error: "permanent".into(),
+                attempt: 3,
+            },
             WorkflowEvent::UpdateAdmitted {
                 update_id: crate::types::UpdateId::new(),
                 name: "approve".into(),
@@ -1110,11 +1141,43 @@ mod tests {
                 resumed_at: Utc::now(),
                 actor: "oncall".into(),
             },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id: ExecutionId::new(),
+                workflow_name: "child_wf".into(),
+                input: serde_json::Value::Null,
+                parent_close_policy: crate::types::ParentClosePolicy::Abandon,
+            },
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id: ExecutionId::new(),
+                policy: crate::types::ParentClosePolicy::RequestCancel,
+                action: "request_cancel".into(),
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id: crate::types::ExternalCancelId::new(),
+                target: ExecutionId::new(),
+            },
+            WorkflowEvent::ExternalCancelDelivered {
+                cancel_id: crate::types::ExternalCancelId::new(),
+            },
+            WorkflowEvent::ExternalCancelFailed {
+                cancel_id: crate::types::ExternalCancelId::new(),
+                reason_code: "target_unknown".into(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: Utc::now(),
+                dead_letter_id: Uuid::new_v4(),
+                reason: None,
+            },
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: Utc::now(),
+            },
         ];
 
-        assert_eq!(events.len(), 37);
+        assert_eq!(events.len(), 45);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 37, "duplicate type names detected");
+        assert_eq!(names.len(), 45, "duplicate type names detected");
     }
 
     // ── SideEffectRecorded tests (issue #384) ─────────────────────────────────

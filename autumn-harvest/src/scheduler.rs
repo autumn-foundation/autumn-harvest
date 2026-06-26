@@ -9,7 +9,7 @@ use croner::Cron;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
-use diesel::{BoolExpressionMethods, ExpressionMethods, TextExpressionMethods};
+use diesel::{BoolExpressionMethods, ExpressionMethods};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
@@ -789,6 +789,10 @@ pub async fn trigger_unified_dag(
             sla: None,
             schedule_id: None, // manual/API DAG trigger, not a scheduler-fired slot
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1239,6 +1243,10 @@ async fn upsert_workflow_schedule(
             // Catchup policy columns (issue #484).
             dsl::catchup_policy.eq(ws.catchup_policy.and_then(|p| p.to_db_columns().0)),
             dsl::catchup_window_secs.eq(ws.catchup_policy.and_then(|p| p.to_db_columns().1)),
+            dsl::retry_policy.eq(ws
+                .retry_policy
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok())),
         ))
         .execute(conn)
         .await
@@ -1720,15 +1728,19 @@ async fn tick_workflow_schedules(
     Ok(())
 }
 
-/// Cancel the oldest scheduled RUNNING executions for `workflow_name`, up to `max_to_cancel`.
+/// Cancel the oldest scheduled RUNNING executions for `workflow_name` under `schedule_id`,
+/// up to `max_to_cancel`.
 ///
-/// Only cancels executions with a `sched:` workflow ID so operator-triggered manual runs are
-/// not inadvertently cancelled. Orders by `started_at ASC` so the oldest executions are
-/// cancelled first, preserving the most recent progress.
+/// Filters by `schedule_id` rather than the `sched:` workflow-id prefix so that workflow-retry
+/// executions (which carry a UUID `workflow_id` but still link back to the originating schedule via
+/// the `schedule_id` FK) are included, while operator-triggered manual runs (which have
+/// `schedule_id = NULL`) are not inadvertently cancelled.
+/// Orders by `started_at ASC` so the oldest executions are cancelled first.
 #[cfg(feature = "db")]
 async fn cancel_in_flight_runs(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
+    schedule_id: uuid::Uuid,
     reason: &str,
     max_to_cancel: u32,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
@@ -1737,7 +1749,7 @@ async fn cancel_in_flight_runs(
 
     let running_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .filter(harvest_workflow_executions::workflow_id.like("sched:%"))
+        .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .order(harvest_workflow_executions::started_at.asc())
         .select(harvest_workflow_executions::id)
@@ -1765,14 +1777,17 @@ async fn cancel_in_flight_runs(
     Ok(count)
 }
 
-/// Terminate the oldest scheduled RUNNING executions for `workflow_name`, up to `max_to_terminate`.
+/// Terminate the oldest scheduled RUNNING executions for `workflow_name` under `schedule_id`,
+/// up to `max_to_terminate`.
 ///
-/// Only terminates executions with a `sched:` workflow ID. Orders by `started_at ASC` so the
-/// oldest executions are terminated first.
+/// Filters by `schedule_id` (same rationale as `cancel_in_flight_runs`) so workflow-retry
+/// executions are included and manual-trigger runs (`schedule_id` = NULL) are excluded.
+/// Orders by `started_at ASC` so the oldest executions are terminated first.
 #[cfg(feature = "db")]
 async fn terminate_in_flight_runs(
     conn: &mut AsyncPgConnection,
     workflow_name: &str,
+    schedule_id: uuid::Uuid,
     reason: &str,
     max_to_terminate: u32,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
@@ -1781,7 +1796,7 @@ async fn terminate_in_flight_runs(
 
     let active_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .filter(harvest_workflow_executions::workflow_id.like("sched:%"))
+        .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .order(harvest_workflow_executions::started_at.asc())
         .select(harvest_workflow_executions::id)
@@ -2541,6 +2556,7 @@ async fn tick_one_workflow_schedule(
                 let cancelled = cancel_in_flight_runs(
                     conn,
                     wf_name,
+                    schedule.id,
                     "overlap policy CancelOther: new firing",
                     needed,
                     metrics.as_ref(),
@@ -2556,6 +2572,7 @@ async fn tick_one_workflow_schedule(
                 let terminated = terminate_in_flight_runs(
                     conn,
                     wf_name,
+                    schedule.id,
                     "overlap policy TerminateOther: new firing",
                     needed,
                     metrics.as_ref(),
@@ -2786,6 +2803,14 @@ async fn tick_one_workflow_schedule(
                 // Logical slot = the slot encoded in workflow_id (original_slot), so
                 // carryover ordering and the migration backfill agree (issue #488).
                 scheduled_for: Some(*original_slot),
+                workflow_attempt: 1,
+                workflow_retry_policy: schedule
+                    .retry_policy
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
             },
         )
         .await;
@@ -3694,6 +3719,14 @@ async fn drain_buffered_schedule_runs(
                     sla,
                     schedule_id: Some(schedule.id),
                     scheduled_for: Some(scheduled_for),
+                    workflow_attempt: 1,
+                    workflow_retry_policy: schedule
+                        .retry_policy
+                        .as_ref()
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
+                    retry_of_exec_id: None,
+                    max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
                 },
             )
             .await;
@@ -3833,27 +3866,35 @@ async fn drain_buffered_schedule_runs(
 /// `workflow_name` when a schedule-triggered execution reaches `FAILED` or
 /// `TIMED_OUT`.  If the counter now equals or exceeds the configured limit,
 /// auto-pause the schedule and emit the `harvest.schedule.auto_paused` metric.
+///
+/// `schedule_id` overrides the `workflow_id`-prefix heuristic when the caller
+/// already has the schedule UUID (e.g. retry executions whose `workflow_id` does
+/// not start with `"sched:"`).
 #[cfg(feature = "db")]
 pub(crate) async fn maybe_increment_schedule_failure_counter(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_id: &str,
     workflow_name: &str,
+    schedule_id: Option<uuid::Uuid>,
     metrics: &dyn crate::telemetry::MetricsRecorder,
 ) {
     use crate::schema::harvest_schedules::dsl;
 
-    if !workflow_id.starts_with("sched:") {
+    // Retry executions carry an explicit `schedule_id`; original scheduled
+    // executions embed the UUID in the `workflow_id` prefix.  Bail out only
+    // when neither source provides a schedule reference.
+    if schedule_id.is_none() && !workflow_id.starts_with("sched:") {
         return;
     }
 
-    // Extract the schedule UUID embedded in the workflow_id by `scheduled_workflow_id`.
-    // Format: "sched:{schedule_uuid}:{workflow_name}:{timestamp}[.{micros}]"
-    // If the UUID cannot be parsed (e.g. executions created before this format was
-    // introduced) we fall back to a workflow_name-scoped update.
-    let schedule_uuid: Option<uuid::Uuid> = workflow_id
-        .strip_prefix("sched:")
-        .and_then(|s| s.split(':').next())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    // Extract the schedule UUID from the explicit field or from the
+    // `workflow_id` prefix ("sched:{schedule_uuid}:{workflow_name}:{ts}").
+    let schedule_uuid: Option<uuid::Uuid> = schedule_id.or_else(|| {
+        workflow_id
+            .strip_prefix("sched:")
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+    });
 
     let now = Utc::now();
 
@@ -3960,22 +4001,29 @@ pub(crate) async fn maybe_increment_schedule_failure_counter(
 /// Reset the consecutive failure counter to zero for the schedule associated with
 /// `workflow_name` when a schedule-triggered execution reaches `COMPLETED`.
 /// Also clears `auto_paused_at` so the schedule resumes firing automatically.
+///
+/// `schedule_id` overrides the `workflow_id`-prefix heuristic when the caller
+/// already has the schedule UUID (e.g. retry executions whose `workflow_id` does
+/// not start with `"sched:"`).
 #[cfg(feature = "db")]
 pub(crate) async fn maybe_reset_schedule_failure_counter(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_id: &str,
     workflow_name: &str,
+    schedule_id: Option<uuid::Uuid>,
 ) {
     use crate::schema::harvest_schedules::dsl;
 
-    if !workflow_id.starts_with("sched:") {
+    if schedule_id.is_none() && !workflow_id.starts_with("sched:") {
         return;
     }
 
-    let schedule_uuid: Option<uuid::Uuid> = workflow_id
-        .strip_prefix("sched:")
-        .and_then(|s| s.split(':').next())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let schedule_uuid: Option<uuid::Uuid> = schedule_id.or_else(|| {
+        workflow_id
+            .strip_prefix("sched:")
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+    });
 
     let now = Utc::now();
     let result = if let Some(sid) = schedule_uuid {

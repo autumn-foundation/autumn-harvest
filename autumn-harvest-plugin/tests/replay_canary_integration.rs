@@ -136,7 +136,10 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260616000001_harvest_workflow_schedule_id/up.sql"
     ),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 async fn setup_database() -> (String, ContainerAsync<Postgres>) {
@@ -231,6 +234,7 @@ fn activity_wf_info() -> autumn_harvest::info::WorkflowInfo {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     }
 }
 

@@ -283,15 +283,26 @@ pub(crate) async fn dispatch_workflow_start_request(
         .await
         .map_err(database_error)?;
 
-    let (owner, runbook_url, severity, info_sla) = state
-        .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
+    let registry_ext = state.extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>();
+    let (owner, runbook_url, severity, info_sla, info_retry_policy) = registry_ext
+        .as_ref()
         .and_then(|registry| {
-            registry
-                .workflows
-                .get(&request.workflow_name)
-                .map(|wf| (wf.owner, wf.runbook_url, wf.severity, wf.sla))
+            registry.workflows.get(&request.workflow_name).map(|wf| {
+                (
+                    wf.owner,
+                    wf.runbook_url,
+                    wf.severity,
+                    wf.sla,
+                    wf.retry_policy.clone(),
+                )
+            })
         })
-        .unwrap_or((None, None, None, None));
+        .unwrap_or((None, None, None, None, None));
+    // Honour the operator's server-side retry-attempt ceiling for outbox-started
+    // workflows, consistent with the API/scheduler/typed start paths (issue #523).
+    let max_workflow_attempts_ceiling = registry_ext
+        .as_ref()
+        .and_then(|registry| registry.max_workflow_attempts_ceiling);
     let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
 
     let start = start_or_load_workflow_execution(
@@ -323,6 +334,10 @@ pub(crate) async fn dispatch_workflow_start_request(
             sla,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: info_retry_policy,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling,
         },
     )
     .await?;

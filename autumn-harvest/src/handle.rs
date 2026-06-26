@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
@@ -169,6 +170,8 @@ struct WorkflowHandleClientInner {
     history_policy: crate::context::WorkflowHistoryPolicy,
     /// Default max-wait cap for debounced starts when the policy omits `max_wait`.
     default_debounce_max_wait: Duration,
+    /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
+    max_workflow_attempts: Option<u32>,
 }
 
 impl std::fmt::Debug for WorkflowHandleClientInner {
@@ -194,6 +197,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("query_timeout", &self.query_timeout)
             .field("history_policy", &self.history_policy)
             .field("default_debounce_max_wait", &self.default_debounce_max_wait)
+            .field("max_workflow_attempts", &self.max_workflow_attempts)
             .finish()
     }
 }
@@ -253,6 +257,7 @@ impl WorkflowHandleClient {
                 query_timeout: Duration::from_secs(5),
                 history_policy: crate::context::WorkflowHistoryPolicy::default(),
                 default_debounce_max_wait: crate::builder::DEFAULT_DEBOUNCE_MAX_WAIT,
+                max_workflow_attempts: None,
             }),
         }
     }
@@ -372,6 +377,22 @@ impl WorkflowHandleClient {
     #[must_use]
     pub fn default_debounce_max_wait(&self) -> Duration {
         self.inner.default_debounce_max_wait
+    }
+
+    /// Get the server-side ceiling on workflow retry attempts (issue #523).
+    #[must_use]
+    pub fn max_workflow_attempts(&self) -> Option<u32> {
+        self.inner.max_workflow_attempts
+    }
+
+    /// Set the server-side ceiling on workflow retry attempts (issue #523).
+    #[must_use]
+    pub fn with_max_workflow_attempts(self, ceiling: Option<u32>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.max_workflow_attempts = ceiling;
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Get the maximum allowed execution timeout.
@@ -590,7 +611,9 @@ impl WorkflowHandle {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             HarvestError::Config("workflow result wait duration overflowed".to_string())
         })?;
-        let snapshot = self.result_snapshot().await?;
+        // Follow the workflow-level retry chain (issue #523) so a still-retrying
+        // run is not reported terminal at its first FAILED attempt.
+        let snapshot = WorkflowResult::from_execution(&self.load_effective_execution().await?);
         if snapshot.is_terminal() {
             return Ok(Some(snapshot));
         }
@@ -601,7 +624,7 @@ impl WorkflowHandle {
         let mut listener = self.connect_listener().await?;
 
         loop {
-            let snapshot = self.result_snapshot().await?;
+            let snapshot = WorkflowResult::from_execution(&self.load_effective_execution().await?);
             if snapshot.is_terminal() {
                 return Ok(Some(snapshot));
             }
@@ -614,7 +637,8 @@ impl WorkflowHandle {
             match listener.wait_for_notification_timeout(remaining).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
-                    let snapshot = self.result_snapshot().await?;
+                    let snapshot =
+                        WorkflowResult::from_execution(&self.load_effective_execution().await?);
                     return if snapshot.is_terminal() {
                         Ok(Some(snapshot))
                     } else {
@@ -637,7 +661,7 @@ impl WorkflowHandle {
     /// Returns terminal workflow errors, database errors, listener setup errors,
     /// or not-found errors.
     pub async fn result_raw(&self) -> HarvestResult<Value> {
-        let execution = self.load_execution().await?;
+        let execution = self.load_effective_execution().await?;
         if let Some(result) = terminal_raw_result(&execution) {
             return result;
         }
@@ -645,7 +669,7 @@ impl WorkflowHandle {
         let mut listener = self.connect_listener().await?;
 
         loop {
-            let execution = self.load_execution().await?;
+            let execution = self.load_effective_execution().await?;
             if let Some(result) = terminal_raw_result(&execution) {
                 return result;
             }
@@ -672,7 +696,7 @@ impl WorkflowHandle {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             HarvestError::Config("workflow result timeout duration overflowed".to_string())
         })?;
-        let execution = self.load_execution().await?;
+        let execution = self.load_effective_execution().await?;
         if let Some(result) = terminal_raw_result(&execution) {
             return result;
         }
@@ -683,7 +707,7 @@ impl WorkflowHandle {
         let mut listener = self.connect_listener().await?;
 
         loop {
-            let execution = self.load_execution().await?;
+            let execution = self.load_effective_execution().await?;
             if let Some(result) = terminal_raw_result(&execution) {
                 return result;
             }
@@ -696,7 +720,7 @@ impl WorkflowHandle {
             match listener.wait_for_notification_timeout(remaining).await? {
                 WorkflowEventWaitOutcome::Notification(_payload) => {}
                 WorkflowEventWaitOutcome::TimedOut => {
-                    let execution = self.load_execution().await?;
+                    let execution = self.load_effective_execution().await?;
                     if let Some(result) = terminal_raw_result(&execution) {
                         return result;
                     }
@@ -732,6 +756,10 @@ impl WorkflowHandle {
     }
 
     async fn load_execution(&self) -> HarvestResult<WorkflowExecution> {
+        self.load_execution_by_id(self.exec_id).await
+    }
+
+    async fn load_execution_by_id(&self, exec_id: ExecutionId) -> HarvestResult<WorkflowExecution> {
         let shard = self.shard();
         let mut conn = self
             .client
@@ -743,13 +771,64 @@ impl WorkflowHandle {
             .map_err(|error| HarvestError::Database(error.to_string()))?;
 
         harvest_workflow_executions::table
-            .find(self.exec_id.as_uuid())
+            .find(exec_id.as_uuid())
             .select(WorkflowExecution::as_select())
             .first(&mut conn)
             .await
             .optional()
             .map_err(database_error)?
-            .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {}", self.exec_id)))
+            .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+    }
+
+    /// If `execution` is `FAILED` and a workflow-level retry was scheduled for
+    /// it (issue #523), return the retry successor's [`ExecutionId`]. The retry
+    /// runs on the same shard with a fresh `exec_id`/`workflow_id` and links back
+    /// via `retry_of_exec_id`, so a result wait that stopped at the original
+    /// `FAILED` row would surface the first transient failure even though the
+    /// chain may still complete. Returns `None` for non-failed states or when no
+    /// retry exists (the failure is the chain's final outcome).
+    async fn retry_successor_id(
+        &self,
+        failed: &WorkflowExecution,
+    ) -> HarvestResult<Option<ExecutionId>> {
+        if failed.state != "FAILED" {
+            return Ok(None);
+        }
+        let shard = self.shard();
+        let mut conn = self
+            .client
+            .inner
+            .pools
+            .pool_for(shard)
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let next: Option<uuid::Uuid> = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(failed.id)))
+            .select(harvest_workflow_executions::id)
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        Ok(next.map(ExecutionId::from_uuid))
+    }
+
+    /// Load the *effective* execution to inspect for a result wait: starting at
+    /// this handle's `exec_id`, follow the workflow-level retry chain (issue
+    /// #523) while each execution is `FAILED` with a scheduled retry, returning
+    /// the deepest (most recent) execution. For workflows without a retry policy
+    /// this is exactly `load_execution()` — the original row — so behavior is
+    /// unchanged for the non-retry case.
+    async fn load_effective_execution(&self) -> HarvestResult<WorkflowExecution> {
+        let mut execution = self.load_execution().await?;
+        // Bounded by the chain length (max_attempts); a self-referential cycle
+        // is impossible because each retry has a strictly fresh exec_id.
+        loop {
+            match self.retry_successor_id(&execution).await? {
+                Some(next) => execution = self.load_execution_by_id(next).await?,
+                None => return Ok(execution),
+            }
+        }
     }
 
     /// Execute a registered query handler in-process by replaying event history.

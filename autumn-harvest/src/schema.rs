@@ -70,6 +70,13 @@ diesel::table! {
         /// ordered by this rather than `completed_at` so out-of-order completions can't
         /// roll an incremental cursor backward. NULL for non-scheduled executions.
         scheduled_for -> Nullable<Timestamptz>,
+        /// Attempt number of this execution in its retry chain (issue #523). 1 = first attempt.
+        /// Default 1 for pre-migration rows.
+        workflow_attempt -> Int4,
+        /// Frozen effective retry policy for this execution (issue #523). NULL = no auto-retry.
+        workflow_retry_policy -> Nullable<Jsonb>,
+        /// ID of the previous failed execution in this retry chain (issue #523). NULL for first attempt.
+        retry_of_exec_id -> Nullable<Uuid>,
     }
 }
 
@@ -244,6 +251,8 @@ diesel::table! {
         /// Timestamp of the most recent recovery tick that produced drops (issue #484).
         /// NULL when `last_catchup_dropped` = 0.
         last_catchup_at -> Nullable<Timestamptz>,
+        /// Default retry policy for runs started by this schedule (issue #523). NULL = no retry.
+        retry_policy -> Nullable<Jsonb>,
     }
 }
 

@@ -730,6 +730,7 @@ fn emit_workflow_companion(
                 input_schema: ::std::option::Option::None,
                 output_schema: ::std::option::Option::None,
                 error_schema: ::std::option::Option::None,
+                retry_policy: ::std::option::Option::None,
             }
         }
     }

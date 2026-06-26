@@ -354,6 +354,9 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             sla: opts.sla.or_else(|| Self::info().sla).and_then(|d|
                                 ::autumn_harvest::chrono::Duration::from_std(d).ok()
                             ),
+                            workflow_retry_policy: Self::info().retry_policy
+                                .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
+                            max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                             // Typed stubs already reject debounced workflows up front.
                             reject_fresh_if_debounced: false,
                         };
@@ -520,6 +523,9 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 sla: opts.sla.or_else(|| Self::info().sla).and_then(|d|
                                     ::autumn_harvest::chrono::Duration::from_std(d).ok()
                                 ),
+                                workflow_retry_policy: Self::info().retry_policy
+                                    .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
+                                max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                                 // Typed stubs already reject debounced workflows up front.
                                 reject_fresh_if_debounced: false,
                             };

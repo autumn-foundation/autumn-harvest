@@ -79,7 +79,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
     "\n",
-    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 async fn setup_test_db() -> (
@@ -136,6 +139,8 @@ fn params<'a>(
         context_headers: None,
 
         sla: None,
+        workflow_retry_policy: None,
+        max_workflow_attempts_ceiling: None,
         reject_fresh_if_debounced: false,
     }
 }

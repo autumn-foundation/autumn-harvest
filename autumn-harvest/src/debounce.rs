@@ -170,6 +170,13 @@ pub struct DebounceStartOptions {
     /// debounced runs carry parent trace linkage (ADR-0001 §3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_context: Option<crate::telemetry::TraceContextCarrier>,
+    /// Effective workflow-level retry policy, captured at admission so a
+    /// debounced run respects the same retry config as a normal start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_retry_policy: Option<serde_json::Value>,
+    /// Server-side ceiling on workflow retry attempts, captured at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workflow_attempts_ceiling: Option<u32>,
 }
 
 /// Parameters for [`admit_debounced_start`].
@@ -706,6 +713,12 @@ async fn fire_claimed_debounce_row(
         sla,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: opts
+            .workflow_retry_policy
+            .and_then(|v| serde_json::from_value(v).ok()),
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
     };
 
     // `in_outer_transaction = true`: this runs inside the scanner's fire

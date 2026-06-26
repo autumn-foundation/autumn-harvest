@@ -489,6 +489,7 @@ mod scanner {
                     conn,
                     &workflow_id,
                     &workflow_name,
+                    None, // schedule_id not available in quarantine context
                     metrics,
                 )
                 .await;
