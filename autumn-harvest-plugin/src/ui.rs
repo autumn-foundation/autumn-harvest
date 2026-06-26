@@ -6176,11 +6176,18 @@ async fn execute_schedule_trigger_ui(
         }
     };
     // Only registered workflows carry an SLA default; DAGs have no SLA concept.
-    let sla = runtime
-        .registry()
-        .workflows
-        .get(workflow_name)
-        .and_then(|info| crate::api::clamp_info_default_sla(info.sla, info.execution_timeout));
+    let (sla, ui_trigger_retry_policy) =
+        runtime
+            .registry()
+            .workflows
+            .get(workflow_name)
+            .map_or((None, None), |info| {
+                (
+                    crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
+                    info.retry_policy
+                        .and_then(|p| serde_json::to_value(&p).ok()),
+                )
+            });
 
     let result = start_or_load_workflow_execution(
         conn,
@@ -6216,7 +6223,7 @@ async fn execute_schedule_trigger_ui(
             schedule_id: None,
             scheduled_for: None,
             workflow_attempt: 1,
-            workflow_retry_policy: None,
+            workflow_retry_policy: ui_trigger_retry_policy,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
         },
@@ -7982,7 +7989,6 @@ mod tests {
             workflow_attempt: 1,
             workflow_retry_policy: None,
             retry_of_exec_id: None,
-            max_workflow_attempts_ceiling: None,
         }
     }
 

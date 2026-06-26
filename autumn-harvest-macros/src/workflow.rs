@@ -917,6 +917,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ),
                         // Typed stubs already reject debounced workflows up front.
                         reject_fresh_if_debounced: false,
+                        workflow_retry_policy: info.retry_policy
+                            .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
+                        max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

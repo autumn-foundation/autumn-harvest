@@ -44,6 +44,8 @@ fn update_with_start_params_is_cloneable_and_debug() {
         context_headers: None,
 
         sla: None,
+        workflow_retry_policy: None,
+        max_workflow_attempts_ceiling: None,
         reject_fresh_if_debounced: false,
     };
 
@@ -110,6 +112,8 @@ fn update_with_start_outcome_idempotency_key_roundtrip() {
         context_headers: None,
 
         sla: None,
+        workflow_retry_policy: None,
+        max_workflow_attempts_ceiling: None,
         reject_fresh_if_debounced: false,
     };
     assert_eq!(
@@ -269,6 +273,8 @@ mod db_tests {
             context_headers: None,
 
             sla: None,
+            workflow_retry_policy: None,
+            max_workflow_attempts_ceiling: None,
             reject_fresh_if_debounced: false,
         }
     }

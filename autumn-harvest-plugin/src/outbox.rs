@@ -283,15 +283,20 @@ pub(crate) async fn dispatch_workflow_start_request(
         .await
         .map_err(database_error)?;
 
-    let (owner, runbook_url, severity, info_sla) = state
+    let (owner, runbook_url, severity, info_sla, info_retry_policy) = state
         .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
         .and_then(|registry| {
-            registry
-                .workflows
-                .get(&request.workflow_name)
-                .map(|wf| (wf.owner, wf.runbook_url, wf.severity, wf.sla))
+            registry.workflows.get(&request.workflow_name).map(|wf| {
+                (
+                    wf.owner,
+                    wf.runbook_url,
+                    wf.severity,
+                    wf.sla,
+                    wf.retry_policy,
+                )
+            })
         })
-        .unwrap_or((None, None, None, None));
+        .unwrap_or((None, None, None, None, None));
     let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
 
     let start = start_or_load_workflow_execution(
@@ -324,7 +329,7 @@ pub(crate) async fn dispatch_workflow_start_request(
             schedule_id: None,
             scheduled_for: None,
             workflow_attempt: 1,
-            workflow_retry_policy: None,
+            workflow_retry_policy: info_retry_policy,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
         },

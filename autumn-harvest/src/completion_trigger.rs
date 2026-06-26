@@ -207,6 +207,8 @@ pub struct WorkflowMetadata {
     /// Declared soft-SLA default (issue #487), resolved at completion-trigger
     /// start time into a fresh `sla_deadline_at`.
     pub sla: Option<std::time::Duration>,
+    /// Declared workflow-type retry policy default (issue #523).
+    pub retry_policy: Option<crate::policy::RetryPolicy>,
 }
 
 #[cfg(feature = "db")]
@@ -306,6 +308,8 @@ pub struct DeferredTriggerStart {
     pub severity: Option<String>,
     /// Resolved soft-SLA default (issue #487), converted to a fresh deadline at start.
     pub sla: Option<std::time::Duration>,
+    /// Resolved workflow-type retry policy default (issue #523).
+    pub retry_policy: Option<crate::policy::RetryPolicy>,
 }
 
 #[cfg(feature = "db")]
@@ -375,7 +379,7 @@ impl DeferredTriggerStart {
                     schedule_id: None,
                     scheduled_for: None,
                     workflow_attempt: 1,
-                    workflow_retry_policy: None,
+                    workflow_retry_policy: self.retry_policy.clone(),
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: None,
                 },
@@ -550,18 +554,19 @@ pub fn evaluate_triggers_for_execution<'a>(
                     .map_or(global_default, |per_wf| per_wf.max(global_default))
             };
 
-            // Resolve target metadata (owner, runbook_url, severity, sla)
-            let (target_owner, target_runbook_url, target_severity, target_sla) = {
+            // Resolve target metadata (owner, runbook_url, severity, sla, retry_policy)
+            let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
                 let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
                 lock.as_ref()
                     .and_then(|guard| guard.as_ref())
                     .and_then(|meta_map| meta_map.get(&trigger_db.target_workflow_name))
-                    .map_or((None, None, None, None), |meta| {
+                    .map_or((None, None, None, None, None), |meta| {
                         (
                             meta.owner.clone(),
                             meta.runbook_url.clone(),
                             meta.severity.clone(),
                             meta.sla,
+                            meta.retry_policy.clone(),
                         )
                     })
             };
@@ -604,7 +609,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         schedule_id: None,
                         scheduled_for: None,
                         workflow_attempt: 1,
-                        workflow_retry_policy: None,
+                        workflow_retry_policy: target_retry_policy.clone(),
                         retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: None,
                     },
@@ -692,6 +697,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                     runbook_url: target_runbook_url,
                     severity: target_severity,
                     sla: target_sla,
+                    retry_policy: target_retry_policy,
                 });
             }
         }
@@ -767,21 +773,21 @@ pub async fn enforce_completion_triggers_outbox(
 
         let priority: Priority = serde_json::from_value(task.priority).unwrap_or_default();
 
-        let (target_owner, target_runbook_url, target_severity, target_sla) = {
+        let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
             let lock = GLOBAL_WORKFLOW_METADATA.read().ok();
             lock.as_ref()
                 .and_then(|guard| guard.as_ref())
                 .and_then(|meta_map| meta_map.get(&task.target_workflow_name))
-                .map_or((None, None, None, None), |meta| {
+                .map_or((None, None, None, None, None), |meta| {
                     (
                         meta.owner.clone(),
                         meta.runbook_url.clone(),
                         meta.severity.clone(),
                         meta.sla,
+                        meta.retry_policy.clone(),
                     )
                 })
         };
-
         let start_res = crate::execution::start_or_load_workflow_execution(
             &mut target_conn,
             crate::execution::StartWorkflowParams {
@@ -814,7 +820,7 @@ pub async fn enforce_completion_triggers_outbox(
                 schedule_id: None,
                 scheduled_for: None,
                 workflow_attempt: 1,
-                workflow_retry_policy: None,
+                workflow_retry_policy: target_retry_policy,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
             },

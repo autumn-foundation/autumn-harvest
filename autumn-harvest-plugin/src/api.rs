@@ -314,6 +314,9 @@ pub struct HarvestApiState {
     /// Default max-wait cap for debounced workflow starts (issue #499).
     /// Applied when `DebouncePolicy.max_wait` is `None`. Defaults to 1 hour.
     default_debounce_max_wait: Arc<Mutex<std::time::Duration>>,
+    /// Server-side ceiling on `workflow_retry_policy.max_attempts` (issue #523).
+    /// `None` = no ceiling enforced.
+    max_workflow_attempts: Arc<Mutex<Option<u32>>>,
 }
 
 impl Default for HarvestApiState {
@@ -343,6 +346,7 @@ impl Default for HarvestApiState {
             gate_cache: Arc::new(autumn_harvest::AdmissionGateCache::new()),
             max_workflow_history_events: Arc::new(Mutex::new(None)),
             default_debounce_max_wait: Arc::new(Mutex::new(std::time::Duration::from_secs(3600))),
+            max_workflow_attempts: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -419,6 +423,33 @@ impl HarvestApiState {
     pub fn max_workflow_execution_timeout(&self) -> Option<std::time::Duration> {
         *self
             .max_workflow_execution_timeout
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Set the server-side ceiling for workflow-level retry attempts (issue #523).
+    ///
+    /// Call this during startup from the plugin to propagate
+    /// `BuiltHarvest::max_workflow_attempts` into the API state so every start
+    /// request can have the cap applied.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_max_workflow_attempts(&self, ceiling: Option<u32>) {
+        *self
+            .max_workflow_attempts
+            .lock()
+            .expect("harvest api state lock poisoned") = ceiling;
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn max_workflow_attempts(&self) -> Option<u32> {
+        *self
+            .max_workflow_attempts
             .lock()
             .expect("harvest api state lock poisoned")
     }
@@ -6702,19 +6733,28 @@ async fn start_workflow(
             // normal start path resolves below, so a debounced run is not a
             // second-class start: the fire path (in core) has no registry access,
             // so these must be captured at admission time.
-            let (info_owner, info_runbook, info_severity, info_sla, info_execution_timeout) =
-                runtime.registry.workflows.get(&workflow_name).map_or(
-                    (None, None, None, None, None),
-                    |info| {
-                        (
-                            info.owner,
-                            info.runbook_url,
-                            info.severity,
-                            info.sla,
-                            info.execution_timeout,
-                        )
-                    },
-                );
+            let (
+                info_owner,
+                info_runbook,
+                info_severity,
+                info_sla,
+                info_execution_timeout,
+                info_retry_policy_debounce,
+            ) = runtime.registry.workflows.get(&workflow_name).map_or(
+                (None, None, None, None, None, None),
+                |info| {
+                    (
+                        info.owner,
+                        info.runbook_url,
+                        info.severity,
+                        info.sla,
+                        info.execution_timeout,
+                        info.retry_policy,
+                    )
+                },
+            );
+            let debounce_workflow_retry_policy =
+                info_retry_policy_debounce.and_then(|p| serde_json::to_value(&p).ok());
 
             // Effective SLA: request override → WorkflowInfo default, clamped to the
             // declared hard execution_timeout (mirrors the normal path).
@@ -6845,6 +6885,8 @@ async fn start_workflow(
                     max_execution_timeout_ceiling_secs: effective_ceiling_secs,
                     max_workflow_input_bytes: Some(effective_wf_cap),
                     trace_context: debounce_trace_ctx,
+                    workflow_retry_policy: debounce_workflow_retry_policy,
+                    max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                 },
             };
 
@@ -7009,19 +7051,28 @@ async fn start_workflow(
                 .into_response();
         }
 
-        let (info_owner, info_runbook, info_severity, info_sla, info_execution_timeout) = runtime
-            .registry
-            .workflows
-            .get(&workflow_name)
-            .map_or((None, None, None, None, None), |info| {
+        let (
+            info_owner,
+            info_runbook,
+            info_severity,
+            info_sla,
+            info_execution_timeout,
+            info_retry_policy_batch,
+        ) = runtime.registry.workflows.get(&workflow_name).map_or(
+            (None, None, None, None, None, None),
+            |info| {
                 (
                     info.owner,
                     info.runbook_url,
                     info.severity,
                     info.sla,
                     info.execution_timeout,
+                    info.retry_policy,
                 )
-            });
+            },
+        );
+        let batch_workflow_retry_policy =
+            info_retry_policy_batch.and_then(|p| serde_json::to_value(&p).ok());
 
         let effective_sla_secs = request
             .sla_secs
@@ -7129,6 +7180,8 @@ async fn start_workflow(
                 max_execution_timeout_ceiling_secs: effective_ceiling_secs,
                 max_workflow_input_bytes: Some(effective_wf_cap),
                 trace_context: debounce_trace_ctx,
+                workflow_retry_policy: batch_workflow_retry_policy,
+                max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             },
         };
 
@@ -7232,19 +7285,21 @@ async fn start_workflow(
     )
     .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-    let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .map_or((None, None, None, None, None), |info| {
-            (
-                info.owner,
-                info.runbook_url,
-                info.severity,
-                info.sla,
-                info.execution_timeout,
-            )
-        });
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy) =
+        runtime.registry.workflows.get(&workflow_name).map_or(
+            (None, None, None, None, None, None),
+            |info| {
+                (
+                    info.owner,
+                    info.runbook_url,
+                    info.severity,
+                    info.sla,
+                    info.execution_timeout,
+                    info.retry_policy,
+                )
+            },
+        );
+    let workflow_retry_policy = info_retry_policy;
 
     // Resolve effective SLA: request override → WorkflowInfo default → None.
     // `try_seconds` avoids a panic on an out-of-range untrusted `i64`, and the
@@ -7301,9 +7356,9 @@ async fn start_workflow(
             schedule_id: None,
             scheduled_for: None,
             workflow_attempt: 1,
-            workflow_retry_policy: None,
+            workflow_retry_policy,
             retry_of_exec_id: None,
-            max_workflow_attempts_ceiling: None,
+            max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         },
     )
     .await;
@@ -7936,20 +7991,22 @@ async fn batch_start_workflows(
             )
             .in_scope(|| runtime.registry.telemetry().capture_trace_context());
 
-            let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
-                .registry
-                .workflows
-                .get(&item.workflow_name)
-                .map_or((None, None, None, None, None), |info| {
-                    (
-                        info.owner,
-                        info.runbook_url,
-                        info.severity,
-                        info.sla,
-                        info.execution_timeout,
-                    )
-                });
+            let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy) =
+                runtime.registry.workflows.get(&item.workflow_name).map_or(
+                    (None, None, None, None, None, None),
+                    |info| {
+                        (
+                            info.owner,
+                            info.runbook_url,
+                            info.severity,
+                            info.sla,
+                            info.execution_timeout,
+                            info.retry_policy,
+                        )
+                    },
+                );
             let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
+            let item_workflow_retry_policy = info_retry_policy;
 
             // Debounced item: AllowDuplicate returns an existing run unchanged
             // (idempotent retry — allowed), but a *fresh* start must go through
@@ -7988,9 +8045,9 @@ async fn batch_start_workflows(
                     schedule_id: None,
                     scheduled_for: None,
                     workflow_attempt: 1,
-                    workflow_retry_policy: None,
+                    workflow_retry_policy: item_workflow_retry_policy,
                     retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: None,
+                    max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                 },
                 false,
                 item_reject_fresh,
@@ -8527,20 +8584,23 @@ async fn signal_with_start_workflow(
             (key, Some(policy.limit))
         });
 
-    let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .map_or((None, None, None, None, None), |info| {
-            (
-                info.owner,
-                info.runbook_url,
-                info.severity,
-                info.sla,
-                info.execution_timeout,
-            )
-        });
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy_sws) =
+        runtime.registry.workflows.get(&workflow_name).map_or(
+            (None, None, None, None, None, None),
+            |info| {
+                (
+                    info.owner,
+                    info.runbook_url,
+                    info.severity,
+                    info.sla,
+                    info.execution_timeout,
+                    info.retry_policy,
+                )
+            },
+        );
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
+    let sws_workflow_retry_policy =
+        info_retry_policy_sws.and_then(|p| serde_json::to_value(&p).ok());
 
     let result = signal_with_start_workflow_execution(
         &mut conn,
@@ -8577,6 +8637,8 @@ async fn signal_with_start_workflow(
             context_headers: None,
             sla,
             reject_fresh_if_debounced,
+            workflow_retry_policy: sws_workflow_retry_policy,
+            max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         },
     )
     .await;
@@ -9020,20 +9082,23 @@ async fn update_with_start_workflow(
             (key, Some(policy.limit))
         });
 
-    let (owner, runbook_url, severity, info_sla, info_execution_timeout) = runtime
-        .registry
-        .workflows
-        .get(&workflow_name)
-        .map_or((None, None, None, None, None), |info| {
-            (
-                info.owner,
-                info.runbook_url,
-                info.severity,
-                info.sla,
-                info.execution_timeout,
-            )
-        });
+    let (owner, runbook_url, severity, info_sla, info_execution_timeout, info_retry_policy_uws) =
+        runtime.registry.workflows.get(&workflow_name).map_or(
+            (None, None, None, None, None, None),
+            |info| {
+                (
+                    info.owner,
+                    info.runbook_url,
+                    info.severity,
+                    info.sla,
+                    info.execution_timeout,
+                    info.retry_policy,
+                )
+            },
+        );
     let sla = clamp_info_default_sla(info_sla, info_execution_timeout);
+    let uws_workflow_retry_policy =
+        info_retry_policy_uws.and_then(|p| serde_json::to_value(&p).ok());
 
     // Run the registered update handler's validator (if any) before admitting.
     if let Some(update_info) = runtime
@@ -9098,6 +9163,8 @@ async fn update_with_start_workflow(
         severity,
         context_headers: None,
         sla,
+        workflow_retry_policy: uws_workflow_retry_policy,
+        max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         reject_fresh_if_debounced,
     };
 
@@ -12771,6 +12838,11 @@ async fn trigger_schedule_now(
             let key = autumn_harvest::concurrency::resolve_concurrency_key(policy.key_expr, &input);
             (key, Some(policy.limit))
         });
+    let manual_trigger_retry_policy = runtime
+        .registry
+        .workflows
+        .get(&workflow_name)
+        .and_then(|info| info.retry_policy);
 
     let result = start_or_load_workflow_execution(
         &mut exec_conn,
@@ -12818,9 +12890,9 @@ async fn trigger_schedule_now(
             schedule_id: None,
             scheduled_for: None,
             workflow_attempt: 1,
-            workflow_retry_policy: None,
+            workflow_retry_policy: manual_trigger_retry_policy,
             retry_of_exec_id: None,
-            max_workflow_attempts_ceiling: None,
+            max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         },
     )
     .await;

@@ -302,6 +302,7 @@ impl HandlerRegistry {
                             severity: w.severity.map(String::from),
                             input_schema: w.input_schema,
                             sla: w.sla,
+                            retry_policy: w.retry_policy.clone(),
                         },
                     )
                 })
@@ -2330,15 +2331,27 @@ async fn persist_workflow_failure(
             None
         };
 
+    // Bug #8: pre-compute fire_at once so the WorkflowRetryScheduled event and
+    // the task's scheduled_at use the same timestamp (not two separate Utc::now()
+    // calls that could differ by milliseconds under load).
+    #[allow(clippy::type_complexity)]
+    let retry_fire_info: Option<(
+        ExecutionId,
+        RetryPolicy,
+        u32,
+        chrono::DateTime<chrono::Utc>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = retry_plan.as_ref().map(|(rid, policy, attempt, delay)| {
+        let fire_at = chrono::Utc::now() + chrono::Duration::from_std(*delay).unwrap_or_default();
+        let start_at = if delay.is_zero() { None } else { Some(fire_at) };
+        (*rid, policy.clone(), *attempt, fire_at, start_at)
+    });
+
     let (deferred, retry_scheduled) = conn
         .transaction::<(Vec<crate::completion_trigger::DeferredTriggerStart>, bool), HarvestError, _>(
             |conn| {
                 let error = error.clone();
-                let retry_plan_ref = retry_plan.as_ref().map(|(id, policy, attempt, delay)| {
-                    let fire_at = chrono::Utc::now()
-                        + chrono::Duration::from_std(*delay).unwrap_or_default();
-                    (*id, policy.clone(), *attempt, fire_at)
-                });
+                let retry_fire_info = retry_fire_info.clone();
                 async move {
                     store::append_events(
                         conn,
@@ -2362,27 +2375,90 @@ async fn persist_workflow_failure(
                     .await?;
                     deferred.extend(triggers);
 
-                    // Append WorkflowRetryScheduled inside the same transaction.
+                    // Bugs #1/#5: start the retry execution INSIDE this transaction
+                    // (atomic with failure) using AllowDuplicateFailedOnly so the
+                    // FAILED→CONTINUED_AS_NEW transition releases the uniqueness slot.
                     let mut retry_committed = false;
-                    if let Some((rid, _policy, attempt, fire_at)) = retry_plan_ref {
-                        let append_res = store::append_events(
+                    if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_at))) =
+                        (execution, retry_fire_info)
+                    {
+                        let retry_params = crate::execution::StartWorkflowParams {
+                            workflow_name: &exec_ref.workflow_name,
+                            workflow_id: &exec_ref.workflow_id,
+                            exec_id: rid,
+                            input: exec_ref.input.clone(),
+                            parent_id: None,
+                            queue_name: &exec_ref.queue_name,
+                            execution_timeout: exec_ref.execution_timeout,
+                            memo: exec_ref.memo.clone(),
+                            search_attrs: None,
+                            // Bug #1: use AllowDuplicateFailedOnly — this calls
+                            // replace_execution which seals the FAILED row as
+                            // CONTINUED_AS_NEW (releasing the uniqueness slot) and
+                            // inserts the retry row atomically inside a savepoint.
+                            reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+                            trace_context: None,
+                            max_execution_timeout_ceiling: None,
+                            concurrency_key: None,
+                            concurrency_limit: None,
+                            priority: crate::types::Priority::default(),
+                            max_workflow_input_bytes: 0,
+                            // Bug #8: use pre-computed start_at (same fire_at reference)
+                            start_at,
+                            delay: None,
+                            max_workflow_start_delay: None,
+                            owner: exec_ref.owner.as_deref(),
+                            runbook_url: exec_ref.runbook_url.as_deref(),
+                            severity: exec_ref.severity.as_deref(),
+                            context_headers: exec_ref
+                                .context_headers
+                                .clone()
+                                .and_then(|v| serde_json::from_value(v).ok()),
+                            sla: None,
+                            schedule_id: exec_ref.schedule_id,
+                            scheduled_for: exec_ref.scheduled_for,
+                            workflow_attempt: attempt + 1,
+                            workflow_retry_policy: Some(policy),
+                            retry_of_exec_id: Some(exec_id.as_uuid()),
+                            max_workflow_attempts_ceiling: None,
+                        };
+
+                        // Bug #5: call with in_outer_transaction=true so the
+                        // savepoint is nested inside this transaction.
+                        match crate::execution::start_or_load_workflow_execution_collect(
                             conn,
-                            exec_id,
-                            &[WorkflowEvent::WorkflowRetryScheduled {
-                                retry_exec_id: rid,
-                                attempt: attempt + 1,
-                                fire_at,
-                            }],
-                            next_event_id + 1, // after WorkflowFailed
+                            retry_params,
+                            true,
+                            false,
                         )
-                        .await;
-                        retry_committed = append_res.is_ok();
-                        if let Err(e) = append_res {
-                            tracing::warn!(
-                                execution_id = %exec_id,
-                                error = %e,
-                                "harvest: failed to append WorkflowRetryScheduled; not retrying"
-                            );
+                        .await
+                        {
+                            Ok((_started, retry_deferred)) => {
+                                deferred.extend(retry_deferred);
+                                // Bug #4: use append_single_event (MAX+1 with FOR UPDATE)
+                                // instead of hardcoding next_event_id + 1, which could
+                                // collide when concurrent appends occur between the
+                                // WorkflowFailed insert and this one.
+                                store::append_single_event(
+                                    conn,
+                                    exec_id,
+                                    WorkflowEvent::WorkflowRetryScheduled {
+                                        retry_exec_id: rid,
+                                        attempt: attempt + 1,
+                                        // Bug #8: same pre-computed fire_at
+                                        fire_at,
+                                    },
+                                )
+                                .await?;
+                                retry_committed = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    execution_id = %exec_id,
+                                    error = %e,
+                                    "harvest: failed to start retry execution; not retrying"
+                                );
+                            }
                         }
                     }
 
@@ -2393,84 +2469,26 @@ async fn persist_workflow_failure(
         )
         .await?;
 
+    if retry_scheduled
+        && let (Some(exec), Some((_, _, attempt, _, _))) = (execution, &retry_fire_info)
+    {
+        if let Some(m) = metrics {
+            m.record_workflow_retry(&exec.workflow_name, &exec.queue_name);
+        }
+        let delay_secs = retry_plan.as_ref().map_or(0, |(_, _, _, d)| d.as_secs());
+        tracing::info!(
+            execution_id = %exec_id,
+            attempt = attempt + 1,
+            delay_secs,
+            "harvest: workflow retry scheduled"
+        );
+    }
+
     for start in deferred {
         start.spawn();
     }
 
-    // Start the retry execution outside the transaction.
-    // Two nested ifs because Rust's if-let chain requires edition 2024+ guards.
-    #[allow(clippy::collapsible_if)]
-    if retry_scheduled {
-        if let (Some(exec), Some((rid, policy, attempt, delay))) = (
-            execution,
-            retry_plan.as_ref().map(|(id, p, a, d)| (*id, p, *a, *d)),
-        ) {
-            let fire_at =
-                chrono::Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default();
-            let start_at = if delay.is_zero() { None } else { Some(fire_at) };
-            let retry_params = crate::execution::StartWorkflowParams {
-                workflow_name: &exec.workflow_name,
-                workflow_id: &exec.workflow_id,
-                exec_id: rid,
-                input: exec.input.clone(),
-                parent_id: None,
-                queue_name: &exec.queue_name,
-                execution_timeout: exec.execution_timeout,
-                memo: exec.memo.clone(),
-                search_attrs: None,
-                reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-                trace_context: None,
-                max_execution_timeout_ceiling: None,
-                concurrency_key: None,
-                concurrency_limit: None,
-                priority: crate::types::Priority::default(),
-                max_workflow_input_bytes: 0,
-                start_at,
-                delay: None,
-                max_workflow_start_delay: None,
-                owner: exec.owner.as_deref(),
-                runbook_url: exec.runbook_url.as_deref(),
-                severity: exec.severity.as_deref(),
-                context_headers: exec
-                    .context_headers
-                    .clone()
-                    .and_then(|v| serde_json::from_value(v).ok()),
-                sla: None,
-                schedule_id: exec.schedule_id,
-                scheduled_for: exec.scheduled_for,
-                workflow_attempt: attempt + 1,
-                workflow_retry_policy: Some(policy.clone()),
-                retry_of_exec_id: Some(exec_id.as_uuid()),
-                max_workflow_attempts_ceiling: None,
-            };
-
-            match crate::execution::start_or_load_workflow_execution(conn, retry_params).await {
-                Ok(_started) => {
-                    if let Some(m) = metrics {
-                        m.record_workflow_retry(&exec.workflow_name, &exec.queue_name);
-                    }
-                    tracing::info!(
-                        execution_id = %exec_id,
-                        retry_exec_id = %rid,
-                        attempt = attempt + 1,
-                        delay_secs = delay.as_secs(),
-                        "harvest: workflow retry scheduled"
-                    );
-                    return Ok(true);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        execution_id = %exec_id,
-                        error = %e,
-                        "harvest: failed to start retry execution"
-                    );
-                    // Fall through: return false (no retry)
-                }
-            }
-        }
-    }
-
-    Ok(false)
+    Ok(retry_scheduled)
 }
 
 /// Append `UpdateCompleted` or `UpdateFailed` events for each
@@ -3277,18 +3295,24 @@ async fn persist_all_started_child_workflows(
             // Insert rows and enqueue tasks for new children.
             for child in &new_children {
                 let child_workflow_id = child.child_id.to_string();
-                let (owner, runbook_url, severity, child_sla, child_execution_timeout) = registry
-                    .workflows
-                    .get(child.workflow_name.as_str())
-                    .map_or((None, None, None, None, None), |w| {
-                        (
-                            w.owner,
-                            w.runbook_url,
-                            w.severity,
-                            w.sla,
-                            w.execution_timeout,
-                        )
-                    });
+                let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
+                let (
+                    owner,
+                    runbook_url,
+                    severity,
+                    child_sla,
+                    child_execution_timeout,
+                    child_retry_policy,
+                ) = child_wf_info.map_or((None, None, None, None, None, None), |w| {
+                    (
+                        w.owner,
+                        w.runbook_url,
+                        w.severity,
+                        w.sla,
+                        w.execution_timeout,
+                        w.retry_policy.clone(),
+                    )
+                });
                 let child_execution_timeout =
                     child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
                 let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
@@ -3318,7 +3342,8 @@ async fn persist_all_started_child_workflows(
                     schedule_id: None, // child workflows are not scheduled fires
                     scheduled_for: None,
                     workflow_attempt: 1,
-                    workflow_retry_policy: None,
+                    workflow_retry_policy: child_retry_policy
+                        .and_then(|p| serde_json::to_value(&p).ok()),
                     retry_of_exec_id: None,
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
@@ -3852,11 +3877,16 @@ async fn create_detached_child_executions(
         }
 
         let child_workflow_id = child_id.to_string();
-        let (owner, runbook_url, severity, child_sla) = registry
-            .workflows
-            .get(workflow_name.as_str())
-            .map_or((None, None, None, None), |w| {
-                (w.owner, w.runbook_url, w.severity, w.sla)
+        let detached_wf_info = registry.workflows.get(workflow_name.as_str());
+        let (owner, runbook_url, severity, child_sla, detached_retry_policy) = detached_wf_info
+            .map_or((None, None, None, None, None), |w| {
+                (
+                    w.owner,
+                    w.runbook_url,
+                    w.severity,
+                    w.sla,
+                    w.retry_policy.clone(),
+                )
             });
         let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
         let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
@@ -3884,7 +3914,8 @@ async fn create_detached_child_executions(
             schedule_id: None, // detached child workflows are not scheduled fires
             scheduled_for: None,
             workflow_attempt: 1,
-            workflow_retry_policy: None,
+            workflow_retry_policy: detached_retry_policy
+                .and_then(|p| serde_json::to_value(&p).ok()),
             retry_of_exec_id: None,
         };
 
@@ -5216,7 +5247,7 @@ async fn persist_workflow_outcome(
     // they must not be called here (a failed counter query inside a Postgres
     // transaction aborts the whole transaction).
     update_schedule_counter: bool,
-) -> HarvestResult<()> {
+) -> HarvestResult<bool> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
     // do NOT wake their parent on completion or failure.
@@ -5235,6 +5266,7 @@ async fn persist_workflow_outcome(
                 Some(registry.telemetry().metrics.as_ref()),
             )
             .await
+            .map(|()| false)
         }
         (WorkflowOutcome::Completed { output }, _) => {
             // Root workflow or detached child completing — no parent wake.
@@ -5256,7 +5288,7 @@ async fn persist_workflow_outcome(
                 )
                 .await;
             }
-            result
+            result.map(|()| false)
         }
         (
             WorkflowOutcome::Failed {
@@ -5286,7 +5318,7 @@ async fn persist_workflow_outcome(
                 )
                 .await;
             }
-            result
+            result.map(|()| false)
         }
         (
             WorkflowOutcome::Failed {
@@ -5296,6 +5328,8 @@ async fn persist_workflow_outcome(
             _,
         ) => {
             // Root workflow or detached child failing — no parent wake.
+            // Returns true if a retry was scheduled (Bug #3: propagate to caller so
+            // the deferred schedule-failure counter can be suppressed).
             let result = persist_workflow_failure(
                 conn,
                 persistence.task.id,
@@ -5322,28 +5356,29 @@ async fn persist_workflow_outcome(
                     _ => {}
                 }
             }
-            result.map(|_| ())
+            result
         }
-        (WorkflowOutcome::Suspended { commands }, _) => {
-            handle_suspended_workflow(
-                conn,
-                registry,
-                SuspendedWorkflowContext {
-                    execution,
-                    persistence,
-                    execute_span,
-                },
-                &commands,
-            )
-            .await
-        }
+        (WorkflowOutcome::Suspended { commands }, _) => handle_suspended_workflow(
+            conn,
+            registry,
+            SuspendedWorkflowContext {
+                execution,
+                persistence,
+                execute_span,
+            },
+            &commands,
+        )
+        .await
+        .map(|()| false),
         (WorkflowOutcome::ContinuedAsNew { input }, _) => {
             // task/worker_id are Copy references; capture before persistence is moved.
             let task = persistence.task;
             let worker_id = persistence.worker_id;
             let result =
                 persist_workflow_continue_as_new(conn, persistence, execution, input).await;
-            fail_execution_on_error(conn, task, worker_id, result).await
+            fail_execution_on_error(conn, task, worker_id, result)
+                .await
+                .map(|()| false)
         }
     }
 }
@@ -5357,7 +5392,10 @@ enum WorkflowPersistFlow {
     /// replay.
     ParkedPaused,
     /// The decision was persisted under the execution row lock.
-    Persisted,
+    /// `retry_scheduled` is `true` when a workflow-level retry was atomically
+    /// started inside the failure transaction; the deferred schedule-failure
+    /// counter must be suppressed until the retry chain is exhausted.
+    Persisted { retry_scheduled: bool },
 }
 
 /// Map a terminal/suspended outcome to its deferred schedule-failure-counter
@@ -5422,7 +5460,7 @@ async fn persist_terminal_outcome_commands(
     outcome: WorkflowOutcome,
     pending_cmds: &[WorkflowCommand],
     execute_span: &tracing::Span,
-) -> HarvestResult<()> {
+) -> HarvestResult<bool> {
     let mut next_event_id = persistence.next_event_id;
     persist_update_result_commands(conn, persistence.exec_id, pending_cmds, &mut next_event_id)
         .await?;
@@ -5440,6 +5478,7 @@ async fn persist_terminal_outcome_commands(
     create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span).await?;
 
     // `update_schedule_counter: false` — the caller runs counters after commit.
+    // Returns true if a workflow retry was scheduled (root/detached failure path).
     persist_workflow_outcome(
         conn,
         registry,
@@ -6638,7 +6677,7 @@ async fn process_workflow_task(
                     return Ok(WorkflowPersistFlow::ParkedPaused);
                 }
 
-                if is_terminal_with_commands {
+                let retry_scheduled = if is_terminal_with_commands {
                     persist_terminal_outcome_commands(
                         conn,
                         registry,
@@ -6648,7 +6687,7 @@ async fn process_workflow_task(
                         &pending_cmds,
                         &execute_span,
                     )
-                    .await?;
+                    .await?
                 } else {
                     persist_workflow_outcome(
                         conn,
@@ -6659,9 +6698,9 @@ async fn process_workflow_task(
                         &execute_span,
                         false,
                     )
-                    .await?;
-                }
-                Ok(WorkflowPersistFlow::Persisted)
+                    .await?
+                };
+                Ok(WorkflowPersistFlow::Persisted { retry_scheduled })
             }
             .scope_boxed()
         })
@@ -6672,9 +6711,16 @@ async fn process_workflow_task(
 
     match persist_flow {
         Ok(WorkflowPersistFlow::ParkedPaused) => return Ok(()),
-        Ok(WorkflowPersistFlow::Persisted) => {
+        Ok(WorkflowPersistFlow::Persisted { retry_scheduled }) => {
             // Deferred best-effort schedule counters, in autocommit post-commit.
-            run_deferred_schedule_counter(conn, registry, &prepared.execution, counter_action)
+            // When a retry was scheduled the failure-counter increment is
+            // suppressed: one failure chain counts as one failure (issue #523).
+            let effective_counter = if retry_scheduled {
+                None
+            } else {
+                counter_action
+            };
+            run_deferred_schedule_counter(conn, registry, &prepared.execution, effective_counter)
                 .await;
         }
         Err(error) => {

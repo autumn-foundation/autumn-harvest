@@ -2076,6 +2076,12 @@ pub struct SignalWithStartParams<'a> {
     /// so an attach/idempotent call is preserved while a fresh start is rejected
     /// — decided atomically under this call's lock (issue #499).
     pub reject_fresh_if_debounced: bool,
+    /// Effective workflow-level retry policy (issue #523). Forwarded to
+    /// [`StartWorkflowParams::workflow_retry_policy`] on fresh starts.
+    pub workflow_retry_policy: Option<serde_json::Value>,
+    /// Server-side ceiling on retry attempts. Forwarded to
+    /// [`StartWorkflowParams::max_workflow_attempts_ceiling`].
+    pub max_workflow_attempts_ceiling: Option<u32>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -2258,9 +2264,12 @@ pub async fn signal_with_start_workflow_execution(
                     schedule_id: None,
                     scheduled_for: None,
                     workflow_attempt: 1,
-                    workflow_retry_policy: None,
+                    workflow_retry_policy: request
+                        .workflow_retry_policy
+                        .clone()
+                        .and_then(|v| serde_json::from_value(v).ok()),
                     retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: None,
+                    max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
                 };
 
             // For a debounced workflow, route the start through the no-spawn collect
@@ -2593,6 +2602,12 @@ pub struct UpdateWithStartParams<'a> {
     pub context_headers: Option<std::collections::HashMap<String, String>>,
     /// Soft SLA budget forwarded to [`StartWorkflowParams::sla`] (issue #487).
     pub sla: Option<chrono::Duration>,
+    /// Effective workflow-level retry policy (issue #523). Forwarded to
+    /// [`StartWorkflowParams::workflow_retry_policy`] on fresh starts.
+    pub workflow_retry_policy: Option<serde_json::Value>,
+    /// Server-side ceiling on retry attempts. Forwarded to
+    /// [`StartWorkflowParams::max_workflow_attempts_ceiling`].
+    pub max_workflow_attempts_ceiling: Option<u32>,
     /// When `true`, reject (with [`HarvestError::DebounceFreshStart`]) any call
     /// that would create a **fresh** execution rather than attach to a live
     /// (RUNNING/PAUSED) prior. Set by the HTTP handler for a debounced workflow
@@ -2730,9 +2745,12 @@ pub async fn update_with_start_workflow_execution(
                     schedule_id: None,
                     scheduled_for: None,
                     workflow_attempt: 1,
-                    workflow_retry_policy: None,
+                    workflow_retry_policy: request
+                        .workflow_retry_policy
+                        .clone()
+                        .and_then(|v| serde_json::from_value(v).ok()),
                     retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: None,
+                    max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
                 };
 
             // Debounced workflow: route through the no-spawn collect path with

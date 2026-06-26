@@ -157,6 +157,8 @@ async fn add_item_atomic(
             context_headers: None,
 
             sla: None,
+            workflow_retry_policy: None,
+            max_workflow_attempts_ceiling: None,
             reject_fresh_if_debounced: false,
         },
     )

@@ -2798,7 +2798,8 @@ async fn tick_one_workflow_schedule(
                 workflow_retry_policy: schedule
                     .retry_policy
                     .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
             },
@@ -3713,7 +3714,8 @@ async fn drain_buffered_schedule_runs(
                     workflow_retry_policy: schedule
                         .retry_policy
                         .as_ref()
-                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: None,
                 },

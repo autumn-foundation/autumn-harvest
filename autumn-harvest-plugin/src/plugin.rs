@@ -330,6 +330,8 @@ async fn start_harvest_runtime(
     api_state.set_max_workflow_start_delay(built.worker_config().max_workflow_start_delay);
     // Propagate the default debounce max-wait cap (issue #499).
     api_state.set_default_debounce_max_wait(built.worker_config().default_debounce_max_wait);
+    // Propagate the server-side workflow retry attempt ceiling (issue #523).
+    api_state.set_max_workflow_attempts(built.max_workflow_attempts);
     // Propagate batch start caps from builder config (issue #357).
     api_state.set_batch_start_config(&built.batch_start_config);
 
@@ -352,6 +354,7 @@ async fn start_harvest_runtime(
     let update_handlers = built.update_handlers().to_vec();
     let max_workflow_input_bytes = built.max_workflow_input_bytes;
     let max_workflow_execution_timeout = built.max_workflow_execution_timeout;
+    let max_workflow_attempts = built.max_workflow_attempts;
     let max_workflow_start_delay = built.max_workflow_start_delay;
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
     let query_timeout = built.worker_config().query_timeout;
@@ -375,7 +378,8 @@ async fn start_harvest_runtime(
     .with_max_signal_payload_bytes(max_signal_payload_bytes)
     .with_query_timeout(query_timeout)
     .with_history_policy(runner.api_runtime().registry().history_policy())
-    .with_default_debounce_max_wait(default_debounce_max_wait);
+    .with_default_debounce_max_wait(default_debounce_max_wait)
+    .with_max_workflow_attempts(max_workflow_attempts);
     state.insert_extension(harvest_db_pool.clone());
     state.insert_extension(runner.api_runtime().registry().clone());
 
@@ -393,16 +397,22 @@ async fn start_harvest_runtime(
                 let client = client.clone();
                 let harvest_db = state.extension::<crate::state::HarvestDbPool>();
 
-                let (owner, runbook_url, severity, info_sla) = state
+                let (owner, runbook_url, severity, info_sla, info_retry_policy) = state
                     .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
                     .and_then(|registry| {
-                        registry
-                            .workflows
-                            .get("webhook_delivery")
-                            .map(|wf| (wf.owner, wf.runbook_url, wf.severity, wf.sla))
+                        registry.workflows.get("webhook_delivery").map(|wf| {
+                            (
+                                wf.owner,
+                                wf.runbook_url,
+                                wf.severity,
+                                wf.sla,
+                                wf.retry_policy,
+                            )
+                        })
                     })
-                    .unwrap_or((None, None, None, None));
+                    .unwrap_or((None, None, None, None, None));
                 let sla = info_sla.and_then(|d| autumn_harvest::chrono::Duration::from_std(d).ok());
+                let webhook_retry_policy = info_retry_policy;
 
                 Box::pin(async move {
                     let workflow_id = format!("webhook-delivery-{}", log.id);
@@ -442,7 +452,7 @@ async fn start_harvest_runtime(
                         schedule_id: None,
                         scheduled_for: None,
                         workflow_attempt: 1,
-                        workflow_retry_policy: None,
+                        workflow_retry_policy: webhook_retry_policy,
                         retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: None,
                     };

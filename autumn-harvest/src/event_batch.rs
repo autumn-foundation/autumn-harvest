@@ -263,9 +263,12 @@ pub async fn admit_batched_start(
                         schedule_id: None,
                         scheduled_for: None,
                         workflow_attempt: 1,
-                        workflow_retry_policy: None,
+                        workflow_retry_policy: opts
+                            .workflow_retry_policy
+                            .clone()
+                            .and_then(|v| serde_json::from_value(v).ok()),
                         retry_of_exec_id: None,
-                        max_workflow_attempts_ceiling: None,
+                        max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
                     };
 
                     let (started, deferred_starts) =
@@ -468,9 +471,11 @@ async fn fire_claimed_batch_row(
         schedule_id: None,
         scheduled_for: None,
         workflow_attempt: 1,
-        workflow_retry_policy: None,
+        workflow_retry_policy: opts
+            .workflow_retry_policy
+            .and_then(|v| serde_json::from_value(v).ok()),
         retry_of_exec_id: None,
-        max_workflow_attempts_ceiling: None,
+        max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
     };
 
     let start_res =

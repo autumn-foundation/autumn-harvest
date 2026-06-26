@@ -718,6 +718,10 @@ impl WorkflowEvent {
                 // never consumed by the workflow function itself, so must be skipped
                 // during unconsumed-event checks to avoid false non-determinism reports.
                 | Self::ChildWorkflowCascadeApplied { .. }
+                // Appended to the failed run's history after WorkflowFailed as a
+                // durable linkage record; the failed run is sealed and the event is
+                // never consumed by its workflow function on replay.
+                | Self::WorkflowRetryScheduled { .. }
         )
     }
 }

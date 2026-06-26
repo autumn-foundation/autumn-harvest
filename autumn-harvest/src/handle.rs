@@ -169,6 +169,8 @@ struct WorkflowHandleClientInner {
     history_policy: crate::context::WorkflowHistoryPolicy,
     /// Default max-wait cap for debounced starts when the policy omits `max_wait`.
     default_debounce_max_wait: Duration,
+    /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
+    max_workflow_attempts: Option<u32>,
 }
 
 impl std::fmt::Debug for WorkflowHandleClientInner {
@@ -194,6 +196,7 @@ impl std::fmt::Debug for WorkflowHandleClientInner {
             .field("query_timeout", &self.query_timeout)
             .field("history_policy", &self.history_policy)
             .field("default_debounce_max_wait", &self.default_debounce_max_wait)
+            .field("max_workflow_attempts", &self.max_workflow_attempts)
             .finish()
     }
 }
@@ -253,6 +256,7 @@ impl WorkflowHandleClient {
                 query_timeout: Duration::from_secs(5),
                 history_policy: crate::context::WorkflowHistoryPolicy::default(),
                 default_debounce_max_wait: crate::builder::DEFAULT_DEBOUNCE_MAX_WAIT,
+                max_workflow_attempts: None,
             }),
         }
     }
@@ -372,6 +376,22 @@ impl WorkflowHandleClient {
     #[must_use]
     pub fn default_debounce_max_wait(&self) -> Duration {
         self.inner.default_debounce_max_wait
+    }
+
+    /// Get the server-side ceiling on workflow retry attempts (issue #523).
+    #[must_use]
+    pub fn max_workflow_attempts(&self) -> Option<u32> {
+        self.inner.max_workflow_attempts
+    }
+
+    /// Set the server-side ceiling on workflow retry attempts (issue #523).
+    #[must_use]
+    pub fn with_max_workflow_attempts(self, ceiling: Option<u32>) -> Self {
+        let mut inner = (*self.inner).clone();
+        inner.max_workflow_attempts = ceiling;
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Get the maximum allowed execution timeout.
