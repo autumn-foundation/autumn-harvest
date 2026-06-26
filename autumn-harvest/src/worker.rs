@@ -7507,6 +7507,13 @@ pub struct Worker {
     /// `drain_deadline_at` so that `drain_in_flight` can honour an extended
     /// window even after it has already started waiting.
     remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Raw `drain_deadline_at` values already applied to `remote_drain_deadline`,
+    /// shared across the per-shard heartbeat tasks (issue #522 review). A multi-
+    /// shard worker runs one heartbeat per assigned shard, all sharing the cell
+    /// above; this set lets `sync_drain_deadline` tell a stale re-read (a value
+    /// some shard already applied) from a genuine operator command that has not
+    /// been seen yet — even on a shard's first observation while the cell is set.
+    drain_deadline_applied: Arc<Mutex<std::collections::HashSet<chrono::DateTime<chrono::Utc>>>>,
     /// Per-worker in-process LRU cache for suspended workflow event histories.
     ///
     /// Populated after each suspension; consulted at the start of each workflow
@@ -7771,6 +7778,7 @@ impl Worker {
             activity_semaphore,
             shutdown: CancellationToken::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
+            drain_deadline_applied: Arc::new(Mutex::new(std::collections::HashSet::new())),
             workflow_cache,
             workflow_task_timeout_strikes: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -8536,6 +8544,7 @@ impl Worker {
             heartbeat_cancel,
             self.shutdown.clone(),
             Arc::clone(&self.remote_drain_deadline),
+            Arc::clone(&self.drain_deadline_applied),
         )
     }
 

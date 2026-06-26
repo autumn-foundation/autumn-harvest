@@ -1016,6 +1016,8 @@ pub async fn drain_preview(
 /// the worker automatically. It stops when `cancel` is triggered.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
+// The shared applied-set uses the worker's own fixed hasher; no need to generalize.
+#[allow(clippy::implicit_hasher)]
 pub fn spawn_worker_heartbeat(
     pool: DbPool,
     registration: WorkerRegistration,
@@ -1030,12 +1032,13 @@ pub fn spawn_worker_heartbeat(
     // operator-supplied drain_deadline_at, refreshed on every heartbeat tick
     // so that extended deadlines are picked up by drain_in_flight.
     remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
+    // Raw `drain_deadline_at` values already applied to `remote_drain_deadline`,
+    // shared across this worker's per-shard heartbeat tasks so a stale re-read
+    // can be told apart from a genuine new operator command (issue #522 review).
+    drain_deadline_applied: Arc<Mutex<std::collections::HashSet<DateTime<Utc>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
-        // This shard's last-observed `drain_deadline_at`, used by
-        // `sync_drain_deadline` to detect a real change vs a stale re-read.
-        let mut last_drain_deadline_seen: Option<DateTime<Utc>> = None;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -1090,7 +1093,7 @@ pub fn spawn_worker_heartbeat(
                                 sync_drain_deadline(
                                     &mut conn,
                                     &registration.worker_id,
-                                    &mut last_drain_deadline_seen,
+                                    &drain_deadline_applied,
                                     &remote_drain_deadline,
                                 )
                                 .await;
@@ -1113,7 +1116,7 @@ pub fn spawn_worker_heartbeat(
                                         sync_drain_deadline(
                                             &mut conn,
                                             &registration.worker_id,
-                                            &mut last_drain_deadline_seen,
+                                            &drain_deadline_applied,
                                             &remote_drain_deadline,
                                         )
                                         .await;
@@ -1149,44 +1152,58 @@ pub fn spawn_worker_heartbeat(
 /// Called both on first drain detection and on every subsequent heartbeat
 /// tick while the worker is draining, so that an operator-extended deadline
 /// is reflected without a restart.
+/// Decide whether an observed `drain_deadline_at` should be applied to the
+/// shared effective-deadline cell, recording it as applied when so (issue #522
+/// review).
+///
+/// Returns `true` for a deadline never applied by any of this worker's per-shard
+/// heartbeats — a genuine operator command (the initial drain, or an
+/// extend/shorten that reached only this shard's row because another shard was
+/// unreachable) — which must be applied even on a shard's first observation
+/// while the cell is already set. Returns `false` for a value some shard already
+/// applied: either the current effective deadline, or a stale value a lagging
+/// shard is only now catching up to, which must not revert a newer value.
+///
+/// The one value this cannot re-apply is an operator re-issuing the exact same
+/// absolute instant after moving away from it; re-using an identical past
+/// deadline is implausible and a benign no-op.
+// Internal helper over the worker's own fixed-hasher set; no need to generalize.
+#[allow(clippy::implicit_hasher)]
+fn classify_drain_deadline(
+    applied: &mut std::collections::HashSet<DateTime<Utc>>,
+    deadline: DateTime<Utc>,
+) -> bool {
+    applied.insert(deadline)
+}
+
+// Internal helper over the worker's own fixed-hasher set; no need to generalize.
+#[allow(clippy::implicit_hasher)]
 async fn sync_drain_deadline(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
-    // This heartbeat task's last-observed raw `drain_deadline_at` for its own
-    // shard row. Updated in place; lets the task detect a genuine change.
-    last_seen: &mut Option<DateTime<Utc>>,
+    // Raw `drain_deadline_at` values already applied to `cell` by any of this
+    // worker's per-shard heartbeat tasks (issue #522 review). Shared so a value
+    // can be classified across shards rather than per-heartbeat.
+    applied: &Mutex<std::collections::HashSet<DateTime<Utc>>>,
     cell: &Mutex<Option<std::time::Instant>>,
 ) {
     if let Ok(Some(deadline)) = read_worker_drain_deadline(conn, worker_id).await {
-        // Change-detection merge across per-shard heartbeats (issue #522 review).
-        // A multi-shard worker runs one heartbeat per assigned shard, all sharing
-        // this `cell`.
-        let was_first = last_seen.is_none();
-        // A stale shard that already synced re-reads its unchanged (pre-update)
-        // deadline — ignore it so it can't overwrite a newer value another shard
-        // applied.
-        if *last_seen == Some(deadline) {
+        let Ok(mut applied_guard) = applied.lock() else {
+            return;
+        };
+        if !classify_drain_deadline(&mut applied_guard, deadline) {
             return;
         }
-        *last_seen = Some(deadline);
         let remaining = deadline
             .signed_duration_since(Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO);
         let candidate = std::time::Instant::now() + remaining;
+        // Update the cell while still holding `applied`, so two shards observing
+        // distinct new deadlines concurrently can't reorder their writes (lock
+        // order applied→cell is the only place both are held).
         if let Ok(mut guard) = cell.lock() {
-            // Authority to set the effective deadline:
-            //   - the *initial* drain establishes it (cell empty), OR
-            //   - a genuine *change* observed by an already-synced shard — a
-            //     deliberate operator extend OR shorten — always applies.
-            // A shard's *first* observation while a deadline already exists is NOT
-            // authoritative: a heartbeat that was down before its first sync can
-            // recover carrying a stale (pre-update) value, which must not override
-            // the effective deadline in either direction (it could be older or
-            // newer than the operator's latest intent applied via another shard).
-            if guard.is_none() || !was_first {
-                *guard = Some(candidate);
-            }
+            *guard = Some(candidate);
         }
     }
 }
@@ -1241,6 +1258,46 @@ mod tests {
         assert_eq!(WorkerStatus::from_str("zombie"), None);
         assert_eq!(WorkerStatus::from_str(""), None);
         assert_eq!(WorkerStatus::from_str("active"), None); // case-sensitive
+    }
+
+    // -- classify_drain_deadline (cross-shard merge, issue #522 review) --
+
+    #[test]
+    fn classify_drain_deadline_applies_initial_and_skips_duplicates() {
+        let mut applied = std::collections::HashSet::new();
+        let d1 = Utc::now();
+        // Initial drain: first shard to observe it applies.
+        assert!(classify_drain_deadline(&mut applied, d1));
+        // Another shard observing the same value applies nothing (it's current).
+        assert!(!classify_drain_deadline(&mut applied, d1));
+    }
+
+    #[test]
+    fn classify_drain_deadline_skips_stale_recovery_reread() {
+        // cell history: D1 (initial) -> D2 (operator update via shard A).
+        let mut applied = std::collections::HashSet::new();
+        let d1 = Utc::now();
+        let d2 = d1 + chrono::Duration::minutes(5);
+        assert!(classify_drain_deadline(&mut applied, d1)); // shard A applies D1
+        assert!(classify_drain_deadline(&mut applied, d2)); // shard A applies D2
+        // Shard B's heartbeat was down; it recovers and first-reads its stale
+        // row value D1. It must NOT revert the cell away from D2.
+        assert!(!classify_drain_deadline(&mut applied, d1));
+    }
+
+    #[test]
+    fn classify_drain_deadline_applies_fresh_update_on_first_observation() {
+        // cell holds D1 (via shard A); shard A then goes unreachable and the
+        // operator re-drains with an explicit new deadline D2 that reaches only
+        // shard B. Shard B's FIRST observation of D2 must apply even though the
+        // cell is already set — this is the bug the reviewer flagged.
+        let mut applied = std::collections::HashSet::new();
+        let d1 = Utc::now();
+        let d2 = d1 + chrono::Duration::minutes(5); // longer
+        let d3 = d1 - chrono::Duration::minutes(2); // or shorter — both apply
+        assert!(classify_drain_deadline(&mut applied, d1)); // shard A applies D1
+        assert!(classify_drain_deadline(&mut applied, d2)); // shard B first-sees D2
+        assert!(classify_drain_deadline(&mut applied, d3)); // a later shorten also applies
     }
 
     #[test]
