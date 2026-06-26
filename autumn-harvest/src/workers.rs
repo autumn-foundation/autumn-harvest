@@ -1292,41 +1292,47 @@ mod tests {
     // -- classify_drain_deadline (cross-shard merge, issue #522 review) --
 
     #[test]
-    fn classify_drain_deadline_applies_initial_and_skips_duplicates() {
-        let mut applied = std::collections::HashSet::new();
+    fn classify_drain_deadline_applies_initial_and_skips_same_value() {
+        let mut max: Option<DateTime<Utc>> = None;
         let d1 = Utc::now();
         // Initial drain: first shard to observe it applies.
-        assert!(classify_drain_deadline(&mut applied, d1));
-        // Another shard observing the same value applies nothing (it's current).
-        assert!(!classify_drain_deadline(&mut applied, d1));
+        assert!(classify_drain_deadline(&mut max, d1));
+        assert_eq!(max, Some(d1));
+        // Another shard observing the same value: idempotent, no re-apply.
+        assert!(!classify_drain_deadline(&mut max, d1));
     }
 
     #[test]
     fn classify_drain_deadline_skips_stale_recovery_reread() {
-        // cell history: D1 (initial) -> D2 (operator update via shard A).
-        let mut applied = std::collections::HashSet::new();
+        // Shard A applies D1 (initial), then D2 (operator extension).
+        // Shard B was offline during D2 so its row still holds D1.
+        // When B recovers it must NOT revert the cell back to D1.
+        let mut max: Option<DateTime<Utc>> = None;
         let d1 = Utc::now();
         let d2 = d1 + chrono::Duration::minutes(5);
-        assert!(classify_drain_deadline(&mut applied, d1)); // shard A applies D1
-        assert!(classify_drain_deadline(&mut applied, d2)); // shard A applies D2
-        // Shard B's heartbeat was down; it recovers and first-reads its stale
-        // row value D1. It must NOT revert the cell away from D2.
-        assert!(!classify_drain_deadline(&mut applied, d1));
+        assert!(classify_drain_deadline(&mut max, d1)); // shard A applies D1
+        assert!(classify_drain_deadline(&mut max, d2)); // shard A applies D2
+        // Shard B recovers; stale D1 < D2 (current max) → rejected.
+        assert!(!classify_drain_deadline(&mut max, d1));
+        assert_eq!(max, Some(d2));
     }
 
     #[test]
-    fn classify_drain_deadline_applies_fresh_update_on_first_observation() {
-        // cell holds D1 (via shard A); shard A then goes unreachable and the
-        // operator re-drains with an explicit new deadline D2 that reaches only
-        // shard B. Shard B's FIRST observation of D2 must apply even though the
-        // cell is already set — this is the bug the reviewer flagged.
-        let mut applied = std::collections::HashSet::new();
+    fn classify_drain_deadline_applies_extension_on_first_observation() {
+        // Shard A applied D1. Shard A then goes unreachable and the operator
+        // re-drains with D2 > D1 that reaches only shard B. Shard B's first
+        // observation of D2 must advance the cell even though it is already set.
+        let mut max: Option<DateTime<Utc>> = None;
         let d1 = Utc::now();
-        let d2 = d1 + chrono::Duration::minutes(5); // longer
-        let d3 = d1 - chrono::Duration::minutes(2); // or shorter — both apply
-        assert!(classify_drain_deadline(&mut applied, d1)); // shard A applies D1
-        assert!(classify_drain_deadline(&mut applied, d2)); // shard B first-sees D2
-        assert!(classify_drain_deadline(&mut applied, d3)); // a later shorten also applies
+        let d2 = d1 + chrono::Duration::minutes(5); // extension
+        let d_short = d1 - chrono::Duration::minutes(2); // would be a shorten
+        assert!(classify_drain_deadline(&mut max, d1)); // shard A applies D1
+        assert!(classify_drain_deadline(&mut max, d2)); // shard B first-sees D2 > D1
+        assert_eq!(max, Some(d2));
+        // Operator-driven shortening (d_short < d2) is NOT reflected via the
+        // in-process cell; the local shutdown_timeout fallback bounds the drain.
+        assert!(!classify_drain_deadline(&mut max, d_short));
+        assert_eq!(max, Some(d2)); // cell unchanged
     }
 
     #[test]
