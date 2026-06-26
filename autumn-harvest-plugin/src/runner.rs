@@ -13,6 +13,7 @@ use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -154,6 +155,20 @@ impl PreparedHarvestRuntime {
         } else {
             HarvestDbPool::from(resources.harvest_pool)
         };
+        // Reject a misconfigured router-vs-pool pair before any I/O.
+        // `pool_for()` falls back to the default shard without warning, so a
+        // missing pool for shard N silently writes shard-N `ExecutionId`s into
+        // shard-0's database; those executions become permanently invisible
+        // once shard N is later added.  Fail loud at startup instead.
+        let mismatched = missing_router_shards(&shard_router, storage_pool.sharded_pool());
+        if !mismatched.is_empty() {
+            return Err(AutumnError::service_unavailable_msg(format!(
+                "ShardRouter references shards {mismatched:?} that have no pool entry in the \
+                 ShardedDbPool; every readable shard and the default shard must have an exact \
+                 pool entry to prevent silent cross-shard writes — check your \
+                 ShardedDbPool configuration"
+            )));
+        }
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
@@ -456,6 +471,27 @@ impl HarvestRunner {
             tracing::warn!(error = %error, "harvest worker task failed during shutdown");
         }
     }
+}
+
+/// Returns shard IDs referenced by `router` that have no exact pool entry in
+/// `pool`.  An empty result means the router and pool are fully consistent.
+///
+/// `ShardedDbPool::pool_for` silently falls back to the default shard when a
+/// configured shard lacks a pool entry; if the caller never checks this gap,
+/// shard-N `ExecutionId`s are written into shard-0's database and become
+/// permanently invisible after shard N is provisioned later.  Call this at
+/// startup and fail if the result is non-empty.
+fn missing_router_shards(router: &ShardRouter, pool: &ShardedDbPool) -> Vec<ShardId> {
+    let mut missing: Vec<ShardId> = router
+        .readable_shards()
+        .iter()
+        .copied()
+        .chain(std::iter::once(router.default_shard()))
+        .filter(|&shard| pool.exact_pool_for(shard).is_none())
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    missing
 }
 
 pub(crate) fn injected_runtime_state(
