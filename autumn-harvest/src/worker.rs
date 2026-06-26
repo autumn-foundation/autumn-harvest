@@ -7001,13 +7001,15 @@ fn spawn_stranded_work_sampler(
                 // A demand is covered when some covering worker polls its queue
                 // AND satisfies its required_capabilities (the same Exact/In
                 // label match claim_task applies) AND is build-eligible for its
-                // required_build_id (the same exact/compatible/legacy rule). The
-                // three constraints are checked against the *same* worker so a
-                // task needing both a label and a build is not falsely covered by
-                // two different workers each satisfying only one. No requirement
-                // ⇒ that dimension is trivially satisfied; unparseable
-                // capabilities fall back to queue+build coverage so the sampler
-                // never fabricates a false-positive stranded signal.
+                // required_build_id (the same exact/compatible/legacy rule) AND,
+                // when the row is held by an unexpired sticky lease, *is* that
+                // lease's owner (only it can claim until the lease expires). All
+                // constraints are checked against the *same* worker so a task
+                // needing several is not falsely covered by different workers
+                // each satisfying only one. No requirement ⇒ that dimension is
+                // trivially satisfied; unparseable capabilities fall back to the
+                // other dimensions so the sampler never fabricates a
+                // false-positive stranded signal.
                 let demand_covered = |demand: &crate::queue::ClaimablePendingDemand| -> bool {
                     let reqs = demand.required_capabilities.as_ref().and_then(|caps| {
                         serde_json::from_value::<Vec<crate::eligibility::Requirement>>(caps.clone())
@@ -7019,6 +7021,13 @@ fn spawn_stranded_work_sampler(
                                 .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
                         });
                         if !polls_queue {
+                            return false;
+                        }
+                        if demand
+                            .sticky_owner
+                            .as_deref()
+                            .is_some_and(|owner| owner != w.worker.worker_id)
+                        {
                             return false;
                         }
                         if !compat_set

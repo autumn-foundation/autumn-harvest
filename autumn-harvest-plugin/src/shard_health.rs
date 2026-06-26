@@ -121,10 +121,11 @@ pub struct QueueDepthSummary {
 /// (issue #522 review).
 ///
 /// `claim_task` only lets a worker whose labels satisfy `required_capabilities`
-/// AND whose build is eligible for `required_build_id` claim the task, so a
-/// covering worker that polls the queue but fails either constraint does not
-/// actually drain it. At least one of the two fields is non-empty (rows with
-/// neither constraint are covered by the basic per-queue check).
+/// AND whose build is eligible for `required_build_id` AND — when the row is
+/// held by an unexpired sticky lease — *is* `sticky_owner` claim the task, so a
+/// covering worker that polls the queue but fails any constraint does not
+/// actually drain it. At least one of the three fields is non-empty (rows with
+/// no constraint are covered by the basic per-queue check).
 #[derive(Debug, Clone, Serialize)]
 pub struct ConstraintDemand {
     pub queue_name: String,
@@ -132,6 +133,10 @@ pub struct ConstraintDemand {
     pub required_capabilities: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required_build_id: Option<String>,
+    /// `Some(worker_id)` when an unexpired sticky lease binds the row to a
+    /// specific worker; only that worker can claim it until the lease expires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sticky_owner: Option<String>,
     pub count: i64,
 }
 
@@ -364,14 +369,16 @@ fn check_no_live_worker_gate(
 
     // Constraint-aware coverage (issue #522 review): a worker that polls the
     // queue may still be unable to claim a pending task because of its
-    // `required_capabilities` (Exact/In label match) or its `required_build_id`
-    // (exact / declared-compatible / legacy rule). claim_task enforces both, so
-    // e.g. a GPU-only or v2-only task queued on `default` with only CPU / v1
-    // workers is stranded even though `default` looks covered by the per-queue
-    // check above. Both constraints are checked against the *same* worker so a
-    // task needing both is not falsely covered by two different workers each
-    // satisfying only one. Skip queues already flagged with no covering worker
-    // at all to avoid a duplicate reason for the same demand.
+    // `required_capabilities` (Exact/In label match), its `required_build_id`
+    // (exact / declared-compatible / legacy rule), or an unexpired sticky lease
+    // binding it to a specific owner (only that worker can claim it until the
+    // lease expires). claim_task enforces all three, so e.g. a GPU-only or
+    // v2-only task, or a row leased to a now-stale worker, is stranded even
+    // though `default` looks covered by the per-queue check above. All
+    // constraints are checked against the *same* worker so a task needing
+    // several is not falsely covered by different workers each satisfying only
+    // one. Skip queues already flagged with no covering worker at all to avoid a
+    // duplicate reason for the same demand.
     let already_uncovered: std::collections::HashSet<&str> = uncovered.iter().copied().collect();
     let mut uncovered_constraints: Vec<String> = Vec::new();
     for demand in &queue_depth.constraint_demands {
@@ -393,6 +400,10 @@ fn check_no_live_worker_gate(
                     qs.iter()
                         .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
                 })
+                && demand
+                    .sticky_owner
+                    .as_deref()
+                    .is_none_or(|owner| owner == w.worker.worker_id)
                 && compat.is_eligible(&w.worker.build_id, demand.required_build_id.as_deref())
                 && reqs.as_ref().is_none_or(|reqs| {
                     let labels: std::collections::HashMap<String, String> =
@@ -409,8 +420,8 @@ fn check_no_live_worker_gate(
         uncovered_constraints.dedup();
         push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
         blocking_reasons.push(format!(
-            "claimable task(s) with capability/build requirements queued on queue(s) [{}] \
-             but no live worker assigned to this shard satisfies their required labels/build",
+            "claimable task(s) with capability/build/sticky requirements queued on queue(s) [{}] \
+             but no live worker assigned to this shard can claim them",
             uncovered_constraints.join(", ")
         ));
     }
@@ -937,15 +948,21 @@ async fn load_queue_depth(
         *by_queue.entry(demand.queue_name.clone()).or_default() += demand.count;
     }
 
-    // Keep only the rows that carry a capability OR build-id constraint; the
-    // unconstrained rows are already covered by the basic per-queue check.
+    // Keep only the rows that carry a capability, build-id, OR sticky-lease
+    // constraint; the fully-unconstrained rows are already covered by the basic
+    // per-queue check.
     let constraint_demands = demands
         .into_iter()
-        .filter(|d| d.required_capabilities.is_some() || d.required_build_id.is_some())
+        .filter(|d| {
+            d.required_capabilities.is_some()
+                || d.required_build_id.is_some()
+                || d.sticky_owner.is_some()
+        })
         .map(|d| ConstraintDemand {
             queue_name: d.queue_name,
             required_capabilities: d.required_capabilities,
             required_build_id: d.required_build_id,
+            sticky_owner: d.sticky_owner,
             count: d.count,
         })
         .collect();
@@ -1489,6 +1506,7 @@ mod tests {
                     serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
                 ),
                 required_build_id: None,
+                sticky_owner: None,
                 count: 1,
             }],
             error: None,
@@ -1507,6 +1525,26 @@ mod tests {
                 queue_name: "default".to_string(),
                 required_capabilities: None,
                 required_build_id: Some("v2".to_string()),
+                sticky_owner: None,
+                count: 1,
+            }],
+            error: None,
+        }
+    }
+
+    /// Build a `QueueDepthSummary` with one pending task on `default` held by an
+    /// unexpired sticky lease owned by `worker_id`.
+    fn sticky_queue_depth(owner: &str) -> QueueDepthSummary {
+        let mut by_queue = std::collections::BTreeMap::new();
+        by_queue.insert("default".to_string(), 1);
+        QueueDepthSummary {
+            total_pending: 1,
+            by_queue,
+            constraint_demands: vec![ConstraintDemand {
+                queue_name: "default".to_string(),
+                required_capabilities: None,
+                required_build_id: None,
+                sticky_owner: Some(owner.to_string()),
                 count: 1,
             }],
             error: None,
@@ -1671,6 +1709,69 @@ mod tests {
         assert!(
             !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "should not fire when a compat declaration makes the worker build-eligible"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_sticky_lease_owner_is_not_covering() {
+        // The pending row is held by an unexpired sticky lease owned by a worker
+        // that is not present (stale/gone). The only live worker on `default`
+        // (test-worker-0) is NOT the owner, so claim_task would not let it claim
+        // the row until the lease expires — the work is stranded.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = sticky_queue_depth("test-worker-stale");
+        let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should fire when the sticky-lease owner is not a live covering worker"
+        );
+        assert!(
+            blocking_reasons
+                .iter()
+                .any(|r| r.contains("sticky") && r.contains("default")),
+            "blocking reason should name the sticky-uncovered queue: {blocking_reasons:?}"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_sticky_lease_owner_is_covering() {
+        // The same sticky-leased row, but the lease owner (test-worker-0) is the
+        // live covering worker, so it can claim the row — no stranded work.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = sticky_queue_depth("test-worker-0");
+        let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when the sticky-lease owner is the live covering worker"
         );
         assert!(blocking_reasons.is_empty());
     }

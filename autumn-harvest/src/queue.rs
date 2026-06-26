@@ -1825,11 +1825,18 @@ pub async fn try_consume_rate_limit_token(
 /// compatible/legacy) worker take. The stranded-work sampler uses this to
 /// detect a queue that looks covered (a worker polls it) but carries a task no
 /// covering worker can actually claim — because of its labels OR its build.
+///
+/// `sticky_owner` is `Some(worker_id)` when the row is currently held by an
+/// **unexpired** sticky lease (issue #235): `claim_task` lets only that worker
+/// claim it until `sticky_until` passes, so coverage must check that specific
+/// owner's liveness rather than any worker on the queue. `None` means the row is
+/// freely claimable by the general pool (no lease, or the lease has expired).
 #[derive(Debug, Clone)]
 pub struct ClaimablePendingDemand {
     pub queue_name: String,
     pub required_capabilities: Option<serde_json::Value>,
     pub required_build_id: Option<String>,
+    pub sticky_owner: Option<String>,
     pub count: i64,
 }
 
@@ -1851,6 +1858,11 @@ pub struct ClaimablePendingDemand {
 ///     skip the rate-limit gate at claim, so they remain claimable even with an
 ///     empty bucket and are still counted.
 ///
+/// An unexpired sticky lease (`sticky_worker_id` set, `sticky_until > NOW()`) is
+/// surfaced as `ClaimablePendingDemand::sticky_owner` rather than excluded, so
+/// the coverage check can require that specific owner to be live (a row leased to
+/// a stale worker is not claimable by anyone else until the lease expires).
+///
 /// `circuit_breaker_activities` is the static set of activity names with a
 /// circuit-breaker policy (`CircuitBreakerRegistry::tracked_activity_names`),
 /// matching `claim_task`'s `$5` parameter. Pass an empty slice when no breakers
@@ -1871,12 +1883,23 @@ pub async fn claimable_pending_demand_by_queue(
         required_capabilities: Option<serde_json::Value>,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         required_build_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        sticky_owner: Option<String>,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         cnt: i64,
     }
 
-    let rows: Vec<DemandRow> = diesel::sql_query(
+    // `sticky_owner` is NULL unless an unexpired lease binds the row to a
+    // specific worker; the CASE mirrors claim_task's sticky predicate (a row
+    // with sticky_until <= NOW() or NULL is freely claimable). It is both
+    // selected and repeated in GROUP BY.
+    let sticky_owner_expr = "CASE WHEN tq.sticky_worker_id IS NOT NULL \
+                                  AND tq.sticky_until IS NOT NULL \
+                                  AND tq.sticky_until > NOW() \
+                             THEN tq.sticky_worker_id ELSE NULL END";
+    let rows: Vec<DemandRow> = diesel::sql_query(format!(
         "SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, \
+                {sticky_owner_expr} AS sticky_owner, \
                 COUNT(*)::BIGINT AS cnt \
          FROM harvest_task_queue tq \
          LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
@@ -1912,8 +1935,8 @@ pub async fn claimable_pending_demand_by_queue(
                      AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
                ) \
            ) \
-         GROUP BY tq.queue_name, tq.required_capabilities, tq.required_build_id",
-    )
+         GROUP BY tq.queue_name, tq.required_capabilities, tq.required_build_id, {sticky_owner_expr}"
+    ))
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
     .load(conn)
     .await
@@ -1925,6 +1948,7 @@ pub async fn claimable_pending_demand_by_queue(
             queue_name: r.queue_name,
             required_capabilities: r.required_capabilities,
             required_build_id: r.required_build_id,
+            sticky_owner: r.sticky_owner,
             count: r.cnt,
         })
         .collect())
