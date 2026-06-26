@@ -19112,6 +19112,39 @@ struct DrainWorkerRequest {
     deadline_at: Option<String>,
 }
 
+/// Relative significance of a drain outcome when aggregating the per-shard rows
+/// of one multi-shard worker. A row newly transitioned (`Accepted`) is the most
+/// informative overall signal; `NotFound` never reaches the aggregate.
+const fn drain_outcome_rank(outcome: autumn_harvest::workers::DrainOutcome) -> u8 {
+    use autumn_harvest::workers::DrainOutcome;
+    match outcome {
+        DrainOutcome::Accepted => 4,
+        DrainOutcome::StaleWorker => 3,
+        DrainOutcome::AlreadyDraining => 2,
+        DrainOutcome::AlreadyStopped => 1,
+        DrainOutcome::NotFound => 0,
+    }
+}
+
+/// Merge the drain results from two shard rows of the same worker into one
+/// aggregate response: keep the most significant outcome, the larger in-flight
+/// count, the union of served shard ids, and the first non-null deadline.
+fn merge_drain_responses(mut acc: DrainResponse, other: DrainResponse) -> DrainResponse {
+    if drain_outcome_rank(other.outcome) > drain_outcome_rank(acc.outcome) {
+        acc.outcome = other.outcome;
+    }
+    acc.in_flight_count = acc.in_flight_count.max(other.in_flight_count);
+    for shard in other.shard_ids {
+        if !acc.shard_ids.contains(&shard) {
+            acc.shard_ids.push(shard);
+        }
+    }
+    if acc.drain_deadline_at.is_none() {
+        acc.drain_deadline_at = other.drain_deadline_at;
+    }
+    acc
+}
+
 #[allow(clippy::too_many_lines)]
 async fn request_drain_handler(
     Extension(api_state): Extension<HarvestApiState>,
@@ -19142,17 +19175,24 @@ async fn request_drain_handler(
         (computed, false)
     };
 
-    // Search every shard for the worker — workers are registered on exactly
-    // one shard, so the first hit wins. Connection failures on individual shards
-    // are recorded as unavailable rather than aborting the whole request (AC #8).
+    // Fan the drain transition out to EVERY reachable shard that has a row for
+    // this worker (issue #522 review). A multi-shard worker registers a row in
+    // each assigned shard's DB and runs an independent heartbeat per shard, any
+    // of which triggers graceful shutdown the moment it observes `Draining`.
+    // Updating only the first-hit row would leave the worker polling if its
+    // heartbeat to that shard happens to be broken while another shard's
+    // heartbeat is healthy (and its row still `Active`). Connection failures on
+    // individual shards are recorded as unavailable rather than aborting the
+    // whole request (AC #8).
     let mut unavailable_shards: Vec<i32> = Vec::new();
+    let mut aggregate: Option<DrainResponse> = None;
     for (shard_id, shard_pool) in pool.iter_shards() {
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             unavailable_shards.push(shard_id.as_i32());
             continue;
         };
 
-        let mut response = request_drain(
+        let response = request_drain(
             &mut conn,
             &worker_id,
             deadline_at,
@@ -19166,8 +19206,7 @@ async fn request_drain_handler(
             continue;
         }
 
-        response.unavailable_shards = std::mem::take(&mut unavailable_shards);
-
+        // Worker found on this shard — audit the transition scoped to it.
         let ar = NewAuditRecord {
             actor: &actor,
             source: &source,
@@ -19185,6 +19224,16 @@ async fn request_drain_handler(
             .await
             .map_err(map_error)?;
 
+        aggregate = Some(match aggregate.take() {
+            None => response,
+            Some(acc) => merge_drain_responses(acc, response),
+        });
+    }
+
+    if let Some(mut response) = aggregate {
+        response.shard_ids.sort_unstable();
+        response.shard_ids.dedup();
+        response.unavailable_shards = unavailable_shards;
         return Ok(Json(response));
     }
 
@@ -21091,6 +21140,51 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn merge_drain_responses_aggregates_across_shards() {
+        use autumn_harvest::workers::{DrainOutcome, DrainResponse};
+
+        let mk = |outcome: DrainOutcome, in_flight: i32, shards: Vec<i32>| DrainResponse {
+            worker_id: "w1".to_string(),
+            outcome,
+            in_flight_count: in_flight,
+            drain_deadline_at: None,
+            shard_ids: shards,
+            unavailable_shards: vec![],
+        };
+
+        // Shard 0 was already draining; shard 1's row was still Active and got
+        // newly accepted. The aggregate must report Accepted (the stronger
+        // signal), the larger in-flight count, and the union of shard ids.
+        let merged = merge_drain_responses(
+            mk(DrainOutcome::AlreadyDraining, 2, vec![0]),
+            mk(DrainOutcome::Accepted, 5, vec![1]),
+        );
+        assert_eq!(merged.outcome, DrainOutcome::Accepted);
+        assert_eq!(merged.in_flight_count, 5);
+        let mut shards = merged.shard_ids;
+        shards.sort_unstable();
+        assert_eq!(shards, vec![0, 1]);
+
+        // Ordering of the merge must not change the result.
+        let merged_rev = merge_drain_responses(
+            mk(DrainOutcome::Accepted, 5, vec![1]),
+            mk(DrainOutcome::AlreadyDraining, 2, vec![0]),
+        );
+        assert_eq!(merged_rev.outcome, DrainOutcome::Accepted);
+        assert_eq!(merged_rev.in_flight_count, 5);
+
+        // A clean Accepted outranks a StaleWorker row.
+        assert_eq!(
+            merge_drain_responses(
+                mk(DrainOutcome::StaleWorker, 0, vec![0]),
+                mk(DrainOutcome::Accepted, 1, vec![1]),
+            )
+            .outcome,
+            DrainOutcome::Accepted
+        );
     }
 
     #[test]
