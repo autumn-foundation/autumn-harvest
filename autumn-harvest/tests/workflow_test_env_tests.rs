@@ -1234,3 +1234,232 @@ async fn test_scheduled_time_replays_deterministically() {
         "scheduled_time must replay deterministically:\n{report}"
     );
 }
+
+// ── issue #526: virtual clock advancement when durable timers fire ─────────────
+
+fn clock_after_timer_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let t0 = ctx.now().timestamp();
+        ctx.timer("sleep30d", 30 * 24 * 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        let t1 = ctx.now().timestamp();
+        Ok(json!({ "t0": t0, "t1": t1, "diff_secs": t1 - t0 }))
+    })
+}
+
+#[tokio::test]
+async fn test_timer_advances_virtual_clock() {
+    let outcome = WorkflowTestEnv::new()
+        .run(clock_after_timer_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+    let v = outcome.result.unwrap();
+    let diff_secs = v["diff_secs"].as_i64().expect("diff_secs must be integer");
+    let expected = 30_i64 * 24 * 3600;
+    assert_eq!(
+        diff_secs, expected,
+        "ctx.now() must advance by 30 days after timer fires"
+    );
+}
+
+fn two_timers_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let t0 = ctx.now().timestamp();
+        ctx.timer("hour1", 3600).await.map_err(|e| e.to_string())?;
+        let t1 = ctx.now().timestamp();
+        ctx.timer("hour2", 7200).await.map_err(|e| e.to_string())?;
+        let t2 = ctx.now().timestamp();
+        Ok(json!({ "t0": t0, "t1": t1, "t2": t2 }))
+    })
+}
+
+#[tokio::test]
+async fn test_sequential_timers_accumulate() {
+    let outcome = WorkflowTestEnv::new()
+        .run(two_timers_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+    let v = outcome.result.unwrap();
+    let t0 = v["t0"].as_i64().unwrap();
+    let t1 = v["t1"].as_i64().unwrap();
+    let t2 = v["t2"].as_i64().unwrap();
+    assert_eq!(t1 - t0, 3600, "first timer must advance clock by 1h");
+    assert_eq!(
+        t2 - t0,
+        3600 + 7200,
+        "second timer must accumulate to 3h total"
+    );
+}
+
+fn activity_then_now_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let t0 = ctx.now().timestamp();
+        ctx.execute_activity_raw("noop", json!(null), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let t1 = ctx.now().timestamp();
+        Ok(json!({ "diff_secs": t1 - t0 }))
+    })
+}
+
+#[tokio::test]
+async fn test_activities_do_not_advance_clock() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("noop", |_| Ok(json!(null)))
+        .run(activity_then_now_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+    let v = outcome.result.unwrap();
+    let diff_secs = v["diff_secs"].as_i64().unwrap();
+    assert_eq!(
+        diff_secs, 0,
+        "activities must not advance the virtual clock"
+    );
+}
+
+fn signal_or_timer_now_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let t0 = ctx.now().timestamp();
+        let won = match ctx
+            .wait_for_signal_timeout("approve", std::time::Duration::from_secs(30 * 24 * 3600))
+            .await
+        {
+            Ok(Some(_)) => "signal",
+            Ok(None) => "timer",
+            Err(e) => return Err(e.to_string()),
+        };
+        let t1 = ctx.now().timestamp();
+        Ok(json!({ "won": won, "diff_secs": t1 - t0 }))
+    })
+}
+
+#[tokio::test]
+async fn test_signal_preempts_timer_no_advance() {
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("approve", json!("go"))
+        .run(signal_or_timer_now_workflow, json!(null))
+        .await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+    let v = outcome.result.unwrap();
+    assert_eq!(v["won"], json!("signal"), "signal must have won");
+    let diff_secs = v["diff_secs"].as_i64().unwrap();
+    assert_eq!(
+        diff_secs, 0,
+        "signal-preempted timer must not advance the clock"
+    );
+}
+
+fn billing_loop_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let t_start = ctx.now().timestamp();
+        ctx.timer("cycle1", 30 * 24 * 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        let t_after_first = ctx.now().timestamp();
+        ctx.timer("cycle2", 30 * 24 * 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        let t_after_second = ctx.now().timestamp();
+        Ok(json!({
+            "t_start": t_start,
+            "t_after_first": t_after_first,
+            "t_after_second": t_after_second,
+        }))
+    })
+}
+
+#[tokio::test]
+async fn test_billing_loop_dates_and_elapsed() {
+    let env = WorkflowTestEnv::new();
+    let start = env.now();
+    let outcome = env.run(billing_loop_workflow, json!(null)).await;
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+    let v = outcome.result.as_ref().unwrap();
+
+    let t_start = v["t_start"].as_i64().unwrap();
+    let t_after_first = v["t_after_first"].as_i64().unwrap();
+    let t_after_second = v["t_after_second"].as_i64().unwrap();
+
+    assert_eq!(
+        t_after_first - t_start,
+        30 * 24 * 3600_i64,
+        "first 30d advance"
+    );
+    assert_eq!(
+        t_after_second - t_start,
+        60 * 24 * 3600_i64,
+        "second 30d accumulates to 60d"
+    );
+
+    let sixty_days = chrono::Duration::days(60);
+    assert_eq!(
+        outcome.final_now(),
+        start + sixty_days,
+        "outcome.final_now() must be start + 60 days"
+    );
+    assert_eq!(
+        outcome.elapsed(),
+        sixty_days,
+        "outcome.elapsed() must be 60 days"
+    );
+    assert_eq!(
+        outcome.final_now().timestamp(),
+        t_after_second,
+        "outcome.final_now() must match workflow-observed ctx.now()"
+    );
+}
+
+fn year_of_timers_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        for i in 0..12_u32 {
+            ctx.timer(&format!("month{i}"), 30 * 24 * 3600)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        ctx.timer("extra5d", 5 * 24 * 3600)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!(null))
+    })
+}
+
+#[tokio::test]
+async fn test_365_days_under_50ms() {
+    let env = WorkflowTestEnv::new();
+    let start = env.now();
+    let wall_start = std::time::Instant::now();
+    let outcome = env.run(year_of_timers_workflow, json!(null)).await;
+    let elapsed_wall = wall_start.elapsed();
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+    // 50ms target in release builds; 5000ms budget for unoptimized debug builds.
+    let wall_budget_ms = if cfg!(debug_assertions) { 5_000 } else { 50 };
+    assert!(
+        elapsed_wall.as_millis() < wall_budget_ms,
+        "365 days of virtual time must complete in < {wall_budget_ms}ms wall-clock, got {}ms",
+        elapsed_wall.as_millis()
+    );
+    assert_eq!(
+        outcome.final_now(),
+        start + chrono::Duration::days(365),
+        "outcome.final_now() must be start + 365 days"
+    );
+}

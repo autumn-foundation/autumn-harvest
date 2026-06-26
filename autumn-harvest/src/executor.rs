@@ -407,6 +407,31 @@ pub async fn run_workflow_with_state(
     .await
 }
 
+/// Like [`run_workflow_with_state`] but enables the advancing virtual clock.
+///
+/// Issue #526, test harness only. The context is built with
+/// [`WorkflowContext::with_advancing_timer_clock`] so that each durable timer
+/// resolved from history increments `ctx.now()` by its duration.
+#[cfg(any(test, feature = "testing"))]
+pub async fn run_workflow_with_state_advancing_clock(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    state: SharedState,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+    use crate::context::WorkflowContext;
+    let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+        exec_id,
+        history,
+        state,
+        WorkflowHistoryPolicy::default(),
+    )
+    .with_advancing_timer_clock();
+    drive_workflow(ctx, handler, input, span_meta).await
+}
+
 /// Like [`run_workflow_with_state`] but installs explicit history guardrails,
 /// workflow name, and payload size caps into the [`WorkflowContext`].
 #[allow(clippy::too_many_arguments)]
@@ -491,6 +516,21 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     for h in declarative_update_handlers {
         ctx.register_declarative_update_handler(h);
     }
+
+    drive_workflow(ctx, handler, input, span_meta).await
+}
+
+/// Core executor body: emit the `OTel` span, run the handler with a suspension
+/// timeout, and return the outcome.  Shared by all public entry points so the
+/// advancing-clock variant (`run_workflow_with_state_advancing_clock`) does not
+/// duplicate the span/timeout/drain logic.
+async fn drive_workflow(
+    ctx: WorkflowContext,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    span_meta: Option<&WorkflowExecuteSpanMeta>,
+) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
+    let exec_id = ctx.execution_id();
 
     // ADR-0001 §2.1: emit harvest.workflow.execute for every executor cycle.
     // harvest.replay defaults to false at span creation so subscribers that only

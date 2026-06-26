@@ -50,7 +50,8 @@ use serde_json::Value;
 use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::executor::{
-    WorkflowOutcome, run_workflow_canary, run_workflow_strict, run_workflow_with_state,
+    WorkflowOutcome, run_workflow_canary, run_workflow_strict,
+    run_workflow_with_state_advancing_clock,
 };
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
 use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, WorkerId};
@@ -2053,6 +2054,9 @@ pub struct TestRunOutcome {
     /// Shared state from the test env — forwarded to `replay_check` so the
     /// replayer sees the same typed state the workflow saw during the run.
     state: SharedState,
+    /// Construction-time `simulated_now` (= `WorkflowStarted` timestamp), used
+    /// to compute `final_now()` and `elapsed()` (issue #526).
+    start_time: DateTime<Utc>,
 }
 
 impl TestRunOutcome {
@@ -2063,6 +2067,29 @@ impl TestRunOutcome {
     #[must_use]
     pub fn events(&self) -> &[WorkflowEvent] {
         &self.events
+    }
+
+    /// The virtual "now" at the end of the run (issue #526).
+    ///
+    /// Computed as `start_time + Σ duration_secs` over all `TimerStarted` events
+    /// in the recorded history — the authoritative set of durable timers that
+    /// fired along the taken path.  Signal-preempted timers produce no
+    /// `TimerStarted` event and therefore do not advance this clock.
+    #[must_use]
+    pub fn final_now(&self) -> DateTime<Utc> {
+        let total_secs: u64 = self.events.iter().fold(0u64, |acc, e| match e {
+            WorkflowEvent::TimerStarted { duration_secs, .. } => acc.saturating_add(*duration_secs),
+            _ => acc,
+        });
+        self.start_time + chrono::Duration::seconds(i64::try_from(total_secs).unwrap_or(i64::MAX))
+    }
+
+    /// Total virtual time elapsed during the run (issue #526).
+    ///
+    /// Equivalent to `final_now() - start_time`.
+    #[must_use]
+    pub fn elapsed(&self) -> chrono::Duration {
+        self.final_now() - self.start_time
     }
 
     /// Run the recorded event history through [`WorkflowReplayer`] and return
@@ -2411,8 +2438,10 @@ impl WorkflowTestEnv {
         let mut remaining_signals = self.queued_signals.clone();
         let mut retry_sequences = self.retry_sequences.clone();
 
+        let start_time = self.simulated_now;
+
         for _iter in 0..MAX_TEST_ITERATIONS {
-            let (outcome, pending_cmds, _span) = run_workflow_with_state(
+            let (outcome, pending_cmds, _span) = run_workflow_with_state_advancing_clock(
                 exec_id,
                 history.clone(),
                 handler,
@@ -2438,6 +2467,7 @@ impl WorkflowTestEnv {
                                 events: history,
                                 exec_id,
                                 state: self.state.clone(),
+                                start_time,
                             };
                         }
                     };
@@ -2450,11 +2480,18 @@ impl WorkflowTestEnv {
                             events: history,
                             exec_id,
                             state: self.state.clone(),
+                            start_time,
                         };
                     }
                 }
                 terminal => {
-                    return self.finish_terminal_outcome(terminal, &pending_cmds, history, exec_id);
+                    return self.finish_terminal_outcome(
+                        terminal,
+                        &pending_cmds,
+                        history,
+                        exec_id,
+                        start_time,
+                    );
                 }
             }
         }
@@ -2467,6 +2504,7 @@ impl WorkflowTestEnv {
             events: history,
             exec_id,
             state: self.state.clone(),
+            start_time,
         }
     }
 
@@ -2476,6 +2514,7 @@ impl WorkflowTestEnv {
         pending_cmds: &[WorkflowCommand],
         mut history: Vec<WorkflowEvent>,
         exec_id: ExecutionId,
+        start_time: DateTime<Utc>,
     ) -> TestRunOutcome {
         Self::record_terminal_pending_commands(pending_cmds, &mut history);
         let should_record_cascades = matches!(
@@ -2515,6 +2554,7 @@ impl WorkflowTestEnv {
             events: history,
             exec_id,
             state: self.state.clone(),
+            start_time,
         }
     }
 
