@@ -360,8 +360,7 @@ pub const METRIC_PAYLOAD_OFFLOADED: &str = "harvest.payload.offloaded";
 /// external store on read/replay (issue #524).
 ///
 /// Labels: `store.id`. Per ADR-0001 §7, `execution.id` is span-only.
-pub const METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION: &str =
-    "harvest.payload.offload_fetch_duration";
+pub const METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION: &str = "harvest.payload.offload_fetch_duration";
 
 /// Counter: incremented each time a new workflow start is blocked by an
 /// active admission gate (issue #377).

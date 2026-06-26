@@ -776,6 +776,12 @@ pub struct WorkflowContext {
     payload_max_side_effect: u64,
     /// Global cap on signal payloads sent via `signal_external_workflow`.
     payload_max_signal: u64,
+    /// Offload threshold (bytes) when a [`PayloadStore`](crate::payload_store::PayloadStore)
+    /// is registered (issue #524). `Some(t)` means a payload-bearing field larger
+    /// than `t` will be offloaded into a tiny reference envelope, so the #252
+    /// size cap is not tripped by it. `None` means no store registered — caps are
+    /// enforced exactly as before.
+    payload_offload_threshold: Option<u64>,
     /// Per-activity input cap overrides: `activity_name → max_bytes`.
     /// When an entry exists, the effective cap is `max(global, override)`.
     activity_input_cap_overrides: HashMap<String, u64>,
@@ -966,6 +972,7 @@ impl WorkflowContext {
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            payload_offload_threshold: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -1071,6 +1078,7 @@ impl WorkflowContext {
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            payload_offload_threshold: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -1113,6 +1121,7 @@ impl WorkflowContext {
             payload_max_workflow_input: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_side_effect: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
             payload_max_signal: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            payload_offload_threshold: None,
             activity_input_cap_overrides: HashMap::new(),
             deferred_nd_error: Mutex::new(None),
             current_details_cap: DEFAULT_CURRENT_DETAILS_CAP_BYTES,
@@ -1145,6 +1154,22 @@ impl WorkflowContext {
         self.payload_max_side_effect = max_workflow_input;
         self.payload_max_signal = max_signal;
         self
+    }
+
+    /// Set the large-payload offload threshold (issue #524). When set, a
+    /// payload-bearing field larger than `threshold` bytes will be offloaded at
+    /// persist time, so the #252 size cap is not enforced against it (the inline
+    /// representation becomes a tiny reference envelope).
+    #[must_use]
+    pub const fn with_payload_offload_threshold(mut self, threshold: Option<u64>) -> Self {
+        self.payload_offload_threshold = threshold;
+        self
+    }
+
+    /// Whether a payload of `observed` bytes will be offloaded rather than stored
+    /// inline, and therefore must NOT be rejected by the #252 size cap.
+    const fn offload_will_apply(&self, observed: u64) -> bool {
+        matches!(self.payload_offload_threshold, Some(t) if observed > t)
     }
 
     /// Add or replace a per-activity input cap override.
@@ -1702,7 +1727,7 @@ impl WorkflowContext {
 
                 // Enforce side-effect payload cap before recording.
                 let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-                if observed > self.payload_max_side_effect {
+                if observed > self.payload_max_side_effect && !self.offload_will_apply(observed) {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::SideEffectValue,
                         observed_bytes: observed,
@@ -2201,7 +2226,10 @@ impl WorkflowContext {
                         .map_or(global, |ov| global.max(ov))
                 };
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if effective_cap > 0 && observed > effective_cap {
+                if effective_cap > 0
+                    && observed > effective_cap
+                    && !self.offload_will_apply(observed)
+                {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
                         observed_bytes: observed,
@@ -2325,7 +2353,10 @@ impl WorkflowContext {
                         .map_or(global, |ov| global.max(ov))
                 };
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if effective_cap > 0 && observed > effective_cap {
+                if effective_cap > 0
+                    && observed > effective_cap
+                    && !self.offload_will_apply(observed)
+                {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
                         observed_bytes: observed,
@@ -2510,7 +2541,10 @@ impl WorkflowContext {
                         .map_or(global, |ov| global.max(ov))
                 };
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if effective_cap > 0 && observed > effective_cap {
+                if effective_cap > 0
+                    && observed > effective_cap
+                    && !self.offload_will_apply(observed)
+                {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
                         observed_bytes: observed,
@@ -2719,7 +2753,9 @@ impl WorkflowContext {
 
                 // Enforce child-workflow input payload cap before scheduling.
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
+                if self.payload_max_workflow_input > 0
+                    && observed > self.payload_max_workflow_input
+                    && !self.offload_will_apply(observed)
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ChildWorkflowInput,
@@ -2815,7 +2851,9 @@ impl WorkflowContext {
 
                 // Enforce child-workflow input payload cap before scheduling.
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
+                if self.payload_max_workflow_input > 0
+                    && observed > self.payload_max_workflow_input
+                    && !self.offload_will_apply(observed)
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ChildWorkflowInput,
@@ -3432,7 +3470,10 @@ impl WorkflowContext {
                 ))?;
                 let payload_json = serde_json::to_value(&payload)?;
                 let observed = serde_json::to_string(&payload_json).map_or(0, |s| s.len() as u64);
-                if self.payload_max_signal > 0 && observed > self.payload_max_signal {
+                if self.payload_max_signal > 0
+                    && observed > self.payload_max_signal
+                    && !self.offload_will_apply(observed)
+                {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: crate::error::PayloadKind::SignalPayload,
                         observed_bytes: observed,
@@ -4207,7 +4248,9 @@ impl WorkflowContext {
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match("ContinueAsNew")?;
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
+                if self.payload_max_workflow_input > 0
+                    && observed > self.payload_max_workflow_input
+                    && !self.offload_will_apply(observed)
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: crate::error::PayloadKind::WorkflowInput,

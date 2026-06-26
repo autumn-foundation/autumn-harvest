@@ -437,6 +437,7 @@ pub async fn run_workflow_with_state_and_history_policy(
         crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
         crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
         std::collections::HashMap::new(),
+        None,
     )
     .await
 }
@@ -460,6 +461,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     max_workflow_input_bytes: u64,
     max_current_details_bytes: usize,
     context_headers: std::collections::HashMap<String, String>,
+    payload_offload_threshold: Option<u64>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
@@ -477,6 +479,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
         max_workflow_input_bytes,
     )
     .with_current_details_cap(max_current_details_bytes)
+    .with_payload_offload_threshold(payload_offload_threshold)
     .with_context_headers(context_headers);
 
     // Auto-register declarative handlers before any workflow code runs.

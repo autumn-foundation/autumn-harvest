@@ -80,6 +80,10 @@ name = "replayer_tests"
 required-features = ["testing"]
 
 [[test]]
+name = "payload_offload_replay_tests"
+required-features = ["testing"]
+
+[[test]]
 name = "workflow_test_env_tests"
 required-features = ["testing"]
 

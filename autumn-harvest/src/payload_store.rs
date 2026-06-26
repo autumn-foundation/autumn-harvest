@@ -82,6 +82,7 @@ pub trait PayloadStore: Send + Sync + 'static {
     /// A stable identifier for this store, recorded in every reference envelope
     /// so a read can tell which backend a blob lives in. Defaults to
     /// `"default"`.
+    #[allow(clippy::unnecessary_literal_bound)]
     fn store_id(&self) -> &str {
         "default"
     }
@@ -143,7 +144,11 @@ impl PayloadOffloader {
     /// Create an offloader over `store`, offloading any payload-bearing field
     /// whose serialized length exceeds `threshold` bytes.
     #[must_use]
-    pub fn new(store: Arc<dyn PayloadStore>, threshold: u64, metrics: Arc<dyn MetricsRecorder>) -> Self {
+    pub fn new(
+        store: Arc<dyn PayloadStore>,
+        threshold: u64,
+        metrics: Arc<dyn MetricsRecorder>,
+    ) -> Self {
         let store_id = store.store_id().to_string();
         Self {
             store,
@@ -279,8 +284,10 @@ impl PayloadOffloader {
 }
 
 /// Recognise an offload reference envelope (without fetching) and extract its
-/// blob reference. Used by carry-forward (continue-as-new) to record a new
-/// reference to an already-offloaded blob without re-uploading.
+/// blob reference.
+///
+/// Used by carry-forward (continue-as-new) to record a new reference to an
+/// already-offloaded blob without re-uploading.
 #[must_use]
 pub fn extract_offload_ref(field: &Value) -> Option<OffloadedRef> {
     parse_offload_envelope(field).map(|env| OffloadedRef {
@@ -346,8 +353,8 @@ fn hex_sha256(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// In-memory content-addressed store with put/get/delete spies.
     #[derive(Default)]
@@ -376,16 +383,19 @@ mod tests {
             self.puts.fetch_add(1, Ordering::SeqCst);
             // Content-addressed key.
             let key = format!("sha256/{}", hex_sha256(bytes));
-            self.blobs.lock().unwrap().insert(key.clone(), bytes.to_vec());
+            self.blobs
+                .lock()
+                .unwrap()
+                .insert(key.clone(), bytes.to_vec());
             Box::pin(async move { Ok(key) })
         }
         fn get(&self, key: &str) -> PayloadStoreFuture<'_, Vec<u8>> {
             self.gets.fetch_add(1, Ordering::SeqCst);
             let found = self.blobs.lock().unwrap().get(key).cloned();
             let key = key.to_string();
-            Box::pin(async move {
-                found.ok_or_else(|| PayloadStoreError(format!("missing key {key}")))
-            })
+            Box::pin(
+                async move { found.ok_or_else(|| PayloadStoreError(format!("missing key {key}"))) },
+            )
         }
         fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()> {
             self.deletes.fetch_add(1, Ordering::SeqCst);
@@ -446,11 +456,13 @@ mod tests {
         let exact = serde_json::to_vec(&payload).unwrap().len() as u64; // 32
         // At threshold == exact -> stays inline (uses <=).
         let mut e1 = event_with_output(payload.clone());
-        assert!(offloader(store.clone(), exact)
-            .offload_event_value(&mut e1)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            offloader(store.clone(), exact)
+                .offload_event_value(&mut e1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // One below -> offloaded.
         let mut e2 = event_with_output(payload);
         assert_eq!(
@@ -558,6 +570,9 @@ mod tests {
         assert_eq!(store.puts.load(Ordering::SeqCst), 2);
         off.inflate_event_value(&mut event).await.unwrap();
         assert_eq!(event["data"]["input"], serde_json::json!("i".repeat(1_000)));
-        assert_eq!(event["data"]["output"], serde_json::json!("o".repeat(1_000)));
+        assert_eq!(
+            event["data"]["output"],
+            serde_json::json!("o".repeat(1_000))
+        );
     }
 }

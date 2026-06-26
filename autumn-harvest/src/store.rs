@@ -194,6 +194,174 @@ pub async fn append_events(
     Ok(inserted)
 }
 
+/// Append events, offloading any over-threshold payload fields to the configured
+/// [`PayloadOffloader`](crate::payload_store::PayloadOffloader) (issue #524).
+///
+/// When `offloader` is `None` this delegates verbatim to [`append_events`], so a
+/// deployment with no `PayloadStore` registered sees byte-for-byte identical
+/// behaviour. Otherwise each event's payload-bearing fields are offloaded (after
+/// codec encode) and a per-execution reference row is recorded in
+/// `harvest_payload_refs` for each blob created, so the retention sweep can GC it
+/// when the execution is collected.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError`] on a store `put` failure, serialization
+/// error, or INSERT failure.
+#[cfg(feature = "db")]
+pub async fn append_events_offloaded(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    events: &[WorkflowEvent],
+    start_id: i32,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> HarvestResult<usize> {
+    let Some(offloader) = offloader else {
+        return append_events(conn, exec_id, events, start_id).await;
+    };
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    let mut rows = events_to_insert_rows_from(exec_id, events, start_id)?;
+    let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
+    for row in &mut rows {
+        let refs = offloader.offload_event_value(&mut row.event_data).await?;
+        all_refs.extend(refs);
+    }
+
+    let inserted = diesel::insert_into(harvest_events::table)
+        .values(&rows)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    if !all_refs.is_empty() {
+        insert_payload_refs(conn, exec_id, &all_refs).await?;
+    }
+
+    if let Some(last_event) = events.last() {
+        crate::notify::notify_workflow_events_appended(
+            conn,
+            exec_id.as_uuid(),
+            inserted,
+            last_event.type_name(),
+        )
+        .await?;
+    }
+
+    Ok(inserted)
+}
+
+/// Record per-execution references to offloaded payload blobs (issue #524).
+///
+/// Idempotent: duplicate `(blob_key, workflow_exec_id)` rows are ignored, so a
+/// retried append or a carry-forward of an already-referenced key is safe.
+#[cfg(feature = "db")]
+pub async fn insert_payload_refs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    refs: &[crate::payload_store::OffloadedRef],
+) -> HarvestResult<()> {
+    use crate::models::NewHarvestPayloadRef;
+    use crate::schema::harvest_payload_refs;
+
+    if refs.is_empty() {
+        return Ok(());
+    }
+    let rows: Vec<NewHarvestPayloadRef> = refs
+        .iter()
+        .map(|r| NewHarvestPayloadRef {
+            blob_key: r.blob_key.clone(),
+            workflow_exec_id: exec_id.as_uuid(),
+            store_id: r.store_id.clone(),
+            byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
+        })
+        .collect();
+    diesel::insert_into(harvest_payload_refs::table)
+        .values(&rows)
+        .on_conflict_do_nothing()
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Load all blob references for an execution (issue #524). Used by the retention
+/// sweep to discover an execution's blobs before deleting it.
+#[cfg(feature = "db")]
+pub async fn load_payload_refs(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Vec<crate::payload_store::OffloadedRef>> {
+    use crate::schema::harvest_payload_refs::dsl;
+
+    let rows: Vec<(String, String, i64)> = dsl::harvest_payload_refs
+        .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select((dsl::blob_key, dsl::store_id, dsl::byte_len))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(blob_key, store_id, byte_len)| crate::payload_store::OffloadedRef {
+                blob_key,
+                store_id,
+                #[allow(clippy::cast_sign_loss)]
+                byte_len: byte_len.max(0) as u64,
+            },
+        )
+        .collect())
+}
+
+/// Whether any execution still references `blob_key` (issue #524). The retention
+/// sweep calls this after an execution row (and its cascade-deleted refs) is
+/// gone to decide whether the blob may be deleted from the store.
+#[cfg(feature = "db")]
+pub async fn blob_key_still_referenced(
+    conn: &mut AsyncPgConnection,
+    blob_key: &str,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_payload_refs::dsl;
+
+    let found: Option<String> = dsl::harvest_payload_refs
+        .filter(dsl::blob_key.eq(blob_key))
+        .select(dsl::blob_key)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(found.is_some())
+}
+
+/// Fetch the raw (un-inflated) `data.last_completion_result` of an execution's
+/// first event (issue #524). Used by continue-as-new carry-forward to copy an
+/// offloaded carryover envelope into the successor WITHOUT re-uploading.
+///
+/// Returns `None` if the execution has no events or the field is absent.
+#[cfg(feature = "db")]
+pub async fn load_raw_started_carryover(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Option<serde_json::Value>> {
+    use crate::models::HarvestEvent;
+
+    let row: Option<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.and_then(|r| {
+        r.event_data
+            .get("data")
+            .and_then(|d| d.get("last_completion_result"))
+            .cloned()
+    }))
+}
+
 /// Append a single event to a workflow's history without loading the full log.
 ///
 /// Acquires a row-level lock on the workflow execution before reading
@@ -416,6 +584,54 @@ pub async fn load_history_with_codecs(
     })
 }
 
+/// Load history, inflating any offloaded payload fields from the configured
+/// [`PayloadOffloader`](crate::payload_store::PayloadOffloader) (issue #524).
+///
+/// When `offloader` is `None` this delegates verbatim to [`load_history`].
+/// Otherwise each loaded event is inflated (store fetch + checksum verify)
+/// **before** codec decode, the inverse of the encode-then-offload write order,
+/// so replay sees byte-identical payloads.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError`] on a store `get` failure, checksum
+/// mismatch, or deserialization error.
+#[cfg(feature = "db")]
+pub async fn load_history_inflated(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> HarvestResult<EventHistory> {
+    use crate::models::HarvestEvent;
+
+    let Some(offloader) = offloader else {
+        return load_history(conn, exec_id).await;
+    };
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
+
+    let codecs = crate::payload_codec::PayloadCodecs::default();
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut data = row.event_data;
+        offloader.inflate_event_value(&mut data).await?;
+        events.push(codecs.decode_event(data)?);
+    }
+
+    Ok(EventHistory {
+        exec_id,
+        events,
+        next_event_id,
+    })
+}
+
 /// Load only events appended since a known event-id cursor.
 ///
 /// Returns events where `event_id >= from_event_id`, ordered by `event_id ASC`.
@@ -454,6 +670,55 @@ pub async fn load_history_since(
         .into_iter()
         .map(|row| crate::payload_codec::PayloadCodecs::default().decode_event(row.event_data))
         .collect::<Result<Vec<WorkflowEvent>, _>>()?;
+
+    Ok(EventHistory {
+        exec_id,
+        events,
+        next_event_id,
+    })
+}
+
+/// Delta-load companion to [`load_history_inflated`] (issue #524): load events
+/// with `event_id >= from_event_id`, inflating offloaded payloads before decode.
+///
+/// When `offloader` is `None` this delegates verbatim to [`load_history_since`].
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError`] on a store `get` failure, checksum
+/// mismatch, or deserialization error.
+#[cfg(feature = "db")]
+pub async fn load_history_since_inflated(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    from_event_id: i32,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> HarvestResult<EventHistory> {
+    use crate::models::HarvestEvent;
+
+    let Some(offloader) = offloader else {
+        return load_history_since(conn, exec_id, from_event_id).await;
+    };
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .filter(harvest_events::event_id.ge(from_event_id))
+        .order(harvest_events::event_id.asc())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_event_id = rows
+        .last()
+        .map_or(from_event_id, |r| r.event_id.saturating_add(1));
+
+    let codecs = crate::payload_codec::PayloadCodecs::default();
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut data = row.event_data;
+        offloader.inflate_event_value(&mut data).await?;
+        events.push(codecs.decode_event(data)?);
+    }
 
     Ok(EventHistory {
         exec_id,
