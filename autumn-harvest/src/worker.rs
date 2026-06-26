@@ -7332,7 +7332,24 @@ impl Worker {
                 [(_, shard_pool), ..] => shard_pool,
                 [] => pool,
             };
-            let listener = match self.config.notification_database_url.as_deref() {
+            // Listen on the database we actually poll. For a one-process-per-
+            // shard deployment assigned to a non-default shard, the global
+            // `notification_database_url` may point at a different shard, so a
+            // NOTIFY fired on the polled shard would never wake this worker
+            // (issue #522). Prefer this shard's entry in
+            // `shard_notification_database_urls`; fall back to the global URL
+            // (legacy behavior) when no per-shard URL is configured.
+            let listener_url: Option<&str> = match shard_targets.as_slice() {
+                [(shard_id, _), ..] => self
+                    .config
+                    .shard_notification_database_urls
+                    .iter()
+                    .find(|(s, _)| s == shard_id)
+                    .map(|(_, url)| url.as_str())
+                    .or(self.config.notification_database_url.as_deref()),
+                [] => self.config.notification_database_url.as_deref(),
+            };
+            let listener = match listener_url {
                 Some(database_url) => {
                     match crate::notify::QueueListener::connect(database_url, &self.config.queues)
                         .await
