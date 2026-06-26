@@ -7703,28 +7703,29 @@ impl Worker {
                 continue;
             }
 
-            if let Some(listener) = listener.as_mut() {
-                match listener
-                    .wait_for_notification(self.config.poll_interval)
-                    .await
-                {
-                    Ok(Some(_)) => {
-                        // Host-side timestamps can be slightly ahead of Postgres NOW(),
-                        // so give newly notified tasks a brief moment to become claimable.
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            worker_id = %self.config.worker_id,
-                            error = %error,
-                            "LISTEN/NOTIFY wait failed; sleeping before retry"
-                        );
-                        tokio::time::sleep(self.config.poll_interval).await;
-                    }
-                }
-            } else {
+            let Some(listener) = listener.as_mut() else {
                 tokio::time::sleep(self.config.poll_interval).await;
+                continue;
+            };
+
+            match listener
+                .wait_for_notification(self.config.poll_interval)
+                .await
+            {
+                Ok(Some(_)) => {
+                    // Host-side timestamps can be slightly ahead of Postgres NOW(),
+                    // so give newly notified tasks a brief moment to become claimable.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        error = %error,
+                        "LISTEN/NOTIFY wait failed; sleeping before retry"
+                    );
+                    tokio::time::sleep(self.config.poll_interval).await;
+                }
             }
         }
     }
