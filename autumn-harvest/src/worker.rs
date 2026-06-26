@@ -7443,20 +7443,30 @@ impl Worker {
                         .shard_assignments
                         .iter()
                         .filter(|shard| seen.insert(*shard))
-                        .map(|shard| {
-                            // Warn when an assigned shard has no matching pool entry (fix #9):
-                            // pool_for silently falls back to the default shard, which means
-                            // this worker would claim from the wrong database.
-                            if sharded.exact_pool_for(*shard).is_none() {
-                                tracing::warn!(
-                                    worker_id = %self.config.worker_id,
-                                    shard_id = shard.as_i32(),
-                                    "shard_assignment refers to a shard not present in the \
-                                     sharded_pool; claims for this shard will fall back to the \
-                                     default shard pool — check your ShardedDbPool configuration"
-                                );
-                            }
-                            (*shard, sharded.pool_for(*shard).clone())
+                        .filter_map(|shard| {
+                            // An assigned shard with no exact pool entry is a
+                            // configuration error: pool_for would silently fall
+                            // back to the default shard, so the worker would poll
+                            // and write its fleet row in the *default* database
+                            // while advertising coverage for the missing shard —
+                            // leaving real tasks on that shard unclaimed and fleet
+                            // views misleading (issue #522 review). Drop the
+                            // target instead of using the fallback pool so this
+                            // worker never claims for a shard it cannot reach.
+                            sharded.exact_pool_for(*shard).map_or_else(
+                                || {
+                                    tracing::error!(
+                                        worker_id = %self.config.worker_id,
+                                        shard_id = shard.as_i32(),
+                                        "shard_assignment refers to a shard not present in the \
+                                         sharded_pool; skipping its claim target to avoid polling \
+                                         the default shard under the wrong shard label — check \
+                                         your ShardedDbPool configuration"
+                                    );
+                                    None
+                                },
+                                |shard_pool| Some((*shard, shard_pool.clone())),
+                            )
                         })
                         .collect()
                 },

@@ -1146,10 +1146,26 @@ fn schedule_count_for_shard(
 ) -> usize {
     let mut count = 0;
     if let Some(runtime) = runtime {
+        // Count a workflow schedule only on the shard that actually owns its
+        // rows, mirroring scheduler::workflow_schedule_shard /
+        // register_workflow_schedules_for_shard: workflow-only schedules route to
+        // the router's default shard, DAG-derived schedules to pick_for_dag.
+        // Without this filter every shard counts every schedule, so an offline
+        // local scheduler monitor on a non-owning shard would degrade readiness
+        // with `scheduler_not_running` for rows that live on another shard
+        // (issue #522 review).
+        let target = ShardId::new(shard_id);
         count += runtime
             .workflow_schedules()
             .iter()
-            .filter(|schedule| !schedule.paused && !matches!(schedule.schedule, Schedule::Manual))
+            .filter(|schedule| {
+                !schedule.paused
+                    && !matches!(schedule.schedule, Schedule::Manual)
+                    && schedule.dag_name.as_deref().map_or_else(
+                        || runtime.router().default_shard(),
+                        |dag| runtime.router().pick_for_dag(dag),
+                    ) == target
+            })
             .count();
         count += runtime
             .dags()
@@ -1158,7 +1174,7 @@ fn schedule_count_for_shard(
                 dag.schedule
                     .as_ref()
                     .is_some_and(|schedule| !matches!(schedule, Schedule::Manual))
-                    && runtime.router().pick_for_dag(&dag.name) == ShardId::new(shard_id)
+                    && runtime.router().pick_for_dag(&dag.name) == target
             })
             .count();
     }
