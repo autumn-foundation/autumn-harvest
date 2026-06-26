@@ -1817,10 +1817,11 @@ pub async fn try_consume_rate_limit_token(
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
 /// Count the number of tasks that are immediately claimable on this shard.
 ///
-/// A task is claimable when `state = 'PENDING'` and `scheduled_at <= NOW()`.
-/// This mirrors the first-level predicate in [`claim_task`] and is used by
-/// the stranded-work sampler (issue #522) to detect claimable tasks on shards
-/// that have no covering live worker.
+/// A task is claimable when `state = 'PENDING'`, `scheduled_at <= NOW()`, its
+/// `schedule_to_close_at` deadline has not elapsed, and it is not a PAUSED
+/// execution's parked workflow task. This mirrors the claim-time predicate in
+/// [`claim_task`] and is used by the stranded-work sampler (issue #522) to
+/// detect claimable tasks on shards that have no covering live worker.
 ///
 /// # Errors
 ///
@@ -1832,11 +1833,14 @@ pub async fn claimable_pending_count(conn: &mut AsyncPgConnection) -> HarvestRes
         cnt: i64,
     }
 
-    // Exclude only PAUSED *workflow* tasks, mirroring claim_task exactly (fix
-    // #7): claim_task parks a paused execution's workflow task until resume,
-    // but its already-scheduled activity tasks stay claimable and still need a
-    // worker. Dropping those activities here would make the stranded-work
-    // sampler miss an uncovered shard that has a queued activity on a paused
+    // Mirror claim_task's exclusions so the count never includes a row a
+    // worker would refuse: tasks past their `schedule_to_close_at` deadline
+    // (issue #378, failed by the timeout scanner) and PAUSED *workflow* tasks
+    // (fix #7). The PAUSED guard is task_type-scoped: claim_task parks a paused
+    // execution's workflow task until resume, but its already-scheduled
+    // activity tasks stay claimable and still need a worker. Dropping those
+    // activities here would make the stranded-work sampler miss an uncovered
+    // shard that has a queued activity on a paused
     // workflow.
     let row: CountRow = diesel::sql_query(
         "SELECT COUNT(*)::BIGINT AS cnt \
@@ -1844,6 +1848,10 @@ pub async fn claimable_pending_count(conn: &mut AsyncPgConnection) -> HarvestRes
          LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
          WHERE tq.state = 'PENDING' \
            AND tq.scheduled_at <= NOW() \
+           AND ( \
+               tq.schedule_to_close_at IS NULL \
+               OR tq.schedule_to_close_at > NOW() \
+           ) \
            AND ( \
                tq.task_type <> 'workflow' \
                OR tq.workflow_exec_id IS NULL \

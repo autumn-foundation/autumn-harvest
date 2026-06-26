@@ -814,16 +814,21 @@ struct QueueDepthRow {
 }
 
 async fn load_queue_depth(conn: &mut AsyncPgConnection) -> QueueDepthSummary {
-    // Exclude workflow tasks whose execution is PAUSED, mirroring the
-    // claim-time predicate in `queue::claim_task` (issue #383). Those rows are
-    // intentionally parked until resume, so counting them as claimable depth
-    // would make a paused-only shard trip `no_live_worker`/degraded readiness
-    // when no worker is assigned (issue #522).
+    // Only count rows `claim_task` would actually claim, so the readiness gate
+    // doesn't degrade a shard for work no worker is allowed to take (issue
+    // #522). Mirror two claim-time exclusions:
+    //   - PAUSED workflow tasks (issue #383) — parked until resume.
+    //   - tasks past their `schedule_to_close_at` deadline (issue #378) — the
+    //     timeout scanner will fail them, not a worker.
     let rows = diesel::sql_query(
         "SELECT queue_name::TEXT AS queue_name, COUNT(*)::BIGINT AS depth \
          FROM harvest_task_queue \
          WHERE state = 'PENDING' \
            AND scheduled_at <= NOW() \
+           AND ( \
+               schedule_to_close_at IS NULL \
+               OR schedule_to_close_at > NOW() \
+           ) \
            AND ( \
                task_type <> 'workflow' \
                OR workflow_exec_id IS NULL \
