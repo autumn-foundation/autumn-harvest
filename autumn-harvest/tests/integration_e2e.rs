@@ -197,6 +197,11 @@ const LEGACY_INIT_SQL: &str = concat!(
     // issue #488: the modern start path inserts schedule_id / scheduled_for.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS schedule_id UUID NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMPTZ NULL;\n",
+    // issue #523: the modern start path inserts workflow_attempt / workflow_retry_policy / retry_of_exec_id.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS workflow_attempt INT NOT NULL DEFAULT 1;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS workflow_retry_policy JSONB NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS retry_of_exec_id UUID NULL;\n",
+    "ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS retry_policy JSONB NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return
