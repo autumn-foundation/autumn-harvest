@@ -1847,6 +1847,11 @@ struct ScheduleEntry {
     /// Timestamp of the most recent recovery tick that produced drops (issue #484).
     /// `null` when `catchup_dropped_last_recovery` is 0.
     last_catchup_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Schedule-level workflow retry policy (issue #523), `null` when unset.
+    /// Exposed so a read-modify-write client can echo it back on the upsert
+    /// endpoint without silently clearing the stored policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_policy: Option<autumn_harvest::RetryPolicy>,
 }
 
 /// Optional request body for `POST /admin/schedules/{id}/pause` and `…/resume`.
@@ -11232,6 +11237,10 @@ async fn list_schedules(
                 catchup_window_secs: s.catchup_window_secs,
                 catchup_dropped_last_recovery: s.last_catchup_dropped,
                 last_catchup_at: s.last_catchup_at,
+                retry_policy: s
+                    .retry_policy
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
             }
         })
         .collect();
@@ -11321,6 +11330,10 @@ async fn get_schedule(
         catchup_window_secs: s.catchup_window_secs,
         catchup_dropped_last_recovery: s.last_catchup_dropped,
         last_catchup_at: s.last_catchup_at,
+        retry_policy: s
+            .retry_policy
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
     }))
 }
 
@@ -11638,6 +11651,10 @@ async fn upsert_workflow_schedule_and_read_back(
         catchup_window_secs: row.catchup_window_secs,
         catchup_dropped_last_recovery: row.last_catchup_dropped,
         last_catchup_at: row.last_catchup_at,
+        retry_policy: row
+            .retry_policy
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
     })
 }
 
@@ -22509,6 +22526,7 @@ mod tests {
             catchup_window_secs: None,
             catchup_dropped_last_recovery: 0,
             last_catchup_at: None,
+            retry_policy: None,
         };
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(
