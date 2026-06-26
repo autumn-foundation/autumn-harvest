@@ -84,6 +84,10 @@ name = "payload_offload_replay_tests"
 required-features = ["testing"]
 
 [[test]]
+name = "payload_offload_db_tests"
+required-features = ["db"]
+
+[[test]]
 name = "workflow_test_env_tests"
 required-features = ["testing"]
 
