@@ -454,7 +454,7 @@ async fn start_harvest_runtime(
                         workflow_attempt: 1,
                         workflow_retry_policy: webhook_retry_policy,
                         retry_of_exec_id: None,
-                        max_workflow_attempts_ceiling: None,
+                        max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                     };
 
                     let Some(harvest_db) = harvest_db else {

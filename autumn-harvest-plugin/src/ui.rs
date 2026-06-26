@@ -6176,7 +6176,7 @@ async fn execute_schedule_trigger_ui(
         }
     };
     // Only registered workflows carry an SLA default; DAGs have no SLA concept.
-    let (sla, ui_trigger_retry_policy) =
+    let (sla, wf_default_retry_policy) =
         runtime
             .registry()
             .workflows
@@ -6187,6 +6187,13 @@ async fn execute_schedule_trigger_ui(
                     info.retry_policy.clone(),
                 )
             });
+    // Schedule-level retry_policy takes precedence over the workflow-type default,
+    // mirroring the automated tick, backfill, and API trigger-now paths.
+    let ui_trigger_retry_policy = row
+        .retry_policy
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .or(wf_default_retry_policy);
 
     let result = start_or_load_workflow_execution(
         conn,

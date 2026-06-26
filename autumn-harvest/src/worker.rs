@@ -5530,12 +5530,28 @@ async fn persist_terminal_outcome_commands(
 
     create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span).await?;
 
+    // `persist_search_attrs_from_commands` above wrote the UpsertSearchAttributes
+    // patch to the DB, but `execution` is the row loaded before that update. A
+    // workflow-retry started from this failure copies `execution.search_attrs`,
+    // so apply the same in-memory patch first; otherwise the retry attempt loses
+    // attributes set immediately before the transient failure (issue #523 P2).
+    let patched_execution =
+        match apply_search_attrs_patch_in_memory(execution.search_attrs.clone(), pending_cmds) {
+            patched if patched == execution.search_attrs => None,
+            patched => {
+                let mut e = execution.clone();
+                e.search_attrs = patched;
+                Some(e)
+            }
+        };
+    let effective_execution = patched_execution.as_ref().unwrap_or(execution);
+
     // `update_schedule_counter: false` — the caller runs counters after commit.
     // Returns true if a workflow retry was scheduled (root/detached failure path).
     persist_workflow_outcome(
         conn,
         registry,
-        execution,
+        effective_execution,
         WorkflowTaskPersistence {
             next_event_id,
             ..persistence
