@@ -5047,7 +5047,13 @@ async fn load_workflow_replay_state(
     exec_id: ExecutionId,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
 ) -> HarvestResult<(store::EventHistory, Vec<TimerId>, Vec<String>)> {
-    let history_result = store::load_history_inflated(conn, exec_id, &crate::payload_codec::PayloadCodecs::default(), offloader).await;
+    let history_result = store::load_history_inflated(
+        conn,
+        exec_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+        offloader,
+    )
+    .await;
     let initial_history = fail_execution_on_error(conn, task, worker_id, history_result).await?;
 
     // Single chronological ingest: due timer fires and pending signals are
@@ -5058,7 +5064,13 @@ async fn load_workflow_replay_state(
     let (timers_fired, signals_delivered) =
         fail_execution_on_error(conn, task, worker_id, ingest_result).await?;
 
-    let final_history_result = store::load_history_inflated(conn, exec_id, &crate::payload_codec::PayloadCodecs::default(), offloader).await;
+    let final_history_result = store::load_history_inflated(
+        conn,
+        exec_id,
+        &crate::payload_codec::PayloadCodecs::default(),
+        offloader,
+    )
+    .await;
     let final_history =
         fail_execution_on_error(conn, task, worker_id, final_history_result).await?;
     Ok((final_history, timers_fired, signals_delivered))

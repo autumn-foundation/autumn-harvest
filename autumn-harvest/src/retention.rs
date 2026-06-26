@@ -853,8 +853,10 @@ async fn run_shard_tick(
             if let Some(offloader) = &offloader
                 && !candidate_blob_refs.is_empty()
             {
-                let keys: Vec<String> =
-                    candidate_blob_refs.iter().map(|b| b.blob_key.clone()).collect();
+                let keys: Vec<String> = candidate_blob_refs
+                    .iter()
+                    .map(|b| b.blob_key.clone())
+                    .collect();
                 match crate::store::batch_blob_keys_still_referenced(&mut conn, &keys).await {
                     Ok(still_referenced) => {
                         for blob in &candidate_blob_refs {

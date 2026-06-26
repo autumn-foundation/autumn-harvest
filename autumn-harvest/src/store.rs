@@ -320,8 +320,7 @@ pub async fn load_payload_refs(
             |(blob_key, store_id, byte_len)| crate::payload_store::OffloadedRef {
                 blob_key,
                 store_id,
-                #[allow(clippy::cast_sign_loss)]
-                byte_len: byte_len.max(0) as u64,
+                byte_len: byte_len.max(0).cast_unsigned(),
             },
         )
         .collect())
