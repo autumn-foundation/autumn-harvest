@@ -520,6 +520,7 @@ impl std::fmt::Debug for HandlerRegistry {
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
             )
+            .field("payload_offloader", &self.payload_offloader.is_some())
             .finish()
     }
 }
@@ -2297,6 +2298,7 @@ fn resolve_workflow_concurrency(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_workflow_completion(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
@@ -6172,7 +6174,9 @@ async fn process_workflow_task(
                     }),
                 registry.max_current_details_bytes,
                 exec_context_headers.clone(),
-                registry.payload_offloader().map(|o| o.threshold()),
+                registry
+                    .payload_offloader()
+                    .map(crate::payload_store::PayloadOffloader::threshold),
             )
             .await;
 

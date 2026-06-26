@@ -194,9 +194,10 @@ pub async fn append_events(
     Ok(inserted)
 }
 
-/// Append events, offloading any over-threshold payload fields to the configured
-/// [`PayloadOffloader`](crate::payload_store::PayloadOffloader) (issue #524).
+/// Append events, offloading any over-threshold payload fields (issue #524).
 ///
+/// Offloads to the configured
+/// [`PayloadOffloader`](crate::payload_store::PayloadOffloader).
 /// When `offloader` is `None` this delegates verbatim to [`append_events`], so a
 /// deployment with no `PayloadStore` registered sees byte-for-byte identical
 /// behaviour. Otherwise each event's payload-bearing fields are offloaded (after
@@ -255,7 +256,7 @@ pub async fn append_events_offloaded(
 
 /// Record per-execution references to offloaded payload blobs (issue #524).
 ///
-/// Idempotent: duplicate `(blob_key, workflow_exec_id)` rows are ignored, so a
+/// Idempotent: a duplicate `(blob_key, workflow_exec_id)` row is ignored, so a
 /// retried append or a carry-forward of an already-referenced key is safe.
 #[cfg(feature = "db")]
 pub async fn insert_payload_refs(
@@ -315,9 +316,10 @@ pub async fn load_payload_refs(
         .collect())
 }
 
-/// Whether any execution still references `blob_key` (issue #524). The retention
-/// sweep calls this after an execution row (and its cascade-deleted refs) is
-/// gone to decide whether the blob may be deleted from the store.
+/// Whether any execution still references `blob_key` (issue #524).
+///
+/// The retention sweep calls this after an execution row (and its
+/// cascade-deleted refs) is gone to decide whether the blob may be deleted.
 #[cfg(feature = "db")]
 pub async fn blob_key_still_referenced(
     conn: &mut AsyncPgConnection,
@@ -336,8 +338,10 @@ pub async fn blob_key_still_referenced(
 }
 
 /// Fetch the raw (un-inflated) `data.last_completion_result` of an execution's
-/// first event (issue #524). Used by continue-as-new carry-forward to copy an
-/// offloaded carryover envelope into the successor WITHOUT re-uploading.
+/// first event (issue #524).
+///
+/// Used by continue-as-new carry-forward to copy an offloaded carryover
+/// envelope into the successor WITHOUT re-uploading.
 ///
 /// Returns `None` if the execution has no events or the field is absent.
 #[cfg(feature = "db")]

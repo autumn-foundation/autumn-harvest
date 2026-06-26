@@ -559,6 +559,7 @@ impl Drop for RetentionLeaseGuard {
 
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_shard_tick(
     pool: crate::worker::DbPool,
     shard: ShardId,

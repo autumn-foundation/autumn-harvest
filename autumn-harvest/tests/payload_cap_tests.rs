@@ -387,6 +387,63 @@ async fn context_accepts_activity_input_within_cap() {
     }
 }
 
+// AC (issue #524): when an offload threshold is configured, an oversized
+// payload that will be offloaded must NOT trip the #252 cap — it suspends
+// (offload happens at persist time) instead of returning PayloadTooLarge.
+#[tokio::test]
+async fn context_skips_cap_when_payload_will_be_offloaded() {
+    let ctx = WorkflowContext::new_test()
+        .with_payload_caps(1024 * 1024, 2 * 1024 * 1024, 256 * 1024, 2 * 1024 * 1024)
+        // Offload anything over 256 KiB — well below the 1 MiB cap.
+        .with_payload_offload_threshold(Some(256 * 1024));
+
+    // ~2 MiB: above the 1 MiB cap, but also above the offload threshold, so it
+    // will be offloaded rather than rejected.
+    let oversized = make_large_json(2 * 1024 * 1024);
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        ctx.execute_activity_raw("send_email", oversized, "default"),
+    )
+    .await;
+
+    match result {
+        // Suspended (timeout) — the cap was skipped and the call proceeded to
+        // dispatch, where offload will run at persist time. Correct.
+        Err(_timeout) => {}
+        Ok(Err(HarvestError::PayloadTooLarge { .. })) => {
+            panic!("offloadable payload must not be rejected by the #252 cap")
+        }
+        Ok(Err(HarvestError::Cancelled(_)) | Ok(_)) => {}
+        Ok(Err(e)) => panic!("Unexpected error: {e}"),
+    }
+}
+
+// AC (issue #524): with NO store registered (threshold None), an oversized
+// payload still fails fast with the existing #252 error — zero behavior change.
+#[tokio::test]
+async fn context_still_rejects_oversized_when_no_offloader() {
+    let ctx = WorkflowContext::new_test().with_payload_caps(
+        1024 * 1024,
+        2 * 1024 * 1024,
+        256 * 1024,
+        2 * 1024 * 1024,
+    );
+    // threshold left as None (no .with_payload_offload_threshold call)
+    let oversized = make_large_json(2 * 1024 * 1024);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        ctx.execute_activity_raw("send_email", oversized, "default"),
+    )
+    .await;
+    match result {
+        Ok(Err(HarvestError::PayloadTooLarge { kind, .. })) => {
+            assert_eq!(kind, PayloadKind::ActivityInput);
+        }
+        other => panic!("expected PayloadTooLarge with no offloader, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AC: side_effect value cap enforced at recording time
 // ---------------------------------------------------------------------------
