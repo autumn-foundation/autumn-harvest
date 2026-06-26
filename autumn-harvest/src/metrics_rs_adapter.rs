@@ -239,6 +239,7 @@ impl MetricsRecorder for MetricsRsRecorder {
         .set(depth as f64);
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn record_shard_stranded_pending(&self, shard: u16, count: u64) {
         gauge!(
             crate::telemetry::METRIC_SHARD_STRANDED_PENDING,

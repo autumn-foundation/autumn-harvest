@@ -7318,7 +7318,20 @@ impl Worker {
         if use_multi_shard {
             self.run_multi_shard(shard_targets, pool).await;
         } else {
-            // Single-shard fast path — byte-for-byte unchanged.
+            // Single-shard fast path. When exactly one shard target resolved,
+            // claim from that shard's pool rather than the caller's default
+            // pool — in a one-process-per-shard deployment assigned to a
+            // non-default shard (e.g. shard_assignments = [1]) those differ,
+            // and using the default pool would strand the assigned shard's
+            // work. With no assignment, fall back to the default pool (legacy
+            // behavior, byte-for-byte unchanged).
+            // Match on the slice rather than calling `.first()`: the diesel
+            // prelude's query-DSL traits are in scope, and probing `.first()`
+            // on the Vec sends the trait solver into overflow (E0275).
+            let claim_pool = match shard_targets.as_slice() {
+                [(_, shard_pool), ..] => shard_pool,
+                [] => pool,
+            };
             let listener = match self.config.notification_database_url.as_deref() {
                 Some(database_url) => {
                     match crate::notify::QueueListener::connect(database_url, &self.config.queues)
@@ -7344,7 +7357,7 @@ impl Worker {
                 }
                 None => None,
             };
-            self.run_with_listener(pool, listener).await;
+            self.run_with_listener(claim_pool, listener).await;
         }
     }
 
@@ -7545,6 +7558,11 @@ impl Worker {
                     }
                     if let Some(i) = broken_idx {
                         shard_listeners[i] = None;
+                        // All listeners gone: nothing left to await in this loop,
+                        // so bail out instead of busy-spinning until the deadline.
+                        if shard_listeners.iter().all(Option::is_none) {
+                            break 'notify_wait;
+                        }
                     }
                 }
                 if notified {

@@ -210,7 +210,7 @@ harvest shard health --candidate-shard <shard_id>
 GET /admin/shards/health?candidate_shard=<shard_id>
 ```
 
-Wait for `readiness: "ready"`. A `degraded` row includes machine-readable `reason_codes` explaining what is blocking readiness. Two codes are relevant here:
+Wait for `readiness: "ready"`. A `degraded` row includes machine-readable `reason_codes` explaining what is blocking readiness. Three codes are relevant here:
 
 | `reason_code` | Meaning | Resolution |
 |---|---|---|

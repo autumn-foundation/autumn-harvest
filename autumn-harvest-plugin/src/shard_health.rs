@@ -296,26 +296,29 @@ fn check_no_live_worker_gate(
         .map(|(q, _)| q.as_str())
         .collect();
 
+    // If worker coverage is unreadable, the worker-readiness path already emits
+    // REASON_WORKER_COVERAGE_UNREADABLE. Bail out here so an unreadable query is
+    // not mistaken for "no worker covers this shard" (a false no_live_worker).
+    let Ok(ws) = workers.as_ref() else {
+        return;
+    };
+
     // A worker "covers" the shard if it is healthy, active, assigned to this
     // shard, AND services at least one queue that has pending work (fix #8).
     // A worker that is assigned to the shard but only covers unrelated queues
     // cannot actually drain the stuck tasks.
-    let covering = workers
-        .as_ref()
-        .map(|ws| {
-            ws.iter()
-                .filter(|w| {
-                    worker_assigned_to_shard(w, shard_id)
-                        && w.health == WorkerHealth::Healthy
-                        && w.worker.status == WorkerStatus::Active.as_str()
-                        && w.worker.queues.as_array().is_some_and(|qs| {
-                            qs.iter()
-                                .any(|v| v.as_str().is_some_and(|q| pending_queues.contains(q)))
-                        })
+    let covering = ws
+        .iter()
+        .filter(|w| {
+            worker_assigned_to_shard(w, shard_id)
+                && w.health == WorkerHealth::Healthy
+                && w.worker.status == WorkerStatus::Active.as_str()
+                && w.worker.queues.as_array().is_some_and(|qs| {
+                    qs.iter()
+                        .any(|v| v.as_str().is_some_and(|q| pending_queues.contains(q)))
                 })
-                .count()
         })
-        .unwrap_or(0);
+        .count();
     if covering == 0 {
         push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
         blocking_reasons.push(format!(
