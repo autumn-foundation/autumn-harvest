@@ -1132,7 +1132,13 @@ async fn do_heartbeat_tick(
                 }
                 // Refresh the stored deadline so an operator-extended window is
                 // picked up by drain_in_flight without restarting the worker.
-                sync_drain_deadline(conn, &registration.worker_id, drain_deadline_max, remote_drain_deadline).await;
+                sync_drain_deadline(
+                    conn,
+                    &registration.worker_id,
+                    drain_deadline_max,
+                    remote_drain_deadline,
+                )
+                .await;
             } else {
                 // Heartbeat succeeded; check whether a remote drain has changed
                 // this worker's status to Draining.  Cancel the worker's
@@ -1145,7 +1151,13 @@ async fn do_heartbeat_tick(
                             worker_id = %registration.worker_id,
                             "remote drain detected; triggering graceful shutdown"
                         );
-                        sync_drain_deadline(conn, &registration.worker_id, drain_deadline_max, remote_drain_deadline).await;
+                        sync_drain_deadline(
+                            conn,
+                            &registration.worker_id,
+                            drain_deadline_max,
+                            remote_drain_deadline,
+                        )
+                        .await;
                         worker_shutdown.cancel();
                     }
                     _ => {}
