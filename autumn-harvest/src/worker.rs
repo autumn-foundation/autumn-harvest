@@ -2326,6 +2326,9 @@ async fn persist_workflow_failure(
     // per-key cap (issue #523 P2).
     concurrency_key: Option<String>,
     concurrency_limit: Option<u32>,
+    // Priority from the current task so the retry inherits the same queue priority
+    // and is not silently demoted behind normal work (issue #523 P2).
+    priority: crate::types::Priority,
 ) -> HarvestResult<bool> {
     let error = error.to_string();
 
@@ -2422,7 +2425,7 @@ async fn persist_workflow_failure(
                             max_execution_timeout_ceiling: None,
                             concurrency_key: concurrency_key.clone(),
                             concurrency_limit,
-                            priority: crate::types::Priority::default(),
+                            priority,
                             max_workflow_input_bytes: 0,
                             start_at,
                             delay: None,
@@ -3622,6 +3625,7 @@ async fn fail_task_and_execution(
         None,
         None,
         None,
+        crate::types::Priority::default(),
     )
     .await
     .map(|_| ())
@@ -4918,6 +4922,7 @@ async fn handle_suspended_workflow(
             None,
             None,
             None,
+            crate::types::Priority::default(),
         )
         .await
         .map(|_| ())
@@ -5111,6 +5116,7 @@ async fn reject_child_continue_as_new(
             None,
             None,
             None,
+            crate::types::Priority::default(),
         )
         .await?;
     } else {
@@ -5390,6 +5396,7 @@ async fn persist_workflow_outcome(
                     .task
                     .concurrency_cap
                     .and_then(|c| u32::try_from(c).ok()),
+                crate::types::Priority::from_i32(persistence.task.priority).unwrap_or_default(),
             )
             .await;
             if update_schedule_counter {

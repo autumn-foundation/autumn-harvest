@@ -638,12 +638,18 @@ async fn workflow_retry_exhaustion_counts_as_one_failure() {
         let _ = tokio::time::timeout(Duration::from_secs(20), worker_ref.run(&pool)).await;
     });
 
-    // Poll until we see 2 FAILED executions for this workflow_id.
+    // Poll until we see 2 FAILED executions for this retry chain. The retry
+    // execution has its own UUID workflow_id (not `workflow_id`) and links back
+    // via `retry_of_exec_id`, so match the original row OR any retry of it.
     let mut check = connect(&url).await;
     let mut failed_count = 0;
     for _ in 0..400 {
         let rows: Vec<String> = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+            .filter(
+                harvest_workflow_executions::id
+                    .eq(exec_id.as_uuid())
+                    .or(harvest_workflow_executions::retry_of_exec_id.eq(Some(exec_id.as_uuid()))),
+            )
             .select(harvest_workflow_executions::state)
             .load(&mut check)
             .await

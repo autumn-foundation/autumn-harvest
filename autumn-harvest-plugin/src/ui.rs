@@ -6231,7 +6231,7 @@ async fn execute_schedule_trigger_ui(
             workflow_attempt: 1,
             workflow_retry_policy: ui_trigger_retry_policy,
             retry_of_exec_id: None,
-            max_workflow_attempts_ceiling: None,
+            max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
         },
     )
     .await;

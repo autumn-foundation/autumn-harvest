@@ -1922,6 +1922,14 @@ struct CreateWorkflowScheduleRequest {
     /// Ignored for every other mode. `null`/omitted defaults to `0`.
     #[serde(default)]
     catchup_window_secs: Option<i64>,
+    /// Schedule-level workflow retry policy (issue #523). When set, scheduler
+    /// fires, backfills, and trigger-now runs for this schedule auto-retry a
+    /// `FAILED` run per this policy (taking precedence over the workflow-type
+    /// default). Like every other field on this upsert endpoint, omitting it on
+    /// an update resets the stored policy to NULL (falling back to the
+    /// workflow-type default); send it explicitly to retain a schedule policy.
+    #[serde(default)]
+    retry_policy: Option<autumn_harvest::RetryPolicy>,
 }
 
 fn default_queue_name() -> String {
@@ -11797,7 +11805,7 @@ async fn create_workflow_schedule(
         // Normalize 0 → None: callers passing max_runs=0 intend "no limit".
         max_runs: request.max_runs.filter(|&n| n > 0),
         catchup_policy,
-        retry_policy: None,
+        retry_policy: request.retry_policy.clone(),
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
