@@ -319,16 +319,24 @@ fn queue_depth_unreadable_degrades(roles: &[ShardRole], candidate: bool) -> bool
     roles.contains(&ShardRole::Writable) || candidate
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_no_live_worker_gate(
     shard_id: i32,
     roles: &[ShardRole],
+    candidate: bool,
     queue_depth: &QueueDepthSummary,
     workers: &Result<Vec<WorkerRow>, String>,
     compat: &autumn_harvest::build_routing::BuildCompatibilitySet,
     reason_codes: &mut Vec<String>,
     blocking_reasons: &mut Vec<String>,
 ) {
-    if !roles.contains(&ShardRole::Writable) || queue_depth.total_pending == 0 {
+    // Writable shards take new starts, and a candidate shard being evaluated for
+    // promotion to writable must prove the same "no stranded claimable work"
+    // invariant *before* the flip (issue #522 review) — so a candidate that
+    // already has claimable rows (prior test writes, migration validation) with
+    // no covering worker must not report ready. Read-only, non-candidate shards
+    // are outside this gate's scope.
+    if (!roles.contains(&ShardRole::Writable) && !candidate) || queue_depth.total_pending == 0 {
         return;
     }
 
@@ -532,6 +540,7 @@ async fn observe_shard(
     check_no_live_worker_gate(
         shard_id,
         &roles,
+        candidate,
         &queue_depth,
         &workers_snapshot,
         &compat,
@@ -1326,6 +1335,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1338,6 +1348,64 @@ mod tests {
             "should emit no_live_worker when no worker covers the shard"
         );
         assert!(!blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_for_candidate_shard_with_uncovered_pending() {
+        // A read-only shard offered as a promotion candidate must prove the
+        // no-stranded-work invariant before the flip (issue #522 review): pending
+        // rows with no covering worker block readiness even though it is not yet
+        // Writable.
+        let roles = vec![ShardRole::Readable];
+        let queue_depth = pending_queue_depth(5);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            true, // candidate
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "candidate shard with uncovered pending work should fire no_live_worker"
+        );
+        assert!(!blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_skips_readonly_non_candidate_shard() {
+        // A plain read-only shard that is not a candidate takes no new starts and
+        // is outside this gate's scope — pending rows there do not block.
+        let roles = vec![ShardRole::Readable];
+        let queue_depth = pending_queue_depth(5);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            false, // not a candidate
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "read-only non-candidate shard should not fire no_live_worker"
+        );
+        assert!(blocking_reasons.is_empty());
     }
 
     #[test]
@@ -1378,6 +1446,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1403,6 +1472,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1427,6 +1497,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1453,6 +1524,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1480,6 +1552,7 @@ mod tests {
         check_no_live_worker_gate(
             0, // checking shard 0
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1525,6 +1598,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1562,6 +1636,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1652,6 +1727,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1686,6 +1762,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1717,6 +1794,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1751,6 +1829,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1783,6 +1862,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &compat,
@@ -1813,6 +1893,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
@@ -1846,6 +1927,7 @@ mod tests {
         check_no_live_worker_gate(
             0,
             &roles,
+            false,
             &queue_depth,
             &workers,
             &empty_compat(),
