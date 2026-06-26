@@ -190,7 +190,6 @@ async fn insert_versioned_execution(
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
-        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)
@@ -274,7 +273,6 @@ async fn insert_execution_without_marker(
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
-        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)

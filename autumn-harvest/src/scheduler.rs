@@ -3857,27 +3857,35 @@ async fn drain_buffered_schedule_runs(
 /// `workflow_name` when a schedule-triggered execution reaches `FAILED` or
 /// `TIMED_OUT`.  If the counter now equals or exceeds the configured limit,
 /// auto-pause the schedule and emit the `harvest.schedule.auto_paused` metric.
+///
+/// `schedule_id` overrides the `workflow_id`-prefix heuristic when the caller
+/// already has the schedule UUID (e.g. retry executions whose `workflow_id` does
+/// not start with `"sched:"`).
 #[cfg(feature = "db")]
 pub(crate) async fn maybe_increment_schedule_failure_counter(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_id: &str,
     workflow_name: &str,
+    schedule_id: Option<uuid::Uuid>,
     metrics: &dyn crate::telemetry::MetricsRecorder,
 ) {
     use crate::schema::harvest_schedules::dsl;
 
-    if !workflow_id.starts_with("sched:") {
+    // Retry executions carry an explicit `schedule_id`; original scheduled
+    // executions embed the UUID in the `workflow_id` prefix.  Bail out only
+    // when neither source provides a schedule reference.
+    if schedule_id.is_none() && !workflow_id.starts_with("sched:") {
         return;
     }
 
-    // Extract the schedule UUID embedded in the workflow_id by `scheduled_workflow_id`.
-    // Format: "sched:{schedule_uuid}:{workflow_name}:{timestamp}[.{micros}]"
-    // If the UUID cannot be parsed (e.g. executions created before this format was
-    // introduced) we fall back to a workflow_name-scoped update.
-    let schedule_uuid: Option<uuid::Uuid> = workflow_id
-        .strip_prefix("sched:")
-        .and_then(|s| s.split(':').next())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    // Extract the schedule UUID from the explicit field or from the
+    // `workflow_id` prefix ("sched:{schedule_uuid}:{workflow_name}:{ts}").
+    let schedule_uuid: Option<uuid::Uuid> = schedule_id.or_else(|| {
+        workflow_id
+            .strip_prefix("sched:")
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+    });
 
     let now = Utc::now();
 
@@ -3984,22 +3992,29 @@ pub(crate) async fn maybe_increment_schedule_failure_counter(
 /// Reset the consecutive failure counter to zero for the schedule associated with
 /// `workflow_name` when a schedule-triggered execution reaches `COMPLETED`.
 /// Also clears `auto_paused_at` so the schedule resumes firing automatically.
+///
+/// `schedule_id` overrides the `workflow_id`-prefix heuristic when the caller
+/// already has the schedule UUID (e.g. retry executions whose `workflow_id` does
+/// not start with `"sched:"`).
 #[cfg(feature = "db")]
 pub(crate) async fn maybe_reset_schedule_failure_counter(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_id: &str,
     workflow_name: &str,
+    schedule_id: Option<uuid::Uuid>,
 ) {
     use crate::schema::harvest_schedules::dsl;
 
-    if !workflow_id.starts_with("sched:") {
+    if schedule_id.is_none() && !workflow_id.starts_with("sched:") {
         return;
     }
 
-    let schedule_uuid: Option<uuid::Uuid> = workflow_id
-        .strip_prefix("sched:")
-        .and_then(|s| s.split(':').next())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+    let schedule_uuid: Option<uuid::Uuid> = schedule_id.or_else(|| {
+        workflow_id
+            .strip_prefix("sched:")
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+    });
 
     let now = Utc::now();
     let result = if let Some(sid) = schedule_uuid {

@@ -671,6 +671,7 @@ async fn enforce_workflow_timeout(
         conn,
         &execution.workflow_id,
         &execution.workflow_name,
+        execution.schedule_id,
         metrics,
     )
     .await;
@@ -871,6 +872,7 @@ pub async fn enforce_workflow_execution_timeouts(
             conn,
             &execution.workflow_id,
             &workflow_name,
+            execution.schedule_id,
             metrics,
         )
         .await;
@@ -1837,6 +1839,7 @@ pub async fn enforce_workflow_history_ceiling(
             conn,
             &row.workflow_id,
             &workflow_name,
+            None, // schedule_id not available in OversizedRow
             metrics,
         )
         .await;

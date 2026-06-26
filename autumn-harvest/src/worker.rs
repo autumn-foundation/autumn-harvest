@@ -2433,7 +2433,7 @@ async fn persist_workflow_failure(
                                 .context_headers
                                 .clone()
                                 .and_then(|v| serde_json::from_value(v).ok()),
-                            sla: None,
+                            sla: exec_ref.sla,
                             schedule_id: exec_ref.schedule_id,
                             scheduled_for: exec_ref.scheduled_for,
                             workflow_attempt: attempt + 1,
@@ -5176,9 +5176,10 @@ async fn persist_workflow_continue_as_new(
         // continuation isn't treated as a brand-new fire (issue #488).
         scheduled_for: execution.scheduled_for,
         // Continue-as-new starts a fresh run: attempt counter resets to 1,
-        // retry policy is not inherited (the new run can define its own).
+        // but the retry policy is carried forward so the chain can still retry
+        // transient failures on the continued run.
         workflow_attempt: 1,
-        workflow_retry_policy: None,
+        workflow_retry_policy: execution.workflow_retry_policy.clone(),
         retry_of_exec_id: None,
     };
     let mut enqueue =
@@ -5303,6 +5304,7 @@ async fn persist_workflow_outcome(
                     conn,
                     &execution.workflow_id,
                     &execution.workflow_name,
+                    execution.schedule_id,
                 )
                 .await;
             }
@@ -5332,6 +5334,7 @@ async fn persist_workflow_outcome(
                     conn,
                     &execution.workflow_id,
                     &execution.workflow_name,
+                    execution.schedule_id,
                     registry.telemetry().metrics.as_ref(),
                 )
                 .await;
@@ -5372,6 +5375,7 @@ async fn persist_workflow_outcome(
                             conn,
                             &execution.workflow_id,
                             &execution.workflow_name,
+                            execution.schedule_id,
                             registry.telemetry().metrics.as_ref(),
                         )
                         .await;
@@ -5450,6 +5454,7 @@ async fn run_deferred_schedule_counter(
                 conn,
                 &execution.workflow_id,
                 &execution.workflow_name,
+                execution.schedule_id,
             )
             .await;
         }
@@ -5458,6 +5463,7 @@ async fn run_deferred_schedule_counter(
                 conn,
                 &execution.workflow_id,
                 &execution.workflow_name,
+                execution.schedule_id,
                 registry.telemetry().metrics.as_ref(),
             )
             .await;
@@ -8601,6 +8607,7 @@ pub async fn quarantine_workflow_task_timeout(
                     &mut conn,
                     &workflow_id_str,
                     workflow_name,
+                    None, // schedule_id not available in quarantine context
                     metrics,
                 )
                 .await;

@@ -7433,6 +7433,7 @@ mod tests {
             catchup_window_secs: None,
             last_catchup_dropped: 0,
             last_catchup_at: None,
+            retry_policy: None,
         }
     }
 
