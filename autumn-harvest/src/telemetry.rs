@@ -345,6 +345,24 @@ pub const METRIC_PAYLOAD_BYTES: &str = "harvest.payload.bytes";
 /// Per ADR-0001 §7, `execution.id` is span-only.
 pub const METRIC_PAYLOAD_REJECTED: &str = "harvest.payload.rejected";
 
+/// Counter + bytes measure: a payload-bearing field was offloaded to an external
+/// [`PayloadStore`](crate::payload_store::PayloadStore) via claim-check (issue #524).
+///
+/// Incremented once per offloaded field; the increment value is the **byte
+/// length** of the offloaded payload, so operators get both an offload rate
+/// (count of events) and total bytes offloaded.
+///
+/// Labels: `payload.field` (the event field name, e.g. `"output"`), `store.id`.
+/// Per ADR-0001 §7, `execution.id` is span-only and must never appear here.
+pub const METRIC_PAYLOAD_OFFLOADED: &str = "harvest.payload.offloaded";
+
+/// Histogram: wall-clock seconds to fetch an offloaded payload back from the
+/// external store on read/replay (issue #524).
+///
+/// Labels: `store.id`. Per ADR-0001 §7, `execution.id` is span-only.
+pub const METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION: &str =
+    "harvest.payload.offload_fetch_duration";
+
 /// Counter: incremented each time a new workflow start is blocked by an
 /// active admission gate (issue #377).
 ///
@@ -1162,6 +1180,23 @@ pub trait MetricsRecorder: Send + Sync {
     /// `payload.kind` and `workflow.type`.
     fn record_payload_rejected(&self, kind: &crate::error::PayloadKind, workflow_type: &str) {
         let _ = (kind, workflow_type);
+    }
+
+    /// A payload-bearing field was offloaded to an external store (issue #524).
+    ///
+    /// Maps to the [`METRIC_PAYLOAD_OFFLOADED`] counter, incremented by
+    /// `byte_len`. `field` is the event field name (`"input"`, `"output"`, …);
+    /// `store_id` identifies the configured store.
+    fn record_payload_offloaded(&self, field: &str, store_id: &str, byte_len: u64) {
+        let _ = (field, store_id, byte_len);
+    }
+
+    /// An offloaded payload was fetched back from the external store on
+    /// read/replay (issue #524).
+    ///
+    /// Maps to the [`METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION`] histogram.
+    fn record_payload_offload_fetch(&self, store_id: &str, duration_secs: f64) {
+        let _ = (store_id, duration_secs);
     }
 
     /// A cross-workflow external signal was sent.

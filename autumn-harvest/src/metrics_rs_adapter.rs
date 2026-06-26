@@ -54,6 +54,7 @@ use crate::telemetry::{
     METRIC_LABEL_SCOPE, METRIC_LABEL_SHARD, METRIC_LABEL_STATUS, METRIC_LABEL_TRIGGER,
     METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH,
     METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START,
+    METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
     METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED, METRIC_RATE_LIMIT_TOKENS_AVAILABLE,
     METRIC_RETENTION_DELETED, METRIC_SCHEDULE_AUTO_PAUSED, METRIC_SCHEDULE_DECISION_WRITE_FAILED,
     METRIC_SCHEDULE_FIRE_ATTEMPTS, METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_RUNS,
@@ -287,6 +288,23 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_SHARD => shard.to_string(),
         )
         .increment(deleted_count);
+    }
+
+    fn record_payload_offloaded(&self, field: &str, store_id: &str, byte_len: u64) {
+        counter!(
+            METRIC_PAYLOAD_OFFLOADED,
+            "payload.field" => field.to_owned(),
+            "store.id" => store_id.to_owned(),
+        )
+        .increment(byte_len);
+    }
+
+    fn record_payload_offload_fetch(&self, store_id: &str, duration_secs: f64) {
+        histogram!(
+            METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION,
+            "store.id" => store_id.to_owned(),
+        )
+        .record(duration_secs);
     }
 
     fn record_query_completed(&self, query_name: &str, duration_secs: f64, success: bool) {

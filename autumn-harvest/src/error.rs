@@ -233,6 +233,15 @@ pub enum HarvestError {
         id: String,
     },
 
+    /// A payload-store operation (offload `put`, fetch `get`, or `delete`)
+    /// failed, or an offloaded payload could not be reconstructed (issue #524).
+    ///
+    /// Covers external-store I/O errors, an unknown `store_id` on read, and a
+    /// content-checksum mismatch between the fetched blob and the recorded
+    /// reference envelope (which would otherwise silently corrupt replay).
+    #[error("payload offload error: {0}")]
+    PayloadOffload(String),
+
     /// A task queue reached its maximum capacity.
     #[error("task queue is full (queue: {queue}, depth: {depth})")]
     QueueFull {
