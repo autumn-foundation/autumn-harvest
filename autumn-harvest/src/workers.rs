@@ -1160,14 +1160,11 @@ async fn sync_drain_deadline(
     if let Ok(Some(deadline)) = read_worker_drain_deadline(conn, worker_id).await {
         // Change-detection merge across per-shard heartbeats (issue #522 review).
         // A multi-shard worker runs one heartbeat per assigned shard, all sharing
-        // this `cell`. Push to the shared cell only when THIS shard's stored
-        // `drain_deadline_at` actually changed since we last observed it:
-        //   - A stale shard that recovers re-reads its unchanged (pre-update)
-        //     deadline, so it does NOT overwrite a newer value another shard
-        //     already applied.
-        //   - A deliberate operator change (extend OR shorten) lands on the
-        //     reachable shard rows; that is a real change here and IS applied,
-        //     so an explicit shorter deadline is honoured.
+        // this `cell`.
+        let was_first = last_seen.is_none();
+        // A stale shard that already synced re-reads its unchanged (pre-update)
+        // deadline — ignore it so it can't overwrite a newer value another shard
+        // applied.
         if *last_seen == Some(deadline) {
             return;
         }
@@ -1176,8 +1173,20 @@ async fn sync_drain_deadline(
             .signed_duration_since(Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO);
+        let candidate = std::time::Instant::now() + remaining;
         if let Ok(mut guard) = cell.lock() {
-            *guard = Some(std::time::Instant::now() + remaining);
+            // Authority to set the effective deadline:
+            //   - the *initial* drain establishes it (cell empty), OR
+            //   - a genuine *change* observed by an already-synced shard — a
+            //     deliberate operator extend OR shorten — always applies.
+            // A shard's *first* observation while a deadline already exists is NOT
+            // authoritative: a heartbeat that was down before its first sync can
+            // recover carrying a stale (pre-update) value, which must not override
+            // the effective deadline in either direction (it could be older or
+            // newer than the operator's latest intent applied via another shard).
+            if guard.is_none() || !was_first {
+                *guard = Some(candidate);
+            }
         }
     }
 }
