@@ -19044,12 +19044,11 @@ async fn workers_health(
         ..WorkerFilters::default()
     };
     for (_shard, shard_pool) in pool.iter_shards() {
-        let Ok(mut conn) = acquire_conn(shard_pool).await else {
-            continue;
-        };
-        if let Ok(mut rows) = list_workers(&mut conn, &per_shard_filters, stale_threshold).await {
-            all_workers.append(&mut rows);
-        }
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
+            .await
+            .map_err(map_error)?;
+        all_workers.append(&mut rows);
     }
 
     {
