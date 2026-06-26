@@ -260,6 +260,33 @@ impl HandlerRegistry {
         Self::with_state(workflows, activities, empty_shared_state())
     }
 
+    /// Build a map of `activity_name` → `required_capabilities` JSON for every
+    /// registered activity that declares `requires`.
+    ///
+    /// Mirrors the per-row `required_capabilities` snapshot. Used by the
+    /// stranded-work sampler and the shard-health coverage gate
+    /// ([`crate::queue::apply_activity_requirements`]) to resolve eligibility for
+    /// activity rows whose queue row left `required_capabilities` NULL even
+    /// though the activity has requirements — the same fallback `claim_task`
+    /// applies via its ineligible-activities gate. Unparseable requirement
+    /// strings are skipped.
+    #[must_use]
+    pub fn activity_requirements_json(&self) -> HashMap<String, serde_json::Value> {
+        let mut map = HashMap::new();
+        for activity in self.activities.values() {
+            let Some(requires) = activity.requires else {
+                continue;
+            };
+            let Ok(reqs) = crate::eligibility::parse_requirements(requires) else {
+                continue;
+            };
+            if let Ok(value) = serde_json::to_value(&reqs) {
+                map.insert(activity.name.to_string(), value);
+            }
+        }
+        map
+    }
+
     /// Create a new registry with shared typed state.
     #[must_use]
     pub fn with_state(
@@ -6901,6 +6928,9 @@ fn spawn_stranded_work_sampler(
     // Static set of activity names with a circuit-breaker policy; these skip the
     // rate-limit gate at claim, so they stay claimable with an empty bucket.
     circuit_breaker_activities: Vec<String>,
+    // Map of activity_name → required_capabilities JSON for activities that
+    // declare `requires`; back-fills the eligibility gate for un-snapshotted rows.
+    activity_requirements: std::collections::HashMap<String, serde_json::Value>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -6918,9 +6948,9 @@ fn spawn_stranded_work_sampler(
                 let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
 
                 // Claimable pending demands for this shard, grouped by
-                // (queue, required_capabilities) so coverage can honour the same
-                // label eligibility claim_task enforces (issue #522 review).
-                let demands: Vec<crate::queue::ClaimablePendingDemand> = {
+                // (queue, required_capabilities, ...) so coverage can honour the
+                // same eligibility claim_task enforces (issue #522 review).
+                let mut demands: Vec<crate::queue::ClaimablePendingDemand> = {
                     let mut conn = match shard_pool.get().await {
                         Ok(conn) => conn,
                         Err(error) => {
@@ -6949,6 +6979,12 @@ fn spawn_stranded_work_sampler(
                         }
                     }
                 };
+
+                // Back-fill effective requirements for activity rows that didn't
+                // snapshot required_capabilities (legacy/manual enqueues), so the
+                // coverage check below applies the same activity eligibility
+                // claim_task's $6 gate enforces.
+                crate::queue::apply_activity_requirements(&mut demands, &activity_requirements);
 
                 if demands.is_empty() {
                     // No claimable work — emit 0 so the gauge resets cleanly.
@@ -7936,6 +7972,7 @@ impl Worker {
                         .circuit_breakers()
                         .tracked_activity_names()
                         .to_vec(),
+                    self.registry.activity_requirements_json(),
                 )
             });
         #[cfg(not(feature = "db"))]

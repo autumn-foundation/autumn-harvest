@@ -466,7 +466,17 @@ async fn observe_shard(
                 .to_vec()
         })
         .unwrap_or_default();
-    let queue_depth = load_queue_depth(&mut conn, &circuit_breaker_activities).await;
+    // Registered activity requirements, to back-fill eligibility for activity
+    // rows that left required_capabilities NULL. Empty when no runtime.
+    let activity_requirements = runtime
+        .map(|r| r.registry().activity_requirements_json())
+        .unwrap_or_default();
+    let queue_depth = load_queue_depth(
+        &mut conn,
+        &circuit_breaker_activities,
+        &activity_requirements,
+    )
+    .await;
     // Build compatibility set for the no_live_worker gate's build-routing check.
     // On load failure fall back to an empty set (exact-match / legacy rules).
     let compat = autumn_harvest::build_routing::load_compat_set(&mut conn)
@@ -916,6 +926,7 @@ fn worker_assigned_to_shard(worker: &WorkerRow, shard_id: i32) -> bool {
 async fn load_queue_depth(
     conn: &mut AsyncPgConnection,
     circuit_breaker_activities: &[String],
+    activity_requirements: &std::collections::HashMap<String, serde_json::Value>,
 ) -> QueueDepthSummary {
     // Derive both the per-queue depth and the constraint demands from the single
     // shared core query, so the basic per-queue coverage check and the
@@ -924,7 +935,7 @@ async fn load_queue_depth(
     // gate: PAUSED workflow tasks, expired `schedule_to_close_at`, concurrency-cap
     // saturation, and rate-limit exhaustion (with the circuit-breaker exemption).
     // A row no worker could claim right now never degrades readiness.
-    let demands = match autumn_harvest::queue::claimable_pending_demand_by_queue(
+    let mut demands = match autumn_harvest::queue::claimable_pending_demand_by_queue(
         conn,
         circuit_breaker_activities,
     )
@@ -940,6 +951,11 @@ async fn load_queue_depth(
             };
         }
     };
+
+    // Back-fill effective requirements for activity rows that didn't snapshot
+    // required_capabilities (legacy/manual enqueues), mirroring claim_task's
+    // ineligible-activities gate so the constraint check below catches them.
+    autumn_harvest::queue::apply_activity_requirements(&mut demands, activity_requirements);
 
     let mut total_pending = 0;
     let mut by_queue: BTreeMap<String, i64> = BTreeMap::new();
