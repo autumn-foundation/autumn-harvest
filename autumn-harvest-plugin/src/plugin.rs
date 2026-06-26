@@ -398,7 +398,7 @@ async fn start_harvest_runtime(
         harvest_db_pool.sharded_pool().clone(),
         runner.api_runtime().router().clone(),
         [(
-            autumn_harvest::ShardId::new(0),
+            harvest_db_pool.sharded_pool().default_shard(),
             workflow_result_notification_url,
         )],
     )

@@ -335,6 +335,9 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
             harvest_workers::deployment_name.eq(excluded(harvest_workers::deployment_name)),
             harvest_workers::labels.eq(excluded(harvest_workers::labels)),
             harvest_workers::status.eq(WorkerStatus::Active.as_str()),
+            // Clear any stale drain deadline so a re-registering worker does not
+            // inherit the deadline left behind by a prior Draining/Stopped cycle.
+            harvest_workers::drain_deadline_at.eq(Option::<DateTime<Utc>>::None),
         ))
         .execute(conn)
         .await
@@ -844,6 +847,31 @@ pub async fn read_worker_drain_deadline(
 ) -> HarvestResult<Option<DateTime<Utc>>> {
     let row: Option<Option<DateTime<Utc>>> = harvest_workers::table
         .find(worker_id)
+        .select(harvest_workers::drain_deadline_at)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(row.flatten())
+}
+
+/// Read the `drain_deadline_at` for a worker that is currently `Draining`.
+///
+/// Returns `None` when the worker row does not exist, has no deadline set, or
+/// is in any other state (e.g. `Active` with a stale deadline left from a
+/// previous drain cycle that was interrupted before `register_worker` cleared
+/// it).
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] on database failure.
+pub async fn read_draining_worker_deadline(
+    conn: &mut AsyncPgConnection,
+    worker_id: &str,
+) -> HarvestResult<Option<DateTime<Utc>>> {
+    let row: Option<Option<DateTime<Utc>>> = harvest_workers::table
+        .find(worker_id)
+        .filter(harvest_workers::status.eq(WorkerStatus::Draining.as_str()))
         .select(harvest_workers::drain_deadline_at)
         .first(conn)
         .await

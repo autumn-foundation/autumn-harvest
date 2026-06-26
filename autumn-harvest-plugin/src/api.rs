@@ -103,7 +103,7 @@ use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
     DrainPreviewItem, DrainResponse, FleetHealth, PinnedExecutionRow, WorkerFilters, WorkerRow,
     get_worker, list_pinned_executions, list_workers, parse_worker_filters, preview_item_from_row,
-    read_worker_drain_deadline, request_drain,
+    read_draining_worker_deadline, request_drain,
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
@@ -19457,7 +19457,7 @@ async fn request_drain_handler(
             let Ok(mut conn) = acquire_conn(shard_pool).await else {
                 continue;
             };
-            if let Ok(Some(stored)) = read_worker_drain_deadline(&mut conn, &worker_id).await {
+            if let Ok(Some(stored)) = read_draining_worker_deadline(&mut conn, &worker_id).await {
                 earliest = Some(earliest.map_or(stored, |e| e.min(stored)));
             }
         }
