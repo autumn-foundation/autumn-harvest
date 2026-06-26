@@ -1506,10 +1506,13 @@ fn validate_local_activity_timeouts(
         if !activity.is_local {
             continue;
         }
-        if activity.default_start_to_close.is_some_and(|stc| stc > cap) {
+        if let Some(actual) = activity
+            .default_start_to_close
+            .filter(|&actual| actual > cap)
+        {
             return Err(HarvestBuilderError::LocalActivityStartToCloseExceedsCap {
                 activity: activity.name.to_string(),
-                actual: activity.default_start_to_close.unwrap(),
+                actual,
                 cap,
             });
         }
@@ -2061,6 +2064,68 @@ mod tests {
     use crate::dag::DagBuilder;
     use crate::info::{DagInfo, WorkflowInfo};
     use crate::policy::Schedule;
+
+    fn fake_activity_info() -> crate::info::ActivityInfo {
+        crate::info::ActivityInfo {
+            name: "test_activity",
+            module: "test",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_schedule_to_close: None,
+            default_queue: None,
+            max_concurrent: None,
+            concurrency_key: None,
+            is_local: false,
+            max_input_bytes: None,
+            max_result_bytes: None,
+            rate_limit_rps: None,
+            rate_limit_burst: None,
+            rate_limit_key: None,
+            circuit_breaker: None,
+            requires: None,
+            handler: |_ctx, _input| Box::pin(async move { Ok(serde_json::Value::Null) }),
+        }
+    }
+
+    #[test]
+    fn test_validate_local_activity_timeouts_ok() {
+        let mut act1 = fake_activity_info();
+        act1.is_local = true;
+        act1.default_start_to_close = Some(Duration::from_secs(10));
+
+        let mut act2 = fake_activity_info();
+        act2.is_local = false;
+        act2.default_start_to_close = Some(Duration::from_secs(100)); // ignored
+
+        let cap = Duration::from_secs(30);
+        let res = validate_local_activity_timeouts(&[act1, act2], cap);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_validate_local_activity_timeouts_err() {
+        let mut act = fake_activity_info();
+        act.is_local = true;
+        act.default_start_to_close = Some(Duration::from_secs(50));
+
+        let cap = Duration::from_secs(30);
+        let res = validate_local_activity_timeouts(&[act], cap);
+
+        match res {
+            Err(HarvestBuilderError::LocalActivityStartToCloseExceedsCap {
+                activity,
+                actual,
+                cap: cap_err,
+            }) => {
+                assert_eq!(activity, "test_activity");
+                assert_eq!(actual, Duration::from_secs(50));
+                assert_eq!(cap_err, cap);
+            }
+            _ => panic!("Expected LocalActivityStartToCloseExceedsCap error"),
+        }
+    }
 
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
