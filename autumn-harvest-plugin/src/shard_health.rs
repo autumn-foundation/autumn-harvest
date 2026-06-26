@@ -107,26 +107,31 @@ pub struct ShardSchedulerCoverage {
 pub struct QueueDepthSummary {
     pub total_pending: i64,
     pub by_queue: BTreeMap<String, i64>,
-    /// Distinct capability requirements among claimable pending activity tasks,
-    /// grouped by `(queue_name, required_capabilities)` (issue #522 review).
-    /// Used by the coverage gate to detect a queued capability-restricted task
-    /// that no covering worker's labels can satisfy. Empty when no pending task
-    /// carries `required_capabilities`.
+    /// Distinct constraint requirements among claimable pending tasks, grouped
+    /// by `(queue_name, required_capabilities, required_build_id)` (issue #522
+    /// review). Used by the coverage gate to detect a queued task that no
+    /// covering worker can actually claim — because of its labels OR its build.
+    /// Empty when no pending task carries a capability or build-id constraint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capability_demands: Vec<CapabilityDemand>,
+    pub constraint_demands: Vec<ConstraintDemand>,
     pub error: Option<String>,
 }
 
-/// A distinct capability requirement set among claimable pending tasks on a
-/// queue (issue #522 review).
+/// A distinct constraint set among claimable pending tasks on a queue
+/// (issue #522 review).
 ///
 /// `claim_task` only lets a worker whose labels satisfy `required_capabilities`
-/// claim the task, so a covering worker that polls the queue but fails the label
-/// match does not actually drain it.
+/// AND whose build is eligible for `required_build_id` claim the task, so a
+/// covering worker that polls the queue but fails either constraint does not
+/// actually drain it. At least one of the two fields is non-empty (rows with
+/// neither constraint are covered by the basic per-queue check).
 #[derive(Debug, Clone, Serialize)]
-pub struct CapabilityDemand {
+pub struct ConstraintDemand {
     pub queue_name: String,
-    pub required_capabilities: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_capabilities: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_build_id: Option<String>,
     pub count: i64,
 }
 
@@ -301,6 +306,7 @@ fn check_no_live_worker_gate(
     roles: &[ShardRole],
     queue_depth: &QueueDepthSummary,
     workers: &Result<Vec<WorkerRow>, String>,
+    compat: &autumn_harvest::build_routing::BuildCompatibilitySet,
     reason_codes: &mut Vec<String>,
     blocking_reasons: &mut Vec<String>,
 ) {
@@ -356,25 +362,29 @@ fn check_no_live_worker_gate(
         ));
     }
 
-    // Capability-aware coverage (issue #522 review): a worker that polls the
-    // queue but whose labels don't satisfy a pending task's
-    // `required_capabilities` cannot claim it. claim_task enforces the same
-    // Exact/In label match, so e.g. a GPU-only activity queued on `default`
-    // with only non-GPU workers is stranded even though `default` looks
-    // covered by the per-queue check above. Skip queues already flagged with no
-    // covering worker at all to avoid a duplicate reason for the same demand.
+    // Constraint-aware coverage (issue #522 review): a worker that polls the
+    // queue may still be unable to claim a pending task because of its
+    // `required_capabilities` (Exact/In label match) or its `required_build_id`
+    // (exact / declared-compatible / legacy rule). claim_task enforces both, so
+    // e.g. a GPU-only or v2-only task queued on `default` with only CPU / v1
+    // workers is stranded even though `default` looks covered by the per-queue
+    // check above. Both constraints are checked against the *same* worker so a
+    // task needing both is not falsely covered by two different workers each
+    // satisfying only one. Skip queues already flagged with no covering worker
+    // at all to avoid a duplicate reason for the same demand.
     let already_uncovered: std::collections::HashSet<&str> = uncovered.iter().copied().collect();
-    let mut uncovered_caps: Vec<String> = Vec::new();
-    for demand in &queue_depth.capability_demands {
+    let mut uncovered_constraints: Vec<String> = Vec::new();
+    for demand in &queue_depth.constraint_demands {
         if already_uncovered.contains(demand.queue_name.as_str()) {
             continue;
         }
-        let Ok(reqs) = serde_json::from_value::<Vec<autumn_harvest::eligibility::Requirement>>(
-            demand.required_capabilities.clone(),
-        ) else {
-            // Unparseable requirement JSON: don't fabricate a coverage failure.
-            continue;
-        };
+        // Parse the capability requirements once. `None` ⇒ no label constraint.
+        // An unparseable value is treated as "no label constraint" so the gate
+        // never fabricates a coverage failure from a value it cannot read.
+        let reqs: Option<Vec<autumn_harvest::eligibility::Requirement>> = demand
+            .required_capabilities
+            .as_ref()
+            .and_then(|caps| serde_json::from_value(caps.clone()).ok());
         let satisfied = ws.iter().any(|w| {
             worker_assigned_to_shard(w, shard_id)
                 && w.health == WorkerHealth::Healthy
@@ -383,24 +393,25 @@ fn check_no_live_worker_gate(
                     qs.iter()
                         .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
                 })
-                && {
+                && compat.is_eligible(&w.worker.build_id, demand.required_build_id.as_deref())
+                && reqs.as_ref().is_none_or(|reqs| {
                     let labels: std::collections::HashMap<String, String> =
                         serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
-                    autumn_harvest::eligibility::matches_requirements(&reqs, &labels)
-                }
+                    autumn_harvest::eligibility::matches_requirements(reqs, &labels)
+                })
         });
         if !satisfied {
-            uncovered_caps.push(demand.queue_name.clone());
+            uncovered_constraints.push(demand.queue_name.clone());
         }
     }
-    if !uncovered_caps.is_empty() {
-        uncovered_caps.sort_unstable();
-        uncovered_caps.dedup();
+    if !uncovered_constraints.is_empty() {
+        uncovered_constraints.sort_unstable();
+        uncovered_constraints.dedup();
         push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
         blocking_reasons.push(format!(
-            "claimable task(s) with capability requirements queued on queue(s) [{}] \
-             but no live worker assigned to this shard satisfies their required labels",
-            uncovered_caps.join(", ")
+            "claimable task(s) with capability/build requirements queued on queue(s) [{}] \
+             but no live worker assigned to this shard satisfies their required labels/build",
+            uncovered_constraints.join(", ")
         ));
     }
 }
@@ -434,6 +445,11 @@ async fn observe_shard(
     let workers = load_workers(&mut conn, freshness_window).await;
     let workers_snapshot = workers.clone();
     let queue_depth = load_queue_depth(&mut conn).await;
+    // Build compatibility set for the no_live_worker gate's build-routing check.
+    // On load failure fall back to an empty set (exact-match / legacy rules).
+    let compat = autumn_harvest::build_routing::load_compat_set(&mut conn)
+        .await
+        .unwrap_or_default();
     let dlq = load_dlq(&mut conn).await;
 
     let mut blocking_reasons = Vec::new();
@@ -473,6 +489,7 @@ async fn observe_shard(
         &roles,
         &queue_depth,
         &workers_snapshot,
+        &compat,
         &mut reason_codes,
         &mut blocking_reasons,
     );
@@ -567,7 +584,7 @@ fn unavailable_row(
         queue_depth: QueueDepthSummary {
             total_pending: 0,
             by_queue: BTreeMap::new(),
-            capability_demands: Vec::new(),
+            constraint_demands: Vec::new(),
             error: Some(error_summary.clone()),
         },
         dlq: DlqSummary {
@@ -926,66 +943,33 @@ async fn load_queue_depth(conn: &mut AsyncPgConnection) -> QueueDepthSummary {
         }
     };
 
-    // Distinct capability requirements among claimable pending activity tasks,
-    // grouped by (queue, required_capabilities). Same claim_task exclusions as
-    // above plus `required_capabilities IS NOT NULL`. On query failure leave
-    // demands empty — the basic per-queue coverage gate still applies.
-    let cap_rows = diesel::sql_query(
-        "SELECT queue_name::TEXT AS queue_name, \
-                required_capabilities AS required_capabilities, \
-                COUNT(*)::BIGINT AS depth \
-         FROM harvest_task_queue \
-         WHERE state = 'PENDING' \
-           AND scheduled_at <= NOW() \
-           AND required_capabilities IS NOT NULL \
-           AND ( \
-               schedule_to_close_at IS NULL \
-               OR schedule_to_close_at > NOW() \
-           ) \
-           AND ( \
-               task_type <> 'workflow' \
-               OR workflow_exec_id IS NULL \
-               OR NOT EXISTS ( \
-                   SELECT 1 FROM harvest_workflow_executions e \
-                   WHERE e.id = harvest_task_queue.workflow_exec_id \
-                     AND e.state = 'PAUSED' \
-               ) \
-           ) \
-         GROUP BY queue_name, required_capabilities \
-         ORDER BY queue_name",
-    )
-    .load::<CapabilityDemandRow>(conn)
-    .await;
-
-    let capability_demands = cap_rows.map_or_else(
-        |_| Vec::new(),
-        |rows| {
-            rows.into_iter()
-                .map(|r| CapabilityDemand {
-                    queue_name: r.queue_name,
-                    required_capabilities: r.required_capabilities,
-                    count: r.depth,
+    // Distinct constraint demands among claimable pending tasks, reusing the
+    // shared core query so the gate sees exactly what the stranded-work sampler
+    // sees. Keep only the rows that carry a capability OR build-id constraint;
+    // the unconstrained rows are already covered by the basic per-queue check.
+    // On query failure leave demands empty — that check still applies.
+    let constraint_demands = autumn_harvest::queue::claimable_pending_demand_by_queue(conn)
+        .await
+        .map(|demands| {
+            demands
+                .into_iter()
+                .filter(|d| d.required_capabilities.is_some() || d.required_build_id.is_some())
+                .map(|d| ConstraintDemand {
+                    queue_name: d.queue_name,
+                    required_capabilities: d.required_capabilities,
+                    required_build_id: d.required_build_id,
+                    count: d.count,
                 })
                 .collect()
-        },
-    );
+        })
+        .unwrap_or_default();
 
     QueueDepthSummary {
         total_pending,
         by_queue,
-        capability_demands,
+        constraint_demands,
         error,
     }
-}
-
-#[derive(diesel::QueryableByName)]
-struct CapabilityDemandRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    queue_name: String,
-    #[diesel(sql_type = diesel::sql_types::Jsonb)]
-    required_capabilities: serde_json::Value,
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    depth: i64,
 }
 
 async fn load_dlq(conn: &mut AsyncPgConnection) -> DlqSummary {
@@ -1258,9 +1242,16 @@ mod tests {
         QueueDepthSummary {
             total_pending: total,
             by_queue,
-            capability_demands: Vec::new(),
+            constraint_demands: Vec::new(),
             error: None,
         }
+    }
+
+    /// An empty build-compatibility set: only exact-build and legacy-worker
+    /// (empty build_id) rules apply, matching a deployment with no declared
+    /// cross-build compatibility.
+    fn empty_compat() -> autumn_harvest::build_routing::BuildCompatibilitySet {
+        autumn_harvest::build_routing::BuildCompatibilitySet::default()
     }
 
     #[test]
@@ -1276,6 +1267,7 @@ mod tests {
             &roles,
             &queue_depth,
             &workers,
+            &empty_compat(),
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -1301,6 +1293,7 @@ mod tests {
             &roles,
             &queue_depth,
             &workers,
+            &empty_compat(),
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -1325,6 +1318,7 @@ mod tests {
             &roles,
             &queue_depth,
             &workers,
+            &empty_compat(),
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -1348,6 +1342,7 @@ mod tests {
             &roles,
             &queue_depth,
             &workers,
+            &empty_compat(),
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -1373,6 +1368,7 @@ mod tests {
             &roles,
             &queue_depth,
             &workers,
+            &empty_compat(),
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -1399,6 +1395,7 @@ mod tests {
             &roles,
             &queue_depth,
             &workers,
+            &empty_compat(),
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -1420,7 +1417,7 @@ mod tests {
         QueueDepthSummary {
             total_pending: default_pending + email_pending,
             by_queue,
-            capability_demands: Vec::new(),
+            constraint_demands: Vec::new(),
             error: None,
         }
     }
@@ -1443,6 +1440,7 @@ mod tests {
             &roles,
             &queue_depth,
             &workers,
+            &empty_compat(),
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -1479,6 +1477,7 @@ mod tests {
             &roles,
             &queue_depth,
             &workers,
+            &empty_compat(),
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -1498,9 +1497,30 @@ mod tests {
         QueueDepthSummary {
             total_pending: 1,
             by_queue,
-            capability_demands: vec![CapabilityDemand {
+            constraint_demands: vec![ConstraintDemand {
                 queue_name: "default".to_string(),
-                required_capabilities: serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+                required_capabilities: Some(
+                    serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+                ),
+                required_build_id: None,
+                count: 1,
+            }],
+            error: None,
+        }
+    }
+
+    /// Build a `QueueDepthSummary` with one build-routed pending task on
+    /// `default` requiring build id `v2`.
+    fn build_routed_queue_depth() -> QueueDepthSummary {
+        let mut by_queue = std::collections::BTreeMap::new();
+        by_queue.insert("default".to_string(), 1);
+        QueueDepthSummary {
+            total_pending: 1,
+            by_queue,
+            constraint_demands: vec![ConstraintDemand {
+                queue_name: "default".to_string(),
+                required_capabilities: None,
+                required_build_id: Some("v2".to_string()),
                 count: 1,
             }],
             error: None,
@@ -1526,6 +1546,7 @@ mod tests {
             &roles,
             &queue_depth,
             &workers,
+            &empty_compat(),
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -1559,6 +1580,7 @@ mod tests {
             &roles,
             &queue_depth,
             &workers,
+            &empty_compat(),
             &mut reason_codes,
             &mut blocking_reasons,
         );
@@ -1566,6 +1588,103 @@ mod tests {
         assert!(
             !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "should not fire when a covering worker satisfies the capabilities"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_build_requirement_unsatisfied() {
+        // A v2-only task is queued on `default`; the only worker polls `default`
+        // but runs build `v1` with no compatibility declared, so claim_task
+        // would never let it claim the task — stranded even though `default`
+        // looks covered by the basic per-queue check.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = build_routed_queue_depth();
+        let mut worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        worker.worker.build_id = "v1".to_string();
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should fire when no worker's build is eligible for the pending task"
+        );
+        assert!(
+            blocking_reasons
+                .iter()
+                .any(|r| r.contains("build") && r.contains("default")),
+            "blocking reason should name the build-uncovered queue: {blocking_reasons:?}"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_build_requirement_satisfied() {
+        // The same v2-only task, but the covering worker runs build `v2`, so it
+        // can claim it — no stranded work.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = build_routed_queue_depth();
+        let mut worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        worker.worker.build_id = "v2".to_string();
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &empty_compat(),
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when a covering worker's build is eligible"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_build_compat_declared() {
+        // The v2-only task with only a v1 worker, but a compatibility
+        // declaration (v1 may process v2) makes the worker eligible — mirroring
+        // claim_task's harvest_build_compat lookup.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = build_routed_queue_depth();
+        let mut worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        worker.worker.build_id = "v1".to_string();
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut compat = autumn_harvest::build_routing::BuildCompatibilitySet::default();
+        compat.add_declaration("v1", "v2");
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &compat,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when a compat declaration makes the worker build-eligible"
         );
         assert!(blocking_reasons.is_empty());
     }

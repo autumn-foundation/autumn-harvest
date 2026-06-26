@@ -6891,6 +6891,7 @@ fn spawn_dlq_depth_sampler(
 /// active worker assigned to the shard. Tasks on queues with no such worker are
 /// counted as stranded and emitted via `harvest.shard.stranded_pending`.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 fn spawn_stranded_work_sampler(
     sharded_pool: crate::shard::ShardedDbPool,
     freshness_window: Duration,
@@ -6976,12 +6977,29 @@ fn spawn_stranded_work_sampler(
                     }
                 };
 
+                // Build compatibility set for this shard (issue #171 routing).
+                // Used to honour the same required_build_id eligibility
+                // claim_task enforces. On load failure fall back to an empty set
+                // (exact-match / legacy-worker rules still apply).
+                let compat_set = {
+                    let Ok(mut conn) = shard_pool.get().await else {
+                        continue;
+                    };
+                    crate::build_routing::load_compat_set(&mut conn)
+                        .await
+                        .unwrap_or_default()
+                };
+
                 // A demand is covered when some covering worker polls its queue
                 // AND satisfies its required_capabilities (the same Exact/In
-                // label match claim_task applies). No requirements ⇒ any worker
-                // polling the queue covers it. Unparseable requirements fall back
-                // to queue-only coverage so the sampler never fabricates a
-                // false-positive stranded signal.
+                // label match claim_task applies) AND is build-eligible for its
+                // required_build_id (the same exact/compatible/legacy rule). The
+                // three constraints are checked against the *same* worker so a
+                // task needing both a label and a build is not falsely covered by
+                // two different workers each satisfying only one. No requirement
+                // ⇒ that dimension is trivially satisfied; unparseable
+                // capabilities fall back to queue+build coverage so the sampler
+                // never fabricates a false-positive stranded signal.
                 let demand_covered = |demand: &crate::queue::ClaimablePendingDemand| -> bool {
                     let reqs = demand.required_capabilities.as_ref().and_then(|caps| {
                         serde_json::from_value::<Vec<crate::eligibility::Requirement>>(caps.clone())
@@ -6993,6 +7011,11 @@ fn spawn_stranded_work_sampler(
                                 .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
                         });
                         if !polls_queue {
+                            return false;
+                        }
+                        if !compat_set
+                            .is_eligible(&w.worker.build_id, demand.required_build_id.as_deref())
+                        {
                             return false;
                         }
                         reqs.as_ref().is_none_or(|reqs| {
@@ -7068,7 +7091,7 @@ struct WorkerMonitoringHandles {
     concurrency_sampler: tokio::task::JoinHandle<()>,
     rate_limit_sampler: tokio::task::JoinHandle<()>,
     dlq_depth_samplers: Vec<tokio::task::JoinHandle<()>>,
-    timeout_checker: tokio::task::JoinHandle<()>,
+    timeout_checkers: Vec<tokio::task::JoinHandle<()>>,
     poison_pill_reclaimers: Vec<tokio::task::JoinHandle<()>>,
     pause_auto_resumers: Vec<tokio::task::JoinHandle<()>>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
@@ -7628,8 +7651,10 @@ impl Worker {
 
     /// Clean up monitoring task handles (extracted for the multi-shard path).
     async fn shutdown_and_cleanup_monitors(&self, monitors: WorkerMonitoringHandles) {
-        if let Err(error) = monitors.timeout_checker.await {
-            tracing::warn!(error = %error, "timeout checker failed during shutdown");
+        for handle in monitors.timeout_checkers {
+            if let Err(error) = handle.await {
+                tracing::warn!(error = %error, "timeout checker failed during shutdown");
+            }
         }
         for handle in monitors.poison_pill_reclaimers {
             if let Err(error) = handle.await {
@@ -7781,32 +7806,11 @@ impl Worker {
             self.registry.telemetry().clone(),
             self.config.poll_interval,
         );
-        let timeout_checker = crate::timeout::spawn_timeout_checker(
-            pool.clone(),
-            self.shutdown.clone(),
-            self.config.poll_interval,
-            self.registry.telemetry().clone(),
-            self.config.unknown_target_grace_window,
-            self.config.sharded_pool.clone(),
-            self.config.shard_assignments.clone(),
-            self.registry.circuit_breakers(),
-            self.config.max_workflow_history_events,
-        );
-        // Worker-stale threshold mirrors the fleet-health classifier:
-        // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
-        // Double *before* rounding to whole seconds so a fractional interval
-        // (e.g. 1500ms → 3s, not 2s) keeps the documented liveness window, and
-        // cap at one year so an absurd interval can never overflow the
-        // chrono::Duration arithmetic in the reclaim path.
-        let doubled = self.config.worker_heartbeat_interval.saturating_mul(2);
-        let worker_stale_secs = i64::try_from(doubled.as_secs())
-            .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
-            .saturating_add(i64::from(doubled.subsec_nanos() > 0))
-            .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS);
-        // Poison-pill reclaimer and pause auto-resumer run per-shard so that
-        // orphaned tasks and over-long pauses on every assigned shard are
-        // recovered (fix #3).  When a ShardedDbPool is available each shard
-        // gets its own instance; otherwise the single default pool is used.
+        // Poison-pill reclaimer, pause auto-resumer, and timeout checker all run
+        // per-shard so that orphaned tasks, over-long pauses, and timed-out
+        // tasks/executions on every assigned shard are recovered (fix #3,
+        // issue #522). When a ShardedDbPool is available each shard gets its own
+        // instance; otherwise the single default pool is used.
         #[cfg(feature = "db")]
         let shard_pools_for_monitors: Vec<DbPool> = {
             let assignments = &self.config.shard_assignments;
@@ -7820,6 +7824,42 @@ impl Worker {
         };
         #[cfg(not(feature = "db"))]
         let shard_pools_for_monitors: Vec<DbPool> = vec![pool.clone()];
+
+        // One timeout checker per assigned shard. `enforce_timeouts_once` scans
+        // the connection's *own* database (find_timed_out_tasks, external-task
+        // timeouts, workflow-execution deadlines, SLA breaches, history
+        // ceiling), so a single checker on the default pool would leave expired
+        // tasks/executions on the other shards stuck RUNNING/PENDING forever.
+        // The cross-shard outbox helpers inside each pass still receive the full
+        // sharded_pool + shard_assignments so peer-shard delivery is unchanged.
+        let timeout_checkers: Vec<_> = shard_pools_for_monitors
+            .iter()
+            .map(|shard_pool| {
+                crate::timeout::spawn_timeout_checker(
+                    shard_pool.clone(),
+                    self.shutdown.clone(),
+                    self.config.poll_interval,
+                    self.registry.telemetry().clone(),
+                    self.config.unknown_target_grace_window,
+                    self.config.sharded_pool.clone(),
+                    self.config.shard_assignments.clone(),
+                    self.registry.circuit_breakers(),
+                    self.config.max_workflow_history_events,
+                )
+            })
+            .collect();
+
+        // Worker-stale threshold mirrors the fleet-health classifier:
+        // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
+        // Double *before* rounding to whole seconds so a fractional interval
+        // (e.g. 1500ms → 3s, not 2s) keeps the documented liveness window, and
+        // cap at one year so an absurd interval can never overflow the
+        // chrono::Duration arithmetic in the reclaim path.
+        let doubled = self.config.worker_heartbeat_interval.saturating_mul(2);
+        let worker_stale_secs = i64::try_from(doubled.as_secs())
+            .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
+            .saturating_add(i64::from(doubled.subsec_nanos() > 0))
+            .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS);
 
         let poison_pill_reclaimers: Vec<_> = shard_pools_for_monitors
             .iter()
@@ -7885,7 +7925,7 @@ impl Worker {
             concurrency_sampler,
             rate_limit_sampler,
             dlq_depth_samplers,
-            timeout_checker,
+            timeout_checkers,
             poison_pill_reclaimers,
             pause_auto_resumers,
             history_oversized_sampler,
@@ -7983,12 +8023,14 @@ impl Worker {
                 "worker heartbeat task failed during shutdown"
             );
         }
-        if let Err(error) = monitors.timeout_checker.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "timeout checker task failed during shutdown"
-            );
+        for handle in monitors.timeout_checkers {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "timeout checker task failed during shutdown"
+                );
+            }
         }
         for handle in monitors.poison_pill_reclaimers {
             if let Err(error) = handle.await {

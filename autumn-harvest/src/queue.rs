@@ -1867,29 +1867,32 @@ pub async fn claimable_pending_count(conn: &mut AsyncPgConnection) -> HarvestRes
 }
 
 /// A distinct claimable-pending demand: how many claimable pending tasks share a
-/// `(queue_name, required_capabilities)` pair.
+/// `(queue_name, required_capabilities, required_build_id)` triple.
 ///
 /// `required_capabilities` is `None` for tasks with no label requirements and
 /// `Some(json)` for tasks that `claim_task` only lets a capability-matching
-/// worker take. The stranded-work sampler uses this to detect a queue that
-/// looks covered (a worker polls it) but carries a task no covering worker's
-/// labels can satisfy.
+/// worker take. `required_build_id` is `None` for build-unrouted tasks and
+/// `Some(id)` for tasks that `claim_task` only lets a build-matching (or
+/// compatible/legacy) worker take. The stranded-work sampler uses this to
+/// detect a queue that looks covered (a worker polls it) but carries a task no
+/// covering worker can actually claim — because of its labels OR its build.
 #[derive(Debug, Clone)]
 pub struct ClaimablePendingDemand {
     pub queue_name: String,
     pub required_capabilities: Option<serde_json::Value>,
+    pub required_build_id: Option<String>,
     pub count: i64,
 }
 
-/// Per-queue, per-capability variant of [`claimable_pending_count`].
+/// Per-queue, per-constraint variant of [`claimable_pending_count`].
 ///
 /// Returns one [`ClaimablePendingDemand`] per distinct
-/// `(queue_name, required_capabilities)` pair among claimable pending tasks.
-/// Applies the same exclusions as `claim_task` (PAUSED workflow tasks, expired
-/// `schedule_to_close_at`) so the counts mirror exactly what a worker would find
-/// claimable. Grouping on `required_capabilities` lets the caller apply the same
-/// label eligibility `claim_task` enforces, rather than collapsing coverage to
-/// queue names.
+/// `(queue_name, required_capabilities, required_build_id)` triple among
+/// claimable pending tasks. Applies the same exclusions as `claim_task` (PAUSED
+/// workflow tasks, expired `schedule_to_close_at`) so the counts mirror exactly
+/// what a worker would find claimable. Grouping on the constraint columns lets
+/// the caller apply the same label and build-id eligibility `claim_task`
+/// enforces, rather than collapsing coverage to queue names.
 pub async fn claimable_pending_demand_by_queue(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<Vec<ClaimablePendingDemand>> {
@@ -1899,12 +1902,15 @@ pub async fn claimable_pending_demand_by_queue(
         queue_name: String,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
         required_capabilities: Option<serde_json::Value>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        required_build_id: Option<String>,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         cnt: i64,
     }
 
     let rows: Vec<DemandRow> = diesel::sql_query(
-        "SELECT tq.queue_name, tq.required_capabilities, COUNT(*)::BIGINT AS cnt \
+        "SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, \
+                COUNT(*)::BIGINT AS cnt \
          FROM harvest_task_queue tq \
          LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
          WHERE tq.state = 'PENDING' \
@@ -1919,7 +1925,7 @@ pub async fn claimable_pending_demand_by_queue(
                OR e.id IS NULL \
                OR e.state <> 'PAUSED' \
            ) \
-         GROUP BY tq.queue_name, tq.required_capabilities",
+         GROUP BY tq.queue_name, tq.required_capabilities, tq.required_build_id",
     )
     .load(conn)
     .await
@@ -1930,6 +1936,7 @@ pub async fn claimable_pending_demand_by_queue(
         .map(|r| ClaimablePendingDemand {
             queue_name: r.queue_name,
             required_capabilities: r.required_capabilities,
+            required_build_id: r.required_build_id,
             count: r.cnt,
         })
         .collect())
