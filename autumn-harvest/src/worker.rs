@@ -7453,15 +7453,28 @@ impl Worker {
             // (issue #522). Prefer this shard's entry in
             // `shard_notification_database_urls`.
             //
-            // The global URL is only a safe fallback when the claim pool *is*
-            // the default pool — that is, when no `ShardedDbPool` is configured,
-            // so the resolved target reuses the passed default `pool` that the
-            // global URL targets. With a `ShardedDbPool` the resolved pool is
-            // shard-specific and the global URL may point at a different
-            // database; a NOTIFY there would never wake this worker, so an absent
-            // per-shard URL means poll-only for this shard rather than risking a
-            // wrong-database listener (issue #522 review).
-            let global_url_targets_claim_pool = self.config.sharded_pool.is_none();
+            // The global URL pairs with the default pool, so it is a safe
+            // fallback only when the claim pool *is* that default pool: no
+            // `ShardedDbPool` at all, or the resolved shard is the pool's
+            // `default_shard()` (or is absent from the map, so `pool_for` falls
+            // back to the default pool the global URL targets). A single-shard
+            // wrapper — the shape every legacy single-shard deployment uses —
+            // therefore keeps its global LISTEN. With real multi-shard routing
+            // the resolved pool is shard-specific and the global URL may point
+            // at a different database; a NOTIFY there would never wake this
+            // worker, so an absent per-shard URL means poll-only for this shard
+            // rather than risking a wrong-database listener (issue #522 review).
+            #[cfg(feature = "db")]
+            let global_safe = match (shard_targets.as_slice(), self.config.sharded_pool.as_ref()) {
+                ([(shard, _), ..], Some(sp)) => {
+                    *shard == sp.default_shard() || sp.exact_pool_for(*shard).is_none()
+                }
+                // No sharded pool, or no resolved shard: the claim pool is
+                // the default pool the global URL targets.
+                _ => true,
+            };
+            #[cfg(not(feature = "db"))]
+            let global_safe = true;
             let listener_url: Option<&str> = match shard_targets.as_slice() {
                 [(shard_id, _), ..] => {
                     let per_shard = self
@@ -7471,7 +7484,7 @@ impl Worker {
                         .find(|(s, _)| s == shard_id)
                         .map(|(_, url)| url.as_str());
                     per_shard.or_else(|| {
-                        global_url_targets_claim_pool
+                        global_safe
                             .then_some(self.config.notification_database_url.as_deref())
                             .flatten()
                     })

@@ -18928,13 +18928,21 @@ async fn list_workers_handler(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut results: Vec<WorkerRow> = Vec::new();
 
-    // Use i64::MAX as the per-shard limit so apply_worker_filters performs no
-    // truncation inside list_workers. Any MAX_LIMIT cap would silently drop
-    // workers on a large shard before the global sort+truncate below, producing
-    // incomplete results for fleets with more than MAX_LIMIT matching workers on
-    // a single shard.
+    // Per-shard load drops the snapshot-dependent filters (status, health,
+    // build_id, deployment_name) and applies them globally AFTER dedup
+    // (issue #522 review). A multi-shard worker's shard rows can disagree on
+    // status/health, so filtering per-shard could let a stale Active copy on one
+    // shard survive while the freshest Draining row on another is dropped before
+    // dedup — returning the obsolete snapshot. The shard-invariant queue/shard
+    // filters (read from the worker's advertised JSON, identical across rows) are
+    // kept here. Use i64::MAX as the per-shard limit so list_workers performs no
+    // truncation before the global sort+truncate below.
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
+        status: None,
+        health: None,
+        build_id: None,
+        deployment_name: None,
         ..filters.clone()
     };
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -18949,6 +18957,20 @@ async fn list_workers_handler(
     // table. Dedup by worker_id, keeping the freshest per-shard snapshot so each
     // physical worker appears exactly once with its true liveness.
     let mut results = dedup_workers_by_freshest(results);
+
+    // Now apply the snapshot-dependent filters against the freshest snapshot.
+    if let Some(ref status) = filters.status {
+        results.retain(|w| &w.worker.status == status);
+    }
+    if let Some(health) = filters.health {
+        results.retain(|w| w.health == health);
+    }
+    if let Some(ref build_id) = filters.build_id {
+        results.retain(|w| &w.worker.build_id == build_id);
+    }
+    if let Some(ref deployment_name) = filters.deployment_name {
+        results.retain(|w| w.worker.deployment_name.as_deref() == Some(deployment_name.as_str()));
+    }
 
     let capable_of = pairs
         .iter()
