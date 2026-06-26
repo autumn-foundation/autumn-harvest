@@ -288,6 +288,7 @@ fn make_worker(
             queues: vec!["default".to_string()],
             queue_weights: std::collections::HashMap::new(),
             notification_database_url: None,
+            shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
             poll_interval: Duration::from_millis(50),

@@ -13,6 +13,7 @@ use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
 };
 use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
+use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
@@ -34,6 +35,14 @@ pub struct HarvestRunnerResources {
     app_pool: Option<DbPool>,
     harvest_pool: DbPool,
     shard_router: Option<ShardRouter>,
+    /// Pre-built multi-shard pool for multi-shard deployments (issue #522).
+    ///
+    /// When set, the runtime uses this pool directly instead of deriving a
+    /// single-shard pool from `harvest_pool`. This allows operators to inject
+    /// a `ShardedDbPool` spanning multiple databases so the worker can drain
+    /// all assigned shards. When `None`, the runtime falls back to a
+    /// single-shard wrapper around `harvest_pool`.
+    sharded_pool: Option<ShardedDbPool>,
 }
 
 impl HarvestRunnerResources {
@@ -45,6 +54,7 @@ impl HarvestRunnerResources {
             app_pool: None,
             harvest_pool,
             shard_router: None,
+            sharded_pool: None,
         }
     }
 
@@ -70,6 +80,18 @@ impl HarvestRunnerResources {
     #[must_use]
     pub fn with_shard_router(mut self, router: ShardRouter) -> Self {
         self.shard_router = Some(router);
+        self
+    }
+
+    /// Inject a pre-built multi-shard pool for multi-shard deployments.
+    ///
+    /// When set, this pool is used as the `storage_pool` instead of deriving
+    /// a single-shard pool from `harvest_pool`. Use this when the runtime
+    /// spans multiple Postgres databases and needs to drain tasks from all
+    /// assigned shards (issue #522).
+    #[must_use]
+    pub fn with_sharded_pool(mut self, pool: ShardedDbPool) -> Self {
+        self.sharded_pool = Some(pool);
         self
     }
 }
@@ -115,11 +137,43 @@ impl PreparedHarvestRuntime {
             .collect();
         let workflow_schedules = Arc::new(built.workflow_schedules().to_vec());
         let max_workflow_history_events = built.max_workflow_history_events;
+        // Resolve the effective sharded storage pool *before* building handler
+        // state so the registry receives the same sharded HarvestDbPool;
+        // otherwise handlers fall back to the default shard's pool and can
+        // read/write the wrong database (issue #522). Precedence:
+        //   1. resources.sharded_pool — explicit runner-level override
+        //   2. WorkerConfig::with_sharded_pool — carried on the built config
+        //   3. single-shard wrapper of the default harvest pool
+        // Honouring (2) here keeps a `HarvestBuilder::with_sharded_pool` from
+        // being silently narrowed to a single shard when the runner is started
+        // with only `HarvestRunnerResources::new(default_pool)` (the plugin
+        // path), which would strand all non-default-shard work.
+        let storage_pool = if let Some(sp) = resources.sharded_pool {
+            HarvestDbPool::sharded(sp)
+        } else if let Some(sp) = built.worker_config().sharded_pool.clone() {
+            HarvestDbPool::sharded(sp)
+        } else {
+            HarvestDbPool::from(resources.harvest_pool)
+        };
+        // Reject a misconfigured router-vs-pool pair before any I/O.
+        // `pool_for()` falls back to the default shard without warning, so a
+        // missing pool for shard N silently writes shard-N `ExecutionId`s into
+        // shard-0's database; those executions become permanently invisible
+        // once shard N is later added.  Fail loud at startup instead.
+        let mismatched = missing_router_shards(&shard_router, storage_pool.sharded_pool());
+        if !mismatched.is_empty() {
+            return Err(AutumnError::service_unavailable_msg(format!(
+                "ShardRouter references shards {mismatched:?} that have no pool entry in the \
+                 ShardedDbPool; every readable shard and the default shard must have an exact \
+                 pool entry to prevent silent cross-shard writes — check your \
+                 ShardedDbPool configuration"
+            )));
+        }
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
                 resources.app_pool,
-                resources.harvest_pool.clone(),
+                storage_pool.clone(),
                 shard_router.clone(),
             ));
         let dag_catalog = Arc::new(
@@ -133,6 +187,11 @@ impl PreparedHarvestRuntime {
         if let Some(ceiling) = max_workflow_history_events {
             worker_runtime_config.max_workflow_history_events = Some(ceiling);
         }
+        // Point the worker at the same resolved sharded pool so it claims from
+        // every assigned shard (issue #522). `storage_pool` already honours the
+        // resources/WorkerConfig precedence above, so this never narrows a
+        // configured `WorkerConfig::with_sharded_pool` to a single shard.
+        worker_runtime_config.sharded_pool = Some(storage_pool.sharded_pool().clone());
 
         Ok(Self {
             registry: Arc::new(registry),
@@ -140,7 +199,7 @@ impl PreparedHarvestRuntime {
             registered_dag_names,
             workflow_schedules,
             worker_runtime_config,
-            storage_pool: HarvestDbPool::from(resources.harvest_pool),
+            storage_pool,
             shard_router,
             retention_config,
             history_archiver,
@@ -259,13 +318,25 @@ impl HarvestRunner {
         }
 
         let worker = if config.worker_enabled {
-            Some(Arc::new(
-                Worker::new(
-                    prepared.worker_runtime_config.clone(),
-                    Arc::clone(&registry),
-                )
-                .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
-            ))
+            let worker = Worker::new(
+                prepared.worker_runtime_config.clone(),
+                Arc::clone(&registry),
+            )
+            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+            // Fail the process at startup if any assigned shard is missing from
+            // the sharded pool (issue #522 review). The same condition is
+            // re-checked inside `Worker::run`, but that only aborts the spawned
+            // task — startup would otherwise return Ok and keep serving the API
+            // and scheduler with no local worker, leaving the assigned shards'
+            // work unclaimed behind a coverage view that still advertises them.
+            let missing = worker.missing_assigned_shard_pools();
+            if !missing.is_empty() {
+                return Err(AutumnError::service_unavailable_msg(format!(
+                    "worker is enabled but shard_assignments {missing:?} are missing from the \
+                     sharded_pool; refusing to start — check your ShardedDbPool configuration"
+                )));
+            }
+            Some(Arc::new(worker))
         } else {
             None
         };
@@ -402,10 +473,31 @@ impl HarvestRunner {
     }
 }
 
+/// Returns shard IDs referenced by `router` that have no exact pool entry in
+/// `pool`.  An empty result means the router and pool are fully consistent.
+///
+/// `ShardedDbPool::pool_for` silently falls back to the default shard when a
+/// configured shard lacks a pool entry; if the caller never checks this gap,
+/// shard-N `ExecutionId`s are written into shard-0's database and become
+/// permanently invisible after shard N is provisioned later.  Call this at
+/// startup and fail if the result is non-empty.
+fn missing_router_shards(router: &ShardRouter, pool: &ShardedDbPool) -> Vec<ShardId> {
+    let mut missing: Vec<ShardId> = router
+        .readable_shards()
+        .iter()
+        .copied()
+        .chain(std::iter::once(router.default_shard()))
+        .filter(|&shard| pool.exact_pool_for(shard).is_none())
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    missing
+}
+
 pub(crate) fn injected_runtime_state(
     pool_state: Option<AppState>,
     app_pool: Option<DbPool>,
-    harvest_pool: DbPool,
+    harvest_pool: HarvestDbPool,
     shard_router: ShardRouter,
 ) -> SharedStateMap {
     let mut state: HashMap<TypeId, Box<dyn Any + Send + Sync>> = HashMap::new();
@@ -418,12 +510,12 @@ pub(crate) fn injected_runtime_state(
             Box::new(AppDbPool::from(app_pool)),
         );
     }
-    let harvest_pool = HarvestDbPool::from(harvest_pool);
-    state.insert(
-        TypeId::of::<HarvestDbPool>(),
-        Box::new(harvest_pool.clone()),
-    );
+    // Inject the same (possibly sharded) HarvestDbPool the worker storage uses
+    // so a handler calling `pool_for_execution` routes to the owning shard.
+    // The legacy raw `DbPool` slot stays the default shard for shard-unaware
+    // handlers (issue #522).
     state.insert(TypeId::of::<DbPool>(), Box::new(harvest_pool.clone_inner()));
+    state.insert(TypeId::of::<HarvestDbPool>(), Box::new(harvest_pool));
     state.insert(TypeId::of::<ShardRouter>(), Box::new(shard_router));
     state
 }

@@ -196,6 +196,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             labels: std::collections::HashMap::new(),
             queue_weights: std::collections::HashMap::new(),
             max_workflow_history_events: None,
+            shard_notification_database_urls: Vec::new(),
             sharded_pool: None,
         },
         registry,

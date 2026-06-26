@@ -80,6 +80,9 @@ pub struct WorkerRuntimeConfig {
     pub queue_weights: std::collections::HashMap<String, u32>,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
+    /// Optional per-shard LISTEN/NOTIFY database URLs for multi-shard workers
+    /// (issue #522). Shards absent from this list fall back to polling.
+    pub shard_notification_database_urls: Vec<(crate::types::ShardId, String)>,
     /// Maximum concurrent workflow task executions.
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity task executions.
@@ -182,6 +185,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             queues: cfg.queues,
             queue_weights: cfg.queue_weights,
             notification_database_url: cfg.notification_database_url,
+            shard_notification_database_urls: cfg.shard_notification_database_urls,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
             max_concurrent_activities: cfg.max_concurrent_activities,
             poll_interval: Duration::from_millis(500),
@@ -258,6 +262,33 @@ impl HandlerRegistry {
     #[must_use]
     pub fn new(workflows: Vec<WorkflowInfo>, activities: Vec<ActivityInfo>) -> Self {
         Self::with_state(workflows, activities, empty_shared_state())
+    }
+
+    /// Build a map of `activity_name` → `required_capabilities` JSON for every
+    /// registered activity that declares `requires`.
+    ///
+    /// Mirrors the per-row `required_capabilities` snapshot. Used by the
+    /// stranded-work sampler and the shard-health coverage gate
+    /// ([`crate::queue::apply_activity_requirements`]) to resolve eligibility for
+    /// activity rows whose queue row left `required_capabilities` NULL even
+    /// though the activity has requirements — the same fallback `claim_task`
+    /// applies via its ineligible-activities gate. Unparseable requirement
+    /// strings are skipped.
+    #[must_use]
+    pub fn activity_requirements_json(&self) -> HashMap<String, serde_json::Value> {
+        let mut map = HashMap::new();
+        for activity in self.activities.values() {
+            let Some(requires) = activity.requires else {
+                continue;
+            };
+            let Ok(reqs) = crate::eligibility::parse_requirements(requires) else {
+                continue;
+            };
+            if let Ok(value) = serde_json::to_value(&reqs) {
+                map.insert(activity.name.to_string(), value);
+            }
+        }
+        map
     }
 
     /// Create a new registry with shared typed state.
@@ -6907,7 +6938,12 @@ async fn process_task(
 /// Stops when the cancellation token fires. Queues with zero pending rows are
 /// also reported (as depth 0) so gauges reset cleanly after drains.
 fn spawn_queue_depth_sampler(
-    pool: DbPool,
+    // One pool per shard to aggregate over. Single-shard deployments pass a
+    // one-element vec; multi-shard workers pass every shard in the ShardedDbPool
+    // so the gauges reflect fleet-wide backlog rather than the default shard only
+    // (issue #522 review). Every worker aggregates the same full set, so all
+    // workers emit a consistent `harvest.queue.depth{queue}` value.
+    pools: Vec<DbPool>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     queues: Vec<String>,
@@ -6926,61 +6962,78 @@ fn spawn_queue_depth_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "queue depth sampler could not acquire DB connection"
-                    );
-                    continue;
-                }
-            };
-
-            match queue::queue_depths(&mut conn, &queues).await {
-                Ok(depths) => {
-                    let mut observed: HashSet<&str> = HashSet::new();
-                    for (queue_name, depth) in &depths {
-                        observed.insert(queue_name.as_str());
-                        telemetry
-                            .metrics
-                            .record_queue_depth(queue_name, u64::try_from(*depth).unwrap_or(0));
+            // Aggregate across every shard: depth is summed (total backlog),
+            // oldest-pending-age is the max (the single oldest task fleet-wide).
+            let mut depth_by_queue: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            let mut age_by_queue: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+            // Track whether any shard read failed this tick. A partial aggregate
+            // is misleading (a down shard looks like zero backlog) and zero-
+            // filling on a total outage would clear the gauges and silence
+            // autoscaling/alerts, so on ANY failure we skip the emit entirely and
+            // let the gauges hold their last value — matching the pre-aggregation
+            // single-pool path that skipped the sample on read failure (#522).
+            let mut read_failed = false;
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "queue depth sampler could not acquire DB connection"
+                        );
+                        read_failed = true;
+                        continue;
                     }
-                    for queue_name in &queues {
-                        if !observed.contains(queue_name.as_str()) {
-                            telemetry.metrics.record_queue_depth(queue_name, 0);
+                };
+                match queue::queue_depths(&mut conn, &queues).await {
+                    Ok(depths) => {
+                        for (queue_name, depth) in depths {
+                            *depth_by_queue.entry(queue_name).or_insert(0) += depth;
                         }
                     }
+                    Err(error) => {
+                        tracing::debug!(error = %error, "queue depth sample failed");
+                        read_failed = true;
+                    }
                 }
-                Err(error) => {
-                    tracing::debug!(error = %error, "queue depth sample failed");
+                match queue::oldest_pending_ages(&mut conn, &queues, &circuit_breaker_activities)
+                    .await
+                {
+                    Ok(ages) => {
+                        for (queue_name, age_secs) in ages {
+                            let slot = age_by_queue.entry(queue_name).or_insert(0.0);
+                            *slot = slot.max(age_secs);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(error = %error, "oldest pending age sample failed");
+                        read_failed = true;
+                    }
                 }
             }
 
-            // Sample oldest-pending-age gauge alongside queue depth.
-            match queue::oldest_pending_ages(&mut conn, &queues, &circuit_breaker_activities).await
-            {
-                Ok(ages) => {
-                    let mut observed: HashSet<&str> = HashSet::new();
-                    for (queue_name, age_secs) in &ages {
-                        observed.insert(queue_name.as_str());
-                        telemetry
-                            .metrics
-                            .record_queue_oldest_pending_age(queue_name, *age_secs);
-                    }
-                    // Reset queues with no eligible tasks to 0 so stale gauge
-                    // values do not linger after a queue drains.
-                    for queue_name in &queues {
-                        if !observed.contains(queue_name.as_str()) {
-                            telemetry
-                                .metrics
-                                .record_queue_oldest_pending_age(queue_name, 0.0);
-                        }
-                    }
+            if read_failed {
+                // Skip this tick rather than publish a partial/zeroed aggregate.
+                if cancel.is_cancelled() {
+                    break;
                 }
-                Err(error) => {
-                    tracing::debug!(error = %error, "oldest pending age sample failed");
-                }
+                continue;
+            }
+
+            // Emit the aggregated gauges, zero-filling configured queues with no
+            // rows so stale values do not linger after a queue drains. The depth
+            // and age queries are scoped to `queues`, so no other queue appears.
+            for queue_name in &queues {
+                let depth = depth_by_queue.get(queue_name).copied().unwrap_or(0);
+                telemetry
+                    .metrics
+                    .record_queue_depth(queue_name, u64::try_from(depth).unwrap_or(0));
+                let age = age_by_queue.get(queue_name).copied().unwrap_or(0.0);
+                telemetry
+                    .metrics
+                    .record_queue_oldest_pending_age(queue_name, age);
             }
 
             if cancel.is_cancelled() {
@@ -6997,7 +7050,8 @@ fn spawn_queue_depth_sampler(
 ///  - `record_concurrency_key_in_flight` with the current RUNNING count
 ///  - A `DEBUG` trace if any tasks are pending while the cap is saturated
 fn spawn_concurrency_sampler(
-    pool: DbPool,
+    // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
+    pools: Vec<DbPool>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     queues: Vec<String>,
@@ -7010,48 +7064,75 @@ fn spawn_concurrency_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "concurrency sampler could not acquire DB connection"
-                    );
-                    continue;
-                }
-            };
-
-            match queue::concurrency_key_stats(&mut conn, &queues).await {
-                Ok(stats) => {
-                    for stat in &stats {
-                        // The stats are grouped by (key, task_type) so workflow
-                        // and activity budgets for the same key don't collide on
-                        // the same metric label.
-                        let metric_key = format!("{}:{}", stat.key, stat.task_type);
-                        telemetry.metrics.record_concurrency_key_in_flight(
-                            &metric_key,
-                            u64::try_from(stat.in_flight).unwrap_or(0),
+            // Concurrency caps are per-shard (issue #247), so the same key can be
+            // active on several shards. Aggregate in-flight and deferred counts
+            // across shards per (key, task_type) for a fleet-wide view; the
+            // per-shard saturation debug log still fires per shard below.
+            let mut in_flight_by_key: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            let mut deferred_by_key: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            // Skip the whole tick on any shard read failure so a partial aggregate
+            // doesn't under-report concurrency during a storage outage (#522).
+            let mut read_failed = false;
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "concurrency sampler could not acquire DB connection"
                         );
-                        let saturated = stat.in_flight >= i64::from(stat.max_concurrent);
-                        if saturated && stat.pending > 0 {
-                            tracing::debug!(
-                                concurrency_key = %stat.key,
-                                task_type = %stat.task_type,
-                                in_flight = stat.in_flight,
-                                max_concurrent = stat.max_concurrent,
-                                deferred = stat.pending,
-                                "concurrency cap saturated; pending tasks deferred until a slot frees"
-                            );
-                            telemetry.metrics.record_concurrency_key_deferred(
-                                &metric_key,
-                                u64::try_from(stat.pending).unwrap_or(0),
-                            );
+                        read_failed = true;
+                        continue;
+                    }
+                };
+                match queue::concurrency_key_stats(&mut conn, &queues).await {
+                    Ok(stats) => {
+                        for stat in &stats {
+                            // Grouped by (key, task_type) so workflow and activity
+                            // budgets for the same key don't collide on the label.
+                            let metric_key = format!("{}:{}", stat.key, stat.task_type);
+                            *in_flight_by_key.entry(metric_key.clone()).or_insert(0) +=
+                                u64::try_from(stat.in_flight).unwrap_or(0);
+                            let saturated = stat.in_flight >= i64::from(stat.max_concurrent);
+                            if saturated && stat.pending > 0 {
+                                tracing::debug!(
+                                    concurrency_key = %stat.key,
+                                    task_type = %stat.task_type,
+                                    in_flight = stat.in_flight,
+                                    max_concurrent = stat.max_concurrent,
+                                    deferred = stat.pending,
+                                    "concurrency cap saturated; pending tasks deferred until a slot frees"
+                                );
+                                *deferred_by_key.entry(metric_key).or_insert(0) +=
+                                    u64::try_from(stat.pending).unwrap_or(0);
+                            }
                         }
                     }
+                    Err(error) => {
+                        tracing::debug!(error = %error, "concurrency key stats sample failed");
+                        read_failed = true;
+                    }
                 }
-                Err(error) => {
-                    tracing::debug!(error = %error, "concurrency key stats sample failed");
+            }
+
+            if read_failed {
+                if cancel.is_cancelled() {
+                    break;
                 }
+                continue;
+            }
+
+            for (metric_key, in_flight) in &in_flight_by_key {
+                telemetry
+                    .metrics
+                    .record_concurrency_key_in_flight(metric_key, *in_flight);
+            }
+            for (metric_key, deferred) in &deferred_by_key {
+                telemetry
+                    .metrics
+                    .record_concurrency_key_deferred(metric_key, *deferred);
             }
 
             if cancel.is_cancelled() {
@@ -7066,7 +7147,8 @@ fn spawn_concurrency_sampler(
 ///
 /// Stops when the cancellation token fires.
 fn spawn_rate_limit_sampler(
-    pool: DbPool,
+    // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
+    pools: Vec<DbPool>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
@@ -7088,42 +7170,72 @@ fn spawn_rate_limit_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "rate limit sampler could not acquire DB connection"
-                    );
-                    continue;
-                }
-            };
-
-            let result: Result<Vec<BucketRow>, _> = diesel::sql_query(
-                "SELECT \
-                     key, \
-                     refill_rate, \
-                     LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) AS estimated_tokens \
-                 FROM harvest_rate_limit_buckets"
-            )
-            .load(&mut conn)
-            .await;
-
-            match result {
-                Ok(buckets) => {
-                    for bucket in buckets {
-                        telemetry.metrics.record_rate_limit_tokens_available(
-                            &bucket.key,
-                            bucket.estimated_tokens,
+            // Rate-limit buckets are per-shard. Aggregate per key across shards:
+            // available tokens are summed (total budget fleet-wide) and the
+            // refill rate is the max (it is configured identically per shard, so
+            // max == any present value).
+            let mut tokens_by_key: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+            let mut refill_by_key: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+            // Skip the whole tick on any shard read failure so a partial aggregate
+            // doesn't under-report available tokens during a storage outage (#522).
+            let mut read_failed = false;
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "rate limit sampler could not acquire DB connection"
                         );
-                        telemetry
-                            .metrics
-                            .record_rate_limit_refill_rate(&bucket.key, bucket.refill_rate);
+                        read_failed = true;
+                        continue;
+                    }
+                };
+
+                let result: Result<Vec<BucketRow>, _> = diesel::sql_query(
+                    "SELECT \
+                         key, \
+                         refill_rate, \
+                         LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) AS estimated_tokens \
+                     FROM harvest_rate_limit_buckets"
+                )
+                .load(&mut conn)
+                .await;
+
+                match result {
+                    Ok(buckets) => {
+                        for bucket in buckets {
+                            *tokens_by_key.entry(bucket.key.clone()).or_insert(0.0) +=
+                                bucket.estimated_tokens;
+                            let slot = refill_by_key.entry(bucket.key).or_insert(0.0);
+                            *slot = slot.max(bucket.refill_rate);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(error = %error, "rate limit sampler query failed");
+                        read_failed = true;
                     }
                 }
-                Err(error) => {
-                    tracing::debug!(error = %error, "rate limit sampler query failed");
+            }
+
+            if read_failed {
+                if cancel.is_cancelled() {
+                    break;
                 }
+                continue;
+            }
+
+            for (key, tokens) in &tokens_by_key {
+                telemetry
+                    .metrics
+                    .record_rate_limit_tokens_available(key, *tokens);
+            }
+            for (key, refill_rate) in &refill_by_key {
+                telemetry
+                    .metrics
+                    .record_rate_limit_refill_rate(key, *refill_rate);
             }
 
             if cancel.is_cancelled() {
@@ -7185,6 +7297,192 @@ fn spawn_dlq_depth_sampler(
     })
 }
 
+/// Spawn the stranded-work sampler (issue #522).
+///
+/// Iterates every shard visible through the pool (not just the shards this
+/// worker is assigned to) so that a writable shard with queued work and no
+/// covering worker is caught even when this worker is not assigned to it.
+///
+/// Per-queue coverage: for each shard the sampler loads the per-queue claimable
+/// pending counts, then checks which of those queues have at least one healthy
+/// active worker assigned to the shard. Tasks on queues with no such worker are
+/// counted as stranded and emitted via `harvest.shard.stranded_pending`.
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
+fn spawn_stranded_work_sampler(
+    sharded_pool: crate::shard::ShardedDbPool,
+    freshness_window: Duration,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+    // Static set of activity names with a circuit-breaker policy; these skip the
+    // rate-limit gate at claim, so they stay claimable with an empty bucket.
+    circuit_breaker_activities: Vec<String>,
+    // Map of activity_name → required_capabilities JSON for activities that
+    // declare `requires`; back-fills the eligibility gate for un-snapshotted rows.
+    activity_requirements: std::collections::HashMap<String, serde_json::Value>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            // Iterate ALL shards so unassigned writable shards with stranded
+            // work are surfaced, not just the shards this worker covers.
+            for (shard_id, shard_pool) in sharded_pool.iter_shards() {
+                let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
+
+                // Claimable pending demands for this shard, grouped by
+                // (queue, required_capabilities, ...) so coverage can honour the
+                // same eligibility claim_task enforces (issue #522 review).
+                let mut demands: Vec<crate::queue::ClaimablePendingDemand> = {
+                    let mut conn = match shard_pool.get().await {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            tracing::debug!(
+                                shard_id = %shard_id.as_i32(),
+                                error = %error,
+                                "stranded-work sampler could not acquire DB connection"
+                            );
+                            continue;
+                        }
+                    };
+                    match crate::queue::claimable_pending_demand_by_queue(
+                        &mut conn,
+                        &circuit_breaker_activities,
+                    )
+                    .await
+                    {
+                        Ok(demands) => demands,
+                        Err(error) => {
+                            tracing::debug!(
+                                shard_id = %shard_id.as_i32(),
+                                error = %error,
+                                "stranded-work count query failed"
+                            );
+                            continue;
+                        }
+                    }
+                };
+
+                // Back-fill effective requirements for activity rows that didn't
+                // snapshot required_capabilities (legacy/manual enqueues), so the
+                // coverage check below applies the same activity eligibility
+                // claim_task's $6 gate enforces.
+                crate::queue::apply_activity_requirements(&mut demands, &activity_requirements);
+
+                if demands.is_empty() {
+                    // No claimable work — emit 0 so the gauge resets cleanly.
+                    telemetry
+                        .metrics
+                        .record_shard_stranded_pending(shard_u16, 0);
+                    continue;
+                }
+
+                // Healthy active workers assigned to this shard. Kept whole (not
+                // collapsed to queue names) so the capability check below can see
+                // each worker's polled queues *and* labels.
+                let covering_workers: Vec<crate::workers::WorkerRow> = {
+                    let Ok(mut conn) = shard_pool.get().await else {
+                        continue;
+                    };
+                    let filters = crate::workers::WorkerFilters {
+                        status: Some(crate::workers::WorkerStatus::Active.as_str().to_string()),
+                        shard_id: Some(shard_id.as_i32()),
+                        health: Some(crate::workers::WorkerHealth::Healthy),
+                        limit: i64::MAX,
+                        ..Default::default()
+                    };
+                    match crate::workers::list_workers(&mut conn, &filters, freshness_window).await
+                    {
+                        Ok(workers) => workers,
+                        Err(error) => {
+                            tracing::debug!(
+                                error = %error,
+                                "worker list query failed for stranded-work sampler"
+                            );
+                            continue;
+                        }
+                    }
+                };
+
+                // Build compatibility set for this shard (issue #171 routing).
+                // Used to honour the same required_build_id eligibility
+                // claim_task enforces. On load failure fall back to an empty set
+                // (exact-match / legacy-worker rules still apply).
+                let compat_set = {
+                    let Ok(mut conn) = shard_pool.get().await else {
+                        continue;
+                    };
+                    crate::build_routing::load_compat_set(&mut conn)
+                        .await
+                        .unwrap_or_default()
+                };
+
+                // A demand is covered when some covering worker polls its queue
+                // AND satisfies its required_capabilities (the same Exact/In
+                // label match claim_task applies) AND is build-eligible for its
+                // required_build_id (the same exact/compatible/legacy rule) AND,
+                // when the row is held by an unexpired sticky lease, *is* that
+                // lease's owner (only it can claim until the lease expires). All
+                // constraints are checked against the *same* worker so a task
+                // needing several is not falsely covered by different workers
+                // each satisfying only one. No requirement ⇒ that dimension is
+                // trivially satisfied; unparseable capabilities fall back to the
+                // other dimensions so the sampler never fabricates a
+                // false-positive stranded signal.
+                let demand_covered = |demand: &crate::queue::ClaimablePendingDemand| -> bool {
+                    let reqs = demand.required_capabilities.as_ref().and_then(|caps| {
+                        serde_json::from_value::<Vec<crate::eligibility::Requirement>>(caps.clone())
+                            .ok()
+                    });
+                    covering_workers.iter().any(|w| {
+                        let polls_queue = w.worker.queues.as_array().is_some_and(|qs| {
+                            qs.iter()
+                                .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
+                        });
+                        if !polls_queue {
+                            return false;
+                        }
+                        if demand
+                            .sticky_owner
+                            .as_deref()
+                            .is_some_and(|owner| owner != w.worker.worker_id)
+                        {
+                            return false;
+                        }
+                        if !compat_set
+                            .is_eligible(&w.worker.build_id, demand.required_build_id.as_deref())
+                        {
+                            return false;
+                        }
+                        reqs.as_ref().is_none_or(|reqs| {
+                            let labels: std::collections::HashMap<String, String> =
+                                serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                            crate::eligibility::matches_requirements(reqs, &labels)
+                        })
+                    })
+                };
+
+                // Sum pending tasks across demands no covering worker can claim.
+                let stranded: u64 = demands
+                    .iter()
+                    .filter(|demand| !demand_covered(demand))
+                    .map(|demand| u64::try_from(demand.count).unwrap_or(0))
+                    .sum();
+                telemetry
+                    .metrics
+                    .record_shard_stranded_pending(shard_u16, stranded);
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
@@ -7209,6 +7507,13 @@ pub struct Worker {
     /// `drain_deadline_at` so that `drain_in_flight` can honour an extended
     /// window even after it has already started waiting.
     remote_drain_deadline: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Maximum `drain_deadline_at` value applied to `remote_drain_deadline` so far,
+    /// shared across the per-shard heartbeat tasks (issue #522 review). A multi-
+    /// shard worker runs one heartbeat per assigned shard, all sharing this value;
+    /// `sync_drain_deadline` rejects any observed deadline that is not strictly
+    /// greater than this maximum, preventing a lagging shard from reverting the
+    /// cell to a stale shorter value.
+    drain_deadline_max: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
     /// Per-worker in-process LRU cache for suspended workflow event histories.
     ///
     /// Populated after each suspension; consulted at the start of each workflow
@@ -7236,10 +7541,11 @@ struct WorkerMonitoringHandles {
     concurrency_sampler: tokio::task::JoinHandle<()>,
     rate_limit_sampler: tokio::task::JoinHandle<()>,
     dlq_depth_samplers: Vec<tokio::task::JoinHandle<()>>,
-    timeout_checker: tokio::task::JoinHandle<()>,
-    poison_pill_reclaimer: tokio::task::JoinHandle<()>,
-    pause_auto_resumer: tokio::task::JoinHandle<()>,
+    timeout_checkers: Vec<tokio::task::JoinHandle<()>>,
+    poison_pill_reclaimers: Vec<tokio::task::JoinHandle<()>>,
+    pause_auto_resumers: Vec<tokio::task::JoinHandle<()>>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
+    stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Spawn the bounded-pause auto-resume scanner (issue #383).
@@ -7300,7 +7606,8 @@ fn spawn_pause_auto_resumer(
 /// (e.g. via `ctx.should_continue_as_new()`) or by the operator (via the
 /// hard ceiling or manual continue-as-new).
 fn spawn_history_oversized_sampler(
-    pool: DbPool,
+    // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
+    pools: Vec<DbPool>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     soft_threshold: u64,
@@ -7314,37 +7621,63 @@ fn spawn_history_oversized_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "history oversized sampler could not acquire DB connection"
-                    );
-                    continue;
-                }
-            };
+            // Oversized RUNNING executions live on the shard that owns them, so
+            // sum the per-workflow counts across every shard for a fleet-wide
+            // gauge.
+            let mut count_by_workflow: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            // Skip the whole tick on any shard read failure so a partial aggregate
+            // (or the zero-fill below) doesn't clear the gauge during an outage
+            // (#522).
+            let mut read_failed = false;
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "history oversized sampler could not acquire DB connection"
+                        );
+                        read_failed = true;
+                        continue;
+                    }
+                };
 
-            match sample_history_oversized_counts(&mut conn, soft_threshold).await {
-                Ok(counts) => {
-                    let mut active_workflows = std::collections::HashSet::new();
-                    for (workflow_name, count) in &counts {
-                        telemetry
-                            .metrics
-                            .record_workflow_history_oversized(workflow_name, *count);
-                        active_workflows.insert(workflow_name.clone());
+                match sample_history_oversized_counts(&mut conn, soft_threshold).await {
+                    Ok(counts) => {
+                        for (workflow_name, count) in counts {
+                            *count_by_workflow.entry(workflow_name).or_insert(0) += count;
+                        }
                     }
-                    for workflow_name in reported_workflows.difference(&active_workflows) {
-                        telemetry
-                            .metrics
-                            .record_workflow_history_oversized(workflow_name, 0);
+                    Err(error) => {
+                        tracing::debug!(error = %error, "history oversized sample failed");
+                        read_failed = true;
                     }
-                    reported_workflows = active_workflows;
-                }
-                Err(error) => {
-                    tracing::debug!(error = %error, "history oversized sample failed");
                 }
             }
+
+            if read_failed {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                continue;
+            }
+
+            let active_workflows: std::collections::HashSet<String> =
+                count_by_workflow.keys().cloned().collect();
+            for (workflow_name, count) in &count_by_workflow {
+                telemetry
+                    .metrics
+                    .record_workflow_history_oversized(workflow_name, *count);
+            }
+            // Zero-fill workflows that were oversized last tick but no longer are
+            // so stale gauge values do not linger.
+            for workflow_name in reported_workflows.difference(&active_workflows) {
+                telemetry
+                    .metrics
+                    .record_workflow_history_oversized(workflow_name, 0);
+            }
+            reported_workflows = active_workflows;
 
             if cancel.is_cancelled() {
                 break;
@@ -7445,6 +7778,7 @@ impl Worker {
             activity_semaphore,
             shutdown: CancellationToken::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
+            drain_deadline_max: Arc::new(Mutex::new(None)),
             workflow_cache,
             workflow_task_timeout_strikes: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -7452,36 +7786,460 @@ impl Worker {
         })
     }
 
+    /// Return the assigned shards that have no exact pool entry in the
+    /// configured `sharded_pool`.
+    ///
+    /// A non-empty result is a `ShardedDbPool` misconfiguration: the worker
+    /// would advertise coverage (in its fleet row and shard-health view) for
+    /// shards it cannot actually poll or heartbeat, silently leaving their work
+    /// unclaimed. Callers should treat a non-empty result as a startup error and
+    /// refuse to run the process rather than partially serving the configured
+    /// set (issue #522 review).
+    ///
+    /// Always empty when there is no `sharded_pool` (the no-sharded-pool / non-db
+    /// paths map every assignment to the default pool, so nothing is missing).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn missing_assigned_shard_pools(&self) -> Vec<i32> {
+        self.config
+            .sharded_pool
+            .as_ref()
+            .map_or_else(Vec::new, |sharded| {
+                self.config
+                    .shard_assignments
+                    .iter()
+                    .filter(|shard| sharded.exact_pool_for(**shard).is_none())
+                    .map(|shard| shard.as_i32())
+                    .collect()
+            })
+    }
+
     /// Run the main poll loop until shutdown is requested.
     ///
     /// This is the worker's entry point. It keeps polling until shutdown is
     /// requested, checking the cancellation token between poll iterations.
+    ///
+    /// When the worker has a `sharded_pool` with more than one shard,
+    /// it drains all assigned shards via `run_poll_loop_multi` (issue #522).
+    /// Otherwise it falls through to the existing single-shard path
+    /// (`run_with_listener`) byte-for-byte unchanged.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(&self, pool: &DbPool) {
-        let listener = match self.config.notification_database_url.as_deref() {
-            Some(database_url) => {
-                match crate::notify::QueueListener::connect(database_url, &self.config.queues).await
-                {
-                    Ok(listener) => {
+        // Defense-in-depth: refuse to start if ANY assigned shard is missing an
+        // exact pool entry (issue #522 review). The authoritative check runs at
+        // process startup (`HarvestRunner::start`) and fails the process before
+        // this task is ever spawned; this guard remains so a direct `Worker::run`
+        // caller that bypasses the runner still fails closed rather than
+        // advertising coverage for shards it cannot serve.
+        #[cfg(feature = "db")]
+        {
+            let missing = self.missing_assigned_shard_pools();
+            if !missing.is_empty() {
+                tracing::error!(
+                    worker_id = %self.config.worker_id,
+                    missing_shards = ?missing,
+                    "one or more shard_assignments are missing from the sharded_pool; refusing to \
+                     start this worker rather than advertising coverage for shards it cannot \
+                     serve — check your ShardedDbPool configuration"
+                );
+                return;
+            }
+        }
+
+        // Resolve the set of (ShardId, DbPool) claim targets from the sharded
+        // pool when available, deduplicating by ShardId.
+        #[cfg(feature = "db")]
+        let shard_targets: Vec<(crate::types::ShardId, DbPool)> = {
+            self.config.sharded_pool.as_ref().map_or_else(
+                || {
+                    self.config
+                        .shard_assignments
+                        .iter()
+                        .map(|shard| (*shard, pool.clone()))
+                        .collect()
+                },
+                |sharded| {
+                    let mut seen = std::collections::HashSet::new();
+                    self.config
+                        .shard_assignments
+                        .iter()
+                        .filter(|shard| seen.insert(*shard))
+                        .map(|shard| {
+                            // Presence of an exact pool entry for every assigned
+                            // shard is guaranteed by the missing-shard guard at
+                            // run() entry, so this never falls back to the default
+                            // pool under the wrong shard label (issue #522 review).
+                            let shard_pool = sharded
+                                .exact_pool_for(*shard)
+                                .expect("assigned shard pool presence verified at run() entry")
+                                .clone();
+                            (*shard, shard_pool)
+                        })
+                        .collect()
+                },
+            )
+        };
+        #[cfg(not(feature = "db"))]
+        let shard_targets: Vec<(crate::types::ShardId, DbPool)> = self
+            .config
+            .shard_assignments
+            .iter()
+            .map(|shard| (*shard, pool.clone()))
+            .collect();
+
+        // More than one distinct shard target → multi-shard loop.
+        // One or zero targets (or single-pool fallback) → existing path.
+        #[cfg(feature = "db")]
+        let use_multi_shard = shard_targets.len() > 1
+            && self
+                .config
+                .sharded_pool
+                .as_ref()
+                .is_some_and(|sp| sp.shard_ids().len() > 1);
+        #[cfg(not(feature = "db"))]
+        let use_multi_shard = false;
+
+        if use_multi_shard {
+            self.run_multi_shard(shard_targets, pool).await;
+        } else {
+            // Single-shard fast path. When exactly one shard target resolved,
+            // claim from that shard's pool rather than the caller's default
+            // pool — in a one-process-per-shard deployment assigned to a
+            // non-default shard (e.g. shard_assignments = [1]) those differ,
+            // and using the default pool would strand the assigned shard's
+            // work. With no assignment, fall back to the default pool (legacy
+            // behavior, byte-for-byte unchanged).
+            // Match on the slice rather than calling `.first()`: the diesel
+            // prelude's query-DSL traits are in scope, and probing `.first()`
+            // on the Vec sends the trait solver into overflow (E0275).
+            let claim_pool = match shard_targets.as_slice() {
+                [(_, shard_pool), ..] => shard_pool,
+                [] => pool,
+            };
+            // Listen on the database we actually poll. For a one-process-per-
+            // shard deployment assigned to a non-default shard, the global
+            // `notification_database_url` may point at a different shard, so a
+            // NOTIFY fired on the polled shard would never wake this worker
+            // (issue #522). Prefer this shard's entry in
+            // `shard_notification_database_urls`.
+            //
+            // The global URL pairs with the default pool, so it is a safe
+            // fallback only when the claim pool *is* that default pool: no
+            // `ShardedDbPool` at all, or the resolved shard is the pool's
+            // `default_shard()` (or is absent from the map, so `pool_for` falls
+            // back to the default pool the global URL targets). A single-shard
+            // wrapper — the shape every legacy single-shard deployment uses —
+            // therefore keeps its global LISTEN. With real multi-shard routing
+            // the resolved pool is shard-specific and the global URL may point
+            // at a different database; a NOTIFY there would never wake this
+            // worker, so an absent per-shard URL means poll-only for this shard
+            // rather than risking a wrong-database listener (issue #522 review).
+            #[cfg(feature = "db")]
+            let global_safe = match (shard_targets.as_slice(), self.config.sharded_pool.as_ref()) {
+                ([(shard, _), ..], Some(sp)) => {
+                    *shard == sp.default_shard() || sp.exact_pool_for(*shard).is_none()
+                }
+                // No sharded pool, or no resolved shard: the claim pool is
+                // the default pool the global URL targets.
+                _ => true,
+            };
+            #[cfg(not(feature = "db"))]
+            let global_safe = true;
+            let listener_url: Option<&str> = match shard_targets.as_slice() {
+                [(shard_id, _), ..] => {
+                    let per_shard = self
+                        .config
+                        .shard_notification_database_urls
+                        .iter()
+                        .find(|(s, _)| s == shard_id)
+                        .map(|(_, url)| url.as_str());
+                    per_shard.or_else(|| {
+                        global_safe
+                            .then_some(self.config.notification_database_url.as_deref())
+                            .flatten()
+                    })
+                }
+                [] => self.config.notification_database_url.as_deref(),
+            };
+            let listener = match listener_url {
+                Some(database_url) => {
+                    match crate::notify::QueueListener::connect(database_url, &self.config.queues)
+                        .await
+                    {
+                        Ok(listener) => {
+                            tracing::info!(
+                                worker_id = %self.config.worker_id,
+                                queues = ?listener.queues(),
+                                "worker LISTEN/NOTIFY listener connected"
+                            );
+                            Some(listener)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                error = %error,
+                                "failed to start LISTEN/NOTIFY listener; falling back to polling"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            self.run_with_listener(claim_pool, listener).await;
+        }
+    }
+
+    /// Multi-shard entry point (issue #522).
+    ///
+    /// Called by `run` when two or more distinct shard pools are active. Each
+    /// shard gets its own optional LISTEN/NOTIFY listener (from
+    /// `shard_notification_database_urls`), and the poll loop calls
+    /// `poll_once(shard_pool)` per shard so that per-shard ACID locality is
+    /// preserved for free — `dispatch_task` already clones whatever pool it
+    /// receives into the spawned task.
+    ///
+    /// Fleet presence (register + heartbeat + status) is written to **each**
+    /// assigned shard's pool so that the shard-health readiness gate (Slice B)
+    /// can see a covering live worker per shard.
+    async fn run_multi_shard(
+        &self,
+        shard_targets: Vec<(crate::types::ShardId, DbPool)>,
+        default_pool: &DbPool,
+    ) {
+        tracing::info!(
+            worker_id = %self.config.worker_id,
+            queues = ?self.config.queues,
+            shards = ?shard_targets.iter().map(|(s, _)| s.as_i32()).collect::<Vec<_>>(),
+            "worker starting (multi-shard)"
+        );
+
+        // Register + rate-limit buckets on every shard pool.
+        for (_, shard_pool) in &shard_targets {
+            self.register_in_fleet(shard_pool).await;
+            self.register_rate_limit_buckets(shard_pool).await;
+        }
+
+        // Monitoring tasks use the default pool for non-shard-specific monitors;
+        // the stranded-work sampler (added in spawn_monitoring_tasks) uses the
+        // full ShardedDbPool so it observes every shard.
+        let monitors = self.spawn_monitoring_tasks(default_pool);
+        let heartbeat_cancel = CancellationToken::new();
+
+        // Spawn one heartbeat task per shard pool so every shard's harvest_workers
+        // table reflects this worker.
+        let heartbeat_handles: Vec<_> = shard_targets
+            .iter()
+            .map(|(_, shard_pool)| self.spawn_heartbeat_task(shard_pool, heartbeat_cancel.clone()))
+            .collect();
+
+        // Build per-shard listeners from shard_notification_database_urls.
+        let mut shard_listeners: Vec<Option<crate::notify::QueueListener>> = Vec::new();
+        for (shard_id, _) in &shard_targets {
+            let listener_url = self
+                .config
+                .shard_notification_database_urls
+                .iter()
+                .find(|(s, _)| s == shard_id)
+                .map(|(_, url)| url.as_str());
+            let listener = if let Some(url) = listener_url {
+                match crate::notify::QueueListener::connect(url, &self.config.queues).await {
+                    Ok(l) => {
                         tracing::info!(
                             worker_id = %self.config.worker_id,
-                            queues = ?listener.queues(),
-                            "worker LISTEN/NOTIFY listener connected"
+                            shard_id = %shard_id.as_i32(),
+                            "per-shard LISTEN/NOTIFY listener connected"
                         );
-                        Some(listener)
+                        Some(l)
                     }
                     Err(error) => {
                         tracing::warn!(
                             worker_id = %self.config.worker_id,
+                            shard_id = %shard_id.as_i32(),
                             error = %error,
-                            "failed to start LISTEN/NOTIFY listener; falling back to polling"
+                            "per-shard LISTEN/NOTIFY failed; shard will fall back to polling"
                         );
                         None
                     }
                 }
+            } else {
+                None
+            };
+            shard_listeners.push(listener);
+        }
+
+        self.run_poll_loop_multi(shard_targets.clone(), shard_listeners)
+            .await;
+
+        tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
+
+        // Draining: transition status on every shard pool.
+        for (_, shard_pool) in &shard_targets {
+            self.transition_fleet_status(shard_pool, crate::workers::WorkerStatus::Draining)
+                .await;
+        }
+
+        tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks (multi-shard)");
+        self.drain_in_flight().await;
+
+        // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
+        for (_, shard_pool) in &shard_targets {
+            self.transition_fleet_status(shard_pool, crate::workers::WorkerStatus::Stopped)
+                .await;
+        }
+        heartbeat_cancel.cancel();
+
+        for handle in heartbeat_handles {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "worker heartbeat task failed during multi-shard shutdown"
+                );
             }
-            None => None,
-        };
-        self.run_with_listener(pool, listener).await;
+        }
+        // Reuse the cleanup path for the monitoring tasks.
+        self.shutdown_and_cleanup_monitors(monitors).await;
+
+        tracing::info!(worker_id = %self.config.worker_id, "worker stopped (multi-shard)");
+    }
+
+    /// Multi-shard poll loop (issue #522).
+    ///
+    /// Each iteration tries every shard in order. The first shard that yields
+    /// a task causes an immediate `continue` so we stay hot when there is work
+    /// anywhere. When all shards are idle we `tokio::select!` across all
+    /// per-shard listeners (falling back to a `poll_interval` sleep for shards
+    /// without a listener) before the next full scan.
+    async fn run_poll_loop_multi(
+        &self,
+        shard_targets: Vec<(crate::types::ShardId, DbPool)>,
+        mut shard_listeners: Vec<Option<crate::notify::QueueListener>>,
+    ) {
+        let n = shard_targets.len();
+        // Rotating start index prevents the first shard from being permanently
+        // favoured when multiple shards have work (fix #4).
+        let mut start_idx = 0usize;
+
+        while !self.shutdown.is_cancelled() {
+            let mut any_claimed = false;
+            for i in 0..n {
+                let idx = (start_idx + i) % n;
+                if self.poll_once(&shard_targets[idx].1).await {
+                    any_claimed = true;
+                    // Advance start past the shard that just claimed so the
+                    // next hot iteration tries the next shard first.
+                    start_idx = (idx + 1) % n;
+                    break;
+                }
+            }
+            if any_claimed {
+                continue;
+            }
+            // All idle — rotate start so the next iteration begins at the next
+            // shard in round-robin order regardless of which fired a NOTIFY.
+            start_idx = (start_idx + 1) % n;
+
+            // All shards idle — poll all per-shard listeners in round-robin
+            // with a short per-listener timeout (fix #6). Notifications are
+            // buffered in each listener's channel so no wake-up is lost.
+            // Sequential round-robin avoids borrow-checker issues with
+            // select_all over &mut references while still letting any listener
+            // wake the loop.
+            let poll_interval = self.config.poll_interval;
+            let shutdown = &self.shutdown;
+
+            if shard_listeners.iter().all(Option::is_none) {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(poll_interval) => {}
+                }
+            } else {
+                // Poll each listener with a short cap; overall timeout = poll_interval.
+                let per_check = Duration::from_millis(10).min(poll_interval);
+                let deadline = tokio::time::Instant::now() + poll_interval;
+                let mut notified = false;
+
+                'notify_wait: while tokio::time::Instant::now() < deadline
+                    && !shutdown.is_cancelled()
+                {
+                    let mut broken_idx: Option<usize> = None;
+                    for (i, slot) in shard_listeners.iter_mut().enumerate() {
+                        if let Some(listener) = slot.as_mut() {
+                            match listener.wait_for_notification(per_check).await {
+                                Ok(Some(_)) => {
+                                    notified = true;
+                                    break 'notify_wait;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(
+                                        worker_id = %self.config.worker_id,
+                                        shard_idx = i,
+                                        error = %error,
+                                        "LISTEN/NOTIFY wait failed for shard; removing listener"
+                                    );
+                                    broken_idx = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(i) = broken_idx {
+                        shard_listeners[i] = None;
+                        // All listeners gone: nothing left to await in this loop,
+                        // so bail out instead of busy-spinning until the deadline.
+                        if shard_listeners.iter().all(Option::is_none) {
+                            break 'notify_wait;
+                        }
+                    }
+                }
+                if notified {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+
+    /// Clean up monitoring task handles (extracted for the multi-shard path).
+    async fn shutdown_and_cleanup_monitors(&self, monitors: WorkerMonitoringHandles) {
+        for handle in monitors.timeout_checkers {
+            if let Err(error) = handle.await {
+                tracing::warn!(error = %error, "timeout checker failed during shutdown");
+            }
+        }
+        for handle in monitors.poison_pill_reclaimers {
+            if let Err(error) = handle.await {
+                tracing::warn!(error = %error, "poison-pill reclaimer failed during shutdown");
+            }
+        }
+        for handle in monitors.pause_auto_resumers {
+            if let Err(error) = handle.await {
+                tracing::warn!(error = %error, "pause auto-resumer failed during shutdown");
+            }
+        }
+        if let Err(error) = monitors.queue_depth_sampler.await {
+            tracing::warn!(error = %error, "queue depth sampler failed during shutdown");
+        }
+        if let Err(error) = monitors.concurrency_sampler.await {
+            tracing::warn!(error = %error, "concurrency sampler failed during shutdown");
+        }
+        if let Err(error) = monitors.rate_limit_sampler.await {
+            tracing::warn!(error = %error, "rate limit sampler failed during shutdown");
+        }
+        for sampler in monitors.dlq_depth_samplers {
+            if let Err(error) = sampler.await {
+                tracing::warn!(error = %error, "dlq depth sampler failed during shutdown");
+            }
+        }
+        if let Err(error) = monitors.history_oversized_sampler.await {
+            tracing::warn!(error = %error, "history oversized sampler failed during shutdown");
+        }
+        if let Some(handle) = monitors.stranded_work_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(error = %error, "stranded-work sampler failed during shutdown");
+        }
     }
 
     /// Run the worker loop using a pre-connected optional listener.
@@ -7532,8 +8290,23 @@ impl Worker {
 
     #[allow(clippy::too_many_lines)]
     fn spawn_monitoring_tasks(&self, pool: &DbPool) -> WorkerMonitoringHandles {
+        // Pools the queue-depth/age, concurrency, rate-limit, and history-
+        // oversized samplers aggregate over (issue #522 review). When a
+        // ShardedDbPool is configured, sample every shard so these fleet-wide
+        // gauges reflect non-default-shard backlog/throttling rather than only
+        // the default shard; otherwise use the single default pool (legacy,
+        // byte-for-byte unchanged). All workers aggregate the same full set, so
+        // the gauges stay consistent across the fleet.
+        #[cfg(feature = "db")]
+        let sampler_pools: Vec<DbPool> = self.config.sharded_pool.as_ref().map_or_else(
+            || vec![pool.clone()],
+            |sp| sp.iter_shards().map(|(_, p)| p.clone()).collect(),
+        );
+        #[cfg(not(feature = "db"))]
+        let sampler_pools: Vec<DbPool> = vec![pool.clone()];
+
         let queue_depth_sampler = spawn_queue_depth_sampler(
-            pool.clone(),
+            sampler_pools.clone(),
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.config.queues.clone(),
@@ -7544,7 +8317,7 @@ impl Worker {
                 .to_vec(),
         );
         let concurrency_sampler = spawn_concurrency_sampler(
-            pool.clone(),
+            sampler_pools.clone(),
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.config.queues.clone(),
@@ -7553,10 +8326,11 @@ impl Worker {
         // DLQ depth gauge — one sampler per shard assignment so every shard
         // this worker owns is reported.  Single-shard deployments get one
         // sampler for shard 0; multi-shard workers (rare) get one per entry.
+        // Each sampler uses the per-shard pool when a ShardedDbPool is available
+        // so it queries the correct database (fix #5).
         let dlq_depth_samplers: Vec<_> = {
             let assignments = &self.config.shard_assignments;
             let shards: &[_] = if assignments.is_empty() {
-                // Fallback: if no explicit assignments, sample with shard 0.
                 &[]
             } else {
                 assignments.as_slice()
@@ -7565,8 +8339,16 @@ impl Worker {
                 .iter()
                 .map(|shard| {
                     let shard_id = u16::try_from(shard.as_i32()).unwrap_or(0);
+                    #[cfg(feature = "db")]
+                    let shard_pool = self
+                        .config
+                        .sharded_pool
+                        .as_ref()
+                        .map_or_else(|| pool.clone(), |sp| sp.pool_for(*shard).clone());
+                    #[cfg(not(feature = "db"))]
+                    let shard_pool = pool.clone();
                     spawn_dlq_depth_sampler(
-                        pool.clone(),
+                        shard_pool,
                         self.shutdown.clone(),
                         self.registry.telemetry().clone(),
                         shard_id,
@@ -7586,22 +8368,54 @@ impl Worker {
             handles
         };
         let rate_limit_sampler = spawn_rate_limit_sampler(
-            pool.clone(),
+            sampler_pools.clone(),
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.config.poll_interval,
         );
-        let timeout_checker = crate::timeout::spawn_timeout_checker(
-            pool.clone(),
-            self.shutdown.clone(),
-            self.config.poll_interval,
-            self.registry.telemetry().clone(),
-            self.config.unknown_target_grace_window,
-            self.config.sharded_pool.clone(),
-            self.config.shard_assignments.clone(),
-            self.registry.circuit_breakers(),
-            self.config.max_workflow_history_events,
-        );
+        // Poison-pill reclaimer, pause auto-resumer, and timeout checker all run
+        // per-shard so that orphaned tasks, over-long pauses, and timed-out
+        // tasks/executions on every assigned shard are recovered (fix #3,
+        // issue #522). When a ShardedDbPool is available each shard gets its own
+        // instance; otherwise the single default pool is used.
+        #[cfg(feature = "db")]
+        let shard_pools_for_monitors: Vec<DbPool> = {
+            let assignments = &self.config.shard_assignments;
+            match (assignments.is_empty(), self.config.sharded_pool.as_ref()) {
+                (false, Some(sp)) => assignments
+                    .iter()
+                    .map(|s| sp.pool_for(*s).clone())
+                    .collect(),
+                _ => vec![pool.clone()],
+            }
+        };
+        #[cfg(not(feature = "db"))]
+        let shard_pools_for_monitors: Vec<DbPool> = vec![pool.clone()];
+
+        // One timeout checker per assigned shard. `enforce_timeouts_once` scans
+        // the connection's *own* database (find_timed_out_tasks, external-task
+        // timeouts, workflow-execution deadlines, SLA breaches, history
+        // ceiling), so a single checker on the default pool would leave expired
+        // tasks/executions on the other shards stuck RUNNING/PENDING forever.
+        // The cross-shard outbox helpers inside each pass still receive the full
+        // sharded_pool + shard_assignments so peer-shard delivery is unchanged.
+        let timeout_checkers: Vec<_> = shard_pools_for_monitors
+            .iter()
+            .map(|shard_pool| {
+                crate::timeout::spawn_timeout_checker(
+                    shard_pool.clone(),
+                    self.shutdown.clone(),
+                    self.config.poll_interval,
+                    self.registry.telemetry().clone(),
+                    self.config.unknown_target_grace_window,
+                    self.config.sharded_pool.clone(),
+                    self.config.shard_assignments.clone(),
+                    self.registry.circuit_breakers(),
+                    self.config.max_workflow_history_events,
+                )
+            })
+            .collect();
+
         // Worker-stale threshold mirrors the fleet-health classifier:
         // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
         // Double *before* rounding to whole seconds so a fractional interval
@@ -7613,41 +8427,81 @@ impl Worker {
             .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
             .saturating_add(i64::from(doubled.subsec_nanos() > 0))
             .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS);
-        let poison_pill_reclaimer = crate::poison_pill::spawn_poison_pill_reclaimer(
-            pool.clone(),
-            self.shutdown.clone(),
-            // Orphan reclaim is background maintenance: sweep at the heartbeat
-            // cadence rather than the (much shorter) task poll interval to keep
-            // the liveness scan off the hot path.
-            self.config.worker_heartbeat_interval,
-            self.config.poison_pill_threshold,
-            worker_stale_secs,
-            self.registry.telemetry().clone(),
-        );
-        let pause_auto_resumer = spawn_pause_auto_resumer(
-            pool.clone(),
-            self.shutdown.clone(),
-            self.config.worker_heartbeat_interval,
-            self.config.max_workflow_pause_duration,
-            self.registry.telemetry().clone(),
-        );
+
+        let poison_pill_reclaimers: Vec<_> = shard_pools_for_monitors
+            .iter()
+            .map(|shard_pool| {
+                crate::poison_pill::spawn_poison_pill_reclaimer(
+                    shard_pool.clone(),
+                    self.shutdown.clone(),
+                    self.config.worker_heartbeat_interval,
+                    self.config.poison_pill_threshold,
+                    worker_stale_secs,
+                    self.registry.telemetry().clone(),
+                )
+            })
+            .collect();
+        let pause_auto_resumers: Vec<_> = shard_pools_for_monitors
+            .iter()
+            .map(|shard_pool| {
+                spawn_pause_auto_resumer(
+                    shard_pool.clone(),
+                    self.shutdown.clone(),
+                    self.config.worker_heartbeat_interval,
+                    self.config.max_workflow_pause_duration,
+                    self.registry.telemetry().clone(),
+                )
+            })
+            .collect();
         let history_oversized_sampler = spawn_history_oversized_sampler(
-            pool.clone(),
+            sampler_pools,
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.registry.history_policy().continue_as_new_threshold(),
             self.config.poll_interval,
         );
 
+        // Stranded-work sampler (issue #522): emits a gauge per shard showing
+        // how many claimable tasks have no live covering worker. Iterates ALL
+        // shards visible through the pool (not just assigned shards) so an
+        // uncovered writable shard is caught regardless of which worker runs
+        // this sampler. Only started when a sharded pool is available and
+        // metrics are enabled.
+        #[cfg(feature = "db")]
+        let stranded_work_sampler = self
+            .config
+            .sharded_pool
+            .as_ref()
+            .filter(|_| self.registry.telemetry().metrics.is_enabled())
+            .map(|sp| {
+                spawn_stranded_work_sampler(
+                    sp.clone(),
+                    // Reuse the heartbeat interval as freshness window so the
+                    // worker-liveness check is consistent with the heartbeat.
+                    self.config.worker_heartbeat_interval.saturating_mul(2),
+                    self.shutdown.clone(),
+                    self.registry.telemetry().clone(),
+                    self.config.poll_interval,
+                    self.registry
+                        .circuit_breakers()
+                        .tracked_activity_names()
+                        .to_vec(),
+                    self.registry.activity_requirements_json(),
+                )
+            });
+        #[cfg(not(feature = "db"))]
+        let stranded_work_sampler: Option<tokio::task::JoinHandle<()>> = None;
+
         WorkerMonitoringHandles {
             queue_depth_sampler,
             concurrency_sampler,
             rate_limit_sampler,
             dlq_depth_samplers,
-            timeout_checker,
-            poison_pill_reclaimer,
-            pause_auto_resumer,
+            timeout_checkers,
+            poison_pill_reclaimers,
+            pause_auto_resumers,
             history_oversized_sampler,
+            stranded_work_sampler,
         }
     }
 
@@ -7690,6 +8544,7 @@ impl Worker {
             heartbeat_cancel,
             self.shutdown.clone(),
             Arc::clone(&self.remote_drain_deadline),
+            Arc::clone(&self.drain_deadline_max),
         )
     }
 
@@ -7741,26 +8596,32 @@ impl Worker {
                 "worker heartbeat task failed during shutdown"
             );
         }
-        if let Err(error) = monitors.timeout_checker.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "timeout checker task failed during shutdown"
-            );
+        for handle in monitors.timeout_checkers {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "timeout checker task failed during shutdown"
+                );
+            }
         }
-        if let Err(error) = monitors.poison_pill_reclaimer.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "poison-pill reclaimer task failed during shutdown"
-            );
+        for handle in monitors.poison_pill_reclaimers {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "poison-pill reclaimer task failed during shutdown"
+                );
+            }
         }
-        if let Err(error) = monitors.pause_auto_resumer.await {
-            tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %error,
-                "pause auto-resume scanner failed during shutdown"
-            );
+        for handle in monitors.pause_auto_resumers {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "pause auto-resume scanner failed during shutdown"
+                );
+            }
         }
         if let Err(error) = monitors.queue_depth_sampler.await {
             tracing::warn!(
@@ -7797,6 +8658,15 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "history oversized sampler failed during shutdown"
+            );
+        }
+        if let Some(handle) = monitors.stranded_work_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "stranded-work sampler failed during shutdown"
             );
         }
     }
@@ -8799,6 +9669,7 @@ mod tests {
             worker_id: "test-worker-1".to_string(),
             queues: vec!["default".to_string()],
             notification_database_url: None,
+            shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
             poll_interval: Duration::from_millis(100),
@@ -9069,6 +9940,7 @@ mod tests {
         let builder_cfg = WorkerConfig {
             queues: vec!["email".to_string(), "billing".to_string()],
             notification_database_url: Some("postgres://localhost/test".to_string()),
+            shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 5,
             max_concurrent_activities: 15,
             shutdown_timeout: Duration::from_secs(60),

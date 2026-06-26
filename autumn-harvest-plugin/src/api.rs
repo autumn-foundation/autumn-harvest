@@ -102,8 +102,8 @@ use autumn_harvest::types::{
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
     DrainPreviewItem, DrainResponse, FleetHealth, PinnedExecutionRow, WorkerFilters, WorkerRow,
-    drain_preview, fleet_health, get_worker, list_pinned_executions, list_workers,
-    parse_worker_filters, request_drain,
+    get_worker, list_pinned_executions, list_workers, parse_worker_filters, preview_item_from_row,
+    read_draining_worker_deadline, request_drain,
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
@@ -19091,6 +19091,33 @@ where
 // Worker fleet observability (issue #100)
 // ---------------------------------------------------------------------------
 
+/// Deduplicate worker rows fanned out across shards, keeping the **freshest**
+/// snapshot per `worker_id` (the row with the most recent `last_heartbeat_at`).
+///
+/// A multi-shard worker registers a row in every assigned shard's
+/// `harvest_workers` table and heartbeats each independently, so the same
+/// `worker_id` appears once per shard with possibly different shard-local
+/// health. Keeping the first-seen row (lowest shard from `iter_shards()`) could
+/// let a stale copy on a lower shard mask a healthy heartbeat on a higher one,
+/// and — since the per-shard filter matches the advertised `shard_assignments`
+/// JSON rather than the source shard — could even return a non-source-shard copy
+/// for `?shard_id=` queries (issue #522 review). The freshest snapshot reflects
+/// the worker's true liveness regardless of which shard it was read from.
+fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
+    let mut by_id: std::collections::HashMap<String, WorkerRow> = std::collections::HashMap::new();
+    for row in rows {
+        match by_id.get(&row.worker.worker_id) {
+            // Keep the existing row only if it is at least as fresh.
+            Some(existing) if existing.worker.last_heartbeat_at >= row.worker.last_heartbeat_at => {
+            }
+            _ => {
+                by_id.insert(row.worker.worker_id.clone(), row);
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
 async fn list_workers_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Query(pairs): Query<Vec<(String, String)>>,
@@ -19100,13 +19127,21 @@ async fn list_workers_handler(
     let pool = api_state.storage_pool().map_err(map_error)?;
     let mut results: Vec<WorkerRow> = Vec::new();
 
-    // Use i64::MAX as the per-shard limit so apply_worker_filters performs no
-    // truncation inside list_workers. Any MAX_LIMIT cap would silently drop
-    // workers on a large shard before the global sort+truncate below, producing
-    // incomplete results for fleets with more than MAX_LIMIT matching workers on
-    // a single shard.
+    // Per-shard load drops the snapshot-dependent filters (status, health,
+    // build_id, deployment_name) and applies them globally AFTER dedup
+    // (issue #522 review). A multi-shard worker's shard rows can disagree on
+    // status/health, so filtering per-shard could let a stale Active copy on one
+    // shard survive while the freshest Draining row on another is dropped before
+    // dedup — returning the obsolete snapshot. The shard-invariant queue/shard
+    // filters (read from the worker's advertised JSON, identical across rows) are
+    // kept here. Use i64::MAX as the per-shard limit so list_workers performs no
+    // truncation before the global sort+truncate below.
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
+        status: None,
+        health: None,
+        build_id: None,
+        deployment_name: None,
         ..filters.clone()
     };
     for (_shard, shard_pool) in pool.iter_shards() {
@@ -19115,6 +19150,25 @@ async fn list_workers_handler(
             .await
             .map_err(map_error)?;
         results.append(&mut rows);
+    }
+
+    // A multi-shard worker registers a row in every shard's harvest_workers
+    // table. Dedup by worker_id, keeping the freshest per-shard snapshot so each
+    // physical worker appears exactly once with its true liveness.
+    let mut results = dedup_workers_by_freshest(results);
+
+    // Now apply the snapshot-dependent filters against the freshest snapshot.
+    if let Some(ref status) = filters.status {
+        results.retain(|w| &w.worker.status == status);
+    }
+    if let Some(health) = filters.health {
+        results.retain(|w| w.health == health);
+    }
+    if let Some(ref build_id) = filters.build_id {
+        results.retain(|w| &w.worker.build_id == build_id);
+    }
+    if let Some(ref deployment_name) = filters.deployment_name {
+        results.retain(|w| w.worker.deployment_name.as_deref() == Some(deployment_name.as_str()));
     }
 
     let capable_of = pairs
@@ -19174,10 +19228,16 @@ async fn get_worker_handler(
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
 
+    // Fan out across all shards: a multi-shard worker has a row per shard, each
+    // carrying its own status/health snapshot and its own RUNNING task ids. Keep
+    // the freshest row (max last_heartbeat_at) and union active_task_ids across
+    // every shard so the detail view is current and complete rather than the
+    // first-reachable shard's partial snapshot (issue #522 review). Skip
+    // unavailable shards rather than returning 500; the worker may live on a
+    // reachable shard even when others are down.
+    let mut freshest: Option<WorkerRow> = None;
+    let mut active_task_ids: Vec<uuid::Uuid> = Vec::new();
     for (_shard, shard_pool) in pool.iter_shards() {
-        // Skip unavailable shards rather than returning 500; the worker may
-        // live on a reachable shard even when others are down, and the --wait
-        // poll loop must not abort just because an unrelated shard is offline.
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
@@ -19185,11 +19245,27 @@ async fn get_worker_handler(
             .await
             .map_err(map_error)?
         {
-            return Ok(Json(row));
+            active_task_ids.extend(row.active_task_ids.iter().copied());
+            freshest = Some(match freshest.take() {
+                Some(existing)
+                    if existing.worker.last_heartbeat_at >= row.worker.last_heartbeat_at =>
+                {
+                    existing
+                }
+                _ => row,
+            });
         }
     }
 
-    Err(AutumnError::not_found_msg(format!("worker '{worker_id}'")))
+    match freshest {
+        Some(mut row) => {
+            active_task_ids.sort_unstable();
+            active_task_ids.dedup();
+            row.active_task_ids = active_task_ids;
+            Ok(Json(row))
+        }
+        None => Err(AutumnError::not_found_msg(format!("worker '{worker_id}'"))),
+    }
 }
 
 /// `GET /workers/{worker_id}/pinned`
@@ -19226,6 +19302,28 @@ async fn workers_health(
 ) -> Result<Json<FleetHealth>, AutumnError> {
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
+
+    // Collect all worker rows from every shard, then dedup by worker_id so a
+    // multi-shard worker (which registers a row in each of its shard DBs) is
+    // counted exactly once in the healthy/stale/draining totals.
+    let mut all_workers: Vec<WorkerRow> = Vec::new();
+    let per_shard_filters = WorkerFilters {
+        limit: i64::MAX,
+        ..WorkerFilters::default()
+    };
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let mut conn = acquire_conn(shard_pool).await?;
+        let mut rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
+            .await
+            .map_err(map_error)?;
+        all_workers.append(&mut rows);
+    }
+
+    // Dedup by worker_id, keeping the freshest per-shard snapshot so a stale
+    // copy on one shard never masks a healthy heartbeat on another in the
+    // healthy/stale/draining totals (issue #522 review).
+    let all_workers = dedup_workers_by_freshest(all_workers);
+
     let mut combined = FleetHealth {
         healthy: 0,
         stale: 0,
@@ -19234,19 +19332,30 @@ async fn workers_health(
         by_shard: std::collections::HashMap::new(),
     };
 
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let shard_health = fleet_health(&mut conn, stale_threshold)
-            .await
-            .map_err(map_error)?;
-        combined.healthy += shard_health.healthy;
-        combined.stale += shard_health.stale;
-        combined.draining += shard_health.draining;
-        for (queue, count) in shard_health.by_queue {
-            *combined.by_queue.entry(queue).or_default() += count;
+    for row in &all_workers {
+        match row.health {
+            autumn_harvest::workers::WorkerHealth::Healthy => combined.healthy += 1,
+            autumn_harvest::workers::WorkerHealth::Stale => combined.stale += 1,
         }
-        for (shard, count) in shard_health.by_shard {
-            *combined.by_shard.entry(shard).or_default() += count;
+        if row.worker.status == autumn_harvest::workers::WorkerStatus::Draining.as_str() {
+            combined.draining += 1;
+        }
+        if let Some(queues) = row.worker.queues.as_array() {
+            for q in queues {
+                if let Some(name) = q.as_str() {
+                    *combined.by_queue.entry(name.to_string()).or_default() += 1;
+                }
+            }
+        }
+        // by_shard stays additive across shard assignments on the deduped
+        // worker, correctly reflecting how many distinct workers cover each
+        // shard.
+        if let Some(shards) = row.worker.shard_assignments.as_array() {
+            for s in shards {
+                if let Some(id) = s.as_i64().and_then(|v| i32::try_from(v).ok()) {
+                    *combined.by_shard.entry(id).or_default() += 1;
+                }
+            }
         }
     }
 
@@ -19269,6 +19378,39 @@ struct DrainWorkerRequest {
     /// When absent the server uses its configured worker shutdown timeout.
     #[serde(default)]
     deadline_at: Option<String>,
+}
+
+/// Relative significance of a drain outcome when aggregating the per-shard rows
+/// of one multi-shard worker. A row newly transitioned (`Accepted`) is the most
+/// informative overall signal; `NotFound` never reaches the aggregate.
+const fn drain_outcome_rank(outcome: autumn_harvest::workers::DrainOutcome) -> u8 {
+    use autumn_harvest::workers::DrainOutcome;
+    match outcome {
+        DrainOutcome::Accepted => 4,
+        DrainOutcome::StaleWorker => 3,
+        DrainOutcome::AlreadyDraining => 2,
+        DrainOutcome::AlreadyStopped => 1,
+        DrainOutcome::NotFound => 0,
+    }
+}
+
+/// Merge the drain results from two shard rows of the same worker into one
+/// aggregate response: keep the most significant outcome, the larger in-flight
+/// count, the union of served shard ids, and the first non-null deadline.
+fn merge_drain_responses(mut acc: DrainResponse, other: DrainResponse) -> DrainResponse {
+    if drain_outcome_rank(other.outcome) > drain_outcome_rank(acc.outcome) {
+        acc.outcome = other.outcome;
+    }
+    acc.in_flight_count = acc.in_flight_count.max(other.in_flight_count);
+    for shard in other.shard_ids {
+        if !acc.shard_ids.contains(&shard) {
+            acc.shard_ids.push(shard);
+        }
+    }
+    if acc.drain_deadline_at.is_none() {
+        acc.drain_deadline_at = other.drain_deadline_at;
+    }
+    acc
 }
 
 #[allow(clippy::too_many_lines)]
@@ -19301,17 +19443,45 @@ async fn request_drain_handler(
         (computed, false)
     };
 
-    // Search every shard for the worker — workers are registered on exactly
-    // one shard, so the first hit wins. Connection failures on individual shards
-    // are recorded as unavailable rather than aborting the whole request (AC #8).
+    // For non-explicit re-drains (omitted or computed default deadline), reuse the
+    // earliest drain deadline already stored on any Draining shard row for this
+    // worker. A lagging-shard Active row receiving a fresh-computed default would
+    // otherwise extend the drain window: the heartbeat task treats any new
+    // drain_deadline_at value as a new drain command and resets its local
+    // shutdown Instant to the new value, silently pushing the deadline out.
+    let deadline_at = if deadline_is_explicit {
+        deadline_at
+    } else {
+        let mut earliest: Option<chrono::DateTime<chrono::Utc>> = None;
+        for (_, shard_pool) in pool.iter_shards() {
+            let Ok(mut conn) = acquire_conn(shard_pool).await else {
+                continue;
+            };
+            if let Ok(Some(stored)) = read_draining_worker_deadline(&mut conn, &worker_id).await {
+                earliest = Some(earliest.map_or(stored, |e| e.min(stored)));
+            }
+        }
+        earliest.or(deadline_at)
+    };
+
+    // Fan the drain transition out to EVERY reachable shard that has a row for
+    // this worker (issue #522 review). A multi-shard worker registers a row in
+    // each assigned shard's DB and runs an independent heartbeat per shard, any
+    // of which triggers graceful shutdown the moment it observes `Draining`.
+    // Updating only the first-hit row would leave the worker polling if its
+    // heartbeat to that shard happens to be broken while another shard's
+    // heartbeat is healthy (and its row still `Active`). Connection failures on
+    // individual shards are recorded as unavailable rather than aborting the
+    // whole request (AC #8).
     let mut unavailable_shards: Vec<i32> = Vec::new();
+    let mut aggregate: Option<DrainResponse> = None;
     for (shard_id, shard_pool) in pool.iter_shards() {
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             unavailable_shards.push(shard_id.as_i32());
             continue;
         };
 
-        let mut response = request_drain(
+        let response = request_drain(
             &mut conn,
             &worker_id,
             deadline_at,
@@ -19325,8 +19495,7 @@ async fn request_drain_handler(
             continue;
         }
 
-        response.unavailable_shards = std::mem::take(&mut unavailable_shards);
-
+        // Worker found on this shard — audit the transition scoped to it.
         let ar = NewAuditRecord {
             actor: &actor,
             source: &source,
@@ -19344,6 +19513,16 @@ async fn request_drain_handler(
             .await
             .map_err(map_error)?;
 
+        aggregate = Some(match aggregate.take() {
+            None => response,
+            Some(acc) => merge_drain_responses(acc, response),
+        });
+    }
+
+    if let Some(mut response) = aggregate {
+        response.shard_ids.sort_unstable();
+        response.shard_ids.dedup();
+        response.unavailable_shards = unavailable_shards;
         return Ok(Json(response));
     }
 
@@ -19417,22 +19596,51 @@ async fn drain_preview_handler(
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
 
+    // Load worker rows per shard WITHOUT snapshot-dependent filters and dedup by
+    // freshest snapshot, exactly as /workers does, so a stale Active copy on one
+    // shard can't be retained while the fresher Draining/Stopped row on another
+    // shard is filtered out before dedup (issue #522 review). The preview's own
+    // filters (default-Active status plus any requested status/health/build/
+    // deployment) and the limit are applied globally against the freshest row.
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
+        status: None,
+        health: None,
+        build_id: None,
+        deployment_name: None,
         ..filters.clone()
     };
-
-    let mut results: Vec<DrainPreviewItem> = Vec::new();
+    let mut rows: Vec<WorkerRow> = Vec::new();
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let mut items = drain_preview(&mut conn, &per_shard_filters, stale_threshold)
+        let mut shard_rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
             .await
             .map_err(map_error)?;
-        results.append(&mut items);
+        rows.append(&mut shard_rows);
+    }
+    let mut rows = dedup_workers_by_freshest(rows);
+
+    // Default to Active-only (workers that would be *newly* drained) unless the
+    // caller asked for an explicit status — matching drain_preview's contract.
+    let status_filter = filters.status.clone().unwrap_or_else(|| {
+        autumn_harvest::workers::WorkerStatus::Active
+            .as_str()
+            .to_string()
+    });
+    rows.retain(|w| w.worker.status == status_filter);
+    if let Some(health) = filters.health {
+        rows.retain(|w| w.health == health);
+    }
+    if let Some(ref build_id) = filters.build_id {
+        rows.retain(|w| &w.worker.build_id == build_id);
+    }
+    if let Some(ref deployment_name) = filters.deployment_name {
+        rows.retain(|w| w.worker.deployment_name.as_deref() == Some(deployment_name.as_str()));
     }
 
-    results.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
-    results.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
+    rows.sort_by(|a, b| a.worker.worker_id.cmp(&b.worker.worker_id));
+    rows.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
+    let results: Vec<DrainPreviewItem> = rows.iter().map(preview_item_from_row).collect();
     Ok(Json(results))
 }
 
@@ -21242,6 +21450,95 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn merge_drain_responses_aggregates_across_shards() {
+        use autumn_harvest::workers::{DrainOutcome, DrainResponse};
+
+        let mk = |outcome: DrainOutcome, in_flight: i32, shards: Vec<i32>| DrainResponse {
+            worker_id: "w1".to_string(),
+            outcome,
+            in_flight_count: in_flight,
+            drain_deadline_at: None,
+            shard_ids: shards,
+            unavailable_shards: vec![],
+        };
+
+        // Shard 0 was already draining; shard 1's row was still Active and got
+        // newly accepted. The aggregate must report Accepted (the stronger
+        // signal), the larger in-flight count, and the union of shard ids.
+        let merged = merge_drain_responses(
+            mk(DrainOutcome::AlreadyDraining, 2, vec![0]),
+            mk(DrainOutcome::Accepted, 5, vec![1]),
+        );
+        assert_eq!(merged.outcome, DrainOutcome::Accepted);
+        assert_eq!(merged.in_flight_count, 5);
+        let mut shards = merged.shard_ids;
+        shards.sort_unstable();
+        assert_eq!(shards, vec![0, 1]);
+
+        // Ordering of the merge must not change the result.
+        let merged_rev = merge_drain_responses(
+            mk(DrainOutcome::Accepted, 5, vec![1]),
+            mk(DrainOutcome::AlreadyDraining, 2, vec![0]),
+        );
+        assert_eq!(merged_rev.outcome, DrainOutcome::Accepted);
+        assert_eq!(merged_rev.in_flight_count, 5);
+
+        // A clean Accepted outranks a StaleWorker row.
+        assert_eq!(
+            merge_drain_responses(
+                mk(DrainOutcome::StaleWorker, 0, vec![0]),
+                mk(DrainOutcome::Accepted, 1, vec![1]),
+            )
+            .outcome,
+            DrainOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn dedup_workers_by_freshest_keeps_latest_heartbeat() {
+        use autumn_harvest::models::HarvestWorker;
+        use autumn_harvest::workers::WorkerHealth;
+
+        let now = chrono::Utc::now();
+        let mk = |hb: chrono::DateTime<chrono::Utc>, health: WorkerHealth| WorkerRow {
+            worker: HarvestWorker {
+                worker_id: "w1".to_string(),
+                started_at: now,
+                last_heartbeat_at: hb,
+                queues: serde_json::json!(["default"]),
+                shard_assignments: serde_json::json!([0, 1]),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: "Active".to_string(),
+                drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
+                labels: serde_json::json!({}),
+            },
+            health,
+            active_task_ids: vec![],
+        };
+
+        // Shard 0's copy (read first, lowest shard) is stale; shard 1's copy is
+        // fresh. The dedup must keep the fresh snapshot, not the first-seen one.
+        let stale = mk(now - chrono::Duration::hours(1), WorkerHealth::Stale);
+        let fresh = mk(now, WorkerHealth::Healthy);
+        let deduped = dedup_workers_by_freshest(vec![stale, fresh]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].health, WorkerHealth::Healthy);
+        assert_eq!(deduped[0].worker.last_heartbeat_at, now);
+
+        // Order-independent: fresh first, stale second → still keeps fresh.
+        let stale2 = mk(now - chrono::Duration::hours(1), WorkerHealth::Stale);
+        let fresh2 = mk(now, WorkerHealth::Healthy);
+        let deduped_rev = dedup_workers_by_freshest(vec![fresh2, stale2]);
+        assert_eq!(deduped_rev.len(), 1);
+        assert_eq!(deduped_rev[0].health, WorkerHealth::Healthy);
     }
 
     #[test]

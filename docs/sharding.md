@@ -181,3 +181,77 @@ predicate text, so every shard derives the identical typed comparison and the
 merged result is deterministic. Numeric comparison matches only number-typed
 stored values; a value stored as a string on one shard is excluded uniformly on
 all shards, never a partial false match.
+
+---
+
+## Adding a Shard — Operational Runbook (issue #522)
+
+Follow this procedure to add a new shard to a live deployment. Each step is safe to stop and retry.
+
+### Step 1 — Provision and migrate
+
+Provision a new Postgres database and run migrations against it:
+
+```bash
+DATABASE_URL=postgres://user:pass@new-shard-host/harvest diesel migration run
+```
+
+### Step 2 — Add to readable_shards
+
+Add the new shard to `readable_shards` (but **not** `writable_shards`) and deploy. The router can now resolve IDs that encode the new shard; nothing writes there yet.
+
+### Step 3 — Wait for readiness gate
+
+Run the shard health check against the new shard:
+
+```bash
+harvest shard health --candidate-shard <shard_id>
+# or
+GET /admin/shards/health?candidate_shard=<shard_id>
+```
+
+Wait for `readiness: "ready"`. A `degraded` row includes machine-readable `reason_codes` explaining what is blocking readiness. Three codes are relevant here:
+
+| `reason_code` | Meaning | Resolution |
+|---|---|---|
+| `no_live_worker` | The shard is `Writable` and has claimable tasks, but **no live worker** lists this shard in its `shard_assignments`. | Add the shard to each worker's `shard_assignments` config and redeploy. |
+| `worker_queue_uncovered` | No healthy worker covers a required queue on this shard. | Same as above — check queue bindings. |
+| `schema_migration_missing` | The shard is missing required migrations. | Re-run `diesel migration run` against the shard. |
+
+The `no_live_worker` gate is the primary pre-flip readiness gate for issue #522: until at least one `Healthy + Active` worker lists the new shard in its `shard_assignments`, the shard will not report `ready`. This prevents silently stranding work on the new shard.
+
+### Step 4 — Flip writable and verify
+
+Add the new shard to `writable_shards` and deploy. The fleet **automatically drains the newly-writable shard** — no operator intervention is needed. Workers that list the shard in `shard_assignments` will claim and dispatch tasks from it within one `poll_interval`.
+
+```toml
+# Example worker config
+[harvest.worker]
+shard_assignments = [0, 1]   # worker now covers both shards
+```
+
+Once flipped:
+- New workflows begin landing on the shard via rendezvous hash.
+- In-flight workflows on existing shards continue draining through their own worker tasks.
+- Workers assigned to both shards poll each shard's pool independently on every tick, preserving per-shard ACID locality.
+
+### Observing stranded work
+
+The `harvest.shard.stranded_pending` gauge (emitted by the stranded-work sampler on each worker) shows per-shard claimable task counts for shards that have **no live covering worker**:
+
+```promql
+harvest_shard_stranded_pending{shard="1"} > 0
+```
+
+A non-zero value means tasks are queued on that shard but no worker is draining them. Healthy steady state is `0` on all shards. Use this as an alerting signal: if it stays non-zero for more than `2 × poll_interval`, check `shard_assignments` on the running worker fleet.
+
+### Pre-flip checklist
+
+Before adding a shard to `writable_shards`:
+
+- [ ] `GET /admin/shards/health?candidate_shard=<id>` returns `readiness: "ready"` for the new shard.
+- [ ] No `no_live_worker` reason code present (at least one live worker covers the shard).
+- [ ] `harvest.shard.stranded_pending{shard="<id>"}` is `0` (no backlog from prior test writes).
+- [ ] Schema migrations are applied (`schema_migration_missing` absent).
+
+A `readiness: "degraded"` result with `no_live_worker` in `reason_codes` is the engine's way of saying: "flip cancelled — no worker will claim work on this shard."

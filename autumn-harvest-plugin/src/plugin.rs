@@ -359,13 +359,46 @@ async fn start_harvest_runtime(
     let max_signal_payload_bytes = built.max_signal_payload_bytes;
     let query_timeout = built.worker_config().query_timeout;
     let default_debounce_max_wait = built.worker_config().default_debounce_max_wait;
+    // Pre-flight: reject a multi-shard WorkerConfig before spawning any background
+    // tasks.  The plugin configures WorkflowHandleClient with only shard-0's
+    // LISTEN/NOTIFY URL; workflows hashed to non-zero shards would fail
+    // wait/result/SSE paths.  Checking here avoids spawning worker/scheduler/batch
+    // tasks that would need to be immediately stopped on error.
+    if let Some(sp) = built.worker_config().sharded_pool.as_ref() {
+        let shard_count = sp.iter_shards().count();
+        if shard_count > 1 {
+            return Err(AutumnError::service_unavailable_msg(format!(
+                "HarvestPlugin does not support multi-shard deployments: the configured \
+                 sharded pool spans {shard_count} shards but only shard-0's LISTEN/NOTIFY \
+                 notification URL is available; workflows hashed to non-zero shards would \
+                 fail wait/result/SSE paths. Use HarvestRunner::start with \
+                 HarvestRunnerResources::with_sharded_pool and a WorkflowHandleClient \
+                 configured with per-shard notification URLs instead."
+            )));
+        }
+    }
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
     let harvest_db_pool = runner.storage_pool();
+    // Defense-in-depth: the pre-flight above catches WorkerConfig::with_sharded_pool;
+    // this catches any future path that sets runner_resources.sharded_pool.
+    // runner.stop().await cancels the spawned tasks before propagating the error so
+    // the process is not left with orphaned background tasks.
+    let shard_count = harvest_db_pool.iter_shards().count();
+    if shard_count > 1 {
+        runner.stop().await;
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "HarvestPlugin does not support multi-shard deployments: the resolved pool spans \
+             {shard_count} shards but only shard-0's LISTEN/NOTIFY notification URL is \
+             configured; workflows hashed to non-zero shards would fail wait/result/SSE paths. \
+             Use HarvestRunner::start with HarvestRunnerResources::with_sharded_pool and a \
+             WorkflowHandleClient with per-shard notification URLs instead."
+        )));
+    }
     let workflow_handle_client = WorkflowHandleClient::new(
         harvest_db_pool.sharded_pool().clone(),
         runner.api_runtime().router().clone(),
         [(
-            autumn_harvest::ShardId::new(0),
+            harvest_db_pool.sharded_pool().default_shard(),
             workflow_result_notification_url,
         )],
     )
@@ -894,7 +927,7 @@ mod tests {
         let injected = injected_runtime_state(
             Some(state.clone()),
             None,
-            harvest_pool,
+            HarvestDbPool::from(harvest_pool),
             ShardRouter::single(),
         );
         let stored = injected
@@ -944,7 +977,7 @@ mod tests {
         let injected = injected_runtime_state(
             Some(app_state),
             Some(app_pool),
-            harvest_pool,
+            HarvestDbPool::from(harvest_pool),
             ShardRouter::single(),
         );
 

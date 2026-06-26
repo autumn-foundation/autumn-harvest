@@ -1815,6 +1815,191 @@ pub async fn try_consume_rate_limit_token(
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// A distinct claimable-pending demand: how many claimable pending tasks share a
+/// `(queue_name, required_capabilities, required_build_id)` triple.
+///
+/// `required_capabilities` is `None` for tasks with no label requirements and
+/// `Some(json)` for tasks that `claim_task` only lets a capability-matching
+/// worker take. `required_build_id` is `None` for build-unrouted tasks and
+/// `Some(id)` for tasks that `claim_task` only lets a build-matching (or
+/// compatible/legacy) worker take. The stranded-work sampler uses this to
+/// detect a queue that looks covered (a worker polls it) but carries a task no
+/// covering worker can actually claim — because of its labels OR its build.
+///
+/// `sticky_owner` is `Some(worker_id)` when the row is currently held by an
+/// **unexpired** sticky lease (issue #235): `claim_task` lets only that worker
+/// claim it until `sticky_until` passes, so coverage must check that specific
+/// owner's liveness rather than any worker on the queue. `None` means the row is
+/// freely claimable by the general pool (no lease, or the lease has expired).
+///
+/// `activity_name` carries the row's activity (NULL for workflow tasks). It lets
+/// [`apply_activity_requirements`] back-fill `required_capabilities` for activity
+/// rows that did not snapshot them (legacy/manual enqueues), mirroring
+/// `claim_task`'s ineligible-activities gate (`$6`).
+#[derive(Debug, Clone)]
+pub struct ClaimablePendingDemand {
+    pub queue_name: String,
+    pub required_capabilities: Option<serde_json::Value>,
+    pub required_build_id: Option<String>,
+    pub sticky_owner: Option<String>,
+    pub activity_name: Option<String>,
+    pub count: i64,
+}
+
+/// Per-queue, per-constraint claimable-demand breakdown for the stranded-work
+/// sampler and the shard-health coverage gate (issue #522).
+///
+/// Returns one [`ClaimablePendingDemand`] per distinct
+/// `(queue_name, required_capabilities, required_build_id)` triple among
+/// claimable pending tasks. Mirrors **every** claim-time gate in `claim_task` so
+/// the counts never include a row a worker would refuse:
+///   - expired `schedule_to_close_at` (issue #378, failed by the timeout scanner);
+///   - PAUSED *workflow* tasks (task_type-scoped — a paused execution's already
+///     scheduled activity tasks stay claimable, so they are still counted);
+///   - concurrency-cap saturation (the per-key `RUNNING` count is already at the
+///     cap, so the row is throttled — the same recheck subquery `claim_task`
+///     uses); and
+///   - rate-limit exhaustion (the non-circuit bucket has no token), with the
+///     **circuit-breaker exemption**: activities in `circuit_breaker_activities`
+///     skip the rate-limit gate at claim, so they remain claimable even with an
+///     empty bucket and are still counted.
+///
+/// An unexpired sticky lease (`sticky_worker_id` set, `sticky_until > NOW()`) is
+/// surfaced as `ClaimablePendingDemand::sticky_owner` rather than excluded, so
+/// the coverage check can require that specific owner to be live (a row leased to
+/// a stale worker is not claimable by anyone else until the lease expires).
+///
+/// `circuit_breaker_activities` is the static set of activity names with a
+/// circuit-breaker policy (`CircuitBreakerRegistry::tracked_activity_names`),
+/// matching `claim_task`'s `$5` parameter. Pass an empty slice when no breakers
+/// are configured.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn claimable_pending_demand_by_queue(
+    conn: &mut AsyncPgConnection,
+    circuit_breaker_activities: &[String],
+) -> HarvestResult<Vec<ClaimablePendingDemand>> {
+    #[derive(diesel::QueryableByName)]
+    struct DemandRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue_name: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        required_capabilities: Option<serde_json::Value>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        required_build_id: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        sticky_owner: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        activity_name: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        cnt: i64,
+    }
+
+    // `sticky_owner` is NULL unless an unexpired lease binds the row to a
+    // specific worker; the CASE mirrors claim_task's sticky predicate (a row
+    // with sticky_until <= NOW() or NULL is freely claimable). It is both
+    // selected and repeated in GROUP BY.
+    let sticky_owner_expr = "CASE WHEN tq.sticky_worker_id IS NOT NULL \
+                                  AND tq.sticky_until IS NOT NULL \
+                                  AND tq.sticky_until > NOW() \
+                             THEN tq.sticky_worker_id ELSE NULL END";
+    let rows: Vec<DemandRow> = diesel::sql_query(format!(
+        "SELECT tq.queue_name, tq.required_capabilities, tq.required_build_id, \
+                {sticky_owner_expr} AS sticky_owner, tq.activity_name, \
+                COUNT(*)::BIGINT AS cnt \
+         FROM harvest_task_queue tq \
+         LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
+         WHERE tq.state = 'PENDING' \
+           AND tq.scheduled_at <= NOW() \
+           AND ( \
+               tq.schedule_to_close_at IS NULL \
+               OR tq.schedule_to_close_at > NOW() \
+           ) \
+           AND ( \
+               tq.task_type <> 'workflow' \
+               OR tq.workflow_exec_id IS NULL \
+               OR e.id IS NULL \
+               OR e.state <> 'PAUSED' \
+           ) \
+           AND ( \
+               tq.concurrency_key IS NULL \
+               OR tq.concurrency_cap IS NULL \
+               OR ( \
+                   SELECT COUNT(*) FROM harvest_task_queue inner_q \
+                   WHERE inner_q.concurrency_key = tq.concurrency_key \
+                     AND inner_q.task_type = tq.task_type \
+                     AND inner_q.state = 'RUNNING' \
+                     AND inner_q.worker_id IS NOT NULL \
+               ) < tq.concurrency_cap \
+           ) \
+           AND ( \
+               tq.rate_limit_key IS NULL \
+               OR tq.activity_name = ANY($1) \
+               OR EXISTS ( \
+                   SELECT 1 FROM harvest_rate_limit_buckets b \
+                   WHERE b.key = tq.rate_limit_key \
+                     AND LEAST(b.burst, b.tokens + EXTRACT(EPOCH FROM (NOW() - b.last_refilled_at)) * b.refill_rate) >= 1.0 \
+               ) \
+           ) \
+         GROUP BY tq.queue_name, tq.required_capabilities, tq.required_build_id, \
+                  {sticky_owner_expr}, tq.activity_name"
+    ))
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(circuit_breaker_activities)
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ClaimablePendingDemand {
+            queue_name: r.queue_name,
+            required_capabilities: r.required_capabilities,
+            required_build_id: r.required_build_id,
+            sticky_owner: r.sticky_owner,
+            activity_name: r.activity_name,
+            count: r.cnt,
+        })
+        .collect())
+}
+
+/// Back-fill effective capability requirements for un-snapshotted activity rows.
+///
+/// `claim_task` skips an activity row with NULL `required_capabilities` for any
+/// worker that does not satisfy the *registered* `requires` of that activity
+/// (its ineligible-activities gate, `$6`). Queue rows from legacy or manual
+/// enqueues may carry NULL `required_capabilities` even when the activity has
+/// requirements. To reproduce the gate in coverage, for each demand whose
+/// `required_capabilities` is `None` and whose `activity_name` has an entry in
+/// `activity_requirements`, the activity's requirements are written into
+/// `required_capabilities` so the downstream label-match coverage check applies
+/// the same gate. Demands that already carry a snapshot, or whose activity
+/// declares no `requires`, are left unchanged.
+///
+/// `activity_requirements` maps `activity_name` → the JSON encoding of its
+/// `Vec<Requirement>` (see `HandlerRegistry::activity_requirements_json`).
+pub fn apply_activity_requirements<S: std::hash::BuildHasher>(
+    demands: &mut [ClaimablePendingDemand],
+    activity_requirements: &std::collections::HashMap<String, serde_json::Value, S>,
+) {
+    if activity_requirements.is_empty() {
+        return;
+    }
+    for demand in demands.iter_mut() {
+        if demand.required_capabilities.is_some() {
+            continue;
+        }
+        if let Some(caps) = demand
+            .activity_name
+            .as_ref()
+            .and_then(|name| activity_requirements.get(name))
+        {
+            demand.required_capabilities = Some(caps.clone());
+        }
+    }
+}
+
 pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
     diesel::sql_query(
         "UPDATE harvest_rate_limit_buckets \
@@ -1996,5 +2181,63 @@ mod tests {
         params.max_concurrent = Some(5);
         assert_eq!(params.concurrency_key.as_deref(), Some("stripe"));
         assert_eq!(params.max_concurrent, Some(5));
+    }
+
+    fn demand(
+        queue: &str,
+        caps: Option<serde_json::Value>,
+        activity: Option<&str>,
+    ) -> ClaimablePendingDemand {
+        ClaimablePendingDemand {
+            queue_name: queue.to_string(),
+            required_capabilities: caps,
+            required_build_id: None,
+            sticky_owner: None,
+            activity_name: activity.map(str::to_string),
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn apply_activity_requirements_backfills_unsnapshotted_rows() {
+        let gpu = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        let mut reqs = std::collections::HashMap::new();
+        reqs.insert("render".to_string(), gpu.clone());
+
+        let mut demands = vec![
+            // NULL caps + activity has requires → back-filled.
+            demand("default", None, Some("render")),
+            // NULL caps + activity has no requires → untouched.
+            demand("default", None, Some("plain")),
+            // NULL caps + no activity (workflow task) → untouched.
+            demand("default", None, None),
+        ];
+        apply_activity_requirements(&mut demands, &reqs);
+
+        assert_eq!(demands[0].required_capabilities, Some(gpu));
+        assert_eq!(demands[1].required_capabilities, None);
+        assert_eq!(demands[2].required_capabilities, None);
+    }
+
+    #[test]
+    fn apply_activity_requirements_keeps_existing_snapshot() {
+        // A row that already snapshotted its capabilities must not be overwritten
+        // by the registered requires (the snapshot is authoritative).
+        let snapshot = serde_json::json!([{"Exact": {"key": "zone", "value": "eu"}}]);
+        let registered = serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]);
+        let mut reqs = std::collections::HashMap::new();
+        reqs.insert("render".to_string(), registered);
+
+        let mut demands = vec![demand("default", Some(snapshot.clone()), Some("render"))];
+        apply_activity_requirements(&mut demands, &reqs);
+
+        assert_eq!(demands[0].required_capabilities, Some(snapshot));
+    }
+
+    #[test]
+    fn apply_activity_requirements_empty_map_is_noop() {
+        let mut demands = vec![demand("default", None, Some("render"))];
+        apply_activity_requirements(&mut demands, &std::collections::HashMap::new());
+        assert_eq!(demands[0].required_capabilities, None);
     }
 }
