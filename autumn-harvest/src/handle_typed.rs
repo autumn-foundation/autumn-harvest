@@ -33,9 +33,6 @@ pub struct TypedWorkflowHandle<T> {
     _marker: PhantomData<fn() -> T>,
 }
 
-
-
-
 impl<T> TypedWorkflowHandle<T> {
     /// Wrap an untyped [`WorkflowHandle`] with type parameter `T` representing
     /// the expected success return type.

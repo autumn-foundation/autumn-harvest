@@ -48,7 +48,11 @@ async fn test_durable_signed_webhook_via_harvest_workflow() {
         .plugin(webhook_plugin)
         .plugin(
             HarvestPlugin::new()
-                .worker(WorkerConfig::default().with_queues(["webhooks"]).with_notification_database_url(db.url()))
+                .worker(
+                    WorkerConfig::default()
+                        .with_queues(["webhooks"])
+                        .with_notification_database_url(db.url()),
+                )
                 .api("/api/harvest"),
         )
         .with_db(db.pool());
