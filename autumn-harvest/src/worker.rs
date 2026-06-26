@@ -7778,6 +7778,34 @@ impl Worker {
         })
     }
 
+    /// Return the assigned shards that have no exact pool entry in the
+    /// configured `sharded_pool`.
+    ///
+    /// A non-empty result is a `ShardedDbPool` misconfiguration: the worker
+    /// would advertise coverage (in its fleet row and shard-health view) for
+    /// shards it cannot actually poll or heartbeat, silently leaving their work
+    /// unclaimed. Callers should treat a non-empty result as a startup error and
+    /// refuse to run the process rather than partially serving the configured
+    /// set (issue #522 review).
+    ///
+    /// Always empty when there is no `sharded_pool` (the no-sharded-pool / non-db
+    /// paths map every assignment to the default pool, so nothing is missing).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn missing_assigned_shard_pools(&self) -> Vec<i32> {
+        self.config
+            .sharded_pool
+            .as_ref()
+            .map_or_else(Vec::new, |sharded| {
+                self.config
+                    .shard_assignments
+                    .iter()
+                    .filter(|shard| sharded.exact_pool_for(**shard).is_none())
+                    .map(|shard| shard.as_i32())
+                    .collect()
+            })
+    }
+
     /// Run the main poll loop until shutdown is requested.
     ///
     /// This is the worker's entry point. It keeps polling until shutdown is
@@ -7789,23 +7817,15 @@ impl Worker {
     /// (`run_with_listener`) byte-for-byte unchanged.
     #[allow(clippy::too_many_lines)]
     pub async fn run(&self, pool: &DbPool) {
-        // Refuse to start if ANY assigned shard is missing an exact pool entry
-        // (issue #522 review). Serving only the resolvable shards while the fleet
-        // row still advertises the full assignment list would report coverage for
-        // shards this worker cannot poll or heartbeat, leaving their work
-        // unclaimed behind a misleading fleet/health view. A missing assigned
-        // shard is a ShardedDbPool misconfiguration, so fail fast and loud rather
-        // than partially serving the configured set. (The no-sharded-pool / non-db
-        // paths map every assignment to the default pool, so nothing is missing.)
+        // Defense-in-depth: refuse to start if ANY assigned shard is missing an
+        // exact pool entry (issue #522 review). The authoritative check runs at
+        // process startup (`HarvestRunner::start`) and fails the process before
+        // this task is ever spawned; this guard remains so a direct `Worker::run`
+        // caller that bypasses the runner still fails closed rather than
+        // advertising coverage for shards it cannot serve.
         #[cfg(feature = "db")]
-        if let Some(sharded) = self.config.sharded_pool.as_ref() {
-            let missing: Vec<i32> = self
-                .config
-                .shard_assignments
-                .iter()
-                .filter(|shard| sharded.exact_pool_for(**shard).is_none())
-                .map(|shard| shard.as_i32())
-                .collect();
+        {
+            let missing = self.missing_assigned_shard_pools();
             if !missing.is_empty() {
                 tracing::error!(
                     worker_id = %self.config.worker_id,

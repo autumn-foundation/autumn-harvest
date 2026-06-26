@@ -303,13 +303,25 @@ impl HarvestRunner {
         }
 
         let worker = if config.worker_enabled {
-            Some(Arc::new(
-                Worker::new(
-                    prepared.worker_runtime_config.clone(),
-                    Arc::clone(&registry),
-                )
-                .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
-            ))
+            let worker = Worker::new(
+                prepared.worker_runtime_config.clone(),
+                Arc::clone(&registry),
+            )
+            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+            // Fail the process at startup if any assigned shard is missing from
+            // the sharded pool (issue #522 review). The same condition is
+            // re-checked inside `Worker::run`, but that only aborts the spawned
+            // task — startup would otherwise return Ok and keep serving the API
+            // and scheduler with no local worker, leaving the assigned shards'
+            // work unclaimed behind a coverage view that still advertises them.
+            let missing = worker.missing_assigned_shard_pools();
+            if !missing.is_empty() {
+                return Err(AutumnError::service_unavailable_msg(format!(
+                    "worker is enabled but shard_assignments {missing:?} are missing from the \
+                     sharded_pool; refusing to start — check your ShardedDbPool configuration"
+                )));
+            }
+            Some(Arc::new(worker))
         } else {
             None
         };

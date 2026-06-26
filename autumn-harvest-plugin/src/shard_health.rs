@@ -174,6 +174,7 @@ const REASON_SHARD_POOL_MISSING: &str = "shard_pool_missing";
 const REASON_SHARD_UNREACHABLE: &str = "shard_unreachable";
 const REASON_STORAGE_POOL_MISSING: &str = "storage_pool_missing";
 const REASON_NO_LIVE_WORKER: &str = "no_live_worker";
+const REASON_QUEUE_DEPTH_UNREADABLE: &str = "queue_depth_unreadable";
 const REASON_WORKER_COVERAGE_UNREADABLE: &str = "worker_coverage_unreadable";
 const REASON_WORKER_HEALTH_STALE: &str = "worker_health_stale";
 const REASON_WORKER_QUEUE_UNCOVERED: &str = "worker_queue_uncovered";
@@ -306,6 +307,18 @@ fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
 
 /// Gate readiness when a writable shard has claimable work but no live covering
 /// worker (issue #522). A stale (unresponsive) worker does not count.
+/// Whether an unreadable claimable-queue-depth query should degrade this shard's
+/// readiness (issue #522).
+///
+/// Only writable shards — and candidate shards being evaluated for promotion to
+/// writable — must prove there is no claimable stranded work before reporting
+/// Ready, so only they fail closed when the depth query fails. A read-only shard
+/// takes no new starts and is outside the no-live-worker gate's scope, so an
+/// unreadable depth there is recorded in `error_summary` without blocking.
+fn queue_depth_unreadable_degrades(roles: &[ShardRole], candidate: bool) -> bool {
+    roles.contains(&ShardRole::Writable) || candidate
+}
+
 fn check_no_live_worker_gate(
     shard_id: i32,
     roles: &[ShardRole],
@@ -549,6 +562,19 @@ async fn observe_shard(
 
     if let Some(error) = &queue_depth.error {
         error_summary.get_or_insert_with(|| error.clone());
+        // An unreadable queue-depth query forces `total_pending` to 0, which
+        // makes `check_no_live_worker_gate` bail and would otherwise let a
+        // writable/candidate shard report Ready (issue #522). In that failure
+        // mode the gate cannot prove there is no claimable stranded work, so
+        // fail closed: degrade readiness rather than attaching the error to an
+        // otherwise-ready row.
+        if queue_depth_unreadable_degrades(&roles, candidate) {
+            push_reason_code(&mut reason_codes, REASON_QUEUE_DEPTH_UNREADABLE);
+            blocking_reasons.push(format!(
+                "claimable queue depth could not be read, so stranded work on this \
+                 shard cannot be ruled out: {error}"
+            ));
+        }
     }
     if let Some(error) = &dlq.error {
         error_summary.get_or_insert_with(|| error.clone());
@@ -1312,6 +1338,32 @@ mod tests {
             "should emit no_live_worker when no worker covers the shard"
         );
         assert!(!blocking_reasons.is_empty());
+    }
+
+    #[test]
+    fn queue_depth_unreadable_degrades_writable_and_candidate_shards() {
+        // Writable shard: must prove no stranded work → fail closed.
+        assert!(queue_depth_unreadable_degrades(
+            &[ShardRole::Writable],
+            false
+        ));
+        // Read-only candidate being evaluated for promotion → fail closed.
+        assert!(queue_depth_unreadable_degrades(
+            &[ShardRole::Readable],
+            true
+        ));
+        // Writable candidate → fail closed.
+        assert!(queue_depth_unreadable_degrades(
+            &[ShardRole::Writable],
+            true
+        ));
+        // Plain read-only, non-candidate shard takes no new starts → not blocking.
+        assert!(!queue_depth_unreadable_degrades(
+            &[ShardRole::Readable],
+            false
+        ));
+        // No roles, non-candidate → not blocking.
+        assert!(!queue_depth_unreadable_degrades(&[], false));
     }
 
     #[test]
