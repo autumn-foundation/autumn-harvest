@@ -565,7 +565,6 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
-        max_workflow_attempts_ceiling: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -3579,7 +3578,6 @@ async fn insert_named_workflow_execution(
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
-        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -7091,7 +7089,6 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
-        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

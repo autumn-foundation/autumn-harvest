@@ -156,7 +156,6 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
             workflow_attempt: 1,
             workflow_retry_policy: None,
             retry_of_exec_id: None,
-            max_workflow_attempts_ceiling: None,
         })
         .execute(conn)
         .await

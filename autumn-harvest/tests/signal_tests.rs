@@ -134,7 +134,6 @@ async fn test_send_and_load_signals() {
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
-        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -195,7 +194,6 @@ async fn test_mark_signals_consumed() {
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
-        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -268,7 +266,6 @@ async fn insert_running_execution(conn: &mut diesel_async::AsyncPgConnection) ->
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
-        max_workflow_attempts_ceiling: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
