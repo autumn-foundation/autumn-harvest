@@ -6968,6 +6968,13 @@ fn spawn_queue_depth_sampler(
                 std::collections::HashMap::new();
             let mut age_by_queue: std::collections::HashMap<String, f64> =
                 std::collections::HashMap::new();
+            // Track whether any shard read failed this tick. A partial aggregate
+            // is misleading (a down shard looks like zero backlog) and zero-
+            // filling on a total outage would clear the gauges and silence
+            // autoscaling/alerts, so on ANY failure we skip the emit entirely and
+            // let the gauges hold their last value — matching the pre-aggregation
+            // single-pool path that skipped the sample on read failure (#522).
+            let mut read_failed = false;
             for pool in &pools {
                 let mut conn = match pool.get().await {
                     Ok(conn) => conn,
@@ -6976,6 +6983,7 @@ fn spawn_queue_depth_sampler(
                             error = %error,
                             "queue depth sampler could not acquire DB connection"
                         );
+                        read_failed = true;
                         continue;
                     }
                 };
@@ -6987,6 +6995,7 @@ fn spawn_queue_depth_sampler(
                     }
                     Err(error) => {
                         tracing::debug!(error = %error, "queue depth sample failed");
+                        read_failed = true;
                     }
                 }
                 match queue::oldest_pending_ages(&mut conn, &queues, &circuit_breaker_activities)
@@ -7000,8 +7009,17 @@ fn spawn_queue_depth_sampler(
                     }
                     Err(error) => {
                         tracing::debug!(error = %error, "oldest pending age sample failed");
+                        read_failed = true;
                     }
                 }
+            }
+
+            if read_failed {
+                // Skip this tick rather than publish a partial/zeroed aggregate.
+                if cancel.is_cancelled() {
+                    break;
+                }
+                continue;
             }
 
             // Emit the aggregated gauges, zero-filling configured queues with no
@@ -7054,6 +7072,9 @@ fn spawn_concurrency_sampler(
                 std::collections::HashMap::new();
             let mut deferred_by_key: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
+            // Skip the whole tick on any shard read failure so a partial aggregate
+            // doesn't under-report concurrency during a storage outage (#522).
+            let mut read_failed = false;
             for pool in &pools {
                 let mut conn = match pool.get().await {
                     Ok(conn) => conn,
@@ -7062,6 +7083,7 @@ fn spawn_concurrency_sampler(
                             error = %error,
                             "concurrency sampler could not acquire DB connection"
                         );
+                        read_failed = true;
                         continue;
                     }
                 };
@@ -7090,8 +7112,16 @@ fn spawn_concurrency_sampler(
                     }
                     Err(error) => {
                         tracing::debug!(error = %error, "concurrency key stats sample failed");
+                        read_failed = true;
                     }
                 }
+            }
+
+            if read_failed {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                continue;
             }
 
             for (metric_key, in_flight) in &in_flight_by_key {
@@ -7148,6 +7178,9 @@ fn spawn_rate_limit_sampler(
                 std::collections::HashMap::new();
             let mut refill_by_key: std::collections::HashMap<String, f64> =
                 std::collections::HashMap::new();
+            // Skip the whole tick on any shard read failure so a partial aggregate
+            // doesn't under-report available tokens during a storage outage (#522).
+            let mut read_failed = false;
             for pool in &pools {
                 let mut conn = match pool.get().await {
                     Ok(conn) => conn,
@@ -7156,6 +7189,7 @@ fn spawn_rate_limit_sampler(
                             error = %error,
                             "rate limit sampler could not acquire DB connection"
                         );
+                        read_failed = true;
                         continue;
                     }
                 };
@@ -7181,8 +7215,16 @@ fn spawn_rate_limit_sampler(
                     }
                     Err(error) => {
                         tracing::debug!(error = %error, "rate limit sampler query failed");
+                        read_failed = true;
                     }
                 }
+            }
+
+            if read_failed {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                continue;
             }
 
             for (key, tokens) in &tokens_by_key {
@@ -7577,6 +7619,10 @@ fn spawn_history_oversized_sampler(
             // gauge.
             let mut count_by_workflow: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
+            // Skip the whole tick on any shard read failure so a partial aggregate
+            // (or the zero-fill below) doesn't clear the gauge during an outage
+            // (#522).
+            let mut read_failed = false;
             for pool in &pools {
                 let mut conn = match pool.get().await {
                     Ok(conn) => conn,
@@ -7585,6 +7631,7 @@ fn spawn_history_oversized_sampler(
                             error = %error,
                             "history oversized sampler could not acquire DB connection"
                         );
+                        read_failed = true;
                         continue;
                     }
                 };
@@ -7597,8 +7644,16 @@ fn spawn_history_oversized_sampler(
                     }
                     Err(error) => {
                         tracing::debug!(error = %error, "history oversized sample failed");
+                        read_failed = true;
                     }
                 }
+            }
+
+            if read_failed {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                continue;
             }
 
             let active_workflows: std::collections::HashSet<String> =
