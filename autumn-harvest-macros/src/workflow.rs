@@ -795,7 +795,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         workflow_attempt: 1,
                         workflow_retry_policy: info.retry_policy.clone(),
                         retry_of_exec_id: ::std::option::Option::None,
-                        max_workflow_attempts_ceiling: ::std::option::Option::None,
+                        max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                     };
 
                     let started = client.start_or_load(conn, params).await?;

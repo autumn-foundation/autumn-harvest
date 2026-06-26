@@ -408,8 +408,12 @@ impl HandlerRegistry {
 
     /// Set the server-side ceiling on `workflow_attempt` (issue #523).
     #[must_use]
-    pub const fn with_max_workflow_attempts_ceiling(mut self, ceiling: Option<u32>) -> Self {
+    pub fn with_max_workflow_attempts_ceiling(mut self, ceiling: Option<u32>) -> Self {
         self.max_workflow_attempts_ceiling = ceiling;
+        #[cfg(feature = "db")]
+        if let Ok(mut lock) = crate::completion_trigger::GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING.write() {
+            *lock = ceiling;
+        }
         self
     }
 
@@ -2387,14 +2391,6 @@ async fn persist_workflow_failure(
                         .await?;
                     queue::fail_task(conn, task_id, &error).await?;
                     let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
-                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                        conn,
-                        exec_id,
-                        crate::completion_trigger::TerminalState::Failed,
-                        metrics,
-                    )
-                    .await?;
-                    deferred.extend(triggers);
 
                     // Start the retry execution atomically inside this failure transaction.
                     // Use the retry exec_id as workflow_id so the original FAILED row is
@@ -2472,6 +2468,20 @@ async fn persist_workflow_failure(
                                 );
                             }
                         }
+                    }
+
+                    // Only evaluate Failed completion triggers on the final failure.
+                    // Triggers must not fire for a transient failure that will be retried —
+                    // compensating/alerting workflows should only run when the chain exhausts.
+                    if !retry_committed {
+                        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                            conn,
+                            exec_id,
+                            crate::completion_trigger::TerminalState::Failed,
+                            metrics,
+                        )
+                        .await?;
+                        deferred.extend(triggers);
                     }
 
                     Ok((deferred, retry_committed))

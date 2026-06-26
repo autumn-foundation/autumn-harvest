@@ -224,6 +224,14 @@ pub static GLOBAL_MAX_WORKFLOW_INPUT_BYTES: std::sync::RwLock<u64> =
 pub static GLOBAL_DEFAULT_WORKFLOW_QUEUE: std::sync::RwLock<Option<String>> =
     std::sync::RwLock::new(None);
 
+/// Server-side ceiling on `workflow_attempt` for completion-trigger-started workflows (issue #523).
+///
+/// Mirrors the per-start ceiling applied on API/scheduler paths. Set at worker startup via
+/// `HandlerRegistry::with_max_workflow_attempts_ceiling`.
+#[cfg(feature = "db")]
+pub static GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING: std::sync::RwLock<Option<u32>> =
+    std::sync::RwLock::new(None);
+
 #[cfg(feature = "db")]
 pub async fn resolve_target_queue(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -310,6 +318,8 @@ pub struct DeferredTriggerStart {
     pub sla: Option<std::time::Duration>,
     /// Resolved workflow-type retry policy default (issue #523).
     pub retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Server-side ceiling on `max_attempts` (issue #523). Clamped at start time.
+    pub max_workflow_attempts_ceiling: Option<u32>,
 }
 
 #[cfg(feature = "db")]
@@ -381,7 +391,7 @@ impl DeferredTriggerStart {
                     workflow_attempt: 1,
                     workflow_retry_policy: self.retry_policy.clone(),
                     retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: None,
+                    max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
                 },
             )
             .await;
@@ -571,6 +581,9 @@ pub fn evaluate_triggers_for_execution<'a>(
                     })
             };
 
+            let max_workflow_attempts_ceiling =
+                GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING.read().ok().and_then(|g| *g);
+
             if target_shard == source_shard {
                 let queue_name = if let Some(ref q) = trigger_db.queue_name {
                     q.clone()
@@ -611,7 +624,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         workflow_attempt: 1,
                         workflow_retry_policy: target_retry_policy.clone(),
                         retry_of_exec_id: None,
-                        max_workflow_attempts_ceiling: None,
+                        max_workflow_attempts_ceiling,
                     },
                 )
                 .await
@@ -698,6 +711,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                     severity: target_severity,
                     sla: target_sla,
                     retry_policy: target_retry_policy,
+                    max_workflow_attempts_ceiling,
                 });
             }
         }
