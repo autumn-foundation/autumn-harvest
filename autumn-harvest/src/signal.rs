@@ -69,6 +69,10 @@ pub async fn send_signal_idempotent(
     use crate::schema::harvest_signals;
     use crate::schema::harvest_workflow_executions;
 
+    // An empty key is not in the partial index's NULL exclusion, so it would
+    // collide across unrelated signals — treat it as no key (at-least-once).
+    let idempotency_key = idempotency_key.filter(|k| !k.is_empty());
+
     conn.transaction::<bool, HarvestError, _>(|conn| {
         async move {
             let execution = harvest_workflow_executions::table

@@ -515,3 +515,21 @@ async fn standalone_signal_without_key_is_at_least_once() {
         "unkeyed deliveries are at-least-once: both report delivered: {b2}"
     );
 }
+
+#[tokio::test]
+async fn standalone_signal_empty_header_key_is_rejected() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let exec = start_running_workflow(&app, "idem-empty-1").await;
+    let uri = format!("/workflows/{exec}/signal/approval");
+
+    // A present but empty Idempotency-Key header is rejected with 400 rather
+    // than silently degraded to at-least-once.
+    let (status, _) = post_signal(&app, &uri, Some(""), json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "empty Idempotency-Key header must be rejected with 400"
+    );
+}

@@ -229,8 +229,10 @@ out-of-band exactly-once key — the request body stays the raw signal payload:
 - `Idempotency-Key:` HTTP header, **or**
 - `?idempotency_key=` query parameter.
 
-The header wins when both are present. The response reports whether the signal
-was freshly queued:
+The header wins when both are present. A present `Idempotency-Key` header that
+is empty or not valid UTF-8 is rejected with `400 Bad Request` rather than
+silently degraded to at-least-once, so a client that intended exactly-once is
+never fooled. The response reports whether the signal was freshly queued:
 
 ```bash
 # First delivery — queued.

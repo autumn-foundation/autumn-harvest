@@ -1122,7 +1122,7 @@
           "name": "Idempotency-Key",
           "in": "header",
           "required": false,
-          "description": "Exactly-once delivery key (issue #521). Wins over the idempotency_key query param when both are present."
+          "description": "Exactly-once delivery key (issue #521). Wins over the idempotency_key query param when both are present. A present but empty or non-UTF-8 value is rejected with 400 rather than degraded to at-least-once."
         },
         {
           "name": "idempotency_key",

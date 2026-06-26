@@ -10361,16 +10361,22 @@ async fn signal_workflow(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
     let route = "POST /workflows/{id}/signal/{signal_name}";
 
-    // Exactly-once delivery key: a present `Idempotency-Key` header wins
-    // outright — a malformed or empty value yields no key rather than silently
-    // falling through to the `?idempotency_key=` query param. The query param is
-    // consulted only when the header is absent. No key reproduces today's
-    // at-least-once behavior exactly.
+    // Exactly-once delivery key. A present `Idempotency-Key` header wins
+    // outright: an empty or non-UTF-8 value is rejected with 400 rather than
+    // silently degraded to at-least-once, so a client that intended exactly-once
+    // is never fooled. The `?idempotency_key=` query param is consulted only
+    // when the header is absent (an empty param there is treated as omitted).
+    // No key at all reproduces today's at-least-once behavior exactly.
     let idempotency_key: Option<String> = if let Some(raw) = headers.get(HEADER_IDEMPOTENCY_KEY) {
-        raw.to_str()
-            .ok()
-            .map(str::to_string)
-            .filter(|s| !s.is_empty())
+        let key = raw.to_str().map_err(|_| {
+            AutumnError::bad_request_msg("Idempotency-Key header is not valid UTF-8")
+        })?;
+        if key.is_empty() {
+            return Err(AutumnError::bad_request_msg(
+                "Idempotency-Key header is empty",
+            ));
+        }
+        Some(key.to_string())
     } else {
         query.idempotency_key.filter(|s| !s.is_empty())
     };
