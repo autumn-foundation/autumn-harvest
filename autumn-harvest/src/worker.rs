@@ -411,7 +411,9 @@ impl HandlerRegistry {
     pub fn with_max_workflow_attempts_ceiling(mut self, ceiling: Option<u32>) -> Self {
         self.max_workflow_attempts_ceiling = ceiling;
         #[cfg(feature = "db")]
-        if let Ok(mut lock) = crate::completion_trigger::GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING.write() {
+        if let Ok(mut lock) =
+            crate::completion_trigger::GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING.write()
+        {
             *lock = ceiling;
         }
         self
