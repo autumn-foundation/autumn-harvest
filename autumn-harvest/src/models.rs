@@ -136,6 +136,12 @@ pub struct WorkflowExecution {
     /// Logical schedule slot this run fires for (issue #488); carryover is ordered by
     /// this, not `completed_at`. `None` for manual starts.
     pub scheduled_for: Option<DateTime<Utc>>,
+    /// Attempt number of this execution in its retry chain (issue #523). 1 = first attempt.
+    pub workflow_attempt: i32,
+    /// Frozen effective retry policy for this execution (issue #523). NULL = no auto-retry.
+    pub workflow_retry_policy: Option<serde_json::Value>,
+    /// ID of the previous failed execution in this retry chain (issue #523). NULL for first attempt.
+    pub retry_of_exec_id: Option<Uuid>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -174,6 +180,12 @@ pub struct NewWorkflowExecution<'a> {
     /// Logical schedule slot this run fires for (issue #488); carryover is ordered by
     /// this, not `completed_at`. `None` for manual starts.
     pub scheduled_for: Option<DateTime<Utc>>,
+    /// Attempt number of this execution in its retry chain (issue #523). 1 = first attempt.
+    pub workflow_attempt: i32,
+    /// Frozen effective retry policy for this execution (issue #523). NULL = no auto-retry.
+    pub workflow_retry_policy: Option<serde_json::Value>,
+    /// ID of the previous failed execution in this retry chain (issue #523). NULL for first attempt.
+    pub retry_of_exec_id: Option<Uuid>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -435,6 +447,8 @@ pub struct HarvestSchedule {
     pub last_catchup_dropped: i32,
     /// Timestamp of the most recent recovery tick that produced drops (issue #484). NULL = none yet.
     pub last_catchup_at: Option<DateTime<Utc>>,
+    /// Default retry policy for runs started by this schedule (issue #523). NULL = no retry.
+    pub retry_policy: Option<serde_json::Value>,
 }
 
 /// Insert struct for registering a new schedule (DAG or workflow).

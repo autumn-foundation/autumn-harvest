@@ -425,6 +425,10 @@ pub enum WorkflowEvent {
         signal_name: String,
         /// JSON payload to deliver to the receiving workflow.
         payload: serde_json::Value,
+        /// Additive optional exactly-once delivery key; dedups re-issued
+        /// requests against `uq_harvest_signals_idem`. Older events load as `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     /// The signal was successfully inserted into the target workflow's signal
     /// queue (or durably queued via the outbox for cross-shard delivery).
@@ -620,6 +624,27 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+
+    // ── Workflow-level retry linkage (issue #523) ─────────────────────────────────
+    /// Appended to a sealed `FAILED` execution immediately after `WorkflowFailed`
+    /// when the engine auto-schedules a retry run.
+    ///
+    /// ## Replay determinism
+    ///
+    /// This event lives ONLY in the sealed failed run's history and is appended
+    /// **after** the terminal `WorkflowFailed` event. The
+    /// [`crate::replay::HistoryMatcher`] stops consuming events after a terminal
+    /// lifecycle event, so this trailing event is transparent to replay: the
+    /// failed run is already sealed; its retry is a separate execution.
+    WorkflowRetryScheduled {
+        /// The execution ID of the newly-created retry run.
+        retry_exec_id: ExecutionId,
+        /// Attempt number of the NEW run (= `failed_run.workflow_attempt` + 1).
+        attempt: u32,
+        /// Wall-clock instant when the retry becomes claimable by a worker.
+        /// `Utc::now()` for immediate retries, or `now + backoff` for delayed ones.
+        fire_at: DateTime<Utc>,
+    },
 }
 
 impl WorkflowEvent {
@@ -672,6 +697,7 @@ impl WorkflowEvent {
             Self::ExternalCancelDelivered { .. } => "ExternalCancelDelivered",
             Self::ExternalCancelFailed { .. } => "ExternalCancelFailed",
             Self::WorkflowRedriven { .. } => "WorkflowRedriven",
+            Self::WorkflowRetryScheduled { .. } => "WorkflowRetryScheduled",
         }
     }
 
@@ -692,6 +718,10 @@ impl WorkflowEvent {
                 // never consumed by the workflow function itself, so must be skipped
                 // during unconsumed-event checks to avoid false non-determinism reports.
                 | Self::ChildWorkflowCascadeApplied { .. }
+                // Appended to the failed run's history after WorkflowFailed as a
+                // durable linkage record; the failed run is sealed and the event is
+                // never consumed by its workflow function on replay.
+                | Self::WorkflowRetryScheduled { .. }
         )
     }
 }
@@ -1049,6 +1079,11 @@ mod tests {
                 error: "transient".into(),
                 attempt: 1,
             },
+            WorkflowEvent::LocalActivityExhausted {
+                activity_id: ActivityExecId::new(),
+                error: "permanent".into(),
+                attempt: 3,
+            },
             WorkflowEvent::UpdateAdmitted {
                 update_id: crate::types::UpdateId::new(),
                 name: "approve".into(),
@@ -1079,6 +1114,7 @@ mod tests {
                 target: ExecutionId::new(),
                 signal_name: "cancel".into(),
                 payload: serde_json::Value::Null,
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalDelivered {
                 signal_id: crate::types::ExternalSignalId::new(),
@@ -1105,11 +1141,43 @@ mod tests {
                 resumed_at: Utc::now(),
                 actor: "oncall".into(),
             },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id: ExecutionId::new(),
+                workflow_name: "child_wf".into(),
+                input: serde_json::Value::Null,
+                parent_close_policy: crate::types::ParentClosePolicy::Abandon,
+            },
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id: ExecutionId::new(),
+                policy: crate::types::ParentClosePolicy::RequestCancel,
+                action: "request_cancel".into(),
+            },
+            WorkflowEvent::ExternalCancelRequested {
+                cancel_id: crate::types::ExternalCancelId::new(),
+                target: ExecutionId::new(),
+            },
+            WorkflowEvent::ExternalCancelDelivered {
+                cancel_id: crate::types::ExternalCancelId::new(),
+            },
+            WorkflowEvent::ExternalCancelFailed {
+                cancel_id: crate::types::ExternalCancelId::new(),
+                reason_code: "target_unknown".into(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: Utc::now(),
+                dead_letter_id: Uuid::new_v4(),
+                reason: None,
+            },
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: ExecutionId::new(),
+                attempt: 2,
+                fire_at: Utc::now(),
+            },
         ];
 
-        assert_eq!(events.len(), 37);
+        assert_eq!(events.len(), 45);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 37, "duplicate type names detected");
+        assert_eq!(names.len(), 45, "duplicate type names detected");
     }
 
     // ── SideEffectRecorded tests (issue #384) ─────────────────────────────────
@@ -1227,6 +1295,7 @@ mod tests {
             target,
             signal_name: "tenant_cancel".into(),
             payload: serde_json::json!({"reason": "billing_lapse"}),
+            idempotency_key: Some("evt_123".into()),
         };
         assert_eq!(event.type_name(), "ExternalSignalRequested");
         let json = serde_json::to_string(&event)?;
@@ -1237,12 +1306,41 @@ mod tests {
                 target: t,
                 signal_name,
                 payload,
+                idempotency_key,
             } => {
                 assert_eq!(sid, signal_id);
                 assert_eq!(t, target);
                 assert_eq!(signal_name, "tenant_cancel");
                 assert_eq!(payload["reason"], "billing_lapse");
+                assert_eq!(idempotency_key.as_deref(), Some("evt_123"));
             }
+            _ => panic!("wrong variant"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_signal_requested_pre_521_json_deserializes_without_key()
+    -> Result<(), serde_json::Error> {
+        // An older event has no `idempotency_key` field; the additive
+        // `#[serde(default)]` must deserialize it to `None` (append-only
+        // invariant: no new variant, old JSON still loads).
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+        let legacy = serde_json::json!({
+            "type": "ExternalSignalRequested",
+            "data": {
+                "signal_id": signal_id,
+                "target": target,
+                "signal_name": "tenant_cancel",
+                "payload": {"reason": "billing_lapse"}
+            }
+        });
+        let back: WorkflowEvent = serde_json::from_value(legacy)?;
+        match back {
+            WorkflowEvent::ExternalSignalRequested {
+                idempotency_key, ..
+            } => assert_eq!(idempotency_key, None),
             _ => panic!("wrong variant"),
         }
         Ok(())
@@ -1313,6 +1411,7 @@ mod tests {
                 target,
                 signal_name: "x".into(),
                 payload: serde_json::Value::Null,
+                idempotency_key: None,
             }
             .is_terminal_lifecycle()
         );

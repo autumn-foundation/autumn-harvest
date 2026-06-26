@@ -154,6 +154,9 @@ async fn seed_external_handoff(
         sla_deadline_at: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&execution)

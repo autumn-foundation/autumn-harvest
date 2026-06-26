@@ -124,6 +124,9 @@ const INIT_SQL: &str = concat!(
     "\n",
     // schedule_id column + carryover index (issue #488)
     include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 // ── Domain types ──────────────────────────────────────────────────────────────
@@ -234,6 +237,7 @@ fn make_registry_for(
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
             sla: None,
         }],
         vec![],
@@ -450,6 +454,10 @@ async fn manual_start_has_no_carryover() {
             sla: None,
             schedule_id: None, // explicitly None for manual start
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await

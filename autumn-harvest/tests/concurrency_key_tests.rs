@@ -30,6 +30,7 @@ fn workflow_info_has_concurrency_fields() {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     };
     assert!(info.concurrency.is_none());
 }
@@ -58,6 +59,7 @@ fn workflow_info_with_concurrency_policy() {
         input_schema: None,
         output_schema: None,
         error_schema: None,
+        retry_policy: None,
     };
     let policy = info.concurrency.expect("should have concurrency policy");
     assert_eq!(policy.key_expr, "input.tenant_id");

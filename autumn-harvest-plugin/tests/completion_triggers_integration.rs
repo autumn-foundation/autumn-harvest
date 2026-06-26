@@ -170,7 +170,10 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
     ),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -265,6 +268,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -284,6 +288,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -303,6 +308,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: Some(target_schema_fn),
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -325,6 +331,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -344,6 +351,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -363,6 +371,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -547,6 +556,10 @@ async fn test_trigger_evaluations_same_shard() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -661,6 +674,10 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -770,6 +787,10 @@ async fn test_trigger_input_mapping_static_and_projection() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -846,6 +867,10 @@ async fn test_trigger_input_mapping_static_and_projection() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -944,6 +969,10 @@ async fn test_trigger_state_matching_and_deduplication() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1119,6 +1148,10 @@ async fn test_trigger_cross_shard() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1222,6 +1255,10 @@ async fn test_completion_trigger_via_worker_run() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1339,6 +1376,10 @@ async fn test_trigger_with_custom_queue() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1524,6 +1565,10 @@ async fn test_trigger_outbox_retry_and_sweep() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -1700,6 +1745,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
         end_at: None,
         max_runs: None,
         catchup_policy: None,
+        retry_policy: None,
     };
     autumn_harvest::register_workflow_schedules(&mut conn0, &[ws])
         .await
@@ -1737,6 +1783,10 @@ async fn test_trigger_cross_shard_queue_preservation() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -2083,6 +2133,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -2101,6 +2152,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
                 owner: None,
                 runbook_url: None,
                 severity: None,
@@ -2200,6 +2252,10 @@ async fn test_trigger_evaluations_schema_validation() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -2271,6 +2327,10 @@ async fn test_trigger_evaluations_schema_validation() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -2384,6 +2444,10 @@ async fn test_trigger_emits_fire_metric_outcomes() {
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await

@@ -394,6 +394,9 @@ pub enum WorkflowCommand {
         /// When `true`, `ExternalSignalRequested` is already in history and must
         /// not be appended again (crash-recovery path).
         already_requested: bool,
+        /// Optional exactly-once delivery key, persisted in the
+        /// `ExternalSignalRequested` event to dedup the target's signal insert.
+        idempotency_key: Option<String>,
     },
     /// Request cancellation of a sibling workflow execution (issue #492).
     RequestCancelExternalWorkflow {
@@ -3344,8 +3347,36 @@ impl WorkflowContext {
         signal_name: &str,
         payload: P,
     ) -> HarvestResult<()> {
+        self.signal_external_workflow_with_idempotency(target, signal_name, payload, None)
+            .await
+    }
+
+    /// Send a named signal to another workflow with an opt-in exactly-once
+    /// delivery key.
+    ///
+    /// When `idempotency_key` is `Some`, the target's delivery insert is
+    /// deduplicated against `uq_harvest_signals_idem`, so the cross-shard outbox
+    /// and any crash-recovery re-delivery land at most one `SignalReceived`
+    /// event. The key is persisted in the `ExternalSignalRequested` event and
+    /// reused verbatim on replay/recovery; `None` is legacy at-least-once.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`signal_external_workflow`](Self::signal_external_workflow).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn signal_external_workflow_with_idempotency<P: serde::Serialize>(
+        &self,
+        target: ExecutionId,
+        signal_name: &str,
+        payload: P,
+        idempotency_key: impl Into<Option<String>>,
+    ) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
+        let idempotency_key = idempotency_key.into();
         let history_match = self.match_history(|m| m.match_external_signal(target, signal_name));
 
         match history_match {
@@ -3378,9 +3409,20 @@ impl WorkflowContext {
             HistoryMatch::ExternalSignalInProgress {
                 signal_id,
                 payload: recorded_payload,
+                idempotency_key: recorded_idempotency_key,
             } => {
-                self.dispatch_signal_command(target, signal_name, recorded_payload, signal_id, true)
-                    .await
+                // Reuse the recorded key (not the current argument) so a code
+                // change to the key expression cannot diverge an in-flight
+                // delivery that the outbox may resolve.
+                self.dispatch_signal_command(
+                    target,
+                    signal_name,
+                    recorded_payload,
+                    signal_id,
+                    true,
+                    recorded_idempotency_key,
+                )
+                .await
             }
 
             // First live call: generate a new signal_id and dispatch.
@@ -3405,6 +3447,7 @@ impl WorkflowContext {
                     payload_json,
                     ExternalSignalId::new(),
                     false,
+                    idempotency_key,
                 )
                 .await
             }
@@ -3438,6 +3481,7 @@ impl WorkflowContext {
         payload: P,
         signal_id: ExternalSignalId,
         already_requested: bool,
+        idempotency_key: Option<String>,
     ) -> HarvestResult<()> {
         let payload_json = serde_json::to_value(&payload)?;
         let (tx, rx) = oneshot::channel();
@@ -3448,6 +3492,7 @@ impl WorkflowContext {
             payload: payload_json,
             result_tx: tx,
             already_requested,
+            idempotency_key,
         });
         match rx.await {
             Ok(Ok(())) => Ok(()),
@@ -8341,6 +8386,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signal_external_workflow_with_idempotency_threads_key_into_command() {
+        // The opt-in key must be carried on the emitted command so the worker
+        // persists it into ExternalSignalRequested and dedupes the target's
+        // signal insert.
+        let target = ExecutionId::new();
+        let cmds = {
+            let ctx = WorkflowContext::new_test();
+            let ctx_ref = &ctx;
+            let cmd_fut = ctx_ref.signal_external_workflow_with_idempotency(
+                target,
+                "tenant_cancel",
+                serde_json::json!({"reason": "billing_lapse"}),
+                "evt_abc".to_string(),
+            );
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+            ctx.drain_commands()
+        };
+
+        assert_eq!(cmds.len(), 1, "one SignalExternalWorkflow command expected");
+        match &cmds[0] {
+            WorkflowCommand::SignalExternalWorkflow {
+                idempotency_key, ..
+            } => {
+                assert_eq!(
+                    idempotency_key.as_deref(),
+                    Some("evt_abc"),
+                    "the opt-in key must be threaded onto the command"
+                );
+            }
+            other => panic!("expected SignalExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_without_key_has_none_on_command() {
+        // The plain (legacy) method must emit a command with no key.
+        let target = ExecutionId::new();
+        let cmds = {
+            let ctx = WorkflowContext::new_test();
+            let ctx_ref = &ctx;
+            let cmd_fut = ctx_ref.signal_external_workflow(
+                target,
+                "tenant_cancel",
+                serde_json::json!({"reason": "billing_lapse"}),
+            );
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+            ctx.drain_commands()
+        };
+        match &cmds[0] {
+            WorkflowCommand::SignalExternalWorkflow {
+                idempotency_key, ..
+            } => assert_eq!(idempotency_key.as_deref(), None),
+            other => panic!("expected SignalExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_external_workflow_crash_recovery_reuses_recorded_key() {
+        // Replay-safety: ExternalSignalRequested is durable but no terminal
+        // event follows (worker crashed mid-delivery). The re-dispatch
+        // must reuse the *recorded* key, even if the current code passes a
+        // different one — otherwise a code change could diverge an in-flight
+        // delivery that the outbox later resolves.
+        let signal_id = crate::types::ExternalSignalId::new();
+        let target = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id,
+                target,
+                signal_name: "tenant_cancel".into(),
+                payload: serde_json::json!({"reason": "billing_lapse"}),
+                idempotency_key: Some("recorded_key".into()),
+            },
+            // no terminal event → crash-recovery path
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let ctx_ref = &ctx;
+        // Current code passes a *different* key; the recorded one must win.
+        let cmd_fut = ctx_ref.signal_external_workflow_with_idempotency(
+            target,
+            "tenant_cancel",
+            serde_json::json!({"reason": "billing_lapse"}),
+            "different_key".to_string(),
+        );
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), cmd_fut).await;
+        let cmds = ctx.drain_commands();
+
+        assert_eq!(cmds.len(), 1, "crash recovery re-emits the signal command");
+        match &cmds[0] {
+            WorkflowCommand::SignalExternalWorkflow {
+                already_requested,
+                idempotency_key,
+                signal_id: cmd_signal_id,
+                ..
+            } => {
+                assert!(already_requested, "request event already durable");
+                assert_eq!(
+                    idempotency_key.as_deref(),
+                    Some("recorded_key"),
+                    "recovery must reuse the recorded key, not the current argument"
+                );
+                assert_eq!(
+                    *cmd_signal_id, signal_id,
+                    "recovery reuses recorded signal_id"
+                );
+            }
+            other => panic!("expected SignalExternalWorkflow, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn signal_external_workflow_replays_delivered_outcome() {
         let signal_id = crate::types::ExternalSignalId::new();
         let target = ExecutionId::new();
@@ -8358,6 +8522,7 @@ mod tests {
                 target,
                 signal_name: "tenant_cancel".into(),
                 payload: serde_json::json!({"reason": "billing_lapse"}),
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalDelivered { signal_id },
         ];
@@ -8393,6 +8558,7 @@ mod tests {
                 target,
                 signal_name: "cancel".into(),
                 payload: Value::Null,
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalFailed {
                 signal_id,
@@ -8433,6 +8599,7 @@ mod tests {
                 target,
                 signal_name: "notify".into(),
                 payload: Value::Null,
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalFailed {
                 signal_id,
@@ -8472,6 +8639,7 @@ mod tests {
                 target,
                 signal_name: "cancel".into(),
                 payload: Value::Null,
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalDelivered { signal_id },
         ];
@@ -8510,6 +8678,7 @@ mod tests {
                 target,
                 signal_name: "cancel".into(),
                 payload: Value::Null,
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalDelivered { signal_id },
         ];
@@ -8558,6 +8727,7 @@ mod tests {
                 target,
                 signal_name: "cancel".into(),
                 payload: Value::Null,
+                idempotency_key: None,
             },
             WorkflowEvent::ExternalSignalDelivered { signal_id },
         ];
@@ -8861,6 +9031,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }
     }
 

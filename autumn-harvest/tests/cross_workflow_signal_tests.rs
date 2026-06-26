@@ -99,7 +99,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
     "\n",
-    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -257,6 +260,7 @@ async fn test_same_shard_not_found_retry() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "target_workflow",
@@ -277,6 +281,7 @@ async fn test_same_shard_not_found_retry() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ])
         .worker(WorkerConfig::default())
@@ -327,6 +332,10 @@ async fn test_same_shard_not_found_retry() {
         sla: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -369,6 +378,10 @@ async fn test_same_shard_not_found_retry() {
         sla: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -434,6 +447,7 @@ async fn test_cross_shard_outbox_delivery() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "target_workflow",
@@ -454,6 +468,7 @@ async fn test_cross_shard_outbox_delivery() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ])
         .worker(WorkerConfig::default())
@@ -505,6 +520,10 @@ async fn test_cross_shard_outbox_delivery() {
         sla: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -540,6 +559,10 @@ async fn test_cross_shard_outbox_delivery() {
         sla: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -601,6 +624,7 @@ async fn test_grace_window_expiration() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }])
         .worker(WorkerConfig::default().with_unknown_target_grace_window(Duration::from_secs(1)))
         .build();
@@ -651,6 +675,10 @@ async fn test_grace_window_expiration() {
         sla: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -728,6 +756,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
             WorkflowInfo {
                 name: "target_workflow",
@@ -748,6 +777,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             },
         ])
         .worker(WorkerConfig::default())
@@ -798,6 +828,10 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         sla: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -840,6 +874,10 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         sla: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await

@@ -155,7 +155,10 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260613000001_harvest_schedule_catchup_window/up.sql"
     ),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -286,6 +289,10 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await
@@ -511,6 +518,10 @@ async fn seed_child(
             sla: None,
             schedule_id: None,
             scheduled_for: None,
+            workflow_attempt: 1,
+            workflow_retry_policy: None,
+            retry_of_exec_id: None,
+            max_workflow_attempts_ceiling: None,
         },
     )
     .await

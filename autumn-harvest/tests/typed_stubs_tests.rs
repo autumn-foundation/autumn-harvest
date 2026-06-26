@@ -102,7 +102,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
     "\n",
-    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql")
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 async fn setup_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -165,6 +168,14 @@ async fn check_progress(_ctx: &WorkflowContext, step: i64) -> Result<String, Str
 #[allow(dead_code)]
 #[signal(workflow = "onboarding")]
 fn subscription_active(_ctx: &WorkflowContext, _val: i64) {}
+
+// Regression: a payload parameter literally named `idempotency_key` must not
+// collide with the generated delivery-key argument on the `_idempotent` stub.
+#[allow(dead_code)]
+#[signal(workflow = "onboarding")]
+fn payment_received(_ctx: &WorkflowContext, idempotency_key: String) {
+    let _ = idempotency_key;
+}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 

@@ -266,6 +266,7 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
         Arc::new(HashMap::new()),
@@ -368,6 +369,7 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }],
         vec![],
     ));

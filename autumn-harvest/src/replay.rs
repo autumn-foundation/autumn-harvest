@@ -127,6 +127,10 @@ pub enum HistoryMatch {
         /// argument value, so that target receives consistent data if the
         /// workflow code changed the payload expression between crash and recovery.
         payload: serde_json::Value,
+        /// Idempotency key recorded in the durable `ExternalSignalRequested`
+        /// event, re-sent verbatim so re-delivery dedups against the target's
+        /// partial unique index. `None` for older events / unkeyed sends.
+        idempotency_key: Option<String>,
     },
     /// History contains an `ExternalSignalFailed` terminal event for a
     /// `signal_external_workflow` call.  Carries the original `signal_id` from
@@ -222,6 +226,9 @@ struct StashedExternalSignal {
     /// payload that was originally sent, not whatever the workflow currently
     /// passes as an argument.
     payload: serde_json::Value,
+    /// Durable idempotency key from the recorded `ExternalSignalRequested`
+    /// event, reused verbatim on crash-recovery re-dispatch.
+    idempotency_key: Option<String>,
     terminal: Option<StashedSignalTerminal>,
 }
 
@@ -375,12 +382,14 @@ impl HistoryMatcher {
         target: ExecutionId,
         signal_name: String,
         payload: Value,
+        idempotency_key: Option<String>,
     ) {
         self.pending_external_signals.push(StashedExternalSignal {
             signal_id,
             target,
             signal_name,
             payload,
+            idempotency_key,
             terminal: None,
         });
         self.consumed_signal_events.insert(cursor);
@@ -551,16 +560,16 @@ impl HistoryMatcher {
                     target,
                     signal_name,
                     payload,
+                    idempotency_key,
                 } => {
-                    let stashed = StashedExternalSignal {
-                        signal_id: *signal_id,
-                        target: *target,
-                        signal_name: signal_name.clone(),
-                        payload: payload.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_signals.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
+                    self.stash_external_signal_request(
+                        scan_cursor,
+                        *signal_id,
+                        *target,
+                        signal_name.clone(),
+                        payload.clone(),
+                        idempotency_key.clone(),
+                    );
                     scan_cursor += 1;
                 }
                 WorkflowEvent::ExternalSignalDelivered { signal_id } => {
@@ -735,16 +744,16 @@ impl HistoryMatcher {
                     target,
                     signal_name,
                     payload,
+                    idempotency_key,
                 } => {
-                    let stashed = StashedExternalSignal {
-                        signal_id: *signal_id,
-                        target: *target,
-                        signal_name: signal_name.clone(),
-                        payload: payload.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_signals.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
+                    self.stash_external_signal_request(
+                        scan_cursor,
+                        *signal_id,
+                        *target,
+                        signal_name.clone(),
+                        payload.clone(),
+                        idempotency_key.clone(),
+                    );
                     scan_cursor += 1;
                 }
                 WorkflowEvent::ExternalSignalDelivered { signal_id } => {
@@ -1010,16 +1019,16 @@ impl HistoryMatcher {
                     target,
                     signal_name,
                     payload,
+                    idempotency_key,
                 } => {
-                    let stashed = StashedExternalSignal {
-                        signal_id: *signal_id,
-                        target: *target,
-                        signal_name: signal_name.clone(),
-                        payload: payload.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_signals.push(stashed);
-                    self.consumed_signal_events.insert(self.cursor);
+                    self.stash_external_signal_request(
+                        self.cursor,
+                        *signal_id,
+                        *target,
+                        signal_name.clone(),
+                        payload.clone(),
+                        idempotency_key.clone(),
+                    );
                     self.cursor += 1;
                     self.advance_to_next_unconsumed_event();
                 }
@@ -1469,16 +1478,16 @@ impl HistoryMatcher {
                     target,
                     signal_name,
                     payload,
+                    idempotency_key,
                 } => {
-                    let stashed = StashedExternalSignal {
-                        signal_id: *signal_id,
-                        target: *target,
-                        signal_name: signal_name.clone(),
-                        payload: payload.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_signals.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
+                    self.stash_external_signal_request(
+                        scan_cursor,
+                        *signal_id,
+                        *target,
+                        signal_name.clone(),
+                        payload.clone(),
+                        idempotency_key.clone(),
+                    );
                     scan_cursor += 1;
                 }
                 WorkflowEvent::ExternalSignalDelivered { signal_id } => {
@@ -1598,6 +1607,7 @@ impl HistoryMatcher {
                 None => HistoryMatch::ExternalSignalInProgress {
                     signal_id: stashed.signal_id,
                     payload: stashed.payload,
+                    idempotency_key: stashed.idempotency_key,
                 },
             })
         };
@@ -1656,6 +1666,7 @@ impl HistoryMatcher {
                 target: recorded_target,
                 signal_name: recorded_name,
                 payload: recorded_payload,
+                idempotency_key: recorded_idempotency_key,
             } => {
                 if *recorded_target != target {
                     return HistoryMatch::Diverged {
@@ -1681,7 +1692,11 @@ impl HistoryMatcher {
                         event_index: i32::try_from(self.cursor).ok(),
                     };
                 }
-                Ok((*signal_id, recorded_payload.clone()))
+                Ok((
+                    *signal_id,
+                    recorded_payload.clone(),
+                    recorded_idempotency_key.clone(),
+                ))
             }
             other => Err(HistoryMatch::Diverged {
                 expected: format!("ExternalSignalRequested(target={target}, signal={signal_name})"),
@@ -1691,8 +1706,8 @@ impl HistoryMatcher {
             }),
         };
 
-        let (signal_id, recorded_payload) = match result {
-            Ok(pair) => pair,
+        let (signal_id, recorded_payload, recorded_idempotency_key) = match result {
+            Ok(triple) => triple,
             Err(diverged) => return diverged,
         };
 
@@ -1797,6 +1812,7 @@ impl HistoryMatcher {
         HistoryMatch::ExternalSignalInProgress {
             signal_id,
             payload: recorded_payload,
+            idempotency_key: recorded_idempotency_key,
         }
     }
 
@@ -1942,6 +1958,7 @@ impl HistoryMatcher {
                     target: sig_target,
                     signal_name,
                     payload,
+                    idempotency_key,
                 } => {
                     self.stash_external_signal_request(
                         scan_cursor,
@@ -1949,6 +1966,7 @@ impl HistoryMatcher {
                         *sig_target,
                         signal_name.clone(),
                         payload.clone(),
+                        idempotency_key.clone(),
                     );
                     scan_cursor += 1;
                 }
@@ -2188,16 +2206,16 @@ impl HistoryMatcher {
                     target,
                     signal_name,
                     payload,
+                    idempotency_key,
                 } => {
-                    let stashed = StashedExternalSignal {
-                        signal_id: *signal_id,
-                        target: *target,
-                        signal_name: signal_name.clone(),
-                        payload: payload.clone(),
-                        terminal: None,
-                    };
-                    self.pending_external_signals.push(stashed);
-                    self.consumed_signal_events.insert(scan_cursor);
+                    self.stash_external_signal_request(
+                        scan_cursor,
+                        *signal_id,
+                        *target,
+                        signal_name.clone(),
+                        payload.clone(),
+                        idempotency_key.clone(),
+                    );
                     scan_cursor += 1;
                     continue;
                 }
@@ -2354,6 +2372,7 @@ impl HistoryMatcher {
                     target,
                     signal_name: sn,
                     payload,
+                    idempotency_key,
                 } => {
                     self.stash_external_signal_request(
                         scan_cursor,
@@ -2361,6 +2380,7 @@ impl HistoryMatcher {
                         *target,
                         sn.clone(),
                         payload.clone(),
+                        idempotency_key.clone(),
                     );
                     scan_cursor += 1;
                 }
@@ -2663,6 +2683,7 @@ impl HistoryMatcher {
                     target,
                     signal_name: sn,
                     payload,
+                    idempotency_key,
                 } => {
                     self.stash_external_signal_request(
                         scan_cursor,
@@ -2670,6 +2691,7 @@ impl HistoryMatcher {
                         *target,
                         sn.clone(),
                         payload.clone(),
+                        idempotency_key.clone(),
                     );
                     scan_cursor += 1;
                 }
@@ -5240,6 +5262,7 @@ mod tests {
                 target,
                 signal_name: "poke".into(),
                 payload: serde_json::json!({"n": 1}),
+                idempotency_key: None,
             },
             WorkflowEvent::ChildWorkflowSpawnedDetached {
                 child_id,

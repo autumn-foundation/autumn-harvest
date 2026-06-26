@@ -252,6 +252,10 @@ fn start_workflow_params_has_priority_field() {
         sla: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
 
     assert_eq!(params.priority, Priority::High);
@@ -292,6 +296,10 @@ fn start_workflow_params_default_priority_is_normal() {
         sla: None,
         schedule_id: None,
         scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        max_workflow_attempts_ceiling: None,
     };
 
     assert_eq!(params.priority, Priority::Normal);

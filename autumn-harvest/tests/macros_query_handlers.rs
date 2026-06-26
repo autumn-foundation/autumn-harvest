@@ -443,6 +443,7 @@ pub mod flows {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }
         }
     }
@@ -499,6 +500,7 @@ pub mod relative_test_self {
                     input_schema: None,
                     output_schema: None,
                     error_schema: None,
+                    retry_policy: None,
                 }
             }
         }
@@ -543,6 +545,7 @@ pub mod relative_test_super {
                     input_schema: None,
                     output_schema: None,
                     error_schema: None,
+                    retry_policy: None,
                 }
             }
         }
@@ -591,6 +594,7 @@ pub mod relative_test_plain {
                     input_schema: None,
                     output_schema: None,
                     error_schema: None,
+                    retry_policy: None,
                 }
             }
         }

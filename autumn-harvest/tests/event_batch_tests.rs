@@ -103,6 +103,9 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260618000001_harvest_debounce/up.sql"),
     "\n",
     include_str!("../migrations/20260624000000_harvest_event_batches/up.sql"),
+    "\n",
+    // issue #523: workflow-level retry policy columns.
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
 );
 
 async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {

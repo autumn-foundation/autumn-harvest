@@ -105,6 +105,9 @@ pub struct HarvestBuilder {
     batch_start_config: BatchStartConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
+    /// Server-side ceiling on `workflow_attempt` (issue #523).
+    /// When set, `retry_policy.max_attempts` is clamped to `min(max_attempts, ceiling)`.
+    max_workflow_attempts: Option<u32>,
 }
 
 impl Default for HarvestBuilder {
@@ -135,6 +138,7 @@ impl Default for HarvestBuilder {
             unknown_target_grace_window: None,
             batch_start_config: BatchStartConfig::default(),
             completion_triggers: Vec::new(),
+            max_workflow_attempts: None,
         }
     }
 }
@@ -176,6 +180,7 @@ impl std::fmt::Debug for HarvestBuilder {
                 &self.unknown_target_grace_window,
             )
             .field("batch_start_config", &self.batch_start_config)
+            .field("max_workflow_attempts", &self.max_workflow_attempts)
             .finish_non_exhaustive()
     }
 }
@@ -225,6 +230,8 @@ pub struct BuiltHarvest {
     pub batch_start_config: BatchStartConfig,
     /// Declarative completion triggers (issue #517).
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
+    /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
+    pub max_workflow_attempts: Option<u32>,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -261,6 +268,7 @@ impl std::fmt::Debug for BuiltHarvest {
                 &self.unknown_target_grace_window,
             )
             .field("batch_start_config", &self.batch_start_config)
+            .field("max_workflow_attempts", &self.max_workflow_attempts)
             .finish_non_exhaustive()
     }
 }
@@ -647,7 +655,8 @@ impl BuiltHarvest {
                 self.max_activity_result_bytes,
                 self.max_signal_payload_bytes,
             )
-            .with_current_details_cap(self.max_current_details_bytes),
+            .with_current_details_cap(self.max_current_details_bytes)
+            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -683,7 +692,8 @@ impl BuiltHarvest {
                 self.max_activity_result_bytes,
                 self.max_signal_payload_bytes,
             )
-            .with_current_details_cap(self.max_current_details_bytes),
+            .with_current_details_cap(self.max_current_details_bytes)
+            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -952,6 +962,16 @@ impl HarvestBuilder {
         self
     }
 
+    /// Set a server-side ceiling on workflow retry attempts (issue #523).
+    ///
+    /// When set, `retry_policy.max_attempts` is clamped to `min(max_attempts, ceiling)`.
+    /// `None` (the default) means no ceiling is enforced.
+    #[must_use]
+    pub const fn max_workflow_attempts(mut self, ceiling: u32) -> Self {
+        self.max_workflow_attempts = Some(ceiling);
+        self
+    }
+
     /// Set the global maximum byte length for activity input payloads (issue #252).
     ///
     /// Default: 2 MiB. Per-activity overrides declared via
@@ -1166,6 +1186,7 @@ impl HarvestBuilder {
             unknown_target_grace_window,
             batch_start_config: self.batch_start_config,
             completion_triggers: self.completion_triggers,
+            max_workflow_attempts: self.max_workflow_attempts,
         })
     }
 }
@@ -2089,6 +2110,7 @@ mod tests {
             input_schema: None,
             output_schema: None,
             error_schema: None,
+            retry_policy: None,
         }
     }
 
@@ -2573,6 +2595,7 @@ mod tests {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }])
             .try_build();
         let err = result.unwrap_err();
@@ -2612,6 +2635,7 @@ mod tests {
                 input_schema: None,
                 output_schema: None,
                 error_schema: None,
+                retry_policy: None,
             }])
             .try_build();
         assert!(result.is_ok());
