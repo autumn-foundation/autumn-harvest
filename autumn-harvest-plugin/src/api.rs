@@ -13607,9 +13607,21 @@ async fn schedule_backfill(
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
                         workflow_attempt: 1,
-                        workflow_retry_policy: None,
+                        workflow_retry_policy: schedule
+                            .retry_policy
+                            .as_ref()
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .or_else(|| {
+                                runtime
+                                    .registry
+                                    .workflows
+                                    .get(&wf_name)
+                                    .and_then(|info| info.retry_policy.clone())
+                            }),
                         retry_of_exec_id: None,
-                        max_workflow_attempts_ceiling: None,
+                        max_workflow_attempts_ceiling: runtime
+                            .registry
+                            .max_workflow_attempts_ceiling,
                     },
                 )
                 .await;
@@ -13793,9 +13805,14 @@ async fn schedule_backfill(
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
                         workflow_attempt: 1,
-                        workflow_retry_policy: None,
+                        workflow_retry_policy: schedule
+                            .retry_policy
+                            .as_ref()
+                            .and_then(|v| serde_json::from_value(v.clone()).ok()),
                         retry_of_exec_id: None,
-                        max_workflow_attempts_ceiling: None,
+                        max_workflow_attempts_ceiling: runtime
+                            .registry
+                            .max_workflow_attempts_ceiling,
                     },
                 )
                 .await;

@@ -2316,6 +2316,10 @@ async fn persist_workflow_failure(
     nd_details: Option<&crate::error::NonDeterministicDetails>,
     execution: Option<&WorkflowExecution>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+    // Concurrency key/limit from the current task so the retry inherits the same
+    // per-key cap (issue #523 P2).
+    concurrency_key: Option<String>,
+    concurrency_limit: Option<u32>,
 ) -> HarvestResult<bool> {
     let error = error.to_string();
 
@@ -2349,9 +2353,8 @@ async fn persist_workflow_failure(
             None
         };
 
-    // Bug #8: pre-compute fire_at once so the WorkflowRetryScheduled event and
-    // the task's scheduled_at use the same timestamp (not two separate Utc::now()
-    // calls that could differ by milliseconds under load).
+    // Pre-compute fire_at once so the WorkflowRetryScheduled event and the task's
+    // scheduled_at share the same timestamp.
     #[allow(clippy::type_complexity)]
     let retry_fire_info: Option<(
         ExecutionId,
@@ -2393,16 +2396,19 @@ async fn persist_workflow_failure(
                     .await?;
                     deferred.extend(triggers);
 
-                    // Bugs #1/#5: start the retry execution INSIDE this transaction
-                    // (atomic with failure) using AllowDuplicateFailedOnly so the
-                    // FAILED→CONTINUED_AS_NEW transition releases the uniqueness slot.
+                    // Start the retry execution atomically inside this failure transaction.
+                    // Use the retry exec_id as workflow_id so the original FAILED row is
+                    // never sealed as CONTINUED_AS_NEW — result waiters on the original
+                    // exec_id continue to see FAILED rather than an erroneous "success".
+                    // AllowDuplicate is safe because the retry workflow_id is brand-new.
                     let mut retry_committed = false;
                     if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_at))) =
                         (execution, retry_fire_info)
                     {
+                        let retry_workflow_id = rid.to_string();
                         let retry_params = crate::execution::StartWorkflowParams {
                             workflow_name: &exec_ref.workflow_name,
-                            workflow_id: &exec_ref.workflow_id,
+                            workflow_id: &retry_workflow_id,
                             exec_id: rid,
                             input: exec_ref.input.clone(),
                             parent_id: None,
@@ -2410,18 +2416,13 @@ async fn persist_workflow_failure(
                             execution_timeout: exec_ref.execution_timeout,
                             memo: exec_ref.memo.clone(),
                             search_attrs: exec_ref.search_attrs.clone(),
-                            // Bug #1: use AllowDuplicateFailedOnly — this calls
-                            // replace_execution which seals the FAILED row as
-                            // CONTINUED_AS_NEW (releasing the uniqueness slot) and
-                            // inserts the retry row atomically inside a savepoint.
-                            reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
+                            reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
                             trace_context: None,
                             max_execution_timeout_ceiling: None,
-                            concurrency_key: None,
-                            concurrency_limit: None,
+                            concurrency_key: concurrency_key.clone(),
+                            concurrency_limit,
                             priority: crate::types::Priority::default(),
                             max_workflow_input_bytes: 0,
-                            // Bug #8: use pre-computed start_at (same fire_at reference)
                             start_at,
                             delay: None,
                             max_workflow_start_delay: None,
@@ -2441,8 +2442,6 @@ async fn persist_workflow_failure(
                             max_workflow_attempts_ceiling: None,
                         };
 
-                        // Bug #5: call with in_outer_transaction=true so the
-                        // savepoint is nested inside this transaction.
                         match crate::execution::start_or_load_workflow_execution_collect(
                             conn,
                             retry_params,
@@ -2453,17 +2452,12 @@ async fn persist_workflow_failure(
                         {
                             Ok((_started, retry_deferred)) => {
                                 deferred.extend(retry_deferred);
-                                // Bug #4: use append_single_event (MAX+1 with FOR UPDATE)
-                                // instead of hardcoding next_event_id + 1, which could
-                                // collide when concurrent appends occur between the
-                                // WorkflowFailed insert and this one.
                                 store::append_single_event(
                                     conn,
                                     exec_id,
                                     WorkflowEvent::WorkflowRetryScheduled {
                                         retry_exec_id: rid,
                                         attempt: attempt + 1,
-                                        // Bug #8: same pre-computed fire_at
                                         fire_at,
                                     },
                                 )
@@ -3608,6 +3602,8 @@ async fn fail_task_and_execution(
         history.next_event_id,
         worker_id,
         error,
+        None,
+        None,
         None,
         None,
         None,
@@ -4896,6 +4892,8 @@ async fn handle_suspended_workflow(
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .map(|_| ())
@@ -5084,6 +5082,8 @@ async fn reject_child_continue_as_new(
             persistence.next_event_id,
             persistence.worker_id,
             error,
+            None,
+            None,
             None,
             None,
             None,
@@ -5346,7 +5346,7 @@ async fn persist_workflow_outcome(
             _,
         ) => {
             // Root workflow or detached child failing — no parent wake.
-            // Returns true if a retry was scheduled (Bug #3: propagate to caller so
+            // Returns true if a retry was scheduled (propagate to caller so
             // the deferred schedule-failure counter can be suppressed).
             let result = persist_workflow_failure(
                 conn,
@@ -5358,6 +5358,11 @@ async fn persist_workflow_outcome(
                 non_deterministic_details.as_ref(),
                 Some(execution),
                 Some(registry.telemetry().metrics.as_ref()),
+                persistence.task.concurrency_key.clone(),
+                persistence
+                    .task
+                    .concurrency_cap
+                    .and_then(|c| u32::try_from(c).ok()),
             )
             .await;
             if update_schedule_counter {
