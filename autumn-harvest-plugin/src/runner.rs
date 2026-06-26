@@ -136,11 +136,20 @@ impl PreparedHarvestRuntime {
             .collect();
         let workflow_schedules = Arc::new(built.workflow_schedules().to_vec());
         let max_workflow_history_events = built.max_workflow_history_events;
-        // Resolve the storage pool (sharded when the embedder supplied one)
-        // *before* building handler state so the registry receives the same
-        // sharded HarvestDbPool. Otherwise handlers fall back to the default
-        // shard's pool and can read/write the wrong database (issue #522).
+        // Resolve the effective sharded storage pool *before* building handler
+        // state so the registry receives the same sharded HarvestDbPool;
+        // otherwise handlers fall back to the default shard's pool and can
+        // read/write the wrong database (issue #522). Precedence:
+        //   1. resources.sharded_pool — explicit runner-level override
+        //   2. WorkerConfig::with_sharded_pool — carried on the built config
+        //   3. single-shard wrapper of the default harvest pool
+        // Honouring (2) here keeps a `HarvestBuilder::with_sharded_pool` from
+        // being silently narrowed to a single shard when the runner is started
+        // with only `HarvestRunnerResources::new(default_pool)` (the plugin
+        // path), which would strand all non-default-shard work.
         let storage_pool = if let Some(sp) = resources.sharded_pool {
+            HarvestDbPool::sharded(sp)
+        } else if let Some(sp) = built.worker_config().sharded_pool.clone() {
             HarvestDbPool::sharded(sp)
         } else {
             HarvestDbPool::from(resources.harvest_pool)
@@ -163,7 +172,10 @@ impl PreparedHarvestRuntime {
         if let Some(ceiling) = max_workflow_history_events {
             worker_runtime_config.max_workflow_history_events = Some(ceiling);
         }
-        // Wire the sharded pool so the worker can claim from all assigned shards (issue #522).
+        // Point the worker at the same resolved sharded pool so it claims from
+        // every assigned shard (issue #522). `storage_pool` already honours the
+        // resources/WorkerConfig precedence above, so this never narrows a
+        // configured `WorkerConfig::with_sharded_pool` to a single shard.
         worker_runtime_config.sharded_pool = Some(storage_pool.sharded_pool().clone());
 
         Ok(Self {
