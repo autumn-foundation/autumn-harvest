@@ -262,7 +262,7 @@ async fn offload_round_trips_through_postgres_with_tiny_event_row() {
     assert_eq!(refs.len(), 1, "one blob reference recorded");
 
     // Inflated load reconstructs the exact original output.
-    let history = store::load_history_inflated(&mut conn, exec_id, Some(&off))
+    let history = store::load_history_inflated(&mut conn, exec_id, &Default::default(), Some(&off))
         .await
         .expect("inflated load");
     match &history.events[2] {

@@ -408,6 +408,7 @@ mod tests {
         PayloadOffloader::new(store, threshold, Arc::new(crate::telemetry::NoOpMetrics))
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn event_with_output(output: Value) -> Value {
         serde_json::json!({ "type": "WorkflowCompleted", "data": { "output": output } })
     }
