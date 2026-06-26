@@ -4216,6 +4216,7 @@ async fn handle_activity_result(
     max_result_bytes: u64,
     activity_name_for_cap: &str,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
 ) -> HarvestResult<()> {
     match activity_result {
         Ok(output) => {
@@ -4257,6 +4258,10 @@ async fn handle_activity_result(
                 // Store the human-readable error for ActivityContext::previous_failure()
                 // on the next attempt. Typed payloads are unwrapped to their message.
                 let previous_error = crate::failure::parse_error_payload_full(&error).message;
+                // AC2 (issue #528): retry counter — fires only after the
+                // schedule_to_close deadline check passes, so a deadline-killed
+                // attempt is NOT counted as a scheduled retry.
+                metrics.record_activity_retried(activity_name_for_cap, &task.queue_name);
                 return queue::requeue_for_retry(conn, task.id, delay, &previous_error).await;
             }
 
@@ -4506,6 +4511,7 @@ async fn process_activity_task(
             0,
             activity_name,
             registry.payload_offloader(),
+            telemetry.metrics.as_ref(),
         )
         .await;
     }
@@ -4657,6 +4663,12 @@ async fn process_activity_task(
         status,
         failure_info.as_ref().map(|(et, _, _)| et.as_str()),
     );
+    // AC1 (issue #528): single-family attempt counter for success-rate SLOs.
+    // Fires for both outcomes so `completed / (completed + failed)` is one
+    // metric family — the activity-level mirror of harvest.workflow.terminal.
+    telemetry
+        .metrics
+        .record_activity_attempt(activity_name, &task.queue_name, status);
     if let Some((error_type, non_retryable, _)) = failure_info.as_ref() {
         // `workflow.type` is intentionally empty here: looking it up requires
         // an extra `harvest_workflow_executions` query per failure, and the
@@ -4737,6 +4749,7 @@ async fn process_activity_task(
         0,
         activity_name,
         registry.payload_offloader(),
+        telemetry.metrics.as_ref(),
     )
     .await
 }
