@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::models::NewWorkflowExecution;
+use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::payload_store::{
     PayloadOffloader, PayloadStore, PayloadStoreError, PayloadStoreFuture,
 };
@@ -262,9 +263,10 @@ async fn offload_round_trips_through_postgres_with_tiny_event_row() {
     assert_eq!(refs.len(), 1, "one blob reference recorded");
 
     // Inflated load reconstructs the exact original output.
-    let history = store::load_history_inflated(&mut conn, exec_id, &Default::default(), Some(&off))
-        .await
-        .expect("inflated load");
+    let history =
+        store::load_history_inflated(&mut conn, exec_id, &PayloadCodecs::default(), Some(&off))
+            .await
+            .expect("inflated load");
     match &history.events[2] {
         WorkflowEvent::ActivityCompleted { output, .. } => {
             assert_eq!(*output, big_output(), "100% byte fidelity through Postgres");
