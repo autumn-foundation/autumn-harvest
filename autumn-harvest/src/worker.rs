@@ -872,19 +872,18 @@ fn extract_started_timer_for_suspension(
 ) -> Option<StartedTimerCommand> {
     // Find all StartTimer commands.
     let mut timers = commands.iter().filter_map(|cmd| {
-        if let WorkflowCommand::StartTimer {
+        let WorkflowCommand::StartTimer {
             timer_id,
             duration_secs,
             ..
         } = cmd
-        {
-            Some(StartedTimerCommand {
-                timer_id: timer_id.clone(),
-                duration_secs: *duration_secs,
-            })
-        } else {
-            None
-        }
+        else {
+            return None;
+        };
+        Some(StartedTimerCommand {
+            timer_id: timer_id.clone(),
+            duration_secs: *duration_secs,
+        })
     });
 
     let first_timer = timers.next()?;
@@ -943,21 +942,20 @@ fn extract_all_started_child_workflows(
     non_markers
         .iter()
         .map(|cmd| {
-            if let WorkflowCommand::StartChildWorkflow {
+            let WorkflowCommand::StartChildWorkflow {
                 child_id,
                 workflow_name,
                 input,
                 ..
             } = cmd
-            {
-                Some(StartedChildWorkflowCommand {
-                    child_id: *child_id,
-                    workflow_name: workflow_name.clone(),
-                    input: input.clone(),
-                })
-            } else {
-                None
-            }
+            else {
+                return None;
+            };
+            Some(StartedChildWorkflowCommand {
+                child_id: *child_id,
+                workflow_name: workflow_name.clone(),
+                input: input.clone(),
+            })
         })
         .collect()
 }
@@ -1904,12 +1902,14 @@ fn find_pending_scheduled_activity(
 
     let mut pending = None;
     for event in history {
-        if let WorkflowEvent::ActivityScheduled {
+        let WorkflowEvent::ActivityScheduled {
             activity_id, name, ..
         } = event
-            && name == activity_name
-            && !terminal_ids.contains(activity_id)
-        {
+        else {
+            continue;
+        };
+
+        if name == activity_name && !terminal_ids.contains(activity_id) {
             if pending.is_some() {
                 return Err(HarvestError::non_deterministic_simple(format!(
                     "multiple pending scheduled activities named '{activity_name}' found in history"
@@ -2396,15 +2396,16 @@ fn apply_search_attrs_patch_in_memory(
         .unwrap_or_default();
 
     for cmd in commands {
-        if let WorkflowCommand::UpsertSearchAttributes { patch } = cmd {
-            for (k, v) in patch {
-                match v {
-                    Some(val) => {
-                        obj.insert(k.clone(), val.clone());
-                    }
-                    None => {
-                        obj.remove(k);
-                    }
+        let WorkflowCommand::UpsertSearchAttributes { patch } = cmd else {
+            continue;
+        };
+        for (k, v) in patch {
+            match v {
+                Some(val) => {
+                    obj.insert(k.clone(), val.clone());
+                }
+                None => {
+                    obj.remove(k);
                 }
             }
         }
@@ -2431,11 +2432,12 @@ async fn persist_search_attrs_from_commands(
     let mut merged: Option<std::collections::HashMap<String, Option<serde_json::Value>>> = None;
 
     for cmd in commands {
-        if let WorkflowCommand::UpsertSearchAttributes { patch } = cmd {
-            let m = merged.get_or_insert_with(std::collections::HashMap::new);
-            for (k, v) in patch {
-                m.insert(k.clone(), v.clone());
-            }
+        let WorkflowCommand::UpsertSearchAttributes { patch } = cmd else {
+            continue;
+        };
+        let m = merged.get_or_insert_with(std::collections::HashMap::new);
+        for (k, v) in patch {
+            m.insert(k.clone(), v.clone());
         }
     }
 
@@ -2460,11 +2462,10 @@ async fn persist_current_details_from_commands(
 ) -> HarvestResult<()> {
     // Last-write-wins: take the last SetCurrentDetails value in the command list.
     let last = commands.iter().rev().find_map(|cmd| {
-        if let WorkflowCommand::SetCurrentDetails { value } = cmd {
-            Some(value.as_str())
-        } else {
-            None
-        }
+        let WorkflowCommand::SetCurrentDetails { value } = cmd else {
+            return None;
+        };
+        Some(value.as_str())
     });
 
     if let Some(details) = last {
