@@ -417,32 +417,6 @@ async fn wait_for_state(conn: &mut AsyncPgConnection, exec_id: ExecutionId, stat
     panic!("execution {exec_id} never reached {states:?}; current state: {state}");
 }
 
-/// Wait until any execution with the given `workflow_id` is in one of the given states.
-async fn wait_for_any_state(
-    conn: &mut AsyncPgConnection,
-    workflow_id: &str,
-    states: &[&str],
-) -> ExecutionId {
-    for _ in 0..400 {
-        let rows: Vec<(uuid::Uuid, String)> = harvest_workflow_executions::table
-            .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
-            .select((
-                harvest_workflow_executions::id,
-                harvest_workflow_executions::state,
-            ))
-            .load(conn)
-            .await
-            .expect("load executions");
-        for (id, state) in &rows {
-            if states.contains(&state.as_str()) {
-                return ExecutionId::from_uuid(*id);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("no execution with workflow_id={workflow_id} ever reached {states:?}");
-}
-
 /// Wait until a retry execution (`retry_of_exec_id = original_exec_id`) reaches
 /// one of the given states and return its `ExecutionId`.
 ///

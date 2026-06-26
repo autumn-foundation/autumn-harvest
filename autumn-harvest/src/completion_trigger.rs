@@ -802,6 +802,10 @@ pub async fn enforce_completion_triggers_outbox(
                     )
                 })
         };
+        let max_workflow_attempts_ceiling = GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING
+            .read()
+            .ok()
+            .and_then(|g| *g);
         let start_res = crate::execution::start_or_load_workflow_execution(
             &mut target_conn,
             crate::execution::StartWorkflowParams {
@@ -836,7 +840,7 @@ pub async fn enforce_completion_triggers_outbox(
                 workflow_attempt: 1,
                 workflow_retry_policy: target_retry_policy,
                 retry_of_exec_id: None,
-                max_workflow_attempts_ceiling: None,
+                max_workflow_attempts_ceiling,
             },
         )
         .await;
