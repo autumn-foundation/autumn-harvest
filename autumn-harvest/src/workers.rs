@@ -399,19 +399,28 @@ pub async fn transition_status(
 /// transient unavailability).  The `Active`-only guard ensures this never
 /// reverts a row that was already advanced by a concurrent path.
 ///
+/// `drain_deadline` is written to `drain_deadline_at` in the same statement
+/// so that the deduplication layer (`dedup_workers_by_freshest`) sees the
+/// correct drain window even when this newly-repaired row becomes the freshest
+/// snapshot (issue #522 review).
+///
 /// # Errors
 ///
 /// Returns [`HarvestError`] on database failure.
 async fn transition_active_to_draining(
     conn: &mut AsyncPgConnection,
     worker_id: &str,
+    drain_deadline: Option<DateTime<Utc>>,
 ) -> HarvestResult<()> {
     diesel::update(
         harvest_workers::table
             .find(worker_id)
             .filter(harvest_workers::status.eq(WorkerStatus::Active.as_str())),
     )
-    .set(harvest_workers::status.eq(WorkerStatus::Draining.as_str()))
+    .set((
+        harvest_workers::status.eq(WorkerStatus::Draining.as_str()),
+        harvest_workers::drain_deadline_at.eq(drain_deadline),
+    ))
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -1121,8 +1130,14 @@ async fn do_heartbeat_tick(
                 // the fan-out missed it (e.g. shard recovered after the drain was
                 // issued).  Guarded to Active rows only so it never reverts a row
                 // that already reached Draining or Stopped.
+                // Also write the current monotonic drain deadline so the
+                // dedup-by-freshest layer doesn't mask the effective drain
+                // window when this row's heartbeat is the most recent one
+                // (issue #522 review).
+                let current_deadline = drain_deadline_max.lock().ok().and_then(|g| *g);
                 if let Err(error) =
-                    transition_active_to_draining(conn, &registration.worker_id).await
+                    transition_active_to_draining(conn, &registration.worker_id, current_deadline)
+                        .await
                 {
                     tracing::warn!(
                         worker_id = %registration.worker_id,
