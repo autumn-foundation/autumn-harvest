@@ -1154,8 +1154,20 @@ async fn sync_drain_deadline(
             .signed_duration_since(Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO);
+        let candidate = std::time::Instant::now() + remaining;
         if let Ok(mut guard) = cell.lock() {
-            *guard = Some(std::time::Instant::now() + remaining);
+            // Monotonic merge across per-shard heartbeats (issue #522 review).
+            // A multi-shard worker runs one heartbeat per assigned shard, all
+            // sharing this cell. If an operator extends the drain while a shard
+            // is unreachable, only the reachable shards' rows get the later
+            // `drain_deadline_at`; when the stale shard recovers, its heartbeat
+            // would otherwise read the old (earlier) deadline and overwrite the
+            // extension, making `drain_in_flight` stop waiting early. Only ever
+            // extend the shared deadline, never shorten it.
+            match *guard {
+                Some(existing) if existing >= candidate => {}
+                _ => *guard = Some(candidate),
+            }
         }
     }
 }

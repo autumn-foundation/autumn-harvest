@@ -7480,6 +7480,30 @@ impl Worker {
             .map(|shard| (*shard, pool.clone()))
             .collect();
 
+        // Refuse to start when shard assignments were configured but every one
+        // was dropped for lacking an exact pool entry above (issue #522 review).
+        // Falling through to the single-shard `[]` arm would silently poll and
+        // register against the *default* database while the assigned shards stay
+        // unserved — hiding the misconfiguration. This only triggers under a
+        // ShardedDbPool: the non-db / no-sharded-pool path maps every assignment
+        // to the default pool, so `shard_targets` is never empty when
+        // assignments are set.
+        if shard_targets.is_empty() && !self.config.shard_assignments.is_empty() {
+            tracing::error!(
+                worker_id = %self.config.worker_id,
+                shard_assignments = ?self
+                    .config
+                    .shard_assignments
+                    .iter()
+                    .map(|s| s.as_i32())
+                    .collect::<Vec<_>>(),
+                "every configured shard_assignment is missing from the sharded_pool; refusing to \
+                 start this worker rather than polling the default shard's database — check your \
+                 ShardedDbPool configuration"
+            );
+            return;
+        }
+
         // More than one distinct shard target → multi-shard loop.
         // One or zero targets (or single-pool fallback) → existing path.
         #[cfg(feature = "db")]
