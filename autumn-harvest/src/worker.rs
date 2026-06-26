@@ -4496,6 +4496,9 @@ async fn process_activity_task(
             crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
             true,
         );
+        telemetry
+            .metrics
+            .record_activity_attempt(activity_name, &task.queue_name, ActivityStatus::Failed);
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
         let retry_policy_result = configured_retry_policy(task);
         let retry_policy =
