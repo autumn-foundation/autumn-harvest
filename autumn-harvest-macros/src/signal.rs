@@ -174,10 +174,10 @@ pub fn signal_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             conn: &mut ::autumn_harvest::diesel_async::AsyncPgConnection,
             handle: &::autumn_harvest::WorkflowHandle,
             #(#params,)*
-            idempotency_key: impl Into<Option<String>>,
+            __autumn_idempotency_key: impl Into<Option<String>>,
         ) -> ::autumn_harvest::HarvestResult<bool> {
             #cap_check
-            let __idem_key = idempotency_key.into();
+            let __idem_key = __autumn_idempotency_key.into();
             ::autumn_harvest::signal::send_signal_idempotent(
                 conn,
                 handle.exec_id(),

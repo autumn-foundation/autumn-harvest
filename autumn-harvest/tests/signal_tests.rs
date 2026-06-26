@@ -231,10 +231,13 @@ async fn test_mark_signals_consumed() {
 /// Insert a fresh RUNNING workflow execution and return its id.
 async fn insert_running_execution(conn: &mut diesel_async::AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
+    // Unique workflow_id per execution: the active partial unique index on
+    // (workflow_name, workflow_id) rejects a second RUNNING row otherwise.
+    let workflow_id = exec_id.to_string();
     let new_exec = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: "test_workflow",
-        workflow_id: "test_id",
+        workflow_id: &workflow_id,
         run_id: exec_id.as_uuid(),
         shard_id: 0,
         input: serde_json::json!({}),
