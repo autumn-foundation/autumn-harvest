@@ -361,6 +361,25 @@ async fn start_harvest_runtime(
     let default_debounce_max_wait = built.worker_config().default_debounce_max_wait;
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources).await?;
     let harvest_db_pool = runner.storage_pool();
+    // The plugin integration registers only shard-0's LISTEN/NOTIFY URL.
+    // When WorkerConfig::with_sharded_pool is set, the resolved pool may span
+    // multiple shards; WorkflowHandle::notification_database_url then returns a
+    // config error for any execution hashed to a non-zero shard, silently
+    // breaking wait/result/SSE paths.  Reject this at startup so operators get
+    // a clear failure instead of a per-request config error.
+    // Use HarvestRunner::start with HarvestRunnerResources::with_sharded_pool and
+    // a WorkflowHandleClient configured with per-shard notification URLs for
+    // multi-shard deployments.
+    let shard_count = harvest_db_pool.iter_shards().count();
+    if shard_count > 1 {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "HarvestPlugin does not support multi-shard deployments: the resolved pool spans \
+             {shard_count} shards but only shard-0's LISTEN/NOTIFY notification URL is \
+             configured; workflows hashed to non-zero shards would fail wait/result/SSE paths. \
+             Use HarvestRunner::start with HarvestRunnerResources::with_sharded_pool and a \
+             WorkflowHandleClient with per-shard notification URLs instead."
+        )));
+    }
     let workflow_handle_client = WorkflowHandleClient::new(
         harvest_db_pool.sharded_pool().clone(),
         runner.api_runtime().router().clone(),
