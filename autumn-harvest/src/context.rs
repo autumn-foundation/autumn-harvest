@@ -1726,8 +1726,11 @@ impl WorkflowContext {
                 let output = serde_json::to_value(&result)?;
 
                 // Enforce side-effect payload cap before recording.
+                // SideEffectRecorded events are written via pre_suspension_events_from_commands
+                // using plain store::append_events (no offloader), so the offload bypass must
+                // NOT apply here even when a PayloadStore is configured.
                 let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-                if observed > self.payload_max_side_effect && !self.offload_will_apply(observed) {
+                if observed > self.payload_max_side_effect {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::SideEffectValue,
                         observed_bytes: observed,
@@ -2752,10 +2755,10 @@ impl WorkflowContext {
                 ))?;
 
                 // Enforce child-workflow input payload cap before scheduling.
+                // ChildWorkflowStarted is written to the parent's history via
+                // append_single_event (plain), so the offload bypass must NOT apply here.
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0
-                    && observed > self.payload_max_workflow_input
-                    && !self.offload_will_apply(observed)
+                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ChildWorkflowInput,
@@ -2850,10 +2853,11 @@ impl WorkflowContext {
                 ))?;
 
                 // Enforce child-workflow input payload cap before scheduling.
+                // ChildWorkflowSpawnedDetached is written via pre_suspension_events_from_commands
+                // using plain store::append_events (no offloader), so the offload bypass must
+                // NOT apply here even when a PayloadStore is configured.
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0
-                    && observed > self.payload_max_workflow_input
-                    && !self.offload_will_apply(observed)
+                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ChildWorkflowInput,
