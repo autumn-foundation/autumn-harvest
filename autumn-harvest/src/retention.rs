@@ -720,7 +720,21 @@ async fn run_shard_tick(
             let mut doc = None;
             if !config.dry_run && archiver.is_some() {
                 let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
-                match crate::store::load_history(&mut conn, exec_id).await {
+                // Inflate offloaded envelopes before archiving so the archived
+                // document contains real payloads, not blob references that will
+                // be deleted moments later. Issue #524.
+                let load_result = if offloader.is_some() {
+                    crate::store::load_history_inflated(
+                        &mut conn,
+                        exec_id,
+                        &crate::payload_codec::PayloadCodecs::default(),
+                        offloader.as_deref(),
+                    )
+                    .await
+                } else {
+                    crate::store::load_history(&mut conn, exec_id).await
+                };
+                match load_result {
                     Ok(history) => {
                         let req = crate::history_export::HistoryExportRequest {
                             workflow_name: candidate.workflow_name.clone(),
