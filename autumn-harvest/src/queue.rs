@@ -1866,6 +1866,48 @@ pub async fn claimable_pending_count(conn: &mut AsyncPgConnection) -> HarvestRes
     Ok(row.cnt)
 }
 
+/// Per-queue variant of [`claimable_pending_count`].
+///
+/// Returns `(queue_name, count)` pairs for every queue that has at least one
+/// claimable pending task. Applies the same exclusions as `claim_task` (PAUSED
+/// workflow tasks, expired `schedule_to_close_at`) so the counts mirror exactly
+/// what a worker would find claimable.
+pub async fn claimable_pending_count_by_queue(
+    conn: &mut AsyncPgConnection,
+) -> HarvestResult<Vec<(String, i64)>> {
+    #[derive(diesel::QueryableByName)]
+    struct QueueCountRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        queue_name: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        cnt: i64,
+    }
+
+    let rows: Vec<QueueCountRow> = diesel::sql_query(
+        "SELECT tq.queue_name, COUNT(*)::BIGINT AS cnt \
+         FROM harvest_task_queue tq \
+         LEFT JOIN harvest_workflow_executions e ON e.id = tq.workflow_exec_id \
+         WHERE tq.state = 'PENDING' \
+           AND tq.scheduled_at <= NOW() \
+           AND ( \
+               tq.schedule_to_close_at IS NULL \
+               OR tq.schedule_to_close_at > NOW() \
+           ) \
+           AND ( \
+               tq.task_type <> 'workflow' \
+               OR tq.workflow_exec_id IS NULL \
+               OR e.id IS NULL \
+               OR e.state <> 'PAUSED' \
+           ) \
+         GROUP BY tq.queue_name",
+    )
+    .load(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().map(|r| (r.queue_name, r.cnt)).collect())
+}
+
 pub async fn refund_rate_limit_token(conn: &mut AsyncPgConnection, key: &str) -> HarvestResult<()> {
     diesel::sql_query(
         "UPDATE harvest_rate_limit_buckets \

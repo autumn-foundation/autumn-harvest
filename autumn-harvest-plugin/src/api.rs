@@ -102,8 +102,8 @@ use autumn_harvest::types::{
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
     DrainPreviewItem, DrainResponse, FleetHealth, PinnedExecutionRow, WorkerFilters, WorkerRow,
-    drain_preview, fleet_health, get_worker, list_pinned_executions, list_workers,
-    parse_worker_filters, request_drain,
+    drain_preview, get_worker, list_pinned_executions, list_workers, parse_worker_filters,
+    request_drain,
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
@@ -18918,6 +18918,13 @@ async fn list_workers_handler(
         results.append(&mut rows);
     }
 
+    // A multi-shard worker registers a row in every shard's harvest_workers
+    // table. Dedup by worker_id so each physical worker appears exactly once.
+    {
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|w| seen.insert(w.worker.worker_id.clone()));
+    }
+
     let capable_of = pairs
         .iter()
         .find(|(k, _)| k == "capable_of")
@@ -19027,6 +19034,29 @@ async fn workers_health(
 ) -> Result<Json<FleetHealth>, AutumnError> {
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
+
+    // Collect all worker rows from every shard, then dedup by worker_id so a
+    // multi-shard worker (which registers a row in each of its shard DBs) is
+    // counted exactly once in the healthy/stale/draining totals.
+    let mut all_workers: Vec<WorkerRow> = Vec::new();
+    let per_shard_filters = WorkerFilters {
+        limit: i64::MAX,
+        ..WorkerFilters::default()
+    };
+    for (_shard, shard_pool) in pool.iter_shards() {
+        let Ok(mut conn) = acquire_conn(shard_pool).await else {
+            continue;
+        };
+        if let Ok(mut rows) = list_workers(&mut conn, &per_shard_filters, stale_threshold).await {
+            all_workers.append(&mut rows);
+        }
+    }
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        all_workers.retain(|w| seen.insert(w.worker.worker_id.clone()));
+    }
+
     let mut combined = FleetHealth {
         healthy: 0,
         stale: 0,
@@ -19035,19 +19065,30 @@ async fn workers_health(
         by_shard: std::collections::HashMap::new(),
     };
 
-    for (_shard, shard_pool) in pool.iter_shards() {
-        let mut conn = acquire_conn(shard_pool).await?;
-        let shard_health = fleet_health(&mut conn, stale_threshold)
-            .await
-            .map_err(map_error)?;
-        combined.healthy += shard_health.healthy;
-        combined.stale += shard_health.stale;
-        combined.draining += shard_health.draining;
-        for (queue, count) in shard_health.by_queue {
-            *combined.by_queue.entry(queue).or_default() += count;
+    for row in &all_workers {
+        match row.health {
+            autumn_harvest::workers::WorkerHealth::Healthy => combined.healthy += 1,
+            autumn_harvest::workers::WorkerHealth::Stale => combined.stale += 1,
         }
-        for (shard, count) in shard_health.by_shard {
-            *combined.by_shard.entry(shard).or_default() += count;
+        if row.worker.status == autumn_harvest::workers::WorkerStatus::Draining.as_str() {
+            combined.draining += 1;
+        }
+        if let Some(queues) = row.worker.queues.as_array() {
+            for q in queues {
+                if let Some(name) = q.as_str() {
+                    *combined.by_queue.entry(name.to_string()).or_default() += 1;
+                }
+            }
+        }
+        // by_shard stays additive across shard assignments on the deduped
+        // worker, correctly reflecting how many distinct workers cover each
+        // shard.
+        if let Some(shards) = row.worker.shard_assignments.as_array() {
+            for s in shards {
+                if let Some(id) = s.as_i64().and_then(|v| i32::try_from(v).ok()) {
+                    *combined.by_shard.entry(id).or_default() += 1;
+                }
+            }
         }
     }
 

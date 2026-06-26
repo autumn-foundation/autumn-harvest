@@ -6882,17 +6882,17 @@ fn spawn_dlq_depth_sampler(
 
 /// Spawn the stranded-work sampler (issue #522).
 ///
-/// Iterates over every shard in the provided sharded pool. Per shard it counts
-/// claimable pending tasks and whether a live covering worker exists. When a
-/// writable shard has pending work but no live covering worker the pending count
-/// is emitted as the `harvest.shard.stranded_pending` gauge; otherwise `0` is
-/// emitted so operators can see the metric go green once a worker picks up the
-/// shard.
+/// Iterates every shard visible through the pool (not just the shards this
+/// worker is assigned to) so that a writable shard with queued work and no
+/// covering worker is caught even when this worker is not assigned to it.
+///
+/// Per-queue coverage: for each shard the sampler loads the per-queue claimable
+/// pending counts, then checks which of those queues have at least one healthy
+/// active worker assigned to the shard. Tasks on queues with no such worker are
+/// counted as stranded and emitted via `harvest.shard.stranded_pending`.
 #[cfg(feature = "db")]
 fn spawn_stranded_work_sampler(
     sharded_pool: crate::shard::ShardedDbPool,
-    // Subset of shards this worker is assigned to (fix #10).
-    assigned_shards: Vec<crate::types::ShardId>,
     freshness_window: Duration,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
@@ -6908,17 +6908,13 @@ fn spawn_stranded_work_sampler(
                 break;
             }
 
-            // Iterate only the shards this worker is assigned to, not every
-            // shard visible through the pool, so read-only replica shards and
-            // shards owned by other workers don't generate spurious alerts.
-            let shard_iter: Vec<(crate::types::ShardId, DbPool)> = assigned_shards
-                .iter()
-                .filter_map(|s| sharded_pool.exact_pool_for(*s).map(|p| (*s, p.clone())))
-                .collect();
-            for (shard_id, shard_pool) in shard_iter {
+            // Iterate ALL shards so unassigned writable shards with stranded
+            // work are surfaced, not just the shards this worker covers.
+            for (shard_id, shard_pool) in sharded_pool.iter_shards() {
                 let shard_u16 = u16::try_from(shard_id.as_i32()).unwrap_or(0);
 
-                let pending_count = {
+                // Per-queue claimable pending counts for this shard.
+                let queue_counts: Vec<(String, i64)> = {
                     let mut conn = match shard_pool.get().await {
                         Ok(conn) => conn,
                         Err(error) => {
@@ -6930,8 +6926,8 @@ fn spawn_stranded_work_sampler(
                             continue;
                         }
                     };
-                    match crate::queue::claimable_pending_count(&mut conn).await {
-                        Ok(n) => n,
+                    match crate::queue::claimable_pending_count_by_queue(&mut conn).await {
+                        Ok(counts) => counts,
                         Err(error) => {
                             tracing::debug!(
                                 shard_id = %shard_id.as_i32(),
@@ -6943,35 +6939,57 @@ fn spawn_stranded_work_sampler(
                     }
                 };
 
-                let has_live_worker = if pending_count == 0 {
-                    // No work to strand — skip the worker check.
-                    true
-                } else {
+                if queue_counts.is_empty() {
+                    // No claimable work — emit 0 so the gauge resets cleanly.
+                    telemetry
+                        .metrics
+                        .record_shard_stranded_pending(shard_u16, 0);
+                    continue;
+                }
+
+                // Queues covered by at least one healthy active worker assigned
+                // to this shard. A queue is covered when any such worker lists
+                // it in its `queues` JSON array.
+                let covered_queues: std::collections::HashSet<String> = {
                     let Ok(mut conn) = shard_pool.get().await else {
                         continue;
                     };
-                    let stale_threshold = freshness_window;
                     let filters = crate::workers::WorkerFilters {
                         status: Some(crate::workers::WorkerStatus::Active.as_str().to_string()),
                         shard_id: Some(shard_id.as_i32()),
                         health: Some(crate::workers::WorkerHealth::Healthy),
-                        limit: crate::workers::WorkerFilters::DEFAULT_LIMIT,
+                        limit: i64::MAX,
                         ..Default::default()
                     };
-                    match crate::workers::list_workers(&mut conn, &filters, stale_threshold).await {
-                        Ok(workers) => !workers.is_empty(),
+                    match crate::workers::list_workers(&mut conn, &filters, freshness_window).await
+                    {
+                        Ok(workers) => workers
+                            .iter()
+                            .flat_map(|w| {
+                                w.worker
+                                    .queues
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                            })
+                            .collect(),
                         Err(error) => {
-                            tracing::debug!(error = %error, "worker list query failed for stranded-work sampler");
+                            tracing::debug!(
+                                error = %error,
+                                "worker list query failed for stranded-work sampler"
+                            );
                             continue;
                         }
                     }
                 };
 
-                let stranded = if has_live_worker {
-                    0u64
-                } else {
-                    u64::try_from(pending_count).unwrap_or(0)
-                };
+                // Sum pending tasks on queues that have no live covering worker.
+                let stranded: u64 = queue_counts
+                    .iter()
+                    .filter(|(q, _)| !covered_queues.contains(q.as_str()))
+                    .map(|(_, cnt)| u64::try_from(*cnt).unwrap_or(0))
+                    .sum();
                 telemetry
                     .metrics
                     .record_shard_stranded_pending(shard_u16, stranded);
@@ -7817,11 +7835,12 @@ impl Worker {
             self.config.poll_interval,
         );
 
-        // Stranded-work sampler (issue #522): emits a gauge per assigned shard
-        // showing how many claimable tasks have no live covering worker. Only
-        // started when a sharded pool is available and metrics are enabled.
-        // Scoped to assigned shards only (fix #10) so read-only or unassigned
-        // shards never contribute a false-positive stranded-work signal.
+        // Stranded-work sampler (issue #522): emits a gauge per shard showing
+        // how many claimable tasks have no live covering worker. Iterates ALL
+        // shards visible through the pool (not just assigned shards) so an
+        // uncovered writable shard is caught regardless of which worker runs
+        // this sampler. Only started when a sharded pool is available and
+        // metrics are enabled.
         #[cfg(feature = "db")]
         let stranded_work_sampler = self
             .config
@@ -7831,7 +7850,6 @@ impl Worker {
             .map(|sp| {
                 spawn_stranded_work_sampler(
                     sp.clone(),
-                    self.config.shard_assignments.clone(),
                     // Reuse the heartbeat interval as freshness window so the
                     // worker-liveness check is consistent with the heartbeat.
                     self.config.worker_heartbeat_interval.saturating_mul(2),
