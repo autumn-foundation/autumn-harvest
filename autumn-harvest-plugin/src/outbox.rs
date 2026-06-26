@@ -292,7 +292,7 @@ pub(crate) async fn dispatch_workflow_start_request(
                     wf.runbook_url,
                     wf.severity,
                     wf.sla,
-                    wf.retry_policy,
+                    wf.retry_policy.clone(),
                 )
             })
         })

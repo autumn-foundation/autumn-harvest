@@ -6184,8 +6184,7 @@ async fn execute_schedule_trigger_ui(
             .map_or((None, None), |info| {
                 (
                     crate::api::clamp_info_default_sla(info.sla, info.execution_timeout),
-                    info.retry_policy
-                        .and_then(|p| serde_json::to_value(&p).ok()),
+                    info.retry_policy.clone(),
                 )
             });
 

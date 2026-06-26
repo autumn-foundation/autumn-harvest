@@ -6749,7 +6749,7 @@ async fn start_workflow(
                         info.severity,
                         info.sla,
                         info.execution_timeout,
-                        info.retry_policy,
+                        info.retry_policy.clone(),
                     )
                 },
             );
@@ -7067,7 +7067,7 @@ async fn start_workflow(
                     info.severity,
                     info.sla,
                     info.execution_timeout,
-                    info.retry_policy,
+                    info.retry_policy.clone(),
                 )
             },
         );
@@ -7295,7 +7295,7 @@ async fn start_workflow(
                     info.severity,
                     info.sla,
                     info.execution_timeout,
-                    info.retry_policy,
+                    info.retry_policy.clone(),
                 )
             },
         );
@@ -8001,7 +8001,7 @@ async fn batch_start_workflows(
                             info.severity,
                             info.sla,
                             info.execution_timeout,
-                            info.retry_policy,
+                            info.retry_policy.clone(),
                         )
                     },
                 );
@@ -8594,7 +8594,7 @@ async fn signal_with_start_workflow(
                     info.severity,
                     info.sla,
                     info.execution_timeout,
-                    info.retry_policy,
+                    info.retry_policy.clone(),
                 )
             },
         );
@@ -9092,7 +9092,7 @@ async fn update_with_start_workflow(
                     info.severity,
                     info.sla,
                     info.execution_timeout,
-                    info.retry_policy,
+                    info.retry_policy.clone(),
                 )
             },
         );
@@ -11797,6 +11797,7 @@ async fn create_workflow_schedule(
         // Normalize 0 → None: callers passing max_runs=0 intend "no limit".
         max_runs: request.max_runs.filter(|&n| n > 0),
         catchup_policy,
+        retry_policy: None,
     };
     let entry = match upsert_workflow_schedule_and_read_back(&mut conn, &ws).await {
         Ok(e) => e,
@@ -12842,7 +12843,7 @@ async fn trigger_schedule_now(
         .registry
         .workflows
         .get(&workflow_name)
-        .and_then(|info| info.retry_policy);
+        .and_then(|info| info.retry_policy.clone());
 
     let result = start_or_load_workflow_execution(
         &mut exec_conn,
@@ -13605,6 +13606,10 @@ async fn schedule_backfill(
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
+                        workflow_attempt: 1,
+                        workflow_retry_policy: None,
+                        retry_of_exec_id: None,
+                        max_workflow_attempts_ceiling: None,
                     },
                 )
                 .await;
@@ -13787,6 +13792,10 @@ async fn schedule_backfill(
                         // Backfilled runs share the schedule's carryover lineage (issue #488).
                         schedule_id: Some(schedule_id),
                         scheduled_for: Some(*original_slot),
+                        workflow_attempt: 1,
+                        workflow_retry_policy: None,
+                        retry_of_exec_id: None,
+                        max_workflow_attempts_ceiling: None,
                     },
                 )
                 .await;

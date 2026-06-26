@@ -2801,7 +2801,7 @@ async fn tick_one_workflow_schedule(
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
                 retry_of_exec_id: None,
-                max_workflow_attempts_ceiling: None,
+                max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
             },
         )
         .await;
@@ -3717,7 +3717,7 @@ async fn drain_buffered_schedule_runs(
                         .and_then(|v| serde_json::from_value(v.clone()).ok())
                         .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
                     retry_of_exec_id: None,
-                    max_workflow_attempts_ceiling: None,
+                    max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
                 },
             )
             .await;

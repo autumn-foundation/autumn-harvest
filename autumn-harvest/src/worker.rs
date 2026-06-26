@@ -247,6 +247,10 @@ pub struct HandlerRegistry {
     /// Maximum byte length for `current_details` strings passed to the
     /// workflow context (issue #473). Default: 1 KiB.
     pub max_current_details_bytes: usize,
+    /// Server-side ceiling on `workflow_attempt` (issue #523). `None` = no
+    /// ceiling. Applied to scheduler-fired starts so automated fires respect
+    /// the same operator-configured cap as API/manual starts.
+    pub max_workflow_attempts_ceiling: Option<u32>,
 }
 
 impl HandlerRegistry {
@@ -340,6 +344,7 @@ impl HandlerRegistry {
             circuit_breakers: Arc::new(crate::circuit_breaker::CircuitBreakerRegistry::new(
                 circuit_policies,
             )),
+            max_workflow_attempts_ceiling: None,
         }
     }
 
@@ -398,6 +403,13 @@ impl HandlerRegistry {
     #[must_use]
     pub const fn with_current_details_cap(mut self, cap_bytes: usize) -> Self {
         self.max_current_details_bytes = cap_bytes;
+        self
+    }
+
+    /// Set the server-side ceiling on `workflow_attempt` (issue #523).
+    #[must_use]
+    pub const fn with_max_workflow_attempts_ceiling(mut self, ceiling: Option<u32>) -> Self {
+        self.max_workflow_attempts_ceiling = ceiling;
         self
     }
 
@@ -471,6 +483,10 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("max_signal_payload_bytes", &self.max_signal_payload_bytes)
             .field("max_current_details_bytes", &self.max_current_details_bytes)
             .field("circuit_breakers", &self.circuit_breakers)
+            .field(
+                "max_workflow_attempts_ceiling",
+                &self.max_workflow_attempts_ceiling,
+            )
             .finish()
     }
 }
@@ -2315,15 +2331,17 @@ async fn persist_workflow_failure(
                 if attempt >= policy.max_attempts {
                     return None;
                 }
-                if policy.is_non_retryable(None, &error) {
+                if failure_is_non_retryable(&error, Some(&policy)) {
                     return None;
                 }
-                let delay = crate::policy::compute_retry_delay(
-                    policy.initial_interval,
-                    policy.backoff_coefficient,
-                    policy.max_interval,
-                    attempt,
+                // Use the execution ID bytes as a deterministic seed so jitter is
+                // consistent for this chain and avoids thundering-herd retry storms.
+                let seed = u64::from_le_bytes(
+                    exec_id.as_uuid().as_bytes()[..8]
+                        .try_into()
+                        .unwrap_or([0u8; 8]),
                 );
+                let delay = crate::policy::compute_retry_delay_with_seed(&policy, attempt, seed);
                 let retry_exec_id = ExecutionId::new_for_shard(exec_id.shard());
                 Some((retry_exec_id, policy, attempt, delay))
             })
@@ -2391,7 +2409,7 @@ async fn persist_workflow_failure(
                             queue_name: &exec_ref.queue_name,
                             execution_timeout: exec_ref.execution_timeout,
                             memo: exec_ref.memo.clone(),
-                            search_attrs: None,
+                            search_attrs: exec_ref.search_attrs.clone(),
                             // Bug #1: use AllowDuplicateFailedOnly — this calls
                             // replace_execution which seals the FAILED row as
                             // CONTINUED_AS_NEW (releasing the uniqueness slot) and

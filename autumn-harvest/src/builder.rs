@@ -655,7 +655,8 @@ impl BuiltHarvest {
                 self.max_activity_result_bytes,
                 self.max_signal_payload_bytes,
             )
-            .with_current_details_cap(self.max_current_details_bytes),
+            .with_current_details_cap(self.max_current_details_bytes)
+            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
@@ -691,7 +692,8 @@ impl BuiltHarvest {
                 self.max_activity_result_bytes,
                 self.max_signal_payload_bytes,
             )
-            .with_current_details_cap(self.max_current_details_bytes),
+            .with_current_details_cap(self.max_current_details_bytes)
+            .with_max_workflow_attempts_ceiling(self.max_workflow_attempts),
             self.dags,
             self.workflow_schedules,
             self.worker_config,
