@@ -6629,7 +6629,12 @@ async fn process_task(
 /// Stops when the cancellation token fires. Queues with zero pending rows are
 /// also reported (as depth 0) so gauges reset cleanly after drains.
 fn spawn_queue_depth_sampler(
-    pool: DbPool,
+    // One pool per shard to aggregate over. Single-shard deployments pass a
+    // one-element vec; multi-shard workers pass every shard in the ShardedDbPool
+    // so the gauges reflect fleet-wide backlog rather than the default shard only
+    // (issue #522 review). Every worker aggregates the same full set, so all
+    // workers emit a consistent `harvest.queue.depth{queue}` value.
+    pools: Vec<DbPool>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     queues: Vec<String>,
@@ -6648,61 +6653,60 @@ fn spawn_queue_depth_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "queue depth sampler could not acquire DB connection"
-                    );
-                    continue;
-                }
-            };
-
-            match queue::queue_depths(&mut conn, &queues).await {
-                Ok(depths) => {
-                    let mut observed: HashSet<&str> = HashSet::new();
-                    for (queue_name, depth) in &depths {
-                        observed.insert(queue_name.as_str());
-                        telemetry
-                            .metrics
-                            .record_queue_depth(queue_name, u64::try_from(*depth).unwrap_or(0));
+            // Aggregate across every shard: depth is summed (total backlog),
+            // oldest-pending-age is the max (the single oldest task fleet-wide).
+            let mut depth_by_queue: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            let mut age_by_queue: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "queue depth sampler could not acquire DB connection"
+                        );
+                        continue;
                     }
-                    for queue_name in &queues {
-                        if !observed.contains(queue_name.as_str()) {
-                            telemetry.metrics.record_queue_depth(queue_name, 0);
+                };
+                match queue::queue_depths(&mut conn, &queues).await {
+                    Ok(depths) => {
+                        for (queue_name, depth) in depths {
+                            *depth_by_queue.entry(queue_name).or_insert(0) += depth;
                         }
                     }
+                    Err(error) => {
+                        tracing::debug!(error = %error, "queue depth sample failed");
+                    }
                 }
-                Err(error) => {
-                    tracing::debug!(error = %error, "queue depth sample failed");
+                match queue::oldest_pending_ages(&mut conn, &queues, &circuit_breaker_activities)
+                    .await
+                {
+                    Ok(ages) => {
+                        for (queue_name, age_secs) in ages {
+                            let slot = age_by_queue.entry(queue_name).or_insert(0.0);
+                            *slot = slot.max(age_secs);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(error = %error, "oldest pending age sample failed");
+                    }
                 }
             }
 
-            // Sample oldest-pending-age gauge alongside queue depth.
-            match queue::oldest_pending_ages(&mut conn, &queues, &circuit_breaker_activities).await
-            {
-                Ok(ages) => {
-                    let mut observed: HashSet<&str> = HashSet::new();
-                    for (queue_name, age_secs) in &ages {
-                        observed.insert(queue_name.as_str());
-                        telemetry
-                            .metrics
-                            .record_queue_oldest_pending_age(queue_name, *age_secs);
-                    }
-                    // Reset queues with no eligible tasks to 0 so stale gauge
-                    // values do not linger after a queue drains.
-                    for queue_name in &queues {
-                        if !observed.contains(queue_name.as_str()) {
-                            telemetry
-                                .metrics
-                                .record_queue_oldest_pending_age(queue_name, 0.0);
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(error = %error, "oldest pending age sample failed");
-                }
+            // Emit the aggregated gauges, zero-filling configured queues with no
+            // rows so stale values do not linger after a queue drains. The depth
+            // and age queries are scoped to `queues`, so no other queue appears.
+            for queue_name in &queues {
+                let depth = depth_by_queue.get(queue_name).copied().unwrap_or(0);
+                telemetry
+                    .metrics
+                    .record_queue_depth(queue_name, u64::try_from(depth).unwrap_or(0));
+                let age = age_by_queue.get(queue_name).copied().unwrap_or(0.0);
+                telemetry
+                    .metrics
+                    .record_queue_oldest_pending_age(queue_name, age);
             }
 
             if cancel.is_cancelled() {
@@ -6719,7 +6723,8 @@ fn spawn_queue_depth_sampler(
 ///  - `record_concurrency_key_in_flight` with the current RUNNING count
 ///  - A `DEBUG` trace if any tasks are pending while the cap is saturated
 fn spawn_concurrency_sampler(
-    pool: DbPool,
+    // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
+    pools: Vec<DbPool>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     queues: Vec<String>,
@@ -6732,48 +6737,63 @@ fn spawn_concurrency_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "concurrency sampler could not acquire DB connection"
-                    );
-                    continue;
-                }
-            };
-
-            match queue::concurrency_key_stats(&mut conn, &queues).await {
-                Ok(stats) => {
-                    for stat in &stats {
-                        // The stats are grouped by (key, task_type) so workflow
-                        // and activity budgets for the same key don't collide on
-                        // the same metric label.
-                        let metric_key = format!("{}:{}", stat.key, stat.task_type);
-                        telemetry.metrics.record_concurrency_key_in_flight(
-                            &metric_key,
-                            u64::try_from(stat.in_flight).unwrap_or(0),
+            // Concurrency caps are per-shard (issue #247), so the same key can be
+            // active on several shards. Aggregate in-flight and deferred counts
+            // across shards per (key, task_type) for a fleet-wide view; the
+            // per-shard saturation debug log still fires per shard below.
+            let mut in_flight_by_key: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            let mut deferred_by_key: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "concurrency sampler could not acquire DB connection"
                         );
-                        let saturated = stat.in_flight >= i64::from(stat.max_concurrent);
-                        if saturated && stat.pending > 0 {
-                            tracing::debug!(
-                                concurrency_key = %stat.key,
-                                task_type = %stat.task_type,
-                                in_flight = stat.in_flight,
-                                max_concurrent = stat.max_concurrent,
-                                deferred = stat.pending,
-                                "concurrency cap saturated; pending tasks deferred until a slot frees"
-                            );
-                            telemetry.metrics.record_concurrency_key_deferred(
-                                &metric_key,
-                                u64::try_from(stat.pending).unwrap_or(0),
-                            );
+                        continue;
+                    }
+                };
+                match queue::concurrency_key_stats(&mut conn, &queues).await {
+                    Ok(stats) => {
+                        for stat in &stats {
+                            // Grouped by (key, task_type) so workflow and activity
+                            // budgets for the same key don't collide on the label.
+                            let metric_key = format!("{}:{}", stat.key, stat.task_type);
+                            *in_flight_by_key.entry(metric_key.clone()).or_insert(0) +=
+                                u64::try_from(stat.in_flight).unwrap_or(0);
+                            let saturated = stat.in_flight >= i64::from(stat.max_concurrent);
+                            if saturated && stat.pending > 0 {
+                                tracing::debug!(
+                                    concurrency_key = %stat.key,
+                                    task_type = %stat.task_type,
+                                    in_flight = stat.in_flight,
+                                    max_concurrent = stat.max_concurrent,
+                                    deferred = stat.pending,
+                                    "concurrency cap saturated; pending tasks deferred until a slot frees"
+                                );
+                                *deferred_by_key.entry(metric_key).or_insert(0) +=
+                                    u64::try_from(stat.pending).unwrap_or(0);
+                            }
                         }
                     }
+                    Err(error) => {
+                        tracing::debug!(error = %error, "concurrency key stats sample failed");
+                    }
                 }
-                Err(error) => {
-                    tracing::debug!(error = %error, "concurrency key stats sample failed");
-                }
+            }
+
+            for (metric_key, in_flight) in &in_flight_by_key {
+                telemetry
+                    .metrics
+                    .record_concurrency_key_in_flight(metric_key, *in_flight);
+            }
+            for (metric_key, deferred) in &deferred_by_key {
+                telemetry
+                    .metrics
+                    .record_concurrency_key_deferred(metric_key, *deferred);
             }
 
             if cancel.is_cancelled() {
@@ -6788,7 +6808,8 @@ fn spawn_concurrency_sampler(
 ///
 /// Stops when the cancellation token fires.
 fn spawn_rate_limit_sampler(
-    pool: DbPool,
+    // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
+    pools: Vec<DbPool>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     interval: Duration,
@@ -6810,42 +6831,60 @@ fn spawn_rate_limit_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "rate limit sampler could not acquire DB connection"
-                    );
-                    continue;
-                }
-            };
-
-            let result: Result<Vec<BucketRow>, _> = diesel::sql_query(
-                "SELECT \
-                     key, \
-                     refill_rate, \
-                     LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) AS estimated_tokens \
-                 FROM harvest_rate_limit_buckets"
-            )
-            .load(&mut conn)
-            .await;
-
-            match result {
-                Ok(buckets) => {
-                    for bucket in buckets {
-                        telemetry.metrics.record_rate_limit_tokens_available(
-                            &bucket.key,
-                            bucket.estimated_tokens,
+            // Rate-limit buckets are per-shard. Aggregate per key across shards:
+            // available tokens are summed (total budget fleet-wide) and the
+            // refill rate is the max (it is configured identically per shard, so
+            // max == any present value).
+            let mut tokens_by_key: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+            let mut refill_by_key: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "rate limit sampler could not acquire DB connection"
                         );
-                        telemetry
-                            .metrics
-                            .record_rate_limit_refill_rate(&bucket.key, bucket.refill_rate);
+                        continue;
+                    }
+                };
+
+                let result: Result<Vec<BucketRow>, _> = diesel::sql_query(
+                    "SELECT \
+                         key, \
+                         refill_rate, \
+                         LEAST(burst, tokens + EXTRACT(EPOCH FROM (NOW() - last_refilled_at)) * refill_rate) AS estimated_tokens \
+                     FROM harvest_rate_limit_buckets"
+                )
+                .load(&mut conn)
+                .await;
+
+                match result {
+                    Ok(buckets) => {
+                        for bucket in buckets {
+                            *tokens_by_key.entry(bucket.key.clone()).or_insert(0.0) +=
+                                bucket.estimated_tokens;
+                            let slot = refill_by_key.entry(bucket.key).or_insert(0.0);
+                            *slot = slot.max(bucket.refill_rate);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(error = %error, "rate limit sampler query failed");
                     }
                 }
-                Err(error) => {
-                    tracing::debug!(error = %error, "rate limit sampler query failed");
-                }
+            }
+
+            for (key, tokens) in &tokens_by_key {
+                telemetry
+                    .metrics
+                    .record_rate_limit_tokens_available(key, *tokens);
+            }
+            for (key, refill_rate) in &refill_by_key {
+                telemetry
+                    .metrics
+                    .record_rate_limit_refill_rate(key, *refill_rate);
             }
 
             if cancel.is_cancelled() {
@@ -7209,7 +7248,8 @@ fn spawn_pause_auto_resumer(
 /// (e.g. via `ctx.should_continue_as_new()`) or by the operator (via the
 /// hard ceiling or manual continue-as-new).
 fn spawn_history_oversized_sampler(
-    pool: DbPool,
+    // One pool per shard to aggregate over (see `spawn_queue_depth_sampler`).
+    pools: Vec<DbPool>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
     soft_threshold: u64,
@@ -7223,37 +7263,50 @@ fn spawn_history_oversized_sampler(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let mut conn = match pool.get().await {
-                Ok(conn) => conn,
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error,
-                        "history oversized sampler could not acquire DB connection"
-                    );
-                    continue;
-                }
-            };
+            // Oversized RUNNING executions live on the shard that owns them, so
+            // sum the per-workflow counts across every shard for a fleet-wide
+            // gauge.
+            let mut count_by_workflow: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            for pool in &pools {
+                let mut conn = match pool.get().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        tracing::debug!(
+                            error = %error,
+                            "history oversized sampler could not acquire DB connection"
+                        );
+                        continue;
+                    }
+                };
 
-            match sample_history_oversized_counts(&mut conn, soft_threshold).await {
-                Ok(counts) => {
-                    let mut active_workflows = std::collections::HashSet::new();
-                    for (workflow_name, count) in &counts {
-                        telemetry
-                            .metrics
-                            .record_workflow_history_oversized(workflow_name, *count);
-                        active_workflows.insert(workflow_name.clone());
+                match sample_history_oversized_counts(&mut conn, soft_threshold).await {
+                    Ok(counts) => {
+                        for (workflow_name, count) in counts {
+                            *count_by_workflow.entry(workflow_name).or_insert(0) += count;
+                        }
                     }
-                    for workflow_name in reported_workflows.difference(&active_workflows) {
-                        telemetry
-                            .metrics
-                            .record_workflow_history_oversized(workflow_name, 0);
+                    Err(error) => {
+                        tracing::debug!(error = %error, "history oversized sample failed");
                     }
-                    reported_workflows = active_workflows;
-                }
-                Err(error) => {
-                    tracing::debug!(error = %error, "history oversized sample failed");
                 }
             }
+
+            let active_workflows: std::collections::HashSet<String> =
+                count_by_workflow.keys().cloned().collect();
+            for (workflow_name, count) in &count_by_workflow {
+                telemetry
+                    .metrics
+                    .record_workflow_history_oversized(workflow_name, *count);
+            }
+            // Zero-fill workflows that were oversized last tick but no longer are
+            // so stale gauge values do not linger.
+            for workflow_name in reported_workflows.difference(&active_workflows) {
+                telemetry
+                    .metrics
+                    .record_workflow_history_oversized(workflow_name, 0);
+            }
+            reported_workflows = active_workflows;
 
             if cancel.is_cancelled() {
                 break;
@@ -7820,8 +7873,23 @@ impl Worker {
 
     #[allow(clippy::too_many_lines)]
     fn spawn_monitoring_tasks(&self, pool: &DbPool) -> WorkerMonitoringHandles {
+        // Pools the queue-depth/age, concurrency, rate-limit, and history-
+        // oversized samplers aggregate over (issue #522 review). When a
+        // ShardedDbPool is configured, sample every shard so these fleet-wide
+        // gauges reflect non-default-shard backlog/throttling rather than only
+        // the default shard; otherwise use the single default pool (legacy,
+        // byte-for-byte unchanged). All workers aggregate the same full set, so
+        // the gauges stay consistent across the fleet.
+        #[cfg(feature = "db")]
+        let sampler_pools: Vec<DbPool> = self.config.sharded_pool.as_ref().map_or_else(
+            || vec![pool.clone()],
+            |sp| sp.iter_shards().map(|(_, p)| p.clone()).collect(),
+        );
+        #[cfg(not(feature = "db"))]
+        let sampler_pools: Vec<DbPool> = vec![pool.clone()];
+
         let queue_depth_sampler = spawn_queue_depth_sampler(
-            pool.clone(),
+            sampler_pools.clone(),
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.config.queues.clone(),
@@ -7832,7 +7900,7 @@ impl Worker {
                 .to_vec(),
         );
         let concurrency_sampler = spawn_concurrency_sampler(
-            pool.clone(),
+            sampler_pools.clone(),
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.config.queues.clone(),
@@ -7883,7 +7951,7 @@ impl Worker {
             handles
         };
         let rate_limit_sampler = spawn_rate_limit_sampler(
-            pool.clone(),
+            sampler_pools.clone(),
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.config.poll_interval,
@@ -7969,7 +8037,7 @@ impl Worker {
             })
             .collect();
         let history_oversized_sampler = spawn_history_oversized_sampler(
-            pool.clone(),
+            sampler_pools,
             self.shutdown.clone(),
             self.registry.telemetry().clone(),
             self.registry.history_policy().continue_as_new_threshold(),
