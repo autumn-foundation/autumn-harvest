@@ -18892,6 +18892,33 @@ where
 // Worker fleet observability (issue #100)
 // ---------------------------------------------------------------------------
 
+/// Deduplicate worker rows fanned out across shards, keeping the **freshest**
+/// snapshot per `worker_id` (the row with the most recent `last_heartbeat_at`).
+///
+/// A multi-shard worker registers a row in every assigned shard's
+/// `harvest_workers` table and heartbeats each independently, so the same
+/// `worker_id` appears once per shard with possibly different shard-local
+/// health. Keeping the first-seen row (lowest shard from `iter_shards()`) could
+/// let a stale copy on a lower shard mask a healthy heartbeat on a higher one,
+/// and — since the per-shard filter matches the advertised `shard_assignments`
+/// JSON rather than the source shard — could even return a non-source-shard copy
+/// for `?shard_id=` queries (issue #522 review). The freshest snapshot reflects
+/// the worker's true liveness regardless of which shard it was read from.
+fn dedup_workers_by_freshest(rows: Vec<WorkerRow>) -> Vec<WorkerRow> {
+    let mut by_id: std::collections::HashMap<String, WorkerRow> = std::collections::HashMap::new();
+    for row in rows {
+        match by_id.get(&row.worker.worker_id) {
+            // Keep the existing row only if it is at least as fresh.
+            Some(existing) if existing.worker.last_heartbeat_at >= row.worker.last_heartbeat_at => {
+            }
+            _ => {
+                by_id.insert(row.worker.worker_id.clone(), row);
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
 async fn list_workers_handler(
     Extension(api_state): Extension<HarvestApiState>,
     Query(pairs): Query<Vec<(String, String)>>,
@@ -18919,11 +18946,9 @@ async fn list_workers_handler(
     }
 
     // A multi-shard worker registers a row in every shard's harvest_workers
-    // table. Dedup by worker_id so each physical worker appears exactly once.
-    {
-        let mut seen = std::collections::HashSet::new();
-        results.retain(|w| seen.insert(w.worker.worker_id.clone()));
-    }
+    // table. Dedup by worker_id, keeping the freshest per-shard snapshot so each
+    // physical worker appears exactly once with its true liveness.
+    let mut results = dedup_workers_by_freshest(results);
 
     let capable_of = pairs
         .iter()
@@ -19051,10 +19076,10 @@ async fn workers_health(
         all_workers.append(&mut rows);
     }
 
-    {
-        let mut seen = std::collections::HashSet::new();
-        all_workers.retain(|w| seen.insert(w.worker.worker_id.clone()));
-    }
+    // Dedup by worker_id, keeping the freshest per-shard snapshot so a stale
+    // copy on one shard never masks a healthy heartbeat on another in the
+    // healthy/stale/draining totals (issue #522 review).
+    let all_workers = dedup_workers_by_freshest(all_workers);
 
     let mut combined = FleetHealth {
         healthy: 0,
@@ -21185,6 +21210,50 @@ mod tests {
             .outcome,
             DrainOutcome::Accepted
         );
+    }
+
+    #[test]
+    fn dedup_workers_by_freshest_keeps_latest_heartbeat() {
+        use autumn_harvest::models::HarvestWorker;
+        use autumn_harvest::workers::WorkerHealth;
+
+        let now = chrono::Utc::now();
+        let mk = |hb: chrono::DateTime<chrono::Utc>, health: WorkerHealth| WorkerRow {
+            worker: HarvestWorker {
+                worker_id: "w1".to_string(),
+                started_at: now,
+                last_heartbeat_at: hb,
+                queues: serde_json::json!(["default"]),
+                shard_assignments: serde_json::json!([0, 1]),
+                max_concurrency: 10,
+                in_flight_count: 0,
+                host: "localhost".to_string(),
+                version: None,
+                status: "Active".to_string(),
+                drain_deadline_at: None,
+                build_id: String::new(),
+                deployment_name: None,
+                labels: serde_json::json!({}),
+            },
+            health,
+            active_task_ids: vec![],
+        };
+
+        // Shard 0's copy (read first, lowest shard) is stale; shard 1's copy is
+        // fresh. The dedup must keep the fresh snapshot, not the first-seen one.
+        let stale = mk(now - chrono::Duration::hours(1), WorkerHealth::Stale);
+        let fresh = mk(now, WorkerHealth::Healthy);
+        let deduped = dedup_workers_by_freshest(vec![stale, fresh]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].health, WorkerHealth::Healthy);
+        assert_eq!(deduped[0].worker.last_heartbeat_at, now);
+
+        // Order-independent: fresh first, stale second → still keeps fresh.
+        let stale2 = mk(now - chrono::Duration::hours(1), WorkerHealth::Stale);
+        let fresh2 = mk(now, WorkerHealth::Healthy);
+        let deduped_rev = dedup_workers_by_freshest(vec![fresh2, stale2]);
+        assert_eq!(deduped_rev.len(), 1);
+        assert_eq!(deduped_rev[0].health, WorkerHealth::Healthy);
     }
 
     #[test]

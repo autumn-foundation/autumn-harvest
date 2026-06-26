@@ -7370,6 +7370,7 @@ impl Worker {
     /// it drains all assigned shards via `run_poll_loop_multi` (issue #522).
     /// Otherwise it falls through to the existing single-shard path
     /// (`run_with_listener`) byte-for-byte unchanged.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(&self, pool: &DbPool) {
         // Resolve the set of (ShardId, DbPool) claim targets from the sharded
         // pool when available, deduplicating by ShardId.
@@ -7450,16 +7451,31 @@ impl Worker {
             // `notification_database_url` may point at a different shard, so a
             // NOTIFY fired on the polled shard would never wake this worker
             // (issue #522). Prefer this shard's entry in
-            // `shard_notification_database_urls`; fall back to the global URL
-            // (legacy behavior) when no per-shard URL is configured.
+            // `shard_notification_database_urls`.
+            //
+            // The global URL is only a safe fallback when the claim pool *is*
+            // the default pool — that is, when no `ShardedDbPool` is configured,
+            // so the resolved target reuses the passed default `pool` that the
+            // global URL targets. With a `ShardedDbPool` the resolved pool is
+            // shard-specific and the global URL may point at a different
+            // database; a NOTIFY there would never wake this worker, so an absent
+            // per-shard URL means poll-only for this shard rather than risking a
+            // wrong-database listener (issue #522 review).
+            let global_url_targets_claim_pool = self.config.sharded_pool.is_none();
             let listener_url: Option<&str> = match shard_targets.as_slice() {
-                [(shard_id, _), ..] => self
-                    .config
-                    .shard_notification_database_urls
-                    .iter()
-                    .find(|(s, _)| s == shard_id)
-                    .map(|(_, url)| url.as_str())
-                    .or(self.config.notification_database_url.as_deref()),
+                [(shard_id, _), ..] => {
+                    let per_shard = self
+                        .config
+                        .shard_notification_database_urls
+                        .iter()
+                        .find(|(s, _)| s == shard_id)
+                        .map(|(_, url)| url.as_str());
+                    per_shard.or_else(|| {
+                        global_url_targets_claim_pool
+                            .then_some(self.config.notification_database_url.as_deref())
+                            .flatten()
+                    })
+                }
                 [] => self.config.notification_database_url.as_deref(),
             };
             let listener = match listener_url {
