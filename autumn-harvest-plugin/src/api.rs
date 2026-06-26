@@ -19272,7 +19272,15 @@ async fn drain_preview_handler(
         results.append(&mut items);
     }
 
+    // A multi-shard worker registers a row in every shard's harvest_workers
+    // table, so drain_preview returns it once per shard. Dedup by worker_id
+    // before truncation so a low `limit` cannot hide other workers behind the
+    // duplicates of a single physical worker.
     results.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+    {
+        let mut seen = std::collections::HashSet::new();
+        results.retain(|item| seen.insert(item.worker_id.clone()));
+    }
     results.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
     Ok(Json(results))
 }

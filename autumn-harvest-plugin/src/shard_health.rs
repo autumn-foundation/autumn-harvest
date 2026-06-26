@@ -107,7 +107,27 @@ pub struct ShardSchedulerCoverage {
 pub struct QueueDepthSummary {
     pub total_pending: i64,
     pub by_queue: BTreeMap<String, i64>,
+    /// Distinct capability requirements among claimable pending activity tasks,
+    /// grouped by `(queue_name, required_capabilities)` (issue #522 review).
+    /// Used by the coverage gate to detect a queued capability-restricted task
+    /// that no covering worker's labels can satisfy. Empty when no pending task
+    /// carries `required_capabilities`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_demands: Vec<CapabilityDemand>,
     pub error: Option<String>,
+}
+
+/// A distinct capability requirement set among claimable pending tasks on a
+/// queue (issue #522 review).
+///
+/// `claim_task` only lets a worker whose labels satisfy `required_capabilities`
+/// claim the task, so a covering worker that polls the queue but fails the label
+/// match does not actually drain it.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilityDemand {
+    pub queue_name: String,
+    pub required_capabilities: serde_json::Value,
+    pub count: i64,
 }
 
 /// Dead-letter count summary for a shard.
@@ -335,6 +355,54 @@ fn check_no_live_worker_gate(
             uncovered.join(", ")
         ));
     }
+
+    // Capability-aware coverage (issue #522 review): a worker that polls the
+    // queue but whose labels don't satisfy a pending task's
+    // `required_capabilities` cannot claim it. claim_task enforces the same
+    // Exact/In label match, so e.g. a GPU-only activity queued on `default`
+    // with only non-GPU workers is stranded even though `default` looks
+    // covered by the per-queue check above. Skip queues already flagged with no
+    // covering worker at all to avoid a duplicate reason for the same demand.
+    let already_uncovered: std::collections::HashSet<&str> = uncovered.iter().copied().collect();
+    let mut uncovered_caps: Vec<String> = Vec::new();
+    for demand in &queue_depth.capability_demands {
+        if already_uncovered.contains(demand.queue_name.as_str()) {
+            continue;
+        }
+        let Ok(reqs) = serde_json::from_value::<Vec<autumn_harvest::eligibility::Requirement>>(
+            demand.required_capabilities.clone(),
+        ) else {
+            // Unparseable requirement JSON: don't fabricate a coverage failure.
+            continue;
+        };
+        let satisfied = ws.iter().any(|w| {
+            worker_assigned_to_shard(w, shard_id)
+                && w.health == WorkerHealth::Healthy
+                && w.worker.status == WorkerStatus::Active.as_str()
+                && w.worker.queues.as_array().is_some_and(|qs| {
+                    qs.iter()
+                        .any(|v| v.as_str() == Some(demand.queue_name.as_str()))
+                })
+                && {
+                    let labels: std::collections::HashMap<String, String> =
+                        serde_json::from_value(w.worker.labels.clone()).unwrap_or_default();
+                    autumn_harvest::eligibility::matches_requirements(&reqs, &labels)
+                }
+        });
+        if !satisfied {
+            uncovered_caps.push(demand.queue_name.clone());
+        }
+    }
+    if !uncovered_caps.is_empty() {
+        uncovered_caps.sort_unstable();
+        uncovered_caps.dedup();
+        push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
+        blocking_reasons.push(format!(
+            "claimable task(s) with capability requirements queued on queue(s) [{}] \
+             but no live worker assigned to this shard satisfies their required labels",
+            uncovered_caps.join(", ")
+        ));
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -499,6 +567,7 @@ fn unavailable_row(
         queue_depth: QueueDepthSummary {
             total_pending: 0,
             by_queue: BTreeMap::new(),
+            capability_demands: Vec::new(),
             error: Some(error_summary.clone()),
         },
         dlq: DlqSummary {
@@ -844,26 +913,79 @@ async fn load_queue_depth(conn: &mut AsyncPgConnection) -> QueueDepthSummary {
     .load::<QueueDepthRow>(conn)
     .await;
 
-    rows.map_or_else(
-        |error| QueueDepthSummary {
-            total_pending: 0,
-            by_queue: BTreeMap::new(),
-            error: Some(error.to_string()),
-        },
-        |rows| {
+    let (total_pending, by_queue, error) = match rows {
+        Err(error) => (0, BTreeMap::new(), Some(error.to_string())),
+        Ok(rows) => {
             let mut total_pending = 0;
             let mut by_queue = BTreeMap::new();
             for row in rows {
                 total_pending += row.depth;
                 by_queue.insert(row.queue_name, row.depth);
             }
-            QueueDepthSummary {
-                total_pending,
-                by_queue,
-                error: None,
-            }
-        },
+            (total_pending, by_queue, None)
+        }
+    };
+
+    // Distinct capability requirements among claimable pending activity tasks,
+    // grouped by (queue, required_capabilities). Same claim_task exclusions as
+    // above plus `required_capabilities IS NOT NULL`. On query failure leave
+    // demands empty — the basic per-queue coverage gate still applies.
+    let cap_rows = diesel::sql_query(
+        "SELECT queue_name::TEXT AS queue_name, \
+                required_capabilities AS required_capabilities, \
+                COUNT(*)::BIGINT AS depth \
+         FROM harvest_task_queue \
+         WHERE state = 'PENDING' \
+           AND scheduled_at <= NOW() \
+           AND required_capabilities IS NOT NULL \
+           AND ( \
+               schedule_to_close_at IS NULL \
+               OR schedule_to_close_at > NOW() \
+           ) \
+           AND ( \
+               task_type <> 'workflow' \
+               OR workflow_exec_id IS NULL \
+               OR NOT EXISTS ( \
+                   SELECT 1 FROM harvest_workflow_executions e \
+                   WHERE e.id = harvest_task_queue.workflow_exec_id \
+                     AND e.state = 'PAUSED' \
+               ) \
+           ) \
+         GROUP BY queue_name, required_capabilities \
+         ORDER BY queue_name",
     )
+    .load::<CapabilityDemandRow>(conn)
+    .await;
+
+    let capability_demands = cap_rows.map_or_else(
+        |_| Vec::new(),
+        |rows| {
+            rows.into_iter()
+                .map(|r| CapabilityDemand {
+                    queue_name: r.queue_name,
+                    required_capabilities: r.required_capabilities,
+                    count: r.depth,
+                })
+                .collect()
+        },
+    );
+
+    QueueDepthSummary {
+        total_pending,
+        by_queue,
+        capability_demands,
+        error,
+    }
+}
+
+#[derive(diesel::QueryableByName)]
+struct CapabilityDemandRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue_name: String,
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    required_capabilities: serde_json::Value,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    depth: i64,
 }
 
 async fn load_dlq(conn: &mut AsyncPgConnection) -> DlqSummary {
@@ -1136,6 +1258,7 @@ mod tests {
         QueueDepthSummary {
             total_pending: total,
             by_queue,
+            capability_demands: Vec::new(),
             error: None,
         }
     }
@@ -1297,6 +1420,7 @@ mod tests {
         QueueDepthSummary {
             total_pending: default_pending + email_pending,
             by_queue,
+            capability_demands: Vec::new(),
             error: None,
         }
     }
@@ -1362,6 +1486,86 @@ mod tests {
         assert!(
             !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "should not fire when every pending queue has a covering worker"
+        );
+        assert!(blocking_reasons.is_empty());
+    }
+
+    /// Build a `QueueDepthSummary` with one capability-bearing pending task on
+    /// `default` requiring label `gpu = "true"`.
+    fn gpu_queue_depth() -> QueueDepthSummary {
+        let mut by_queue = std::collections::BTreeMap::new();
+        by_queue.insert("default".to_string(), 1);
+        QueueDepthSummary {
+            total_pending: 1,
+            by_queue,
+            capability_demands: vec![CapabilityDemand {
+                queue_name: "default".to_string(),
+                required_capabilities: serde_json::json!([{"Exact": {"key": "gpu", "value": "true"}}]),
+                count: 1,
+            }],
+            error: None,
+        }
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_capability_requirement_unsatisfied() {
+        // A GPU-only activity is queued on `default`; the only worker polls
+        // `default` but has no `gpu` label, so claim_task would never let it
+        // claim the task — the work is stranded even though `default` looks
+        // covered by the basic per-queue check.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = gpu_queue_depth();
+        let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        // make_worker_row polls ["default"] with empty labels.
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should fire when no worker satisfies the pending task's capabilities"
+        );
+        assert!(
+            blocking_reasons
+                .iter()
+                .any(|r| r.contains("capability") && r.contains("default")),
+            "blocking reason should name the capability-uncovered queue: {blocking_reasons:?}"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_capability_requirement_satisfied() {
+        // The same GPU-only activity, but the covering worker carries the
+        // `gpu = "true"` label, so it can claim the task — no stranded work.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = gpu_queue_depth();
+        let mut worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        worker.worker.labels = serde_json::json!({"gpu": "true"});
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when a covering worker satisfies the capabilities"
         );
         assert!(blocking_reasons.is_empty());
     }
