@@ -303,28 +303,36 @@ fn check_no_live_worker_gate(
         return;
     };
 
-    // A worker "covers" the shard if it is healthy, active, assigned to this
-    // shard, AND services at least one queue that has pending work (fix #8).
-    // A worker that is assigned to the shard but only covers unrelated queues
-    // cannot actually drain the stuck tasks.
-    let covering = ws
-        .iter()
-        .filter(|w| {
+    // Coverage is per pending queue, not shard-wide (fix #8 + per-queue,
+    // issue #522): a worker assigned to this shard that polls `default` does
+    // not drain pending `email` tasks, so checking that *any* worker covers
+    // *any* pending queue would hide stranded work on an uncovered queue. Flag
+    // when any queue with claimable work lacks a healthy, active, assigned
+    // worker that polls it.
+    let queue_covered = |queue: &str| {
+        ws.iter().any(|w| {
             worker_assigned_to_shard(w, shard_id)
                 && w.health == WorkerHealth::Healthy
                 && w.worker.status == WorkerStatus::Active.as_str()
-                && w.worker.queues.as_array().is_some_and(|qs| {
-                    qs.iter()
-                        .any(|v| v.as_str().is_some_and(|q| pending_queues.contains(q)))
-                })
+                && w.worker
+                    .queues
+                    .as_array()
+                    .is_some_and(|qs| qs.iter().any(|v| v.as_str() == Some(queue)))
         })
-        .count();
-    if covering == 0 {
+    };
+    let mut uncovered: Vec<&str> = pending_queues
+        .iter()
+        .copied()
+        .filter(|q| !queue_covered(q))
+        .collect();
+    if !uncovered.is_empty() {
+        uncovered.sort_unstable();
         push_reason_code(reason_codes, REASON_NO_LIVE_WORKER);
         blocking_reasons.push(format!(
-            "{} claimable task(s) queued but no live worker covers this shard \
-             and the relevant queue(s) in shard_assignments",
-            queue_depth.total_pending
+            "{} claimable task(s) queued but no live worker assigned to this shard \
+             polls queue(s) [{}]",
+            queue_depth.total_pending,
+            uncovered.join(", ")
         ));
     }
 }
@@ -1257,5 +1265,85 @@ mod tests {
             reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
             "worker on different shard should not count as coverage"
         );
+    }
+
+    fn two_queue_depth(default_pending: i64, email_pending: i64) -> QueueDepthSummary {
+        let mut by_queue = std::collections::BTreeMap::new();
+        if default_pending > 0 {
+            by_queue.insert("default".to_string(), default_pending);
+        }
+        if email_pending > 0 {
+            by_queue.insert("email".to_string(), email_pending);
+        }
+        QueueDepthSummary {
+            total_pending: default_pending + email_pending,
+            by_queue,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn no_live_worker_gate_fires_when_one_pending_queue_is_uncovered() {
+        // Pending work on `default` and `email`; the only worker polls
+        // `default`, so the `email` tasks are stranded even though some
+        // pending work is covered.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = two_queue_depth(3, 2);
+        let worker = make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        // make_worker_row already polls only ["default"].
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should fire when a pending queue has no covering worker"
+        );
+        assert!(
+            blocking_reasons
+                .iter()
+                .any(|r| r.contains("email") && !r.contains("default")),
+            "blocking reason should name the uncovered queue only: {blocking_reasons:?}"
+        );
+    }
+
+    #[test]
+    fn no_live_worker_gate_suppressed_when_every_pending_queue_is_covered() {
+        // Pending work on `default` and `email`; two workers cover them
+        // between them, so no work is stranded.
+        let roles = vec![ShardRole::Writable];
+        let queue_depth = two_queue_depth(3, 2);
+        let default_worker =
+            make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        let mut email_worker =
+            make_worker_row(0, WorkerStatus::Active.as_str(), WorkerHealth::Healthy);
+        email_worker.worker.queues = serde_json::json!(["email"]);
+        let workers: Result<Vec<WorkerRow>, String> = Ok(vec![default_worker, email_worker]);
+        let mut reason_codes = Vec::new();
+        let mut blocking_reasons = Vec::new();
+
+        check_no_live_worker_gate(
+            0,
+            &roles,
+            &queue_depth,
+            &workers,
+            &mut reason_codes,
+            &mut blocking_reasons,
+        );
+
+        assert!(
+            !reason_codes.contains(&REASON_NO_LIVE_WORKER.to_string()),
+            "should not fire when every pending queue has a covering worker"
+        );
+        assert!(blocking_reasons.is_empty());
     }
 }

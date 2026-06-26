@@ -136,22 +136,26 @@ impl PreparedHarvestRuntime {
             .collect();
         let workflow_schedules = Arc::new(built.workflow_schedules().to_vec());
         let max_workflow_history_events = built.max_workflow_history_events;
+        // Resolve the storage pool (sharded when the embedder supplied one)
+        // *before* building handler state so the registry receives the same
+        // sharded HarvestDbPool. Otherwise handlers fall back to the default
+        // shard's pool and can read/write the wrong database (issue #522).
+        let storage_pool = if let Some(sp) = resources.sharded_pool {
+            HarvestDbPool::sharded(sp)
+        } else {
+            HarvestDbPool::from(resources.harvest_pool)
+        };
         let (registry, dags, _ws, worker_config) =
             built.into_worker_parts_with_extra_state(injected_runtime_state(
                 resources.app_state,
                 resources.app_pool,
-                resources.harvest_pool.clone(),
+                storage_pool.clone(),
                 shard_router.clone(),
             ));
         let dag_catalog = Arc::new(
             compile_dag_catalog(dags)
                 .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
         );
-        let storage_pool = if let Some(sp) = resources.sharded_pool {
-            HarvestDbPool::sharded(sp)
-        } else {
-            HarvestDbPool::from(resources.harvest_pool)
-        };
         let mut worker_runtime_config = WorkerRuntimeConfig::from(worker_config);
         // Builder-level ceiling takes precedence; WorkerConfig ceiling is kept
         // when the builder did not set one (avoids silently disabling a ceiling
@@ -433,7 +437,7 @@ impl HarvestRunner {
 pub(crate) fn injected_runtime_state(
     pool_state: Option<AppState>,
     app_pool: Option<DbPool>,
-    harvest_pool: DbPool,
+    harvest_pool: HarvestDbPool,
     shard_router: ShardRouter,
 ) -> SharedStateMap {
     let mut state: HashMap<TypeId, Box<dyn Any + Send + Sync>> = HashMap::new();
@@ -446,12 +450,12 @@ pub(crate) fn injected_runtime_state(
             Box::new(AppDbPool::from(app_pool)),
         );
     }
-    let harvest_pool = HarvestDbPool::from(harvest_pool);
-    state.insert(
-        TypeId::of::<HarvestDbPool>(),
-        Box::new(harvest_pool.clone()),
-    );
+    // Inject the same (possibly sharded) HarvestDbPool the worker storage uses
+    // so a handler calling `pool_for_execution` routes to the owning shard.
+    // The legacy raw `DbPool` slot stays the default shard for shard-unaware
+    // handlers (issue #522).
     state.insert(TypeId::of::<DbPool>(), Box::new(harvest_pool.clone_inner()));
+    state.insert(TypeId::of::<HarvestDbPool>(), Box::new(harvest_pool));
     state.insert(TypeId::of::<ShardRouter>(), Box::new(shard_router));
     state
 }

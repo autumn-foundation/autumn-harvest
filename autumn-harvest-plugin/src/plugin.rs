@@ -879,7 +879,7 @@ mod tests {
         let injected = injected_runtime_state(
             Some(state.clone()),
             None,
-            harvest_pool,
+            HarvestDbPool::from(harvest_pool),
             ShardRouter::single(),
         );
         let stored = injected
@@ -929,7 +929,7 @@ mod tests {
         let injected = injected_runtime_state(
             Some(app_state),
             Some(app_pool),
-            harvest_pool,
+            HarvestDbPool::from(harvest_pool),
             ShardRouter::single(),
         );
 
