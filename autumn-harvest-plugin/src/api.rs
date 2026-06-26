@@ -102,7 +102,7 @@ use autumn_harvest::types::{
 use autumn_harvest::worker::{DbPool, HandlerRegistry};
 use autumn_harvest::workers::{
     DrainPreviewItem, DrainResponse, FleetHealth, PinnedExecutionRow, WorkerFilters, WorkerRow,
-    drain_preview, get_worker, list_pinned_executions, list_workers, parse_worker_filters,
+    get_worker, list_pinned_executions, list_workers, parse_worker_filters, preview_item_from_row,
     request_drain,
 };
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
@@ -19029,10 +19029,16 @@ async fn get_worker_handler(
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
 
+    // Fan out across all shards: a multi-shard worker has a row per shard, each
+    // carrying its own status/health snapshot and its own RUNNING task ids. Keep
+    // the freshest row (max last_heartbeat_at) and union active_task_ids across
+    // every shard so the detail view is current and complete rather than the
+    // first-reachable shard's partial snapshot (issue #522 review). Skip
+    // unavailable shards rather than returning 500; the worker may live on a
+    // reachable shard even when others are down.
+    let mut freshest: Option<WorkerRow> = None;
+    let mut active_task_ids: Vec<uuid::Uuid> = Vec::new();
     for (_shard, shard_pool) in pool.iter_shards() {
-        // Skip unavailable shards rather than returning 500; the worker may
-        // live on a reachable shard even when others are down, and the --wait
-        // poll loop must not abort just because an unrelated shard is offline.
         let Ok(mut conn) = acquire_conn(shard_pool).await else {
             continue;
         };
@@ -19040,11 +19046,27 @@ async fn get_worker_handler(
             .await
             .map_err(map_error)?
         {
-            return Ok(Json(row));
+            active_task_ids.extend(row.active_task_ids.iter().copied());
+            freshest = Some(match freshest.take() {
+                Some(existing)
+                    if existing.worker.last_heartbeat_at >= row.worker.last_heartbeat_at =>
+                {
+                    existing
+                }
+                _ => row,
+            });
         }
     }
 
-    Err(AutumnError::not_found_msg(format!("worker '{worker_id}'")))
+    match freshest {
+        Some(mut row) => {
+            active_task_ids.sort_unstable();
+            active_task_ids.dedup();
+            row.active_task_ids = active_task_ids;
+            Ok(Json(row))
+        }
+        None => Err(AutumnError::not_found_msg(format!("worker '{worker_id}'"))),
+    }
 }
 
 /// `GET /workers/{worker_id}/pinned`
@@ -19354,30 +19376,51 @@ async fn drain_preview_handler(
     let stale_threshold = api_state.worker_stale_threshold();
     let pool = api_state.storage_pool().map_err(map_error)?;
 
+    // Load worker rows per shard WITHOUT snapshot-dependent filters and dedup by
+    // freshest snapshot, exactly as /workers does, so a stale Active copy on one
+    // shard can't be retained while the fresher Draining/Stopped row on another
+    // shard is filtered out before dedup (issue #522 review). The preview's own
+    // filters (default-Active status plus any requested status/health/build/
+    // deployment) and the limit are applied globally against the freshest row.
     let per_shard_filters = WorkerFilters {
         limit: i64::MAX,
+        status: None,
+        health: None,
+        build_id: None,
+        deployment_name: None,
         ..filters.clone()
     };
-
-    let mut results: Vec<DrainPreviewItem> = Vec::new();
+    let mut rows: Vec<WorkerRow> = Vec::new();
     for (_shard, shard_pool) in pool.iter_shards() {
         let mut conn = acquire_conn(shard_pool).await?;
-        let mut items = drain_preview(&mut conn, &per_shard_filters, stale_threshold)
+        let mut shard_rows = list_workers(&mut conn, &per_shard_filters, stale_threshold)
             .await
             .map_err(map_error)?;
-        results.append(&mut items);
+        rows.append(&mut shard_rows);
+    }
+    let mut rows = dedup_workers_by_freshest(rows);
+
+    // Default to Active-only (workers that would be *newly* drained) unless the
+    // caller asked for an explicit status — matching drain_preview's contract.
+    let status_filter = filters.status.clone().unwrap_or_else(|| {
+        autumn_harvest::workers::WorkerStatus::Active
+            .as_str()
+            .to_string()
+    });
+    rows.retain(|w| w.worker.status == status_filter);
+    if let Some(health) = filters.health {
+        rows.retain(|w| w.health == health);
+    }
+    if let Some(ref build_id) = filters.build_id {
+        rows.retain(|w| &w.worker.build_id == build_id);
+    }
+    if let Some(ref deployment_name) = filters.deployment_name {
+        rows.retain(|w| w.worker.deployment_name.as_deref() == Some(deployment_name.as_str()));
     }
 
-    // A multi-shard worker registers a row in every shard's harvest_workers
-    // table, so drain_preview returns it once per shard. Dedup by worker_id
-    // before truncation so a low `limit` cannot hide other workers behind the
-    // duplicates of a single physical worker.
-    results.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
-    {
-        let mut seen = std::collections::HashSet::new();
-        results.retain(|item| seen.insert(item.worker_id.clone()));
-    }
-    results.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
+    rows.sort_by(|a, b| a.worker.worker_id.cmp(&b.worker.worker_id));
+    rows.truncate(usize::try_from(filters.limit).unwrap_or(usize::MAX));
+    let results: Vec<DrainPreviewItem> = rows.iter().map(preview_item_from_row).collect();
     Ok(Json(results))
 }
 
