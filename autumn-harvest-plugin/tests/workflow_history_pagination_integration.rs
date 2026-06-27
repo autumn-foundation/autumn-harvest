@@ -1,12 +1,12 @@
 //! Integration tests for `GET /api/harvest/workflows/{id}/history` (issue #529).
 //!
 //! Tests run against a real Postgres instance (testcontainers) and exercise:
-//!   (a) Page boundaries: limit=10, follow next_cursor, no drops/duplicates.
-//!   (b) event_type filter: only matching types returned; total_events is unfiltered.
+//!   (a) Page boundaries: `limit=10`, follow `next_cursor`, no drops/duplicates.
+//!   (b) `event_type` filter: only matching types returned; `total_events` is unfiltered.
 //!   (c) Append-during-paging stability: new events after page 1 visible on page 2.
 //!   (d) 404 for unknown execution id.
 //!   (e) 400 for malformed `after` cursor and non-integer `limit`.
-//!   (f) get_workflow truncation: history.len() <= 100, history_truncated=true, history_endpoint present.
+//!   (f) `get_workflow` truncation: `history.len()` <= 100, `history_truncated=true`, `history_endpoint` present.
 
 #![allow(clippy::too_many_lines)]
 
@@ -29,7 +29,6 @@ use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use chrono::Utc;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
 use serde_json::{Value, json};
@@ -262,7 +261,7 @@ async fn seed_execution(conn: &mut AsyncPgConnection, workflow_id: &str) -> Exec
 }
 
 /// Append N `TimerStarted` events then N `TimerFired` events and return the
-/// total appended count (not counting the initial WorkflowStarted row).
+/// total appended count (not counting the initial `WorkflowStarted` row).
 async fn append_mixed_events(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -287,7 +286,7 @@ async fn append_mixed_events(
     store::append_events(conn, exec_id, &events, next_id)
         .await
         .expect("append events");
-    next_id += events.len() as i32;
+    next_id += i32::try_from(events.len()).expect("event count fits i32");
     let _ = next_id;
     events.len()
 }
@@ -358,8 +357,8 @@ async fn history_non_integer_limit_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// (a) Page boundaries: limit=5, follow next_cursor to drain all events, no
-/// drops/duplicates, last page has next_cursor=null.
+/// (a) Page boundaries: `limit=5`, follow `next_cursor` to drain all events, no
+/// drops/duplicates, last page has `next_cursor=null`.
 #[tokio::test]
 async fn history_page_boundaries_no_drops_or_duplicates() {
     let (url, _container) = setup_database().await;
@@ -424,7 +423,7 @@ async fn history_page_boundaries_no_drops_or_duplicates() {
     assert_eq!(collected_ids.len(), 15, "must have collected all 15 events");
 }
 
-/// (b) event_type filter: only matching types returned; total_events is the
+/// (b) `event_type` filter: only matching types returned; `total_events` is the
 /// unfiltered count.
 #[tokio::test]
 async fn history_event_type_filter_returns_only_matching() {
@@ -469,7 +468,7 @@ async fn history_event_type_filter_returns_only_matching() {
     );
 }
 
-/// (b) Multiple event_type values (repeatable param).
+/// (b) Multiple `event_type` values (repeatable param).
 #[tokio::test]
 async fn history_multiple_event_type_filters() {
     let (url, _container) = setup_database().await;
@@ -555,8 +554,8 @@ async fn history_append_during_paging_stability() {
     );
 }
 
-/// (f) get_workflow truncation: when >100 events, history.len() <= 100,
-/// history_truncated=true, history_endpoint is present.
+/// (f) `get_workflow` truncation: when >100 events, `history.len()` <= 100,
+/// `history_truncated=true`, `history_endpoint` is present.
 #[tokio::test]
 async fn get_workflow_history_is_truncated_when_over_100_events() {
     let (url, _container) = setup_database().await;
@@ -593,7 +592,7 @@ async fn get_workflow_history_is_truncated_when_over_100_events() {
     );
 }
 
-/// Response shape: each event in the history page must have id, event_id, timestamp, type, data.
+/// Response shape: each event in the history page must have `id`, `event_id`, timestamp, type, data.
 #[tokio::test]
 async fn history_response_shape_has_required_fields() {
     let (url, _container) = setup_database().await;
@@ -642,7 +641,7 @@ async fn history_response_shape_has_required_fields() {
     assert!(first["data"].is_object(), "each event must have 'data'");
 }
 
-/// Unknown event_type names yield an empty events page (not a 400).
+/// Unknown `event_type` names yield an empty events page (not a 400).
 #[tokio::test]
 async fn history_unknown_event_type_yields_empty_page() {
     let (url, _container) = setup_database().await;
