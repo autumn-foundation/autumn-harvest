@@ -5199,9 +5199,12 @@ async fn get_workflow_history(
 
     let mut entries = Vec::with_capacity(page.events.len());
     for paged in page.events {
-        // Take ownership of raw_event and remove both fields to avoid cloning any payload.
-        let mut raw = paged.raw_event;
-        let (type_name, data) = match &mut raw {
+        // Serialize via WorkflowEvent (not raw_event) to fill serde-default fields on legacy
+        // events, keeping the shape consistent with the embedded history in get_workflow.
+        let mut normalized = serde_json::to_value(paged.event)
+            .map_err(HarvestError::from)
+            .map_err(map_error)?;
+        let (type_name, data) = match &mut normalized {
             Value::Object(map) => {
                 let type_name = map
                     .remove("type")
