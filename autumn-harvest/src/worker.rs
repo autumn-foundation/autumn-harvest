@@ -50,7 +50,7 @@ use crate::signal;
 use crate::store;
 use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
-    ATTR_WORKFLOW_ID, ActivityStatus, TraceContextCarrier, WorkflowStatus,
+    ATTR_WORKFLOW_ID, ActivityStatus, SlotType, TraceContextCarrier, WorkflowStatus,
 };
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, TimerId,
@@ -7482,12 +7482,6 @@ fn spawn_worker_slot_sampler(
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // No recorder configured: the per-sample reads are cheap, but there is
-        // no point doing them when nothing is listening — matches the other
-        // samplers' opt-in contract.
-        if !telemetry.metrics.is_enabled() {
-            return;
-        }
         loop {
             tokio::select! {
                 () = cancel.cancelled() => break,
@@ -7498,25 +7492,19 @@ fn spawn_worker_slot_sampler(
                 max_concurrent_workflows,
                 workflow_semaphore.available_permits(),
             );
-            telemetry.metrics.record_worker_slots(
-                crate::telemetry::SlotType::Workflow,
-                wf_in_use,
-                wf_available,
-            );
+            telemetry
+                .metrics
+                .record_worker_slots(SlotType::Workflow, wf_in_use, wf_available);
 
+            // Activity read is a separate snapshot; cross-type totals may reflect
+            // different instants when a task is dispatched between the two reads.
             let (act_in_use, act_available) = slot_occupancy(
                 max_concurrent_activities,
                 activity_semaphore.available_permits(),
             );
-            telemetry.metrics.record_worker_slots(
-                crate::telemetry::SlotType::Activity,
-                act_in_use,
-                act_available,
-            );
-
-            if cancel.is_cancelled() {
-                break;
-            }
+            telemetry
+                .metrics
+                .record_worker_slots(SlotType::Activity, act_in_use, act_available);
         }
     })
 }
@@ -7769,7 +7757,7 @@ struct WorkerMonitoringHandles {
     poison_pill_reclaimers: Vec<tokio::task::JoinHandle<()>>,
     pause_auto_resumers: Vec<tokio::task::JoinHandle<()>>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
-    worker_slot_sampler: tokio::task::JoinHandle<()>,
+    worker_slot_sampler: Option<tokio::task::JoinHandle<()>>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -8460,7 +8448,9 @@ impl Worker {
         if let Err(error) = monitors.history_oversized_sampler.await {
             tracing::warn!(error = %error, "history oversized sampler failed during shutdown");
         }
-        if let Err(error) = monitors.worker_slot_sampler.await {
+        if let Some(handle) = monitors.worker_slot_sampler
+            && let Err(error) = handle.await
+        {
             tracing::warn!(error = %error, "worker slot sampler failed during shutdown");
         }
         if let Some(handle) = monitors.stranded_work_sampler
@@ -8690,16 +8680,19 @@ impl Worker {
         );
         // Worker slot-occupancy gauges (issue #531): a pure in-memory read of the
         // two dispatch semaphores against their configured maxima, on the same
-        // cadence as the other samplers.
-        let worker_slot_sampler = spawn_worker_slot_sampler(
-            Arc::clone(&self.workflow_semaphore),
-            self.config.max_concurrent_workflows,
-            Arc::clone(&self.activity_semaphore),
-            self.config.max_concurrent_activities,
-            self.shutdown.clone(),
-            self.registry.telemetry().clone(),
-            self.config.poll_interval,
-        );
+        // cadence as the other samplers. Only started when metrics are enabled,
+        // matching the stranded_work_sampler opt-in pattern.
+        let worker_slot_sampler = self.registry.telemetry().metrics.is_enabled().then(|| {
+            spawn_worker_slot_sampler(
+                Arc::clone(&self.workflow_semaphore),
+                self.config.max_concurrent_workflows,
+                Arc::clone(&self.activity_semaphore),
+                self.config.max_concurrent_activities,
+                self.shutdown.clone(),
+                self.registry.telemetry().clone(),
+                self.config.poll_interval,
+            )
+        });
 
         // Stranded-work sampler (issue #522): emits a gauge per shard showing
         // how many claimable tasks have no live covering worker. Iterates ALL
@@ -8899,6 +8892,15 @@ impl Worker {
                 worker_id = %self.config.worker_id,
                 error = %error,
                 "history oversized sampler failed during shutdown"
+            );
+        }
+        if let Some(handle) = monitors.worker_slot_sampler
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %error,
+                "worker slot sampler failed during shutdown"
             );
         }
         if let Some(handle) = monitors.stranded_work_sampler
