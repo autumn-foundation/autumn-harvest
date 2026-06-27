@@ -813,6 +813,12 @@ pub struct WorkflowContext {
     /// `Some` for scheduled / backfilled / caught-up runs; `None` for manual/ad-hoc starts
     /// and pre-#508 histories (which deserialize the absent field to `None`).
     scheduled_time: Option<DateTime<Utc>>,
+    /// Total virtual seconds elapsed from durable timers (issue #526).
+    /// `None` = production behavior (`ctx.now()` always returns `start_time`).
+    /// `Some` = test harness advancing-clock mode; incremented each time a
+    /// durable timer resolves from history so `ctx.now()` reflects virtual elapsed time.
+    #[cfg(any(test, feature = "testing"))]
+    timer_clock_elapsed_secs: Option<std::sync::atomic::AtomicU64>,
 }
 
 impl WorkflowContext {
@@ -980,6 +986,8 @@ impl WorkflowContext {
             last_completion_result,
             last_error,
             scheduled_time,
+            #[cfg(any(test, feature = "testing"))]
+            timer_clock_elapsed_secs: None,
         }
     }
 
@@ -1086,6 +1094,8 @@ impl WorkflowContext {
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
+            #[cfg(any(test, feature = "testing"))]
+            timer_clock_elapsed_secs: None,
         })
     }
 
@@ -1129,6 +1139,36 @@ impl WorkflowContext {
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
+            #[cfg(any(test, feature = "testing"))]
+            timer_clock_elapsed_secs: None,
+        }
+    }
+
+    /// Enable the advancing virtual clock (issue #526, test harness only).
+    ///
+    /// When set, `ctx.now()` reflects cumulative durable-timer duration consumed
+    /// from history, rather than the fixed `WorkflowStarted` timestamp.
+    /// Only the test harness (`WorkflowTestEnv`) sets this; production entry
+    /// points leave it `None`, preserving byte-for-byte identical behaviour.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn with_advancing_timer_clock(mut self) -> Self {
+        self.timer_clock_elapsed_secs = Some(std::sync::atomic::AtomicU64::new(0));
+        self
+    }
+
+    /// Advance the virtual timer clock by `duration_secs` (no-op in production).
+    ///
+    /// Called at each `TimerStarted` resolution site in `timer()` and
+    /// `wait_for_signal_timeout()`.  `TestRunOutcome::final_now()` independently
+    /// sums the same `TimerStarted { duration_secs }` events from the recorded
+    /// history — the two mechanisms must remain in sync: every call here
+    /// corresponds to exactly one `TimerStarted` event appended to history.
+    #[cfg(any(test, feature = "testing"))]
+    fn advance_timer_clock(&self, duration_secs: u64) {
+        if let Some(ref atomic) = self.timer_clock_elapsed_secs {
+            atomic.fetch_add(duration_secs, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1223,10 +1263,24 @@ impl WorkflowContext {
 
     // ── Accessors ─────────────────────────────────────────────────────
 
-    /// Deterministic "wall clock" -- returns the `WorkflowStarted` timestamp
+    /// Deterministic "wall clock" — returns the `WorkflowStarted` timestamp
     /// so that all replays produce the same result.
+    ///
+    /// In the test harness with the advancing clock enabled (issue #526),
+    /// each durable timer that fires from history advances this by its duration,
+    /// so time-aware logic can be unit-tested without a real database.
     #[must_use]
-    pub const fn now(&self) -> DateTime<Utc> {
+    pub fn now(&self) -> DateTime<Utc> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(ref atomic) = self.timer_clock_elapsed_secs {
+            let elapsed = atomic.load(std::sync::atomic::Ordering::Relaxed);
+            let delta = chrono::Duration::seconds(
+                i64::try_from(elapsed)
+                    .unwrap_or(i64::MAX / 1000)
+                    .min(i64::MAX / 1000),
+            );
+            return self.start_time + delta;
+        }
         self.start_time
     }
 
@@ -2604,7 +2658,14 @@ impl WorkflowContext {
             self.match_history(|m| m.match_timer_strict(timer_id, Some(duration_secs)));
 
         match history_match {
-            HistoryMatch::Matched { .. } => Ok(()),
+            HistoryMatch::Matched { .. } => {
+                // Advance the virtual clock so ctx.now() reflects elapsed time.
+                // TestRunOutcome::final_now() independently sums TimerStarted
+                // duration_secs from the recorded history — both must stay in sync.
+                #[cfg(any(test, feature = "testing"))]
+                self.advance_timer_clock(duration_secs);
+                Ok(())
+            }
 
             HistoryMatch::Diverged {
                 expected,
@@ -3251,7 +3312,13 @@ impl WorkflowContext {
 
         match history_match {
             SignalOrTimerMatch::SignalWon { payload } => Ok(Some(payload)),
-            SignalOrTimerMatch::TimerWon => Ok(None),
+            SignalOrTimerMatch::TimerWon => {
+                // Advance the virtual clock (same coupling as timer() above).
+                // Signal-won path advances nothing — no TimerStarted event recorded.
+                #[cfg(any(test, feature = "testing"))]
+                self.advance_timer_clock(duration_secs);
+                Ok(None)
+            }
             SignalOrTimerMatch::Diverged {
                 expected,
                 actual,
