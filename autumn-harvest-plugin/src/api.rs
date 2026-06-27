@@ -5051,11 +5051,13 @@ async fn get_workflow(
             (None, None, None)
         };
 
-    let events: Vec<Value> = history_page
+    // Serialize via WorkflowEvent (not raw_event) to fill serde-default fields on legacy events.
+    let events = history_page
         .events
         .into_iter()
-        .map(|paged| paged.raw_event)
-        .collect();
+        .map(|paged| serde_json::to_value(paged.event).map_err(HarvestError::from))
+        .collect::<HarvestResult<Vec<_>>>()
+        .map_err(map_error)?;
 
     let handoff_filters = external_task::ExternalHandoffFilters {
         states: vec!["PENDING".to_string()],
