@@ -4,7 +4,7 @@
 //!   (a) 404 for an unknown execution id.
 //!   (b) 200 with correct terminal state for a COMPLETED execution.
 //!   (c) 204 No Content + Retry-After for a RUNNING execution (no wait).
-//!   (d) ContinuedAsNew → follows the successor chain to the final output (AC5).
+//!   (d) `ContinuedAsNew` → follows the successor chain to the final output (AC5).
 
 #![allow(clippy::too_many_lines)]
 
@@ -364,8 +364,8 @@ async fn result_running_no_wait_returns_204() {
     );
 }
 
-/// (d) AC5: ContinuedAsNew predecessor → follows the chain to the successor's
-/// COMPLETED output, not the ContinuedAsNew sentinel.
+/// (d) AC5: `ContinuedAsNew` predecessor → follows the chain to the successor's
+/// COMPLETED output, not the `ContinuedAsNew` sentinel.
 #[tokio::test]
 async fn result_follows_continue_as_new_to_final_output() {
     let (url, _container) = setup_database().await;
