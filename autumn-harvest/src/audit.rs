@@ -249,6 +249,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "GET /workflows/{id}/update/{update_id}/result",
         RouteClass::ReadOnly,
     ),
+    // Workflow terminal-output projection (issue #527): read-only long-poll.
+    ("GET /workflows/{id}/result", RouteClass::ReadOnly),
     ("GET /workflows/{id}/history/export", RouteClass::ReadOnly),
     ("GET /dags", RouteClass::ReadOnly),
     ("GET /dags/{dag_name}/runs", RouteClass::ReadOnly),
@@ -516,6 +518,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}/queries", None),
     ("POST /workflows/{id}/update/{update_name}", None),
     ("GET /workflows/{id}/update/{update_id}/result", None),
+    ("GET /workflows/{id}/result", None),
     ("GET /workflows/{id}/history/export", None),
     // DAG management
     ("GET /dags", None),
@@ -873,6 +876,20 @@ mod tests {
                  CLASSIFIED_ROUTES — add it with the correct RouteClass"
             );
         }
+    }
+
+    #[test]
+    fn workflow_result_route_is_classified_read_only() {
+        // The workflow-result endpoint (issue #527) is a read-only projection of the
+        // execution's terminal output. It must be classified so the route-exhaustiveness
+        // guards below cover it.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /workflows/{id}/result" && *c == RouteClass::ReadOnly),
+            "GET /workflows/{{id}}/result must be classified RouteClass::ReadOnly in \
+             CLASSIFIED_ROUTES (issue #527)"
+        );
     }
 
     #[test]

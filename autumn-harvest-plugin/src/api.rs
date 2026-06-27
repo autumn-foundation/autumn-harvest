@@ -5070,24 +5070,68 @@ async fn get_workflow_result(
     };
 
     if wait.is_zero() {
-        let snapshot = match workflow_result_snapshot(&api_state, exec_id).await {
+        let snapshot = match workflow_result_snapshot_following_can(&api_state, exec_id).await {
             Ok(snapshot) => snapshot,
             Err(error) => return error.into_response(),
         };
         return workflow_result_response(snapshot);
     }
 
+    // Long-poll path: loop until terminal (following ContinuedAsNew) or deadline.
+    let deadline = std::time::Instant::now() + wait;
     let client = match api_state.workflow_handle_client() {
         Ok(client) => client,
         Err(error) => return map_error(error).into_response(),
     };
-    let handle = client.handle(exec_id);
-
-    match handle.result_snapshot_with_wait(wait).await {
-        Ok(Some(snapshot)) => workflow_result_response(snapshot),
-        Ok(None) => workflow_result_pending_response(),
-        Err(error) => map_error(error).into_response(),
+    let mut current_id = exec_id;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return workflow_result_pending_response();
+        }
+        let handle = client.handle(current_id);
+        match handle.result_snapshot_with_wait(remaining).await {
+            Ok(None) => return workflow_result_pending_response(),
+            Err(error) => return map_error(error).into_response(),
+            Ok(Some(snapshot)) => {
+                use autumn_harvest::WorkflowResultState;
+                if snapshot.state != WorkflowResultState::ContinuedAsNew {
+                    return workflow_result_response(snapshot);
+                }
+                // Follow the ContinuedAsNew chain to its successor.
+                match load_continue_as_new_successor(&api_state, current_id).await {
+                    Ok(Some(next_id)) => current_id = next_id,
+                    // Successor not locatable — return the sentinel as-is.
+                    Ok(None) => return workflow_result_response(snapshot),
+                    Err(error) => return error.into_response(),
+                }
+            }
+        }
     }
+}
+
+/// Snapshot the result of `exec_id`, transparently following any
+/// `ContinuedAsNew` → successor chain until a non-ContinuedAsNew terminal is
+/// found (or the chain is unresolvable, in which case the sentinel is returned).
+async fn workflow_result_snapshot_following_can(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<WorkflowResult, AutumnError> {
+    use autumn_harvest::WorkflowResultState;
+    let mut current_id = exec_id;
+    // Bound the chain walk so a pathological cycle can't loop forever.
+    for _ in 0..128 {
+        let snapshot = workflow_result_snapshot(api_state, current_id).await?;
+        if snapshot.state != WorkflowResultState::ContinuedAsNew {
+            return Ok(snapshot);
+        }
+        match load_continue_as_new_successor(api_state, current_id).await? {
+            Some(next_id) => current_id = next_id,
+            None => return Ok(snapshot),
+        }
+    }
+    // Exceeded chain depth — return whatever snapshot we have.
+    workflow_result_snapshot(api_state, current_id).await
 }
 
 async fn workflow_result_snapshot(
@@ -5099,6 +5143,26 @@ async fn workflow_result_snapshot(
         .await
         .map_err(map_error)?;
     Ok(WorkflowResult::from_execution(&execution))
+}
+
+/// Load the successor execution ID from a `WorkflowContinuedAsNew` event in
+/// the predecessor's history. Returns `None` when no such event exists.
+async fn load_continue_as_new_successor(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<Option<ExecutionId>, AutumnError> {
+    let mut conn = db_conn_for_execution(api_state, exec_id).await?;
+    let history = store::load_history(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?;
+    let successor = history.events.into_iter().find_map(|event| {
+        if let WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } = event {
+            Some(new_exec_id)
+        } else {
+            None
+        }
+    });
+    Ok(successor)
 }
 
 fn workflow_result_response(result: WorkflowResult) -> axum::response::Response {

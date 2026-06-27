@@ -180,13 +180,13 @@
           "name": "wait",
           "in": "query",
           "required": false,
-          "description": "Optional wait duration such as 250ms, 5s, or 1m. Defaults to 0s and is capped by the server, default 30s."
+          "description": "Optional wait duration such as 250ms, 5s, or 1m. Defaults to 0s. Values above the server ceiling (default 30s, configurable via set_workflow_result_max_wait) are silently clamped — not rejected with 400."
         }
       ],
       "request_body": null,
       "success_response": {
         "status": 200,
-        "note": "Returns 204 No Content with Retry-After when the execution is still running after the wait window.",
+        "note": "Returns 204 No Content with Retry-After: 1 when the execution is still running after the wait window. A CONTINUED_AS_NEW predecessor transparently resolves to the final successor's output rather than returning the sentinel state.",
         "fields": [
           "state",
           "output",
