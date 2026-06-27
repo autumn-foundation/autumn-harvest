@@ -5017,12 +5017,14 @@ async fn get_workflow(
         .map_err(map_error)?;
 
     // Use paged loading bounded to DEFAULT_HISTORY_PAGE events (issue #529).
+    // Totals are not needed for the details view — skip the extra aggregate query.
     let history_page = autumn_harvest::store::load_history_page(
         &mut conn,
         exec_id,
         None,
         DEFAULT_HISTORY_PAGE,
         &[],
+        false,
     )
     .await
     .map_err(map_error)?;
@@ -5049,12 +5051,11 @@ async fn get_workflow(
             (None, None, None)
         };
 
-    let events = history_page
+    let events: Vec<Value> = history_page
         .events
         .into_iter()
-        .map(|paged| serde_json::to_value(paged.event).map_err(HarvestError::from))
-        .collect::<HarvestResult<Vec<_>>>()
-        .map_err(map_error)?;
+        .map(|paged| paged.raw_event)
+        .collect();
 
     let handoff_filters = external_task::ExternalHandoffFilters {
         states: vec!["PENDING".to_string()],
@@ -5132,6 +5133,11 @@ fn parse_workflow_history_query(
                         "invalid limit {v:?}: must be a positive integer"
                     ))
                 })?;
+                if limit <= 0 {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid limit {limit}: must be a positive integer"
+                    )));
+                }
                 limit = limit.clamp(1, MAX_HISTORY_PAGE);
             }
             "after" => {
@@ -5168,23 +5174,38 @@ async fn get_workflow_history(
 
     let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
 
-    // 404 when the execution doesn't exist.
-    load_execution(&mut conn, exec_id)
+    // 404 when the execution doesn't exist — cheaper than a full-row load.
+    if !autumn_harvest::store::check_execution_exists(&mut conn, exec_id)
         .await
-        .map_err(map_error)?;
+        .map_err(map_error)?
+    {
+        return Err(AutumnError::not_found_msg(format!(
+            "workflow execution {exec_id}"
+        )));
+    }
 
-    let page =
-        autumn_harvest::store::load_history_page(&mut conn, exec_id, after_id, limit, &event_types)
-            .await
-            .map_err(map_error)?;
+    let page = autumn_harvest::store::load_history_page(
+        &mut conn,
+        exec_id,
+        after_id,
+        limit,
+        &event_types,
+        true,
+    )
+    .await
+    .map_err(map_error)?;
 
     let mut entries = Vec::with_capacity(page.events.len());
     for paged in page.events {
-        let raw = serde_json::to_value(&paged.event)
-            .map_err(HarvestError::from)
-            .map_err(map_error)?;
-        let type_name = paged.event.type_name().to_string();
-        let data = raw
+        // Use the stored raw JSON to avoid a redundant serialize round-trip.
+        let type_name = paged
+            .raw_event
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let data = paged
+            .raw_event
             .get("data")
             .cloned()
             .unwrap_or_else(|| Value::Object(serde_json::Map::new()));

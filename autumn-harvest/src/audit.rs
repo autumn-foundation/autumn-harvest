@@ -251,6 +251,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     // Workflow terminal-output projection (issue #527): read-only long-poll.
     ("GET /workflows/{id}/result", RouteClass::ReadOnly),
+    // Paginated, filterable single-execution history (issue #529): read-only cursor walk.
+    ("GET /workflows/{id}/history", RouteClass::ReadOnly),
     ("GET /workflows/{id}/history/export", RouteClass::ReadOnly),
     ("GET /dags", RouteClass::ReadOnly),
     ("GET /dags/{dag_name}/runs", RouteClass::ReadOnly),
@@ -441,6 +443,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     // Updates are synchronous request/response, not tracked as operator
     // audit events in this slice; they appear in the workflow event history.
     "POST /workflows/{id}/update/{update_name}",
+    "GET /workflows/{id}/history",
     "GET /workflows/{id}/history/export",
     "GET /dags",
     "GET /dags/{dag_name}/runs",
@@ -519,6 +522,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("POST /workflows/{id}/update/{update_name}", None),
     ("GET /workflows/{id}/update/{update_id}/result", None),
     ("GET /workflows/{id}/result", None),
+    ("GET /workflows/{id}/history", None),
     ("GET /workflows/{id}/history/export", None),
     // DAG management
     ("GET /dags", None),
