@@ -5197,18 +5197,24 @@ async fn get_workflow_history(
 
     let mut entries = Vec::with_capacity(page.events.len());
     for paged in page.events {
-        // Use the stored raw JSON to avoid a redundant serialize round-trip.
-        let type_name = paged
-            .raw_event
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let data = paged
-            .raw_event
-            .get("data")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        // Take ownership of raw_event and remove both fields to avoid cloning any payload.
+        let mut raw = paged.raw_event;
+        let (type_name, data) = match &mut raw {
+            Value::Object(map) => {
+                let type_name = map
+                    .remove("type")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let data = map
+                    .remove("data")
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                (type_name, data)
+            }
+            _ => (String::new(), Value::Object(serde_json::Map::new())),
+        };
         entries.push(WorkflowHistoryEntry {
             id: paged.id,
             event_id: paged.event_id,
