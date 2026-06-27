@@ -57,6 +57,8 @@ const STABLE_PROMETHEUS_METRICS: &[&str] = &[
     "harvest_workflow_non_determinism_total",
     "harvest_activity_attempts_total",
     "harvest_activity_retries_total",
+    "harvest_worker_slots_in_use",
+    "harvest_worker_slots_available",
 ];
 
 #[test]
