@@ -430,20 +430,21 @@ async fn start_harvest_runtime(
                 let client = client.clone();
                 let harvest_db = state.extension::<crate::state::HarvestDbPool>();
 
-                let (owner, runbook_url, severity, info_sla, info_retry_policy) = state
-                    .extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>()
-                    .and_then(|registry| {
-                        registry.workflows.get("webhook_delivery").map(|wf| {
-                            (
-                                wf.owner,
-                                wf.runbook_url,
-                                wf.severity,
-                                wf.sla,
-                                wf.retry_policy,
-                            )
-                        })
-                    })
-                    .unwrap_or((None, None, None, None, None));
+                let registry =
+                    state.extension::<std::sync::Arc<autumn_harvest::worker::HandlerRegistry>>();
+                let wf_info = registry
+                    .as_ref()
+                    .and_then(|r| r.workflows.get("webhook_delivery"));
+                let (owner, runbook_url, severity, info_sla, info_retry_policy) =
+                    wf_info.map_or((None, None, None, None, None), |wf| {
+                        (
+                            wf.owner,
+                            wf.runbook_url,
+                            wf.severity,
+                            wf.sla,
+                            wf.retry_policy.clone(),
+                        )
+                    });
                 let sla = info_sla.and_then(|d| autumn_harvest::chrono::Duration::from_std(d).ok());
                 let webhook_retry_policy = info_retry_policy;
 
