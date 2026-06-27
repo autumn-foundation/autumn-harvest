@@ -5086,6 +5086,10 @@ async fn get_workflow_result(
     // Hop count matches the zero-wait bound to prevent runaway chains.
     let deadline = std::time::Instant::now() + wait;
     let mut current_id = exec_id;
+    // Mirrors the zero-wait fallback: if a mid-chain successor row is missing
+    // (retained/deleted), return the last seen ContinuedAsNew sentinel rather
+    // than a confusing 404.
+    let mut last_can_snapshot: Option<WorkflowResult> = None;
     for _ in 0..128u32 {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -5094,6 +5098,10 @@ async fn get_workflow_result(
         let handle = client.handle(current_id);
         match handle.result_snapshot_with_wait(remaining).await {
             Ok(None) => return workflow_result_pending_response(),
+            // Successor row gone mid-chain — return the last CAN sentinel.
+            Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
+                return workflow_result_response(last_can_snapshot.unwrap());
+            }
             Err(error) => return map_error(error).into_response(),
             Ok(Some(snapshot)) => {
                 use autumn_harvest::WorkflowResultState;
@@ -5109,6 +5117,7 @@ async fn get_workflow_result(
                         Ok(e) => ExecutionId::from_uuid(e.id),
                         Err(e) => return map_error(e).into_response(),
                     };
+                last_can_snapshot = Some(snapshot.clone());
                 match load_continue_as_new_successor(&api_state, effective_id).await {
                     Ok(Some(next_id)) => current_id = next_id,
                     // Successor not locatable — return the sentinel as-is.
