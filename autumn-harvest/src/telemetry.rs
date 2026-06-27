@@ -196,6 +196,22 @@ pub const METRIC_QUEUE_DISPATCHED: &str = "harvest.queue.dispatched";
 /// A healthy steady state is `0` on every shard.
 pub const METRIC_SHARD_STRANDED_PENDING: &str = "harvest.shard.stranded_pending";
 
+/// Gauge: number of a worker's dispatch slots currently in use for one slot
+/// type (issue #531).
+///
+/// Sampled in-process by the worker's slot sampler against the two dispatch
+/// `Semaphore`s (`max_concurrent_workflows` / `max_concurrent_activities`).
+/// Labelled `{slot_type}` where `slot_type` is `workflow` or `activity`.
+/// Invariant: `slots_in_use + slots_available == configured_max` for that slot
+/// type within one sampler interval. Per ADR-0001 §7, `execution.id` MUST NOT
+/// appear as a label.
+pub const METRIC_WORKER_SLOTS_IN_USE: &str = "harvest.worker.slots_in_use";
+
+/// Gauge: number of a worker's dispatch slots currently free for one slot type
+/// (issue #531). Companion to [`METRIC_WORKER_SLOTS_IN_USE`]; same labels and
+/// invariant.
+pub const METRIC_WORKER_SLOTS_AVAILABLE: &str = "harvest.worker.slots_available";
+
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
@@ -514,6 +530,8 @@ pub const METRIC_LABEL_TRIGGER: &str = "trigger";
 pub const METRIC_LABEL_SCOPE: &str = "scope";
 /// Metric label: the build ID of the worker.
 pub const METRIC_LABEL_BUILD_ID: &str = "build_id";
+/// Metric label: worker dispatch-slot type (`"workflow"` or `"activity"`).
+pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 
 // ---------------------------------------------------------------------------
 // TraceContextCarrier
@@ -744,6 +762,27 @@ impl ActivityStatus {
         match self {
             Self::Completed => "completed",
             Self::Failed => "failed",
+        }
+    }
+}
+
+/// A worker dispatch-slot pool, used as the bounded `slot_type` label on the
+/// worker slot-occupancy gauges (issue #531).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotType {
+    /// The `max_concurrent_workflows` semaphore pool.
+    Workflow,
+    /// The `max_concurrent_activities` semaphore pool.
+    Activity,
+}
+
+impl SlotType {
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
         }
     }
 }
@@ -1024,6 +1063,21 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the gauge `harvest_dlq_entries{shard}`.
     fn record_dlq_entries(&self, shard: u16, depth: u64) {
         let _ = (shard, depth);
+    }
+
+    /// Periodic snapshot of a worker's dispatch-slot occupancy for one slot
+    /// type (issue #531).
+    ///
+    /// Emitted in-process by the worker's slot sampler against the two dispatch
+    /// `Semaphore`s. `in_use` and `available` are read from a single
+    /// `available_permits()` observation, so the invariant
+    /// `in_use + available == configured_max` holds for that slot type.
+    ///
+    /// Maps to the gauges
+    /// `harvest_worker_slots_in_use{slot_type}` /
+    /// `harvest_worker_slots_available{slot_type}`.
+    fn record_worker_slots(&self, slot_type: SlotType, in_use: u64, available: u64) {
+        let _ = (slot_type, in_use, available);
     }
 
     /// Current number of claimable pending tasks on a shard that has no
@@ -1902,6 +1956,71 @@ mod tests {
     }
 
     #[test]
+    fn worker_slots_gauge_has_default_noop_impl() {
+        // record_worker_slots must exist on MetricsRecorder with
+        // (slot_type: SlotType, in_use: u64, available: u64). The constants are
+        // the registered names; this verifies shape + no-op (issue #531).
+        let rec = NoOpMetrics;
+        rec.record_worker_slots(SlotType::Workflow, 0, 0);
+        rec.record_worker_slots(SlotType::Activity, 3, 5);
+        assert_eq!(METRIC_WORKER_SLOTS_IN_USE, "harvest.worker.slots_in_use");
+        assert_eq!(
+            METRIC_WORKER_SLOTS_AVAILABLE,
+            "harvest.worker.slots_available"
+        );
+        assert_eq!(METRIC_LABEL_SLOT_TYPE, "slot_type");
+    }
+
+    #[test]
+    fn slot_type_stringify_is_bounded() {
+        assert_eq!(SlotType::Workflow.as_str(), "workflow");
+        assert_eq!(SlotType::Activity.as_str(), "activity");
+    }
+
+    #[test]
+    fn worker_slot_invariant_holds_at_recorder_call_site() {
+        // AC: `available + in_use == configured_max` for each slot type within
+        // one sampler interval. A tracking recorder seeded with the configured
+        // maxima asserts the invariant for every observed sample (issue #531).
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        struct InvariantRecorder {
+            configured: HashMap<&'static str, u64>,
+            samples: Mutex<Vec<(&'static str, u64, u64)>>,
+        }
+
+        impl MetricsRecorder for InvariantRecorder {
+            fn record_worker_slots(&self, slot_type: SlotType, in_use: u64, available: u64) {
+                let max = *self
+                    .configured
+                    .get(slot_type.as_str())
+                    .expect("known slot type");
+                assert_eq!(
+                    in_use + available,
+                    max,
+                    "in_use + available must equal configured max for {}",
+                    slot_type.as_str()
+                );
+                self.samples
+                    .lock()
+                    .unwrap()
+                    .push((slot_type.as_str(), in_use, available));
+            }
+        }
+
+        let rec = InvariantRecorder {
+            configured: HashMap::from([("workflow", 8), ("activity", 16)]),
+            samples: Mutex::new(Vec::new()),
+        };
+        // Simulate one sampler interval: 3 of 8 workflow slots busy, 10 of 16
+        // activity slots busy.
+        rec.record_worker_slots(SlotType::Workflow, 3, 5);
+        rec.record_worker_slots(SlotType::Activity, 10, 6);
+        assert_eq!(rec.samples.lock().unwrap().len(), 2);
+    }
+
+    #[test]
     fn all_metric_record_methods_compile_without_execution_id() {
         // ADR-0001 §7: execution.id is span-only and FORBIDDEN as a metric label.
         // This test verifies by construction that no record_* method on
@@ -1924,6 +2043,7 @@ mod tests {
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
         rec.record_schedule_to_start("default", 1.5);
         rec.record_queue_oldest_pending_age("default", 30.0);
+        rec.record_worker_slots(SlotType::Workflow, 3, 5);
         // If any method silently accepted execution.id we'd see it here.
     }
 

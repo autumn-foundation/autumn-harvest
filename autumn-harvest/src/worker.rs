@@ -7453,6 +7453,74 @@ fn spawn_dlq_depth_sampler(
     })
 }
 
+/// Compute `(in_use, available)` dispatch-slot counts from a semaphore reading
+/// (issue #531).
+///
+/// `available` is clamped to `configured_max` so a transient over-count (e.g. a
+/// permit released just before the read) can never produce a negative `in_use`.
+/// Invariant: `in_use + available == configured_max`.
+fn slot_occupancy(configured_max: usize, available_permits: usize) -> (u64, u64) {
+    let available = available_permits.min(configured_max);
+    let in_use = configured_max - available;
+    (in_use as u64, available as u64)
+}
+
+/// Spawn the worker slot-occupancy sampler (issue #531).
+///
+/// Reads the two dispatch `Semaphore`s' `available_permits()` against the
+/// configured maxima on the same cadence as the queue/DLQ samplers and emits
+/// the `harvest.worker.slots_in_use` / `harvest.worker.slots_available` gauges,
+/// labelled by `slot_type`. This is a pure in-memory read — no DB access, no new
+/// lock contention. Skipped entirely when no metrics recorder is configured.
+fn spawn_worker_slot_sampler(
+    workflow_semaphore: Arc<Semaphore>,
+    max_concurrent_workflows: usize,
+    activity_semaphore: Arc<Semaphore>,
+    max_concurrent_activities: usize,
+    cancel: CancellationToken,
+    telemetry: Arc<crate::telemetry::TelemetryConfig>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // No recorder configured: the per-sample reads are cheap, but there is
+        // no point doing them when nothing is listening — matches the other
+        // samplers' opt-in contract.
+        if !telemetry.metrics.is_enabled() {
+            return;
+        }
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+
+            let (wf_in_use, wf_available) = slot_occupancy(
+                max_concurrent_workflows,
+                workflow_semaphore.available_permits(),
+            );
+            telemetry.metrics.record_worker_slots(
+                crate::telemetry::SlotType::Workflow,
+                wf_in_use,
+                wf_available,
+            );
+
+            let (act_in_use, act_available) = slot_occupancy(
+                max_concurrent_activities,
+                activity_semaphore.available_permits(),
+            );
+            telemetry.metrics.record_worker_slots(
+                crate::telemetry::SlotType::Activity,
+                act_in_use,
+                act_available,
+            );
+
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
+}
+
 /// Spawn the stranded-work sampler (issue #522).
 ///
 /// Iterates every shard visible through the pool (not just the shards this
@@ -7701,6 +7769,7 @@ struct WorkerMonitoringHandles {
     poison_pill_reclaimers: Vec<tokio::task::JoinHandle<()>>,
     pause_auto_resumers: Vec<tokio::task::JoinHandle<()>>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
+    worker_slot_sampler: tokio::task::JoinHandle<()>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -8391,6 +8460,9 @@ impl Worker {
         if let Err(error) = monitors.history_oversized_sampler.await {
             tracing::warn!(error = %error, "history oversized sampler failed during shutdown");
         }
+        if let Err(error) = monitors.worker_slot_sampler.await {
+            tracing::warn!(error = %error, "worker slot sampler failed during shutdown");
+        }
         if let Some(handle) = monitors.stranded_work_sampler
             && let Err(error) = handle.await
         {
@@ -8616,6 +8688,18 @@ impl Worker {
             self.registry.history_policy().continue_as_new_threshold(),
             self.config.poll_interval,
         );
+        // Worker slot-occupancy gauges (issue #531): a pure in-memory read of the
+        // two dispatch semaphores against their configured maxima, on the same
+        // cadence as the other samplers.
+        let worker_slot_sampler = spawn_worker_slot_sampler(
+            Arc::clone(&self.workflow_semaphore),
+            self.config.max_concurrent_workflows,
+            Arc::clone(&self.activity_semaphore),
+            self.config.max_concurrent_activities,
+            self.shutdown.clone(),
+            self.registry.telemetry().clone(),
+            self.config.poll_interval,
+        );
 
         // Stranded-work sampler (issue #522): emits a gauge per shard showing
         // how many claimable tasks have no live covering worker. Iterates ALL
@@ -8657,6 +8741,7 @@ impl Worker {
             poison_pill_reclaimers,
             pause_auto_resumers,
             history_oversized_sampler,
+            worker_slot_sampler,
             stranded_work_sampler,
         }
     }
@@ -9819,6 +9904,44 @@ mod tests {
     use crate::types::ParentClosePolicy;
     use serde_json::Value;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn slot_occupancy_invariant_holds() {
+        // AC (issue #531): in_use + available == configured_max for each slot
+        // type within one sampler interval. Exhaustively check the domain.
+        for max in [0usize, 1, 8, 20, 100] {
+            for avail in 0..=max {
+                let (in_use, available) = slot_occupancy(max, avail);
+                assert_eq!(
+                    in_use + available,
+                    max as u64,
+                    "max={max} avail={avail}: in_use+available must equal max"
+                );
+                assert_eq!(available, avail as u64);
+                assert_eq!(in_use, (max - avail) as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn slot_occupancy_clamps_over_count() {
+        // Defensive: a transient permit over-count (available > max) must never
+        // underflow in_use — it clamps to (0, max).
+        let (in_use, available) = slot_occupancy(8, 12);
+        assert_eq!(in_use, 0);
+        assert_eq!(available, 8);
+    }
+
+    #[tokio::test]
+    async fn slot_occupancy_reflects_acquired_permits() {
+        // Acquiring 3 of 8 permits leaves 5 available and reports 3 in use.
+        let sem = Arc::new(Semaphore::new(8));
+        let _p1 = sem.acquire().await.expect("acquire");
+        let _p2 = sem.acquire().await.expect("acquire");
+        let _p3 = sem.acquire().await.expect("acquire");
+        let (in_use, available) = slot_occupancy(8, sem.available_permits());
+        assert_eq!((in_use, available), (3, 5));
+    }
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
