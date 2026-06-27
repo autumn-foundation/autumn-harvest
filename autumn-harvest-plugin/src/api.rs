@@ -5100,8 +5100,16 @@ async fn get_workflow_result(
                 if snapshot.state != WorkflowResultState::ContinuedAsNew {
                     return workflow_result_response(snapshot);
                 }
-                // Follow the ContinuedAsNew chain to its successor.
-                match load_continue_as_new_successor(&api_state, current_id).await {
+                // result_snapshot_with_wait follows retry_of_exec_id internally, so
+                // the ContinuedAsNew event may live on the retried execution rather
+                // than current_id.  Resolve the effective id via a DB walk before
+                // reading history for the CAN successor.
+                let effective_id =
+                    match load_execution_following_retries(&api_state, current_id).await {
+                        Ok(e) => ExecutionId::from_uuid(e.id),
+                        Err(e) => return map_error(e).into_response(),
+                    };
+                match load_continue_as_new_successor(&api_state, effective_id).await {
                     Ok(Some(next_id)) => current_id = next_id,
                     // Successor not locatable — return the sentinel as-is.
                     Ok(None) => return workflow_result_response(snapshot),
@@ -5144,8 +5152,12 @@ async fn workflow_result_snapshot_following_can(
         if snapshot.state != WorkflowResultState::ContinuedAsNew {
             return Ok(snapshot);
         }
+        // load_execution_following_retries may have advanced past current_id via
+        // the retry chain; the ContinuedAsNew event lives on the effective
+        // (retried) execution, so read history from its id, not current_id.
+        let effective_id = ExecutionId::from_uuid(execution.id);
         last_can_snapshot = Some(snapshot);
-        match load_continue_as_new_successor(api_state, current_id).await? {
+        match load_continue_as_new_successor(api_state, effective_id).await? {
             Some(next_id) => current_id = next_id,
             None => return Ok(last_can_snapshot.unwrap()),
         }
