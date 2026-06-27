@@ -1114,7 +1114,18 @@ pub async fn requeue_for_retry(
         crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
     })?;
 
-    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
+    // Notify is best-effort: the task is already durably PENDING after the
+    // UPDATE above and will be claimed on the next poll cycle even if
+    // pg_notify is unavailable. Callers that count retries should key on
+    // Ok(()) meaning "state update succeeded", not "notify succeeded".
+    if let Err(e) = crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await {
+        tracing::warn!(
+            task_id = %task_id,
+            queue = %queue_name,
+            error = %e,
+            "pg_notify failed after retry requeue; task is PENDING and will be claimed on next poll"
+        );
+    }
 
     Ok(())
 }

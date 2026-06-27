@@ -512,7 +512,7 @@
         ]
       },
       "management_checks": [
-        "GET /api/harvest/dlq",
+        "GET /api/harvest/dead-letters",
         "GET /api/harvest/admin/circuits"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_activity_success_ratio"
@@ -544,7 +544,7 @@
         ]
       },
       "management_checks": [
-        "GET /api/harvest/dlq",
+        "GET /api/harvest/dead-letters",
         "GET /api/harvest/admin/circuits",
         "harvest workflow stack <execution_id>"
       ],
