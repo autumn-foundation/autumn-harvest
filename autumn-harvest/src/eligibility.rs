@@ -87,17 +87,19 @@ pub fn parse_requirements(s: &str) -> Result<Vec<Requirement>, String> {
     Ok(requirements)
 }
 
+/// Finds the indices of the first unquoted `=` and ` in ` operators in a token.
+///
+/// ⚡ Bolt Optimization:
+/// This function avoids allocating `Vec<char>` and full `String::to_lowercase()`
+/// by iterating over `char_indices` and using byte-slice (`as_bytes()`) comparisons.
+/// This prevents O(N) allocations per token parsed on the hot path, improving
+/// memory usage and throughput.
 fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut eq_idx = None;
     let mut in_idx = None;
     let mut in_quotes = None;
-    let token_chars: Vec<char> = token.chars().collect();
-    let token_lower = token.to_lowercase();
-    let token_lower_chars: Vec<char> = token_lower.chars().collect();
 
-    let mut i = 0;
-    while i < token_chars.len() {
-        let c = token_chars[i];
+    for (i, c) in token.char_indices() {
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -110,19 +112,14 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
                 eq_idx = Some(i);
             }
             _ => {
-                if in_quotes.is_none()
-                    && in_idx.is_none()
-                    && i + 3 < token_chars.len()
-                    && token_lower_chars[i] == ' '
-                    && token_lower_chars[i + 1] == 'i'
-                    && token_lower_chars[i + 2] == 'n'
-                    && token_lower_chars[i + 3] == ' '
-                {
-                    in_idx = Some(i);
+                if in_quotes.is_none() && in_idx.is_none() {
+                    let remainder = token[i..].as_bytes();
+                    if remainder.len() >= 4 && remainder[..4].eq_ignore_ascii_case(b" in ") {
+                        in_idx = Some(i);
+                    }
                 }
             }
         }
-        i += 1;
     }
     (eq_idx, in_idx)
 }
