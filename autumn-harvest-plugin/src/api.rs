@@ -5068,21 +5068,21 @@ async fn get_workflow_result(
         Ok(wait) => wait,
         Err(error) => return error.into_response(),
     };
-    // Create the client once; used by both the zero-wait and long-poll paths.
+    if wait.is_zero() {
+        // Storage-only path: no listener/LISTEN-NOTIFY required.
+        return match workflow_result_snapshot_following_can(&api_state, exec_id).await {
+            Ok(snapshot) => workflow_result_response(snapshot),
+            Err(error) => error.into_response(),
+        };
+    }
+
+    // Long-poll path requires a running listener runtime.
     let client = match api_state.workflow_handle_client() {
         Ok(client) => client,
         Err(error) => return map_error(error).into_response(),
     };
 
-    if wait.is_zero() {
-        return match workflow_result_snapshot_following_can(&api_state, &client, exec_id).await {
-            Ok(Some(snapshot)) => workflow_result_response(snapshot),
-            Ok(None) => workflow_result_pending_response(),
-            Err(error) => error.into_response(),
-        };
-    }
-
-    // Long-poll path: loop until terminal (following ContinuedAsNew) or deadline.
+    // Loop until terminal (following ContinuedAsNew) or deadline.
     // Hop count matches the zero-wait bound to prevent runaway chains.
     let deadline = std::time::Instant::now() + wait;
     let mut current_id = exec_id;
@@ -5114,59 +5114,86 @@ async fn get_workflow_result(
     workflow_result_pending_response()
 }
 
-/// Snapshot the result of `exec_id`, transparently following:
-/// 1. the workflow-level retry chain (via `result_snapshot_with_wait`) so a
-///    transient `FAILED` + retry successor is not surfaced as the final answer;
+/// Snapshot the result of `exec_id` using only DB reads (no LISTEN/NOTIFY),
+/// transparently following:
+/// 1. the workflow-level retry chain so a transient `FAILED` + retry successor
+///    is not surfaced as the final answer;
 /// 2. `ContinuedAsNew` → successor chains so callers get the final logical output.
 ///
-/// Returns `Ok(None)` when the execution is still running, `Ok(Some(snapshot))`
-/// for a terminal result, or `Err` on hard failures. Only a `NotFound` on a
-/// mid-chain successor is swallowed (returns the last `ContinuedAsNew` sentinel
-/// rather than a confusing 404).
+/// Only a `NotFound` on a mid-chain successor row is swallowed (returns the last
+/// `ContinuedAsNew` sentinel rather than a confusing 404); all other errors
+/// propagate so callers see the 5xx.
 async fn workflow_result_snapshot_following_can(
     api_state: &HarvestApiState,
-    client: &WorkflowHandleClient,
     exec_id: ExecutionId,
-) -> Result<Option<WorkflowResult>, AutumnError> {
+) -> Result<WorkflowResult, AutumnError> {
     use autumn_harvest::WorkflowResultState;
     let mut current_id = exec_id;
     let mut last_can_snapshot: Option<WorkflowResult> = None;
     // Bound the chain walk so a pathological cycle can't loop forever.
     for _ in 0..128 {
-        let snapshot = match client
-            .handle(current_id)
-            .result_snapshot_with_wait(std::time::Duration::ZERO)
-            .await
-        {
-            Ok(Some(s)) => s,
-            // Still running after zero-wait; surface as non-terminal.
-            Ok(None) => return Ok(None),
-            // Only swallow NotFound mid-chain (missing successor row); propagate
-            // DB, pool, or serialization errors so callers see the 5xx.
+        let execution = match load_execution_following_retries(api_state, current_id).await {
+            Ok(e) => e,
+            // Only swallow NotFound mid-chain (missing successor row).
             Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-                return Ok(last_can_snapshot);
+                return Ok(last_can_snapshot.unwrap());
             }
             Err(e) => return Err(map_error(e)),
         };
+        let snapshot = WorkflowResult::from_execution(&execution);
         if snapshot.state != WorkflowResultState::ContinuedAsNew {
-            return Ok(Some(snapshot));
+            return Ok(snapshot);
         }
         last_can_snapshot = Some(snapshot);
         match load_continue_as_new_successor(api_state, current_id).await? {
             Some(next_id) => current_id = next_id,
-            None => return Ok(last_can_snapshot),
+            None => return Ok(last_can_snapshot.unwrap()),
         }
     }
-    // Exceeded chain depth — return whatever snapshot we have.
-    match client
-        .handle(current_id)
-        .result_snapshot_with_wait(std::time::Duration::ZERO)
-        .await
-    {
-        Ok(result) => Ok(result),
-        Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => Ok(last_can_snapshot),
+    // Exceeded chain depth — return whatever state the current execution has.
+    match load_execution_following_retries(api_state, current_id).await {
+        Ok(e) => Ok(WorkflowResult::from_execution(&e)),
+        Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
+            Ok(last_can_snapshot.unwrap())
+        }
         Err(e) => Err(map_error(e)),
     }
+}
+
+/// Load the effective execution for `exec_id` by following the workflow-level
+/// retry chain (issue #523): while the current row is `FAILED` and a successor
+/// with `retry_of_exec_id = id` exists, advance to that successor. Returns the
+/// deepest (most recent) execution. Uses only DB reads — no listener required.
+async fn load_execution_following_retries(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> HarvestResult<WorkflowExecution> {
+    let mut conn = db_conn_for_execution(api_state, exec_id)
+        .await
+        .map_err(|e| HarvestError::Database(e.to_string()))?;
+    let mut execution = load_execution(&mut conn, exec_id).await?;
+    // Bounded by max_attempts; self-referential cycles are impossible (each
+    // retry gets a fresh exec_id).
+    for _ in 0..256 {
+        if execution.state != "FAILED" {
+            return Ok(execution);
+        }
+        let next: Option<uuid::Uuid> = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(execution.id)))
+            .select(harvest_workflow_executions::id)
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(database_error)?;
+        match next {
+            Some(next_uuid) => {
+                let next_id = ExecutionId::from_uuid(next_uuid);
+                execution = load_execution(&mut conn, next_id).await?;
+            }
+            None => return Ok(execution),
+        }
+    }
+    Ok(execution)
 }
 
 /// Load the successor execution ID from a `WorkflowContinuedAsNew` event in
