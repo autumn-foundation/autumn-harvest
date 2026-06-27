@@ -102,6 +102,61 @@ incident is worse than retrying the work.
 Escalate when all workers for a required queue are stale or draining, or when
 deferred concurrency work grows while downstream owners report elevated errors.
 
+## harvest_worker_slot_saturation
+
+**Worker dispatch-slot bottleneck** (issue #531). Fires when a worker's slot
+utilisation (`slots_in_use / (slots_in_use + slots_available)`) for either
+`slot_type` (`workflow` or `activity`) stays above 90 % for 5 minutes. This
+means the worker itself is the bottleneck — not the queue or the database.
+
+### Triage steps
+
+1. **Read the alert labels.** The firing alert carries `slot_type=workflow` or
+   `slot_type=activity` and the Prometheus `instance`/`job` labels that identify
+   the saturated worker process. The `harvest.worker.slots_in_use` /
+   `harvest.worker.slots_available` gauges are per-process in-memory reads, so
+   the scrape target is the authoritative source for which worker and slot type
+   is saturated. `harvest worker health --output json` returns aggregate fleet
+   counts (healthy/stale/draining by queue/shard) and does **not** include
+   per-worker slot-type breakdowns — use it for fleet context only.
+2. Run `harvest worker list --output json` to confirm expected worker count per
+   queue and check for stale heartbeats or workers already draining.
+3. Run `harvest concurrency status --output json` (`GET /api/harvest/admin/concurrency`)
+   to check whether per-key concurrency limits are deferring work on top of the
+   slot pressure.
+4. Compare `harvest.queue.depth` for the same queue:
+   - **Slots saturated AND backlog growing** → worker is the bottleneck; raise
+     `max_concurrent_workflows` / `max_concurrent_activities` or add workers.
+   - **Backlog growing but slots are free** → bottleneck is downstream
+     (DB, throttled dependency); adding workers will not help.
+
+### Likely causes
+
+Activity handlers that run slowly or block the executor leave activity slots
+occupied for longer than expected. A concurrency cap set below the worker's
+physical capacity. Too few workers for the offered throughput. A slow downstream
+dependency extending handler latency.
+
+### False positives
+
+Sustained high utilisation is expected and healthy for throughput-oriented
+fleets. Tune the threshold per queue and latency target before treating this as
+a page. A brief spike during traffic bursts that self-resolves within the
+5-minute window will not fire.
+
+### Safe actions
+
+Raise `WorkerConfig::max_concurrent_workflows` or `max_concurrent_activities` if
+the host has headroom. Add worker replicas for the affected queue. Investigate
+slow activity handlers with `harvest.activity.duration` histograms. Temporarily
+lower the ingestion rate if downstream dependencies are the bottleneck.
+
+### Escalation criteria
+
+Escalate when slot saturation persists after adding workers, or when the
+`harvest.queue.oldest_pending_age` gauge climbs alongside this alert, indicating
+work is stalling rather than simply queuing briefly.
+
 ## harvest_queue_schedule_to_start_high
 
 **Primary queue-saturation page** (issue #501). Fires when p99

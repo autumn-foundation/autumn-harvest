@@ -139,6 +139,8 @@ metric is emitted in the source code.
 | `harvest.queue.oldest_pending_age` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, alongside depth; excludes PAUSED executions, skew-discounted, periodic (5 s default) (issue #501). Aggregated across all shards as the **max** age per queue (the single oldest task fleet-wide) (issue #522) |
 | `harvest.queue.dispatched` | Counter | `worker.rs` — `dispatch_task`, once per dispatched task; lets operators confirm the live per-queue dispatch split matches `WorkerConfig::queue_weights` (issue #515) |
 | `harvest.dlq.entries` | Gauge | `worker.rs` — `spawn_dlq_depth_sampler`, periodic (5 s default) |
+| `harvest.worker.slots_in_use` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, periodic (5 s default). Pure in-memory read of the workflow/activity dispatch `Semaphore`s against their configured maxima — no DB access (issue #531) |
+| `harvest.worker.slots_available` | Gauge | `worker.rs` — `spawn_worker_slot_sampler`, alongside `slots_in_use`. Invariant: `slots_in_use + slots_available == configured_max` per `slot_type` within one sampler interval (issue #531) |
 | `harvest.schedule.runs` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, on successful dispatch |
 | `harvest.schedule.skipped` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, when a run is skipped |
 | `harvest.retention.deleted` | Counter | `retention.rs` — `run_shard_tick`, per tick per shard |
@@ -158,6 +160,8 @@ metric is emitted in the source code.
 | `harvest.queue.schedule_to_start` | `queue` |
 | `harvest.queue.oldest_pending_age` | `queue` |
 | `harvest.dlq.entries` | `shard` |
+| `harvest.worker.slots_in_use` | `slot_type` (`workflow\|activity`) |
+| `harvest.worker.slots_available` | `slot_type` (`workflow\|activity`) |
 | `harvest.schedule.runs` | `kind` (`workflow\|dag`), `name` |
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
 | `harvest.retention.deleted` | `shard` |
@@ -185,6 +189,11 @@ harvest_queue_oldest_pending_age{queue="default"}
 
 # DLQ depth per shard
 harvest_dlq_entries{shard="0"}
+
+# Worker dispatch-slot utilization per slot type (issue #531):
+# "are my workers saturated?" — pairs with queue.depth to tell a worker
+# bottleneck apart from a queue/DB bottleneck.
+harvest_worker_slots_in_use / (harvest_worker_slots_in_use + harvest_worker_slots_available)
 
 # Effective schedule run rate (runs - skips)
 rate(harvest_schedule_runs_total[1h]) - rate(harvest_schedule_skipped_total[1h])

@@ -195,6 +195,51 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_queue_backlog_growth"
     },
     {
+      "id": "harvest_worker_slot_saturation",
+      "status": "enforceable",
+      "signal_source": "Issue #531 gauges harvest.worker.slots_in_use / harvest.worker.slots_available, sampled in-process per worker against the workflow/activity dispatch semaphores. Labelled by bounded slot_type (workflow|activity).",
+      "default_threshold": "Ticket when a worker's slot utilization (slots_in_use / (slots_in_use + slots_available)) stays above 90% for 5 minutes for either slot_type. The 90% / 5m threshold is a STARTER DEFAULT, not a universal SLO — sustained high utilization is healthy for some throughput-oriented fleets; tune per queue/latency target. Pair with harvest.queue.depth to tell a worker bottleneck (slots saturated AND backlog growing) apart from a queue/DB bottleneck (backlog growing while slots are free).",
+      "severity": "ticket",
+      "owner_persona": "workflow on-call",
+      "description": "A worker's workflow or activity dispatch slots are nearly all in use — the worker, not the queue or DB, is the bottleneck. When this fires alongside a growing harvest.queue.depth, raising max_concurrent_* or adding workers will relieve the backlog. When slots are free but the backlog grows, the bottleneck is downstream (DB/throttled dependency) and adding workers will not help.",
+      "first_action": "harvest worker health --output json",
+      "dependencies": [
+        {
+          "ref": "#531",
+          "status": "shipped",
+          "surface": "METRIC_WORKER_SLOTS_IN_USE / METRIC_WORKER_SLOTS_AVAILABLE / harvest.worker.slots_*"
+        },
+        {
+          "ref": "ADR-0001",
+          "status": "accepted",
+          "surface": "bounded metric labels: slot_type"
+        },
+        {
+          "ref": "#100",
+          "status": "shipped",
+          "surface": "worker health API for first triage"
+        }
+      ],
+      "prometheus": {
+        "mode": "native-metric",
+        "notes": "Prometheus exporters commonly expose these gauges as harvest_worker_slots_in_use / harvest_worker_slots_available. Label only by bounded slot_type. The 90% / 5m threshold is a starter default, not a universal SLO. Evaluate per slot_type; a single-worker process exposes one series per slot_type distinguished by the scrape target's own instance/job labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "min_over_time((harvest_worker_slots_in_use / (harvest_worker_slots_in_use + harvest_worker_slots_available))[5m:]) > 0.9"
+          }
+        ]
+      },
+      "management_checks": [
+        "harvest worker health --output json",
+        "harvest worker list --output json",
+        "harvest concurrency status --output json",
+        "GET /api/harvest/workers/health",
+        "GET /api/harvest/admin/concurrency"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_worker_slot_saturation"
+    },
+    {
       "id": "harvest_activity_failure_surge",
       "status": "enforceable",
       "signal_source": "ADR-0001/#138 histogram harvest.activity.duration with bounded activity, queue, and status labels.",
