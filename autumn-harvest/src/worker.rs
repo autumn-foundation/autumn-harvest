@@ -7484,6 +7484,7 @@ fn spawn_worker_slot_sampler(
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
