@@ -312,7 +312,8 @@ async fn mark_continued_as_new(
         .get_result(conn)
         .await
         .unwrap();
-    assert!(count >= 1, "ContinuedAsNew event must have been appended");
+    // >= 2: WorkflowStarted is always present; ContinuedAsNew must be the second row.
+    assert!(count >= 2, "ContinuedAsNew event must have been appended");
 }
 
 /// (a) Unknown execution id → 404.

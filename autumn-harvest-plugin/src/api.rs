@@ -5078,13 +5078,14 @@ async fn get_workflow_result(
     }
 
     // Long-poll path: loop until terminal (following ContinuedAsNew) or deadline.
+    // Hop count matches the zero-wait bound to prevent runaway chains.
     let deadline = std::time::Instant::now() + wait;
     let client = match api_state.workflow_handle_client() {
         Ok(client) => client,
         Err(error) => return map_error(error).into_response(),
     };
     let mut current_id = exec_id;
-    loop {
+    for _ in 0..128u32 {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return workflow_result_pending_response();
@@ -5108,6 +5109,8 @@ async fn get_workflow_result(
             }
         }
     }
+    // Exceeded chain depth — return pending so the caller retries.
+    workflow_result_pending_response()
 }
 
 /// Snapshot the result of `exec_id`, transparently following any
@@ -5119,19 +5122,33 @@ async fn workflow_result_snapshot_following_can(
 ) -> Result<WorkflowResult, AutumnError> {
     use autumn_harvest::WorkflowResultState;
     let mut current_id = exec_id;
+    let mut last_can_snapshot: Option<WorkflowResult> = None;
     // Bound the chain walk so a pathological cycle can't loop forever.
     for _ in 0..128 {
-        let snapshot = workflow_result_snapshot(api_state, current_id).await?;
+        let snapshot = match workflow_result_snapshot(api_state, current_id).await {
+            Ok(s) => s,
+            // Successor row is missing (data inconsistency) — return the last
+            // ContinuedAsNew sentinel rather than a confusing 404.
+            Err(_) if last_can_snapshot.is_some() => {
+                return Ok(last_can_snapshot.unwrap());
+            }
+            Err(e) => return Err(e),
+        };
         if snapshot.state != WorkflowResultState::ContinuedAsNew {
             return Ok(snapshot);
         }
+        last_can_snapshot = Some(snapshot);
         match load_continue_as_new_successor(api_state, current_id).await? {
             Some(next_id) => current_id = next_id,
-            None => return Ok(snapshot),
+            None => return Ok(last_can_snapshot.unwrap()),
         }
     }
     // Exceeded chain depth — return whatever snapshot we have.
-    workflow_result_snapshot(api_state, current_id).await
+    match workflow_result_snapshot(api_state, current_id).await {
+        Ok(s) => Ok(s),
+        Err(_) if last_can_snapshot.is_some() => Ok(last_can_snapshot.unwrap()),
+        Err(e) => Err(e),
+    }
 }
 
 async fn workflow_result_snapshot(
