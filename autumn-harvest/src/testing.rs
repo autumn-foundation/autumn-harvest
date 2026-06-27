@@ -2113,7 +2113,12 @@ impl TestRunOutcome {
             WorkflowEvent::TimerStarted { duration_secs, .. } => acc.saturating_add(*duration_secs),
             _ => acc,
         });
-        self.start_time + chrono::Duration::seconds(i64::try_from(total_secs).unwrap_or(i64::MAX))
+        self.start_time
+            + chrono::Duration::seconds(
+                i64::try_from(total_secs)
+                    .unwrap_or(i64::MAX / 1000)
+                    .min(i64::MAX / 1000),
+            )
     }
 
     /// Total virtual time elapsed during the run (issue #526).

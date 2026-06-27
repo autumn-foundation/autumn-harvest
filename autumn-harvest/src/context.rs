@@ -1274,7 +1274,11 @@ impl WorkflowContext {
         #[cfg(any(test, feature = "testing"))]
         if let Some(ref atomic) = self.timer_clock_elapsed_secs {
             let elapsed = atomic.load(std::sync::atomic::Ordering::Relaxed);
-            let delta = chrono::Duration::seconds(i64::try_from(elapsed).unwrap_or(i64::MAX));
+            let delta = chrono::Duration::seconds(
+                i64::try_from(elapsed)
+                    .unwrap_or(i64::MAX / 1000)
+                    .min(i64::MAX / 1000),
+            );
             return self.start_time + delta;
         }
         self.start_time
