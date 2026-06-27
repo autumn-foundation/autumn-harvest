@@ -616,15 +616,27 @@ impl WorkflowReplayer {
         let total_events = events.len();
         let input = extract_input(&events);
 
-        let outcome = run_workflow_strict(
-            exec_id,
-            events,
-            handler,
-            input,
-            self.state.clone(),
-            self.context_headers.clone(),
-        )
-        .await;
+        let outcome = if self.use_advancing_clock {
+            run_workflow_strict_advancing_clock(
+                exec_id,
+                events,
+                handler,
+                input,
+                self.state.clone(),
+                self.context_headers.clone(),
+            )
+            .await
+        } else {
+            run_workflow_strict(
+                exec_id,
+                events,
+                handler,
+                input,
+                self.state.clone(),
+                self.context_headers.clone(),
+            )
+            .await
+        };
         outcome_to_report(exec_id, total_events, outcome, false)
     }
 
