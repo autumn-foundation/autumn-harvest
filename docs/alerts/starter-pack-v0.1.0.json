@@ -507,7 +507,7 @@
         "expressions": [
           {
             "kind": "promql",
-            "expr": "sum by (activity, queue) (rate(harvest_activity_attempts_total{outcome=\"completed\"}[5m])) / sum by (activity, queue) (rate(harvest_activity_attempts_total[5m])) < 0.90"
+            "expr": "(sum by (activity, queue) (rate(harvest_activity_attempts_total{outcome=\"completed\"}[5m])) or on(activity, queue) (0 * sum by (activity, queue) (rate(harvest_activity_attempts_total[5m])))) / sum by (activity, queue) (rate(harvest_activity_attempts_total[5m])) < 0.90"
           }
         ]
       },
@@ -521,7 +521,7 @@
       "id": "harvest_activity_retry_storm",
       "status": "enforceable",
       "signal_source": "harvest.activity.retries counter (issue #528).",
-      "default_threshold": "Ticket when the retry rate for any activity type exceeds 5 retries/second sustained over 5 minutes. Page when it exceeds 20/s — retry storms at that scale saturate the task queue and block other work.",
+      "default_threshold": "Ticket when the retry rate for any activity type exceeds 5 retries/second sustained over 5 minutes. Tune with harvest_activity_retry_storm_critical for a page at the 20/s threshold.",
       "severity": "ticket",
       "owner_persona": "workflow owner",
       "description": "A high retry rate for an activity type is the earliest warning of a degrading downstream dependency before work tips into the DLQ. harvest.activity.retries fires exactly once per retry actually scheduled (after the schedule_to_close deadline check), so the counter is the authoritative retry-storm signal independent of eventual success or failure. The existing harvest_activity_failure_surge alert fires only when failures are terminal — this alert catches storms that eventually succeed but are burning retries at scale.",
@@ -547,6 +547,39 @@
         "GET /api/harvest/dlq",
         "GET /api/harvest/admin/circuits",
         "harvest workflow stack <execution_id>"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm"
+    },
+    {
+      "id": "harvest_activity_retry_storm_critical",
+      "status": "enforceable",
+      "signal_source": "harvest.activity.retries counter (issue #528).",
+      "default_threshold": "Page when the retry rate for any activity type exceeds 20 retries/second sustained over 5 minutes — at this scale the task queue saturates and other work is blocked.",
+      "severity": "page",
+      "owner_persona": "workflow owner",
+      "description": "The page-tier companion to harvest_activity_retry_storm. At 20 retries/s the worker pool is under severe pressure and latency for all work on that queue will degrade. Escalate immediately if the retry rate does not drop within 5 minutes of first response.",
+      "first_action": "harvest dlq list --limit 25; check harvest.activity.failed{error.type} for the failure class causing retries; force-open the circuit breaker if the downstream is known-bad: POST /api/harvest/admin/circuits/{activity_name}/force-open",
+      "dependencies": [
+        {
+          "ref": "#528",
+          "status": "shipped",
+          "surface": "harvest.activity.retries{activity,queue} counter incremented once per retry enqueued"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Labels are low-cardinality (activity type, queue). Do NOT add execution.id or activity.id as labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (activity, queue) (rate(harvest_activity_retries_total[5m])) > 20"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/dead-letters",
+        "GET /api/harvest/admin/circuits",
+        "POST /api/harvest/admin/circuits/{activity_name}/force-open"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm"
     },

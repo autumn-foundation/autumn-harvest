@@ -11,7 +11,6 @@
 use autumn_harvest::telemetry::{ActivityStatus, MetricsRecorder, NoOpMetrics};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // Recording mock for asserting counter values and labels.

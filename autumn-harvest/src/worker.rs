@@ -4259,10 +4259,15 @@ async fn handle_activity_result(
                 // on the next attempt. Typed payloads are unwrapped to their message.
                 let previous_error = crate::failure::parse_error_payload_full(&error).message;
                 // AC2 (issue #528): retry counter — fires only after the
-                // schedule_to_close deadline check passes, so a deadline-killed
-                // attempt is NOT counted as a scheduled retry.
-                metrics.record_activity_retried(activity_name_for_cap, &task.queue_name);
-                return queue::requeue_for_retry(conn, task.id, delay, &previous_error).await;
+                // schedule_to_close deadline check passes (so a deadline-killed
+                // attempt is NOT counted as a scheduled retry) and only when the
+                // DB requeue actually succeeds (avoids inflating the counter on
+                // transient DB errors or stale task state).
+                let result = queue::requeue_for_retry(conn, task.id, delay, &previous_error).await;
+                if result.is_ok() {
+                    metrics.record_activity_retried(activity_name_for_cap, &task.queue_name);
+                }
+                return result;
             }
 
             finalize_activity_failure(conn, task, exec_id, activity_id, &error).await
