@@ -111,12 +111,19 @@ means the worker itself is the bottleneck — not the queue or the database.
 
 ### Triage steps
 
-1. Run `harvest worker health --output json` to identify which worker and
-   `slot_type` is saturated and whether any workers are stale or draining.
+1. **Read the alert labels.** The firing alert carries `slot_type=workflow` or
+   `slot_type=activity` and the Prometheus `instance`/`job` labels that identify
+   the saturated worker process. The `harvest.worker.slots_in_use` /
+   `harvest.worker.slots_available` gauges are per-process in-memory reads, so
+   the scrape target is the authoritative source for which worker and slot type
+   is saturated. `harvest worker health --output json` returns aggregate fleet
+   counts (healthy/stale/draining by queue/shard) and does **not** include
+   per-worker slot-type breakdowns — use it for fleet context only.
 2. Run `harvest worker list --output json` to confirm expected worker count per
-   queue.
+   queue and check for stale heartbeats or workers already draining.
 3. Run `harvest concurrency status --output json` (`GET /api/harvest/admin/concurrency`)
-   to check whether per-key concurrency limits are deferring work.
+   to check whether per-key concurrency limits are deferring work on top of the
+   slot pressure.
 4. Compare `harvest.queue.depth` for the same queue:
    - **Slots saturated AND backlog growing** → worker is the bottleneck; raise
      `max_concurrent_workflows` / `max_concurrent_activities` or add workers.
