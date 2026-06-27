@@ -50,7 +50,7 @@ use serde_json::Value;
 use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::executor::{
-    WorkflowOutcome, run_workflow_canary, run_workflow_strict,
+    WorkflowOutcome, run_workflow_canary, run_workflow_strict, run_workflow_strict_advancing_clock,
     run_workflow_with_state_advancing_clock,
 };
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
@@ -276,6 +276,10 @@ pub struct WorkflowReplayer {
     /// Optional offloader for inflating offloaded payloads in the fixture
     /// before replay (issue #524).
     payload_offloader: Option<std::sync::Arc<crate::payload_store::PayloadOffloader>>,
+    /// When `true`, replay uses the advancing virtual clock (issue #526) so
+    /// that `ctx.now()` tracks elapsed timer duration.  Required for
+    /// `TestRunOutcome::replay_check` on time-branching workflows.
+    use_advancing_clock: bool,
 }
 
 impl Default for WorkflowReplayer {
@@ -302,7 +306,23 @@ impl WorkflowReplayer {
             state: empty_shared_state(),
             context_headers: HashMap::new(),
             payload_offloader: None,
+            use_advancing_clock: false,
         }
+    }
+
+    /// Enable the advancing virtual clock for this replayer (issue #526).
+    ///
+    /// When set, `ctx.now()` inside the replayed workflow reflects cumulative
+    /// durable-timer duration rather than the fixed `WorkflowStarted` timestamp.
+    /// Required when replaying histories from [`WorkflowTestEnv`] runs that
+    /// branch on `ctx.now()`, otherwise the replay produces a false
+    /// `ReplayStatus::Failed`.
+    ///
+    /// [`WorkflowTestEnv`]: crate::testing::WorkflowTestEnv
+    #[must_use]
+    pub const fn with_advancing_timer_clock(mut self) -> Self {
+        self.use_advancing_clock = true;
+        self
     }
 
     /// Set context headers to propagate into the replayed `WorkflowContext`.
@@ -464,8 +484,19 @@ impl WorkflowReplayer {
         let headers = snapshot
             .context_headers
             .unwrap_or_else(|| self.context_headers.clone());
-        let outcome =
-            run_workflow_strict(exec_id, events, handler, input, self.state.clone(), headers).await;
+        let outcome = if self.use_advancing_clock {
+            run_workflow_strict_advancing_clock(
+                exec_id,
+                events,
+                handler,
+                input,
+                self.state.clone(),
+                headers,
+            )
+            .await
+        } else {
+            run_workflow_strict(exec_id, events, handler, input, self.state.clone(), headers).await
+        };
         outcome_to_report(exec_id, total_events, outcome, false)
     }
 
@@ -1972,6 +2003,7 @@ async fn replay_fixture_file(
         state,
         context_headers: HashMap::new(),
         payload_offloader: None,
+        use_advancing_clock: false,
     };
 
     let replay_result =
@@ -2101,6 +2133,10 @@ impl TestRunOutcome {
     ///
     /// This check is free — it reuses the event history already produced by
     /// the test run, so there is no extra DB or network call.
+    ///
+    /// The advancing virtual clock is enabled automatically (issue #526) so
+    /// that time-branching workflows — those that branch on `ctx.now()` —
+    /// replay correctly without a false `ReplayStatus::Failed`.
     pub async fn replay_check(&self, handler: WorkflowHandlerFn) -> ReplayReport {
         let snapshot = crate::testing::HistorySnapshot {
             workflow_name: "__test__".to_string(),
@@ -2111,6 +2147,7 @@ impl TestRunOutcome {
         WorkflowReplayer::new()
             .with_existing_state(self.state.clone())
             .register_fn("__test__", handler)
+            .with_advancing_timer_clock()
             .replay_from_snapshot(snapshot)
             .await
     }
@@ -2396,10 +2433,16 @@ impl WorkflowTestEnv {
         self
     }
 
-    /// Return the current simulated wall-clock time.
+    /// Return the construction-time simulated wall-clock (`WorkflowStarted` timestamp).
     ///
-    /// This is the value that `ctx.now()` returns inside the workflow function
-    /// during the run.  The time is fixed at construction.
+    /// This is the **starting** value of the virtual clock, not the final value.
+    /// Inside the workflow function `ctx.now()` advances with each durable timer
+    /// that fires (issue #526); use [`TestRunOutcome::final_now`] to read the
+    /// clock after all timers have fired, or [`TestRunOutcome::elapsed`] for the
+    /// total virtual time elapsed.
+    ///
+    /// [`TestRunOutcome::final_now`]: crate::testing::TestRunOutcome::final_now
+    /// [`TestRunOutcome::elapsed`]: crate::testing::TestRunOutcome::elapsed
     #[must_use]
     pub const fn now(&self) -> DateTime<Utc> {
         self.simulated_now

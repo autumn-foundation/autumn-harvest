@@ -122,7 +122,39 @@ pub async fn run_workflow_strict(
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers);
+    run_strict_with_ctx(exec_id, ctx, handler, input).await
+}
 
+/// Like [`run_workflow_strict`] but enables the advancing virtual clock (issue #526).
+///
+/// Used by [`WorkflowReplayer::with_advancing_timer_clock`] so that
+/// `replay_check` on a [`TestRunOutcome`](crate::testing::TestRunOutcome) can
+/// verify time-branching workflows without false non-determinism failures.
+#[cfg(any(test, feature = "testing"))]
+#[allow(clippy::implicit_hasher)]
+pub async fn run_workflow_strict_advancing_clock(
+    exec_id: ExecutionId,
+    history: Vec<WorkflowEvent>,
+    handler: WorkflowHandlerFn,
+    input: Value,
+    state: SharedState,
+    context_headers: std::collections::HashMap<String, String>,
+) -> WorkflowOutcome {
+    let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
+        .with_context_headers(context_headers)
+        .with_advancing_timer_clock();
+    run_strict_with_ctx(exec_id, ctx, handler, input).await
+}
+
+/// Inner body shared by [`run_workflow_strict`] and
+/// [`run_workflow_strict_advancing_clock`].  The caller builds the context
+/// (including any advancing-clock opt-in) and passes it here.
+async fn run_strict_with_ctx(
+    exec_id: ExecutionId,
+    ctx: WorkflowContext,
+    handler: WorkflowHandlerFn,
+    input: Value,
+) -> WorkflowOutcome {
     // ADR-0001 §2.1: strict mode is always a replay cycle.
     let span = tracing::info_span!(
         "harvest.workflow.execute",

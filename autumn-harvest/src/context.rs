@@ -818,7 +818,7 @@ pub struct WorkflowContext {
     /// `Some` = test harness advancing-clock mode; incremented each time a
     /// durable timer resolves from history so `ctx.now()` reflects virtual elapsed time.
     #[cfg(any(test, feature = "testing"))]
-    timer_clock_elapsed_secs: Option<std::sync::Mutex<u64>>,
+    timer_clock_elapsed_secs: Option<std::sync::atomic::AtomicU64>,
 }
 
 impl WorkflowContext {
@@ -1154,16 +1154,21 @@ impl WorkflowContext {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn with_advancing_timer_clock(mut self) -> Self {
-        self.timer_clock_elapsed_secs = Some(std::sync::Mutex::new(0));
+        self.timer_clock_elapsed_secs = Some(std::sync::atomic::AtomicU64::new(0));
         self
     }
 
     /// Advance the virtual timer clock by `duration_secs` (no-op in production).
+    ///
+    /// Called at each `TimerStarted` resolution site in `timer()` and
+    /// `wait_for_signal_timeout()`.  `TestRunOutcome::final_now()` independently
+    /// sums the same `TimerStarted { duration_secs }` events from the recorded
+    /// history — the two mechanisms must remain in sync: every call here
+    /// corresponds to exactly one `TimerStarted` event appended to history.
     #[cfg(any(test, feature = "testing"))]
-    pub(crate) fn advance_timer_clock(&self, duration_secs: u64) {
-        if let Some(ref mu) = self.timer_clock_elapsed_secs {
-            let mut elapsed = mu.lock().expect("timer_clock_elapsed_secs poisoned");
-            *elapsed = elapsed.saturating_add(duration_secs);
+    fn advance_timer_clock(&self, duration_secs: u64) {
+        if let Some(ref atomic) = self.timer_clock_elapsed_secs {
+            atomic.fetch_add(duration_secs, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1264,20 +1269,13 @@ impl WorkflowContext {
     /// In the test harness with the advancing clock enabled (issue #526),
     /// each durable timer that fires from history advances this by its duration,
     /// so time-aware logic can be unit-tested without a real database.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal timer-clock mutex is poisoned (test harness only;
-    /// the mutex is never poisoned in normal usage).
     #[must_use]
     pub fn now(&self) -> DateTime<Utc> {
         #[cfg(any(test, feature = "testing"))]
-        if let Some(ref mu) = self.timer_clock_elapsed_secs {
-            let elapsed = *mu.lock().expect("timer_clock_elapsed_secs poisoned");
-            if elapsed > 0 {
-                let delta = chrono::Duration::seconds(i64::try_from(elapsed).unwrap_or(i64::MAX));
-                return self.start_time + delta;
-            }
+        if let Some(ref atomic) = self.timer_clock_elapsed_secs {
+            let elapsed = atomic.load(std::sync::atomic::Ordering::Relaxed);
+            let delta = chrono::Duration::seconds(i64::try_from(elapsed).unwrap_or(i64::MAX));
+            return self.start_time + delta;
         }
         self.start_time
     }
@@ -2657,6 +2655,9 @@ impl WorkflowContext {
 
         match history_match {
             HistoryMatch::Matched { .. } => {
+                // Advance the virtual clock so ctx.now() reflects elapsed time.
+                // TestRunOutcome::final_now() independently sums TimerStarted
+                // duration_secs from the recorded history — both must stay in sync.
                 #[cfg(any(test, feature = "testing"))]
                 self.advance_timer_clock(duration_secs);
                 Ok(())
@@ -3308,6 +3309,8 @@ impl WorkflowContext {
         match history_match {
             SignalOrTimerMatch::SignalWon { payload } => Ok(Some(payload)),
             SignalOrTimerMatch::TimerWon => {
+                // Advance the virtual clock (same coupling as timer() above).
+                // Signal-won path advances nothing — no TimerStarted event recorded.
                 #[cfg(any(test, feature = "testing"))]
                 self.advance_timer_clock(duration_secs);
                 Ok(None)
