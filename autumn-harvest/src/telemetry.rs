@@ -108,6 +108,42 @@ pub const METRIC_ACTIVITY_DURATION: &str = "harvest.activity.duration";
 /// Per ADR-0001 §7, `execution.id` / `activity.id` are span-only.
 pub const METRIC_ACTIVITY_FAILED: &str = "harvest.activity.failed";
 
+/// Counter: incremented once per activity attempt for **both** successful and
+/// failed outcomes, providing a single metric family for success-rate SLOs.
+///
+/// Labels:
+/// - `activity` (= [`METRIC_LABEL_ACTIVITY`]): the registered activity name (bounded)
+/// - `queue` (= [`METRIC_LABEL_QUEUE`]): the task queue name (bounded)
+/// - `outcome` (= [`METRIC_LABEL_OUTCOME`]): `"completed"` or `"failed"`
+///   (mirrors [`ActivityStatus::as_str`])
+///
+/// Use this counter to compute activity success rate in a single metric family:
+/// `rate(harvest_activity_attempts_total{outcome="completed"}[5m]) /
+///  rate(harvest_activity_attempts_total[5m])`.
+///
+/// Complements the existing [`METRIC_ACTIVITY_FAILED`] (richer labels:
+/// `workflow.type`/`error.type`/`non_retryable`) and [`METRIC_ACTIVITY_DURATION`]
+/// (histogram). Together the three form the complete activity-outcome trio.
+///
+/// Per ADR-0001 §7, `execution.id` and `activity.id` are **span-only** and must
+/// never appear as labels here.
+pub const METRIC_ACTIVITY_ATTEMPTS: &str = "harvest.activity.attempts";
+
+/// Counter: incremented once each time a retry is **actually scheduled** for
+/// an activity, enabling direct "retry storm" alerting before work dead-letters.
+///
+/// Labels:
+/// - `activity` (= [`METRIC_LABEL_ACTIVITY`]): the registered activity name (bounded)
+/// - `queue` (= [`METRIC_LABEL_QUEUE`]): the task queue name (bounded)
+///
+/// A retry is counted only when the attempt is retryable *and* the
+/// `schedule_to_close` deadline (if set) is not already exceeded — i.e., exactly
+/// when a new task row is enqueued for the next attempt.
+///
+/// Per ADR-0001 §7, `execution.id` and `activity.id` are **span-only** and must
+/// never appear as labels here.
+pub const METRIC_ACTIVITY_RETRIES: &str = "harvest.activity.retries";
+
 /// Counter: incremented when a durable timer is persisted.
 pub const METRIC_TIMER_STARTED: &str = "harvest.timer.started";
 
@@ -863,6 +899,37 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (activity_name, workflow_type, error_type, non_retryable);
     }
 
+    /// An activity attempt completed (success or failure).
+    ///
+    /// Increments [`METRIC_ACTIVITY_ATTEMPTS`] with label `outcome` set to
+    /// `ActivityStatus::as_str()` (`"completed"` or `"failed"`). Fires **once per
+    /// attempt for both outcomes**, keeping the counter in lockstep with the
+    /// `harvest.activity.duration` histogram count.
+    ///
+    /// This is the primary signal for activity success-rate SLOs: compute
+    /// `rate(harvest_activity_attempts_total{outcome="completed"}[5m]) /
+    ///  rate(harvest_activity_attempts_total[5m])` within a single metric family.
+    ///
+    /// Per ADR-0001 §7, `execution.id` and `activity.id` are **span-only** and
+    /// must never appear as metric attributes; the method signature enforces this
+    /// by construction.
+    fn record_activity_attempt(&self, activity_name: &str, queue: &str, outcome: ActivityStatus) {
+        let _ = (activity_name, queue, outcome);
+    }
+
+    /// A retry was scheduled for an activity (one per retry actually enqueued).
+    ///
+    /// Increments [`METRIC_ACTIVITY_RETRIES`] with labels `activity` and `queue`.
+    /// Fires only when a retry is durably enqueued (i.e. after the
+    /// `schedule_to_close` deadline check passes), so the count is the authoritative
+    /// "retries scheduled" signal for retry-storm detection.
+    ///
+    /// Per ADR-0001 §7, `execution.id` and `activity.id` are **span-only** and
+    /// must never appear as metric attributes.
+    fn record_activity_retried(&self, activity_name: &str, queue: &str) {
+        let _ = (activity_name, queue);
+    }
+
     /// A durable timer was persisted.
     fn record_timer_started(&self, duration_secs: f64) {
         let _ = duration_secs;
@@ -1563,6 +1630,108 @@ mod tests {
         rec.record_workflow_terminal("billing", "default", WorkflowStatus::Completed);
         // If execution.id were a parameter the call above would require an
         // extra UUID argument and this test would fail to compile.
+    }
+
+    // ── Activity attempt + retry counter tests (issue #528) ─────────────
+
+    #[test]
+    fn metric_activity_attempts_constant_has_correct_name() {
+        assert_eq!(METRIC_ACTIVITY_ATTEMPTS, "harvest.activity.attempts");
+    }
+
+    #[test]
+    fn metric_activity_retries_constant_has_correct_name() {
+        assert_eq!(METRIC_ACTIVITY_RETRIES, "harvest.activity.retries");
+    }
+
+    #[test]
+    fn record_activity_attempt_has_noop_default() {
+        // MetricsRecorder::record_activity_attempt must exist with a no-op
+        // default body so existing implementations compile without changes.
+        let rec = NoOpMetrics;
+        rec.record_activity_attempt("send_email", "default", ActivityStatus::Completed);
+        rec.record_activity_attempt("send_email", "default", ActivityStatus::Failed);
+    }
+
+    #[test]
+    fn record_activity_retried_has_noop_default() {
+        let rec = NoOpMetrics;
+        rec.record_activity_retried("send_email", "default");
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_activity_attempt() {
+        // ADR-0001 §7 cardinality rule: execution.id / activity.id are span-only.
+        // Verifies by construction: the method only accepts activity_name, queue, outcome.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_activity_attempt("charge_card", "billing", ActivityStatus::Completed);
+    }
+
+    #[test]
+    fn activity_status_outcome_values_are_bounded() {
+        // outcome label is low-cardinality: exactly "completed" and "failed".
+        assert_eq!(ActivityStatus::Completed.as_str(), "completed");
+        assert_eq!(ActivityStatus::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn record_activity_attempt_fires_for_both_outcomes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct AttemptCounter {
+            completed: AtomicUsize,
+            failed: AtomicUsize,
+        }
+
+        impl MetricsRecorder for AttemptCounter {
+            fn record_activity_attempt(
+                &self,
+                _activity: &str,
+                _queue: &str,
+                outcome: ActivityStatus,
+            ) {
+                match outcome {
+                    ActivityStatus::Completed => {
+                        self.completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ActivityStatus::Failed => {
+                        self.failed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+
+        let counter = AttemptCounter::default();
+        counter.record_activity_attempt("act", "q", ActivityStatus::Completed);
+        counter.record_activity_attempt("act", "q", ActivityStatus::Completed);
+        counter.record_activity_attempt("act", "q", ActivityStatus::Failed);
+        assert_eq!(counter.completed.load(Ordering::SeqCst), 2);
+        assert_eq!(counter.failed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn record_activity_retried_fires_per_retry_scheduled() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct RetryCounter(AtomicUsize);
+
+        impl MetricsRecorder for RetryCounter {
+            fn record_activity_retried(&self, _activity: &str, _queue: &str) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = RetryCounter::default();
+        counter.record_activity_retried("send_email", "default");
+        counter.record_activity_retried("send_email", "default");
+        counter.record_activity_retried("send_email", "default");
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            3,
+            "retry counter should fire once per retry scheduled"
+        );
     }
 
     // ── Workflow-task timeout metric tests (issue #494) ───────────────────

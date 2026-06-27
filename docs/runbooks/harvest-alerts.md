@@ -546,3 +546,74 @@ None. A non-determinism mismatch means the workflow code generated a different s
 
 Escalate immediately to the release owner and the team who shipped the latest version. Replay divergence blocks execution progress for all active workflows of that type, risking data inconsistency.
 
+## harvest_activity_success_ratio
+
+### Triage steps
+
+1. Identify the `activity` and `queue` labels from the alert.
+2. Run `harvest dlq list --limit 25` to check for dead-letter accumulation from that activity.
+3. Run `harvest workflow stack <execution_id>` on affected executions to see pending activity state.
+4. Check `harvest.activity.failed{activity=<name>}` for `error.type` breakdown to classify the failure mode.
+5. Inspect the circuit breaker state: `GET /api/harvest/admin/circuits/<activity_name>`.
+
+### Likely causes
+
+Downstream outage or degradation, bad credentials, schema or payload drift, deployment regression
+in the activity handler, timeout configured too low, or retry exhaustion tipping into the DLQ.
+
+### False positives
+
+Newly deployed activities with sparse traffic produce unstable ratios over short windows. Alert
+only when the activity has steady baseline traffic and the ratio drops for more than one 5-minute
+window. A ratio of exactly 0 with no `outcome=completed` series usually indicates the activity
+has never succeeded in the window — check if it is newly deployed or was just restarted.
+
+### Safe actions
+
+Roll back the handler release, restore downstream credentials, force-open the circuit breaker
+(`POST /api/harvest/admin/circuits/{activity_name}/force-open`) if the downstream is known-bad,
+or pause the schedules that are triggering the activity until the downstream recovers.
+Replay dead letters only after the root cause is fixed.
+
+### Escalation criteria
+
+Escalate to the downstream team for sustained external errors. Escalate to the workflow owner
+for payload or schema regressions. Page immediately if the success ratio stays below 50% for
+more than 10 minutes or if DLQ entries are accumulating rapidly.
+
+## harvest_activity_retry_storm
+
+### Triage steps
+
+1. Identify the `activity` and `queue` labels from the alert.
+2. Check the retry rate trend: is it growing, stable, or receding?
+3. Run `harvest dlq list --limit 25` to determine whether retries are eventually succeeding or tipping into the DLQ.
+4. Check `harvest.activity.failed{activity=<name>,error.type=<type>}` to identify the failure class driving retries.
+5. Inspect circuit breaker state: `GET /api/harvest/admin/circuits/<activity_name>`.
+   If the breaker is closed and failures are consistent, consider force-opening it to stop flooding: `POST /api/harvest/admin/circuits/{activity_name}/force-open`.
+
+### Likely causes
+
+Intermittent downstream degradation that recovers before retry exhaustion, too-aggressive retry
+policy (high max_attempts or very short backoff), cascading failure across many parallel workflow
+executions, or a transient infrastructure event (restart, rebalance, network blip).
+
+### False positives
+
+A burst of retries after a brief dependency restart is expected and self-resolving. Alert only
+when the retry rate is sustained (> 5 min) or growing. If the circuit breaker opens automatically,
+the storm signal will drop even if the underlying dependency is still recovering.
+
+### Safe actions
+
+1. If the downstream is known-bad, force-open the circuit breaker to stop the retry flood immediately.
+2. Reduce concurrency on the affected queue temporarily via `WorkerConfig::max_concurrent_activities`.
+3. Pause schedules that are generating the affected work until the downstream recovers.
+4. Tune the retry policy (`max_attempts`, `initial_interval`) in a follow-up release if the storm is structural.
+
+### Escalation criteria
+
+Escalate to the downstream owner for external dependency outages. Escalate to the workflow owner
+if the retry policy is misconfigured. Page (`harvest_activity_retry_storm_critical`) when the retry
+rate exceeds 20/s — at that scale the task queue backlog will grow and other queues will be starved.
+

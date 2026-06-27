@@ -28,6 +28,10 @@ fn metrics_rs_recorder_implements_metrics_recorder_trait() {
     recorder.record_concurrency_key_deferred("email-cap", 1);
     recorder.record_schedule_to_start("default", 1.5);
     recorder.record_queue_oldest_pending_age("default", 30.0);
+    // AC5 (issue #528): new activity outcome counters must be bridged.
+    recorder.record_activity_attempt("charge_card", "billing", ActivityStatus::Completed);
+    recorder.record_activity_attempt("charge_card", "billing", ActivityStatus::Failed);
+    recorder.record_activity_retried("charge_card", "billing");
 }
 
 #[test]

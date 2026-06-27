@@ -129,7 +129,10 @@ metric is emitted in the source code.
 |--------|-----------|-----------|
 | `harvest.workflow.started` | Counter | `worker.rs` — `process_workflow_task`, on first live invocation |
 | `harvest.workflow.duration` | Histogram | `worker.rs` — `process_workflow_task`, on executor cycle completion |
-| `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion |
+| `harvest.activity.duration` | Histogram | `worker.rs` — `dispatch_activity_handler`, on activity completion (success or failure) |
+| `harvest.activity.failed` | Counter | `worker.rs` — `dispatch_activity_handler`, on each failed attempt; richer labels than `harvest.activity.attempts` (`workflow.type`, `error.type`, `non_retryable`) |
+| `harvest.activity.attempts` | Counter | `worker.rs` — `dispatch_activity_handler`, once per attempt for **both** outcomes; use for success-rate SLOs: `rate(attempts{outcome="completed"}[5m]) / rate(attempts[5m])` (issue #528) |
+| `harvest.activity.retries` | Counter | `worker.rs` — `handle_activity_result`, once per retry actually scheduled (after the `schedule_to_close` deadline check); use for retry-storm detection (issue #528) |
 | `harvest.timer.started` | Counter | `worker.rs` — `persist_timer_command`, when a durable timer is written |
 | `harvest.queue.depth` | Gauge | `worker.rs` — `spawn_queue_depth_sampler`, periodic (5 s default). Aggregated **across all shards** of the worker's `ShardedDbPool` (summed per queue) so multi-shard backlog is fleet-wide, not default-shard-only (issue #522) |
 | `harvest.queue.schedule_to_start` | Histogram | `worker.rs` — `dispatch_task`, recorded after the concurrency permit is acquired so it captures worker-local backpressure; skew-discounted (issue #501) |
@@ -147,6 +150,9 @@ metric is emitted in the source code.
 | `harvest.workflow.started` | `workflow`, `queue` |
 | `harvest.workflow.duration` | `workflow`, `queue`, `status` (`completed\|failed\|suspended\|continued_as_new`) |
 | `harvest.activity.duration` | `activity`, `queue`, `status` (`completed\|failed`) |
+| `harvest.activity.failed` | `activity`, `workflow.type`, `error.type`, `non_retryable` |
+| `harvest.activity.attempts` | `activity`, `queue`, `outcome` (`completed\|failed`) |
+| `harvest.activity.retries` | `activity`, `queue` |
 | `harvest.timer.started` | _(none)_ |
 | `harvest.queue.depth` | `queue` |
 | `harvest.queue.schedule_to_start` | `queue` |

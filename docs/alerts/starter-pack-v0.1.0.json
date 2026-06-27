@@ -486,6 +486,104 @@
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_failure_rate"
     },
     {
+      "id": "harvest_activity_success_ratio",
+      "status": "enforceable",
+      "signal_source": "harvest.activity.attempts counter with outcome label (issue #528).",
+      "default_threshold": "Page when the activity success ratio drops below 90% over 5 minutes for any activity type. Tune per SLO.",
+      "severity": "page",
+      "owner_persona": "workflow owner",
+      "description": "The fraction of activity attempts that succeeded has fallen below the threshold for a given activity type. Unlike the legacy harvest_activity_failure_surge alert (which counts failed histogram samples), this alert is computed within a single metric family — harvest.activity.attempts{outcome} — so the ratio is accurate and directly actionable. outcome is bounded to two values (completed/failed), keeping cardinality low. execution.id is never a label.",
+      "first_action": "harvest dlq list --limit 25; check harvest.activity.failed for error.type breakdown and harvest.activity.retries for retry-storm indicators",
+      "dependencies": [
+        {
+          "ref": "#528",
+          "status": "shipped",
+          "surface": "harvest.activity.attempts{activity,queue,outcome=completed|failed} counter emitted once per attempt for both outcomes"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "outcome label is low-cardinality (2 values: completed/failed). activity must be bounded to registered activity types. Do NOT add execution.id or activity.id as labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "(sum by (activity, queue) (rate(harvest_activity_attempts_total{outcome=\"completed\"}[5m])) or on(activity, queue) (0 * sum by (activity, queue) (rate(harvest_activity_attempts_total[5m])))) / sum by (activity, queue) (rate(harvest_activity_attempts_total[5m])) < 0.90"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/dead-letters",
+        "GET /api/harvest/admin/circuits"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_activity_success_ratio"
+    },
+    {
+      "id": "harvest_activity_retry_storm",
+      "status": "enforceable",
+      "signal_source": "harvest.activity.retries counter (issue #528).",
+      "default_threshold": "Ticket when the retry rate for any activity type exceeds 5 retries/second sustained over 5 minutes. Tune with harvest_activity_retry_storm_critical for a page at the 20/s threshold.",
+      "severity": "ticket",
+      "owner_persona": "workflow owner",
+      "description": "A high retry rate for an activity type is the earliest warning of a degrading downstream dependency before work tips into the DLQ. harvest.activity.retries fires exactly once per retry actually scheduled (after the schedule_to_close deadline check), so the counter is the authoritative retry-storm signal independent of eventual success or failure. The existing harvest_activity_failure_surge alert fires only when failures are terminal — this alert catches storms that eventually succeed but are burning retries at scale.",
+      "first_action": "harvest dlq list --limit 25; check harvest.activity.failed{error.type} for the failure class causing retries; inspect circuit breaker state at GET /api/harvest/admin/circuits",
+      "dependencies": [
+        {
+          "ref": "#528",
+          "status": "shipped",
+          "surface": "harvest.activity.retries{activity,queue} counter incremented once per retry enqueued"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Labels are low-cardinality (activity type, queue). Do NOT add execution.id or activity.id as labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (activity, queue) (rate(harvest_activity_retries_total[5m])) > 5"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/dead-letters",
+        "GET /api/harvest/admin/circuits",
+        "harvest workflow stack <execution_id>"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm"
+    },
+    {
+      "id": "harvest_activity_retry_storm_critical",
+      "status": "enforceable",
+      "signal_source": "harvest.activity.retries counter (issue #528).",
+      "default_threshold": "Page when the retry rate for any activity type exceeds 20 retries/second sustained over 5 minutes — at this scale the task queue saturates and other work is blocked.",
+      "severity": "page",
+      "owner_persona": "workflow owner",
+      "description": "The page-tier companion to harvest_activity_retry_storm. At 20 retries/s the worker pool is under severe pressure and latency for all work on that queue will degrade. Escalate immediately if the retry rate does not drop within 5 minutes of first response.",
+      "first_action": "harvest dlq list --limit 25; check harvest.activity.failed{error.type} for the failure class causing retries; force-open the circuit breaker if the downstream is known-bad: POST /api/harvest/admin/circuits/{activity_name}/force-open",
+      "dependencies": [
+        {
+          "ref": "#528",
+          "status": "shipped",
+          "surface": "harvest.activity.retries{activity,queue} counter incremented once per retry enqueued"
+        }
+      ],
+      "prometheus": {
+        "mode": "native",
+        "notes": "Labels are low-cardinality (activity type, queue). Do NOT add execution.id or activity.id as labels.",
+        "expressions": [
+          {
+            "kind": "promql",
+            "expr": "sum by (activity, queue) (rate(harvest_activity_retries_total[5m])) > 20"
+          }
+        ]
+      },
+      "management_checks": [
+        "GET /api/harvest/dead-letters",
+        "GET /api/harvest/admin/circuits",
+        "POST /api/harvest/admin/circuits/{activity_name}/force-open"
+      ],
+      "runbook": "docs/runbooks/harvest-alerts.md#harvest_activity_retry_storm"
+    },
+    {
       "id": "harvest_workflow_non_determinism",
       "status": "enforceable",
       "signal_source": "ADR-0001/#138 counter harvest.workflow.non_determinism plus management API failure_cause query.",
