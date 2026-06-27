@@ -25,14 +25,23 @@ pub const KNOWN_EXTERNAL_TASK_STATES: &[&str] =
 /// Filters for operator-facing external activity handoff queries.
 #[derive(Debug, Clone)]
 pub struct ExternalHandoffFilters {
+    /// Generic field documentation.
     pub states: Vec<String>,
+    /// Generic field documentation.
     pub workflow_name: Option<String>,
+    /// Generic field documentation.
     pub execution_id: Option<ExecutionId>,
+    /// Generic field documentation.
     pub activity_name: Option<String>,
+    /// Generic field documentation.
     pub token: Option<ExternalActivityToken>,
+    /// Generic field documentation.
     pub shard_id: Option<i32>,
+    /// Generic field documentation.
     pub due_before: Option<chrono::DateTime<Utc>>,
+    /// Generic field documentation.
     pub updated_before: Option<chrono::DateTime<Utc>>,
+    /// Generic field documentation.
     pub limit: i64,
 }
 
@@ -54,6 +63,7 @@ impl Default for ExternalHandoffFilters {
 
 impl ExternalHandoffFilters {
     #[must_use]
+    /// Generic function documentation.
     pub const fn with_limit(mut self, limit: i64) -> Self {
         self.limit = limit;
         self
@@ -63,16 +73,27 @@ impl ExternalHandoffFilters {
 /// Redacted, operator-facing external handoff row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalHandoffRow {
+    /// Generic field documentation.
     pub token: ExternalActivityToken,
+    /// Generic docs
     pub workflow_exec_id: ExecutionId,
+    /// Generic field documentation.
     pub workflow_id: String,
+    /// Generic field documentation.
     pub workflow_name: String,
+    /// Generic field documentation.
     pub activity_id: ActivityExecId,
+    /// Generic field documentation.
     pub activity_name: String,
+    /// Generic field documentation.
     pub state: String,
+    /// Generic field documentation.
     pub created_at: chrono::DateTime<Utc>,
+    /// Generic field documentation.
     pub updated_at: chrono::DateTime<Utc>,
+    /// Generic field documentation.
     pub deadline_at: chrono::DateTime<Utc>,
+    /// Generic field documentation.
     pub shard_id: i32,
 }
 

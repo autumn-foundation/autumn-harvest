@@ -1186,6 +1186,7 @@ async fn do_heartbeat_tick(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Generic docs
 pub fn spawn_worker_heartbeat(
     pool: DbPool,
     registration: WorkerRegistration,

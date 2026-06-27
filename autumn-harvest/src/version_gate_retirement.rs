@@ -52,15 +52,23 @@ pub struct RetirementCheckFilters {
 /// before retiring the old branch."
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct RetirementCheckShardRow {
+    /// Generic field documentation.
     pub workflow_name: String,
+    /// Generic field documentation.
     pub change_id: String,
+    /// Generic field documentation.
     pub recorded_version: u32,
+    /// Generic field documentation.
     pub active_executions: i64,
+    /// Generic field documentation.
     pub terminal_executions: i64,
+    /// Generic field documentation.
     pub oldest_blocker_started_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub newest_blocker_started_at: DateTime<Utc>,
     /// Up to 10 active (non-terminal) execution IDs for manual investigation.
     pub sample_active_execution_ids: Vec<Uuid>,
+    /// Generic field documentation.
     pub shard_id: i32,
 }
 

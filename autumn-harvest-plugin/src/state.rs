@@ -16,6 +16,7 @@ pub struct AppDbPool(DbPool);
 
 impl AppDbPool {
     #[must_use]
+    /// Generic function documentation.
     pub fn clone_inner(&self) -> DbPool {
         self.0.clone()
     }

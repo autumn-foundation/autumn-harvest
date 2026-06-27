@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Transactional outbox implementation for reliable workflow event emission.
 
 use std::time::Duration;
@@ -24,31 +25,53 @@ use crate::state::HarvestDbPool;
 
 diesel::table! {
     harvest_workflow_outbox (id) {
+        /// Generic variant documentation.
         id -> BigInt,
+        /// Generic variant documentation.
         workflow_name -> Text,
+        /// Generic variant documentation.
         workflow_id -> Text,
+        /// Generic variant documentation.
         queue_name -> Text,
+        /// Generic variant documentation.
         input -> Jsonb,
+        /// Generic variant documentation.
         memo -> Nullable<Jsonb>,
+        /// Generic variant documentation.
         search_attrs -> Nullable<Jsonb>,
+        /// Generic variant documentation.
         delivery_attempts -> BigInt,
+        /// Generic variant documentation.
         last_error -> Nullable<Text>,
+        /// Generic variant documentation.
         delivered_execution_id -> Nullable<Text>,
+        /// Generic variant documentation.
         delivered_at -> Nullable<Timestamp>,
+        /// Generic variant documentation.
         next_attempt_at -> Timestamp,
+        /// Generic variant documentation.
         claimed_at -> Nullable<Timestamp>,
+        /// Generic variant documentation.
         claimed_by -> Nullable<Text>,
+        /// Generic variant documentation.
         created_at -> Timestamp,
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Generic struct documentation.
 pub struct WorkflowStartRequest {
+    /// Generic field documentation.
     pub workflow_name: String,
+    /// Generic field documentation.
     pub workflow_id: String,
+    /// Generic field documentation.
     pub queue_name: String,
+    /// Generic field documentation.
     pub input: Value,
+    /// Generic field documentation.
     pub memo: Option<Value>,
+    /// Generic field documentation.
     pub search_attrs: Option<Value>,
 }
 

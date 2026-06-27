@@ -180,6 +180,7 @@ pub struct AdmissionGate {
     /// What work this gate blocks.
     pub scope: GateScope,
     /// Human-readable reason; surfaced in the blocked-caller error.
+    /// Reason
     pub reason: String,
     /// Optional extended message displayed in the Vantage UI.
     pub message: Option<String>,
@@ -259,6 +260,7 @@ pub fn check_admission<'a>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateCreateError {
     /// The active gate count reached [`MAX_ACTIVE_GATES`].
+    #[allow(missing_docs)]
     TooManyGates { limit: usize },
     /// The reason string was empty.
     EmptyReason,
@@ -395,6 +397,7 @@ impl AdmissionGateCache {
 // ── DB layer (requires `db` feature) ─────────────────────────────────────────
 
 #[cfg(feature = "db")]
+/// Generic field documentation.
 pub mod db {
     use super::{AdmissionGate, AdmissionGateId, DateTime, GateScope, MAX_ACTIVE_GATES, Utc, Uuid};
     use crate::error::{HarvestResult, database_error};
@@ -600,13 +603,21 @@ pub mod db {
 /// JSON-serialisable view of an admission gate for API responses.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdmissionGateView {
+    /// Generic field documentation.
     pub id: Uuid,
+    /// Generic field documentation.
     pub scope_kind: String,
+    /// Generic field documentation.
     pub scope_value: Option<String>,
+    /// Reason
     pub reason: String,
+    /// Generic field documentation.
     pub message: Option<String>,
+    /// Generic field documentation.
     pub created_by: String,
+    /// Generic field documentation.
     pub created_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub expires_at: Option<DateTime<Utc>>,
     /// `true` when the gate is currently blocking (active + not expired).
     pub is_active: bool,

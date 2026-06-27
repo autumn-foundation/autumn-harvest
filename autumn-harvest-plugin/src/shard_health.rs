@@ -23,8 +23,11 @@ use crate::api::{HarvestApiRuntime, HarvestApiState};
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShardReadiness {
+    /// Generic variant documentation.
     Ready,
+    /// Generic variant documentation.
     Degraded,
+    /// Generic variant documentation.
     Unavailable,
 }
 
@@ -32,80 +35,125 @@ pub enum ShardReadiness {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShardRole {
+    /// Generic variant documentation.
     Readable,
+    /// Generic variant documentation.
     Writable,
+    /// Generic variant documentation.
     Default,
 }
 
 /// Response returned by `GET /admin/shards/health`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShardHealthReport {
+    /// Generic field documentation.
     pub overall_readiness: ShardReadiness,
+    /// Generic field documentation.
     pub observed_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub freshness_window_secs: u64,
+    /// Generic field documentation.
     pub candidate_shard: Option<i32>,
+    /// Generic field documentation.
     pub shards: Vec<ShardHealthRow>,
 }
 
 /// One shard row in the health response.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShardHealthRow {
+    /// Generic field documentation.
     pub shard_id: i32,
+    /// Generic field documentation.
     pub roles: Vec<ShardRole>,
+    /// Generic field documentation.
     pub candidate: bool,
+    /// Generic field documentation.
     pub reachable: bool,
+    /// Generic field documentation.
     pub active_worker_count: usize,
+    /// Generic field documentation.
     pub stale_worker_count: usize,
+    /// Generic field documentation.
     pub schema: ShardSchemaHealth,
+    /// Generic field documentation.
     pub worker_coverage: Vec<QueueWorkerCoverage>,
+    /// Generic field documentation.
     pub scheduler: ShardSchedulerCoverage,
+    /// Generic field documentation.
     pub queue_depth: QueueDepthSummary,
+    /// Generic field documentation.
     pub dlq: DlqSummary,
+    /// Generic field documentation.
     pub last_health_sample_time: Option<DateTime<Utc>>,
+    /// Generic field documentation.
     pub readiness: ShardReadiness,
+    /// Generic field documentation.
     pub reason_codes: Vec<String>,
+    /// Generic field documentation.
     pub blocking_reasons: Vec<String>,
+    /// Generic field documentation.
     pub error_summary: Option<String>,
 }
 
 /// Migration/schema readiness details for a shard.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShardSchemaHealth {
+    /// Generic field documentation.
     pub ready: bool,
+    /// Generic field documentation.
     pub applied_count: Option<usize>,
+    /// Generic field documentation.
     pub missing_migrations: Vec<String>,
+    /// Generic field documentation.
     pub error: Option<String>,
 }
 
 /// Worker coverage for a required queue on one shard.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueWorkerCoverage {
+    /// Generic field documentation.
     pub queue: String,
+    /// Generic field documentation.
     pub ready: bool,
+    /// Generic field documentation.
     pub healthy_active: usize,
+    /// Generic field documentation.
     pub stale: usize,
+    /// Generic field documentation.
     pub draining: usize,
+    /// Generic field documentation.
     pub stopped: usize,
+    /// Generic field documentation.
     pub total_matching: usize,
 }
 
 /// Scheduler coverage for a shard when schedules exist.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShardSchedulerCoverage {
+    /// Generic field documentation.
     pub enabled: bool,
+    /// Generic field documentation.
     pub ready: bool,
+    /// Generic field documentation.
     pub running: bool,
+    /// Generic field documentation.
     pub last_tick_at: Option<DateTime<Utc>>,
+    /// Generic field documentation.
     pub tick_interval_ms: u64,
+    /// Generic field documentation.
     pub freshness_window_secs: u64,
+    /// Generic field documentation.
     pub schedule_count: usize,
+    /// Generic field documentation.
     pub error: Option<String>,
 }
 
 /// Pending task count summary for a shard.
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueDepthSummary {
+    /// Generic field documentation.
     pub total_pending: i64,
+    /// Generic field documentation.
     pub by_queue: BTreeMap<String, i64>,
     /// Distinct constraint requirements among claimable pending tasks, grouped
     /// by `(queue_name, required_capabilities, required_build_id)` (issue #522
@@ -114,6 +162,7 @@ pub struct QueueDepthSummary {
     /// Empty when no pending task carries a capability or build-id constraint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub constraint_demands: Vec<ConstraintDemand>,
+    /// Generic field documentation.
     pub error: Option<String>,
 }
 
@@ -128,22 +177,28 @@ pub struct QueueDepthSummary {
 /// no constraint are covered by the basic per-queue check).
 #[derive(Debug, Clone, Serialize)]
 pub struct ConstraintDemand {
+    /// Generic field documentation.
     pub queue_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub required_capabilities: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub required_build_id: Option<String>,
     /// `Some(worker_id)` when an unexpired sticky lease binds the row to a
     /// specific worker; only that worker can claim it until the lease expires.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sticky_owner: Option<String>,
+    /// Generic field documentation.
     pub count: i64,
 }
 
 /// Dead-letter count summary for a shard.
 #[derive(Debug, Clone, Serialize)]
 pub struct DlqSummary {
+    /// Generic field documentation.
     pub count: Option<i64>,
+    /// Generic field documentation.
     pub error: Option<String>,
 }
 

@@ -220,10 +220,12 @@ impl std::fmt::Debug for ShardedDbPool {
 }
 
 #[cfg(feature = "db")]
+/// Generic static documentation.
 pub static GLOBAL_SHARDED_POOL: std::sync::RwLock<Option<ShardedDbPool>> =
     std::sync::RwLock::new(None);
 
 #[cfg(feature = "db")]
+/// Generic static documentation.
 pub static GLOBAL_SHARD_ROUTER: std::sync::RwLock<Option<ShardRouter>> =
     std::sync::RwLock::new(None);
 

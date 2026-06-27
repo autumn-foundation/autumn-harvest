@@ -1,0 +1,309 @@
+    Checking autumn-harvest v0.4.0 (/app/autumn-harvest)
+ Documenting autumn-harvest v0.4.0 (/app/autumn-harvest)
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:262:20
+    |
+262 |     TooManyGates { limit: usize },
+    |                    ^^^^^^^^^^^^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:610:5
+    |
+610 |     pub reason: String,
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> autumn-harvest/src/eligibility.rs:7:13
+  |
+7 |     Exact { key: String, value: String },
+  |             ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> autumn-harvest/src/eligibility.rs:7:26
+  |
+7 |     Exact { key: String, value: String },
+  |                          ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> autumn-harvest/src/eligibility.rs:9:10
+  |
+9 |     In { key: String, values: Vec<String> },
+  |          ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> autumn-harvest/src/eligibility.rs:9:23
+  |
+9 |     In { key: String, values: Vec<String> },
+  |                       ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/error.rs:154:9
+    |
+154 |         reason: String,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/error.rs:155:9
+    |
+155 |         details: Box<NonDeterministicDetails>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn-harvest/src/reset.rs:223:5
+    |
+223 |     TerminalSource { exec_id: ExecutionId, state: String },
+    |     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:223:22
+    |
+223 |     TerminalSource { exec_id: ExecutionId, state: String },
+    |                      ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:223:44
+    |
+223 |     TerminalSource { exec_id: ExecutionId, state: String },
+    |                                            ^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn-harvest/src/reset.rs:225:5
+    |
+225 |     ChildWorkflow {
+    |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:226:9
+    |
+226 |         exec_id: ExecutionId,
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:227:9
+    |
+227 |         parent_id: Uuid,
+    |         ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn-harvest/src/testing.rs:1274:15
+     |
+1274 |     Skipped { reason: String },
+     |               ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/scheduler.rs:43:21
+   |
+43 |     LimitExceeded { limit: usize },
+   |                     ^^^^^^^^^^^^
+
+    Checking autumn-harvest-plugin v0.4.0 (/app/autumn-harvest-plugin)
+ Documenting autumn-harvest-cli v0.4.0 (/app/autumn-harvest-cli)
+    Checking autumn-harvest-cli v0.4.0 (/app/autumn-harvest-cli)
+ Documenting autumn-harvest-plugin v0.4.0 (/app/autumn-harvest-plugin)
+ Documenting saga-choreography v0.4.0 (/app/examples/saga-choreography)
+warning: unresolved link to `GateCreateError::TooManyGates`
+  |
+  = note: the link appears in this line:
+
+          [`TooManyGates`](GateCreateError::TooManyGates) rather than silently
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `GateCreateError` in scope
+  = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default
+
+warning: unresolved link to `BuildError::ExecutionTimeoutExceedsCeiling`
+  --> autumn-harvest/src/builder.rs:86:53
+   |
+86 | ...ted with [`BuildError::ExecutionTimeoutExceedsCeiling`].
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `BuildError` in scope
+
+warning: unresolved link to `HarvestError::QueryTimedOut`
+    --> autumn-harvest/src/builder.rs:1707:46
+     |
+1707 | ... and returns [`HarvestError::QueryTimedOut`] to
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `HarvestError` in scope
+
+warning: unresolved link to `resolve_concurrency_key`
+  |
+  = note: the link appears in this line:
+
+          JSON input (via [`resolve_concurrency_key`]) to get the concrete group key
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `resolve_concurrency_key` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `for_replay_strict_with_state`
+    --> autumn-harvest/src/context.rs:1016:16
+     |
+1016 |     /// Like [`for_replay_strict_with_state`] but also sets `canary_mo...
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `for_replay_strict_with_state` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ActivityInfo`
+    --> autumn-harvest/src/context.rs:2926:41
+     |
+2926 | ...g its [`ActivityInfo`] for name, queue, and defaults.
+     |            ^^^^^^^^^^^^ no item named `ActivityInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ActivityInfo`
+    --> autumn-harvest/src/context.rs:2989:76
+     |
+2989 | ...g its [`ActivityInfo`].
+     |            ^^^^^^^^^^^^ no item named `ActivityInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `WorkflowInfo`
+    --> autumn-harvest/src/context.rs:3056:63
+     |
+3056 | ...ing a [`WorkflowInfo`].
+     |            ^^^^^^^^^^^^ no item named `WorkflowInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `QueryHandlerInfo`
+    --> autumn-harvest/src/context.rs:4474:55
+     |
+4474 | ...a [`QueryHandlerInfo`] companion record.
+     |        ^^^^^^^^^^^^^^^^ no item named `QueryHandlerInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `UpdateHandlerInfo`
+    --> autumn-harvest/src/context.rs:4491:57
+     |
+4491 | ... [`UpdateHandlerInfo`] companion record.
+     |       ^^^^^^^^^^^^^^^^^ no item named `UpdateHandlerInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Ok(())`
+    --> autumn-harvest/src/context.rs:5460:57
+     |
+5460 | ...).  Returns [`Ok(())`] otherwise.
+     |                  ^^^^^^ no item named `Ok(())` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `MarkerRecorded`
+  --> autumn-harvest/src/dag.rs:26:44
+   |
+26 | /// activity.  The skip is recorded as a [`MarkerRecorded`] event so replay
+   |                                            ^^^^^^^^^^^^^^ no item named `MarkerRecorded` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `erase_workflow_payloads`
+  |
+  = note: the link appears in this line:
+
+          A single call to [`erase_workflow_payloads`] tombstones:
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `erase_workflow_payloads` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `EraseOutcome::skipped_children`
+  |
+  = note: the link appears in this line:
+
+          [`EraseOutcome::skipped_children`]; they must be erased separately once
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `EraseOutcome` in scope
+
+warning: unresolved link to `WorkflowLogger`
+  --> autumn-harvest/src/executor.rs:67:47
+   |
+67 | ...] so [`WorkflowLogger`] can tag events.
+   |           ^^^^^^^^^^^^^^ no item named `WorkflowLogger` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Self::with_schemas`
+   --> autumn-harvest/src/info.rs:211:45
+    |
+211 |     /// `schema` feature's [`with_schemas`](Self::with_schemas) method.
+    |                                             ^^^^^^^^^^^^^^^^^^ the struct `WorkflowInfo` has no field or associated item named `with_schemas`
+
+warning: unresolved link to `OverlapPolicy::Skip`
+   --> autumn-harvest/src/info.rs:786:23
+    |
+786 |     /// Defaults to [`OverlapPolicy::Skip`].
+    |                       ^^^^^^^^^^^^^^^^^^^ no item named `OverlapPolicy` in scope
+
+warning: unresolved link to `OverlapPolicy::BufferAll`
+   --> autumn-harvest/src/info.rs:788:40
+    |
+788 | ...ed slots under [`OverlapPolicy::BufferAll`]. Default 100.
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^ no item named `OverlapPolicy` in scope
+
+warning: unresolved link to `HarvestError::ActivityFailed`
+  --> autumn-harvest/src/replay.rs:39:15
+   |
+39 |         /// [`HarvestError::ActivityFailed`] without parsing the message.
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `HarvestError` in scope
+
+warning: unresolved link to `WorkflowContext::spawn_child_workflow_detached_raw`
+   --> autumn-harvest/src/types.rs:820:7
+    |
+820 | /// [`WorkflowContext::spawn_child_workflow_detached_raw`]. Children sp...
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `WorkflowContext` in scope
+
+warning: unresolved link to `WorkflowEvent::WorkflowRedriven`
+   --> autumn-harvest/src/dlq.rs:797:29
+    |
+797 | ... appending a [`WorkflowEvent::WorkflowRedriven`] event so replay
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `WorkflowEvent` in scope
+
+warning: unresolved link to `database_error`
+  --> autumn-harvest/src/schedule_decision.rs:56:17
+   |
+56 | /// Returns a [`database_error`] if the database query execution fails.
+   |                 ^^^^^^^^^^^^^^ no item named `database_error` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `CatchupPolicy`
+    --> autumn-harvest/src/scheduler.rs:3170:67
+     |
+3170 | ...en a [`CatchupPolicy`].
+     |           ^^^^^^^^^^^^^ no item named `CatchupPolicy` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `RegisteredWorkflowRecord`
+    --> autumn-harvest-plugin/src/api.rs:4453:27
+     |
+4453 | ...ns an array of [`RegisteredWorkflowRecord`] objects sorted by name.
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^ no item named `RegisteredWorkflowRecord` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+     = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default
+
+warning: unresolved link to `RegisteredWorkflowRecord`
+    --> autumn-harvest-plugin/src/api.rs:4473:30
+     |
+4473 | ...`200` with the [`RegisteredWorkflowRecord`] when the workflow is
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^ no item named `RegisteredWorkflowRecord` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Skipped`
+    --> autumn-harvest-plugin/src/ui.rs:4491:40
+     |
+4491 | ...tinct from [`Skipped`] so the UI can show a different
+     |                 ^^^^^^^ no item named `Skipped` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: `autumn-harvest` (lib doc) generated 39 warnings
+ Documenting autumn-harvest-redis v0.4.0 (/app/autumn-harvest-redis)
+warning: `autumn-harvest-plugin` (lib doc) generated 3 warnings
+ Documenting billing-autumn-web v0.4.0 (/app/examples/billing-autumn-web)
+ Documenting quickstart v0.4.0 (/app/examples/quickstart)
+ Documenting standalone-runner v0.4.0 (/app/examples/standalone-runner)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 53.96s
+   Generated /app/target/doc/autumn_harvest/index.html and 12 other files

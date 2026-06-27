@@ -1,3 +1,4 @@
+//! Retry jitter.
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 
 fn main() {

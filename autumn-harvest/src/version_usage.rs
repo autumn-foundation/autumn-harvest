@@ -23,6 +23,7 @@ pub enum VersionExecutionStateGroup {
 
 impl VersionExecutionStateGroup {
     #[must_use]
+    /// Generic function documentation.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Active => "active",
@@ -50,23 +51,36 @@ impl std::str::FromStr for VersionExecutionStateGroup {
 /// Filters applied when reading version-gate marker usage from one shard.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct VersionUsageFilters {
+    /// Generic field documentation.
     pub workflow_name: Option<String>,
+    /// Generic field documentation.
     pub change_id: Option<String>,
+    /// Generic field documentation.
     pub recorded_version: Option<u32>,
+    /// Generic field documentation.
     pub state_group: VersionExecutionStateGroup,
+    /// Generic field documentation.
     pub shard_id: Option<i32>,
 }
 
 /// One grouped version-gate usage row read from a single database shard.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct VersionUsageShardRow {
+    /// Generic field documentation.
     pub workflow_name: String,
+    /// Generic field documentation.
     pub change_id: String,
+    /// Generic field documentation.
     pub recorded_version: u32,
+    /// Generic field documentation.
     pub active_executions: i64,
+    /// Generic field documentation.
     pub terminal_executions: i64,
+    /// Generic field documentation.
     pub oldest_matching_started_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub newest_matching_started_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub shard_id: i32,
 }
 

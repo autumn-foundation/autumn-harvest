@@ -37,6 +37,7 @@ pub enum ResetSignalReapplyPolicy {
 
 impl ResetSignalReapplyPolicy {
     #[must_use]
+    /// Generic function documentation.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Drop => "drop",
@@ -73,10 +74,14 @@ impl<'de> Deserialize<'de> for ResetSignalReapplyPolicy {
 /// Request body for resetting one workflow execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowResetRequest {
+    /// Generic field documentation.
     pub reset_to_event_id: i64,
+    /// Generic docs
     pub reason: String,
+    /// Generic field documentation.
     pub operator_id: String,
     #[serde(default)]
+    /// Generic field documentation.
     pub signal_reapply: ResetSignalReapplyPolicy,
     /// When `true`, the source execution may be in a terminal failure state
     /// (`FAILED`, `CANCELLED`, `TIMED_OUT`) instead of `RUNNING`. This opt-in is
@@ -113,23 +118,36 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
 /// A side effect that is still unresolved at a proposed reset boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetUnresolvedSideEffect {
+    /// Generic field documentation.
     pub kind: String,
+    /// Generic field documentation.
     pub side_effect_id: String,
+    /// Generic field documentation.
     pub name: Option<String>,
+    /// Generic field documentation.
     pub scheduled_event_id: i64,
 }
 
 /// Valid reset-boundary plan, also used as dry-run output after DB counts are attached.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetPlan {
+    /// Generic field documentation.
     pub reset_to_event_id: i64,
+    /// Generic field documentation.
     pub events_carried_over: usize,
+    /// Generic field documentation.
     pub unresolved_side_effects: Vec<ResetUnresolvedSideEffect>,
+    /// Generic field documentation.
     pub nearest_valid_before: Option<i64>,
+    /// Generic field documentation.
     pub nearest_valid_after: Option<i64>,
+    /// Generic field documentation.
     pub source_tasks_to_cancel: usize,
+    /// Generic field documentation.
     pub source_timers_to_remove: usize,
+    /// Generic field documentation.
     pub source_signals_to_drop: usize,
+    /// Generic field documentation.
     pub source_signals_to_buffer: usize,
 }
 
@@ -152,11 +170,17 @@ impl ResetPlan {
 /// Invalid reset-boundary details surfaced by the management API as `400`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetInvalidPoint {
+    /// Generic field documentation.
     pub message: String,
+    /// Generic field documentation.
     pub reset_to_event_id: i64,
+    /// Generic field documentation.
     pub last_event_id: i64,
+    /// Generic field documentation.
     pub unresolved_side_effects: Vec<ResetUnresolvedSideEffect>,
+    /// Generic field documentation.
     pub nearest_valid_before: Option<i64>,
+    /// Generic field documentation.
     pub nearest_valid_after: Option<i64>,
 }
 
@@ -171,13 +195,21 @@ impl std::error::Error for ResetInvalidPoint {}
 /// Result of a committed workflow reset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResetResult {
+    /// Generic docs
     pub new_exec_id: ExecutionId,
+    /// Generic docs
     pub reset_from_exec_id: ExecutionId,
+    /// Generic field documentation.
     pub reset_to_event_id: i64,
+    /// Generic field documentation.
     pub events_carried_over: usize,
+    /// Generic field documentation.
     pub source_tasks_cancelled: usize,
+    /// Generic field documentation.
     pub source_timers_removed: usize,
+    /// Generic field documentation.
     pub source_signals_dropped: usize,
+    /// Generic field documentation.
     pub source_signals_buffered: usize,
 }
 
@@ -185,6 +217,7 @@ pub struct ResetResult {
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowResetError {
     #[error(transparent)]
+    /// Generic variant documentation.
     InvalidPoint(#[from] ResetInvalidPoint),
     #[error("workflow execution {exec_id} is terminal ({state})")]
     TerminalSource { exec_id: ExecutionId, state: String },
@@ -194,6 +227,7 @@ pub enum WorkflowResetError {
         parent_id: Uuid,
     },
     #[error("continue-as-new histories cannot be reset in v1")]
+    /// Generic variant documentation.
     ContinueAsNew,
     /// An underlying storage or database error occurred during the reset operation.
     #[error(transparent)]

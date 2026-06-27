@@ -52,6 +52,7 @@ pub enum HistoryMatch {
         /// The activity execution ID already recorded in history.
         activity_id: ActivityExecId,
     },
+    /// Generic variant documentation.
     NoMatch,
     /// The command does not match what was recorded at this position,
     /// indicating non-determinism in the workflow code.

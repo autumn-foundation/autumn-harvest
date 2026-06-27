@@ -1,3 +1,4 @@
+//! Billing web.
 #![allow(clippy::missing_errors_doc, clippy::unused_async)]
 
 mod activities;

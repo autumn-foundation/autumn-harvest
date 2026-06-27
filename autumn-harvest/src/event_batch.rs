@@ -18,47 +18,81 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Generic struct documentation.
 pub struct BatchPolicy {
+    /// Generic field documentation.
     pub key_expr: String,
+    /// Generic field documentation.
     pub max_size: usize,
+    /// Generic field documentation.
     pub max_wait: Duration,
 }
 
+/// Generic struct documentation.
 pub struct AdmitBatchParams {
+    /// Generic field documentation.
     pub workflow_name: String,
+    /// Generic field documentation.
     pub batch_key: String,
+    /// Generic field documentation.
     pub workflow_id: String,
+    /// Generic field documentation.
     pub queue_name: String,
+    /// Generic field documentation.
     pub payload: serde_json::Value,
+    /// Generic field documentation.
     pub start_options: DebounceStartOptions,
+    /// Generic field documentation.
     pub max_wait: Duration,
+    /// Generic field documentation.
     pub max_size: usize,
+    /// Generic field documentation.
     pub shard_id: i32,
 }
 
 #[derive(Debug, Clone)]
+/// Generic struct documentation.
 pub struct BatchAdmitOutcome {
+    /// Generic field documentation.
     pub batch_key: String,
+    /// Generic field documentation.
     pub workflow_id: String,
+    /// Generic field documentation.
     pub fire_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub pending_count: i32,
+    /// Generic field documentation.
     pub max_size: usize,
+    /// Generic field documentation.
     pub is_flushed: bool,
+    /// Generic field documentation.
     pub flushed_execution_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Generic struct documentation.
 pub struct PendingEventBatchRecord {
+    /// Generic field documentation.
     pub id: uuid::Uuid,
+    /// Generic field documentation.
     pub workflow_name: String,
+    /// Generic field documentation.
     pub batch_key: String,
+    /// Generic field documentation.
     pub workflow_id: String,
+    /// Generic field documentation.
     pub queue_name: String,
+    /// Generic field documentation.
     pub current_size: i32,
+    /// Generic field documentation.
     pub max_size: i32,
+    /// Generic field documentation.
     pub fire_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub shard_id: i32,
+    /// Generic field documentation.
     pub created_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -116,6 +150,7 @@ struct FireDueBatchRow {
 }
 
 #[cfg(feature = "db")]
+/// Generic docs
 pub async fn admit_batched_start(
     conn: &mut AsyncPgConnection,
     params: AdmitBatchParams,
@@ -554,6 +589,7 @@ async fn fire_claimed_batch_row(
 }
 
 #[cfg(feature = "db")]
+/// Generic docs
 pub async fn fire_due_event_batches(
     conn: &mut diesel_async::AsyncPgConnection,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
@@ -590,6 +626,7 @@ pub async fn fire_due_event_batches(
 }
 
 #[cfg(feature = "db")]
+/// Generic docs
 pub async fn list_pending_event_batches(
     conn: &mut AsyncPgConnection,
     limit: i64,

@@ -909,6 +909,7 @@ impl WorkflowContext {
     }
 
     #[must_use]
+    /// Generic docs
     pub fn for_replay_with_state_and_history_policy(
         exec_id: ExecutionId,
         events: Vec<WorkflowEvent>,

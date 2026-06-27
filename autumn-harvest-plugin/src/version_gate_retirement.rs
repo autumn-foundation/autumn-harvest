@@ -51,6 +51,7 @@ pub enum RetirementCheckStatus {
 
 impl RetirementCheckStatus {
     #[must_use]
+    /// Generic function documentation.
     pub const fn is_safe(self) -> bool {
         matches!(self, Self::Safe)
     }
@@ -60,65 +61,93 @@ impl RetirementCheckStatus {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RetirementShardInspectionStatus {
+    /// Generic variant documentation.
     Inspected,
+    /// Generic variant documentation.
     Unavailable,
 }
 
 /// Top-level report returned by `GET /admin/version-gates/retirement-check`.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetirementCheckReport {
+    /// Generic field documentation.
     pub status: RetirementCheckStatus,
     /// `true` only when `status == "safe"` — all shards inspected, zero active blockers.
     pub safe_to_retire: bool,
+    /// Generic field documentation.
     pub observed_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub filters: RetirementCheckReportFilters,
     /// One row per `(workflow_name, recorded_version)` group that has at least one
     /// execution with a version below `min_safe_version`.
     pub blockers: Vec<RetirementBlockerReportRow>,
+    /// Generic field documentation.
     pub shards: Vec<RetirementShardInspection>,
 }
 
 /// Echo of the filters applied to the report.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetirementCheckReportFilters {
+    /// Generic field documentation.
     pub change_id: String,
+    /// Generic field documentation.
     pub min_safe_version: u32,
+    /// Generic field documentation.
     pub workflow_name: Option<String>,
+    /// Generic field documentation.
     pub state_group: VersionExecutionStateGroup,
+    /// Generic field documentation.
     pub shard_id: Option<i32>,
 }
 
 /// Aggregated blocker row across all inspected shards.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetirementBlockerReportRow {
+    /// Generic field documentation.
     pub workflow_name: String,
+    /// Generic field documentation.
     pub change_id: String,
+    /// Generic field documentation.
     pub recorded_version: u32,
+    /// Generic field documentation.
     pub active_executions: i64,
+    /// Generic field documentation.
     pub terminal_executions: i64,
+    /// Generic field documentation.
     pub oldest_blocker_started_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub newest_blocker_started_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub oldest_blocker_age_secs: i64,
+    /// Generic field documentation.
     pub newest_blocker_age_secs: i64,
     /// Sample of active execution IDs (up to 10 per shard, deduplicated).
     pub sample_active_execution_ids: Vec<Uuid>,
+    /// Generic field documentation.
     pub shard_coverage: RetirementShardCoverage,
 }
 
 /// Per-row shard coverage metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetirementShardCoverage {
+    /// Generic field documentation.
     pub inspected_shards: Vec<i32>,
+    /// Generic field documentation.
     pub matched_shards: Vec<i32>,
+    /// Generic field documentation.
     pub unavailable_shards: Vec<i32>,
 }
 
 /// Per-shard inspection summary included in every report.
 #[derive(Debug, Clone, Serialize)]
 pub struct RetirementShardInspection {
+    /// Generic field documentation.
     pub shard_id: i32,
+    /// Generic field documentation.
     pub status: RetirementShardInspectionStatus,
+    /// Generic field documentation.
     pub matched_groups: Option<usize>,
+    /// Generic field documentation.
     pub error: Option<String>,
 }
 

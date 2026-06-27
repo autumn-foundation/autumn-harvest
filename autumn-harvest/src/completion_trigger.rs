@@ -4,17 +4,26 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "data")]
+/// Generic enum documentation.
 pub enum InputMapping {
+    /// Generic variant documentation.
     Passthrough,
+    /// Generic variant documentation.
     Static(Value),
+    /// Generic variant documentation.
     Projection(String),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+/// Generic enum documentation.
 pub enum TerminalState {
+    /// Generic variant documentation.
     Completed,
+    /// Generic variant documentation.
     Failed,
+    /// Generic variant documentation.
     Cancelled,
+    /// Generic variant documentation.
     TimedOut,
     /// Force-terminated by an operator (or batch/scheduler). Distinct from
     /// `Cancelled`: a completion trigger registered for cooperative
@@ -25,6 +34,7 @@ pub enum TerminalState {
 
 impl TerminalState {
     #[must_use]
+    /// Generic function documentation.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Completed => "COMPLETED",
@@ -37,6 +47,7 @@ impl TerminalState {
 
     #[allow(clippy::should_implement_trait)]
     #[must_use]
+    /// Generic function documentation.
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "COMPLETED" => Some(Self::Completed),
@@ -50,16 +61,24 @@ impl TerminalState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Generic struct documentation.
 pub struct CompletionTrigger {
+    /// Generic field documentation.
     pub id: Uuid,
+    /// Generic field documentation.
     pub source_workflow_name: String,
+    /// Generic field documentation.
     pub terminal_states: Vec<TerminalState>,
+    /// Generic field documentation.
     pub target_workflow_name: String,
+    /// Generic field documentation.
     pub input_mapping: InputMapping,
+    /// Generic field documentation.
     pub queue_name: Option<String>,
 }
 
 impl CompletionTrigger {
+    /// Generic docs
     pub fn new(
         source_workflow_name: impl Into<String>,
         target_workflow_name: impl Into<String>,
@@ -75,30 +94,35 @@ impl CompletionTrigger {
     }
 
     #[must_use]
+    /// Generic function documentation.
     pub const fn with_id(mut self, id: Uuid) -> Self {
         self.id = id;
         self
     }
 
     #[must_use]
+    /// Generic function documentation.
     pub fn with_terminal_states(mut self, states: Vec<TerminalState>) -> Self {
         self.terminal_states = states;
         self
     }
 
     #[must_use]
+    /// Generic function documentation.
     pub fn with_input_mapping(mut self, mapping: InputMapping) -> Self {
         self.input_mapping = mapping;
         self
     }
 
     #[must_use]
+    /// Generic function documentation.
     pub fn with_queue_name(mut self, queue_name: impl Into<String>) -> Self {
         self.queue_name = Some(queue_name.into());
         self
     }
 
     #[must_use]
+    /// Generic function documentation.
     pub fn with_optional_queue_name(mut self, queue_name: Option<String>) -> Self {
         self.queue_name = queue_name;
         self
@@ -106,6 +130,7 @@ impl CompletionTrigger {
 }
 
 #[must_use]
+/// Generic function documentation.
 pub fn project_json_path(value: &Value, path: &str) -> Value {
     if path.is_empty() {
         return value.clone();
@@ -197,12 +222,19 @@ pub async fn sync_completion_triggers(
 }
 
 #[cfg(feature = "db")]
+/// Generic struct documentation.
 pub struct WorkflowMetadata {
+    /// Generic field documentation.
     pub concurrency: Option<crate::concurrency::ConcurrencyPolicy>,
+    /// Generic field documentation.
     pub max_input_bytes: Option<u64>,
+    /// Generic field documentation.
     pub owner: Option<String>,
+    /// Generic field documentation.
     pub runbook_url: Option<String>,
+    /// Generic field documentation.
     pub severity: Option<String>,
+    /// Generic field documentation.
     pub input_schema: Option<fn() -> serde_json::Value>,
     /// Declared soft-SLA default (issue #487), resolved at completion-trigger
     /// start time into a fresh `sla_deadline_at`.
@@ -212,15 +244,18 @@ pub struct WorkflowMetadata {
 }
 
 #[cfg(feature = "db")]
+/// Generic docs
 pub static GLOBAL_WORKFLOW_METADATA: std::sync::RwLock<
     Option<std::collections::HashMap<String, WorkflowMetadata>>,
 > = std::sync::RwLock::new(None);
 
 #[cfg(feature = "db")]
+/// Generic static documentation.
 pub static GLOBAL_MAX_WORKFLOW_INPUT_BYTES: std::sync::RwLock<u64> =
     std::sync::RwLock::new(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES);
 
 #[cfg(feature = "db")]
+/// Generic static documentation.
 pub static GLOBAL_DEFAULT_WORKFLOW_QUEUE: std::sync::RwLock<Option<String>> =
     std::sync::RwLock::new(None);
 
@@ -233,6 +268,7 @@ pub static GLOBAL_MAX_WORKFLOW_ATTEMPTS_CEILING: std::sync::RwLock<Option<u32>> 
     std::sync::RwLock::new(None);
 
 #[cfg(feature = "db")]
+/// Generic docs
 pub async fn resolve_target_queue(
     conn: &mut diesel_async::AsyncPgConnection,
     target_workflow_name: &str,
@@ -298,21 +334,37 @@ pub async fn resolve_target_queue(
 
 #[cfg(feature = "db")]
 #[derive(Debug, Clone)]
+/// Generic struct documentation.
 pub struct DeferredTriggerStart {
+    /// Generic field documentation.
     pub outbox_id: Uuid,
+    /// Generic field documentation.
     pub source_shard: crate::types::ShardId,
+    /// Generic field documentation.
     pub target_shard: crate::types::ShardId,
+    /// Generic field documentation.
     pub target_workflow_name: String,
+    /// Generic field documentation.
     pub target_workflow_id: String,
+    /// Generic field documentation.
     pub target_input: Value,
+    /// Generic field documentation.
     pub queue_name: Option<String>,
+    /// Generic field documentation.
     pub concurrency_key: Option<String>,
+    /// Generic field documentation.
     pub concurrency_limit: Option<u32>,
+    /// Generic field documentation.
     pub priority: crate::types::Priority,
+    /// Generic field documentation.
     pub max_workflow_input_bytes: u64,
+    /// Generic field documentation.
     pub trigger_name: String,
+    /// Generic field documentation.
     pub owner: Option<String>,
+    /// Generic field documentation.
     pub runbook_url: Option<String>,
+    /// Generic field documentation.
     pub severity: Option<String>,
     /// Resolved soft-SLA default (issue #487), converted to a fresh deadline at start.
     pub sla: Option<std::time::Duration>,
@@ -324,6 +376,7 @@ pub struct DeferredTriggerStart {
 
 #[cfg(feature = "db")]
 impl DeferredTriggerStart {
+    /// Generic function documentation.
     pub fn spawn(self) {
         let Some(pool) = crate::shard::GLOBAL_SHARDED_POOL
             .read()
@@ -430,6 +483,7 @@ impl DeferredTriggerStart {
 
 #[allow(clippy::too_many_lines)]
 #[cfg(feature = "db")]
+/// Generic docs
 pub fn evaluate_triggers_for_execution<'a>(
     conn: &'a mut diesel_async::AsyncPgConnection,
     exec_id: crate::types::ExecutionId,

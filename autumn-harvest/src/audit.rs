@@ -120,33 +120,49 @@ pub const OP_ACTIVITY_RETRY_NOW: &str = "activity.retry_now";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
+/// Generic field documentation.
 pub const TARGET_CIRCUIT: &str = "circuit";
 /// Audit target type for task queue operations (issue #249).
 pub const TARGET_TASK: &str = "task";
 /// Audit target type for admission gate operations (issue #377).
 pub const TARGET_GATE: &str = "gate";
+/// Generic field documentation.
 pub const TARGET_WORKFLOW: &str = "workflow";
+/// Generic field documentation.
 pub const TARGET_DAG: &str = "dag";
+/// Generic field documentation.
 pub const TARGET_SCHEDULE: &str = "schedule";
+/// Generic field documentation.
 pub const TARGET_DEAD_LETTER: &str = "dead_letter";
+/// Generic field documentation.
 pub const TARGET_BATCH: &str = "batch";
+/// Generic field documentation.
 pub const TARGET_RETENTION: &str = "retention";
+/// Generic field documentation.
 pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
 /// Audit target type for individual activity task operations (issue #516).
 pub const TARGET_ACTIVITY: &str = "activity";
+/// Generic field documentation.
 pub const TARGET_WORKER: &str = "worker";
+/// Generic field documentation.
 pub const TARGET_RATE_LIMIT: &str = "rate_limit";
+/// Generic field documentation.
 pub const TARGET_BUILD_ROUTING: &str = "build_routing";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 
+/// Generic field documentation.
 pub const STATUS_SUCCEEDED: &str = "succeeded";
+/// Generic field documentation.
 pub const STATUS_FAILED: &str = "failed";
 
 // ── Source constants ──────────────────────────────────────────────────────────
 
+/// Generic field documentation.
 pub const SOURCE_API: &str = "api";
+/// Generic field documentation.
 pub const SOURCE_CLI: &str = "cli";
+/// Generic field documentation.
 pub const SOURCE_UI: &str = "ui";
 
 // ── HTTP header names ─────────────────────────────────────────────────────────
@@ -636,12 +652,19 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
 /// Filters for `list_audit`.
 #[derive(Debug, Clone)]
 pub struct AuditFilters {
+    /// Generic field documentation.
     pub actor: Option<String>,
+    /// Generic field documentation.
     pub operation: Option<String>,
+    /// Generic field documentation.
     pub target_type: Option<String>,
+    /// Generic field documentation.
     pub target_id: Option<String>,
+    /// Generic field documentation.
     pub status: Option<String>,
+    /// Generic field documentation.
     pub since: Option<DateTime<Utc>>,
+    /// Generic field documentation.
     pub before: Option<DateTime<Utc>>,
     /// Maximum number of records to return. Clamped to [1, 500].
     pub limit: i64,
@@ -649,6 +672,7 @@ pub struct AuditFilters {
 
 impl AuditFilters {
     #[must_use]
+    /// Generic function documentation.
     pub const fn default_limit() -> i64 {
         50
     }

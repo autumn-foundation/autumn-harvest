@@ -25,6 +25,7 @@ macro_rules! cfg_db {
 }
 
 #[cfg(feature = "db")]
+/// Generic field documentation.
 pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!();
 
@@ -57,6 +58,7 @@ pub mod calendar;
 /// Per-activity circuit breaker that fast-fails dispatch during downstream
 /// outages (issue #369).
 pub mod circuit_breaker;
+/// Generic field documentation.
 pub mod completion_trigger;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;
@@ -75,6 +77,7 @@ pub mod debounce;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;
+/// Generic field documentation.
 pub mod eligibility;
 /// Targeted PII erasure for completed workflow executions (issue #495).
 ///
@@ -157,6 +160,7 @@ pub mod notify;
 #[doc(hidden)]
 pub mod queue;
 #[cfg(feature = "db")]
+/// Generic field documentation.
 pub mod schedule_decision;
 #[cfg(feature = "db")]
 pub mod scheduler;

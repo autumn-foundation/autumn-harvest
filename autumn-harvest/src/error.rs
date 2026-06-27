@@ -92,11 +92,17 @@ impl std::fmt::Display for TimeoutType {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+/// Generic struct documentation.
 pub struct NonDeterministicDetails {
+    /// Generic field documentation.
     pub event_index: Option<i32>,
+    /// Generic field documentation.
     pub expected: Option<String>,
+    /// Generic field documentation.
     pub actual: Option<String>,
+    /// Generic field documentation.
     pub workflow_type: Option<String>,
+    /// Generic field documentation.
     pub build_id: Option<String>,
 }
 

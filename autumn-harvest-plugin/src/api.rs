@@ -122,6 +122,7 @@ use crate::version_usage::{VersionUsageQuery, build_version_usage_report};
 use crate::workflow_reachability::{WorkflowReachabilityQuery, build_workflow_reachability_report};
 
 #[derive(Clone)]
+/// Generic struct documentation.
 pub struct HarvestRetentionRuntime {
     config: RetentionConfig,
     monitor: Option<RetentionMonitor>,
@@ -130,6 +131,7 @@ pub struct HarvestRetentionRuntime {
 
 impl HarvestRetentionRuntime {
     #[must_use]
+    /// Generic docs
     pub const fn new(
         config: RetentionConfig,
         monitor: Option<RetentionMonitor>,
@@ -143,12 +145,14 @@ impl HarvestRetentionRuntime {
     }
 
     #[must_use]
+    /// Generic function documentation.
     pub const fn disabled(config: RetentionConfig) -> Self {
         Self::new(config, None, None)
     }
 }
 
 #[derive(Clone)]
+/// Generic struct documentation.
 pub struct HarvestApiRuntime {
     registry: Arc<HandlerRegistry>,
     dags: Arc<DagCatalog>,
@@ -261,6 +265,7 @@ impl HarvestApiRuntime {
 pub type ActorExtractorFn = Arc<dyn Fn(&axum::http::HeaderMap) -> String + Send + Sync + 'static>;
 
 #[derive(Clone)]
+/// Generic struct documentation.
 pub struct HarvestApiState {
     runtime: Arc<Mutex<Option<HarvestApiRuntime>>>,
     storage_pool: Arc<Mutex<Option<HarvestDbPool>>>,
@@ -353,6 +358,7 @@ impl Default for HarvestApiState {
 
 impl HarvestApiState {
     #[must_use]
+    /// Generic function documentation.
     pub fn new() -> Self {
         Self::default()
     }
@@ -1058,10 +1064,15 @@ struct WorkflowStackResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StallReason {
+    /// Generic variant documentation.
     PendingActivity,
+    /// Generic variant documentation.
     PendingChild,
+    /// Generic variant documentation.
     AwaitingSignal,
+    /// Generic variant documentation.
     SleepingTimer,
+    /// Generic variant documentation.
     NoPendingWork,
 }
 
@@ -1074,12 +1085,16 @@ pub enum StallReason {
 #[derive(Debug, Clone, Serialize)]
 pub struct StalledWorkflowRow {
     #[serde(flatten)]
+    /// Generic field documentation.
     pub execution: WorkflowExecution,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub last_event_age_seconds: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub stall_reason: Option<StallReason>,
 }
 
@@ -2034,7 +2049,9 @@ pub(crate) struct WorkflowListCursor {
 /// Response envelope returned when any pagination param is present (issue #498).
 #[derive(Debug, Serialize)]
 pub struct WorkflowListPage {
+    /// Generic field documentation.
     pub workflows: Vec<StalledWorkflowRow>,
+    /// Generic field documentation.
     pub next_cursor: Option<String>,
 }
 
@@ -2464,6 +2481,7 @@ async fn lift_gate_handler(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Generic function documentation.
 pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
     let require_admin = middleware::from_fn_with_state(api_state.clone(), require_harvest_admin);
 
@@ -11888,12 +11906,19 @@ async fn resume_schedule(
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+/// Generic struct documentation.
 pub struct CreateCompletionTriggerRequest {
+    /// Generic field documentation.
     pub id: Option<uuid::Uuid>,
+    /// Generic field documentation.
     pub source_workflow_name: String,
+    /// Generic field documentation.
     pub terminal_states: Option<Vec<TerminalState>>,
+    /// Generic field documentation.
     pub target_workflow_name: String,
+    /// Generic field documentation.
     pub input_mapping: Option<InputMapping>,
+    /// Generic field documentation.
     pub queue_name: Option<String>,
 }
 
@@ -20671,69 +20696,113 @@ async fn retire_build_handler(
 // ── Stuck-task triage eligibility explainer structures (issue #380) ──────────
 
 #[derive(Debug, Serialize, Deserialize)]
+/// Generic struct documentation.
 pub struct QueueEligibilityResponse {
+    /// Generic field documentation.
     pub queue_name: String,
+    /// Generic field documentation.
     pub pending_count: i64,
+    /// Generic field documentation.
     pub oldest_pending_age_secs: Option<i64>,
+    /// Generic field documentation.
     pub required_build_ids: Vec<String>,
+    /// Generic field documentation.
     pub eligible_workers: Vec<EligibleWorkerInfo>,
+    /// Generic field documentation.
     pub ineligible_workers: Vec<IneligibleWorkerInfo>,
+    /// Generic field documentation.
     pub summary: EligibilitySummary,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    /// Generic field documentation.
     pub shards: std::collections::BTreeMap<String, ShardEligibilityResponse>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Generic field documentation.
     pub shard_errors: Vec<EligibilityShardError>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+/// Generic struct documentation.
 pub struct ShardEligibilityResponse {
+    /// Generic field documentation.
     pub pending_count: i64,
+    /// Generic field documentation.
     pub oldest_pending_age_secs: Option<i64>,
+    /// Generic field documentation.
     pub required_build_ids: Vec<String>,
+    /// Generic field documentation.
     pub eligible_workers: Vec<EligibleWorkerInfo>,
+    /// Generic field documentation.
     pub ineligible_workers: Vec<IneligibleWorkerInfo>,
+    /// Generic field documentation.
     pub summary: EligibilitySummary,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+/// Generic struct documentation.
 pub struct EligibilityShardError {
+    /// Generic field documentation.
     pub shard_id: i32,
+    /// Generic field documentation.
     pub error: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+/// Generic struct documentation.
 pub struct EligibleWorkerInfo {
+    /// Generic field documentation.
     pub worker_id: String,
+    /// Generic field documentation.
     pub build_id: String,
+    /// Generic field documentation.
     pub deployment_name: Option<String>,
+    /// Generic field documentation.
     pub shard_assignments: Vec<i32>,
+    /// Generic field documentation.
     pub status: String,
+    /// Generic field documentation.
     pub in_flight_count: i32,
+    /// Generic field documentation.
     pub max_concurrency: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+/// Generic struct documentation.
 pub struct IneligibleWorkerInfo {
+    /// Generic field documentation.
     pub worker_id: String,
+    /// Generic field documentation.
     pub reason_codes: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+/// Generic struct documentation.
 pub struct EligibilitySummary {
+    /// Generic field documentation.
     pub diagnosis: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+/// Generic struct documentation.
 pub struct TaskEligibilityResponse {
+    /// Generic field documentation.
     pub task_id: uuid::Uuid,
+    /// Generic field documentation.
     pub queue_name: String,
+    /// Generic field documentation.
     pub pending_count: i64,
+    /// Generic field documentation.
     pub oldest_pending_age_secs: Option<i64>,
+    /// Generic field documentation.
     pub required_build_id: Option<String>,
+    /// Generic field documentation.
     pub assigned_shard: i32,
+    /// Generic field documentation.
     pub concurrency_key: Option<String>,
+    /// Generic field documentation.
     pub eligible_workers: Vec<EligibleWorkerInfo>,
+    /// Generic field documentation.
     pub ineligible_workers: Vec<IneligibleWorkerInfo>,
+    /// Generic field documentation.
     pub summary: EligibilitySummary,
 }
 

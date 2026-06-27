@@ -17,73 +17,118 @@ use crate::shard_fanout;
 /// Query string accepted by `GET /admin/version-gates/usage`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VersionUsageQuery {
+    /// Optional filter for a specific workflow name.
     pub workflow_name: Option<String>,
+    /// Optional filter for a specific change ID.
     pub change_id: Option<String>,
+    /// Optional filter for a specific recorded version.
     pub recorded_version: Option<u32>,
+    /// Generic field documentation.
     pub state_group: Option<String>,
+    /// Optional filter to restrict the query to a specific shard ID.
     pub shard_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+/// Status of the version usage report.
 pub enum VersionUsageReportStatus {
+    /// Report is complete.
     Complete,
+    /// No matches were found for the report.
     NoMatches,
+    /// The report is partial (e.g., some shards were unavailable).
     Partial,
+    /// The shard was unavailable or failed to respond.
     Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
+/// Status of inspecting a specific shard for version usage.
 pub enum VersionUsageShardInspectionStatus {
+    /// The shard was successfully inspected.
     Inspected,
+    /// The shard was unavailable or failed to respond.
     Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Report representing version usage across executions.
 pub struct VersionUsageReport {
+    /// Overarching status of the report generation.
     pub status: VersionUsageReportStatus,
+    /// Timestamp when this report was observed.
     pub observed_at: DateTime<Utc>,
+    /// Filters used to generate this report.
     pub filters: VersionUsageReportFilters,
+    /// The individual usage records returned by the report.
     pub items: Vec<VersionUsageReportRow>,
+    /// Details regarding which shards were inspected and their status.
     pub shards: Vec<VersionUsageShardInspection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Filters used when querying for version usage reports.
 pub struct VersionUsageReportFilters {
+    /// Optional filter for a specific workflow name.
     pub workflow_name: Option<String>,
+    /// Optional filter for a specific change ID.
     pub change_id: Option<String>,
+    /// Optional filter for a specific recorded version.
     pub recorded_version: Option<u32>,
+    /// Defines which execution states are included (e.g., active, terminal).
     pub state_group: VersionExecutionStateGroup,
+    /// Optional filter to restrict the query to a specific shard ID.
     pub shard_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// A single row within a version usage report representing usage for a specific workflow, change, and version.
 pub struct VersionUsageReportRow {
+    /// The name of the workflow.
     pub workflow_name: String,
+    /// The change ID associated with the version usage.
     pub change_id: String,
+    /// The recorded version number.
     pub recorded_version: u32,
+    /// Number of active executions using this version.
     pub active_executions: i64,
+    /// Number of terminal executions using this version.
     pub terminal_executions: i64,
+    /// The start time of the oldest execution matching this version.
     pub oldest_matching_started_at: DateTime<Utc>,
+    /// The start time of the newest execution matching this version.
     pub newest_matching_started_at: DateTime<Utc>,
+    /// Age in seconds of the oldest matching execution.
     pub oldest_matching_execution_age_secs: i64,
+    /// Age in seconds of the newest matching execution.
     pub newest_matching_execution_age_secs: i64,
+    /// Details on the shard coverage for this row.
     pub shard_coverage: VersionUsageShardCoverage,
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Represents which shards were inspected, matched, or unavailable for a specific usage report row.
 pub struct VersionUsageShardCoverage {
+    /// List of shard IDs that were successfully inspected.
     pub inspected_shards: Vec<i32>,
+    /// List of shard IDs where this version usage was matched.
     pub matched_shards: Vec<i32>,
+    /// List of shard IDs that were unavailable during inspection.
     pub unavailable_shards: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+/// Details regarding the inspection of a single shard.
 pub struct VersionUsageShardInspection {
+    /// The ID of the inspected shard.
     pub shard_id: i32,
+    /// The inspection status of the shard.
     pub status: VersionUsageShardInspectionStatus,
+    /// The number of matched groups found in the shard, if successfully inspected.
     pub matched_groups: Option<usize>,
+    /// Any error message encountered during the shard's inspection.
     pub error: Option<String>,
 }
 

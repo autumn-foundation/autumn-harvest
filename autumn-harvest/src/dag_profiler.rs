@@ -10,14 +10,18 @@ use std::time::Duration;
 /// An event in the profiler timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfilerEventKind {
+    /// Generic variant documentation.
     TaskStarted(usize, String),
+    /// Generic variant documentation.
     TaskCompleted(usize, String),
 }
 
 /// A recorded event at a specific duration from the start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfilerEvent {
+    /// Generic field documentation.
     pub time: Duration,
+    /// Generic field documentation.
     pub kind: ProfilerEventKind,
 }
 

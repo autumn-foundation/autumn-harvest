@@ -1,3 +1,4 @@
+//! Debug json.
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::types::ExternalSignalId;
 

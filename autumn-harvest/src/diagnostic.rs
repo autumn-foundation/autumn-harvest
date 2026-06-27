@@ -9,9 +9,13 @@ use std::fmt::Write;
 /// A diagnostic report generated from a simulated workflow execution.
 #[derive(Debug, Clone)]
 pub struct DiagnosticReport {
+    /// Generic field documentation.
     pub final_output: Result<Value, String>,
+    /// Generic field documentation.
     pub event_count: usize,
+    /// Generic field documentation.
     pub analyzer_warnings: Vec<AnalyzerWarning>,
+    /// Generic field documentation.
     pub mermaid_sequence: String,
 }
 

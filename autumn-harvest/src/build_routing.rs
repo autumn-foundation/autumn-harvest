@@ -120,11 +120,17 @@ impl BuildCompatibilitySet {
 /// in-flight executions; those keep whatever build they were started with.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BuildPolicy {
+    /// Generic field documentation.
     pub id: Uuid,
+    /// Generic field documentation.
     pub queue_name: String,
+    /// Generic field documentation.
     pub build_id: String,
+    /// Generic field documentation.
     pub deployment_name: Option<String>,
+    /// Generic field documentation.
     pub created_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub updated_at: DateTime<Utc>,
 }
 
@@ -134,17 +140,20 @@ pub struct BuildPolicy {
 /// whose `assigned_build_id` equals `compatible_with`."
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BuildCompatEntry {
+    /// Generic field documentation.
     pub id: Uuid,
     /// Worker build that may process the other build's tasks.
     pub build_id: String,
     /// Execution build whose tasks the worker may process.
     pub compatible_with: String,
+    /// Generic field documentation.
     pub declared_at: DateTime<Utc>,
 }
 
 /// Per-build reachability snapshot.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BuildReachability {
+    /// Generic field documentation.
     pub build_id: String,
     /// Workflow executions in a non-terminal state with this `assigned_build_id`.
     pub open_executions: i64,

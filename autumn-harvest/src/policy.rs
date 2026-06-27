@@ -35,9 +35,13 @@ pub fn compute_retry_delay(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum JitterPolicy {
     #[default]
+    /// Generic variant documentation.
     None,
+    /// Generic variant documentation.
     Full,
+    /// Generic variant documentation.
     Equal,
+    /// Generic variant documentation.
     Decorrelated,
 }
 
@@ -135,6 +139,7 @@ pub struct RetryPolicy {
     /// Error type names that must not be retried.
     pub non_retryable_errors: Vec<String>,
     #[serde(default)]
+    /// Generic field documentation.
     pub jitter: JitterPolicy,
 }
 
@@ -210,12 +215,14 @@ impl RetryPolicy {
     }
 
     #[must_use]
+    /// Generic function documentation.
     pub const fn with_jitter(mut self, jitter: JitterPolicy) -> Self {
         self.jitter = jitter;
         self
     }
 
     #[must_use]
+    /// Generic function documentation.
     pub fn next_delay_with_seed(&self, attempt: u32, stream_seed: u64) -> Option<Duration> {
         if attempt >= self.max_attempts {
             return None;

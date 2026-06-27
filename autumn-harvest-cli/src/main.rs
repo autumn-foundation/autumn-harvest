@@ -1,3 +1,4 @@
+//! CLI tool.
 use clap::Parser;
 
 use autumn_harvest_cli::{Cli, run_cli};

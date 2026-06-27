@@ -23,8 +23,11 @@ use crate::api::HarvestApiState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PreflightStatus {
+    /// Generic variant documentation.
     Pass,
+    /// Generic variant documentation.
     Warn,
+    /// Generic variant documentation.
     Fail,
 }
 
@@ -41,28 +44,41 @@ impl PreflightStatus {
 /// Version metadata returned with every preflight report.
 #[derive(Debug, Clone, Serialize)]
 pub struct PreflightVersion {
+    /// Generic field documentation.
     pub package: &'static str,
+    /// Generic field documentation.
     pub version: &'static str,
+    /// Generic field documentation.
     pub core_version: &'static str,
 }
 
 /// One preflight check result.
 #[derive(Debug, Clone, Serialize)]
 pub struct PreflightCheckResult {
+    /// Generic field documentation.
     pub name: String,
+    /// Generic field documentation.
     pub status: PreflightStatus,
+    /// Generic field documentation.
     pub summary: String,
+    /// Generic field documentation.
     pub remediation: Option<String>,
+    /// Generic field documentation.
     pub affected_shards: Vec<i32>,
+    /// Generic field documentation.
     pub details: Value,
 }
 
 /// Deployment-readiness report returned by `GET /admin/preflight`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PreflightReport {
+    /// Generic field documentation.
     pub overall_status: PreflightStatus,
+    /// Generic field documentation.
     pub observed_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub version: PreflightVersion,
+    /// Generic field documentation.
     pub checks: Vec<PreflightCheckResult>,
 }
 

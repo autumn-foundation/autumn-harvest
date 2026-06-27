@@ -131,22 +131,31 @@ pub fn compute_fire_deadline(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct DebounceStartOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub reuse_policy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub execution_timeout_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub memo: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub search_attrs: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub sla_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub context_headers: Option<std::collections::HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub priority: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub concurrency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub concurrency_limit: Option<u32>,
     /// Effective owner/runbook/severity resolved from `WorkflowInfo` at admission
     /// time, so a debounced run carries the same operator metadata as a normal
@@ -154,8 +163,10 @@ pub struct DebounceStartOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub runbook_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub severity: Option<String>,
     /// Effective server-side execution-timeout ceiling (seconds), captured at
     /// admission so a debounced start can't bypass the cap the normal path
@@ -182,16 +193,23 @@ pub struct DebounceStartOptions {
 /// Parameters for [`admit_debounced_start`].
 #[cfg(feature = "db")]
 pub struct AdmitDebounceParams<'a> {
+    /// Generic field documentation.
     pub workflow_name: &'a str,
+    /// Generic field documentation.
     pub debounce_key: &'a str,
+    /// Generic field documentation.
     pub workflow_id: &'a str,
+    /// Generic field documentation.
     pub queue_name: &'a str,
+    /// Generic field documentation.
     pub last_input: serde_json::Value,
+    /// Generic field documentation.
     pub start_options: DebounceStartOptions,
     /// Pre-computed window for this admission (from the effective policy).
     pub window: Duration,
     /// Pre-computed `max_wait` cap (policy value or builder default).
     pub max_wait: Duration,
+    /// Generic field documentation.
     pub shard_id: i32,
 }
 
@@ -216,16 +234,27 @@ pub struct DebounceAdmitOutcome {
 /// A pending debounce record surfaced by the management API.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PendingDebounceRecord {
+    /// Generic field documentation.
     pub id: uuid::Uuid,
+    /// Generic field documentation.
     pub workflow_name: String,
+    /// Generic field documentation.
     pub debounce_key: String,
+    /// Generic field documentation.
     pub workflow_id: String,
+    /// Generic field documentation.
     pub queue_name: String,
+    /// Generic field documentation.
     pub effective_fire_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub max_fire_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub pending_count: i32,
+    /// Generic field documentation.
     pub shard_id: i32,
+    /// Generic field documentation.
     pub created_at: DateTime<Utc>,
+    /// Generic field documentation.
     pub updated_at: DateTime<Utc>,
 }
 

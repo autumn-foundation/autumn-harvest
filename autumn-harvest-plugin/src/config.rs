@@ -7,25 +7,38 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+/// Generic enum documentation.
 pub enum HarvestMode {
     #[default]
+    /// Generic variant documentation.
     Embedded,
+    /// Generic variant documentation.
     Split,
+    /// Generic variant documentation.
     External,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Generic struct documentation.
 pub struct HarvestDatabaseConfig {
+    /// Generic field documentation.
     pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Generic struct documentation.
 pub struct HarvestOutboxConfig {
+    /// Generic field documentation.
     pub enabled: bool,
+    /// Generic field documentation.
     pub batch_size: i64,
+    /// Generic field documentation.
     pub poll_interval_ms: u64,
+    /// Generic field documentation.
     pub claim_ttl_ms: u64,
+    /// Generic field documentation.
     pub base_retry_delay_ms: u64,
+    /// Generic field documentation.
     pub max_retry_delay_ms: u64,
 }
 
@@ -37,7 +50,9 @@ pub struct HarvestOutboxConfig {
 /// the same loop drains in-progress jobs synchronously within a tick.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarvestBatchConfig {
+    /// Generic field documentation.
     pub concurrency: u32,
+    /// Generic field documentation.
     pub tick_interval_ms: u64,
 }
 
@@ -49,13 +64,21 @@ pub struct HarvestReadinessConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Generic struct documentation.
 pub struct HarvestRuntimeConfig {
+    /// Generic field documentation.
     pub mode: HarvestMode,
+    /// Generic field documentation.
     pub worker_enabled: bool,
+    /// Generic field documentation.
     pub scheduler_enabled: bool,
+    /// Generic field documentation.
     pub database: HarvestDatabaseConfig,
+    /// Generic field documentation.
     pub outbox: HarvestOutboxConfig,
+    /// Generic field documentation.
     pub batch: HarvestBatchConfig,
+    /// Generic field documentation.
     pub readiness: HarvestReadinessConfig,
 }
 

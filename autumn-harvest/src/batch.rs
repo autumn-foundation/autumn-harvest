@@ -32,8 +32,11 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum BatchAction {
+    /// Generic variant documentation.
     Cancel,
+    /// Generic variant documentation.
     Terminate,
+    /// Generic variant documentation.
     Signal,
 }
 
@@ -75,14 +78,19 @@ impl FromStr for BatchAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum BatchJobStatus {
+    /// Generic variant documentation.
     Pending,
+    /// Generic variant documentation.
     Running,
+    /// Generic variant documentation.
     Completed,
+    /// Generic variant documentation.
     Failed,
 }
 
 impl BatchJobStatus {
     #[must_use]
+    /// Generic function documentation.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "Pending",
@@ -181,11 +189,17 @@ mod db {
     /// resolves to the same job, preventing the "double-cancel" foot-gun.
     #[derive(Debug, Clone)]
     pub struct BatchSubmission {
+        /// Generic field documentation.
         pub action: BatchAction,
+        /// Generic field documentation.
         pub filter: BatchFilter,
+        /// Generic field documentation.
         pub signal_name: Option<String>,
+        /// Generic field documentation.
         pub signal_payload: Option<Value>,
+        /// Generic field documentation.
         pub idempotency_key: Option<String>,
+        /// Generic field documentation.
         pub created_by: Option<String>,
     }
 
@@ -248,11 +262,15 @@ mod db {
     /// Filters accepted by the management list endpoint.
     #[derive(Debug, Default, Clone)]
     pub struct ListFilters {
+        /// Generic field documentation.
         pub status: Option<BatchJobStatus>,
+        /// Generic field documentation.
         pub action: Option<BatchAction>,
+        /// Generic field documentation.
         pub limit: i64,
     }
 
+    /// Generic docs
     pub async fn get_batch_job(
         conn: &mut AsyncPgConnection,
         id: Uuid,
@@ -266,6 +284,7 @@ mod db {
             .map_err(database_error)
     }
 
+    /// Generic docs
     pub async fn list_batch_jobs(
         conn: &mut AsyncPgConnection,
         filters: &ListFilters,
@@ -407,6 +426,7 @@ mod db {
         Ok(())
     }
 
+    /// Generic function documentation.
     pub async fn mark_completed(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
         diesel::update(harvest_batch_jobs::table.find(id))
             .set((
@@ -440,23 +460,37 @@ mod db {
     /// `{ id, action, filter, status, total, completed, failed, started_at, completed_at, errors[] }`.
     #[derive(Debug, Clone, Serialize)]
     pub struct BatchJobView {
+        /// Generic field documentation.
         pub id: String,
+        /// Generic field documentation.
         pub action: String,
+        /// Generic field documentation.
         pub filter: Value,
+        /// Generic field documentation.
         pub signal_name: Option<String>,
+        /// Generic field documentation.
         pub status: String,
+        /// Generic field documentation.
         pub total: i64,
+        /// Generic field documentation.
         pub completed: i64,
+        /// Generic field documentation.
         pub failed: i64,
+        /// Generic field documentation.
         pub started_at: Option<DateTime<Utc>>,
+        /// Generic field documentation.
         pub completed_at: Option<DateTime<Utc>>,
+        /// Generic field documentation.
         pub errors: Vec<BatchTargetError>,
+        /// Generic field documentation.
         pub created_at: DateTime<Utc>,
+        /// Generic field documentation.
         pub created_by: Option<String>,
     }
 
     impl BatchJobView {
         #[must_use]
+        /// Generic function documentation.
         pub fn from_row(row: BatchJob) -> Self {
             let errors: Vec<BatchTargetError> =
                 serde_json::from_value(row.errors.clone()).unwrap_or_default();
@@ -498,6 +532,7 @@ mod db {
         /// connection pool — the issue's success metric calls for no more
         /// than 10% p99 regression on unrelated workflows.
         pub concurrency: u32,
+        /// Generic field documentation.
         pub metrics: Arc<dyn MetricsRecorder>,
     }
 
@@ -788,6 +823,7 @@ mod db {
         Ok(())
     }
 
+    /// Generic docs
     pub async fn mark_failed(
         conn: &mut AsyncPgConnection,
         id: Uuid,

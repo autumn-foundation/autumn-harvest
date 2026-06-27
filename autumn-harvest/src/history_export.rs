@@ -30,6 +30,7 @@ pub enum HistoryPayloadPolicy {
 
 impl HistoryPayloadPolicy {
     #[must_use]
+    /// Generic function documentation.
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::Full => "full",

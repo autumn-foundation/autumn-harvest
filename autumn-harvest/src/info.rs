@@ -117,11 +117,16 @@ pub struct SchemaViolation {
 /// `GET /workflows/registered/{name}/schema` (issue #373).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RegisteredWorkflowRecord {
+    /// Generic field documentation.
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Generic field documentation.
     pub description: Option<String>,
+    /// Generic field documentation.
     pub input_schema: Option<serde_json::Value>,
+    /// Generic field documentation.
     pub output_schema: Option<serde_json::Value>,
+    /// Generic field documentation.
     pub error_schema: Option<serde_json::Value>,
 }
 

@@ -1,0 +1,3643 @@
+    Checking autumn-harvest-plugin v0.4.0 (/app/autumn-harvest-plugin)
+warning: missing documentation for a constant
+  --> autumn-harvest/src/lib.rs:28:1
+   |
+28 | pub const MIGRATIONS: diesel_migrations::EmbeddedMigrations =
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for a module
+  --> autumn-harvest/src/lib.rs:60:1
+   |
+60 | pub mod completion_trigger;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> autumn-harvest/src/lib.rs:78:1
+   |
+78 | pub mod eligibility;
+   | ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+   --> autumn-harvest/src/lib.rs:160:1
+    |
+160 | pub mod schedule_decision;
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:262:20
+    |
+262 |     TooManyGates { limit: usize },
+    |                    ^^^^^^^^^^^^
+
+warning: missing documentation for a module
+   --> autumn-harvest/src/admission_gate.rs:398:1
+    |
+398 | pub mod db {
+    | ^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:603:5
+    |
+603 |     pub id: Uuid,
+    |     ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:604:5
+    |
+604 |     pub scope_kind: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:605:5
+    |
+605 |     pub scope_value: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:606:5
+    |
+606 |     pub reason: String,
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:607:5
+    |
+607 |     pub message: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:608:5
+    |
+608 |     pub created_by: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:609:5
+    |
+609 |     pub created_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/admission_gate.rs:610:5
+    |
+610 |     pub expires_at: Option<DateTime<Utc>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:123:1
+    |
+123 | pub const TARGET_CIRCUIT: &str = "circuit";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:128:1
+    |
+128 | pub const TARGET_WORKFLOW: &str = "workflow";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:129:1
+    |
+129 | pub const TARGET_DAG: &str = "dag";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:130:1
+    |
+130 | pub const TARGET_SCHEDULE: &str = "schedule";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:131:1
+    |
+131 | pub const TARGET_DEAD_LETTER: &str = "dead_letter";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:132:1
+    |
+132 | pub const TARGET_BATCH: &str = "batch";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:133:1
+    |
+133 | pub const TARGET_RETENTION: &str = "retention";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:134:1
+    |
+134 | pub const TARGET_EXTERNAL_ACTIVITY: &str = "external_activity";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:137:1
+    |
+137 | pub const TARGET_WORKER: &str = "worker";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:138:1
+    |
+138 | pub const TARGET_RATE_LIMIT: &str = "rate_limit";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:139:1
+    |
+139 | pub const TARGET_BUILD_ROUTING: &str = "build_routing";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:143:1
+    |
+143 | pub const STATUS_SUCCEEDED: &str = "succeeded";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:144:1
+    |
+144 | pub const STATUS_FAILED: &str = "failed";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:148:1
+    |
+148 | pub const SOURCE_API: &str = "api";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:149:1
+    |
+149 | pub const SOURCE_CLI: &str = "cli";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+   --> autumn-harvest/src/audit.rs:150:1
+    |
+150 | pub const SOURCE_UI: &str = "ui";
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:639:5
+    |
+639 |     pub actor: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:640:5
+    |
+640 |     pub operation: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:641:5
+    |
+641 |     pub target_type: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:642:5
+    |
+642 |     pub target_id: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:643:5
+    |
+643 |     pub status: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:644:5
+    |
+644 |     pub since: Option<DateTime<Utc>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/audit.rs:645:5
+    |
+645 |     pub before: Option<DateTime<Utc>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn-harvest/src/audit.rs:652:5
+    |
+652 |     pub const fn default_limit() -> i64 {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:35:5
+   |
+35 |     Cancel,
+   |     ^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:36:5
+   |
+36 |     Terminate,
+   |     ^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:37:5
+   |
+37 |     Signal,
+   |     ^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:78:5
+   |
+78 |     Pending,
+   |     ^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:79:5
+   |
+79 |     Running,
+   |     ^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:80:5
+   |
+80 |     Completed,
+   |     ^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/batch.rs:81:5
+   |
+81 |     Failed,
+   |     ^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/batch.rs:86:5
+   |
+86 |     pub const fn as_str(self) -> &'static str {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:184:9
+    |
+184 |         pub action: BatchAction,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:185:9
+    |
+185 |         pub filter: BatchFilter,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:186:9
+    |
+186 |         pub signal_name: Option<String>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:187:9
+    |
+187 |         pub signal_payload: Option<Value>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:188:9
+    |
+188 |         pub idempotency_key: Option<String>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:189:9
+    |
+189 |         pub created_by: Option<String>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:251:9
+    |
+251 |         pub status: Option<BatchJobStatus>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:252:9
+    |
+252 |         pub action: Option<BatchAction>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:253:9
+    |
+253 |         pub limit: i64,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/batch.rs:256:5
+    |
+256 | /     pub async fn get_batch_job(
+257 | |         conn: &mut AsyncPgConnection,
+258 | |         id: Uuid,
+259 | |     ) -> HarvestResult<Option<BatchJob>> {
+    | |________________________________________^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/batch.rs:269:5
+    |
+269 | /     pub async fn list_batch_jobs(
+270 | |         conn: &mut AsyncPgConnection,
+271 | |         filters: &ListFilters,
+272 | |     ) -> HarvestResult<Vec<BatchJob>> {
+    | |_____________________________________^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/batch.rs:410:5
+    |
+410 |     pub async fn mark_completed(conn: &mut AsyncPgConnection, id: Uuid) -> HarvestResult<()> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:443:9
+    |
+443 |         pub id: String,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:444:9
+    |
+444 |         pub action: String,
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:445:9
+    |
+445 |         pub filter: Value,
+    |         ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:446:9
+    |
+446 |         pub signal_name: Option<String>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:447:9
+    |
+447 |         pub status: String,
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:448:9
+    |
+448 |         pub total: i64,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:449:9
+    |
+449 |         pub completed: i64,
+    |         ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:450:9
+    |
+450 |         pub failed: i64,
+    |         ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:451:9
+    |
+451 |         pub started_at: Option<DateTime<Utc>>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:452:9
+    |
+452 |         pub completed_at: Option<DateTime<Utc>>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:453:9
+    |
+453 |         pub errors: Vec<BatchTargetError>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:454:9
+    |
+454 |         pub created_at: DateTime<Utc>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:455:9
+    |
+455 |         pub created_by: Option<String>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn-harvest/src/batch.rs:460:9
+    |
+460 |         pub fn from_row(row: BatchJob) -> Self {
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/batch.rs:501:9
+    |
+501 |         pub metrics: Arc<dyn MetricsRecorder>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/batch.rs:791:5
+    |
+791 | /     pub async fn mark_failed(
+792 | |         conn: &mut AsyncPgConnection,
+793 | |         id: Uuid,
+794 | |         reason: &str,
+795 | |     ) -> HarvestResult<()> {
+    | |__________________________^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:123:5
+    |
+123 |     pub id: Uuid,
+    |     ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:124:5
+    |
+124 |     pub queue_name: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:125:5
+    |
+125 |     pub build_id: String,
+    |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:126:5
+    |
+126 |     pub deployment_name: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:127:5
+    |
+127 |     pub created_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:128:5
+    |
+128 |     pub updated_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:137:5
+    |
+137 |     pub id: Uuid,
+    |     ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:142:5
+    |
+142 |     pub declared_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/build_routing.rs:148:5
+    |
+148 |     pub build_id: String,
+    |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest/src/builder.rs:61:1
+   |
+61 | pub struct HarvestBuilder {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn-harvest/src/builder.rs:523:5
+    |
+523 |     pub const fn payload_codecs(&self) -> &PayloadCodecs {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn-harvest/src/builder.rs:934:5
+    |
+934 |     pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an enum
+ --> autumn-harvest/src/completion_trigger.rs:7:1
+  |
+7 | pub enum InputMapping {
+  | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+ --> autumn-harvest/src/completion_trigger.rs:8:5
+  |
+8 |     Passthrough,
+  |     ^^^^^^^^^^^
+
+warning: missing documentation for a variant
+ --> autumn-harvest/src/completion_trigger.rs:9:5
+  |
+9 |     Static(Value),
+  |     ^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/completion_trigger.rs:10:5
+   |
+10 |     Projection(String),
+   |     ^^^^^^^^^^
+
+warning: missing documentation for an enum
+  --> autumn-harvest/src/completion_trigger.rs:14:1
+   |
+14 | pub enum TerminalState {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/completion_trigger.rs:15:5
+   |
+15 |     Completed,
+   |     ^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/completion_trigger.rs:16:5
+   |
+16 |     Failed,
+   |     ^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/completion_trigger.rs:17:5
+   |
+17 |     Cancelled,
+   |     ^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/completion_trigger.rs:18:5
+   |
+18 |     TimedOut,
+   |     ^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/completion_trigger.rs:28:5
+   |
+28 |     pub const fn as_str(self) -> &'static str {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+  --> autumn-harvest/src/completion_trigger.rs:40:5
+   |
+40 |     pub fn from_str(s: &str) -> Option<Self> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest/src/completion_trigger.rs:53:1
+   |
+53 | pub struct CompletionTrigger {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/completion_trigger.rs:54:5
+   |
+54 |     pub id: Uuid,
+   |     ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/completion_trigger.rs:55:5
+   |
+55 |     pub source_workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/completion_trigger.rs:56:5
+   |
+56 |     pub terminal_states: Vec<TerminalState>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/completion_trigger.rs:57:5
+   |
+57 |     pub target_workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/completion_trigger.rs:58:5
+   |
+58 |     pub input_mapping: InputMapping,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/completion_trigger.rs:59:5
+   |
+59 |     pub queue_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+  --> autumn-harvest/src/completion_trigger.rs:63:5
+   |
+63 | /     pub fn new(
+64 | |         source_workflow_name: impl Into<String>,
+65 | |         target_workflow_name: impl Into<String>,
+66 | |     ) -> Self {
+   | |_____________^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/completion_trigger.rs:78:5
+   |
+78 |     pub const fn with_id(mut self, id: Uuid) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/completion_trigger.rs:84:5
+   |
+84 |     pub fn with_terminal_states(mut self, states: Vec<TerminalState>) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/completion_trigger.rs:90:5
+   |
+90 |     pub fn with_input_mapping(mut self, mapping: InputMapping) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/completion_trigger.rs:96:5
+   |
+96 |     pub fn with_queue_name(mut self, queue_name: impl Into<String>) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn-harvest/src/completion_trigger.rs:102:5
+    |
+102 |     pub fn with_optional_queue_name(mut self, queue_name: Option<String>) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/completion_trigger.rs:109:1
+    |
+109 | pub fn project_json_path(value: &Value, path: &str) -> Value {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> autumn-harvest/src/completion_trigger.rs:200:1
+    |
+200 | pub struct WorkflowMetadata {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:201:5
+    |
+201 |     pub concurrency: Option<crate::concurrency::ConcurrencyPolicy>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:202:5
+    |
+202 |     pub max_input_bytes: Option<u64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:203:5
+    |
+203 |     pub owner: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:204:5
+    |
+204 |     pub runbook_url: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:205:5
+    |
+205 |     pub severity: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:206:5
+    |
+206 |     pub input_schema: Option<fn() -> serde_json::Value>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a static
+   --> autumn-harvest/src/completion_trigger.rs:215:1
+    |
+215 | / pub static GLOBAL_WORKFLOW_METADATA: std::sync::RwLock<
+216 | |     Option<std::collections::HashMap<String, WorkflowMetadata>>,
+217 | | > = std::sync::RwLock::new(None);
+    | |_^
+
+warning: missing documentation for a static
+   --> autumn-harvest/src/completion_trigger.rs:220:1
+    |
+220 | pub static GLOBAL_MAX_WORKFLOW_INPUT_BYTES: std::sync::RwLock<u64> =
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a static
+   --> autumn-harvest/src/completion_trigger.rs:224:1
+    |
+224 | pub static GLOBAL_DEFAULT_WORKFLOW_QUEUE: std::sync::RwLock<Option<String>> =
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/completion_trigger.rs:236:1
+    |
+236 | / pub async fn resolve_target_queue(
+237 | |     conn: &mut diesel_async::AsyncPgConnection,
+238 | |     target_workflow_name: &str,
+239 | |     target_shard: crate::types::ShardId,
+240 | | ) -> String {
+    | |___________^
+
+warning: missing documentation for a struct
+   --> autumn-harvest/src/completion_trigger.rs:301:1
+    |
+301 | pub struct DeferredTriggerStart {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:302:5
+    |
+302 |     pub outbox_id: Uuid,
+    |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:303:5
+    |
+303 |     pub source_shard: crate::types::ShardId,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:304:5
+    |
+304 |     pub target_shard: crate::types::ShardId,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:305:5
+    |
+305 |     pub target_workflow_name: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:306:5
+    |
+306 |     pub target_workflow_id: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:307:5
+    |
+307 |     pub target_input: Value,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:308:5
+    |
+308 |     pub queue_name: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:309:5
+    |
+309 |     pub concurrency_key: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:310:5
+    |
+310 |     pub concurrency_limit: Option<u32>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:311:5
+    |
+311 |     pub priority: crate::types::Priority,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:312:5
+    |
+312 |     pub max_workflow_input_bytes: u64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:313:5
+    |
+313 |     pub trigger_name: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:314:5
+    |
+314 |     pub owner: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:315:5
+    |
+315 |     pub runbook_url: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/completion_trigger.rs:316:5
+    |
+316 |     pub severity: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn-harvest/src/completion_trigger.rs:327:5
+    |
+327 |     pub fn spawn(self) {
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/completion_trigger.rs:433:1
+    |
+433 | / pub fn evaluate_triggers_for_execution<'a>(
+434 | |     conn: &'a mut diesel_async::AsyncPgConnection,
+435 | |     exec_id: crate::types::ExecutionId,
+436 | |     state: TerminalState,
+437 | |     metrics: Option<&'a (dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+438 | | ) -> futures::future::BoxFuture<'a, crate::error::HarvestResult<Vec<DeferredTriggerStart>>> {
+    | |___________________________________________________________________________________________^
+
+warning: missing documentation for an associated function
+   --> autumn-harvest/src/context.rs:912:5
+    |
+912 | /     pub fn for_replay_with_state_and_history_policy(
+913 | |         exec_id: ExecutionId,
+914 | |         events: Vec<WorkflowEvent>,
+915 | |         state: SharedState,
+916 | |         history_policy: WorkflowHistoryPolicy,
+917 | |     ) -> Self {
+    | |_____________^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/dag_profiler.rs:13:5
+   |
+13 |     TaskStarted(usize, String),
+   |     ^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/dag_profiler.rs:14:5
+   |
+14 |     TaskCompleted(usize, String),
+   |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/dag_profiler.rs:20:5
+   |
+20 |     pub time: Duration,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/dag_profiler.rs:21:5
+   |
+21 |     pub kind: ProfilerEventKind,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:134:5
+    |
+134 |     pub reuse_policy: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:136:5
+    |
+136 |     pub execution_timeout_secs: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:138:5
+    |
+138 |     pub memo: Option<serde_json::Value>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:140:5
+    |
+140 |     pub search_attrs: Option<serde_json::Value>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:142:5
+    |
+142 |     pub sla_secs: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:144:5
+    |
+144 |     pub context_headers: Option<std::collections::HashMap<String, String>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:146:5
+    |
+146 |     pub priority: Option<i32>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:148:5
+    |
+148 |     pub concurrency_key: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:150:5
+    |
+150 |     pub concurrency_limit: Option<u32>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:157:5
+    |
+157 |     pub runbook_url: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:159:5
+    |
+159 |     pub severity: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:185:5
+    |
+185 |     pub workflow_name: &'a str,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:186:5
+    |
+186 |     pub debounce_key: &'a str,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:187:5
+    |
+187 |     pub workflow_id: &'a str,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:188:5
+    |
+188 |     pub queue_name: &'a str,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:189:5
+    |
+189 |     pub last_input: serde_json::Value,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:190:5
+    |
+190 |     pub start_options: DebounceStartOptions,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:195:5
+    |
+195 |     pub shard_id: i32,
+    |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:219:5
+    |
+219 |     pub id: uuid::Uuid,
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:220:5
+    |
+220 |     pub workflow_name: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:221:5
+    |
+221 |     pub debounce_key: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:222:5
+    |
+222 |     pub workflow_id: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:223:5
+    |
+223 |     pub queue_name: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:224:5
+    |
+224 |     pub effective_fire_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:225:5
+    |
+225 |     pub max_fire_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:226:5
+    |
+226 |     pub pending_count: i32,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:227:5
+    |
+227 |     pub shard_id: i32,
+    |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:228:5
+    |
+228 |     pub created_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/debounce.rs:229:5
+    |
+229 |     pub updated_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/diagnostic.rs:12:5
+   |
+12 |     pub final_output: Result<Value, String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/diagnostic.rs:13:5
+   |
+13 |     pub event_count: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/diagnostic.rs:14:5
+   |
+14 |     pub analyzer_warnings: Vec<AnalyzerWarning>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/diagnostic.rs:15:5
+   |
+15 |     pub mermaid_sequence: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> autumn-harvest/src/eligibility.rs:7:13
+  |
+7 |     Exact { key: String, value: String },
+  |             ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> autumn-harvest/src/eligibility.rs:7:26
+  |
+7 |     Exact { key: String, value: String },
+  |                          ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> autumn-harvest/src/eligibility.rs:9:10
+  |
+9 |     In { key: String, values: Vec<String> },
+  |          ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> autumn-harvest/src/eligibility.rs:9:23
+  |
+9 |     In { key: String, values: Vec<String> },
+  |                       ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest/src/error.rs:95:1
+   |
+95 | pub struct NonDeterministicDetails {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/error.rs:96:5
+   |
+96 |     pub event_index: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/error.rs:97:5
+   |
+97 |     pub expected: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/error.rs:98:5
+   |
+98 |     pub actual: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/error.rs:99:5
+   |
+99 |     pub workflow_type: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/error.rs:100:5
+    |
+100 |     pub build_id: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/error.rs:148:9
+    |
+148 |         reason: String,
+    |         ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/error.rs:149:9
+    |
+149 |         details: Box<NonDeterministicDetails>,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest/src/event_batch.rs:21:1
+   |
+21 | pub struct BatchPolicy {
+   | ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:22:5
+   |
+22 |     pub key_expr: String,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:23:5
+   |
+23 |     pub max_size: usize,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:24:5
+   |
+24 |     pub max_wait: Duration,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest/src/event_batch.rs:27:1
+   |
+27 | pub struct AdmitBatchParams {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:28:5
+   |
+28 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:29:5
+   |
+29 |     pub batch_key: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:30:5
+   |
+30 |     pub workflow_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:31:5
+   |
+31 |     pub queue_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:32:5
+   |
+32 |     pub payload: serde_json::Value,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:33:5
+   |
+33 |     pub start_options: DebounceStartOptions,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:34:5
+   |
+34 |     pub max_wait: Duration,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:35:5
+   |
+35 |     pub max_size: usize,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:36:5
+   |
+36 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest/src/event_batch.rs:40:1
+   |
+40 | pub struct BatchAdmitOutcome {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:41:5
+   |
+41 |     pub batch_key: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:42:5
+   |
+42 |     pub workflow_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:43:5
+   |
+43 |     pub fire_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:44:5
+   |
+44 |     pub pending_count: i32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:45:5
+   |
+45 |     pub max_size: usize,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:46:5
+   |
+46 |     pub is_flushed: bool,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:47:5
+   |
+47 |     pub flushed_execution_id: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest/src/event_batch.rs:51:1
+   |
+51 | pub struct PendingEventBatchRecord {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:52:5
+   |
+52 |     pub id: uuid::Uuid,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:53:5
+   |
+53 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:54:5
+   |
+54 |     pub batch_key: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:55:5
+   |
+55 |     pub workflow_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:56:5
+   |
+56 |     pub queue_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:57:5
+   |
+57 |     pub current_size: i32,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:58:5
+   |
+58 |     pub max_size: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:59:5
+   |
+59 |     pub fire_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:60:5
+   |
+60 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:61:5
+   |
+61 |     pub created_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/event_batch.rs:62:5
+   |
+62 |     pub updated_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/event_batch.rs:119:1
+    |
+119 | / pub async fn admit_batched_start(
+120 | |     conn: &mut AsyncPgConnection,
+121 | |     params: AdmitBatchParams,
+122 | | ) -> HarvestResult<
+...   |
+126 | |     )>,
+127 | | > {
+    | |_^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/event_batch.rs:557:1
+    |
+557 | / pub async fn fire_due_event_batches(
+558 | |     conn: &mut diesel_async::AsyncPgConnection,
+559 | |     sharded_pool: &Option<crate::shard::ShardedDbPool>,
+560 | |     shard_assignments: &[crate::types::ShardId],
+561 | |     _metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+562 | | ) -> HarvestResult<usize> {
+    | |_________________________^
+
+warning: missing documentation for a function
+   --> autumn-harvest/src/event_batch.rs:593:1
+    |
+593 | / pub async fn list_pending_event_batches(
+594 | |     conn: &mut AsyncPgConnection,
+595 | |     limit: i64,
+596 | | ) -> HarvestResult<Vec<PendingEventBatchRecord>> {
+    | |________________________________________________^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:28:5
+   |
+28 |     pub states: Vec<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:29:5
+   |
+29 |     pub workflow_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:30:5
+   |
+30 |     pub execution_id: Option<ExecutionId>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:31:5
+   |
+31 |     pub activity_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:32:5
+   |
+32 |     pub token: Option<ExternalActivityToken>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:33:5
+   |
+33 |     pub shard_id: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:34:5
+   |
+34 |     pub due_before: Option<chrono::DateTime<Utc>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:35:5
+   |
+35 |     pub updated_before: Option<chrono::DateTime<Utc>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:36:5
+   |
+36 |     pub limit: i64,
+   |     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/external_task.rs:57:5
+   |
+57 |     pub const fn with_limit(mut self, limit: i64) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:66:5
+   |
+66 |     pub token: ExternalActivityToken,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:67:5
+   |
+67 |     pub workflow_exec_id: ExecutionId,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:68:5
+   |
+68 |     pub workflow_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:69:5
+   |
+69 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:70:5
+   |
+70 |     pub activity_id: ActivityExecId,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:71:5
+   |
+71 |     pub activity_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:72:5
+   |
+72 |     pub state: String,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:73:5
+   |
+73 |     pub created_at: chrono::DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:74:5
+   |
+74 |     pub updated_at: chrono::DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:75:5
+   |
+75 |     pub deadline_at: chrono::DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/external_task.rs:76:5
+   |
+76 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/history_export.rs:33:5
+   |
+33 |     pub const fn as_wire(self) -> &'static str {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/info.rs:120:5
+    |
+120 |     pub name: String,
+    |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/info.rs:122:5
+    |
+122 |     pub description: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/info.rs:123:5
+    |
+123 |     pub input_schema: Option<serde_json::Value>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/info.rs:124:5
+    |
+124 |     pub output_schema: Option<serde_json::Value>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/info.rs:125:5
+    |
+125 |     pub error_schema: Option<serde_json::Value>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/policy.rs:38:5
+   |
+38 |     None,
+   |     ^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/policy.rs:39:5
+   |
+39 |     Full,
+   |     ^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/policy.rs:40:5
+   |
+40 |     Equal,
+   |     ^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/policy.rs:41:5
+   |
+41 |     Decorrelated,
+   |     ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/policy.rs:138:5
+    |
+138 |     pub jitter: JitterPolicy,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn-harvest/src/policy.rs:213:5
+    |
+213 |     pub const fn with_jitter(mut self, jitter: JitterPolicy) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn-harvest/src/policy.rs:219:5
+    |
+219 |     pub fn next_delay_with_seed(&self, attempt: u32, stream_seed: u64) -> Option<Duration> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest/src/replay.rs:55:5
+   |
+55 |     NoMatch,
+   |     ^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/reset.rs:40:5
+   |
+40 |     pub const fn as_str(self) -> &'static str {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/reset.rs:76:5
+   |
+76 |     pub reset_to_event_id: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/reset.rs:77:5
+   |
+77 |     pub reason: String,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/reset.rs:78:5
+   |
+78 |     pub operator_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/reset.rs:80:5
+   |
+80 |     pub signal_reapply: ResetSignalReapplyPolicy,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:116:5
+    |
+116 |     pub kind: String,
+    |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:117:5
+    |
+117 |     pub side_effect_id: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:118:5
+    |
+118 |     pub name: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:119:5
+    |
+119 |     pub scheduled_event_id: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:125:5
+    |
+125 |     pub reset_to_event_id: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:126:5
+    |
+126 |     pub events_carried_over: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:127:5
+    |
+127 |     pub unresolved_side_effects: Vec<ResetUnresolvedSideEffect>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:128:5
+    |
+128 |     pub nearest_valid_before: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:129:5
+    |
+129 |     pub nearest_valid_after: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:130:5
+    |
+130 |     pub source_tasks_to_cancel: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:131:5
+    |
+131 |     pub source_timers_to_remove: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:132:5
+    |
+132 |     pub source_signals_to_drop: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:133:5
+    |
+133 |     pub source_signals_to_buffer: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:155:5
+    |
+155 |     pub message: String,
+    |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:156:5
+    |
+156 |     pub reset_to_event_id: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:157:5
+    |
+157 |     pub last_event_id: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:158:5
+    |
+158 |     pub unresolved_side_effects: Vec<ResetUnresolvedSideEffect>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:159:5
+    |
+159 |     pub nearest_valid_before: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:160:5
+    |
+160 |     pub nearest_valid_after: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:174:5
+    |
+174 |     pub new_exec_id: ExecutionId,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:175:5
+    |
+175 |     pub reset_from_exec_id: ExecutionId,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:176:5
+    |
+176 |     pub reset_to_event_id: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:177:5
+    |
+177 |     pub events_carried_over: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:178:5
+    |
+178 |     pub source_tasks_cancelled: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:179:5
+    |
+179 |     pub source_timers_removed: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:180:5
+    |
+180 |     pub source_signals_dropped: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:181:5
+    |
+181 |     pub source_signals_buffered: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn-harvest/src/reset.rs:188:5
+    |
+188 |     InvalidPoint(#[from] ResetInvalidPoint),
+    |     ^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn-harvest/src/reset.rs:190:5
+    |
+190 |     TerminalSource { exec_id: ExecutionId, state: String },
+    |     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:190:22
+    |
+190 |     TerminalSource { exec_id: ExecutionId, state: String },
+    |                      ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:190:44
+    |
+190 |     TerminalSource { exec_id: ExecutionId, state: String },
+    |                                            ^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn-harvest/src/reset.rs:192:5
+    |
+192 |     ChildWorkflow {
+    |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:193:9
+    |
+193 |         exec_id: ExecutionId,
+    |         ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest/src/reset.rs:194:9
+    |
+194 |         parent_id: Uuid,
+    |         ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn-harvest/src/reset.rs:197:5
+    |
+197 |     ContinueAsNew,
+    |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a static
+   --> autumn-harvest/src/shard.rs:223:1
+    |
+223 | pub static GLOBAL_SHARDED_POOL: std::sync::RwLock<Option<ShardedDbPool>> =
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a static
+   --> autumn-harvest/src/shard.rs:227:1
+    |
+227 | pub static GLOBAL_SHARD_ROUTER: std::sync::RwLock<Option<ShardRouter>> =
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn-harvest/src/testing.rs:1274:15
+     |
+1274 |     Skipped { reason: String },
+     |               ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:55:5
+   |
+55 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:56:5
+   |
+56 |     pub change_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:57:5
+   |
+57 |     pub recorded_version: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:58:5
+   |
+58 |     pub active_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:59:5
+   |
+59 |     pub terminal_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:60:5
+   |
+60 |     pub oldest_blocker_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:61:5
+   |
+61 |     pub newest_blocker_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_gate_retirement.rs:64:5
+   |
+64 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest/src/version_usage.rs:26:5
+   |
+26 |     pub const fn as_str(self) -> &'static str {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:53:5
+   |
+53 |     pub workflow_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:54:5
+   |
+54 |     pub change_id: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:55:5
+   |
+55 |     pub recorded_version: Option<u32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:56:5
+   |
+56 |     pub state_group: VersionExecutionStateGroup,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:57:5
+   |
+57 |     pub shard_id: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:63:5
+   |
+63 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:64:5
+   |
+64 |     pub change_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:65:5
+   |
+65 |     pub recorded_version: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:66:5
+   |
+66 |     pub active_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:67:5
+   |
+67 |     pub terminal_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:68:5
+   |
+68 |     pub oldest_matching_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:69:5
+   |
+69 |     pub newest_matching_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/version_usage.rs:70:5
+   |
+70 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest/src/scheduler.rs:43:21
+   |
+43 |     LimitExceeded { limit: usize },
+   |                     ^^^^^^^^^^^^
+
+warning: missing documentation for a function
+    --> autumn-harvest/src/workers.rs:1189:1
+     |
+1189 | / pub fn spawn_worker_heartbeat(
+1190 | |     pool: DbPool,
+1191 | |     registration: WorkerRegistration,
+1192 | |     wf_semaphore: Arc<Semaphore>,
+...    |
+1208 | |     drain_deadline_max: Arc<Mutex<Option<DateTime<Utc>>>>,
+1209 | | ) -> JoinHandle<()> {
+     | |___________________^
+
+warning: unresolved link to `GateCreateError::TooManyGates`
+  |
+  = note: the link appears in this line:
+
+          [`TooManyGates`](GateCreateError::TooManyGates) rather than silently
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `GateCreateError` in scope
+  = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default
+
+warning: unresolved link to `BuildError::ExecutionTimeoutExceedsCeiling`
+  --> autumn-harvest/src/builder.rs:85:53
+   |
+85 | ...ted with [`BuildError::ExecutionTimeoutExceedsCeiling`].
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `BuildError` in scope
+
+warning: unresolved link to `HarvestError::QueryTimedOut`
+    --> autumn-harvest/src/builder.rs:1704:46
+     |
+1704 | ... and returns [`HarvestError::QueryTimedOut`] to
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `HarvestError` in scope
+
+warning: unresolved link to `resolve_concurrency_key`
+  |
+  = note: the link appears in this line:
+
+          JSON input (via [`resolve_concurrency_key`]) to get the concrete group key
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `resolve_concurrency_key` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `for_replay_strict_with_state`
+    --> autumn-harvest/src/context.rs:1015:16
+     |
+1015 |     /// Like [`for_replay_strict_with_state`] but also sets `canary_mo...
+     |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `for_replay_strict_with_state` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ActivityInfo`
+    --> autumn-harvest/src/context.rs:2925:41
+     |
+2925 | ...g its [`ActivityInfo`] for name, queue, and defaults.
+     |            ^^^^^^^^^^^^ no item named `ActivityInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ActivityInfo`
+    --> autumn-harvest/src/context.rs:2988:76
+     |
+2988 | ...g its [`ActivityInfo`].
+     |            ^^^^^^^^^^^^ no item named `ActivityInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `WorkflowInfo`
+    --> autumn-harvest/src/context.rs:3055:63
+     |
+3055 | ...ing a [`WorkflowInfo`].
+     |            ^^^^^^^^^^^^ no item named `WorkflowInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `QueryHandlerInfo`
+    --> autumn-harvest/src/context.rs:4473:55
+     |
+4473 | ...a [`QueryHandlerInfo`] companion record.
+     |        ^^^^^^^^^^^^^^^^ no item named `QueryHandlerInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `UpdateHandlerInfo`
+    --> autumn-harvest/src/context.rs:4490:57
+     |
+4490 | ... [`UpdateHandlerInfo`] companion record.
+     |       ^^^^^^^^^^^^^^^^^ no item named `UpdateHandlerInfo` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Ok(())`
+    --> autumn-harvest/src/context.rs:5459:57
+     |
+5459 | ...).  Returns [`Ok(())`] otherwise.
+     |                  ^^^^^^ no item named `Ok(())` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `MarkerRecorded`
+  --> autumn-harvest/src/dag.rs:26:44
+   |
+26 | /// activity.  The skip is recorded as a [`MarkerRecorded`] event so replay
+   |                                            ^^^^^^^^^^^^^^ no item named `MarkerRecorded` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `erase_workflow_payloads`
+  |
+  = note: the link appears in this line:
+
+          A single call to [`erase_workflow_payloads`] tombstones:
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `erase_workflow_payloads` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `EraseOutcome::skipped_children`
+  |
+  = note: the link appears in this line:
+
+          [`EraseOutcome::skipped_children`]; they must be erased separately once
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: no item named `EraseOutcome` in scope
+
+warning: unresolved link to `WorkflowLogger`
+  --> autumn-harvest/src/executor.rs:67:47
+   |
+67 | ...] so [`WorkflowLogger`] can tag events.
+   |           ^^^^^^^^^^^^^^ no item named `WorkflowLogger` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Self::with_schemas`
+   --> autumn-harvest/src/info.rs:206:45
+    |
+206 |     /// `schema` feature's [`with_schemas`](Self::with_schemas) method.
+    |                                             ^^^^^^^^^^^^^^^^^^ the struct `WorkflowInfo` has no field or associated item named `with_schemas`
+
+warning: unresolved link to `OverlapPolicy::Skip`
+   --> autumn-harvest/src/info.rs:781:23
+    |
+781 |     /// Defaults to [`OverlapPolicy::Skip`].
+    |                       ^^^^^^^^^^^^^^^^^^^ no item named `OverlapPolicy` in scope
+
+warning: unresolved link to `OverlapPolicy::BufferAll`
+   --> autumn-harvest/src/info.rs:783:40
+    |
+783 | ...ed slots under [`OverlapPolicy::BufferAll`]. Default 100.
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^ no item named `OverlapPolicy` in scope
+
+warning: unresolved link to `HarvestError::ActivityFailed`
+  --> autumn-harvest/src/replay.rs:39:15
+   |
+39 |         /// [`HarvestError::ActivityFailed`] without parsing the message.
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `HarvestError` in scope
+
+warning: unresolved link to `WorkflowContext::spawn_child_workflow_detached_raw`
+   --> autumn-harvest/src/types.rs:820:7
+    |
+820 | /// [`WorkflowContext::spawn_child_workflow_detached_raw`]. Children sp...
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `WorkflowContext` in scope
+
+warning: unresolved link to `WorkflowEvent::WorkflowRedriven`
+   --> autumn-harvest/src/dlq.rs:797:29
+    |
+797 | ... appending a [`WorkflowEvent::WorkflowRedriven`] event so replay
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `WorkflowEvent` in scope
+
+warning: unresolved link to `database_error`
+  --> autumn-harvest/src/schedule_decision.rs:56:17
+   |
+56 | /// Returns a [`database_error`] if the database query execution fails.
+   |                 ^^^^^^^^^^^^^^ no item named `database_error` in scope
+   |
+   = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `CatchupPolicy`
+    --> autumn-harvest/src/scheduler.rs:3170:67
+     |
+3170 | ...en a [`CatchupPolicy`].
+     |           ^^^^^^^^^^^^^ no item named `CatchupPolicy` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: `autumn-harvest` (lib doc) generated 352 warnings
+warning: missing documentation for the crate
+  --> autumn-harvest/src/bin/debug_json.rs:1:1
+   |
+ 1 | / use autumn_harvest::event::WorkflowEvent;
+ 2 | | use autumn_harvest::types::ExternalSignalId;
+ 3 | |
+ 4 | | fn main() {
+...  |
+20 | |     println!("{json_req}");
+21 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `autumn-harvest` (bin "debug_json" doc) generated 1 warning
+warning: missing documentation for the crate
+  --> autumn-harvest-cli/src/main.rs:1:1
+   |
+ 1 | / use clap::Parser;
+ 2 | |
+ 3 | | use autumn_harvest_cli::{Cli, run_cli};
+...  |
+13 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+ Documenting autumn-harvest-plugin v0.4.0 (/app/autumn-harvest-plugin)
+warning: `autumn-harvest-cli` (bin "harvest" doc) generated 1 warning
+warning: missing documentation for a struct
+   --> autumn-harvest-plugin/src/api.rs:125:1
+    |
+125 | pub struct HarvestRetentionRuntime {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for an associated function
+   --> autumn-harvest-plugin/src/api.rs:133:5
+    |
+133 | /     pub const fn new(
+134 | |         config: RetentionConfig,
+135 | |         monitor: Option<RetentionMonitor>,
+136 | |         trigger: Option<tokio::sync::mpsc::Sender<()>>,
+137 | |     ) -> Self {
+    | |_____________^
+
+warning: missing documentation for an associated function
+   --> autumn-harvest-plugin/src/api.rs:146:5
+    |
+146 |     pub const fn disabled(config: RetentionConfig) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> autumn-harvest-plugin/src/api.rs:152:1
+    |
+152 | pub struct HarvestApiRuntime {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> autumn-harvest-plugin/src/api.rs:264:1
+    |
+264 | pub struct HarvestApiState {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn-harvest-plugin/src/api.rs:356:5
+    |
+356 |     pub fn new() -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+    --> autumn-harvest-plugin/src/api.rs:1061:5
+     |
+1061 |     PendingActivity,
+     |     ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+    --> autumn-harvest-plugin/src/api.rs:1062:5
+     |
+1062 |     PendingChild,
+     |     ^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+    --> autumn-harvest-plugin/src/api.rs:1063:5
+     |
+1063 |     AwaitingSignal,
+     |     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+    --> autumn-harvest-plugin/src/api.rs:1064:5
+     |
+1064 |     SleepingTimer,
+     |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+    --> autumn-harvest-plugin/src/api.rs:1065:5
+     |
+1065 |     NoPendingWork,
+     |     ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn-harvest-plugin/src/api.rs:1077:5
+     |
+1077 |     pub execution: WorkflowExecution,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn-harvest-plugin/src/api.rs:1079:5
+     |
+1079 |     pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn-harvest-plugin/src/api.rs:1081:5
+     |
+1081 |     pub last_event_age_seconds: Option<f64>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn-harvest-plugin/src/api.rs:1083:5
+     |
+1083 |     pub stall_reason: Option<StallReason>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn-harvest-plugin/src/api.rs:2037:5
+     |
+2037 |     pub workflows: Vec<StalledWorkflowRow>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn-harvest-plugin/src/api.rs:2038:5
+     |
+2038 |     pub next_cursor: Option<String>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+    --> autumn-harvest-plugin/src/api.rs:2467:1
+     |
+2467 | pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+     --> autumn-harvest-plugin/src/api.rs:11891:1
+      |
+11891 | pub struct CreateCompletionTriggerRequest {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:11892:5
+      |
+11892 |     pub id: Option<uuid::Uuid>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:11893:5
+      |
+11893 |     pub source_workflow_name: String,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:11894:5
+      |
+11894 |     pub terminal_states: Option<Vec<TerminalState>>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:11895:5
+      |
+11895 |     pub target_workflow_name: String,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:11896:5
+      |
+11896 |     pub input_mapping: Option<InputMapping>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:11897:5
+      |
+11897 |     pub queue_name: Option<String>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+     --> autumn-harvest-plugin/src/api.rs:20674:1
+      |
+20674 | pub struct QueueEligibilityResponse {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20675:5
+      |
+20675 |     pub queue_name: String,
+      |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20676:5
+      |
+20676 |     pub pending_count: i64,
+      |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20677:5
+      |
+20677 |     pub oldest_pending_age_secs: Option<i64>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20678:5
+      |
+20678 |     pub required_build_ids: Vec<String>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20679:5
+      |
+20679 |     pub eligible_workers: Vec<EligibleWorkerInfo>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20680:5
+      |
+20680 |     pub ineligible_workers: Vec<IneligibleWorkerInfo>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20681:5
+      |
+20681 |     pub summary: EligibilitySummary,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20683:5
+      |
+20683 |     pub shards: std::collections::BTreeMap<String, ShardEligibilityResponse>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20685:5
+      |
+20685 |     pub shard_errors: Vec<EligibilityShardError>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+     --> autumn-harvest-plugin/src/api.rs:20689:1
+      |
+20689 | pub struct ShardEligibilityResponse {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20690:5
+      |
+20690 |     pub pending_count: i64,
+      |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20691:5
+      |
+20691 |     pub oldest_pending_age_secs: Option<i64>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20692:5
+      |
+20692 |     pub required_build_ids: Vec<String>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20693:5
+      |
+20693 |     pub eligible_workers: Vec<EligibleWorkerInfo>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20694:5
+      |
+20694 |     pub ineligible_workers: Vec<IneligibleWorkerInfo>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20695:5
+      |
+20695 |     pub summary: EligibilitySummary,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+     --> autumn-harvest-plugin/src/api.rs:20699:1
+      |
+20699 | pub struct EligibilityShardError {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20700:5
+      |
+20700 |     pub shard_id: i32,
+      |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20701:5
+      |
+20701 |     pub error: String,
+      |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+     --> autumn-harvest-plugin/src/api.rs:20705:1
+      |
+20705 | pub struct EligibleWorkerInfo {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20706:5
+      |
+20706 |     pub worker_id: String,
+      |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20707:5
+      |
+20707 |     pub build_id: String,
+      |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20708:5
+      |
+20708 |     pub deployment_name: Option<String>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20709:5
+      |
+20709 |     pub shard_assignments: Vec<i32>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20710:5
+      |
+20710 |     pub status: String,
+      |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20711:5
+      |
+20711 |     pub in_flight_count: i32,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20712:5
+      |
+20712 |     pub max_concurrency: i32,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+     --> autumn-harvest-plugin/src/api.rs:20716:1
+      |
+20716 | pub struct IneligibleWorkerInfo {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20717:5
+      |
+20717 |     pub worker_id: String,
+      |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20718:5
+      |
+20718 |     pub reason_codes: Vec<String>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+     --> autumn-harvest-plugin/src/api.rs:20722:1
+      |
+20722 | pub struct EligibilitySummary {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20723:5
+      |
+20723 |     pub diagnosis: String,
+      |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+     --> autumn-harvest-plugin/src/api.rs:20727:1
+      |
+20727 | pub struct TaskEligibilityResponse {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20728:5
+      |
+20728 |     pub task_id: uuid::Uuid,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20729:5
+      |
+20729 |     pub queue_name: String,
+      |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20730:5
+      |
+20730 |     pub pending_count: i64,
+      |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20731:5
+      |
+20731 |     pub oldest_pending_age_secs: Option<i64>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20732:5
+      |
+20732 |     pub required_build_id: Option<String>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20733:5
+      |
+20733 |     pub assigned_shard: i32,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20734:5
+      |
+20734 |     pub concurrency_key: Option<String>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20735:5
+      |
+20735 |     pub eligible_workers: Vec<EligibleWorkerInfo>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20736:5
+      |
+20736 |     pub ineligible_workers: Vec<IneligibleWorkerInfo>,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+     --> autumn-harvest-plugin/src/api.rs:20737:5
+      |
+20737 |     pub summary: EligibilitySummary,
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an enum
+  --> autumn-harvest-plugin/src/config.rs:10:1
+   |
+10 | pub enum HarvestMode {
+   | ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/config.rs:12:5
+   |
+12 |     Embedded,
+   |     ^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/config.rs:13:5
+   |
+13 |     Split,
+   |     ^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/config.rs:14:5
+   |
+14 |     External,
+   |     ^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/config.rs:18:1
+   |
+18 | pub struct HarvestDatabaseConfig {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:19:5
+   |
+19 |     pub url: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/config.rs:23:1
+   |
+23 | pub struct HarvestOutboxConfig {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:24:5
+   |
+24 |     pub enabled: bool,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:25:5
+   |
+25 |     pub batch_size: i64,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:26:5
+   |
+26 |     pub poll_interval_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:27:5
+   |
+27 |     pub claim_ttl_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:28:5
+   |
+28 |     pub base_retry_delay_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:29:5
+   |
+29 |     pub max_retry_delay_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:40:5
+   |
+40 |     pub concurrency: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:41:5
+   |
+41 |     pub tick_interval_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/config.rs:52:1
+   |
+52 | pub struct HarvestRuntimeConfig {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:53:5
+   |
+53 |     pub mode: HarvestMode,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:54:5
+   |
+54 |     pub worker_enabled: bool,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:55:5
+   |
+55 |     pub scheduler_enabled: bool,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:56:5
+   |
+56 |     pub database: HarvestDatabaseConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:57:5
+   |
+57 |     pub outbox: HarvestOutboxConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:58:5
+   |
+58 |     pub batch: HarvestBatchConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/config.rs:59:5
+   |
+59 |     pub readiness: HarvestReadinessConfig,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+  --> autumn-harvest-plugin/src/outbox.rs:25:1
+   |
+25 | / diesel::table! {
+26 | |     harvest_workflow_outbox (id) {
+   | |___________________________^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:46:1
+   |
+46 | pub struct WorkflowStartRequest {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:47:5
+   |
+47 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:48:5
+   |
+48 |     pub workflow_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:49:5
+   |
+49 |     pub queue_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:50:5
+   |
+50 |     pub input: Value,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:51:5
+   |
+51 |     pub memo: Option<Value>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/outbox.rs:52:5
+   |
+52 |     pub search_attrs: Option<Value>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:27:9
+   |
+27 |         id -> BigInt,
+   |         ^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:28:9
+   |
+28 |         workflow_name -> Text,
+   |         ^^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:29:9
+   |
+29 |         workflow_id -> Text,
+   |         ^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:30:9
+   |
+30 |         queue_name -> Text,
+   |         ^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:31:9
+   |
+31 |         input -> Jsonb,
+   |         ^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:32:9
+   |
+32 |         memo -> Nullable<Jsonb>,
+   |         ^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:33:9
+   |
+33 |         search_attrs -> Nullable<Jsonb>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:34:9
+   |
+34 |         delivery_attempts -> BigInt,
+   |         ^^^^^^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:35:9
+   |
+35 |         last_error -> Nullable<Text>,
+   |         ^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:36:9
+   |
+36 |         delivered_execution_id -> Nullable<Text>,
+   |         ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:37:9
+   |
+37 |         delivered_at -> Nullable<Timestamp>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:38:9
+   |
+38 |         next_attempt_at -> Timestamp,
+   |         ^^^^^^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:39:9
+   |
+39 |         claimed_at -> Nullable<Timestamp>,
+   |         ^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:40:9
+   |
+40 |         claimed_by -> Nullable<Text>,
+   |         ^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn-harvest-plugin/src/outbox.rs:41:9
+   |
+41 |         created_at -> Timestamp,
+   |         ^^^^^^^^^^
+   |
+   = note: this warning originates in the macro `diesel::table` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/preflight.rs:26:5
+   |
+26 |     Pass,
+   |     ^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/preflight.rs:27:5
+   |
+27 |     Warn,
+   |     ^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/preflight.rs:28:5
+   |
+28 |     Fail,
+   |     ^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:44:5
+   |
+44 |     pub package: &'static str,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:45:5
+   |
+45 |     pub version: &'static str,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:46:5
+   |
+46 |     pub core_version: &'static str,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:52:5
+   |
+52 |     pub name: String,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:53:5
+   |
+53 |     pub status: PreflightStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:54:5
+   |
+54 |     pub summary: String,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:55:5
+   |
+55 |     pub remediation: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:56:5
+   |
+56 |     pub affected_shards: Vec<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:57:5
+   |
+57 |     pub details: Value,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:63:5
+   |
+63 |     pub overall_status: PreflightStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:64:5
+   |
+64 |     pub observed_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:65:5
+   |
+65 |     pub version: PreflightVersion,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/preflight.rs:66:5
+   |
+66 |     pub checks: Vec<PreflightCheckResult>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:26:5
+   |
+26 |     Ready,
+   |     ^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:27:5
+   |
+27 |     Degraded,
+   |     ^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:28:5
+   |
+28 |     Unavailable,
+   |     ^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:35:5
+   |
+35 |     Readable,
+   |     ^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:36:5
+   |
+36 |     Writable,
+   |     ^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/shard_health.rs:37:5
+   |
+37 |     Default,
+   |     ^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:43:5
+   |
+43 |     pub overall_readiness: ShardReadiness,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:44:5
+   |
+44 |     pub observed_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:45:5
+   |
+45 |     pub freshness_window_secs: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:46:5
+   |
+46 |     pub candidate_shard: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:47:5
+   |
+47 |     pub shards: Vec<ShardHealthRow>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:53:5
+   |
+53 |     pub shard_id: i32,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:54:5
+   |
+54 |     pub roles: Vec<ShardRole>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:55:5
+   |
+55 |     pub candidate: bool,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:56:5
+   |
+56 |     pub reachable: bool,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:57:5
+   |
+57 |     pub active_worker_count: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:58:5
+   |
+58 |     pub stale_worker_count: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:59:5
+   |
+59 |     pub schema: ShardSchemaHealth,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:60:5
+   |
+60 |     pub worker_coverage: Vec<QueueWorkerCoverage>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:61:5
+   |
+61 |     pub scheduler: ShardSchedulerCoverage,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:62:5
+   |
+62 |     pub queue_depth: QueueDepthSummary,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:63:5
+   |
+63 |     pub dlq: DlqSummary,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:64:5
+   |
+64 |     pub last_health_sample_time: Option<DateTime<Utc>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:65:5
+   |
+65 |     pub readiness: ShardReadiness,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:66:5
+   |
+66 |     pub reason_codes: Vec<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:67:5
+   |
+67 |     pub blocking_reasons: Vec<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:68:5
+   |
+68 |     pub error_summary: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:74:5
+   |
+74 |     pub ready: bool,
+   |     ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:75:5
+   |
+75 |     pub applied_count: Option<usize>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:76:5
+   |
+76 |     pub missing_migrations: Vec<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:77:5
+   |
+77 |     pub error: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:83:5
+   |
+83 |     pub queue: String,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:84:5
+   |
+84 |     pub ready: bool,
+   |     ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:85:5
+   |
+85 |     pub healthy_active: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:86:5
+   |
+86 |     pub stale: usize,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:87:5
+   |
+87 |     pub draining: usize,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:88:5
+   |
+88 |     pub stopped: usize,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:89:5
+   |
+89 |     pub total_matching: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:95:5
+   |
+95 |     pub enabled: bool,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:96:5
+   |
+96 |     pub ready: bool,
+   |     ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:97:5
+   |
+97 |     pub running: bool,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:98:5
+   |
+98 |     pub last_tick_at: Option<DateTime<Utc>>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/shard_health.rs:99:5
+   |
+99 |     pub tick_interval_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:100:5
+    |
+100 |     pub freshness_window_secs: u64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:101:5
+    |
+101 |     pub schedule_count: usize,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:102:5
+    |
+102 |     pub error: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:108:5
+    |
+108 |     pub total_pending: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:109:5
+    |
+109 |     pub by_queue: BTreeMap<String, i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:117:5
+    |
+117 |     pub error: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:131:5
+    |
+131 |     pub queue_name: String,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:133:5
+    |
+133 |     pub required_capabilities: Option<serde_json::Value>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:135:5
+    |
+135 |     pub required_build_id: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:140:5
+    |
+140 |     pub count: i64,
+    |     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:146:5
+    |
+146 |     pub count: Option<i64>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/shard_health.rs:147:5
+    |
+147 |     pub error: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest-plugin/src/state.rs:19:5
+   |
+19 |     pub fn clone_inner(&self) -> DbPool {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:54:5
+   |
+54 |     pub const fn is_safe(self) -> bool {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:63:5
+   |
+63 |     Inspected,
+   |     ^^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:64:5
+   |
+64 |     Unavailable,
+   |     ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:70:5
+   |
+70 |     pub status: RetirementCheckStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:73:5
+   |
+73 |     pub observed_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:74:5
+   |
+74 |     pub filters: RetirementCheckReportFilters,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:78:5
+   |
+78 |     pub shards: Vec<RetirementShardInspection>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:84:5
+   |
+84 |     pub change_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:85:5
+   |
+85 |     pub min_safe_version: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:86:5
+   |
+86 |     pub workflow_name: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:87:5
+   |
+87 |     pub state_group: VersionExecutionStateGroup,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:88:5
+   |
+88 |     pub shard_id: Option<i32>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:94:5
+   |
+94 |     pub workflow_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:95:5
+   |
+95 |     pub change_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:96:5
+   |
+96 |     pub recorded_version: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:97:5
+   |
+97 |     pub active_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:98:5
+   |
+98 |     pub terminal_executions: i64,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_gate_retirement.rs:99:5
+   |
+99 |     pub oldest_blocker_started_at: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:100:5
+    |
+100 |     pub newest_blocker_started_at: DateTime<Utc>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:101:5
+    |
+101 |     pub oldest_blocker_age_secs: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:102:5
+    |
+102 |     pub newest_blocker_age_secs: i64,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:105:5
+    |
+105 |     pub shard_coverage: RetirementShardCoverage,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:111:5
+    |
+111 |     pub inspected_shards: Vec<i32>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:112:5
+    |
+112 |     pub matched_shards: Vec<i32>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:113:5
+    |
+113 |     pub unavailable_shards: Vec<i32>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:119:5
+    |
+119 |     pub shard_id: i32,
+    |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:120:5
+    |
+120 |     pub status: RetirementShardInspectionStatus,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:121:5
+    |
+121 |     pub matched_groups: Option<usize>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn-harvest-plugin/src/version_gate_retirement.rs:122:5
+    |
+122 |     pub error: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn-harvest-plugin/src/version_usage.rs:26:5
+   |
+26 |     pub state_group: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+ Documenting billing-autumn-web v0.4.0 (/app/examples/billing-autumn-web)
+ Documenting quickstart v0.4.0 (/app/examples/quickstart)
+warning: missing documentation for the crate
+  --> examples/quickstart/src/retry_jitter_example.rs:1:1
+   |
+ 1 | / use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
+ 2 | |
+ 3 | | fn main() {
+ 4 | |     let seed = 0xdecafbad_u64;
+...  |
+16 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for the crate
+  --> examples/billing-autumn-web/src/main.rs:1:1
+   |
+ 1 | / #![allow(clippy::missing_errors_doc, clippy::unused_async)]
+ 2 | |
+ 3 | | mod activities;
+ 4 | | mod dags;
+...  |
+35 | |         .await;
+36 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `quickstart` (bin "retry-jitter-example" doc) generated 1 warning
+ Documenting standalone-runner v0.4.0 (/app/examples/standalone-runner)
+warning: missing documentation for the crate
+  --> examples/standalone-runner/src/main.rs:1:1
+   |
+ 1 | / #![allow(clippy::missing_errors_doc, clippy::unused_async)]
+ 2 | |
+ 3 | | mod activities;
+ 4 | | mod domain;
+...  |
+14 | |     server::run().await
+15 | | }
+   | |_^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: `billing-autumn-web` (bin "billing-autumn-web" doc) generated 1 warning
+warning: `standalone-runner` (bin "standalone-runner" doc) generated 1 warning
+warning: unresolved link to `RegisteredWorkflowRecord`
+    --> autumn-harvest-plugin/src/api.rs:4435:27
+     |
+4435 | ...ns an array of [`RegisteredWorkflowRecord`] objects sorted by name.
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^ no item named `RegisteredWorkflowRecord` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+     = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default
+
+warning: unresolved link to `RegisteredWorkflowRecord`
+    --> autumn-harvest-plugin/src/api.rs:4455:30
+     |
+4455 | ...`200` with the [`RegisteredWorkflowRecord`] when the workflow is
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^ no item named `RegisteredWorkflowRecord` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `Skipped`
+    --> autumn-harvest-plugin/src/ui.rs:4491:40
+     |
+4491 | ...tinct from [`Skipped`] so the UI can show a different
+     |                 ^^^^^^^ no item named `Skipped` in scope
+     |
+     = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: `autumn-harvest-plugin` (lib doc) generated 220 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 16.39s
+   Generated /app/target/doc/autumn_harvest/index.html and 12 other files

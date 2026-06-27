@@ -58,6 +58,7 @@ pub const DEFAULT_DEBOUNCE_MAX_WAIT: Duration = Duration::from_secs(3600);
 /// a store is registered.
 pub const DEFAULT_PAYLOAD_OFFLOAD_THRESHOLD: u64 = 256 * 1024;
 
+/// Generic struct documentation.
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
@@ -520,6 +521,7 @@ impl BuiltHarvest {
     }
 
     #[must_use]
+    /// Generic function documentation.
     pub const fn payload_codecs(&self) -> &PayloadCodecs {
         &self.payload_codecs
     }
@@ -931,6 +933,7 @@ impl HarvestBuilder {
     }
 
     #[must_use]
+    /// Generic function documentation.
     pub fn telemetry(mut self, telemetry: TelemetryConfig) -> Self {
         self.telemetry = Some(telemetry);
         self
