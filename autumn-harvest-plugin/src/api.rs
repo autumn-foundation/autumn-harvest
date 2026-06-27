@@ -1030,6 +1030,10 @@ struct WorkflowDetailsResponse {
     /// Nominal scheduled fire-time (logical slot) for this run, or `None` for manual starts (issue #508).
     #[serde(skip_serializing_if = "Option::is_none")]
     scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// `true` when the execution has more events than the embedded `history` slice (issue #529).
+    history_truncated: bool,
+    /// URL path of the paginated history endpoint for this execution (issue #529).
+    history_endpoint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2500,6 +2504,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/workflows/{id}/history/export",
             get(export_workflow_history),
         )
+        .route("/workflows/{id}/history", get(get_workflow_history))
         .route("/workflows/{id}", get(get_workflow))
         .route("/workflows/{id}/result", get(get_workflow_result))
         .route("/workflows/{id}/children", get(list_workflow_children))
@@ -2876,6 +2881,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/registered"),
         ("GET", "/workflows/registered/{name}/schema"),
         ("GET", "/workflows/{id}"),
+        ("GET", "/workflows/{id}/history"),
         ("GET", "/workflows/{id}/result"),
         ("GET", "/workflows/{id}/history/export"),
         ("GET", "/workflows/{id}/children"),
@@ -3314,7 +3320,14 @@ pub const fn management_api_response_fields()
                 "last_completion_result",
                 "last_error",
                 "scheduled_time",
+                "history_truncated",
+                "history_endpoint",
             ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/history",
+            Some(&["events", "next_cursor", "total_events", "last_event_id"]),
         ),
         (
             "GET",
@@ -5002,18 +5015,32 @@ async fn get_workflow(
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
-    let history = store::load_history(&mut conn, exec_id)
-        .await
-        .map_err(map_error)?;
 
-    // Extract carryover and scheduled_time from the first (WorkflowStarted) event before consuming the vec.
+    // Use paged loading bounded to DEFAULT_HISTORY_PAGE events (issue #529).
+    // Totals are not needed for the details view — skip the extra aggregate query.
+    let history_page = autumn_harvest::store::load_history_page(
+        &mut conn,
+        exec_id,
+        None,
+        DEFAULT_HISTORY_PAGE,
+        &[],
+        false,
+    )
+    .await
+    .map_err(map_error)?;
+
+    let history_truncated = history_page.next_cursor.is_some();
+    let history_endpoint = format!("/workflows/{exec_id}/history");
+
+    // Extract carryover and scheduled_time from the first (WorkflowStarted) event.
+    // event_id 0 is always in the first page so this is safe after bounding.
     let (last_completion_result, last_error, scheduled_time) =
         if let Some(autumn_harvest::event::WorkflowEvent::WorkflowStarted {
             last_completion_result,
             last_error,
             scheduled_time,
             ..
-        }) = history.events.as_slice().first()
+        }) = history_page.events.as_slice().first().map(|e| &e.event)
         {
             (
                 last_completion_result.clone(),
@@ -5024,12 +5051,14 @@ async fn get_workflow(
             (None, None, None)
         };
 
-    let events = history
+    // Serialize via WorkflowEvent (not raw_event) to fill serde-default fields on legacy events.
+    let events = history_page
         .events
         .into_iter()
-        .map(|event| serde_json::to_value(event).map_err(HarvestError::from))
+        .map(|paged| serde_json::to_value(paged.event).map_err(HarvestError::from))
         .collect::<HarvestResult<Vec<_>>>()
         .map_err(map_error)?;
+
     let handoff_filters = external_task::ExternalHandoffFilters {
         states: vec!["PENDING".to_string()],
         execution_id: Some(exec_id),
@@ -5051,6 +5080,160 @@ async fn get_workflow(
         last_completion_result,
         last_error,
         scheduled_time,
+        history_truncated,
+        history_endpoint,
+    }))
+}
+
+/// Default and maximum page sizes for `GET /workflows/{id}/history`.
+const DEFAULT_HISTORY_PAGE: i64 = 100;
+const MAX_HISTORY_PAGE: i64 = 1000;
+
+/// Per-event entry returned by `GET /workflows/{id}/history`.
+#[derive(Debug, Serialize)]
+struct WorkflowHistoryEntry {
+    /// `harvest_events.id` — the BIGSERIAL cursor anchor.
+    id: i64,
+    /// Sequential event index within this execution.
+    event_id: i32,
+    /// RFC 3339 timestamp recorded when the event was appended.
+    timestamp: chrono::DateTime<chrono::Utc>,
+    /// Adjacently-tagged event type name.
+    #[serde(rename = "type")]
+    event_type: String,
+    /// Event payload (the `data` object from the stored JSON).
+    data: Value,
+}
+
+/// Response envelope for `GET /workflows/{id}/history`.
+#[derive(Debug, Serialize)]
+struct WorkflowHistoryPage {
+    events: Vec<WorkflowHistoryEntry>,
+    /// Opaque cursor; pass as `?after=` on the next request. `null` = last page.
+    next_cursor: Option<String>,
+    /// Total event count for this execution, unaffected by `event_type` filter.
+    total_events: i64,
+    /// Highest `harvest_events.id` for this execution (unfiltered).
+    last_event_id: i64,
+}
+
+/// Parse query parameters for `GET /workflows/{id}/history`.
+///
+/// Returns `(limit, after_id, event_types)` or a 400 error.
+fn parse_workflow_history_query(
+    pairs: &[(String, String)],
+) -> Result<(i64, Option<i64>, Vec<String>), AutumnError> {
+    let mut limit = DEFAULT_HISTORY_PAGE;
+    let mut after_id: Option<i64> = None;
+    let mut event_types: Vec<String> = Vec::new();
+
+    for (k, v) in pairs {
+        match k.as_str() {
+            "limit" => {
+                limit = v.parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid limit {v:?}: must be a positive integer"
+                    ))
+                })?;
+                if limit <= 0 {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid limit {limit}: must be a positive integer"
+                    )));
+                }
+                limit = limit.clamp(1, MAX_HISTORY_PAGE);
+            }
+            "after" => {
+                let parsed = v.parse::<i64>().map_err(|_| {
+                    AutumnError::bad_request_msg(format!(
+                        "invalid cursor {v:?}: must be a positive integer"
+                    ))
+                })?;
+                if parsed < 0 {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid cursor {parsed}: must be non-negative"
+                    )));
+                }
+                after_id = Some(parsed);
+            }
+            "event_type" => {
+                event_types.push(v.clone());
+            }
+            _ => {}
+        }
+    }
+
+    Ok((limit, after_id, event_types))
+}
+
+/// `GET /workflows/{id}/history` — paginated, filterable event history.
+async fn get_workflow_history(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<WorkflowHistoryPage>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let (limit, after_id, event_types) = parse_workflow_history_query(&pairs)?;
+
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+
+    // 404 when the execution doesn't exist — cheaper than a full-row load.
+    if !autumn_harvest::store::check_execution_exists(&mut conn, exec_id)
+        .await
+        .map_err(map_error)?
+    {
+        return Err(AutumnError::not_found_msg(format!(
+            "workflow execution {exec_id}"
+        )));
+    }
+
+    let page = autumn_harvest::store::load_history_page(
+        &mut conn,
+        exec_id,
+        after_id,
+        limit,
+        &event_types,
+        true,
+    )
+    .await
+    .map_err(map_error)?;
+
+    let mut entries = Vec::with_capacity(page.events.len());
+    for paged in page.events {
+        // Serialize via WorkflowEvent (not raw_event) to fill serde-default fields on legacy
+        // events, keeping the shape consistent with the embedded history in get_workflow.
+        let mut normalized = serde_json::to_value(paged.event)
+            .map_err(HarvestError::from)
+            .map_err(map_error)?;
+        let (type_name, data) = match &mut normalized {
+            Value::Object(map) => {
+                let type_name = map
+                    .remove("type")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let data = map
+                    .remove("data")
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                (type_name, data)
+            }
+            _ => (String::new(), Value::Object(serde_json::Map::new())),
+        };
+        entries.push(WorkflowHistoryEntry {
+            id: paged.id,
+            event_id: paged.event_id,
+            timestamp: paged.timestamp,
+            event_type: type_name,
+            data,
+        });
+    }
+
+    Ok(Json(WorkflowHistoryPage {
+        events: entries,
+        next_cursor: page.next_cursor.map(|c| c.to_string()),
+        total_events: page.total_events,
+        last_event_id: page.last_event_id,
     }))
 }
 

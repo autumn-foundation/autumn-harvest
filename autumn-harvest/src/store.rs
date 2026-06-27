@@ -801,6 +801,151 @@ pub async fn load_events_after_row_id(
         .map_err(crate::error::database_error)
 }
 
+/// A single deserialized row from a paged history query.
+#[derive(Debug)]
+pub struct PagedHistoryEvent {
+    /// `harvest_events.id` — the BIGSERIAL row cursor anchor.
+    pub id: i64,
+    /// Sequential event index within this execution (`event_id` column).
+    pub event_id: i32,
+    /// Wall-clock timestamp recorded when the event was appended.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Deserialized workflow event (for structured inspection and pattern matching).
+    pub event: crate::event::WorkflowEvent,
+    /// Raw adjacently-tagged JSON exactly as stored in `harvest_events.event_data`.
+    /// Avoids a round-trip serialize when the caller only needs the wire representation.
+    pub raw_event: serde_json::Value,
+}
+
+/// Result of a paged history query.
+#[derive(Debug)]
+pub struct HistoryPage {
+    /// The events on this page (at most `limit` entries).
+    pub events: Vec<PagedHistoryEvent>,
+    /// Opaque cursor to pass as `after` on the next request.  `None` when this
+    /// is the last page.
+    pub next_cursor: Option<i64>,
+    /// Total event count for this execution, ignoring any type filter.
+    pub total_events: i64,
+    /// Highest `harvest_events.id` for this execution (unfiltered).
+    pub last_event_id: i64,
+}
+
+/// Returns `true` when a workflow execution with `exec_id` exists in the database.
+///
+/// Cheaper than [`load_execution`] when only presence needs to be confirmed
+/// because it projects only the primary key column.
+#[cfg(feature = "db")]
+pub async fn check_execution_exists(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> crate::error::HarvestResult<bool> {
+    use diesel::dsl::exists;
+    diesel::select(exists(
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid())),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
+/// Load a page of events for `exec_id`.
+///
+/// - `after_id`: exclusive lower-bound cursor (`harvest_events.id`).  `None`
+///   means start from the first event.
+/// - `limit`: maximum number of events to return (1–1000).
+/// - `event_types`: if non-empty, only return rows whose `event_type` is in
+///   this list.  Unknown type names yield an empty page (not an error).
+/// - `include_totals`: when `true`, runs an extra `COUNT`/`MAX` aggregate
+///   query to populate `HistoryPage::total_events` and `HistoryPage::last_event_id`.
+///   Pass `false` when the caller doesn't need these fields to save a DB round-trip.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure or if
+/// any stored event cannot be decoded.
+#[cfg(feature = "db")]
+pub async fn load_history_page(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    after_id: Option<i64>,
+    limit: i64,
+    event_types: &[String],
+    include_totals: bool,
+) -> crate::error::HarvestResult<HistoryPage> {
+    use diesel::dsl::{count_star, max};
+
+    // ── 1. Aggregate query: total events + last id (unfiltered) ──────────────
+    // Skipped when the caller doesn't need totals (e.g. get_workflow bounded view).
+    let (total_events, last_event_id) = if include_totals {
+        let (total, last): (i64, Option<i64>) = harvest_events::table
+            .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+            .select((count_star(), max(harvest_events::id)))
+            .first(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        (total, last.unwrap_or(0))
+    } else {
+        (0, 0)
+    };
+
+    // ── 2. Page query: fetch limit+1 rows to detect next page ────────────────
+    let fetch = limit + 1;
+    let mut query = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::id.asc())
+        .limit(fetch)
+        .into_boxed();
+
+    if let Some(after) = after_id {
+        query = query.filter(harvest_events::id.gt(after));
+    }
+    if !event_types.is_empty() {
+        query = query.filter(harvest_events::event_type.eq_any(event_types));
+    }
+
+    let mut rows: Vec<crate::models::HarvestEvent> = query
+        .select(crate::models::HarvestEvent::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    // ── 3. Detect next page using the extra row ───────────────────────────────
+    // `limit` is validated to [1, MAX_HISTORY_PAGE=1000] by the caller before this function is
+    // invoked, so the usize conversions below are always safe on any supported target.
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let next_cursor = if rows.len() > limit_usize {
+        let cursor = rows[limit_usize - 1].id;
+        rows.truncate(limit_usize);
+        Some(cursor)
+    } else {
+        None
+    };
+
+    // ── 4. Decode events ──────────────────────────────────────────────────────
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw_event = row.event_data.clone();
+        let event: crate::event::WorkflowEvent =
+            serde_json::from_value(row.event_data).map_err(crate::error::HarvestError::from)?;
+        events.push(PagedHistoryEvent {
+            id: row.id,
+            event_id: row.event_id,
+            timestamp: row.timestamp,
+            event,
+            raw_event,
+        });
+    }
+
+    Ok(HistoryPage {
+        events,
+        next_cursor,
+        total_events,
+        last_event_id,
+    })
+}
+
 /// Load the direct children of `parent_id` from one shard.
 ///
 /// Callers that need cross-shard discovery should call this once per shard and

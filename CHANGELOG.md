@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add paginated, filterable single-execution workflow history API (issue #529). New read-only `GET /workflows/{id}/history` endpoint supports keyset pagination via opaque `next_cursor` (backed by `harvest_events.id`), `limit` (1–1000, default 100), `after` cursor, and repeatable `event_type` filter for server-side event-type narrowing. Response includes `total_events` (unfiltered) and `last_event_id` for UI progress tracking. `GET /workflows/{id}` now bounds `history` to the first 100 events and adds `history_truncated: bool` and `history_endpoint: string` fields so callers can discover the pagination endpoint. No new `WorkflowEvent` variant, no migration.
+
 - Add workflow-type reachability check to gate safe handler removal (issue #520). New read-only `GET /admin/workflow-types/reachability` endpoint and `harvest workflow-types reachability [--type] [--json]` CLI subcommand report, per workflow type, how many non-terminal executions still depend on its handler and a `safe_to_remove` / `in_use` / `orphaned` verdict. The CLI exits `2` when any type is `orphaned` or the cross-shard answer is incomplete, so it is usable as a CI/deploy gate. No new `WorkflowEvent` variant, no migration.
 
 ## [0.4.0] - 2026-06-16

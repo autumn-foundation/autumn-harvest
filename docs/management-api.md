@@ -421,3 +421,96 @@ curl "/api/harvest/workflows/$EXEC_ID/stack"
   ]
 }
 ```
+
+## Single-execution history (paginated)
+
+### Endpoint
+
+```
+GET /workflows/{id}/history
+```
+
+Returns a bounded, paginated, filterable view of a single execution's event log.
+Use this endpoint to page through history incrementally for long-running executions,
+or to filter events by type during incident triage.
+
+### Parameters
+
+| Parameter | In | Required | Description |
+|-----------|----|----------|-------------|
+| `id` | path | yes | Execution UUID. |
+| `limit` | query | no | Maximum events per page (1–1000). Default: **100**. Values above 1000 are silently clamped to 1000. |
+| `after` | query | no | Exclusive cursor anchor. Opaque — treat as a string; absent means start from the first event. |
+| `event_type` | query | no | Repeatable. Filter to matching event type discriminators (e.g. `TimerStarted`, `ActivityCompleted`). Unknown type names yield an empty events array, not a 400. |
+
+### Cursor semantics
+
+- The cursor is the decimal string of `harvest_events.id` (a BIGSERIAL integer).
+- Pagination is exclusive: `after=N` returns rows with `id > N`, in ascending order.
+- Absent `next_cursor` in the response means you are on the last page.
+- The cursor is gap-tolerant and append-safe: concurrent event appends with higher `id`
+  values are always reachable via future pages; already-returned rows are never re-emitted.
+
+### Response shape
+
+```json
+{
+  "events": [
+    {
+      "id": 42,
+      "event_id": 0,
+      "timestamp": "2026-06-27T10:00:00Z",
+      "type": "WorkflowStarted",
+      "data": { "workflow_id": "my-wf", "input": { "n": 1 } }
+    }
+  ],
+  "next_cursor": "42",
+  "total_events": 350,
+  "last_event_id": 9999
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `events` | array | Events on this page (≤ `limit`). |
+| `next_cursor` | string \| null | Cursor for the next page. `null` = last page. |
+| `total_events` | integer | Total event count for this execution, **unaffected** by `event_type` filter. |
+| `last_event_id` | integer | Highest `harvest_events.id` for this execution (unfiltered). |
+
+Each entry in `events`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | integer | `harvest_events.id` — the cursor anchor for keyset pagination. |
+| `event_id` | integer | Sequential event index within this execution (0-based). |
+| `timestamp` | string | RFC 3339 timestamp recorded when the event was appended. |
+| `type` | string | Event discriminator (e.g. `TimerStarted`, `ActivityCompleted`). |
+| `data` | object | Event payload (the `data` object from the adjacently-tagged stored JSON). |
+
+### `get_workflow` truncation contract
+
+`GET /workflows/{id}` now bounds `history` to the first **100** events and adds two
+new fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `history_truncated` | boolean | `true` when the execution has more than 100 events and the embedded `history` is a partial view. |
+| `history_endpoint` | string | URL path of this paginated endpoint (e.g. `/workflows/{id}/history`). |
+
+`GET /workflows/{id}/history/export` (full history export) is unchanged.
+
+### Paging example
+
+```bash
+# Page 1 (first 50 events)
+curl -H "x-harvest-admin: true" \
+  "/api/harvest/workflows/$EXEC_ID/history?limit=50"
+
+# Page 2 (use next_cursor from page 1)
+curl -H "x-harvest-admin: true" \
+  "/api/harvest/workflows/$EXEC_ID/history?limit=50&after=$CURSOR"
+
+# Filter to only TimerStarted + TimerFired events
+curl -H "x-harvest-admin: true" \
+  "/api/harvest/workflows/$EXEC_ID/history?event_type=TimerStarted&event_type=TimerFired"
+```

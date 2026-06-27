@@ -69,7 +69,7 @@
           "name": "page_size",
           "in": "query",
           "required": false,
-          "description": "Number of results per page (1–200). Activates the paginated response envelope {workflows, next_cursor}."
+          "description": "Number of results per page (1\u2013200). Activates the paginated response envelope {workflows, next_cursor}."
         },
         {
           "name": "cursor",
@@ -149,7 +149,9 @@
           "external_handoffs",
           "last_completion_result",
           "last_error",
-          "scheduled_time"
+          "scheduled_time",
+          "history_truncated",
+          "history_endpoint"
         ]
       },
       "error_responses": [
@@ -162,6 +164,64 @@
           "description": "Database error."
         }
       ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/history",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Paginated, filterable event history for a single workflow execution (issue #529). Cursor is the harvest_events.id (BIGSERIAL); absent next_cursor means last page.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Execution UUID."
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "required": false,
+          "description": "Maximum events per page (1\u20131000, default 100)."
+        },
+        {
+          "name": "after",
+          "in": "query",
+          "required": false,
+          "description": "Exclusive cursor anchor (harvest_events.id). Opaque \u2014 treat as a string; absent means start from the first event."
+        },
+        {
+          "name": "event_type",
+          "in": "query",
+          "required": false,
+          "description": "Repeatable. Filter to matching event type discriminators (e.g. TimerStarted, ActivityCompleted). Unknown names yield an empty page."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "events",
+          "next_cursor",
+          "total_events",
+          "last_event_id"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Malformed cursor or non-integer limit."
+        },
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ],
+      "idempotency": "Fully idempotent; read-only."
     },
     {
       "method": "GET",
@@ -180,7 +240,7 @@
           "name": "wait",
           "in": "query",
           "required": false,
-          "description": "Optional wait duration such as 250ms, 5s, or 1m. Defaults to 0s. Values above the server ceiling (default 30s, configurable via set_workflow_result_max_wait) are silently clamped — not rejected with 400."
+          "description": "Optional wait duration such as 250ms, 5s, or 1m. Defaults to 0s. Values above the server ceiling (default 30s, configurable via set_workflow_result_max_wait) are silently clamped \u2014 not rejected with 400."
         }
       ],
       "request_body": null,
@@ -678,13 +738,27 @@
         "status": 201,
         "note": "Returns 200 when an existing live execution is attached rather than a fresh one started.",
         "fields": [
-          { "name": "execution_id" },
-          { "name": "workflow_name" },
-          { "name": "workflow_id" },
-          { "name": "state" },
-          { "name": "started_fresh" },
-          { "name": "update_id" },
-          { "name": "result" }
+          {
+            "name": "execution_id"
+          },
+          {
+            "name": "workflow_name"
+          },
+          {
+            "name": "workflow_id"
+          },
+          {
+            "name": "state"
+          },
+          {
+            "name": "started_fresh"
+          },
+          {
+            "name": "update_id"
+          },
+          {
+            "name": "result"
+          }
         ]
       },
       "error_responses": [
@@ -970,7 +1044,7 @@
       "path": "/workflows/{id}/activities/{activity_exec_id}/retry-now",
       "category": "workflow",
       "read_only": false,
-      "description": "Force a backing-off activity to retry immediately by advancing its scheduled_at to NOW() and waking an idle worker via pg_notify. Only PENDING tasks (including those waiting out exponential backoff) can be advanced. Local activities run inline and have no task-queue row — this endpoint does not apply to them.",
+      "description": "Force a backing-off activity to retry immediately by advancing its scheduled_at to NOW() and waking an idle worker via pg_notify. Only PENDING tasks (including those waiting out exponential backoff) can be advanced. Local activities run inline and have no task-queue row \u2014 this endpoint does not apply to them.",
       "idempotency": "Idempotent: calling on an already-eligible task (scheduled_at <= now) returns advanced=false and performs no update. Calling twice after advancing also returns advanced=false on the second call.",
       "params": [
         {
@@ -1003,7 +1077,7 @@
           "already_eligible"
         ],
         "field_notes": {
-          "advanced": "true when scheduled_at was moved to immediate eligibility; false otherwise. Note: advanced=true means scheduled_at was updated, not that the task will be dispatched immediately — per-queue rate-limit buckets and concurrency caps in claim_task can still defer actual dispatch.",
+          "advanced": "true when scheduled_at was moved to immediate eligibility; false otherwise. Note: advanced=true means scheduled_at was updated, not that the task will be dispatched immediately \u2014 per-queue rate-limit buckets and concurrency caps in claim_task can still defer actual dispatch.",
           "already_eligible": "Only meaningful when advanced=false. true=task was already claimable (idempotent no-op). false=a concurrent worker claimed the task between the SELECT and UPDATE (task is now RUNNING).",
           "next_retry_at": "The backdated scheduled_at written to the task when advanced=true (immediately claimable). null when advanced=false."
         }
@@ -1104,7 +1178,7 @@
       "category": "workflow",
       "read_only": false,
       "description": "Send a named signal to a running workflow execution. The request body is the signal payload itself (free-form JSON). Supply an exactly-once delivery key out-of-band via the Idempotency-Key header or the idempotency_key query param (issue #521).",
-      "idempotency": "Optional exactly-once delivery: when an Idempotency-Key header (or idempotency_key query param) is supplied, repeated deliveries with the same key for the same execution land exactly one SignalReceived event — the response reports signal_delivered=false for the deduped retries. Dedupe scope is shard-local, keyed on (execution_id, idempotency_key). Omitting the key reproduces the legacy at-least-once behavior (every call delivers a distinct signal event).",
+      "idempotency": "Optional exactly-once delivery: when an Idempotency-Key header (or idempotency_key query param) is supplied, repeated deliveries with the same key for the same execution land exactly one SignalReceived event \u2014 the response reports signal_delivered=false for the deduped retries. Dedupe scope is shard-local, keyed on (execution_id, idempotency_key). Omitting the key reproduces the legacy at-least-once behavior (every call delivers a distinct signal event).",
       "params": [
         {
           "name": "id",
@@ -1521,14 +1595,38 @@
         "note": "Returns 200 (not 201) when dry_run is true: the plan is computed and returned without any write, and new_run_exec_id / events_carried_over are omitted.",
         "free_form": false,
         "fields": [
-          { "name": "dry_run", "description": "True for a dry-run preview." },
-          { "name": "dag_name", "description": "The DAG name." },
-          { "name": "source_run_exec_id", "description": "The source DAG run execution id." },
-          { "name": "reset_to_event_id", "description": "Resolved 0-based reset event id passed to the #148 reset." },
-          { "name": "nodes_to_re_execute", "description": "Nodes that will re-execute on the new run." },
-          { "name": "nodes_carried_over", "description": "Nodes whose recorded results are carried over." },
-          { "name": "new_run_exec_id", "description": "The forked DAG run execution id (omitted on dry run)." },
-          { "name": "events_carried_over", "description": "Number of carried-over events on the new run (omitted on dry run)." }
+          {
+            "name": "dry_run",
+            "description": "True for a dry-run preview."
+          },
+          {
+            "name": "dag_name",
+            "description": "The DAG name."
+          },
+          {
+            "name": "source_run_exec_id",
+            "description": "The source DAG run execution id."
+          },
+          {
+            "name": "reset_to_event_id",
+            "description": "Resolved 0-based reset event id passed to the #148 reset."
+          },
+          {
+            "name": "nodes_to_re_execute",
+            "description": "Nodes that will re-execute on the new run."
+          },
+          {
+            "name": "nodes_carried_over",
+            "description": "Nodes whose recorded results are carried over."
+          },
+          {
+            "name": "new_run_exec_id",
+            "description": "The forked DAG run execution id (omitted on dry run)."
+          },
+          {
+            "name": "events_carried_over",
+            "description": "Number of carried-over events on the new run (omitted on dry run)."
+          }
         ]
       },
       "error_responses": [
@@ -1949,12 +2047,12 @@
           {
             "name": "dead_lettered_after",
             "required": false,
-            "description": "RFC 3339 timestamp — only redrive entries dead-lettered at or after this time."
+            "description": "RFC 3339 timestamp \u2014 only redrive entries dead-lettered at or after this time."
           },
           {
             "name": "dead_lettered_before",
             "required": false,
-            "description": "RFC 3339 timestamp — only redrive entries dead-lettered before this time."
+            "description": "RFC 3339 timestamp \u2014 only redrive entries dead-lettered before this time."
           },
           {
             "name": "error_contains",
@@ -4089,18 +4187,66 @@
       "request_body": {
         "free_form": false,
         "fields": [
-          { "name": "schedule_expr", "type": "string", "description": "Cron, interval, or manual expression (same format as POST /admin/schedules/workflow)." },
-          { "name": "timezone", "type": "string", "description": "IANA timezone for cron evaluation. Defaults to UTC." },
-          { "name": "catchup", "type": "boolean", "description": "Whether missed fires should be caught up. Informational only in preview; defaults to false." },
-          { "name": "max_active_runs", "type": "integer", "description": "Maximum concurrent runs. Used to set would_skip_if_active. Defaults to 1." },
-          { "name": "paused", "type": "boolean", "description": "If true, returns empty entries with is_paused=true." },
-          { "name": "jitter_secs", "type": "integer", "description": "Jitter window in seconds. 0 disables jitter. Validated via validate_jitter." },
-          { "name": "overlap_policy", "type": "string", "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other. Defaults to skip." },
-          { "name": "buffer_all_max", "type": "integer", "description": "Max buffered slots under buffer_all. Defaults to 100." },
-          { "name": "calendar", "type": "string", "description": "Optional named calendar for exclusion filtering. Returns 400 if not found." },
-          { "name": "skip_policy", "type": "string", "description": "One of: skip, run_next_business_day, run_prev_business_day. Defaults to skip." },
-          { "name": "count", "type": "integer", "description": "Number of entries to return. Defaults to 10, max 100." },
-          { "name": "from", "type": "string", "description": "ISO-8601 UTC start instant. Defaults to now." }
+          {
+            "name": "schedule_expr",
+            "type": "string",
+            "description": "Cron, interval, or manual expression (same format as POST /admin/schedules/workflow)."
+          },
+          {
+            "name": "timezone",
+            "type": "string",
+            "description": "IANA timezone for cron evaluation. Defaults to UTC."
+          },
+          {
+            "name": "catchup",
+            "type": "boolean",
+            "description": "Whether missed fires should be caught up. Informational only in preview; defaults to false."
+          },
+          {
+            "name": "max_active_runs",
+            "type": "integer",
+            "description": "Maximum concurrent runs. Used to set would_skip_if_active. Defaults to 1."
+          },
+          {
+            "name": "paused",
+            "type": "boolean",
+            "description": "If true, returns empty entries with is_paused=true."
+          },
+          {
+            "name": "jitter_secs",
+            "type": "integer",
+            "description": "Jitter window in seconds. 0 disables jitter. Validated via validate_jitter."
+          },
+          {
+            "name": "overlap_policy",
+            "type": "string",
+            "description": "One of: skip, buffer_one, buffer_all, cancel_other, terminate_other. Defaults to skip."
+          },
+          {
+            "name": "buffer_all_max",
+            "type": "integer",
+            "description": "Max buffered slots under buffer_all. Defaults to 100."
+          },
+          {
+            "name": "calendar",
+            "type": "string",
+            "description": "Optional named calendar for exclusion filtering. Returns 400 if not found."
+          },
+          {
+            "name": "skip_policy",
+            "type": "string",
+            "description": "One of: skip, run_next_business_day, run_prev_business_day. Defaults to skip."
+          },
+          {
+            "name": "count",
+            "type": "integer",
+            "description": "Number of entries to return. Defaults to 10, max 100."
+          },
+          {
+            "name": "from",
+            "type": "string",
+            "description": "ISO-8601 UTC start instant. Defaults to now."
+          }
         ]
       },
       "success_response": {
@@ -4152,10 +4298,26 @@
       "read_only": true,
       "description": "List schedule-decision records (fire/skip/overlap/catchup outcomes) across all schedules.",
       "params": [
-        { "name": "schedule_id", "type": "string", "description": "Filter by schedule UUID." },
-        { "name": "decision", "type": "string", "description": "Filter by decision kind (e.g. fired, skipped, overlap_skipped)." },
-        { "name": "reason", "type": "string", "description": "Filter by reason label." },
-        { "name": "limit", "type": "integer", "description": "Maximum number of records to return. Defaults to 50." }
+        {
+          "name": "schedule_id",
+          "type": "string",
+          "description": "Filter by schedule UUID."
+        },
+        {
+          "name": "decision",
+          "type": "string",
+          "description": "Filter by decision kind (e.g. fired, skipped, overlap_skipped)."
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "description": "Filter by reason label."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum number of records to return. Defaults to 50."
+        }
       ],
       "request_body": null,
       "success_response": {
@@ -4164,8 +4326,14 @@
         "fields": []
       },
       "error_responses": [
-        { "status": 400, "description": "Invalid schedule_id UUID." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 400,
+          "description": "Invalid schedule_id UUID."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4175,9 +4343,21 @@
       "read_only": true,
       "description": "List schedule-decision records for a specific schedule.",
       "params": [
-        { "name": "decision", "type": "string", "description": "Filter by decision kind." },
-        { "name": "reason", "type": "string", "description": "Filter by reason label." },
-        { "name": "limit", "type": "integer", "description": "Maximum number of records to return. Defaults to 50." }
+        {
+          "name": "decision",
+          "type": "string",
+          "description": "Filter by decision kind."
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "description": "Filter by reason label."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum number of records to return. Defaults to 50."
+        }
       ],
       "request_body": null,
       "success_response": {
@@ -4186,8 +4366,14 @@
         "fields": []
       },
       "error_responses": [
-        { "status": 404, "description": "Schedule not found." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 404,
+          "description": "Schedule not found."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4544,11 +4730,19 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "fields": ["policies", "reachability", "diverged_queues", "shard_errors"],
+        "fields": [
+          "policies",
+          "reachability",
+          "diverged_queues",
+          "shard_errors"
+        ],
         "notes": "diverged_queues lists queue names whose active build_id differs across shards, indicating a partial-write incident. shard_errors lists shards that could not be reached."
       },
       "error_responses": [
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4563,18 +4757,43 @@
         "required": true,
         "free_form": false,
         "fields": [
-          { "name": "queue_name", "required": true, "description": "Task queue to configure the build policy for." },
-          { "name": "build_id", "required": true, "description": "Build ID to assign to new workflow starts on this queue." },
-          { "name": "deployment_name", "required": false, "description": "Optional human-readable deployment label." }
+          {
+            "name": "queue_name",
+            "required": true,
+            "description": "Task queue to configure the build policy for."
+          },
+          {
+            "name": "build_id",
+            "required": true,
+            "description": "Build ID to assign to new workflow starts on this queue."
+          },
+          {
+            "name": "deployment_name",
+            "required": false,
+            "description": "Optional human-readable deployment label."
+          }
         ]
       },
       "success_response": {
         "status": 200,
-        "fields": ["id", "queue_name", "build_id", "deployment_name", "created_at", "updated_at"]
+        "fields": [
+          "id",
+          "queue_name",
+          "build_id",
+          "deployment_name",
+          "created_at",
+          "updated_at"
+        ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4587,11 +4806,18 @@
       "request_body": null,
       "success_response": {
         "status": 200,
-        "fields": ["entries", "diverged_pairs", "shard_errors"],
+        "fields": [
+          "entries",
+          "diverged_pairs",
+          "shard_errors"
+        ],
         "notes": "entries is an array of BuildCompatEntry objects. diverged_pairs lists (build_id, compatible_with) pairs present on some shards but absent on others, indicating a partial fanout incident. shard_errors lists shards that could not be reached; non-empty means the list may be incomplete."
       },
       "error_responses": [
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4606,17 +4832,36 @@
         "required": true,
         "free_form": false,
         "fields": [
-          { "name": "build_id", "required": true, "description": "The worker build that will process tasks." },
-          { "name": "compatible_with", "required": true, "description": "The assigned build whose tasks the worker build may safely replay." }
+          {
+            "name": "build_id",
+            "required": true,
+            "description": "The worker build that will process tasks."
+          },
+          {
+            "name": "compatible_with",
+            "required": true,
+            "description": "The assigned build whose tasks the worker build may safely replay."
+          }
         ]
       },
       "success_response": {
         "status": 201,
-        "fields": ["id", "build_id", "compatible_with", "declared_at"]
+        "fields": [
+          "id",
+          "build_id",
+          "compatible_with",
+          "declared_at"
+        ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4627,8 +4872,18 @@
       "description": "Revoke a compatibility declaration between two build IDs.",
       "idempotency": "Idempotent: revoking a non-existent pair returns revoked=false without error.",
       "params": [
-        { "name": "build_id", "in": "path", "required": true, "description": "The worker build." },
-        { "name": "compat_with", "in": "path", "required": true, "description": "The assigned build to remove from the compatibility set." }
+        {
+          "name": "build_id",
+          "in": "path",
+          "required": true,
+          "description": "The worker build."
+        },
+        {
+          "name": "compat_with",
+          "in": "path",
+          "required": true,
+          "description": "The assigned build to remove from the compatibility set."
+        }
       ],
       "request_body": {
         "required": false,
@@ -4637,11 +4892,19 @@
       },
       "success_response": {
         "status": 200,
-        "fields": ["revoked"]
+        "fields": [
+          "revoked"
+        ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4656,20 +4919,35 @@
         "required": true,
         "free_form": false,
         "fields": [
-          { "name": "build_id", "required": true, "description": "The build ID to check for retirement readiness." }
+          {
+            "name": "build_id",
+            "required": true,
+            "description": "The build ID to check for retirement readiness."
+          }
         ]
       },
       "success_response": {
         "status": 200,
-        "fields": ["build_id", "safe_to_retire", "open_executions", "pending_tasks"]
+        "fields": [
+          "build_id",
+          "safe_to_retire",
+          "open_executions",
+          "pending_tasks"
+        ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
         {
           "status": 409,
           "description": "Build has open executions or pending tasks and cannot be retired yet. Body contains the same fields showing current counts."
         },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4680,13 +4958,19 @@
       "description": "List all active (non-lifted) admission gates.",
       "idempotency": "Read-only; always idempotent.",
       "params": [],
-      "request_body": { "required": false, "free_form": true },
+      "request_body": {
+        "required": false,
+        "free_form": true
+      },
       "success_response": {
         "status": 200,
         "free_form": true
       },
       "error_responses": [
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4701,22 +4985,61 @@
         "required": true,
         "free_form": false,
         "fields": [
-          { "name": "scope_kind", "required": true, "description": "One of: fleet, workflow_name, queue, shard_id, owner." },
-          { "name": "scope_value", "required": false, "description": "Required for non-fleet scopes." },
-          { "name": "reason", "required": true, "description": "Human-readable incident description." },
-          { "name": "message", "required": false, "description": "Optional extended message surfaced in the Vantage UI." },
-          { "name": "expires_at", "required": false, "description": "ISO 8601 timestamp after which the gate self-clears." }
+          {
+            "name": "scope_kind",
+            "required": true,
+            "description": "One of: fleet, workflow_name, queue, shard_id, owner."
+          },
+          {
+            "name": "scope_value",
+            "required": false,
+            "description": "Required for non-fleet scopes."
+          },
+          {
+            "name": "reason",
+            "required": true,
+            "description": "Human-readable incident description."
+          },
+          {
+            "name": "message",
+            "required": false,
+            "description": "Optional extended message surfaced in the Vantage UI."
+          },
+          {
+            "name": "expires_at",
+            "required": false,
+            "description": "ISO 8601 timestamp after which the gate self-clears."
+          }
         ]
       },
       "success_response": {
         "status": 201,
-        "fields": ["id", "scope_kind", "scope_value", "reason", "created_at", "expires_at"]
+        "fields": [
+          "id",
+          "scope_kind",
+          "scope_value",
+          "reason",
+          "created_at",
+          "expires_at"
+        ]
       },
       "error_responses": [
-        { "status": 400, "description": "Invalid scope_kind/scope_value combination or empty reason." },
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 429, "description": "Active gate limit (100) reached." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 400,
+          "description": "Invalid scope_kind/scope_value combination or empty reason."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 429,
+          "description": "Active gate limit (100) reached."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4727,16 +5050,33 @@
       "description": "Lift (soft-delete) an admission gate, immediately re-opening the blocked scope.",
       "idempotency": "Idempotent: lifting a gate that does not exist or is already lifted returns lifted=false without error.",
       "params": [
-        { "name": "id", "in": "path", "required": true, "description": "UUID of the gate to lift." }
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "UUID of the gate to lift."
+        }
       ],
-      "request_body": { "required": false, "free_form": false, "fields": [] },
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
       "success_response": {
         "status": 200,
-        "fields": ["lifted"]
+        "fields": [
+          "lifted"
+        ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 503, "description": "Database unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
       ]
     },
     {
@@ -4747,7 +5087,12 @@
       "description": "Get detailed worker and queue status eligibility and diagnostic breakdown for triaging stuck tasks in a specific queue.",
       "idempotency": "Read-only; always idempotent.",
       "params": [
-        { "name": "queue_name", "in": "path", "required": true, "description": "Target task queue name." }
+        {
+          "name": "queue_name",
+          "in": "path",
+          "required": true,
+          "description": "Target task queue name."
+        }
       ],
       "request_body": null,
       "success_response": {
@@ -4765,8 +5110,14 @@
         ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 503, "description": "Database or shard unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 503,
+          "description": "Database or shard unavailable."
+        }
       ]
     },
     {
@@ -4777,7 +5128,12 @@
       "description": "Get detailed worker eligibility and diagnostic breakdown narrowed to a single pending task.",
       "idempotency": "Read-only; always idempotent.",
       "params": [
-        { "name": "id", "in": "path", "required": true, "description": "Task UUID." }
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Task UUID."
+        }
       ],
       "request_body": null,
       "success_response": {
@@ -4796,9 +5152,18 @@
         ]
       },
       "error_responses": [
-        { "status": 401, "description": "Unauthenticated request." },
-        { "status": 404, "description": "Task not found across any shard." },
-        { "status": 503, "description": "Database or shard unavailable." }
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "Task not found across any shard."
+        },
+        {
+          "status": 503,
+          "description": "Database or shard unavailable."
+        }
       ]
     }
   ]
