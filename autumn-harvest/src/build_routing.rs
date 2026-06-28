@@ -677,3 +677,108 @@ pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildRe
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_reachability() {
+        let shard1 = vec![
+            BuildReachability {
+                build_id: "build1".to_string(),
+                open_executions: 10,
+                pending_tasks: 5,
+                active_workers: 2,
+                stale_workers: 0,
+                safe_to_retire: false,
+            },
+            BuildReachability {
+                build_id: "build2".to_string(),
+                open_executions: 0,
+                pending_tasks: 0,
+                active_workers: 0,
+                stale_workers: 1,
+                safe_to_retire: true,
+            },
+        ];
+
+        let shard2 = vec![
+            BuildReachability {
+                build_id: "build1".to_string(),
+                open_executions: 5,
+                pending_tasks: 1,
+                active_workers: 1,
+                stale_workers: 1,
+                safe_to_retire: false,
+            },
+            BuildReachability {
+                build_id: "build3".to_string(),
+                open_executions: 0,
+                pending_tasks: 0,
+                active_workers: 0,
+                stale_workers: 0,
+                safe_to_retire: true,
+            },
+        ];
+
+        let merged = merge_reachability(vec![shard1, shard2]);
+        assert_eq!(merged.len(), 3);
+
+        let b1 = merged.iter().find(|r| r.build_id == "build1").unwrap();
+        assert_eq!(b1.open_executions, 15);
+        assert_eq!(b1.pending_tasks, 6);
+        assert_eq!(b1.active_workers, 3);
+        assert_eq!(b1.stale_workers, 1);
+        assert!(!b1.safe_to_retire);
+
+        let b2 = merged.iter().find(|r| r.build_id == "build2").unwrap();
+        assert_eq!(b2.open_executions, 0);
+        assert_eq!(b2.pending_tasks, 0);
+        assert_eq!(b2.active_workers, 0);
+        assert_eq!(b2.stale_workers, 1);
+        assert!(b2.safe_to_retire);
+
+        let b3 = merged.iter().find(|r| r.build_id == "build3").unwrap();
+        assert_eq!(b3.open_executions, 0);
+        assert_eq!(b3.pending_tasks, 0);
+        assert_eq!(b3.active_workers, 0);
+        assert_eq!(b3.stale_workers, 0);
+        assert!(b3.safe_to_retire);
+    }
+
+    #[test]
+    fn test_build_compatibility_set() {
+        let mut set = BuildCompatibilitySet::new();
+
+        // 1. Initially empty, legacy workers can claim anything
+        assert!(set.is_eligible("", Some("any_build")));
+        // Any worker can claim untagged tasks
+        assert!(set.is_eligible("worker_build", None));
+
+        // 2. Add declarations
+        set.add_declaration("worker_v2", "worker_v1");
+
+        // Exact match works
+        assert!(set.is_eligible("worker_v2", Some("worker_v2")));
+
+        // Forward compatibility works
+        assert!(set.is_eligible("worker_v2", Some("worker_v1")));
+
+        // Backward compatibility doesn't work (unless added)
+        assert!(!set.is_eligible("worker_v1", Some("worker_v2")));
+
+        // Unknown build doesn't work
+        assert!(!set.is_eligible("worker_v2", Some("unknown_build")));
+
+        // 3. Remove declarations
+        set.remove_declaration("worker_v2", "worker_v1");
+        assert!(!set.is_eligible("worker_v2", Some("worker_v1")));
+
+        // Remove non-existent declaration does not panic
+        set.remove_declaration("worker_v2", "non_existent");
+
+        // Remove from non-existent worker does not panic
+        set.remove_declaration("non_existent_worker", "non_existent");
+    }
+}
