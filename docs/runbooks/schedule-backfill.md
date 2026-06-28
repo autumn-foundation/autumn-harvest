@@ -144,3 +144,7 @@ harvest audit list --operation schedule.backfill --target-id <schedule-id>
 ## Success metric
 
 For a 7-day hourly schedule (168 timestamps): dry-run planning should return in under 1 s. A full backfill dispatch should complete in under 5 s under normal worker availability. After three repeated client retries, `dispatched + skipped = total` with zero duplicates in the workflow execution or DAG run tables.
+
+## See also
+
+- `docs/runbooks/schedule-run-history.md` — after a backfill, confirm the recovered runs and their outcomes with `harvest schedule runs <schedule-id>`. Backfilled runs appear there under `origin = backfill`, so they stay distinct from the normal `scheduled` cadence.

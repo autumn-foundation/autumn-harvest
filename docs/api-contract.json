@@ -4338,6 +4338,69 @@
     },
     {
       "method": "GET",
+      "path": "/admin/schedules/{id}/runs",
+      "category": "schedule",
+      "read_only": true,
+      "description": "List the workflow executions a schedule launched, newest-first, each with its terminal outcome and dispatch origin (scheduled/backfill/manual_trigger), plus a per-state cadence summary counting only scheduled-origin runs. Fans out across shards; reports partial results when a shard is unavailable instead of failing.",
+      "params": [
+        {
+          "name": "state",
+          "type": "string",
+          "description": "Filter by execution state (repeatable, or comma-separated), e.g. FAILED,TIMED_OUT."
+        },
+        {
+          "name": "origin",
+          "type": "string",
+          "description": "Filter by dispatch origin: scheduled, backfill, or manual_trigger (repeatable)."
+        },
+        {
+          "name": "since",
+          "type": "string",
+          "description": "Inclusive lower bound on started_at: RFC 3339 timestamp or relative duration like 24h."
+        },
+        {
+          "name": "until",
+          "type": "string",
+          "description": "Exclusive upper bound on started_at: RFC 3339 timestamp or relative duration."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "description": "Maximum runs to return (default 100, max 1000). Reported via the echoed limit and next_cursor; never silently truncated."
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "description": "Opaque keyset cursor from a prior response's next_cursor for the next page."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "free_form": false,
+        "fields": [
+          "schedule_id",
+          "status",
+          "runs",
+          "summary",
+          "limit",
+          "next_cursor",
+          "shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid state, origin, since/until, limit, or cursor."
+        },
+        {
+          "status": 404,
+          "description": "Schedule id is not a valid UUID."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/schedules/{id}/decisions",
       "category": "schedule",
       "read_only": true,

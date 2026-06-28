@@ -143,6 +143,9 @@ pub struct WorkflowExecution {
     pub workflow_retry_policy: Option<serde_json::Value>,
     /// ID of the previous failed execution in this retry chain (issue #523). NULL for first attempt.
     pub retry_of_exec_id: Option<Uuid>,
+    /// Dispatch origin (issue #534): `scheduled` / `backfill` / `manual_trigger` for
+    /// schedule-attributed runs, `None` for all non-scheduled runs. Metadata only.
+    pub origin: Option<String>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -187,6 +190,9 @@ pub struct NewWorkflowExecution<'a> {
     pub workflow_retry_policy: Option<serde_json::Value>,
     /// ID of the previous failed execution in this retry chain (issue #523). NULL for first attempt.
     pub retry_of_exec_id: Option<Uuid>,
+    /// Dispatch origin (issue #534): `scheduled` / `backfill` / `manual_trigger` for
+    /// schedule-attributed runs, `None` for all non-scheduled runs. Metadata only.
+    pub origin: Option<&'a str>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────

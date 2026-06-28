@@ -392,6 +392,7 @@ impl DeferredTriggerStart {
                     workflow_retry_policy: self.retry_policy.clone(),
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
+                    origin: None,
                 },
             )
             .await;
@@ -625,6 +626,8 @@ pub fn evaluate_triggers_for_execution<'a>(
                         workflow_retry_policy: target_retry_policy.clone(),
                         retry_of_exec_id: None,
                         max_workflow_attempts_ceiling,
+                        // Completion-trigger start is not a schedule fire (issue #534).
+                        origin: None,
                     },
                 )
                 .await
@@ -841,6 +844,8 @@ pub async fn enforce_completion_triggers_outbox(
                 workflow_retry_policy: target_retry_policy,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling,
+                // Completion-trigger start is not a schedule fire (issue #534).
+                origin: None,
             },
         )
         .await;

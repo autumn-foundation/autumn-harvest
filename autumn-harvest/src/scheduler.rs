@@ -793,6 +793,7 @@ pub async fn trigger_unified_dag(
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -2811,6 +2812,8 @@ async fn tick_one_workflow_schedule(
                     .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
+                // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
+                origin: Some(crate::execution::ORIGIN_SCHEDULED),
             },
         )
         .await;
@@ -3727,6 +3730,8 @@ async fn drain_buffered_schedule_runs(
                         .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
+                    // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
+                    origin: Some(crate::execution::ORIGIN_SCHEDULED),
                 },
             )
             .await;

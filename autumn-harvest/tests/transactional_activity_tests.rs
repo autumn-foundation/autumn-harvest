@@ -378,6 +378,7 @@ async fn transactional_activity_happy_path_atomic_commit() {
                 workflow_retry_policy: None,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
+                origin: None,
             },
         )
         .await
@@ -464,6 +465,7 @@ async fn transactional_activity_err_rolls_back_user_writes() {
                 workflow_retry_policy: None,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
+                origin: None,
             },
         )
         .await

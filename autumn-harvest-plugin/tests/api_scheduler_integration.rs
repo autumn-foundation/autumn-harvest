@@ -598,6 +598,7 @@ async fn insert_workflow_on_url(
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -684,6 +685,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -850,6 +852,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             workflow_attempt: 1,
             workflow_retry_policy: None,
             retry_of_exec_id: None,
+            origin: None,
         })
         .execute(&mut conn)
         .await
@@ -1183,6 +1186,7 @@ async fn seed_scheduled_activity_task_from_url(
             workflow_attempt: 1,
             workflow_retry_policy: None,
             retry_of_exec_id: None,
+            origin: None,
         })
         .execute(&mut conn)
         .await

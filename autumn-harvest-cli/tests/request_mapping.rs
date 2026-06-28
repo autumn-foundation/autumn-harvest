@@ -1179,6 +1179,61 @@ fn schedule_backfill_missing_to_is_rejected_by_clap() {
 }
 
 #[test]
+fn schedule_runs_maps_to_get_runs_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "runs",
+        "00000000-0000-0000-0000-000000000042",
+    ])
+    .expect("schedule runs args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("schedule runs request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(
+        request.path,
+        "/admin/schedules/00000000-0000-0000-0000-000000000042/runs"
+    );
+    assert!(request.body.is_none());
+}
+
+#[test]
+fn schedule_runs_threads_filters_into_query() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "schedule",
+        "runs",
+        "00000000-0000-0000-0000-000000000042",
+        "--state",
+        "FAILED",
+        "--state",
+        "TIMED_OUT",
+        "--origin",
+        "scheduled",
+        "--since",
+        "24h",
+        "--limit",
+        "50",
+    ])
+    .expect("schedule runs filter args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("schedule runs request should build");
+    assert_eq!(request.method, ApiMethod::Get);
+    let path = request.path;
+    assert!(path.starts_with("/admin/schedules/00000000-0000-0000-0000-000000000042/runs?"));
+    assert!(path.contains("state=FAILED"), "path was {path}");
+    assert!(path.contains("state=TIMED_OUT"), "path was {path}");
+    assert!(path.contains("origin=scheduled"), "path was {path}");
+    assert!(path.contains("since=24h"), "path was {path}");
+    assert!(path.contains("limit=50"), "path was {path}");
+}
+
+#[test]
 fn canary_maps_to_management_api_request() {
     let cli = Cli::try_parse_from([
         "harvest",

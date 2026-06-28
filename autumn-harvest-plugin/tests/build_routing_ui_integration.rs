@@ -626,6 +626,7 @@ async fn api_retire_build_returns_conflict_when_not_safe() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -924,6 +925,7 @@ async fn two_build_rolling_deploy_full_lifecycle() {
                 workflow_retry_policy: None,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
+                origin: None,
             },
         )
         .await

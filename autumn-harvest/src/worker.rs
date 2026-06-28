@@ -2526,6 +2526,7 @@ async fn persist_workflow_failure(
                             workflow_retry_policy: Some(policy),
                             retry_of_exec_id: Some(exec_id.as_uuid()),
                             max_workflow_attempts_ceiling: None,
+                            origin: None,
                         };
 
                         match crate::execution::start_or_load_workflow_execution_collect(
@@ -3462,6 +3463,7 @@ async fn persist_all_started_child_workflows(
                     workflow_retry_policy: child_retry_policy
                         .and_then(|p| serde_json::to_value(&p).ok()),
                     retry_of_exec_id: None,
+                    origin: None, // child workflow, not a schedule fire (issue #534)
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
@@ -4061,6 +4063,7 @@ async fn create_detached_child_executions(
             workflow_retry_policy: detached_retry_policy
                 .and_then(|p| serde_json::to_value(&p).ok()),
             retry_of_exec_id: None,
+            origin: None, // detached child workflow, not a schedule fire (issue #534)
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -5386,6 +5389,9 @@ async fn persist_workflow_continue_as_new(
         workflow_attempt: 1,
         workflow_retry_policy: execution.workflow_retry_policy.clone(),
         retry_of_exec_id: None,
+        // Preserve dispatch origin through continue-as-new so a continued scheduled run
+        // stays attributed to its schedule's cadence (issue #534).
+        origin: execution.origin.as_deref(),
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);

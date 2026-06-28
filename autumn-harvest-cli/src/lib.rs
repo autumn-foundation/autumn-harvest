@@ -1107,6 +1107,29 @@ enum ScheduleCommand {
         #[arg(long)]
         force: bool,
     },
+    /// List the runs a schedule launched, newest-first, with terminal outcomes.
+    Runs {
+        /// Schedule row ID (UUID).
+        id: String,
+        /// Filter by execution state (repeatable), e.g. --state FAILED --state TIMED_OUT.
+        #[arg(long = "state")]
+        state: Vec<String>,
+        /// Filter by dispatch origin (repeatable): scheduled, backfill, manual_trigger.
+        #[arg(long = "origin")]
+        origin: Vec<String>,
+        /// Only runs started at/after this RFC 3339 time or relative duration (e.g. 24h).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only runs started before this RFC 3339 time or relative duration.
+        #[arg(long)]
+        until: Option<String>,
+        /// Maximum runs to return (default 100, max 1000).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Opaque keyset cursor from a prior response's `next_cursor`.
+        #[arg(long)]
+        cursor: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3834,6 +3857,41 @@ fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
                 path.push_str("?force=true");
             }
             Ok(ApiRequest::post(path, Some(Value::Object(body))))
+        }
+        ScheduleCommand::Runs {
+            id,
+            state,
+            origin,
+            since,
+            until,
+            limit,
+            cursor,
+        } => {
+            let mut params: Vec<(&str, String)> = Vec::new();
+            for s in state {
+                params.push(("state", s.clone()));
+            }
+            for o in origin {
+                params.push(("origin", o.clone()));
+            }
+            if let Some(v) = since {
+                params.push(("since", v.clone()));
+            }
+            if let Some(v) = until {
+                params.push(("until", v.clone()));
+            }
+            if let Some(v) = limit {
+                params.push(("limit", v.to_string()));
+            }
+            if let Some(v) = cursor {
+                params.push(("cursor", v.clone()));
+            }
+            let mut path = format!("/admin/schedules/{}/runs", path_segment(id));
+            if !params.is_empty() {
+                path.push('?');
+                path.push_str(&encode_query_params(&params));
+            }
+            Ok(ApiRequest::get(path))
         }
     }
 }

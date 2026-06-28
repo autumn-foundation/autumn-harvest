@@ -209,6 +209,7 @@ async fn start_workflow(
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -417,6 +418,7 @@ async fn insert_detached_child_execution(
             workflow_attempt: 1,
             workflow_retry_policy: None,
             retry_of_exec_id: None,
+            origin: None,
         })
         .execute(conn)
         .await
@@ -1013,6 +1015,7 @@ async fn detached_child_execution_timeout_does_not_wake_parent() {
             workflow_attempt: 1,
             workflow_retry_policy: None,
             retry_of_exec_id: None,
+            origin: None,
         })
         .execute(&mut conn)
         .await

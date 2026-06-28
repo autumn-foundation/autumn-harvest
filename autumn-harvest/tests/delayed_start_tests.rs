@@ -220,6 +220,7 @@ async fn test_delayed_start_validation() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -272,6 +273,7 @@ async fn test_delayed_start_validation() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -384,6 +386,7 @@ async fn test_delayed_start_no_premature_dispatch() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -467,6 +470,7 @@ async fn test_delayed_start_cancel_before_firing() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -557,6 +561,7 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -615,6 +620,7 @@ async fn test_immediate_start_skew_tolerance() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await

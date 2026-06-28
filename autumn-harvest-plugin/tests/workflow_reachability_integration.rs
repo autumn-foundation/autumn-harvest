@@ -189,6 +189,7 @@ async fn insert_execution(
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        origin: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)

@@ -560,6 +560,7 @@ async fn test_trigger_evaluations_same_shard() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -678,6 +679,7 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -791,6 +793,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -871,6 +874,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -973,6 +977,7 @@ async fn test_trigger_state_matching_and_deduplication() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1152,6 +1157,7 @@ async fn test_trigger_cross_shard() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1259,6 +1265,7 @@ async fn test_completion_trigger_via_worker_run() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1380,6 +1387,7 @@ async fn test_trigger_with_custom_queue() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1569,6 +1577,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1787,6 +1796,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -2256,6 +2266,7 @@ async fn test_trigger_evaluations_schema_validation() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -2331,6 +2342,7 @@ async fn test_trigger_evaluations_schema_validation() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -2448,6 +2460,7 @@ async fn test_trigger_emits_fire_metric_outcomes() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await

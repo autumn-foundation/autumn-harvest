@@ -338,6 +338,8 @@ pub(crate) async fn dispatch_workflow_start_request(
             workflow_retry_policy: info_retry_policy,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling,
+            // Outbox delivery is not a schedule fire (issue #534).
+            origin: None,
         },
     )
     .await?;

@@ -510,6 +510,7 @@ mod db_tests {
                 workflow_attempt: 1,
                 workflow_retry_policy: None,
                 retry_of_exec_id: None,
+                origin: None,
             })
             .execute(conn)
             .await

@@ -401,6 +401,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                     workflow_retry_policy: None,
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: None,
+                    origin: None,
                 },
             )
             .await

@@ -573,6 +573,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        origin: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -637,6 +638,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
+        origin: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -3593,6 +3595,7 @@ async fn insert_named_workflow_execution(
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        origin: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -4147,6 +4150,7 @@ mod reuse_policy_helpers {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         }
     }
 
@@ -5438,6 +5442,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -5605,6 +5610,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -7107,6 +7113,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        origin: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
