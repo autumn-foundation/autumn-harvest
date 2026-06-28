@@ -133,7 +133,7 @@ replay.
 #[workflow]
 async fn checkout(ctx: &WorkflowContext, order: Order) -> Result<String, String> {
     let result = ctx.execute_activity(&charge_card_info(), order.clone()).await?;
-    // Emitted exactly once on the live execution frontier; suppressed on every replay.
+    // Suppressed on every replay cycle; emitted at the live execution frontier.
     ctx.metrics().counter("orders_processed", 1, &[("tier", &order.tier)]);
     ctx.metrics().histogram("order_amount_usd", order.amount_usd, &[("tier", &order.tier)]);
     Ok(result)
@@ -151,12 +151,23 @@ async fn charge_card(ctx: &ActivityContext, order: Order) -> Result<String, Stri
 
 ### Replay safety
 
-Workflow metrics are **suppressed during replay** (`WorkflowContext::is_replaying() == true`).
-This means a workflow that has been suspended and resumed 50 times will emit its
-`ctx.metrics()` calls exactly **once** — during the first live execution frontier,
-never during the re-invocation cycles the replay engine uses to reconstruct state.
-No new `WorkflowEvent` variants are produced; the history remains byte-identical
-whether or not the workflow author emits custom metrics.
+Workflow metrics are **suppressed during deterministic replay**
+(`WorkflowContext::is_replaying() == true`). A workflow that has been suspended
+and resumed 50 times will not emit `ctx.metrics()` calls during those 50
+re-invocation cycles the replay engine uses to reconstruct state — only at the
+live execution frontier are metrics emitted. No new `WorkflowEvent` variants are
+produced; the history remains byte-identical whether or not the workflow author
+emits custom metrics.
+
+> **At-least-once in crash-recovery scenarios:** if the worker crashes after a
+> `ctx.metrics()` call but before the *next* event (activity schedule, timer,
+> completion) commits to the database, the task is retried from the same frontier.
+> The replay engine re-runs to that point, finds no new committed history past it,
+> and emits the metric again. This is the same at-least-once behaviour Temporal's
+> own `workflow.GetMetricsHandler()` exhibits. In practice, workflow-task durations
+> are measured in milliseconds, so duplicate emissions are rare transients; design
+> counter dashboards to be idempotent (sum/rate) rather than expecting exact
+> counts.
 
 Activity functions always run exactly once per attempt. Retries are separate
 executions and each emits independently — this is intentional and matches the

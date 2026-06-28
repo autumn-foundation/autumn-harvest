@@ -113,7 +113,7 @@ pub async fn run_workflow(
 /// [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
 /// input-changing code changes before deployment.
 #[allow(clippy::implicit_hasher)]
-pub async fn run_workflow_strict(
+pub(crate) async fn run_workflow_strict(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
     handler: WorkflowHandlerFn,
@@ -135,7 +135,7 @@ pub async fn run_workflow_strict(
 /// verify time-branching workflows without false non-determinism failures.
 #[cfg(any(test, feature = "testing"))]
 #[allow(clippy::implicit_hasher)]
-pub async fn run_workflow_strict_advancing_clock(
+pub(crate) async fn run_workflow_strict_advancing_clock(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
     handler: WorkflowHandlerFn,
@@ -280,7 +280,7 @@ async fn run_strict_with_ctx(
 /// it returns `WorkflowOutcome::Suspended` rather than a non-determinism error.
 /// If it suspends *before* all events in history are processed, it fails.
 #[allow(clippy::implicit_hasher, clippy::too_many_lines)]
-pub async fn run_workflow_canary(
+pub(crate) async fn run_workflow_canary(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
     handler: WorkflowHandlerFn,

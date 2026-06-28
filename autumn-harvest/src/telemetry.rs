@@ -2568,7 +2568,8 @@ mod tests {
                     name.starts_with(USER_METRIC_PREFIX),
                     "emitted name must start with USER_METRIC_PREFIX"
                 );
-                self.0.fetch_add(val as usize, Ordering::SeqCst);
+                self.0
+                    .fetch_add(usize::try_from(val).unwrap_or(usize::MAX), Ordering::SeqCst);
             }
         }
 
