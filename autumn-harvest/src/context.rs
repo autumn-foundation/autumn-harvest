@@ -1270,6 +1270,7 @@ impl WorkflowContext {
     /// each durable timer that fires from history advances this by its duration,
     /// so time-aware logic can be unit-tested without a real database.
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn now(&self) -> DateTime<Utc> {
         #[cfg(any(test, feature = "testing"))]
         if let Some(ref atomic) = self.timer_clock_elapsed_secs {

@@ -5100,7 +5100,9 @@ async fn get_workflow_result(
             Ok(None) => return workflow_result_pending_response(),
             // Successor row gone mid-chain — return the last CAN sentinel.
             Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-                return workflow_result_response(last_can_snapshot.unwrap());
+                return workflow_result_response(
+                    last_can_snapshot.expect("last_can_snapshot must be Some at this point"),
+                );
             }
             Err(error) => return map_error(error).into_response(),
             Ok(Some(snapshot)) => {
@@ -5153,7 +5155,7 @@ async fn workflow_result_snapshot_following_can(
             Ok(e) => e,
             // Only swallow NotFound mid-chain (missing successor row).
             Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-                return Ok(last_can_snapshot.unwrap());
+                return Ok(last_can_snapshot.expect("last_can_snapshot must be Some at this point"));
             }
             Err(e) => return Err(map_error(e)),
         };
@@ -5168,14 +5170,16 @@ async fn workflow_result_snapshot_following_can(
         last_can_snapshot = Some(snapshot);
         match load_continue_as_new_successor(api_state, effective_id).await? {
             Some(next_id) => current_id = next_id,
-            None => return Ok(last_can_snapshot.unwrap()),
+            None => {
+                return Ok(last_can_snapshot.expect("last_can_snapshot must be Some at this point"));
+            }
         }
     }
     // Exceeded chain depth — return whatever state the current execution has.
     match load_execution_following_retries(api_state, current_id).await {
         Ok(e) => Ok(WorkflowResult::from_execution(&e)),
         Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-            Ok(last_can_snapshot.unwrap())
+            Ok(last_can_snapshot.expect("last_can_snapshot must be Some at this point"))
         }
         Err(e) => Err(map_error(e)),
     }
@@ -20925,7 +20929,9 @@ async fn evaluate_eligibility_for_shard(
             t.state == "PENDING"
                 && t.scheduled_at <= chrono::Utc::now()
                 && (t.schedule_to_close_at.is_none()
-                    || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+                    || t.schedule_to_close_at
+                        .expect("schedule_to_close_at must be Some when is_none() is false")
+                        > chrono::Utc::now())
         }))
     } else {
         let count: i64 = harvest_task_queue::table
@@ -20952,7 +20958,9 @@ async fn evaluate_eligibility_for_shard(
                 if t.state == "PENDING"
                     && t.scheduled_at <= chrono::Utc::now()
                     && (t.schedule_to_close_at.is_none()
-                        || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+                        || t.schedule_to_close_at
+                            .expect("schedule_to_close_at must be Some when is_none() is false")
+                            > chrono::Utc::now())
                 {
                     Some(t)
                 } else {
@@ -21127,7 +21135,9 @@ async fn evaluate_eligibility_for_shard(
             t.state == "PENDING"
                 && t.scheduled_at <= chrono::Utc::now()
                 && (t.schedule_to_close_at.is_none()
-                    || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
+                    || t.schedule_to_close_at
+                        .expect("schedule_to_close_at must be Some when is_none() is false")
+                        > chrono::Utc::now())
         })
         .collect();
 
@@ -23525,7 +23535,7 @@ mod tests {
             entry.is_some(),
             "POST /workflows/{{workflow_name}}/update-with-start must be in management_api_request_fields"
         );
-        let (_, _, body_fields) = entry.unwrap();
+        let (_, _, body_fields) = entry.expect("entry must exist in stream");
         let body = body_fields.expect("update-with-start must have a structured body");
         assert!(
             body.contains(&"workflow_id"),

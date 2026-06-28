@@ -130,7 +130,7 @@ async fn run_app(
             .unwrap_or_else(|| Duration::from_secs(0));
 
         if event::poll(timeout).unwrap_or(false)
-            && let Event::Key(key) = event::read().unwrap()
+            && let Event::Key(key) = event::read().expect("failed to read terminal event")
             && (key.code == KeyCode::Char('q')
                 || (key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.code == KeyCode::Char('c')))

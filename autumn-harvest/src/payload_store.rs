@@ -391,7 +391,12 @@ mod tests {
         }
         fn get(&self, key: &str) -> PayloadStoreFuture<'_, Vec<u8>> {
             self.gets.fetch_add(1, Ordering::SeqCst);
-            let found = self.blobs.lock().unwrap().get(key).cloned();
+            let found = self
+                .blobs
+                .lock()
+                .expect("blobs lock is poisoned")
+                .get(key)
+                .cloned();
             let key = key.to_string();
             Box::pin(
                 async move { found.ok_or_else(|| PayloadStoreError(format!("missing key {key}"))) },
@@ -399,7 +404,10 @@ mod tests {
         }
         fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()> {
             self.deletes.fetch_add(1, Ordering::SeqCst);
-            self.blobs.lock().unwrap().remove(key);
+            self.blobs
+                .lock()
+                .expect("blobs lock is poisoned")
+                .remove(key);
             Box::pin(async move { Ok(()) })
         }
     }

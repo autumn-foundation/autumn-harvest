@@ -186,9 +186,18 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         for _ in 0..300 {
             let order = weighted_queue_order(&pairs, &mut rng);
-            let zero_pos = order.iter().position(|q| q == "zero").unwrap();
-            let high_pos = order.iter().position(|q| q == "high").unwrap();
-            let med_pos = order.iter().position(|q| q == "med").unwrap();
+            let zero_pos = order
+                .iter()
+                .position(|q| q == "zero")
+                .expect("item must exist in order slice");
+            let high_pos = order
+                .iter()
+                .position(|q| q == "high")
+                .expect("item must exist in order slice");
+            let med_pos = order
+                .iter()
+                .position(|q| q == "med")
+                .expect("item must exist in order slice");
             assert!(
                 zero_pos > high_pos && zero_pos > med_pos,
                 "zero-weight queue must come after all positive-weight queues; order={order:?}"
