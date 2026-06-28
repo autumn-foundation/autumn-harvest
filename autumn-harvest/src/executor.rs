@@ -20,7 +20,8 @@ use crate::context::{
 use crate::event::WorkflowEvent;
 use crate::info::{QueryHandlerInfo, UpdateHandlerInfo, WorkflowHandlerFn};
 use crate::telemetry::{
-    ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID, ATTR_WORKFLOW_ID,
+    ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_REPLAY, ATTR_SHARD_ID, ATTR_WORKFLOW_ID, MetricsRecorder,
+    NoOpMetrics,
 };
 use crate::types::ExecutionId;
 
@@ -119,9 +120,11 @@ pub async fn run_workflow_strict(
     input: Value,
     state: SharedState,
     context_headers: std::collections::HashMap<String, String>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
-        .with_context_headers(context_headers);
+        .with_context_headers(context_headers)
+        .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
 
@@ -132,17 +135,19 @@ pub async fn run_workflow_strict(
 /// verify time-branching workflows without false non-determinism failures.
 #[cfg(any(test, feature = "testing"))]
 #[allow(clippy::implicit_hasher)]
-pub async fn run_workflow_strict_advancing_clock(
+pub(crate) async fn run_workflow_strict_advancing_clock(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
     handler: WorkflowHandlerFn,
     input: Value,
     state: SharedState,
     context_headers: std::collections::HashMap<String, String>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_strict_with_state(exec_id, history, state)
         .with_context_headers(context_headers)
-        .with_advancing_timer_clock();
+        .with_advancing_timer_clock()
+        .with_metrics(metrics);
     run_strict_with_ctx(exec_id, ctx, handler, input).await
 }
 
@@ -275,16 +280,18 @@ async fn run_strict_with_ctx(
 /// it returns `WorkflowOutcome::Suspended` rather than a non-determinism error.
 /// If it suspends *before* all events in history are processed, it fails.
 #[allow(clippy::implicit_hasher, clippy::too_many_lines)]
-pub async fn run_workflow_canary(
+pub(crate) async fn run_workflow_canary(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
     handler: WorkflowHandlerFn,
     input: Value,
     state: SharedState,
     context_headers: std::collections::HashMap<String, String>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
-        .with_context_headers(context_headers);
+        .with_context_headers(context_headers)
+        .with_metrics(metrics);
 
     let span = tracing::info_span!(
         "harvest.workflow.execute",
@@ -435,6 +442,7 @@ pub async fn run_workflow_with_state(
         span_meta,
         &[],
         &[],
+        std::sync::Arc::new(NoOpMetrics),
     )
     .await
 }
@@ -452,6 +460,7 @@ pub async fn run_workflow_with_state_advancing_clock(
     input: Value,
     state: SharedState,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     use crate::context::WorkflowContext;
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
@@ -460,7 +469,8 @@ pub async fn run_workflow_with_state_advancing_clock(
         state,
         WorkflowHistoryPolicy::default(),
     )
-    .with_advancing_timer_clock();
+    .with_advancing_timer_clock()
+    .with_metrics(metrics);
     drive_workflow(ctx, handler, input, span_meta).await
 }
 
@@ -477,6 +487,7 @@ pub async fn run_workflow_with_state_and_history_policy(
     span_meta: Option<&WorkflowExecuteSpanMeta>,
     declarative_query_handlers: &[&QueryHandlerInfo],
     declarative_update_handlers: &[&UpdateHandlerInfo],
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     run_workflow_with_state_history_policy_and_caps(
         exec_id,
@@ -495,6 +506,7 @@ pub async fn run_workflow_with_state_and_history_policy(
         crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
         std::collections::HashMap::new(),
         None,
+        metrics,
     )
     .await
 }
@@ -519,6 +531,7 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     max_current_details_bytes: usize,
     context_headers: std::collections::HashMap<String, String>,
     payload_offload_threshold: Option<u64>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
         exec_id,
@@ -537,7 +550,8 @@ pub async fn run_workflow_with_state_history_policy_and_caps(
     )
     .with_current_details_cap(max_current_details_bytes)
     .with_payload_offload_threshold(payload_offload_threshold)
-    .with_context_headers(context_headers);
+    .with_context_headers(context_headers)
+    .with_metrics(metrics);
 
     // Auto-register declarative handlers before any workflow code runs.
     // This satisfies the AC: "authors do not call ctx.register_*_handler in

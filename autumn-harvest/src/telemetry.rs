@@ -534,6 +534,135 @@ pub const METRIC_LABEL_BUILD_ID: &str = "build_id";
 pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 
 // ---------------------------------------------------------------------------
+// Custom (user) metric constants and validation (issue #532)
+// ---------------------------------------------------------------------------
+
+/// Required prefix for all user-emitted custom metric names.
+///
+/// A call like `ctx.metrics().counter("orders_processed", 1, &[])` emits a
+/// metric named `"harvest.user.orders_processed"`. The prefix is applied
+/// automatically by [`UserMetrics`]; callers supply only the suffix.
+///
+/// Names already starting with `"harvest."` are rejected to prevent collision
+/// with engine-internal metrics (see [`validate_user_metric`]).
+pub const USER_METRIC_PREFIX: &str = "harvest.user.";
+
+/// Maximum byte length of the user-supplied metric name suffix.
+pub const MAX_USER_METRIC_NAME_LEN: usize = 200;
+
+/// Maximum number of key-value labels allowed per custom metric call.
+///
+/// Matches the practical label-count limit recommended by ADR-0001 §7.
+pub const MAX_USER_METRIC_LABELS: usize = 16;
+
+/// High-cardinality label keys that are rejected by [`validate_user_metric`].
+///
+/// Per ADR-0001 §7, execution/activity identifiers must never appear on
+/// metrics because they would create an unbounded label cardinality.
+/// Both dotted and underscore-separated forms are listed to block both
+/// the OpenTelemetry convention (`execution.id`) and the Prometheus convention
+/// (`execution_id`) from being used as label keys.
+pub const FORBIDDEN_USER_LABEL_KEYS: &[&str] = &[
+    // Dotted forms (OpenTelemetry naming convention)
+    "execution.id",
+    "activity.id",
+    "workflow.id",
+    ATTR_EXECUTION_ID, // = "harvest.execution.id"
+    ATTR_WORKFLOW_ID,  // = "harvest.workflow.id"
+    "harvest.activity.id",
+    // Prometheus underscore forms
+    "execution_id",
+    "activity_id",
+    "workflow_id",
+    // Non-namespaced high-cardinality keys
+    "idempotency_key",
+    "run_id",
+];
+
+/// Validation error returned by [`validate_user_metric`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserMetricError {
+    /// The name is empty.
+    EmptyName,
+    /// The name starts with `"harvest."`, which is reserved for engine metrics.
+    ReservedPrefix,
+    /// The name exceeds [`MAX_USER_METRIC_NAME_LEN`] bytes.
+    NameTooLong,
+    /// More than [`MAX_USER_METRIC_LABELS`] labels were supplied.
+    TooManyLabels,
+    /// A label key is empty.
+    EmptyLabelKey,
+    /// A label key is in the high-cardinality denylist ([`FORBIDDEN_USER_LABEL_KEYS`]).
+    ForbiddenLabelKey(String),
+}
+
+impl std::fmt::Display for UserMetricError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyName => write!(f, "custom metric name must not be empty"),
+            Self::ReservedPrefix => write!(
+                f,
+                "custom metric name must not start with \"harvest.\"; \
+                 that prefix is reserved for engine metrics"
+            ),
+            Self::NameTooLong => write!(
+                f,
+                "custom metric name exceeds {MAX_USER_METRIC_NAME_LEN} bytes"
+            ),
+            Self::TooManyLabels => write!(
+                f,
+                "custom metric has more than {MAX_USER_METRIC_LABELS} labels"
+            ),
+            Self::EmptyLabelKey => write!(f, "custom metric label key must not be empty"),
+            Self::ForbiddenLabelKey(key) => write!(
+                f,
+                "label key \"{key}\" is forbidden on custom metrics (ADR-0001 §7 \
+                 cardinality rule); use a low-cardinality label instead"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UserMetricError {}
+
+/// Validate a user-supplied custom metric name and label set.
+///
+/// Called automatically by [`UserMetrics`]; you only need to call this
+/// directly when building a custom [`MetricsRecorder`] that pre-validates
+/// names at registration time.
+///
+/// # Errors
+///
+/// Returns `Err(UserMetricError::*)` for any of the following:
+/// - empty or over-long name suffix
+/// - name starting with `"harvest."` (reserved engine prefix)
+/// - more than [`MAX_USER_METRIC_LABELS`] labels
+/// - empty or forbidden label key
+pub fn validate_user_metric(name: &str, labels: &[(&str, &str)]) -> Result<(), UserMetricError> {
+    if name.is_empty() {
+        return Err(UserMetricError::EmptyName);
+    }
+    if name.starts_with("harvest.") {
+        return Err(UserMetricError::ReservedPrefix);
+    }
+    if name.len() > MAX_USER_METRIC_NAME_LEN {
+        return Err(UserMetricError::NameTooLong);
+    }
+    if labels.len() > MAX_USER_METRIC_LABELS {
+        return Err(UserMetricError::TooManyLabels);
+    }
+    for (key, _) in labels {
+        if key.is_empty() {
+            return Err(UserMetricError::EmptyLabelKey);
+        }
+        if FORBIDDEN_USER_LABEL_KEYS.contains(key) {
+            return Err(UserMetricError::ForbiddenLabelKey((*key).to_string()));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // TraceContextCarrier
 // ---------------------------------------------------------------------------
 
@@ -1384,6 +1513,39 @@ pub trait MetricsRecorder: Send + Sync {
     fn is_enabled(&self) -> bool {
         true
     }
+
+    // ── Custom / user-emitted metrics (issue #532) ────────────────────────
+
+    /// Record a custom counter emitted by workflow or activity author code.
+    ///
+    /// `name` is the **fully-qualified** metric name (already prefixed with
+    /// `"harvest.user."` by [`UserMetrics`]); `labels` are validated
+    /// low-cardinality key-value pairs.  The default implementation is a no-op.
+    ///
+    /// Per ADR-0001 §7, `execution.id` and other high-cardinality identifiers
+    /// must never appear in `labels`.  [`UserMetrics`] enforces this before
+    /// reaching this method.
+    fn record_user_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
+        let _ = (name, value, labels);
+    }
+
+    /// Record a custom gauge emitted by workflow or activity author code.
+    ///
+    /// Same namespacing and cardinality contract as [`record_user_counter`].
+    ///
+    /// [`record_user_counter`]: MetricsRecorder::record_user_counter
+    fn record_user_gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        let _ = (name, value, labels);
+    }
+
+    /// Record a custom histogram sample emitted by workflow or activity author code.
+    ///
+    /// Same namespacing and cardinality contract as [`record_user_counter`].
+    ///
+    /// [`record_user_counter`]: MetricsRecorder::record_user_counter
+    fn record_user_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        let _ = (name, value, labels);
+    }
 }
 
 /// Default metrics recorder that discards every sample.
@@ -1393,6 +1555,117 @@ pub struct NoOpMetrics;
 impl MetricsRecorder for NoOpMetrics {
     fn is_enabled(&self) -> bool {
         false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UserMetrics handle (issue #532)
+// ---------------------------------------------------------------------------
+
+/// Replay-safe custom-metrics handle exposed by `ctx.metrics()`.
+///
+/// Obtained from [`WorkflowContext::metrics`](crate::context::WorkflowContext::metrics)
+/// or [`ActivityContext::metrics`](crate::context::ActivityContext::metrics).
+/// All method calls are **zero-cost no-ops** when the configured
+/// [`MetricsRecorder`] is [`NoOpMetrics`] or when the workflow is replaying.
+///
+/// ## Namespacing
+///
+/// The `name` argument is the **suffix** only.  A full metric name is
+/// assembled as `"harvest.user.{name}"` so custom metrics are clearly
+/// separated from engine metrics in your backend.
+///
+/// ```text
+/// ctx.metrics().counter("orders_processed", 1, &[("tier", "gold")])
+/// // → emits "harvest.user.orders_processed" with label tier=gold
+/// ```
+///
+/// ## Replay safety (workflow metrics only)
+///
+/// When called from a `#[workflow]` body, metric emission is **suppressed
+/// during deterministic replay** (`ctx.is_replaying() == true`).  A counter
+/// incremented once in workflow logic therefore increments the backend exactly
+/// once regardless of how many replay cycles the executor runs.
+///
+/// ## Activity retries
+///
+/// When called from a `#[activity]` body, metrics are **not** suppressed —
+/// every actual invocation emits.  Each retry is a separate execution, so a
+/// counter inside an activity body increments once per attempt.  Document
+/// retry semantics in your metrics if downstream consumers care.
+///
+/// ## Label cardinality
+///
+/// Per ADR-0001 §7, label keys must be low-cardinality.  The following keys
+/// are **always rejected** (logged as warnings, metric is dropped):
+/// `execution.id`, `activity.id`, `workflow.id`, `harvest.execution.id`,
+/// `harvest.activity.id`, `idempotency_key`, `run_id`.  At most
+/// [`MAX_USER_METRIC_LABELS`] labels are accepted per call.
+pub struct UserMetrics<'a> {
+    recorder: &'a dyn MetricsRecorder,
+    suppressed: bool,
+}
+
+impl<'a> UserMetrics<'a> {
+    /// Create a new handle.
+    ///
+    /// `suppressed` should be `true` when `WorkflowContext::is_replaying()` is
+    /// true; always `false` for `ActivityContext`.
+    #[must_use]
+    pub(crate) fn new(recorder: &'a dyn MetricsRecorder, suppressed: bool) -> Self {
+        Self {
+            recorder,
+            suppressed,
+        }
+    }
+
+    /// Emit a custom counter increment.
+    ///
+    /// Suppressed during workflow replay and when telemetry is disabled.
+    /// Logs a `tracing::warn!` and drops the call on label-validation failure.
+    pub fn counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
+        if self.suppressed || !self.recorder.is_enabled() {
+            return;
+        }
+        if let Err(e) = validate_user_metric(name, labels) {
+            tracing::warn!(metric_name = name, error = %e, "custom metric rejected");
+            return;
+        }
+        let full_name = format!("{USER_METRIC_PREFIX}{name}");
+        self.recorder.record_user_counter(&full_name, value, labels);
+    }
+
+    /// Emit a custom gauge observation.
+    ///
+    /// Suppressed during workflow replay and when telemetry is disabled.
+    /// Logs a `tracing::warn!` and drops the call on label-validation failure.
+    pub fn gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        if self.suppressed || !self.recorder.is_enabled() {
+            return;
+        }
+        if let Err(e) = validate_user_metric(name, labels) {
+            tracing::warn!(metric_name = name, error = %e, "custom metric rejected");
+            return;
+        }
+        let full_name = format!("{USER_METRIC_PREFIX}{name}");
+        self.recorder.record_user_gauge(&full_name, value, labels);
+    }
+
+    /// Emit a custom histogram sample.
+    ///
+    /// Suppressed during workflow replay and when telemetry is disabled.
+    /// Logs a `tracing::warn!` and drops the call on label-validation failure.
+    pub fn histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        if self.suppressed || !self.recorder.is_enabled() {
+            return;
+        }
+        if let Err(e) = validate_user_metric(name, labels) {
+            tracing::warn!(metric_name = name, error = %e, "custom metric rejected");
+            return;
+        }
+        let full_name = format!("{USER_METRIC_PREFIX}{name}");
+        self.recorder
+            .record_user_histogram(&full_name, value, labels);
     }
 }
 
@@ -2159,5 +2432,194 @@ mod tests {
             count.activities.load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+
+    // ── Custom metrics tests (issue #532) ────────────────────────────────
+
+    #[test]
+    fn user_metric_prefix_constant_is_correct() {
+        assert_eq!(USER_METRIC_PREFIX, "harvest.user.");
+    }
+
+    #[test]
+    fn validate_user_metric_accepts_valid_name_and_labels() {
+        assert!(
+            validate_user_metric("orders_processed", &[("tier", "gold")]).is_ok(),
+            "valid name + label should pass"
+        );
+        assert!(
+            validate_user_metric("orders_processed", &[]).is_ok(),
+            "empty label list should pass"
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_empty_name() {
+        assert_eq!(
+            validate_user_metric("", &[]),
+            Err(UserMetricError::EmptyName)
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_harvest_prefix() {
+        // Names starting with "harvest." would collide with engine metrics.
+        assert_eq!(
+            validate_user_metric("harvest.workflow.started", &[]),
+            Err(UserMetricError::ReservedPrefix)
+        );
+        assert_eq!(
+            validate_user_metric("harvest.user.something", &[]),
+            Err(UserMetricError::ReservedPrefix),
+            "even the user prefix itself must be rejected in the suffix argument"
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_name_too_long() {
+        let long_name = "a".repeat(MAX_USER_METRIC_NAME_LEN + 1);
+        assert_eq!(
+            validate_user_metric(&long_name, &[]),
+            Err(UserMetricError::NameTooLong)
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_too_many_labels() {
+        let labels: Vec<(&str, &str)> = (0..=MAX_USER_METRIC_LABELS)
+            .map(|_| ("tier", "gold"))
+            .collect();
+        assert_eq!(
+            validate_user_metric("orders", &labels),
+            Err(UserMetricError::TooManyLabels)
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_empty_label_key() {
+        assert_eq!(
+            validate_user_metric("orders", &[("", "value")]),
+            Err(UserMetricError::EmptyLabelKey)
+        );
+    }
+
+    #[test]
+    fn validate_user_metric_rejects_forbidden_label_keys() {
+        // ADR-0001 §7 cardinality rule: these keys are never allowed on metrics.
+        for forbidden in FORBIDDEN_USER_LABEL_KEYS {
+            let result = validate_user_metric("orders", &[(forbidden, "some-uuid")]);
+            assert!(
+                matches!(result, Err(UserMetricError::ForbiddenLabelKey(_))),
+                "label key \"{forbidden}\" should be forbidden"
+            );
+        }
+    }
+
+    #[test]
+    fn user_metrics_noop_recorder_is_suppressed_silently() {
+        // With NoOpMetrics the is_enabled() gate returns false so no validation
+        // is run and nothing panics, even for a theoretically invalid name.
+        let rec = NoOpMetrics;
+        let m = UserMetrics::new(&rec, false);
+        m.counter("orders", 1, &[]);
+        m.gauge("queue_depth", 3.0, &[]);
+        m.histogram("latency_ms", 42.0, &[]);
+    }
+
+    #[test]
+    fn user_metrics_suppressed_flag_short_circuits_even_with_real_recorder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingRec(AtomicUsize);
+        impl MetricsRecorder for CountingRec {
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            fn record_user_counter(&self, _name: &str, _val: u64, _labels: &[(&str, &str)]) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let rec = CountingRec::default();
+        let m = UserMetrics::new(&rec, true); // suppressed = true (replay mode)
+        m.counter("orders", 1, &[]);
+        m.counter("orders", 1, &[]);
+        assert_eq!(
+            rec.0.load(Ordering::SeqCst),
+            0,
+            "suppressed handle must emit zero samples"
+        );
+    }
+
+    #[test]
+    fn user_metrics_live_handle_emits_to_recorder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingRec(AtomicUsize);
+        impl MetricsRecorder for CountingRec {
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            fn record_user_counter(&self, name: &str, val: u64, _labels: &[(&str, &str)]) {
+                // Verify prefix is applied
+                assert!(
+                    name.starts_with(USER_METRIC_PREFIX),
+                    "emitted name must start with USER_METRIC_PREFIX"
+                );
+                self.0
+                    .fetch_add(usize::try_from(val).unwrap_or(usize::MAX), Ordering::SeqCst);
+            }
+        }
+
+        let rec = CountingRec::default();
+        let m = UserMetrics::new(&rec, false); // not suppressed
+        m.counter("orders_processed", 3, &[("tier", "gold")]);
+        assert_eq!(rec.0.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn user_metrics_drops_call_with_forbidden_label_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingRec(AtomicUsize);
+        impl MetricsRecorder for CountingRec {
+            fn is_enabled(&self) -> bool {
+                true
+            }
+            fn record_user_counter(&self, _name: &str, _val: u64, _labels: &[(&str, &str)]) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let rec = CountingRec::default();
+        let m = UserMetrics::new(&rec, false);
+        // execution.id is forbidden — call should be dropped (warn + return)
+        m.counter("orders", 1, &[("execution.id", "some-uuid")]);
+        assert_eq!(
+            rec.0.load(Ordering::SeqCst),
+            0,
+            "metric with forbidden label must be dropped"
+        );
+    }
+
+    #[test]
+    fn record_user_counter_has_noop_default() {
+        // Verify the three new default methods compile and are no-ops on NoOpMetrics.
+        let rec = NoOpMetrics;
+        rec.record_user_counter("harvest.user.orders", 1, &[("tier", "gold")]);
+        rec.record_user_gauge("harvest.user.balance", 42.0, &[]);
+        rec.record_user_histogram("harvest.user.latency_ms", 10.5, &[]);
+    }
+
+    #[test]
+    fn execution_id_is_not_a_parameter_of_record_user_counter() {
+        // ADR-0001 §7 — execution.id must not appear in the method signature.
+        // This test verifies it by construction: the call below compiles only
+        // because the signature is (name, value, labels) with no exec-id param.
+        let rec: Arc<dyn MetricsRecorder> = Arc::new(NoOpMetrics);
+        rec.record_user_counter("harvest.user.orders", 1, &[("tier", "gold")]);
     }
 }

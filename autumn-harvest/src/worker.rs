@@ -1706,6 +1706,7 @@ async fn run_local_activity_inline(
         let ctx =
             ActivityContext::new_local_activity(registry.shared_state(), CancellationToken::new())
                 .with_context_headers(std::sync::Arc::clone(&context_headers))
+                .with_metrics(registry.telemetry().metrics.clone())
                 .with_idempotency_key(local_idempotency_key.clone())
                 .with_attempt(attempt)
                 .with_max_attempts(max_attempts)
@@ -4559,6 +4560,7 @@ async fn process_activity_task(
     )
     .with_trace_context(trace_carrier.clone())
     .with_context_headers(activity_context_headers)
+    .with_metrics(registry.telemetry().metrics.clone())
     .with_idempotency_key(IdempotencyKey::from_activity_exec_id(activity_id))
     .with_attempt(task_attempt(task))
     .with_max_attempts(u32::try_from(task.max_attempts.max(1)).unwrap_or(1))
@@ -6251,6 +6253,7 @@ async fn process_workflow_task(
                 registry
                     .payload_offloader()
                     .map(crate::payload_store::PayloadOffloader::threshold),
+                telemetry.metrics.clone(),
             )
             .await;
 

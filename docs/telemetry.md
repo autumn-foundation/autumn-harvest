@@ -119,6 +119,105 @@ impl MetricsRecorder for MyRecorder {
 
 ---
 
+## Custom workflow/activity metrics (issue #532)
+
+Workflow and activity authors can emit business KPIs ("orders processed",
+"dollars charged") into the same `MetricsRecorder` pipeline the engine uses —
+without standing up a parallel metrics stack or risking double-counting on
+replay.
+
+### API
+
+```rust
+// Inside a #[workflow] function — emission is suppressed during replay:
+#[workflow]
+async fn checkout(ctx: &WorkflowContext, order: Order) -> Result<String, String> {
+    let result = ctx.execute_activity(&charge_card_info(), order.clone()).await?;
+    // Suppressed on every replay cycle; emitted at the live execution frontier.
+    ctx.metrics().counter("orders_processed", 1, &[("tier", &order.tier)]);
+    ctx.metrics().histogram("order_amount_usd", order.amount_usd, &[("tier", &order.tier)]);
+    Ok(result)
+}
+
+// Inside a #[activity] function — always emitted (activities run once per attempt):
+#[activity(start_to_close = "30s")]
+async fn charge_card(ctx: &ActivityContext, order: Order) -> Result<String, String> {
+    // Each retry of this activity is a separate execution — each emits once.
+    ctx.metrics().counter("charge_attempts", 1, &[("payment_method", &order.payment_method)]);
+    // … charge logic …
+    Ok("txn-123".to_string())
+}
+```
+
+### Replay safety
+
+Workflow metrics are **suppressed during deterministic replay**
+(`WorkflowContext::is_replaying() == true`). A workflow that has been suspended
+and resumed 50 times will not emit `ctx.metrics()` calls during those 50
+re-invocation cycles the replay engine uses to reconstruct state — only at the
+live execution frontier are metrics emitted. No new `WorkflowEvent` variants are
+produced; the history remains byte-identical whether or not the workflow author
+emits custom metrics.
+
+> **At-least-once in crash-recovery scenarios:** if the worker crashes after a
+> `ctx.metrics()` call but before the *next* event (activity schedule, timer,
+> completion) commits to the database, the task is retried from the same frontier.
+> The replay engine re-runs to that point, finds no new committed history past it,
+> and emits the metric again. This is the same at-least-once behaviour Temporal's
+> own `workflow.GetMetricsHandler()` exhibits. In practice, workflow-task durations
+> are measured in milliseconds, so duplicate emissions are rare transients; design
+> counter dashboards to be idempotent (sum/rate) rather than expecting exact
+> counts.
+
+Activity functions always run exactly once per attempt. Retries are separate
+executions and each emits independently — this is intentional and matches the
+"each attempt counts" semantics activities already have.
+
+### Namespacing
+
+All names are automatically prefixed with `harvest.user.`:
+
+| `ctx.metrics().counter("orders_processed", …)` | emits `harvest.user.orders_processed` |
+|---|---|
+| `ctx.metrics().gauge("queue_depth", …)` | emits `harvest.user.queue_depth` |
+| `ctx.metrics().histogram("latency_ms", …)` | emits `harvest.user.latency_ms` |
+
+Do **not** pass a name that starts with `harvest.` — it is reserved for engine
+metrics and will be rejected with a `tracing::warn!` (the call is dropped, not
+a hard error, so the workflow continues running).
+
+### Label cardinality rule (ADR-0001 §7)
+
+The following label keys are **forbidden** because they carry per-execution
+cardinality that would blow up any metrics backend:
+
+`execution.id`, `activity.id`, `workflow.id`, `harvest.execution.id`,
+`harvest.workflow.id`, `harvest.activity.id`, `idempotency_key`, `run_id`
+
+Using any of these keys logs a `tracing::warn!` and silently drops the metric
+call. Use low-cardinality labels only (e.g. `tier`, `region`, `payment_method`).
+Additional limits: up to 16 labels per call; label keys and metric names up to
+200 characters.
+
+### Zero-overhead when telemetry is off
+
+If no `MetricsRecorder` is configured (the default no-op path), the
+`is_enabled() → false` short-circuit exits before validation, so there is zero
+overhead in the common "telemetry off" case.
+
+### `metrics-rs` bridge
+
+When the `metrics-rs` feature is enabled, the three user-metric methods are
+bridged through `MetricsRsRecorder` using the low-level `metrics::with_recorder`
+API with dynamic names and `Vec<Label>`:
+
+```rust
+// Emits to whatever metrics exporter is installed globally (e.g. Prometheus).
+ctx.metrics().counter("orders_processed", 1, &[("tier", "gold")]);
+```
+
+---
+
 ## Metric catalogue (ADR-0001 §7)
 
 See [`docs/adr/0001-otel-trace-contract.md`](adr/0001-otel-trace-contract.md)

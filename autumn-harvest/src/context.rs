@@ -819,6 +819,12 @@ pub struct WorkflowContext {
     /// durable timer resolves from history so `ctx.now()` reflects virtual elapsed time.
     #[cfg(any(test, feature = "testing"))]
     timer_clock_elapsed_secs: Option<std::sync::atomic::AtomicU64>,
+    /// Metrics recorder for user-emitted custom business metrics (issue #532).
+    /// Defaults to [`NoOpMetrics`](crate::telemetry::NoOpMetrics) when the
+    /// worker has no telemetry configured.  Workflow metrics are replay-safe:
+    /// [`metrics()`](Self::metrics) returns a suppressed handle while
+    /// `is_replaying()` is `true`.
+    metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
 }
 
 impl WorkflowContext {
@@ -988,6 +994,7 @@ impl WorkflowContext {
             scheduled_time,
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
+            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
         }
     }
 
@@ -1096,6 +1103,7 @@ impl WorkflowContext {
             scheduled_time: None,
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
+            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
         })
     }
 
@@ -1141,6 +1149,7 @@ impl WorkflowContext {
             scheduled_time: None,
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
+            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
         }
     }
 
@@ -1403,6 +1412,44 @@ impl WorkflowContext {
         self
     }
 
+    // ── Custom metrics (issue #532) ───────────────────────────────────────────
+
+    /// Attach a metrics recorder to this context (builder-style, called by the worker).
+    ///
+    /// The worker passes `registry.telemetry().metrics.clone()` here so that
+    /// `ctx.metrics()` forwards to the same backend as engine metrics.
+    /// Tests may inject a counting recorder via this method to assert emission counts.
+    #[must_use]
+    pub fn with_metrics(
+        mut self,
+        metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    ) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Obtain a **replay-safe** custom-metrics handle for this workflow execution.
+    ///
+    /// Calls on the returned [`UserMetrics`](crate::telemetry::UserMetrics) handle
+    /// are **suppressed** while the workflow is replaying recorded history
+    /// (`is_replaying() == true`), so a counter inside workflow logic increments
+    /// the backend **exactly once** per logical occurrence regardless of how many
+    /// replay cycles the executor runs.
+    ///
+    /// ```rust,ignore
+    /// #[workflow]
+    /// async fn process_order(ctx: &WorkflowContext, order: Order) -> Result<(), String> {
+    ///     ctx.metrics().counter("orders_accepted", 1, &[("tier", &order.tier)]);
+    ///     ctx.execute_activity(&charge_card_info(), order.amount).await?;
+    ///     ctx.metrics().counter("orders_completed", 1, &[("tier", &order.tier)]);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[must_use]
+    pub fn metrics(&self) -> crate::telemetry::UserMetrics<'_> {
+        crate::telemetry::UserMetrics::new(&*self.metrics, self.is_replaying())
+    }
+
     /// Return the value of the named context header, or `None` if not set.
     ///
     /// Returns `None` (never panics) when `key` was never attached, including
@@ -1477,7 +1524,7 @@ impl WorkflowContext {
         self.matcher
             .lock()
             .expect("matcher lock poisoned")
-            .has_buffered_history()
+            .is_replaying()
     }
 
     // ── Replay-safe logging (issue #379) ──────────────────────────────
@@ -4587,6 +4634,7 @@ impl WorkflowContext {
         // (issue #488).
         let last_completion_result = self.last_completion_result.clone();
         let last_error = self.last_error.clone();
+        let metrics = std::sync::Arc::clone(&self.metrics);
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -4606,6 +4654,7 @@ impl WorkflowContext {
                     .last_completion_result
                     .clone_from(&last_completion_result);
                 inner.last_error.clone_from(&last_error);
+                inner.metrics = std::sync::Arc::clone(&metrics);
             }
             handler_fn(ctx, input)
         });
@@ -4674,6 +4723,7 @@ impl WorkflowContext {
                     .last_completion_result
                     .clone_from(&self.last_completion_result);
                 inner.last_error.clone_from(&self.last_error);
+                inner.metrics = std::sync::Arc::clone(&self.metrics);
             }
             h(ctx, input)
         })
@@ -5092,6 +5142,10 @@ pub struct ActivityContext {
     /// Read via `header()` / `headers()`. Empty for activities dispatched before
     /// this feature was deployed.
     context_headers: std::sync::Arc<HashMap<String, String>>,
+    /// Metrics recorder for user-emitted custom business metrics (issue #532).
+    /// Activity metrics are never suppressed — each invocation (including retries)
+    /// emits independently.
+    metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
 }
 
 impl ActivityContext {
@@ -5123,6 +5177,7 @@ impl ActivityContext {
             #[cfg(feature = "db")]
             transactional_state: None,
             context_headers: std::sync::Arc::new(HashMap::new()),
+            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
         }
     }
 
@@ -5158,6 +5213,7 @@ impl ActivityContext {
             max_attempts: None,
             transactional_state: None,
             context_headers: std::sync::Arc::new(HashMap::new()),
+            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
         }
     }
 
@@ -5182,6 +5238,7 @@ impl ActivityContext {
             #[cfg(feature = "db")]
             transactional_state: None,
             context_headers: std::sync::Arc::new(HashMap::new()),
+            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
         }
     }
 
@@ -5218,6 +5275,38 @@ impl ActivityContext {
     ) -> Self {
         self.context_headers = headers;
         self
+    }
+
+    // ── Custom metrics (issue #532) ───────────────────────────────────────────
+
+    /// Attach a metrics recorder to this activity context (builder-style, called by the worker).
+    #[must_use]
+    pub fn with_metrics(
+        mut self,
+        metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    ) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Obtain a custom-metrics handle for this activity invocation.
+    ///
+    /// Unlike workflow metrics, activity metrics are **never suppressed** —
+    /// each actual invocation emits.  Retries count as separate executions,
+    /// so a counter inside an activity body increments once per attempt.
+    ///
+    /// ```rust,ignore
+    /// #[activity]
+    /// async fn charge_card(ctx: &ActivityContext, amount: u64) -> Result<(), String> {
+    ///     ctx.metrics().counter("payments_attempted", 1, &[("currency", "usd")]);
+    ///     charge(amount)?;
+    ///     ctx.metrics().counter("payments_succeeded", 1, &[("currency", "usd")]);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[must_use]
+    pub fn metrics(&self) -> crate::telemetry::UserMetrics<'_> {
+        crate::telemetry::UserMetrics::new(&*self.metrics, false)
     }
 
     /// Return the value of the named context header, or `None` if not set.

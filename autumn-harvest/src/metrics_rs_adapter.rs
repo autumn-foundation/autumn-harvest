@@ -41,7 +41,7 @@
 //!
 //! Enabled by the `metrics-rs` cargo feature.
 
-use metrics::{counter, gauge, histogram};
+use metrics::{Key, Label, counter, gauge, histogram};
 
 use crate::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_ATTEMPTS, METRIC_ACTIVITY_DURATION, METRIC_ACTIVITY_FAILED,
@@ -599,6 +599,54 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_QUEUE => queue.to_owned(),
         )
         .increment(1);
+    }
+
+    fn record_user_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
+        let ls: Vec<Label> = labels
+            .iter()
+            .map(|&(k, v)| Label::new(k.to_string(), v.to_string()))
+            .collect();
+        let key = Key::from_parts(name.to_string(), ls);
+        metrics::with_recorder(|recorder| {
+            recorder
+                .register_counter(
+                    &key,
+                    &metrics::Metadata::new(module_path!(), metrics::Level::INFO, None),
+                )
+                .increment(value);
+        });
+    }
+
+    fn record_user_gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        let ls: Vec<Label> = labels
+            .iter()
+            .map(|&(k, v)| Label::new(k.to_string(), v.to_string()))
+            .collect();
+        let key = Key::from_parts(name.to_string(), ls);
+        metrics::with_recorder(|recorder| {
+            recorder
+                .register_gauge(
+                    &key,
+                    &metrics::Metadata::new(module_path!(), metrics::Level::INFO, None),
+                )
+                .set(value);
+        });
+    }
+
+    fn record_user_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
+        let ls: Vec<Label> = labels
+            .iter()
+            .map(|&(k, v)| Label::new(k.to_string(), v.to_string()))
+            .collect();
+        let key = Key::from_parts(name.to_string(), ls);
+        metrics::with_recorder(|recorder| {
+            recorder
+                .register_histogram(
+                    &key,
+                    &metrics::Metadata::new(module_path!(), metrics::Level::INFO, None),
+                )
+                .record(value);
+        });
     }
 }
 
