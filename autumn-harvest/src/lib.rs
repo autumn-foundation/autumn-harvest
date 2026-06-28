@@ -297,7 +297,8 @@ pub use simulator::{SimulatorResult, WorkflowSimulator};
 pub use store::AwaitMode;
 pub use telemetry::{
     ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
-    TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, WorkflowStatus,
+    TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, USER_METRIC_PREFIX,
+    UserMetricError, UserMetrics, WorkflowStatus,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
