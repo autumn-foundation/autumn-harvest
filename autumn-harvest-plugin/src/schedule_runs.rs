@@ -276,6 +276,7 @@ pub fn parse_cursor(raw: &str) -> Result<(DateTime<Utc>, Uuid), String> {
 /// row. The cadence summary sums each shard's scheduled-origin per-state counts.
 /// `status` is `complete` only when every shard was inspected.
 #[must_use]
+#[allow(clippy::needless_pass_by_value)]
 pub fn build_runs_response(
     schedule_id: Uuid,
     limit: i64,

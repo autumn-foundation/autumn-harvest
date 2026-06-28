@@ -1754,15 +1754,23 @@ async fn cancel_in_flight_runs(
 ) -> HarvestResult<u32> {
     use crate::execution::cancel_workflow_execution;
 
-    let running_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
-        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-        .order(harvest_workflow_executions::started_at.asc())
-        .select(harvest_workflow_executions::id)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let running_ids: Vec<uuid::Uuid> =
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+            .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+            // Exclude manual-trigger runs: attributing them to the schedule (issue #534)
+            // must not make them targets for automatic overlap-cleanup. Scheduled and
+            // backfill runs remain eligible; NULL origin (pre-migration) is included for
+            // backward compatibility.
+            .filter(harvest_workflow_executions::origin.is_null().or(
+                harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
+            ))
+            .order(harvest_workflow_executions::started_at.asc())
+            .select(harvest_workflow_executions::id)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
 
     let mut count: u32 = 0;
     for raw_id in running_ids
@@ -1801,15 +1809,19 @@ async fn terminate_in_flight_runs(
 ) -> HarvestResult<u32> {
     use crate::execution::terminate_workflow_execution;
 
-    let active_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
-        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-        .order(harvest_workflow_executions::started_at.asc())
-        .select(harvest_workflow_executions::id)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let active_ids: Vec<uuid::Uuid> =
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+            .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+            .filter(harvest_workflow_executions::origin.is_null().or(
+                harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
+            ))
+            .order(harvest_workflow_executions::started_at.asc())
+            .select(harvest_workflow_executions::id)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
 
     let mut count: u32 = 0;
     for raw_id in active_ids
@@ -3882,6 +3894,7 @@ async fn drain_buffered_schedule_runs(
 /// already has the schedule UUID (e.g. retry executions whose `workflow_id` does
 /// not start with `"sched:"`).
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn maybe_increment_schedule_failure_counter(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_id: &str,

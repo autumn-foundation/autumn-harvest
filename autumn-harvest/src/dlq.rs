@@ -1357,7 +1357,11 @@ fn set_filter(slot: &mut Option<String>, value: &str) {
     }
 }
 
-pub fn parse_instant(field: &str, value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+pub fn parse_instant(
+    field: &str,
+    value: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, String> {
     let trimmed = value.trim();
     if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
         return Ok(parsed.with_timezone(&Utc));
