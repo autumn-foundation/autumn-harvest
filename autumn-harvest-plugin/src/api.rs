@@ -11813,7 +11813,14 @@ async fn list_schedule_runs_handler(
             }
         };
 
-        let runs = match autumn_harvest::list_schedule_runs(&mut conn, schedule_id, &query).await {
+        let runs = match autumn_harvest::list_schedule_runs(
+            &mut conn,
+            schedule_id,
+            shard_id,
+            &query,
+        )
+        .await
+        {
             Ok(runs) => runs,
             Err(err) => {
                 observations.push(schedule_runs::ShardRunsObservation {
@@ -11829,6 +11836,7 @@ async fn list_schedule_runs_handler(
         let summary = match autumn_harvest::schedule_run_state_summary(
             &mut conn,
             schedule_id,
+            shard_id,
             params.since,
             params.until,
         )

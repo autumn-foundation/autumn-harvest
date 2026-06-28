@@ -3139,6 +3139,7 @@ pub struct ScheduleRunQuery {
 pub async fn list_schedule_runs(
     conn: &mut AsyncPgConnection,
     schedule_id: uuid::Uuid,
+    shard_id: i32,
     query: &ScheduleRunQuery,
 ) -> HarvestResult<Vec<ScheduleRunRow>> {
     use crate::schema::harvest_workflow_executions::dsl;
@@ -3147,6 +3148,7 @@ pub async fn list_schedule_runs(
 
     let mut q = harvest_workflow_executions::table
         .filter(dsl::schedule_id.eq(schedule_id))
+        .filter(dsl::shard_id.eq(shard_id))
         .into_boxed();
 
     if !query.states.is_empty() {
@@ -3226,6 +3228,7 @@ pub struct ScheduleRunStateCount {
 pub async fn schedule_run_state_summary(
     conn: &mut AsyncPgConnection,
     schedule_id: uuid::Uuid,
+    shard_id: i32,
     since: Option<chrono::DateTime<Utc>>,
     until: Option<chrono::DateTime<Utc>>,
 ) -> HarvestResult<Vec<ScheduleRunStateCount>> {
@@ -3235,6 +3238,7 @@ pub async fn schedule_run_state_summary(
 
     let mut q = harvest_workflow_executions::table
         .filter(dsl::schedule_id.eq(schedule_id))
+        .filter(dsl::shard_id.eq(shard_id))
         .filter(dsl::origin.eq(ORIGIN_SCHEDULED))
         .into_boxed();
 
