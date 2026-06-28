@@ -219,7 +219,7 @@ pub async fn list_external_handoffs(
         .into_boxed::<diesel::pg::Pg>();
 
     if !filters.states.is_empty() {
-        query = query.filter(harvest_external_tasks::state.eq_any(filters.states.clone()));
+        query = query.filter(harvest_external_tasks::state.eq_any(&filters.states));
     }
     if let Some(workflow_name) = &filters.workflow_name {
         query = query.filter(harvest_workflow_executions::workflow_name.eq(workflow_name));

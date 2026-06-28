@@ -556,7 +556,7 @@ mod db {
                 }
             }
         } else {
-            query = query.filter(harvest_workflow_executions::state.eq_any(filter.states.clone()));
+            query = query.filter(harvest_workflow_executions::state.eq_any(&filter.states));
         }
         if let Some(name) = &filter.workflow_name {
             query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));

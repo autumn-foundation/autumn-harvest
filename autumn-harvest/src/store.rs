@@ -969,7 +969,7 @@ pub async fn load_workflow_children(
         ));
 
     if !filters.statuses.is_empty() {
-        query = query.filter(harvest_workflow_executions::state.eq_any(filters.statuses.clone()));
+        query = query.filter(harvest_workflow_executions::state.eq_any(&filters.statuses));
     }
     if let Some(name) = &filters.workflow_name {
         query = query.filter(harvest_workflow_executions::workflow_name.eq(name.clone()));
