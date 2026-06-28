@@ -113,7 +113,7 @@ pub async fn run_workflow(
 /// [`WorkflowReplayer`](crate::testing::WorkflowReplayer) to catch
 /// input-changing code changes before deployment.
 #[allow(clippy::implicit_hasher)]
-pub(crate) async fn run_workflow_strict(
+pub async fn run_workflow_strict(
     exec_id: ExecutionId,
     history: Vec<WorkflowEvent>,
     handler: WorkflowHandlerFn,
