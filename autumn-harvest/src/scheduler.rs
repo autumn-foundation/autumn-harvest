@@ -787,13 +787,19 @@ pub async fn trigger_unified_dag(
             context_headers: None,
 
             sla: None,
-            schedule_id: None, // manual/API DAG trigger, not a scheduler-fired slot
+            // Attribute the manual API trigger to the schedule so it appears in
+            // GET /admin/schedules/{id}/runs with origin='manual_trigger'.
+            // scheduled_for stays None so resolve_carryover (issue #488) still
+            // short-circuits — NULL slot comparisons are false.
+            schedule_id: schedule.as_ref().map(|s| s.id),
             scheduled_for: None,
             workflow_attempt: 1,
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
-            origin: None,
+            origin: schedule
+                .as_ref()
+                .map(|_| crate::execution::ORIGIN_MANUAL_TRIGGER),
         },
     )
     .await
@@ -3881,9 +3887,20 @@ pub(crate) async fn maybe_increment_schedule_failure_counter(
     workflow_id: &str,
     workflow_name: &str,
     schedule_id: Option<uuid::Uuid>,
+    origin: Option<&str>,
     metrics: &dyn crate::telemetry::MetricsRecorder,
 ) {
     use crate::schema::harvest_schedules::dsl;
+
+    // Only scheduled-cadence failures count toward the auto-pause threshold.
+    // Backfill and manual-trigger runs are deliberately excluded: a backfill
+    // storm or an operator ad-hoc fire should not trip the consecutive-failure
+    // circuit breaker.  NULL origin is treated as scheduled (legacy rows
+    // pre-dating the origin column, or the quarantine path which lacks
+    // execution context).
+    if matches!(origin, Some(o) if o != crate::execution::ORIGIN_SCHEDULED) {
+        return;
+    }
 
     // Retry executions carry an explicit `schedule_id`; original scheduled
     // executions embed the UUID in the `workflow_id` prefix.  Bail out only
@@ -4016,8 +4033,14 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
     workflow_id: &str,
     workflow_name: &str,
     schedule_id: Option<uuid::Uuid>,
+    origin: Option<&str>,
 ) {
     use crate::schema::harvest_schedules::dsl;
+
+    // Only reset on scheduled-cadence successes (mirrors the increment guard).
+    if matches!(origin, Some(o) if o != crate::execution::ORIGIN_SCHEDULED) {
+        return;
+    }
 
     if schedule_id.is_none() && !workflow_id.starts_with("sched:") {
         return;

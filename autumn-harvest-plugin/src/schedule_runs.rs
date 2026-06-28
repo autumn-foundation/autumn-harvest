@@ -25,7 +25,7 @@
 //! list then reflect only the inspected shards.
 
 use autumn_harvest::{ScheduleRunRow, ScheduleRunStateCount};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -111,6 +111,9 @@ pub struct ScheduleRunSummary {
     pub other: i64,
     /// Total scheduled-origin runs counted in the window.
     pub total: i64,
+    /// `true` when the summary covers all shards (status == `complete`); `false`
+    /// when one or more shards were unavailable, so the counts may be understated.
+    pub summary_complete: bool,
 }
 
 impl ScheduleRunSummary {
@@ -190,21 +193,6 @@ pub struct ScheduleRunsParams {
     pub limit: i64,
 }
 
-fn parse_instant(field: &str, value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
-    let trimmed = value.trim();
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
-        return Ok(parsed.with_timezone(&Utc));
-    }
-    if let Some(dur) = autumn_harvest::task_duration(trimmed)
-        && let Ok(chrono_dur) = chrono::Duration::from_std(dur)
-    {
-        return Ok(now - chrono_dur);
-    }
-    Err(format!(
-        "invalid {field} '{value}'; expected an RFC 3339 timestamp or a relative duration like '24h'"
-    ))
-}
-
 fn push_csv(target: &mut Vec<String>, value: &str) {
     for part in value.split(',') {
         let trimmed = part.trim();
@@ -233,8 +221,8 @@ impl ScheduleRunsParams {
             match key.as_str() {
                 "state" => push_csv(&mut out.states, value),
                 "origin" => push_csv(&mut out.origins, value),
-                "since" => out.since = Some(parse_instant("since", value, now)?),
-                "until" => out.until = Some(parse_instant("until", value, now)?),
+                "since" => out.since = Some(autumn_harvest::parse_instant("since", value, now)?),
+                "until" => out.until = Some(autumn_harvest::parse_instant("until", value, now)?),
                 "cursor" => out.cursor = Some(parse_cursor(value)?),
                 "limit" => {
                     let n: i64 = value
@@ -258,11 +246,7 @@ impl ScheduleRunsParams {
 /// format `"<rfc3339_micros>|<uuid>"` (matching the #514 workflow-list cursor).
 #[must_use]
 pub fn encode_cursor(started_at: DateTime<Utc>, execution_id: Uuid) -> String {
-    format!(
-        "{}|{}",
-        started_at.to_rfc3339_opts(SecondsFormat::Micros, true),
-        execution_id
-    )
+    crate::api::encode_workflow_list_cursor_raw(&started_at, &execution_id)
 }
 
 /// Parse an opaque keyset cursor token back into `(started_at, execution_id)`.
@@ -328,16 +312,8 @@ pub fn build_runs_response(
         None
     };
 
-    // Sum each shard's scheduled-origin per-state counts into the cadence summary.
-    let mut summary = ScheduleRunSummary::default();
-    for observation in &observations {
-        for ScheduleRunStateCount { state, count } in &observation.summary {
-            summary.add(state, *count);
-        }
-    }
-
     let mut shards: Vec<RunsShardInspection> = observations
-        .into_iter()
+        .iter()
         .map(|o| RunsShardInspection {
             shard_id: o.shard_id,
             status: if o.error.is_some() {
@@ -345,7 +321,7 @@ pub fn build_runs_response(
             } else {
                 "inspected"
             },
-            error: o.error,
+            error: o.error.clone(),
         })
         .collect();
     shards.sort_by_key(|s| s.shard_id);
@@ -357,6 +333,15 @@ pub fn build_runs_response(
     } else {
         RunsReportStatus::Complete
     };
+
+    // Sum each shard's scheduled-origin per-state counts into the cadence summary.
+    let mut summary = ScheduleRunSummary::default();
+    for observation in &observations {
+        for ScheduleRunStateCount { state, count } in &observation.summary {
+            summary.add(state, *count);
+        }
+    }
+    summary.summary_complete = status == RunsReportStatus::Complete;
 
     ScheduleRunsResponse {
         schedule_id,

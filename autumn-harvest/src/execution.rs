@@ -3172,7 +3172,7 @@ pub async fn list_schedule_runs(
 
     let rows = q
         .order((dsl::started_at.desc(), dsl::id.desc()))
-        .limit(query.limit.max(0))
+        .limit(query.limit.max(0) + 1)
         .select((
             dsl::id,
             dsl::scheduled_for,

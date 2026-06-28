@@ -5719,7 +5719,7 @@ fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> String {
 
 /// Encode a `(created_at, exec_id)` cursor pair into the opaque token format
 /// `"<rfc3339_micros>|<uuid>"`.
-fn encode_workflow_list_cursor_raw(
+pub(crate) fn encode_workflow_list_cursor_raw(
     created_at: &chrono::DateTime<chrono::Utc>,
     exec_id: &uuid::Uuid,
 ) -> String {

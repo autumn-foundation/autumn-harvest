@@ -340,6 +340,9 @@ pub use diesel;
 pub use diesel_async;
 
 #[cfg(feature = "db")]
+pub use dlq::parse_instant;
+
+#[cfg(feature = "db")]
 pub use queue::{ConcurrencyKeyStats, QueueScalingSignal, QueueTaskCounts, queue_task_counts};
 
 // Allow macro-generated code to use ::autumn_harvest::serde_json

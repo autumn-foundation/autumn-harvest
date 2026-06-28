@@ -2526,7 +2526,7 @@ async fn persist_workflow_failure(
                             workflow_retry_policy: Some(policy),
                             retry_of_exec_id: Some(exec_id.as_uuid()),
                             max_workflow_attempts_ceiling: None,
-                            origin: None,
+                            origin: exec_ref.origin.as_deref(),
                         };
 
                         match crate::execution::start_or_load_workflow_execution_collect(
@@ -5531,6 +5531,7 @@ async fn persist_workflow_outcome(
                     &execution.workflow_id,
                     &execution.workflow_name,
                     execution.schedule_id,
+                    execution.origin.as_deref(),
                 )
                 .await;
             }
@@ -5561,6 +5562,7 @@ async fn persist_workflow_outcome(
                     &execution.workflow_id,
                     &execution.workflow_name,
                     execution.schedule_id,
+                    execution.origin.as_deref(),
                     registry.telemetry().metrics.as_ref(),
                 )
                 .await;
@@ -5603,6 +5605,7 @@ async fn persist_workflow_outcome(
                             &execution.workflow_id,
                             &execution.workflow_name,
                             execution.schedule_id,
+                            execution.origin.as_deref(),
                             registry.telemetry().metrics.as_ref(),
                         )
                         .await;
@@ -5688,6 +5691,7 @@ async fn run_deferred_schedule_counter(
                 &execution.workflow_id,
                 &execution.workflow_name,
                 execution.schedule_id,
+                execution.origin.as_deref(),
             )
             .await;
         }
@@ -5697,6 +5701,7 @@ async fn run_deferred_schedule_counter(
                 &execution.workflow_id,
                 &execution.workflow_name,
                 execution.schedule_id,
+                execution.origin.as_deref(),
                 registry.telemetry().metrics.as_ref(),
             )
             .await;
@@ -9794,6 +9799,7 @@ pub async fn quarantine_workflow_task_timeout(
                     &workflow_id_str,
                     workflow_name,
                     None, // schedule_id not available in quarantine context
+                    None, // origin not available; NULL treated as 'scheduled' (backward-compat)
                     metrics,
                 )
                 .await;

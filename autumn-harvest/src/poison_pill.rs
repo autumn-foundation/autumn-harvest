@@ -490,6 +490,7 @@ mod scanner {
                     &workflow_id,
                     &workflow_name,
                     None, // schedule_id not available in quarantine context
+                    None, // origin not available in quarantine context; NULL treated as 'scheduled' (backward-compat)
                     metrics,
                 )
                 .await;

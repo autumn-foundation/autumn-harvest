@@ -6222,17 +6222,18 @@ async fn execute_schedule_trigger_ui(
             severity,
             context_headers: None,
             sla,
-            // Manual trigger-now is a manual fire and does NOT participate in scheduled
-            // carryover (issue #488) — matches the API trigger path and avoids the
-            // cross-shard resolve / budget-bypass issues. Scheduled fires and backfills
-            // carry the lineage; ad-hoc operator fires do not.
-            schedule_id: None,
+            // Manual trigger-now fires are attributed to the schedule (schedule_id is
+            // set) so they appear in GET /admin/schedules/{id}/runs, but scheduled_for
+            // stays None so resolve_carryover (issue #488) still short-circuits for
+            // this run — NULL slot comparisons are false, so carryover is never
+            // resolved for a manual fire.
+            schedule_id: Some(row.id),
             scheduled_for: None,
             workflow_attempt: 1,
             workflow_retry_policy: ui_trigger_retry_policy,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
-            origin: None,
+            origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
         },
     )
     .await;

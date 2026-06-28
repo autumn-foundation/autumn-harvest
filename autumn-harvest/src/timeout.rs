@@ -672,6 +672,7 @@ async fn enforce_workflow_timeout(
         &execution.workflow_id,
         &execution.workflow_name,
         execution.schedule_id,
+        execution.origin.as_deref(),
         metrics,
     )
     .await;
@@ -873,6 +874,7 @@ pub async fn enforce_workflow_execution_timeouts(
             &execution.workflow_id,
             &workflow_name,
             execution.schedule_id,
+            execution.origin.as_deref(),
             metrics,
         )
         .await;
@@ -1840,6 +1842,7 @@ pub async fn enforce_workflow_history_ceiling(
             &row.workflow_id,
             &workflow_name,
             None, // schedule_id not available in OversizedRow
+            None, // origin not available in OversizedRow; NULL treated as 'scheduled' (backward-compat)
             metrics,
         )
         .await;
