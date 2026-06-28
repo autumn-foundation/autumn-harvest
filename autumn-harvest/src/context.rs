@@ -1524,7 +1524,7 @@ impl WorkflowContext {
         self.matcher
             .lock()
             .expect("matcher lock poisoned")
-            .has_buffered_history()
+            .is_replaying()
     }
 
     // ── Replay-safe logging (issue #379) ──────────────────────────────
@@ -4634,6 +4634,7 @@ impl WorkflowContext {
         // (issue #488).
         let last_completion_result = self.last_completion_result.clone();
         let last_error = self.last_error.clone();
+        let metrics = std::sync::Arc::clone(&self.metrics);
 
         let boxed_handler: crate::update::BoxUpdateHandler = std::sync::Arc::new(move |input| {
             let mut ctx = Self::new_for_handler(
@@ -4653,6 +4654,7 @@ impl WorkflowContext {
                     .last_completion_result
                     .clone_from(&last_completion_result);
                 inner.last_error.clone_from(&last_error);
+                inner.metrics = std::sync::Arc::clone(&metrics);
             }
             handler_fn(ctx, input)
         });
@@ -4721,6 +4723,7 @@ impl WorkflowContext {
                     .last_completion_result
                     .clone_from(&self.last_completion_result);
                 inner.last_error.clone_from(&self.last_error);
+                inner.metrics = std::sync::Arc::clone(&self.metrics);
             }
             h(ctx, input)
         })

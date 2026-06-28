@@ -880,10 +880,17 @@ impl HistoryMatcher {
     /// Returns `true` if there is any un-replayed history — either cursor-based
     /// events or signals/external-signals buffered in the early-drain stash.
     ///
-    /// Use this for the user-visible `ctx.is_replaying()` check.  Stashed entries
-    /// represent recorded history that `drain_early_signals` moved out of the
-    /// cursor path for out-of-order matching; they are still "history" from the
-    /// workflow's perspective even though the cursor is past them.
+    /// This answers the question "is there any recorded history not yet consumed?"
+    /// and is used internally (e.g., by `history_has_unconsumed_events`). It is
+    /// intentionally more conservative than the user-visible `ctx.is_replaying()`
+    /// check, which uses the cursor-based [`is_replaying`](Self::is_replaying).
+    ///
+    /// The distinction matters for metrics suppression: `pending_signals` in the stash
+    /// were drained from the event stream ahead of the cursor during
+    /// `drain_early_signals`, but the workflow's current code position is at the
+    /// live frontier. Using this method for `ctx.is_replaying()` would incorrectly
+    /// suppress metrics emitted between an activity completion and a
+    /// `wait_for_signal` call.
     #[must_use]
     pub fn has_buffered_history(&self) -> bool {
         self.is_replaying()

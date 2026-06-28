@@ -287,9 +287,11 @@ pub async fn run_workflow_canary(
     input: Value,
     state: SharedState,
     context_headers: std::collections::HashMap<String, String>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
 ) -> WorkflowOutcome {
     let ctx = WorkflowContext::for_replay_canary_with_state(exec_id, history, state)
-        .with_context_headers(context_headers);
+        .with_context_headers(context_headers)
+        .with_metrics(metrics);
 
     let span = tracing::info_span!(
         "harvest.workflow.execute",
@@ -440,6 +442,7 @@ pub async fn run_workflow_with_state(
         span_meta,
         &[],
         &[],
+        std::sync::Arc::new(NoOpMetrics),
     )
     .await
 }
@@ -457,6 +460,7 @@ pub async fn run_workflow_with_state_advancing_clock(
     input: Value,
     state: SharedState,
     span_meta: Option<&WorkflowExecuteSpanMeta>,
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     use crate::context::WorkflowContext;
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
@@ -465,7 +469,8 @@ pub async fn run_workflow_with_state_advancing_clock(
         state,
         WorkflowHistoryPolicy::default(),
     )
-    .with_advancing_timer_clock();
+    .with_advancing_timer_clock()
+    .with_metrics(metrics);
     drive_workflow(ctx, handler, input, span_meta).await
 }
 
@@ -482,6 +487,7 @@ pub async fn run_workflow_with_state_and_history_policy(
     span_meta: Option<&WorkflowExecuteSpanMeta>,
     declarative_query_handlers: &[&QueryHandlerInfo],
     declarative_update_handlers: &[&UpdateHandlerInfo],
+    metrics: std::sync::Arc<dyn MetricsRecorder>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     run_workflow_with_state_history_policy_and_caps(
         exec_id,
@@ -500,7 +506,7 @@ pub async fn run_workflow_with_state_and_history_policy(
         crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
         std::collections::HashMap::new(),
         None,
-        std::sync::Arc::new(NoOpMetrics),
+        metrics,
     )
     .await
 }

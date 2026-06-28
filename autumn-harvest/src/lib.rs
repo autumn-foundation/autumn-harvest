@@ -298,7 +298,7 @@ pub use store::AwaitMode;
 pub use telemetry::{
     ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
     TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, USER_METRIC_PREFIX,
-    UserMetricError, UserMetrics, WorkflowStatus,
+    UserMetricError, UserMetrics, WorkflowStatus, validate_user_metric,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;

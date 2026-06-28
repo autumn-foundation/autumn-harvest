@@ -559,12 +559,21 @@ pub const MAX_USER_METRIC_LABELS: usize = 16;
 ///
 /// Per ADR-0001 §7, execution/activity identifiers must never appear on
 /// metrics because they would create an unbounded label cardinality.
+/// Both dotted and underscore-separated forms are listed to block both
+/// the OpenTelemetry convention (`execution.id`) and the Prometheus convention
+/// (`execution_id`) from being used as label keys.
 pub const FORBIDDEN_USER_LABEL_KEYS: &[&str] = &[
+    // Dotted forms (OpenTelemetry naming convention)
     "execution.id",
     "activity.id",
     "workflow.id",
-    "harvest.execution.id",
+    ATTR_EXECUTION_ID, // = "harvest.execution.id"
     "harvest.activity.id",
+    // Prometheus underscore forms
+    "execution_id",
+    "activity_id",
+    "workflow_id",
+    // Non-namespaced high-cardinality keys
     "idempotency_key",
     "run_id",
 ];

@@ -560,6 +560,7 @@ impl WorkflowReplayer {
             input,
             self.state.clone(),
             headers,
+            self.metrics.clone(),
         )
         .await;
         outcome_to_report(exec_id, total_events, outcome, true)
@@ -2268,6 +2269,10 @@ pub struct WorkflowTestEnv {
     last_error: Option<String>,
     /// Simulated scheduled fire-time (logical slot) for testing scheduled workflows (issue #508).
     scheduled_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// Metrics recorder injected into the `WorkflowContext` on each iteration.
+    /// Defaults to `NoOpMetrics`; inject a counting recorder to assert that
+    /// `ctx.metrics()` calls fire exactly once per logical occurrence.
+    metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
 }
 
 impl Default for WorkflowTestEnv {
@@ -2294,6 +2299,7 @@ impl WorkflowTestEnv {
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
+            metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
         }
     }
 
@@ -2467,6 +2473,20 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Inject a [`MetricsRecorder`](crate::telemetry::MetricsRecorder) into the
+    /// `WorkflowContext` used on each test iteration.
+    ///
+    /// Use this to assert that `ctx.metrics()` calls fire exactly once per
+    /// logical occurrence across the iterations `WorkflowTestEnv` drives.
+    #[must_use]
+    pub fn with_metrics(
+        mut self,
+        metrics: std::sync::Arc<dyn crate::telemetry::MetricsRecorder>,
+    ) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Inject typed shared state accessible via `ctx.state::<T>()` inside the
     /// workflow function.
     ///
@@ -2540,6 +2560,7 @@ impl WorkflowTestEnv {
                 input.clone(),
                 self.state.clone(),
                 None,
+                self.metrics.clone(),
             )
             .await;
 
