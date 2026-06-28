@@ -3430,7 +3430,7 @@ pub async fn check_and_report_unfinished_handlers(
 ) -> HarvestResult<()> {
     let history = store::load_history(conn, exec_id).await?;
     let matcher = crate::replay::HistoryMatcher::new(history.events);
-    let count = matcher.unfinished_update_handler_count();
+    let count = matcher.unfinished_update_handler_count_at_end();
     if count > 0 {
         tracing::warn!(
             workflow_name = workflow_name,

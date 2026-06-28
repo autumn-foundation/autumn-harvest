@@ -18652,6 +18652,8 @@ async fn stream_execution_events(
                     cur_last_seen = row.id;
                     if is_terminal_event_type(&row.event_type) {
                         found_terminal = Some(terminal_event_type_to_state(&row.event_type));
+                    } else if row.event_type == "WorkflowRedriven" {
+                        found_terminal = None;
                     }
                 }
                 (cur_last_seen, found_terminal, false)
@@ -18689,6 +18691,8 @@ async fn stream_execution_events(
             }
             if is_terminal_event_type(&row.event_type) {
                 backfill_terminal = Some(terminal_event_type_to_state(&row.event_type));
+            } else if row.event_type == "WorkflowRedriven" {
+                backfill_terminal = None;
             }
         }
 
@@ -20631,14 +20635,8 @@ async fn admit_update(
     // and the insert under the same row-level lock prevents a TOCTOU race where
     // the workflow could complete between a separate state read and the insert.
     // UpdateRejected is returned if the execution is no longer RUNNING.
-    if let Err(e) = store::admit_update_event(
-        &mut conn,
-        exec_id,
-        update_id,
-        update_name.clone(),
-        request.input,
-    )
-    .await
+    if let Err(e) =
+        store::admit_update_event(&mut conn, exec_id, update_id, update_name, request.input).await
     {
         return map_error(e).into_response();
     }
@@ -20677,7 +20675,7 @@ enum PollOutcome {
 }
 
 fn get_terminal_workflow_state(events: &[WorkflowEvent]) -> Option<&'static str> {
-    for ev in events {
+    for ev in events.iter().rev() {
         match ev {
             WorkflowEvent::WorkflowCompleted { .. } => return Some("COMPLETED"),
             WorkflowEvent::WorkflowFailed { .. } => return Some("FAILED"),
@@ -20685,6 +20683,7 @@ fn get_terminal_workflow_state(events: &[WorkflowEvent]) -> Option<&'static str>
             WorkflowEvent::WorkflowContinuedAsNew { .. } => return Some("CONTINUED_AS_NEW"),
             WorkflowEvent::WorkflowResetTerminated { .. } => return Some("TERMINATED"),
             WorkflowEvent::WorkflowExecutionTimedOut { .. } => return Some("TIMED_OUT"),
+            WorkflowEvent::WorkflowRedriven { .. } => return None,
             _ => {}
         }
     }
@@ -20714,11 +20713,12 @@ pub async fn poll_update_result(
                     .map_err(|e| HarvestError::Database(e.to_string()))?;
                 let h = store::load_history(&mut c, exec_id).await?;
                 // c is dropped here, releasing the connection back to the pool.
-                match HistoryMatcher::new(h.events.clone()).match_update(update_id) {
+                let terminal_state = get_terminal_workflow_state(&h.events);
+                match HistoryMatcher::new(h.events).match_update(update_id) {
                     HistoryMatch::Matched { output } => Some(Ok(PollOutcome::Matched(output))),
                     HistoryMatch::Failed { error, .. } => Some(Ok(PollOutcome::Failed(error))),
                     _ => {
-                        if let Some(state) = get_terminal_workflow_state(&h.events) {
+                        if let Some(state) = terminal_state {
                             Some(Ok(PollOutcome::Orphaned(state.to_string())))
                         } else {
                             None
@@ -20816,7 +20816,8 @@ async fn get_update_result(
         return AutumnError::not_found_msg(format!("update {update_id_str}")).into_response();
     }
 
-    let matcher = HistoryMatcher::new(history.events.clone());
+    let terminal_state = get_terminal_workflow_state(&history.events);
+    let matcher = HistoryMatcher::new(history.events);
     match matcher.match_update(update_id) {
         HistoryMatch::Matched { output } => (
             axum::http::StatusCode::OK,
@@ -20835,7 +20836,7 @@ async fn get_update_result(
         )
             .into_response(),
         _ => {
-            if let Some(state) = get_terminal_workflow_state(&history.events) {
+            if let Some(state) = terminal_state {
                 (
                     axum::http::StatusCode::CONFLICT,
                     Json(UpdateOrphanedResponse {

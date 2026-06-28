@@ -9643,8 +9643,14 @@ mod tests {
         let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
 
         // We expect update_id2 to be unfinished, while update_id1 is finished.
-        assert_eq!(ctx.unfinished_update_handler_count(), 1);
-        assert!(!ctx.all_handlers_finished());
+        assert_eq!(
+            ctx.matcher
+                .lock()
+                .unwrap()
+                .unfinished_update_handler_count_at_end(),
+            1
+        );
+        assert!(!ctx.matcher.lock().unwrap().all_handlers_finished_at_end());
     }
 
     #[tokio::test]
