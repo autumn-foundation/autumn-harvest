@@ -9623,6 +9623,8 @@ pub async fn quarantine_workflow_task_timeout(
     let mut parent_id_opt: Option<uuid::Uuid> = None;
     let mut parent_close_policy_opt: Option<String> = None;
     let mut workflow_id_str = String::new();
+    let mut schedule_id_opt: Option<uuid::Uuid> = None;
+    let mut origin_opt: Option<String> = None;
     let (owner, severity) = match exec_id_opt {
         Some(exec_uuid) => {
             let res = exec_dsl::harvest_workflow_executions
@@ -9633,6 +9635,8 @@ pub async fn quarantine_workflow_task_timeout(
                     exec_dsl::parent_id,
                     exec_dsl::parent_close_policy,
                     exec_dsl::workflow_id,
+                    exec_dsl::schedule_id,
+                    exec_dsl::origin,
                 ))
                 .first::<(
                     Option<String>,
@@ -9640,17 +9644,21 @@ pub async fn quarantine_workflow_task_timeout(
                     Option<uuid::Uuid>,
                     Option<String>,
                     String,
+                    Option<uuid::Uuid>,
+                    Option<String>,
                 )>(&mut conn)
                 .await
                 .optional()
                 .ok()
                 .flatten();
             match res {
-                Some((o, s, p, pcp, wid)) => {
+                Some((o, s, p, pcp, wid, sched_id, orig)) => {
                     exec_exists = true;
                     parent_id_opt = p;
                     parent_close_policy_opt = pcp;
                     workflow_id_str = wid;
+                    schedule_id_opt = sched_id;
+                    origin_opt = orig;
                     (o, s)
                 }
                 None => (None, None),
@@ -9798,8 +9806,8 @@ pub async fn quarantine_workflow_task_timeout(
                     &mut conn,
                     &workflow_id_str,
                     workflow_name,
-                    None, // schedule_id not available in quarantine context
-                    None, // origin not available; NULL treated as 'scheduled' (backward-compat)
+                    schedule_id_opt,
+                    origin_opt.as_deref(),
                     metrics,
                 )
                 .await;

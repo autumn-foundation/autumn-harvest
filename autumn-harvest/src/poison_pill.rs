@@ -230,17 +230,31 @@ mod scanner {
     ///
     /// Only transitions executions still in `RUNNING`; a workflow that already
     /// reached a terminal state is left untouched. Returns the
-    /// `(workflow_id, workflow_name)` of the execution when (and only when) it
-    /// actually transitioned `RUNNING` → `FAILED`, so the caller can count the
-    /// failure toward schedule auto-pause once the transaction commits.
+    /// `(workflow_id, workflow_name, schedule_id, origin)` of the execution when
+    /// (and only when) it actually transitioned `RUNNING` → `FAILED`, so the
+    /// caller can count the failure toward schedule auto-pause once the
+    /// transaction commits (with the correct origin so backfill quarantines are
+    /// not mis-attributed to the cadence counter).
+    #[allow(clippy::too_many_lines)]
     async fn fail_owning_workflow(
         conn: &mut AsyncPgConnection,
         exec_id: ExecutionId,
         error: &str,
-    ) -> HarvestResult<(Option<(String, String)>, Vec<DeferredTriggerStart>)> {
+    ) -> HarvestResult<(
+        Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
+        Vec<DeferredTriggerStart>,
+    )> {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
 
-        type ExecRow = (String, Option<uuid::Uuid>, Option<String>, String, String);
+        type ExecRow = (
+            String,
+            Option<uuid::Uuid>,
+            Option<String>,
+            String,
+            String,
+            Option<uuid::Uuid>,
+            Option<String>,
+        );
         let current: Option<ExecRow> = exec_dsl::harvest_workflow_executions
             .find(exec_id.as_uuid())
             .for_update()
@@ -250,12 +264,22 @@ mod scanner {
                 exec_dsl::parent_close_policy,
                 exec_dsl::workflow_id,
                 exec_dsl::workflow_name,
+                exec_dsl::schedule_id,
+                exec_dsl::origin,
             ))
             .first(conn)
             .await
             .optional()
             .map_err(crate::error::database_error)?;
-        let Some((state, parent_id, parent_close_policy, workflow_id, workflow_name)) = current
+        let Some((
+            state,
+            parent_id,
+            parent_close_policy,
+            workflow_id,
+            workflow_name,
+            schedule_id,
+            origin,
+        )) = current
         else {
             return Ok((None, Vec::new()));
         };
@@ -352,7 +376,10 @@ mod scanner {
             .await?;
             crate::queue::wake_workflow_task(conn, parent_exec_id).await?;
         }
-        Ok((Some((workflow_id, workflow_name)), deferred))
+        Ok((
+            Some((workflow_id, workflow_name, schedule_id, origin)),
+            deferred,
+        ))
     }
 
     /// Quarantine an orphaned poison-pill task: move it to the dead-letter
@@ -415,12 +442,13 @@ mod scanner {
         let workflow_exec_id = task.workflow_exec_id;
 
         // The transaction returns whether the row was acted on, plus the owning
-        // workflow's (id, name) when it was actually failed RUNNING → FAILED so
-        // the schedule failure counter can be bumped after commit.
+        // workflow's (id, name, schedule_id, origin) when it was actually failed
+        // RUNNING → FAILED so the schedule failure counter can be bumped (with
+        // the correct origin) after commit.
         let (acted, failed_workflow, deferred_starts) = conn
-            .transaction::< (
+            .transaction::<(
                 bool,
-                Option<(String, String)>,
+                Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
                 Vec<DeferredTriggerStart>,
             ), HarvestError, _>(|conn| {
                 async move {
@@ -479,7 +507,7 @@ mod scanner {
             // schedule auto-pause threshold (issue #360), mirroring the normal
             // failure and timeout paths. Runs after the transaction commits so
             // a counter error can never abort the quarantine.
-            if let Some((workflow_id, workflow_name)) = failed_workflow {
+            if let Some((workflow_id, workflow_name, schedule_id, origin)) = failed_workflow {
                 metrics.record_workflow_terminal(
                     &workflow_name,
                     &task.queue_name,
@@ -489,8 +517,8 @@ mod scanner {
                     conn,
                     &workflow_id,
                     &workflow_name,
-                    None, // schedule_id not available in quarantine context
-                    None, // origin not available in quarantine context; NULL treated as 'scheduled' (backward-compat)
+                    schedule_id,
+                    origin.as_deref(),
                     metrics,
                 )
                 .await;
