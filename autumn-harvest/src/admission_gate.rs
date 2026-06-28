@@ -54,7 +54,7 @@
 //! ## Upper bound on simultaneous gates
 //!
 //! [`MAX_ACTIVE_GATES`] documents the supported maximum. Exceeding it returns
-//! [`TooManyGates`](GateCreateError::TooManyGates) rather than silently
+//! [`TooManyGates`](crate::admission_gate::GateCreateError::TooManyGates) rather than silently
 //! accepting the gate.
 
 use chrono::{DateTime, Utc};
@@ -65,7 +65,7 @@ use uuid::Uuid;
 
 /// Maximum number of simultaneously active gates.
 ///
-/// Reaching this limit returns [`GateCreateError::TooManyGates`] rather than
+/// Reaching this limit returns [`GateCreateError::TooManyGates`](crate::admission_gate::GateCreateError::TooManyGates) rather than
 /// silently accepting more. This bounds the scan cost of the admission check
 /// and prevents unbounded metric cardinality growth from the `gate_id` label.
 ///

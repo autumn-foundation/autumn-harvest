@@ -23,7 +23,7 @@ use crate::policy::{MapFailurePolicy, RetryPolicy, TaskStatus, TriggerRule};
 ///
 /// When the predicate returns `false` the node is skipped
 /// (`DagDispatchDecision::SkipByCondition`) without ever dispatching the
-/// activity.  The skip is recorded as a [`MarkerRecorded`] event so replay
+/// activity.  The skip is recorded as a [`MarkerRecorded`](crate::event::WorkflowEvent::MarkerRecorded) event so replay
 /// always selects the same branch.
 ///
 /// # Example
