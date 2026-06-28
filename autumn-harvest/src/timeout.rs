@@ -1382,6 +1382,7 @@ pub async fn enforce_external_cancels_outbox(
                             conn,
                             target,
                             "cancelled by external request",
+                            Some(metrics),
                         )
                         .await
                         {

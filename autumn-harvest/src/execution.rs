@@ -379,6 +379,7 @@ pub async fn start_or_load_workflow_execution_collect(
             conn,
             existing_exec_id,
             "terminated to start new execution",
+            None,
         )
         .await
         {
@@ -933,6 +934,7 @@ pub async fn cancel_workflow_execution_collect(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     reason: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(CancelledWorkflowExecution, Vec<DeferredTriggerStart>)> {
     let reason = reason.trim();
     let reason = if reason.is_empty() {
@@ -1089,9 +1091,13 @@ pub async fn cancel_workflow_execution_collect(
         .await?;
 
     if cancel_result.newly_cancelled {
-        if let Err(e) =
-            check_and_report_unfinished_handlers(conn, exec_id, &cancel_result.workflow_name, None)
-                .await
+        if let Err(e) = check_and_report_unfinished_handlers(
+            conn,
+            exec_id,
+            &cancel_result.workflow_name,
+            metrics,
+        )
+        .await
         {
             tracing::error!(exec_id = %exec_id, err = %e, "Failed to check and report unfinished handlers on cancel");
         }
@@ -1123,7 +1129,7 @@ pub async fn cancel_workflow_execution(
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<CancelledWorkflowExecution> {
     let (cancel_result, deferred_starts) =
-        cancel_workflow_execution_collect(conn, exec_id, reason).await?;
+        cancel_workflow_execution_collect(conn, exec_id, reason, Some(metrics)).await?;
 
     for start in deferred_starts {
         start.spawn();

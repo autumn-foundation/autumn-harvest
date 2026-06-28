@@ -20713,7 +20713,20 @@ pub async fn poll_update_result(
                     .map_err(|e| HarvestError::Database(e.to_string()))?;
                 let h = store::load_history(&mut c, exec_id).await?;
                 // c is dropped here, releasing the connection back to the pool.
-                let terminal_state = get_terminal_workflow_state(&h.events);
+                let mut terminal_state = get_terminal_workflow_state(&h.events);
+                if terminal_state == Some("CANCELLED") {
+                    if let Ok(Some(db_state)) = harvest_workflow_executions::table
+                        .find(exec_id.as_uuid())
+                        .select(harvest_workflow_executions::state)
+                        .first::<String>(&mut c)
+                        .await
+                        .optional()
+                    {
+                        if db_state == "TERMINATED" {
+                            terminal_state = Some("TERMINATED");
+                        }
+                    }
+                }
                 match HistoryMatcher::new(h.events).match_update(update_id) {
                     HistoryMatch::Matched { output } => Some(Ok(PollOutcome::Matched(output))),
                     HistoryMatch::Failed { error, .. } => Some(Ok(PollOutcome::Failed(error))),
@@ -20816,7 +20829,20 @@ async fn get_update_result(
         return AutumnError::not_found_msg(format!("update {update_id_str}")).into_response();
     }
 
-    let terminal_state = get_terminal_workflow_state(&history.events);
+    let mut terminal_state = get_terminal_workflow_state(&history.events);
+    if terminal_state == Some("CANCELLED") {
+        if let Ok(Some(db_state)) = harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .select(harvest_workflow_executions::state)
+            .first::<String>(&mut conn)
+            .await
+            .optional()
+        {
+            if db_state == "TERMINATED" {
+                terminal_state = Some("TERMINATED");
+            }
+        }
+    }
     let matcher = HistoryMatcher::new(history.events);
     match matcher.match_update(update_id) {
         HistoryMatch::Matched { output } => (

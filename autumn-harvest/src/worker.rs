@@ -1529,6 +1529,7 @@ async fn persist_external_signal_inline(
                                 conn,
                                 run.target,
                                 "cancelled by external request",
+                                Some(metrics),
                             )
                             .await
                             {
