@@ -18,7 +18,7 @@ use autumn_harvest::execution::{
     schedule_run_state_summary,
 };
 use autumn_harvest::schema::harvest_workflow_executions;
-use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::types::ExecutionId;
 use autumn_harvest::{
     StartWorkflowParams, WorkflowIdReusePolicy, start_or_load_workflow_execution,
 };
@@ -248,7 +248,7 @@ async fn origin_is_persisted_for_each_dispatch_source() {
     let runs = list_schedule_runs(
         &mut conn,
         sid,
-        ShardId::UNENCODED.as_i32(),
+        0,
         &ScheduleRunQuery {
             limit: 100,
             ..Default::default()
@@ -315,7 +315,7 @@ async fn list_orders_newest_first_and_filters_by_state() {
     let all = list_schedule_runs(
         &mut conn,
         sid,
-        ShardId::UNENCODED.as_i32(),
+        0,
         &ScheduleRunQuery {
             limit: 100,
             ..Default::default()
@@ -329,7 +329,7 @@ async fn list_orders_newest_first_and_filters_by_state() {
     let failed = list_schedule_runs(
         &mut conn,
         sid,
-        ShardId::UNENCODED.as_i32(),
+        0,
         &ScheduleRunQuery {
             states: vec!["FAILED".to_string()],
             limit: 100,
@@ -365,7 +365,7 @@ async fn keyset_cursor_paginates_without_overlap() {
     let page1 = list_schedule_runs(
         &mut conn,
         sid,
-        ShardId::UNENCODED.as_i32(),
+        0,
         &ScheduleRunQuery {
             limit: 3,
             ..Default::default()
@@ -380,7 +380,7 @@ async fn keyset_cursor_paginates_without_overlap() {
     let page2 = list_schedule_runs(
         &mut conn,
         sid,
-        ShardId::UNENCODED.as_i32(),
+        0,
         &ScheduleRunQuery {
             cursor,
             limit: 100,
@@ -456,10 +456,9 @@ async fn summary_counts_scheduled_origin_only() {
     )
     .await;
 
-    let summary =
-        schedule_run_state_summary(&mut conn, sid, ShardId::UNENCODED.as_i32(), None, None)
-            .await
-            .expect("summary");
+    let summary = schedule_run_state_summary(&mut conn, sid, 0, None, None)
+        .await
+        .expect("summary");
     let by_state: std::collections::HashMap<_, _> =
         summary.into_iter().map(|c| (c.state, c.count)).collect();
 
@@ -474,7 +473,7 @@ async fn summary_counts_scheduled_origin_only() {
     let all = list_schedule_runs(
         &mut conn,
         sid,
-        ShardId::UNENCODED.as_i32(),
+        0,
         &ScheduleRunQuery {
             limit: 100,
             ..Default::default()

@@ -3220,11 +3220,42 @@ pub struct ScheduleRunStateCount {
     pub count: i64,
 }
 
+/// SQL for [`schedule_run_state_summary`].
+///
+/// `GROUP BY state` + `COUNT(*)` in the database so the admin endpoint never
+/// transfers millions of rows for a high-frequency schedule. `$1` = `schedule_id`,
+/// `$2` = `shard_id` (prevents double-counting when two logical shards share one
+/// physical Postgres database), `$3` = optional `since` bound on `started_at`,
+/// `$4` = optional `until` bound on `started_at`. Restricted to
+/// `origin = 'scheduled'` so backfill/manual fires never inflate cadence counts.
+const SCHEDULE_RUN_SUMMARY_SQL: &str = "
+SELECT
+    state::TEXT AS state,
+    COUNT(*)::BIGINT AS count
+FROM harvest_workflow_executions
+WHERE schedule_id  = $1::UUID
+  AND shard_id     = $2::INT4
+  AND origin       = 'scheduled'
+  AND ($3::TIMESTAMPTZ IS NULL OR started_at >= $3::TIMESTAMPTZ)
+  AND ($4::TIMESTAMPTZ IS NULL OR started_at <  $4::TIMESTAMPTZ)
+GROUP BY state
+ORDER BY state
+";
+
+#[derive(Debug, diesel::QueryableByName)]
+struct ScheduleRunStateSqlRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
 /// Count a schedule's **scheduled-origin** runs by terminal state (issue #534).
 ///
 /// Restricted to `origin = 'scheduled'` so a backfill storm or ad-hoc manual fire
 /// never inflates the failure ratio an operator reads off the cadence summary.
-/// Shard-local; the plugin sums the per-shard counts.
+/// Shard-local; the plugin sums the per-shard counts. Uses a SQL `GROUP BY` so
+/// a high-frequency schedule never transfers millions of rows to the app layer.
 pub async fn schedule_run_state_summary(
     conn: &mut AsyncPgConnection,
     schedule_id: uuid::Uuid,
@@ -3232,41 +3263,21 @@ pub async fn schedule_run_state_summary(
     since: Option<chrono::DateTime<Utc>>,
     until: Option<chrono::DateTime<Utc>>,
 ) -> HarvestResult<Vec<ScheduleRunStateCount>> {
-    use crate::schema::harvest_workflow_executions::dsl;
-    use diesel::prelude::*;
-    use diesel_async::RunQueryDsl;
-
-    let mut q = harvest_workflow_executions::table
-        .filter(dsl::schedule_id.eq(schedule_id))
-        .filter(dsl::shard_id.eq(shard_id))
-        .filter(dsl::origin.eq(ORIGIN_SCHEDULED))
-        .into_boxed();
-
-    if let Some(since) = since {
-        q = q.filter(dsl::started_at.ge(since));
-    }
-    if let Some(until) = until {
-        q = q.filter(dsl::started_at.lt(until));
-    }
-
-    // Diesel's `group_by` does not compose with a boxed query; per-schedule
-    // cardinality is bounded by the retention window, so we load the state column
-    // for scheduled-origin runs and tally in memory. Deterministic ordering keeps
-    // the cross-shard merge and tests stable.
-    let states = q
-        .select(dsl::state)
-        .load::<String>(conn)
+    let rows = diesel::sql_query(SCHEDULE_RUN_SUMMARY_SQL)
+        .bind::<diesel::sql_types::Uuid, _>(schedule_id)
+        .bind::<diesel::sql_types::Integer, _>(shard_id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(since)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(until)
+        .load::<ScheduleRunStateSqlRow>(conn)
         .await
         .map_err(database_error)?;
 
-    let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    for state in states {
-        *counts.entry(state).or_insert(0) += 1;
-    }
-
-    Ok(counts
+    Ok(rows
         .into_iter()
-        .map(|(state, count)| ScheduleRunStateCount { state, count })
+        .map(|r| ScheduleRunStateCount {
+            state: r.state,
+            count: r.count,
+        })
         .collect())
 }
 
