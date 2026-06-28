@@ -568,6 +568,7 @@ pub const FORBIDDEN_USER_LABEL_KEYS: &[&str] = &[
     "activity.id",
     "workflow.id",
     ATTR_EXECUTION_ID, // = "harvest.execution.id"
+    ATTR_WORKFLOW_ID,  // = "harvest.workflow.id"
     "harvest.activity.id",
     // Prometheus underscore forms
     "execution_id",

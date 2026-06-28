@@ -181,7 +181,7 @@ The following label keys are **forbidden** because they carry per-execution
 cardinality that would blow up any metrics backend:
 
 `execution.id`, `activity.id`, `workflow.id`, `harvest.execution.id`,
-`harvest.activity.id`, `idempotency_key`, `run_id`
+`harvest.workflow.id`, `harvest.activity.id`, `idempotency_key`, `run_id`
 
 Using any of these keys logs a `tracing::warn!` and silently drops the metric
 call. Use low-cardinality labels only (e.g. `tier`, `region`, `payment_method`).
