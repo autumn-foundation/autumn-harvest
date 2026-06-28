@@ -205,6 +205,8 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS workflow_retry_policy JSONB NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS retry_of_exec_id UUID NULL;\n",
     "ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS retry_policy JSONB NULL;\n",
+    // issue #534: the modern start path inserts origin.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS origin TEXT NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return
