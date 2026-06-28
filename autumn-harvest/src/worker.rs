@@ -2377,6 +2377,25 @@ async fn persist_workflow_completion(
     for start in deferred {
         start.spawn();
     }
+
+    let workflow_name = if let Ok(exec) = crate::execution::load_execution(conn, exec_id).await {
+        exec.workflow_name
+    } else {
+        String::new()
+    };
+    if !workflow_name.is_empty() {
+        if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+            conn,
+            exec_id,
+            &workflow_name,
+            metrics,
+        )
+        .await
+        {
+            tracing::error!(execution_id = %exec_id, err = %e, "Failed to check and report unfinished handlers");
+        }
+    }
+
     Ok(())
 }
 
@@ -2602,6 +2621,33 @@ async fn persist_workflow_failure(
 
     for start in deferred {
         start.spawn();
+    }
+
+    if !retry_scheduled {
+        let workflow_name = execution
+            .map(|exec| exec.workflow_name.clone())
+            .unwrap_or_default();
+        let workflow_name = if workflow_name.is_empty() {
+            if let Ok(exec) = crate::execution::load_execution(conn, exec_id).await {
+                exec.workflow_name
+            } else {
+                String::new()
+            }
+        } else {
+            workflow_name
+        };
+        if !workflow_name.is_empty() {
+            if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+                conn,
+                exec_id,
+                &workflow_name,
+                metrics,
+            )
+            .await
+            {
+                tracing::error!(execution_id = %exec_id, err = %e, "Failed to check and report unfinished handlers");
+            }
+        }
     }
 
     Ok(retry_scheduled)

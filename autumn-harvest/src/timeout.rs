@@ -852,6 +852,17 @@ pub async fn enforce_workflow_execution_timeouts(
             start.spawn();
         }
 
+        if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+            conn,
+            exec_id,
+            &workflow_name,
+            Some(metrics),
+        )
+        .await
+        {
+            tracing::error!(exec_id = %exec_id, err = %e, "Failed to check and report unfinished handlers");
+        }
+
         tracing::warn!(
             exec_id = %exec_id,
             workflow_name = %workflow_name,

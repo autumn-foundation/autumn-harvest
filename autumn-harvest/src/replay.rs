@@ -343,6 +343,35 @@ impl HistoryMatcher {
         }
     }
 
+    /// Returns the IDs of all updates that were admitted but have not completed or failed.
+    pub fn unfinished_update_handlers(&self) -> Vec<UpdateId> {
+        let mut admitted = HashSet::new();
+        let mut completed_or_failed = HashSet::new();
+        for event in &self.events {
+            match event {
+                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
+                    admitted.insert(*update_id);
+                }
+                WorkflowEvent::UpdateCompleted { update_id, .. }
+                | WorkflowEvent::UpdateFailed { update_id, .. } => {
+                    completed_or_failed.insert(*update_id);
+                }
+                _ => {}
+            }
+        }
+        admitted.difference(&completed_or_failed).copied().collect()
+    }
+
+    /// Returns the number of unfinished update handlers.
+    pub fn unfinished_update_handler_count(&self) -> usize {
+        self.unfinished_update_handlers().len()
+    }
+
+    /// Returns `true` if all admitted update handlers have completed or failed.
+    pub fn all_handlers_finished(&self) -> bool {
+        self.unfinished_update_handler_count() == 0
+    }
+
     /// Returns `true` for operator pause/resume lifecycle events (issue #383),
     /// which are transparent no-ops for command-dispatch replay.
     const fn is_pause_lifecycle_event(event: &WorkflowEvent) -> bool {

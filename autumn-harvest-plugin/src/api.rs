@@ -20594,6 +20594,13 @@ struct UpdateFailedResponse {
     error: String,
 }
 
+#[derive(Debug, Serialize)]
+struct UpdateOrphanedResponse {
+    update_id: String,
+    error_type: String,
+    workflow_state: String,
+}
+
 /// `POST /workflows/{id}/update/{update_name}`
 ///
 /// Durably appends an `UpdateAdmitted` event for the named handler, wakes the
@@ -20663,7 +20670,30 @@ async fn admit_update(
 
 /// Poll history until `update_id` resolves to `UpdateCompleted`/`UpdateFailed`
 /// or the wall-clock `timeout_secs` elapses (→ 504 Gateway Timeout).
-async fn poll_update_result(
+enum PollOutcome {
+    Matched(Value),
+    Failed(String),
+    Orphaned(String),
+}
+
+fn get_terminal_workflow_state(events: &[WorkflowEvent]) -> Option<&'static str> {
+    for ev in events {
+        match ev {
+            WorkflowEvent::WorkflowCompleted { .. } => return Some("COMPLETED"),
+            WorkflowEvent::WorkflowFailed { .. } => return Some("FAILED"),
+            WorkflowEvent::WorkflowCancelled { .. } => return Some("CANCELLED"),
+            WorkflowEvent::WorkflowContinuedAsNew { .. } => return Some("CONTINUED_AS_NEW"),
+            WorkflowEvent::WorkflowResetTerminated { .. } => return Some("TERMINATED"),
+            WorkflowEvent::WorkflowExecutionTimedOut { .. } => return Some("TIMED_OUT"),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Poll history until `update_id` resolves to `UpdateCompleted`/`UpdateFailed`
+/// or the wall-clock `timeout_secs` elapses (→ 504 Gateway Timeout).
+pub async fn poll_update_result(
     pool: &HarvestDbPool,
     exec_id: ExecutionId,
     update_id: UpdateId,
@@ -20684,10 +20714,16 @@ async fn poll_update_result(
                     .map_err(|e| HarvestError::Database(e.to_string()))?;
                 let h = store::load_history(&mut c, exec_id).await?;
                 // c is dropped here, releasing the connection back to the pool.
-                match HistoryMatcher::new(h.events).match_update(update_id) {
-                    HistoryMatch::Matched { output } => Some(Ok((true, output, String::new()))),
-                    HistoryMatch::Failed { error, .. } => Some(Ok((false, Value::Null, error))),
-                    _ => None,
+                match HistoryMatcher::new(h.events.clone()).match_update(update_id) {
+                    HistoryMatch::Matched { output } => Some(Ok(PollOutcome::Matched(output))),
+                    HistoryMatch::Failed { error, .. } => Some(Ok(PollOutcome::Failed(error))),
+                    _ => {
+                        if let Some(state) = get_terminal_workflow_state(&h.events) {
+                            Some(Ok(PollOutcome::Orphaned(state.to_string())))
+                        } else {
+                            None
+                        }
+                    }
                 }
             };
             match result {
@@ -20699,7 +20735,7 @@ async fn poll_update_result(
     .await;
 
     match poll_result {
-        Ok(Ok((true, output, _))) => (
+        Ok(Ok(PollOutcome::Matched(output))) => (
             axum::http::StatusCode::OK,
             Json(UpdateCompletedResponse {
                 update_id: update_id.to_string(),
@@ -20707,11 +20743,20 @@ async fn poll_update_result(
             }),
         )
             .into_response(),
-        Ok(Ok((false, _, error))) => (
+        Ok(Ok(PollOutcome::Failed(error))) => (
             axum::http::StatusCode::CONFLICT,
             Json(UpdateFailedResponse {
                 update_id: update_id.to_string(),
                 error,
+            }),
+        )
+            .into_response(),
+        Ok(Ok(PollOutcome::Orphaned(state))) => (
+            axum::http::StatusCode::CONFLICT,
+            Json(UpdateOrphanedResponse {
+                update_id: update_id.to_string(),
+                error_type: "update_orphaned".to_string(),
+                workflow_state: state,
             }),
         )
             .into_response(),
@@ -20771,7 +20816,7 @@ async fn get_update_result(
         return AutumnError::not_found_msg(format!("update {update_id_str}")).into_response();
     }
 
-    let matcher = HistoryMatcher::new(history.events);
+    let matcher = HistoryMatcher::new(history.events.clone());
     match matcher.match_update(update_id) {
         HistoryMatch::Matched { output } => (
             axum::http::StatusCode::OK,
@@ -20789,13 +20834,27 @@ async fn get_update_result(
             }),
         )
             .into_response(),
-        _ => (
-            axum::http::StatusCode::ACCEPTED,
-            Json(UpdateAdmittedResponse {
-                update_id: update_id.to_string(),
-            }),
-        )
-            .into_response(),
+        _ => {
+            if let Some(state) = get_terminal_workflow_state(&history.events) {
+                (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(UpdateOrphanedResponse {
+                        update_id: update_id.to_string(),
+                        error_type: "update_orphaned".to_string(),
+                        workflow_state: state.to_string(),
+                    }),
+                )
+                    .into_response()
+            } else {
+                (
+                    axum::http::StatusCode::ACCEPTED,
+                    Json(UpdateAdmittedResponse {
+                        update_id: update_id.to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        }
     }
 }
 

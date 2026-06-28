@@ -396,3 +396,105 @@ async fn result_follows_continue_as_new_to_final_output() {
         "must return the successor's output"
     );
 }
+
+#[tokio::test]
+async fn test_get_update_result_orphaned() {
+    use autumn_harvest::types::UpdateId;
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "orphaned-wf").await;
+    let update_id = UpdateId::new();
+
+    // 1. Append UpdateAdmitted to history
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    let events = vec![WorkflowEvent::UpdateAdmitted {
+        update_id,
+        name: "test_update".to_string(),
+        input: Value::Null,
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &events, history.next_event_id)
+        .await
+        .expect("append admitted update event");
+
+    // 2. Querying result while running should return 202 Accepted
+    let (status, body) = get_json(
+        &app,
+        &format!("/workflows/{exec_id}/update/{update_id}/result"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["update_id"], update_id.to_string());
+
+    // 3. Mark the workflow COMPLETED (unresolved update becomes orphaned)
+    mark_completed(&mut conn, exec_id, Value::Null).await;
+    // Append WorkflowCompleted event to history to make get_terminal_workflow_state find it
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    let completed_event = vec![WorkflowEvent::WorkflowCompleted {
+        output: Value::Null,
+    }];
+    store::append_events(&mut conn, exec_id, &completed_event, history.next_event_id)
+        .await
+        .expect("append completed event");
+
+    // 4. Querying result now should return 409 Conflict with update_orphaned
+    let (status, body) = get_json(
+        &app,
+        &format!("/workflows/{exec_id}/update/{update_id}/result"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["update_id"], update_id.to_string());
+    assert_eq!(body["error_type"], "update_orphaned");
+    assert_eq!(body["workflow_state"], "COMPLETED");
+}
+
+#[tokio::test]
+async fn test_poll_update_result_orphaned() {
+    use autumn_harvest::types::UpdateId;
+    use autumn_harvest_plugin::api::poll_update_result;
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let harvest_pool = HarvestDbPool::from(pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "orphaned-poll-wf").await;
+    let update_id = UpdateId::new();
+
+    // Append UpdateAdmitted to history
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    let events = vec![WorkflowEvent::UpdateAdmitted {
+        update_id,
+        name: "test_update".to_string(),
+        input: Value::Null,
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &events, history.next_event_id)
+        .await
+        .expect("append admitted update event");
+
+    // Mark completed + append WorkflowCompleted event
+    mark_completed(&mut conn, exec_id, Value::Null).await;
+    let history2 = store::load_history(&mut conn, exec_id).await.unwrap();
+    let completed_event = vec![WorkflowEvent::WorkflowCompleted {
+        output: Value::Null,
+    }];
+    store::append_events(&mut conn, exec_id, &completed_event, history2.next_event_id)
+        .await
+        .expect("append completed event");
+
+    // Poll the result — it should immediately resolve with 409 Conflict
+    let response = poll_update_result(&harvest_pool, exec_id, update_id, 1).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["update_id"], update_id.to_string());
+    assert_eq!(body["error_type"], "update_orphaned");
+    assert_eq!(body["workflow_state"], "COMPLETED");
+}

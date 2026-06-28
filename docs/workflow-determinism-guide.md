@@ -366,3 +366,24 @@ The determinism rule catalog is an early-stage guardrail, not the final proof of
 5. **Build-id routing** (`WorkerConfig::with_build_id`): gate new executions on the new build until compatibility is declared.
 
 Each layer catches a different class of problem. All five together provide defence-in-depth for safe rolling deploys.
+
+---
+
+## Update Handlers and Determinism
+
+Workflow Update Handlers allow external clients to interact with running workflows and receive synchronous results (issue #140). However, update handlers run asynchronously and their lifecycles are decoupled from the main workflow function.
+
+### Orphaned Update Handlers
+
+If a workflow completes (or fails, times out, is cancelled/terminated) while update handlers are still in progress, these updates become **orphaned**. Orphaned updates will be terminated immediately, and their clients will receive a `409 Conflict` response with an `update_orphaned` error payload.
+
+### Waiting for Update Handlers to Complete
+
+To prevent orphaned updates and ensure all clients receive their results, you can gate the workflow completion by waiting for all admitted update handlers to resolve using the `WorkflowContext::all_handlers_finished()` and `WorkflowContext::unfinished_update_handler_count()` helpers inside your workflow logic:
+
+```rust
+// Block workflow completion until all update handlers are resolved.
+ctx.await_condition(|| ctx.all_handlers_finished()).await;
+```
+
+This ensures a clean exit and prevents unhandled update requests from being aborted.

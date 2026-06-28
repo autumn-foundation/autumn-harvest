@@ -65,8 +65,8 @@ use crate::telemetry::{
     METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
     METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
     METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_STARTED,
-    METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, MetricsRecorder, SlotType,
-    WorkflowStatus,
+    METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
+    MetricsRecorder, SlotType, WorkflowStatus,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -85,6 +85,15 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_QUEUE => queue.to_owned(),
         )
         .increment(1);
+    }
+
+    fn record_workflow_unfinished_handlers(&self, workflow_name: &str, kind: &str, count: u64) {
+        counter!(
+            METRIC_WORKFLOW_UNFINISHED_HANDLERS,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_KIND => kind.to_owned(),
+        )
+        .increment(count);
     }
 
     fn record_workflow_completed(

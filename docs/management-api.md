@@ -514,3 +514,43 @@ curl -H "x-harvest-admin: true" \
 curl -H "x-harvest-admin: true" \
   "/api/harvest/workflows/$EXEC_ID/history?event_type=TimerStarted&event_type=TimerFired"
 ```
+
+---
+
+## Workflow Updates Result API
+
+### Endpoints
+
+#### Poll/Admit Update
+```
+POST /workflows/{id}/update/{update_name}
+```
+
+By default (or when `wait=completed`), this endpoint admits the update and then polls for completion. If the workflow reaches a terminal state before the update is completed or failed, the poll immediately returns a `409 Conflict` containing the orphaned update error payload:
+
+```json
+{
+  "update_id": "<uuid>",
+  "error_type": "update_orphaned",
+  "workflow_state": "COMPLETED"
+}
+```
+
+#### Get Update Result
+```
+GET /workflows/{id}/update/{update_id}/result
+```
+
+Looks up the result of an admitted update. Returns:
+- `200 OK` with the JSON output if completed successfully.
+- `409 Conflict` with the failure error string if failed.
+- `202 Accepted` if the update is still in-flight.
+- `409 Conflict` with `update_orphaned` payload if the workflow ended while the update was unresolved:
+
+```json
+{
+  "update_id": "<uuid>",
+  "error_type": "update_orphaned",
+  "workflow_state": "FAILED"
+}
+```

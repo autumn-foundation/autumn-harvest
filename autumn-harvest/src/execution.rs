@@ -941,8 +941,8 @@ pub async fn cancel_workflow_execution_collect(
         reason.to_string()
     };
 
-    conn.transaction::<(CancelledWorkflowExecution, Vec<DeferredTriggerStart>), HarvestError, _>(
-        |conn| {
+    let (cancel_result, deferred_starts) = conn
+        .transaction::<_, HarvestError, _>(|conn| {
             async move {
                 let execution = harvest_workflow_executions::table
                     .find(exec_id.as_uuid())
@@ -1085,9 +1085,19 @@ pub async fn cancel_workflow_execution_collect(
                 ))
             }
             .scope_boxed()
-        },
-    )
-    .await
+        })
+        .await?;
+
+    if cancel_result.newly_cancelled {
+        if let Err(e) =
+            check_and_report_unfinished_handlers(conn, exec_id, &cancel_result.workflow_name, None)
+                .await
+        {
+            tracing::error!(exec_id = %exec_id, err = %e, "Failed to check and report unfinished handlers on cancel");
+        }
+    }
+
+    Ok((cancel_result, deferred_starts))
 }
 
 /// Cancel a running workflow execution.
@@ -2002,17 +2012,28 @@ pub async fn terminate_workflow_execution(
     // already terminal (FAILED, TIMED_OUT, COMPLETED), that outcome was already
     // counted — emitting Terminated again would inflate the SLO denominator for
     // operator cleanup actions.
-    if cancel_result.newly_cancelled
-        && matches!(
+    if cancel_result.newly_cancelled {
+        if let Err(e) = check_and_report_unfinished_handlers(
+            conn,
+            exec_id,
+            &cancel_result.workflow_name,
+            Some(metrics),
+        )
+        .await
+        {
+            tracing::error!(exec_id = %exec_id, err = %e, "Failed to check and report unfinished handlers on terminate");
+        }
+
+        if matches!(
             cancel_result.prior_state.as_str(),
             "RUNNING" | "SUSPENDED" | "PAUSED"
-        )
-    {
-        metrics.record_workflow_terminal(
-            &cancel_result.workflow_name,
-            &cancel_result.queue_name,
-            crate::telemetry::WorkflowStatus::Terminated,
-        );
+        ) {
+            metrics.record_workflow_terminal(
+                &cancel_result.workflow_name,
+                &cancel_result.queue_name,
+                crate::telemetry::WorkflowStatus::Terminated,
+            );
+        }
     }
 
     Ok(cancel_result)
@@ -3383,6 +3404,45 @@ pub async fn non_terminal_counts_by_workflow_name(
             oldest_started_at: row.oldest_started_at,
         })
         .collect())
+}
+
+/// Load a workflow execution row by execution ID without locking.
+pub async fn load_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<WorkflowExecution> {
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+}
+
+/// Scans workflow history for unresolved update handlers and records warning logs/metrics if any exist.
+pub async fn check_and_report_unfinished_handlers(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    workflow_name: &str,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<()> {
+    let history = store::load_history(conn, exec_id).await?;
+    let matcher = crate::replay::HistoryMatcher::new(history.events);
+    let count = matcher.unfinished_update_handler_count();
+    if count > 0 {
+        tracing::warn!(
+            workflow_name = workflow_name,
+            execution_id = %exec_id,
+            unfinished_update_handler_count = count,
+            "Workflow completed with unfinished update handlers"
+        );
+        if let Some(recorder) = metrics {
+            recorder.record_workflow_unfinished_handlers(workflow_name, "update", count as u64);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
