@@ -91,7 +91,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
     "\n",
     // issue #523: workflow-level retry policy columns.
-    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql"),
+    "\n",
+    // issue #534: origin column + per-schedule run-history index.
+    include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql")
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -184,6 +187,7 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -594,6 +598,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -811,6 +816,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -966,6 +972,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1118,6 +1125,7 @@ async fn activity_without_cancellation_check_completes_normally() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await

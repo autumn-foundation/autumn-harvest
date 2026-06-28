@@ -867,6 +867,8 @@ async fn insert_fork_execution(
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        // Reset fork is an operator intervention, not a schedule fire (issue #534).
+        origin: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -1123,6 +1125,7 @@ mod tests {
             workflow_attempt: 1,
             workflow_retry_policy: None,
             retry_of_exec_id: None,
+            origin: None,
         }
     }
 

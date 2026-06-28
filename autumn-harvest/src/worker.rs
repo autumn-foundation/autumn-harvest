@@ -2526,6 +2526,7 @@ async fn persist_workflow_failure(
                             workflow_retry_policy: Some(policy),
                             retry_of_exec_id: Some(exec_id.as_uuid()),
                             max_workflow_attempts_ceiling: None,
+                            origin: exec_ref.origin.as_deref(),
                         };
 
                         match crate::execution::start_or_load_workflow_execution_collect(
@@ -3462,6 +3463,7 @@ async fn persist_all_started_child_workflows(
                     workflow_retry_policy: child_retry_policy
                         .and_then(|p| serde_json::to_value(&p).ok()),
                     retry_of_exec_id: None,
+                    origin: None, // child workflow, not a schedule fire (issue #534)
                 };
                 let child_started_event = WorkflowEvent::WorkflowStarted {
                     input: child.input.clone(),
@@ -4061,6 +4063,7 @@ async fn create_detached_child_executions(
             workflow_retry_policy: detached_retry_policy
                 .and_then(|p| serde_json::to_value(&p).ok()),
             retry_of_exec_id: None,
+            origin: None, // detached child workflow, not a schedule fire (issue #534)
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -5386,6 +5389,9 @@ async fn persist_workflow_continue_as_new(
         workflow_attempt: 1,
         workflow_retry_policy: execution.workflow_retry_policy.clone(),
         retry_of_exec_id: None,
+        // Preserve dispatch origin through continue-as-new so a continued scheduled run
+        // stays attributed to its schedule's cadence (issue #534).
+        origin: execution.origin.as_deref(),
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
@@ -5525,6 +5531,7 @@ async fn persist_workflow_outcome(
                     &execution.workflow_id,
                     &execution.workflow_name,
                     execution.schedule_id,
+                    execution.origin.as_deref(),
                 )
                 .await;
             }
@@ -5555,6 +5562,7 @@ async fn persist_workflow_outcome(
                     &execution.workflow_id,
                     &execution.workflow_name,
                     execution.schedule_id,
+                    execution.origin.as_deref(),
                     registry.telemetry().metrics.as_ref(),
                 )
                 .await;
@@ -5597,6 +5605,7 @@ async fn persist_workflow_outcome(
                             &execution.workflow_id,
                             &execution.workflow_name,
                             execution.schedule_id,
+                            execution.origin.as_deref(),
                             registry.telemetry().metrics.as_ref(),
                         )
                         .await;
@@ -5682,6 +5691,7 @@ async fn run_deferred_schedule_counter(
                 &execution.workflow_id,
                 &execution.workflow_name,
                 execution.schedule_id,
+                execution.origin.as_deref(),
             )
             .await;
         }
@@ -5691,6 +5701,7 @@ async fn run_deferred_schedule_counter(
                 &execution.workflow_id,
                 &execution.workflow_name,
                 execution.schedule_id,
+                execution.origin.as_deref(),
                 registry.telemetry().metrics.as_ref(),
             )
             .await;
@@ -9612,6 +9623,8 @@ pub async fn quarantine_workflow_task_timeout(
     let mut parent_id_opt: Option<uuid::Uuid> = None;
     let mut parent_close_policy_opt: Option<String> = None;
     let mut workflow_id_str = String::new();
+    let mut schedule_id_opt: Option<uuid::Uuid> = None;
+    let mut origin_opt: Option<String> = None;
     let (owner, severity) = match exec_id_opt {
         Some(exec_uuid) => {
             let res = exec_dsl::harvest_workflow_executions
@@ -9622,6 +9635,8 @@ pub async fn quarantine_workflow_task_timeout(
                     exec_dsl::parent_id,
                     exec_dsl::parent_close_policy,
                     exec_dsl::workflow_id,
+                    exec_dsl::schedule_id,
+                    exec_dsl::origin,
                 ))
                 .first::<(
                     Option<String>,
@@ -9629,17 +9644,21 @@ pub async fn quarantine_workflow_task_timeout(
                     Option<uuid::Uuid>,
                     Option<String>,
                     String,
+                    Option<uuid::Uuid>,
+                    Option<String>,
                 )>(&mut conn)
                 .await
                 .optional()
                 .ok()
                 .flatten();
             match res {
-                Some((o, s, p, pcp, wid)) => {
+                Some((o, s, p, pcp, wid, sched_id, orig)) => {
                     exec_exists = true;
                     parent_id_opt = p;
                     parent_close_policy_opt = pcp;
                     workflow_id_str = wid;
+                    schedule_id_opt = sched_id;
+                    origin_opt = orig;
                     (o, s)
                 }
                 None => (None, None),
@@ -9787,7 +9806,8 @@ pub async fn quarantine_workflow_task_timeout(
                     &mut conn,
                     &workflow_id_str,
                     workflow_name,
-                    None, // schedule_id not available in quarantine context
+                    schedule_id_opt,
+                    origin_opt.as_deref(),
                     metrics,
                 )
                 .await;

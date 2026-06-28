@@ -77,6 +77,11 @@ diesel::table! {
         workflow_retry_policy -> Nullable<Jsonb>,
         /// ID of the previous failed execution in this retry chain (issue #523). NULL for first attempt.
         retry_of_exec_id -> Nullable<Uuid>,
+        /// Dispatch origin of this execution (issue #534): `scheduled` / `backfill` /
+        /// `manual_trigger` for schedule-attributed runs, NULL for all non-scheduled runs
+        /// (manual start, signal-with-start, child workflows, etc.). Metadata only —
+        /// never affects replay or carryover.
+        origin -> Nullable<Text>,
     }
 }
 

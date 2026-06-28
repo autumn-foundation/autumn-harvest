@@ -149,7 +149,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql"),
     "\n",
-    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql"),
+    "\n",
+    // issue #534: origin column + per-schedule run-history index.
+    include_str!("../../autumn-harvest/migrations/20260628000001_harvest_execution_origin/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -261,6 +264,7 @@ async fn seed_running(conn: &mut AsyncPgConnection, workflow_id: &str) -> Execut
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await

@@ -69,7 +69,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
     "\n",
     // issue #523: workflow-level retry policy columns.
-    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql"),
+    "\n",
+    // issue #534: origin column + per-schedule run-history index.
+    include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql")
 );
 
 async fn setup_test_db() -> (
@@ -137,6 +140,7 @@ async fn test_send_and_load_signals() {
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        origin: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -197,6 +201,7 @@ async fn test_mark_signals_consumed() {
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        origin: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)
@@ -269,6 +274,7 @@ async fn insert_running_execution(conn: &mut diesel_async::AsyncPgConnection) ->
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        origin: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&new_exec)

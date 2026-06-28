@@ -173,7 +173,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260615000001_harvest_context_headers/up.sql"),
     "\n",
     // issue #523: workflow-level retry policy columns.
-    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql"),
+    "\n",
+    // issue #534: origin column + per-schedule run-history index.
+    include_str!("../../autumn-harvest/migrations/20260628000001_harvest_execution_origin/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -560,6 +563,7 @@ async fn test_trigger_evaluations_same_shard() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -678,6 +682,7 @@ async fn test_terminate_fires_terminated_trigger_not_cancelled() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -791,6 +796,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -871,6 +877,7 @@ async fn test_trigger_input_mapping_static_and_projection() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -973,6 +980,7 @@ async fn test_trigger_state_matching_and_deduplication() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1152,6 +1160,7 @@ async fn test_trigger_cross_shard() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1259,6 +1268,7 @@ async fn test_completion_trigger_via_worker_run() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1380,6 +1390,7 @@ async fn test_trigger_with_custom_queue() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1569,6 +1580,7 @@ async fn test_trigger_outbox_retry_and_sweep() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -1787,6 +1799,7 @@ async fn test_trigger_cross_shard_queue_preservation() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -2256,6 +2269,7 @@ async fn test_trigger_evaluations_schema_validation() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -2331,6 +2345,7 @@ async fn test_trigger_evaluations_schema_validation() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await
@@ -2448,6 +2463,7 @@ async fn test_trigger_emits_fire_metric_outcomes() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: None,
         },
     )
     .await

@@ -115,6 +115,7 @@ use autumn_harvest::{
 };
 
 use crate::preflight::{PreflightReport, build_preflight_report};
+use crate::schedule_runs;
 use crate::shard_health::{ShardHealthReport, ShardReadiness, build_shard_health_report};
 use crate::state::HarvestDbPool;
 use crate::version_gate_retirement::{RetirementCheckQuery, build_retirement_check_report};
@@ -2694,6 +2695,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(trigger_schedule_now).route_layer(require_admin.clone()),
         )
         .route("/admin/schedules/{id}", delete(delete_schedule))
+        .route(
+            "/admin/schedules/{id}/runs",
+            get(list_schedule_runs_handler).route_layer(require_admin.clone()),
+        )
         .route("/admin/schedules/decisions", get(list_fleet_decisions))
         .route(
             "/admin/schedules/{id}/decisions",
@@ -2971,6 +2976,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("POST", "/admin/schedules/{id}/backfill"),
         ("POST", "/admin/schedules/{id}/trigger"),
         ("DELETE", "/admin/schedules/{id}"),
+        ("GET", "/admin/schedules/{id}/runs"),
         ("GET", "/admin/schedules/{id}/preview"),
         ("POST", "/admin/schedules/preview"),
         ("GET", "/admin/schedules/decisions"),
@@ -3849,6 +3855,19 @@ pub const fn management_api_response_fields()
             Some(&["execution_id", "workflow_id", "triggered_at", "outcome"]),
         ),
         ("DELETE", "/admin/schedules/{id}", Some(&["ok"])),
+        (
+            "GET",
+            "/admin/schedules/{id}/runs",
+            Some(&[
+                "schedule_id",
+                "status",
+                "runs",
+                "summary",
+                "limit",
+                "next_cursor",
+                "shards",
+            ]),
+        ),
         (
             "GET",
             "/admin/schedules/{id}/preview",
@@ -5700,7 +5719,7 @@ fn encode_workflow_children_cursor(row: &store::WorkflowChildRow) -> String {
 
 /// Encode a `(created_at, exec_id)` cursor pair into the opaque token format
 /// `"<rfc3339_micros>|<uuid>"`.
-fn encode_workflow_list_cursor_raw(
+pub(crate) fn encode_workflow_list_cursor_raw(
     created_at: &chrono::DateTime<chrono::Utc>,
     exec_id: &uuid::Uuid,
 ) -> String {
@@ -7691,6 +7710,7 @@ async fn start_workflow(
             workflow_retry_policy,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+            origin: None,
         },
     )
     .await;
@@ -8380,6 +8400,7 @@ async fn batch_start_workflows(
                     workflow_retry_policy: item_workflow_retry_policy,
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                    origin: None,
                 },
                 false,
                 item_reject_fresh,
@@ -11722,6 +11743,132 @@ async fn get_schedule_decisions(
     Ok(Json(records))
 }
 
+/// `GET /admin/schedules/{id}/runs` — per-schedule run history (issue #534).
+///
+/// Lists the executions a schedule launched, newest-first, each with its terminal
+/// outcome and dispatch `origin` (`scheduled`/`backfill`/`manual_trigger`), plus a
+/// cadence summary that counts only `scheduled`-origin runs so a backfill storm or
+/// ad-hoc trigger never inflates the failure ratio. Fans out across shards and
+/// flags partial results when a shard is unavailable (never a hard 500).
+async fn list_schedule_runs_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id_str): Path<String>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<schedule_runs::ScheduleRunsResponse>, AutumnError> {
+    const KNOWN_ORIGINS: [&str; 3] = [
+        autumn_harvest::execution::ORIGIN_SCHEDULED,
+        autumn_harvest::execution::ORIGIN_BACKFILL,
+        autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER,
+    ];
+
+    let schedule_id = parse_uuid(&id_str, "schedule id")?;
+    let params = schedule_runs::ScheduleRunsParams::from_query_pairs(&pairs, chrono::Utc::now())
+        .map_err(AutumnError::bad_request_msg)?;
+
+    // Validate the state/origin vocabularies up front so a typo is a 400, not a
+    // silently-empty match.
+    for state in &params.states {
+        if !KNOWN_WORKFLOW_STATES.contains(&state.as_str()) {
+            return Err(AutumnError::bad_request_msg(format!(
+                "invalid state '{state}'; expected one of {KNOWN_WORKFLOW_STATES:?}"
+            )));
+        }
+    }
+    for origin in &params.origins {
+        if !KNOWN_ORIGINS.contains(&origin.as_str()) {
+            return Err(AutumnError::bad_request_msg(format!(
+                "invalid origin '{origin}'; expected one of {KNOWN_ORIGINS:?}"
+            )));
+        }
+    }
+
+    let pool = api_state.storage_pool().map_err(map_error)?;
+
+    // Fetch limit + 1 per shard so the merge can detect whether a further page
+    // exists across the combined keyset.
+    let query = autumn_harvest::ScheduleRunQuery {
+        states: params.states.clone(),
+        origins: params.origins.clone(),
+        since: params.since,
+        until: params.until,
+        cursor: params.cursor,
+        limit: params.limit.saturating_add(1),
+    };
+
+    let mut observations = Vec::new();
+    for (shard, shard_pool) in pool.iter_shards() {
+        let shard_id = shard.as_i32();
+        // Per-shard failures are recorded as an unavailable observation rather than
+        // failing the whole request, so one down shard yields a partial result.
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(conn) => conn,
+            Err(err) => {
+                observations.push(schedule_runs::ShardRunsObservation {
+                    shard_id,
+                    runs: Vec::new(),
+                    summary: Vec::new(),
+                    error: Some(err.to_string()),
+                });
+                continue;
+            }
+        };
+
+        let runs = match autumn_harvest::list_schedule_runs(
+            &mut conn,
+            schedule_id,
+            shard_id,
+            &query,
+        )
+        .await
+        {
+            Ok(runs) => runs,
+            Err(err) => {
+                observations.push(schedule_runs::ShardRunsObservation {
+                    shard_id,
+                    runs: Vec::new(),
+                    summary: Vec::new(),
+                    error: Some(err.to_string()),
+                });
+                continue;
+            }
+        };
+
+        let summary = match autumn_harvest::schedule_run_state_summary(
+            &mut conn,
+            schedule_id,
+            shard_id,
+            params.since,
+            params.until,
+        )
+        .await
+        {
+            Ok(summary) => summary,
+            Err(err) => {
+                observations.push(schedule_runs::ShardRunsObservation {
+                    shard_id,
+                    runs: Vec::new(),
+                    summary: Vec::new(),
+                    error: Some(err.to_string()),
+                });
+                continue;
+            }
+        };
+
+        observations.push(schedule_runs::ShardRunsObservation {
+            shard_id,
+            runs,
+            summary,
+            error: None,
+        });
+    }
+
+    Ok(Json(schedule_runs::build_runs_response(
+        schedule_id,
+        params.limit,
+        observations,
+    )))
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct FleetDecisionsQuery {
     schedule_name: Option<String>,
@@ -13233,19 +13380,21 @@ async fn trigger_schedule_now(
             severity,
             context_headers: None,
             sla,
-            // Manual trigger-now is treated as a manual fire and deliberately does NOT
-            // participate in scheduled carryover (issue #488). Tagging it with the
-            // schedule would make resolve_carryover run on this default-pool connection
-            // even when the schedule's prior runs live on another shard (multi-shard
-            // schedule routing is issue #171 follow-up), and the UI trigger path lacks
-            // the budget/exhaustion checks the automated lineage relies on. Scheduled
-            // fires and backfills carry the lineage; ad-hoc operator fires do not.
-            schedule_id: None,
+            // Manual trigger-now is *attributed* to its schedule (issue #534) so it shows
+            // up in GET /admin/schedules/{id}/runs, but is marked origin=manual_trigger so
+            // it never masquerades as normal cadence. It deliberately does NOT participate
+            // in scheduled carryover (issue #488): scheduled_for stays None, so
+            // resolve_carryover short-circuits to (None, None) before any DB query (it never
+            // runs the cross-shard carryover lookup on this default-pool connection). The UI
+            // trigger path also lacks the budget/exhaustion checks the automated lineage
+            // relies on — only scheduled fires and backfills advance the carryover cursor.
+            schedule_id: Some(schedule_id),
             scheduled_for: None,
             workflow_attempt: 1,
             workflow_retry_policy: manual_trigger_retry_policy,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+            origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
         },
     )
     .await;
@@ -13974,6 +14123,8 @@ async fn schedule_backfill(
                         max_workflow_attempts_ceiling: runtime
                             .registry
                             .max_workflow_attempts_ceiling,
+                        // Distinguish a backfill storm from normal cadence (issue #534).
+                        origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
                     },
                 )
                 .await;
@@ -14165,6 +14316,8 @@ async fn schedule_backfill(
                         max_workflow_attempts_ceiling: runtime
                             .registry
                             .max_workflow_attempts_ceiling,
+                        // Distinguish a backfill storm from normal cadence (issue #534).
+                        origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
                     },
                 )
                 .await;
@@ -22860,6 +23013,7 @@ mod tests {
                 workflow_retry_policy: None,
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
+                origin: None,
             },
         )
         .await

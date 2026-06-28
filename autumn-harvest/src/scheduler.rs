@@ -787,12 +787,19 @@ pub async fn trigger_unified_dag(
             context_headers: None,
 
             sla: None,
-            schedule_id: None, // manual/API DAG trigger, not a scheduler-fired slot
+            // Attribute the manual API trigger to the schedule so it appears in
+            // GET /admin/schedules/{id}/runs with origin='manual_trigger'.
+            // scheduled_for stays None so resolve_carryover (issue #488) still
+            // short-circuits — NULL slot comparisons are false.
+            schedule_id: schedule.as_ref().map(|s| s.id),
             scheduled_for: None,
             workflow_attempt: 1,
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
+            origin: schedule
+                .as_ref()
+                .map(|_| crate::execution::ORIGIN_MANUAL_TRIGGER),
         },
     )
     .await
@@ -1747,15 +1754,23 @@ async fn cancel_in_flight_runs(
 ) -> HarvestResult<u32> {
     use crate::execution::cancel_workflow_execution;
 
-    let running_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
-        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-        .order(harvest_workflow_executions::started_at.asc())
-        .select(harvest_workflow_executions::id)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let running_ids: Vec<uuid::Uuid> =
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+            .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+            // Exclude manual-trigger runs: attributing them to the schedule (issue #534)
+            // must not make them targets for automatic overlap-cleanup. Scheduled and
+            // backfill runs remain eligible; NULL origin (pre-migration) is included for
+            // backward compatibility.
+            .filter(harvest_workflow_executions::origin.is_null().or(
+                harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
+            ))
+            .order(harvest_workflow_executions::started_at.asc())
+            .select(harvest_workflow_executions::id)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
 
     let mut count: u32 = 0;
     for raw_id in running_ids
@@ -1794,15 +1809,19 @@ async fn terminate_in_flight_runs(
 ) -> HarvestResult<u32> {
     use crate::execution::terminate_workflow_execution;
 
-    let active_ids: Vec<uuid::Uuid> = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
-        .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
-        .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
-        .order(harvest_workflow_executions::started_at.asc())
-        .select(harvest_workflow_executions::id)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let active_ids: Vec<uuid::Uuid> =
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+            .filter(harvest_workflow_executions::schedule_id.eq(Some(schedule_id)))
+            .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
+            .filter(harvest_workflow_executions::origin.is_null().or(
+                harvest_workflow_executions::origin.ne(crate::execution::ORIGIN_MANUAL_TRIGGER),
+            ))
+            .order(harvest_workflow_executions::started_at.asc())
+            .select(harvest_workflow_executions::id)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
 
     let mut count: u32 = 0;
     for raw_id in active_ids
@@ -2811,6 +2830,8 @@ async fn tick_one_workflow_schedule(
                     .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
+                // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
+                origin: Some(crate::execution::ORIGIN_SCHEDULED),
             },
         )
         .await;
@@ -3727,6 +3748,8 @@ async fn drain_buffered_schedule_runs(
                         .or_else(|| wf_info.and_then(|info| info.retry_policy.clone())),
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
+                    // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
+                    origin: Some(crate::execution::ORIGIN_SCHEDULED),
                 },
             )
             .await;
@@ -3871,14 +3894,26 @@ async fn drain_buffered_schedule_runs(
 /// already has the schedule UUID (e.g. retry executions whose `workflow_id` does
 /// not start with `"sched:"`).
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn maybe_increment_schedule_failure_counter(
     conn: &mut diesel_async::AsyncPgConnection,
     workflow_id: &str,
     workflow_name: &str,
     schedule_id: Option<uuid::Uuid>,
+    origin: Option<&str>,
     metrics: &dyn crate::telemetry::MetricsRecorder,
 ) {
     use crate::schema::harvest_schedules::dsl;
+
+    // Only scheduled-cadence failures count toward the auto-pause threshold.
+    // Backfill and manual-trigger runs are deliberately excluded: a backfill
+    // storm or an operator ad-hoc fire should not trip the consecutive-failure
+    // circuit breaker.  NULL origin is treated as scheduled (legacy rows
+    // pre-dating the origin column, or the quarantine path which lacks
+    // execution context).
+    if matches!(origin, Some(o) if o != crate::execution::ORIGIN_SCHEDULED) {
+        return;
+    }
 
     // Retry executions carry an explicit `schedule_id`; original scheduled
     // executions embed the UUID in the `workflow_id` prefix.  Bail out only
@@ -4011,8 +4046,14 @@ pub(crate) async fn maybe_reset_schedule_failure_counter(
     workflow_id: &str,
     workflow_name: &str,
     schedule_id: Option<uuid::Uuid>,
+    origin: Option<&str>,
 ) {
     use crate::schema::harvest_schedules::dsl;
+
+    // Only reset on scheduled-cadence successes (mirrors the increment guard).
+    if matches!(origin, Some(o) if o != crate::execution::ORIGIN_SCHEDULED) {
+        return;
+    }
 
     if schedule_id.is_none() && !workflow_id.starts_with("sched:") {
         return;

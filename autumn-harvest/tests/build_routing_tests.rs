@@ -333,7 +333,10 @@ mod db_tests {
         include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
         "\n",
         // issue #523: workflow-level retry policy columns.
-        include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
+        include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql"),
+        "\n",
+        // issue #534: origin column + per-schedule run-history index.
+        include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql")
     );
 
     async fn setup() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -510,6 +513,7 @@ mod db_tests {
                 workflow_attempt: 1,
                 workflow_retry_policy: None,
                 retry_of_exec_id: None,
+                origin: None,
             })
             .execute(conn)
             .await

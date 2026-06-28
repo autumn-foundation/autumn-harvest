@@ -102,7 +102,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
     "\n",
     // issue #523: workflow-level retry policy columns.
-    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql"),
+    "\n",
+    // issue #534: origin column + per-schedule run-history index.
+    include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql")
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -336,6 +339,7 @@ async fn test_same_shard_not_found_retry() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
+        origin: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -382,6 +386,7 @@ async fn test_same_shard_not_found_retry() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
+        origin: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -524,6 +529,7 @@ async fn test_cross_shard_outbox_delivery() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
+        origin: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await
@@ -563,6 +569,7 @@ async fn test_cross_shard_outbox_delivery() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
+        origin: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -679,6 +686,7 @@ async fn test_grace_window_expiration() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
+        origin: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -832,6 +840,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
+        origin: None,
     };
     start_or_load_workflow_execution(&mut conn, start_params)
         .await
@@ -878,6 +887,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
+        origin: None,
     };
     start_or_load_workflow_execution(&mut conn, start_target_params)
         .await

@@ -113,7 +113,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260618000001_harvest_debounce/up.sql"),
     "\n",
     // issue #523: workflow-level retry policy columns.
-    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql")
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql"),
+    "\n",
+    // issue #534: origin column + per-schedule run-history index.
+    include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql")
 );
 
 // ---------------------------------------------------------------------------
@@ -171,6 +174,7 @@ async fn insert_execution_for_queue(
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        origin: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

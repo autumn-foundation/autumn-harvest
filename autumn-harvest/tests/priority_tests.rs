@@ -256,6 +256,7 @@ fn start_workflow_params_has_priority_field() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
+        origin: None,
     };
 
     assert_eq!(params.priority, Priority::High);
@@ -300,6 +301,7 @@ fn start_workflow_params_default_priority_is_normal() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
+        origin: None,
     };
 
     assert_eq!(params.priority, Priority::Normal);

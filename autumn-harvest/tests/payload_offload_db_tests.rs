@@ -110,7 +110,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql"),
     "\n",
     // issue #524: offloaded-payload reference table.
-    include_str!("../migrations/20260627000001_harvest_payload_refs/up.sql")
+    include_str!("../migrations/20260627000001_harvest_payload_refs/up.sql"),
+    "\n",
+    // issue #534: origin column + per-schedule run-history index.
+    include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql")
 );
 
 #[derive(Default)]
@@ -192,6 +195,7 @@ async fn insert_execution(conn: &mut AsyncPgConnection, name: &str) -> Execution
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        origin: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

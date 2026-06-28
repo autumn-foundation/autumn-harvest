@@ -719,6 +719,7 @@ async fn fire_claimed_debounce_row(
             .and_then(|v| serde_json::from_value(v).ok()),
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
+        origin: None,
     };
 
     // `in_outer_transaction = true`: this runs inside the scanner's fire

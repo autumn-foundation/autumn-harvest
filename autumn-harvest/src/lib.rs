@@ -228,11 +228,13 @@ pub use error::{HarvestError, HarvestResult, TimeoutType};
 pub use event::{SideEffectKind, WorkflowEvent};
 #[cfg(feature = "db")]
 pub use execution::{
-    CancelledWorkflowExecution, PausedWorkflowExecution, ResumedWorkflowExecution,
-    SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, StartedWorkflowExecution,
-    UpdateWithStartOutcome, UpdateWithStartParams, WorkflowTypeNonTerminalCount,
-    auto_resume_expired_pauses, cancel_workflow_execution, non_terminal_counts_by_workflow_name,
-    pause_workflow_execution, resume_workflow_execution, signal_with_start_workflow_execution,
+    CancelledWorkflowExecution, ORIGIN_BACKFILL, ORIGIN_MANUAL_TRIGGER, ORIGIN_SCHEDULED,
+    PausedWorkflowExecution, ResumedWorkflowExecution, ScheduleRunQuery, ScheduleRunRow,
+    ScheduleRunStateCount, SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams,
+    StartedWorkflowExecution, UpdateWithStartOutcome, UpdateWithStartParams,
+    WorkflowTypeNonTerminalCount, auto_resume_expired_pauses, cancel_workflow_execution,
+    list_schedule_runs, non_terminal_counts_by_workflow_name, pause_workflow_execution,
+    resume_workflow_execution, schedule_run_state_summary, signal_with_start_workflow_execution,
     start_or_load_workflow_execution, terminate_workflow_execution,
     update_with_start_workflow_execution,
 };
@@ -336,6 +338,9 @@ pub use models::{AuditRecord, NewAuditRecord};
 pub use diesel;
 #[cfg(feature = "db")]
 pub use diesel_async;
+
+#[cfg(feature = "db")]
+pub use dlq::parse_instant;
 
 #[cfg(feature = "db")]
 pub use queue::{ConcurrencyKeyStats, QueueScalingSignal, QueueTaskCounts, queue_task_counts};

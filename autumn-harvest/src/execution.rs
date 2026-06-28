@@ -127,7 +127,22 @@ pub struct StartWorkflowParams<'a> {
     /// When `Some(n)`, the effective max attempts = `min(policy.max_attempts, n)`.
     /// Typically sourced from `BuiltHarvest::max_workflow_attempts`.
     pub max_workflow_attempts_ceiling: Option<u32>,
+    /// Dispatch origin of this execution (issue #534).
+    ///
+    /// One of [`ORIGIN_SCHEDULED`], [`ORIGIN_BACKFILL`], or [`ORIGIN_MANUAL_TRIGGER`]
+    /// for schedule-attributed runs (set alongside `schedule_id`); `None` for every
+    /// non-scheduled call site. Persisted as metadata only — it never affects replay,
+    /// carryover, or shard routing, and is surfaced solely by the per-schedule
+    /// run-history endpoint to distinguish normal cadence from backfill/manual fires.
+    pub origin: Option<&'a str>,
 }
+
+/// Origin marker for a normal scheduler-tick fire (issue #534).
+pub const ORIGIN_SCHEDULED: &str = "scheduled";
+/// Origin marker for a run created by a schedule backfill (issue #534).
+pub const ORIGIN_BACKFILL: &str = "backfill";
+/// Origin marker for an ad-hoc operator `trigger-now` fire of a schedule (issue #534).
+pub const ORIGIN_MANUAL_TRIGGER: &str = "manual_trigger";
 
 impl StartWorkflowParams<'_> {
     /// Shard derived from the encoded `exec_id`, used to populate the row's
@@ -437,6 +452,7 @@ pub async fn start_or_load_workflow_execution_collect(
             serde_json::to_value(&p).unwrap_or(serde_json::Value::Null)
         }),
         retry_of_exec_id: request.retry_of_exec_id,
+        origin: request.origin,
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -2270,6 +2286,7 @@ pub async fn signal_with_start_workflow_execution(
                         .and_then(|v| serde_json::from_value(v).ok()),
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
+                    origin: None,
                 };
 
             // For a debounced workflow, route the start through the no-spawn collect
@@ -2751,6 +2768,7 @@ pub async fn update_with_start_workflow_execution(
                         .and_then(|v| serde_json::from_value(v).ok()),
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
+                    origin: None,
                 };
 
             // Debounced workflow: route through the no-spawn collect path with
@@ -3062,6 +3080,205 @@ async fn resolve_carryover(
     });
 
     Ok((last_completion_result, last_error))
+}
+
+/// One row of the per-schedule run-history listing (issue #534).
+///
+/// Each row is a single workflow execution that a schedule launched (attributed
+/// via [`StartWorkflowParams::schedule_id`]), with the columns an operator needs
+/// to triage a flaky cron: the originating slot, its timing, its terminal `state`,
+/// and the dispatch [`origin`](StartWorkflowParams::origin) marker that keeps a
+/// backfill storm or manual fire from masquerading as normal cadence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleRunRow {
+    /// Execution id of the run.
+    pub execution_id: Uuid,
+    /// Logical schedule slot this run fired for (`scheduled_for`). `None` for a
+    /// `manual_trigger` fire, which is attributed to the schedule but carries no slot.
+    pub nominal_fire_time: Option<chrono::DateTime<Utc>>,
+    /// When the run started.
+    pub started_at: chrono::DateTime<Utc>,
+    /// When the run reached a terminal state, or `None` while still active.
+    pub completed_at: Option<chrono::DateTime<Utc>>,
+    /// Current execution state (`RUNNING`/`COMPLETED`/`FAILED`/`TIMED_OUT`/…).
+    pub state: String,
+    /// Dispatch origin: `scheduled` / `backfill` / `manual_trigger`. `None` only for
+    /// pre-migration rows whose origin could not be reconstructed.
+    pub origin: Option<String>,
+}
+
+/// Filters + keyset cursor for [`list_schedule_runs`] (issue #534).
+///
+/// Mirrors the #514 execution-list conventions: a `state` filter, optional time
+/// bounds on `started_at`, and a `(started_at, id)` keyset cursor for stable
+/// newest-first pagination that merges cleanly across shards.
+#[derive(Debug, Clone, Default)]
+pub struct ScheduleRunQuery {
+    /// Restrict to these terminal/active states. Empty = all states.
+    pub states: Vec<String>,
+    /// Restrict to these origins (`scheduled`/`backfill`/`manual_trigger`). Empty = all.
+    pub origins: Vec<String>,
+    /// Lower bound (inclusive) on `started_at`.
+    pub since: Option<chrono::DateTime<Utc>>,
+    /// Upper bound (exclusive) on `started_at`.
+    pub until: Option<chrono::DateTime<Utc>>,
+    /// Keyset cursor: return only rows strictly before `(started_at, id)` in the
+    /// `started_at DESC, id DESC` ordering.
+    pub cursor: Option<(chrono::DateTime<Utc>, Uuid)>,
+    /// Maximum rows to return. The caller typically passes `limit + 1` to detect
+    /// whether a further page exists.
+    pub limit: i64,
+}
+
+/// List the executions a schedule launched, newest-first (issue #534).
+///
+/// Shard-local: a schedule's runs may be spread across shards, so the plugin layer
+/// fans this out across `iter_shards()` and merges the per-shard results with a
+/// keyset merge. Ordered `started_at DESC, id DESC` so the cursor is stable and the
+/// cross-shard merge is well-defined.
+pub async fn list_schedule_runs(
+    conn: &mut AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    shard_id: i32,
+    query: &ScheduleRunQuery,
+) -> HarvestResult<Vec<ScheduleRunRow>> {
+    use crate::schema::harvest_workflow_executions::dsl;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let mut q = harvest_workflow_executions::table
+        .filter(dsl::schedule_id.eq(schedule_id))
+        .filter(dsl::shard_id.eq(shard_id))
+        .into_boxed();
+
+    if !query.states.is_empty() {
+        q = q.filter(dsl::state.eq_any(query.states.clone()));
+    }
+    if !query.origins.is_empty() {
+        q = q.filter(dsl::origin.eq_any(query.origins.clone()));
+    }
+    if let Some(since) = query.since {
+        q = q.filter(dsl::started_at.ge(since));
+    }
+    if let Some(until) = query.until {
+        q = q.filter(dsl::started_at.lt(until));
+    }
+    if let Some((cursor_ts, cursor_id)) = query.cursor {
+        // Keyset: (started_at, id) < (cursor_ts, cursor_id) under the DESC ordering.
+        q = q.filter(
+            dsl::started_at
+                .lt(cursor_ts)
+                .or(dsl::started_at.eq(cursor_ts).and(dsl::id.lt(cursor_id))),
+        );
+    }
+
+    let rows = q
+        .order((dsl::started_at.desc(), dsl::id.desc()))
+        .limit(query.limit.max(0).saturating_add(1))
+        .select((
+            dsl::id,
+            dsl::scheduled_for,
+            dsl::started_at,
+            dsl::completed_at,
+            dsl::state,
+            dsl::origin,
+        ))
+        .load::<(
+            Uuid,
+            Option<chrono::DateTime<Utc>>,
+            chrono::DateTime<Utc>,
+            Option<chrono::DateTime<Utc>>,
+            String,
+            Option<String>,
+        )>(conn)
+        .await
+        .map_err(database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(execution_id, nominal_fire_time, started_at, completed_at, state, origin)| {
+                ScheduleRunRow {
+                    execution_id,
+                    nominal_fire_time,
+                    started_at,
+                    completed_at,
+                    state,
+                    origin,
+                }
+            },
+        )
+        .collect())
+}
+
+/// A `(state, count)` pair from the per-schedule cadence summary (issue #534).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleRunStateCount {
+    /// Execution state.
+    pub state: String,
+    /// Number of `scheduled`-origin runs in this state within the window.
+    pub count: i64,
+}
+
+/// SQL for [`schedule_run_state_summary`].
+///
+/// `GROUP BY state` + `COUNT(*)` in the database so the admin endpoint never
+/// transfers millions of rows for a high-frequency schedule. `$1` = `schedule_id`,
+/// `$2` = `shard_id` (prevents double-counting when two logical shards share one
+/// physical Postgres database), `$3` = optional `since` bound on `started_at`,
+/// `$4` = optional `until` bound on `started_at`. Restricted to
+/// `origin = 'scheduled'` so backfill/manual fires never inflate cadence counts.
+const SCHEDULE_RUN_SUMMARY_SQL: &str = "
+SELECT
+    state::TEXT AS state,
+    COUNT(*)::BIGINT AS count
+FROM harvest_workflow_executions
+WHERE schedule_id  = $1::UUID
+  AND shard_id     = $2::INT4
+  AND origin       = 'scheduled'
+  AND ($3::TIMESTAMPTZ IS NULL OR started_at >= $3::TIMESTAMPTZ)
+  AND ($4::TIMESTAMPTZ IS NULL OR started_at <  $4::TIMESTAMPTZ)
+GROUP BY state
+ORDER BY state
+";
+
+#[derive(Debug, diesel::QueryableByName)]
+struct ScheduleRunStateSqlRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+/// Count a schedule's **scheduled-origin** runs by terminal state (issue #534).
+///
+/// Restricted to `origin = 'scheduled'` so a backfill storm or ad-hoc manual fire
+/// never inflates the failure ratio an operator reads off the cadence summary.
+/// Shard-local; the plugin sums the per-shard counts. Uses a SQL `GROUP BY` so
+/// a high-frequency schedule never transfers millions of rows to the app layer.
+pub async fn schedule_run_state_summary(
+    conn: &mut AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    shard_id: i32,
+    since: Option<chrono::DateTime<Utc>>,
+    until: Option<chrono::DateTime<Utc>>,
+) -> HarvestResult<Vec<ScheduleRunStateCount>> {
+    let rows = diesel::sql_query(SCHEDULE_RUN_SUMMARY_SQL)
+        .bind::<diesel::sql_types::Uuid, _>(schedule_id)
+        .bind::<diesel::sql_types::Integer, _>(shard_id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(since)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(until)
+        .load::<ScheduleRunStateSqlRow>(conn)
+        .await
+        .map_err(database_error)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ScheduleRunStateCount {
+            state: r.state,
+            count: r.count,
+        })
+        .collect())
 }
 
 /// One workflow-type row from the per-shard non-terminal execution count
