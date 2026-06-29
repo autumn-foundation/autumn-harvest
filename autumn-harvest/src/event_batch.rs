@@ -177,10 +177,11 @@ pub async fn admit_batched_start(
     let payload = params.payload;
     let max_size = params.max_size;
 
-    let outcome = conn
+    let (outcome, deferred_starts, deferred_checks) = conn
         .transaction::<(
             BatchAdmitOutcome,
             Vec<crate::completion_trigger::DeferredTriggerStart>,
+            Vec<(ExecutionId, String)>,
         ), HarvestError, _>(|conn| {
             Box::pin(async move {
                 let row: UpsertBatchRow = diesel::sql_query(sql)
@@ -213,7 +214,7 @@ pub async fn admit_batched_start(
                 }
 
                 let is_flushed = row.current_size >= row.max_size;
-                let (flushed_execution_id, pending_deferred) = if is_flushed {
+                let (flushed_execution_id, pending_deferred, deferred_checks) = if is_flushed {
                     let exec_id =
                         ExecutionId::new_for_shard(crate::types::ShardId::new(row.shard_id));
                     let reuse_policy = opts
@@ -273,9 +274,9 @@ pub async fn admit_batched_start(
                         origin: None,
                     };
 
-                    let (started, deferred_starts) =
+                    let (started, deferred_starts, deferred_checks, _cancel_metrics) =
                         crate::execution::start_or_load_workflow_execution_collect(
-                            conn, params, true, false, metrics,
+                            conn, params, true, false,
                         )
                         .await?;
 
@@ -285,9 +286,13 @@ pub async fn admit_batched_start(
                         .await
                         .map_err(crate::error::database_error)?;
 
-                    (Some(started.exec_id.to_string()), deferred_starts)
+                    (
+                        Some(started.exec_id.to_string()),
+                        deferred_starts,
+                        deferred_checks,
+                    )
                 } else {
-                    (None, Vec::new())
+                    (None, Vec::new(), Vec::new())
                 };
 
                 Ok((
@@ -301,12 +306,20 @@ pub async fn admit_batched_start(
                         flushed_execution_id,
                     },
                     pending_deferred,
+                    deferred_checks,
                 ))
             })
         })
-        .await;
+        .await?;
 
-    outcome.map(Some)
+    for check in &deferred_checks {
+        let _ = crate::execution::check_and_report_unfinished_handlers(
+            conn, check.0, &check.1, metrics,
+        )
+        .await;
+    }
+
+    Ok(Some((outcome, deferred_starts)))
 }
 
 #[cfg(feature = "db")]
@@ -315,6 +328,7 @@ const fn is_transient_error(e: &HarvestError) -> bool {
 }
 
 #[cfg(feature = "db")]
+#[allow(clippy::type_complexity)]
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: Option<i32>,
@@ -366,8 +380,12 @@ async fn fire_due_on_conn(
 
     loop {
         let now = Utc::now();
-        let processed: Option<(String, Vec<crate::completion_trigger::DeferredTriggerStart>)> =
-            conn.transaction(|conn| {
+        let processed: Option<(
+            String,
+            Vec<crate::completion_trigger::DeferredTriggerStart>,
+            Vec<(ExecutionId, String)>,
+        )> = conn
+            .transaction(|conn| {
                 Box::pin(async move {
                     let due_rows: Vec<FireDueBatchRow> = if let Some(sid) = shard_id {
                         diesel::sql_query(due_sql)
@@ -387,8 +405,10 @@ async fn fire_due_on_conn(
                     };
 
                     if let Some(row) = due_rows.into_iter().next() {
-                        match fire_claimed_batch_row(conn, row, metrics).await {
-                            Ok(Some((exec_id, deferred))) => Ok(Some((exec_id, deferred))),
+                        match fire_claimed_batch_row(conn, row).await {
+                            Ok(Some((exec_id, deferred, checks))) => {
+                                Ok(Some((exec_id, deferred, checks)))
+                            }
                             Ok(None) => Ok(None),
                             Err(e) => Err(e),
                         }
@@ -399,9 +419,15 @@ async fn fire_due_on_conn(
             })
             .await?;
 
-        if let Some((exec_id, deferred)) = processed {
+        if let Some((exec_id, deferred, checks)) = processed {
             fired_ids.push(exec_id);
             deferred_starts.extend(deferred);
+            for check in checks {
+                let _ = crate::execution::check_and_report_unfinished_handlers(
+                    conn, check.0, &check.1, metrics,
+                )
+                .await;
+            }
         } else {
             break;
         }
@@ -414,8 +440,13 @@ async fn fire_due_on_conn(
 async fn fire_claimed_batch_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueBatchRow,
-    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
-) -> HarvestResult<Option<(String, Vec<crate::completion_trigger::DeferredTriggerStart>)>> {
+) -> HarvestResult<
+    Option<(
+        String,
+        Vec<crate::completion_trigger::DeferredTriggerStart>,
+        Vec<(ExecutionId, String)>,
+    )>,
+> {
     use diesel_async::RunQueryDsl;
 
     let opts: DebounceStartOptions = serde_json::from_value(row.start_options).unwrap_or_default();
@@ -483,13 +514,11 @@ async fn fire_claimed_batch_row(
         origin: None,
     };
 
-    let start_res = crate::execution::start_or_load_workflow_execution_collect(
-        conn, params, true, false, metrics,
-    )
-    .await;
+    let start_res =
+        crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false).await;
 
     match start_res {
-        Ok((started, deferred_starts)) => {
+        Ok((started, deferred_starts, deferred_checks, _cancel_metrics)) => {
             diesel::sql_query("DELETE FROM harvest_event_batches WHERE id = $1")
                 .bind::<diesel::sql_types::Uuid, _>(row_id)
                 .execute(conn)
@@ -504,7 +533,11 @@ async fn fire_claimed_batch_row(
                 "batched start fired",
             );
 
-            Ok(Some((started.exec_id.to_string(), deferred_starts)))
+            Ok(Some((
+                started.exec_id.to_string(),
+                deferred_starts,
+                deferred_checks,
+            )))
         }
         Err(crate::error::HarvestError::AlreadyExists { .. }) => {
             diesel::sql_query("DELETE FROM harvest_event_batches WHERE id = $1")

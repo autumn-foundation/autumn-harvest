@@ -110,7 +110,8 @@ use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, UpdateWithStartOutcome,
     UpdateWithStartParams, WorkflowHandleClient, WorkflowResult, cancel_workflow_execution,
-    pause_workflow_execution, resume_workflow_execution, signal_with_start_workflow_execution,
+    pause_workflow_execution, resume_workflow_execution,
+    signal_with_start_workflow_execution_with_metrics,
     start_or_load_workflow_execution_with_metrics, terminate_workflow_execution,
     update_with_start_workflow_execution_with_metrics,
 };
@@ -8447,15 +8448,35 @@ async fn batch_start_workflows(
                 },
                 false,
                 item_reject_fresh,
-                Some(runtime.registry.telemetry().metrics.as_ref()),
             )
-            .await
-            .map(|(started, deferred)| {
-                for start in deferred {
-                    start.spawn();
+            .await;
+
+            let start_result = match start_result {
+                Ok((started, deferred, checks, cancel_metrics)) => {
+                    for start in deferred {
+                        start.spawn();
+                    }
+                    for check in checks {
+                        let _ = autumn_harvest::execution::check_and_report_unfinished_handlers(
+                            &mut conn,
+                            check.0,
+                            &check.1,
+                            Some(runtime.registry.telemetry().metrics.as_ref()),
+                        )
+                        .await;
+                    }
+                    let m = runtime.registry.telemetry().metrics.as_ref();
+                    for (wf_name, q_name) in cancel_metrics {
+                        m.record_workflow_terminal(
+                            &wf_name,
+                            &q_name,
+                            autumn_harvest::telemetry::WorkflowStatus::Cancelled,
+                        );
+                    }
+                    Ok(started)
                 }
-                started
-            });
+                Err(e) => Err(e),
+            };
 
             match start_result {
                 Ok(started) => {
@@ -9386,7 +9407,7 @@ async fn signal_with_start_workflow(
     let sws_workflow_retry_policy =
         info_retry_policy_sws.and_then(|p| serde_json::to_value(&p).ok());
 
-    let result = signal_with_start_workflow_execution(
+    let result = signal_with_start_workflow_execution_with_metrics(
         &mut conn,
         SignalWithStartParams {
             workflow_name: &workflow_name,
@@ -9424,6 +9445,7 @@ async fn signal_with_start_workflow(
             workflow_retry_policy: sws_workflow_retry_policy,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
         },
+        Some(runtime.registry.telemetry().metrics.as_ref()),
     )
     .await;
 
@@ -21835,16 +21857,11 @@ async fn evaluate_eligibility_for_shard(
         tasks
             .as_slice()
             .first()
-            .and_then(|t| {
-                if t.state == "PENDING"
+            .filter(|&t| {
+                t.state == "PENDING"
                     && t.scheduled_at <= chrono::Utc::now()
                     && (t.schedule_to_close_at.is_none()
                         || t.schedule_to_close_at.unwrap() > chrono::Utc::now())
-                {
-                    Some(t)
-                } else {
-                    None
-                }
             })
             .map(|t| {
                 let age = chrono::Utc::now().signed_duration_since(t.scheduled_at);

@@ -27,11 +27,12 @@ use crate::error::{HarvestError, HarvestResult, TimeoutType};
 use crate::event::WorkflowEvent;
 use crate::execution::{
     apply_parent_close_cascade, cancel_workflow_execution, cancel_workflow_execution_collect,
+    check_and_report_unfinished_handlers,
 };
 use crate::models::{ExternalTask, TaskQueueItem, WorkflowExecution};
 use crate::schema::{harvest_external_tasks, harvest_task_queue, harvest_workflow_executions};
 use crate::telemetry::MetricsRecorder;
-use crate::types::ActivityExecId;
+use crate::types::{ActivityExecId, ExecutionId};
 use crate::{queue, store};
 
 /// The reason a task was identified as timed out.
@@ -1253,6 +1254,7 @@ type CancelStepOutcome = (
     Option<i64>,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(String, String)>,
+    Vec<(ExecutionId, String)>,
 );
 
 #[allow(clippy::too_many_lines)]
@@ -1321,11 +1323,11 @@ pub async fn enforce_external_cancels_outbox(
                         }
                         Ok(other) => {
                             tracing::error!(event = ?other, "cancel outbox sweep: query returned non-ExternalCancelRequested event");
-                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new())));
+                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "cancel outbox sweep: failed to decode event_data");
-                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new())));
+                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
                         }
                     };
 
@@ -1376,13 +1378,13 @@ pub async fn enforce_external_cancels_outbox(
                         crate::completion_trigger::DeferredTriggerStart,
                     > = Vec::new();
                     let mut cancel_metrics: Vec<(String, String)> = Vec::new();
+                    let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
 
                     let terminal_opt = if same_pool {
                         match cancel_workflow_execution_collect(
                             conn,
                             target,
                             "cancelled by external request",
-                            Some(metrics),
                         )
                         .await
                         {
@@ -1391,11 +1393,11 @@ pub async fn enforce_external_cancels_outbox(
                                 tracing::error!(error = %e, "cancel outbox sweep: db error");
                                 None
                             }
-                            Ok((cancelled, deferred)) => {
+                            Ok((_cancelled, deferred, checks, metrics_opt)) => {
                                 deferred_starts.extend(deferred);
-                                if cancelled.newly_cancelled {
-                                    cancel_metrics
-                                        .push((cancelled.workflow_name, cancelled.queue_name));
+                                deferred_checks.extend(checks);
+                                if let Some(m) = metrics_opt {
+                                    cancel_metrics.push(m);
                                 }
                                 Some(WorkflowEvent::ExternalCancelDelivered { cancel_id })
                             }
@@ -1413,14 +1415,14 @@ pub async fn enforce_external_cancels_outbox(
                                 target_shard = %target.shard(),
                                 "cancel outbox sweep: target shard not configured locally; skipping"
                             );
-                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new())));
+                            return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
                         };
 
                         let mut target_conn = match pool.get().await {
                             Ok(c) => c,
                             Err(e) => {
                                 tracing::error!(error = %e, "cancel outbox sweep: failed to acquire target connection");
-                                return Ok(Some((false, Some(row.id), Vec::new(), Vec::new())));
+                                return Ok(Some((false, Some(row.id), Vec::new(), Vec::new(), Vec::new())));
                             }
                         };
 
@@ -1469,9 +1471,9 @@ pub async fn enforce_external_cancels_outbox(
                         .await?;
                         queue::wake_workflow_task(conn, caller_exec_id).await?;
                         metrics.record_external_cancel_sent(outcome, reason_code.as_deref());
-                        Ok(Some((true, None, deferred_starts, cancel_metrics)))
+                        Ok(Some((true, None, deferred_starts, cancel_metrics, deferred_checks)))
                     } else {
-                        Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics)))
+                        Ok(Some((false, Some(row.id), deferred_starts, cancel_metrics, deferred_checks)))
                     }
                 }
                 .scope_boxed()
@@ -1479,12 +1481,21 @@ pub async fn enforce_external_cancels_outbox(
             .await;
 
         match step_res {
-            Ok(Some((processed, skipped_id, deferred_starts, cancel_metrics))) => {
+            Ok(Some((processed, skipped_id, deferred_starts, cancel_metrics, deferred_checks))) => {
                 // The step transaction has committed: now spawn trigger/cascade
                 // follow-up starts and record terminal metrics for same-pool
                 // cancellations (issue #492).
                 for start in deferred_starts {
                     start.spawn();
+                }
+                for check in deferred_checks {
+                    let _ = check_and_report_unfinished_handlers(
+                        conn,
+                        check.0,
+                        &check.1,
+                        Some(metrics),
+                    )
+                    .await;
                 }
                 for (workflow_name, queue_name) in cancel_metrics {
                     metrics.record_workflow_terminal(

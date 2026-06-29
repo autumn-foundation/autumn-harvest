@@ -438,7 +438,8 @@ async fn n_slots_produce_n_distinct_scheduled_times() {
     let registry = make_registry(wf_name);
     let dags = Arc::new(DagCatalog::default());
 
-    let sched = WorkflowSchedule::new(wf_name, Schedule::Interval(Duration::from_secs(60)));
+    let sched = WorkflowSchedule::new(wf_name, Schedule::Interval(Duration::from_secs(60)))
+        .with_max_active_runs(u32::try_from(N).unwrap());
     register_workflow_schedules(&mut conn, &[sched])
         .await
         .expect("register schedules");

@@ -367,7 +367,7 @@ async fn keyset_cursor_paginates_without_overlap() {
         sid,
         0,
         &ScheduleRunQuery {
-            limit: 3,
+            limit: 2,
             ..Default::default()
         },
     )

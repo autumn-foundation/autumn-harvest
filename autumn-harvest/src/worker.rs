@@ -32,7 +32,8 @@ use crate::dlq::{self, DeadLetterReason, NewDeadLetterEntry};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
 use crate::execution::{
-    apply_parent_close_cascade, cancel_workflow_execution_collect, parent_close_cascade_event_count,
+    apply_parent_close_cascade, cancel_workflow_execution_collect,
+    check_and_report_unfinished_handlers, parent_close_cascade_event_count,
 };
 use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_history_policy_and_caps,
@@ -1383,6 +1384,7 @@ type InlinePersistResult = (
     i32,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(String, String)>,
+    Vec<(ExecutionId, String)>,
 );
 
 #[allow(clippy::too_many_lines)]
@@ -1403,7 +1405,7 @@ async fn persist_external_signal_inline(
     // deliver it, and append the terminal first, leaving the inline path to
     // append the same terminal at a now-stale `next_event_id` — a history write
     // conflict that fails the caller even though delivery succeeded (issue #492).
-    let (new_events, final_next, deferred_starts, cancel_metrics): InlinePersistResult = conn
+    let (new_events, final_next, deferred_starts, cancel_metrics, deferred_checks): InlinePersistResult = conn
         .transaction::<InlinePersistResult, HarvestError, _>(|conn| {
             async move {
                 let mut new_events: Vec<WorkflowEvent> = Vec::new();
@@ -1418,6 +1420,7 @@ async fn persist_external_signal_inline(
                 // (workflow_name, queue_name) of targets newly cancelled inline,
                 // so the terminal metric is recorded after commit.
                 let mut cancel_metrics: Vec<(String, String)> = Vec::new();
+                let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
 
                 for item in items {
                     match item {
@@ -1529,7 +1532,6 @@ async fn persist_external_signal_inline(
                                 conn,
                                 run.target,
                                 "cancelled by external request",
-                                Some(metrics),
                             )
                             .await
                             {
@@ -1540,11 +1542,11 @@ async fn persist_external_signal_inline(
                                 Err(HarvestError::Database(e)) => {
                                     return Err(HarvestError::Database(e));
                                 }
-                                Ok((cancelled, deferred)) => {
+                                Ok((_cancelled, deferred, checks, metrics_opt)) => {
                                     deferred_starts.extend(deferred);
-                                    if cancelled.newly_cancelled {
-                                        cancel_metrics
-                                            .push((cancelled.workflow_name, cancelled.queue_name));
+                                    deferred_checks.extend(checks);
+                                    if let Some(m) = metrics_opt {
+                                        cancel_metrics.push(m);
                                     }
                                     Some(WorkflowEvent::ExternalCancelDelivered {
                                         cancel_id: run.cancel_id,
@@ -1571,7 +1573,7 @@ async fn persist_external_signal_inline(
                     }
                 }
 
-                Ok((new_events, next, deferred_starts, cancel_metrics))
+                Ok((new_events, next, deferred_starts, cancel_metrics, deferred_checks))
             }
             .scope_boxed()
         })
@@ -1581,6 +1583,9 @@ async fn persist_external_signal_inline(
     // starts and record terminal metrics for any targets cancelled above.
     for start in deferred_starts {
         start.spawn();
+    }
+    for check in deferred_checks {
+        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, Some(metrics)).await;
     }
     for (workflow_name, queue_name) in cancel_metrics {
         metrics.record_workflow_terminal(
@@ -2482,138 +2487,124 @@ async fn persist_workflow_failure(
         (*rid, policy.clone(), *attempt, fire_at, start_delay)
     });
 
-    let (deferred, retry_scheduled) = conn
-        .transaction::<(Vec<crate::completion_trigger::DeferredTriggerStart>, bool), HarvestError, _>(
-            |conn| {
-                let error = error.clone();
-                let retry_fire_info = retry_fire_info.clone();
-                async move {
-                    store::append_events(
-                        conn,
-                        exec_id,
-                        &[WorkflowEvent::WorkflowFailed {
-                            error: error.clone(),
-                        }],
-                        next_event_id,
-                    )
+    let (deferred, retry_scheduled, deferred_checks) = conn
+        .transaction::<(
+            Vec<crate::completion_trigger::DeferredTriggerStart>,
+            bool,
+            Vec<(ExecutionId, String)>,
+        ), HarvestError, _>(|conn| {
+            let error = error.clone();
+            let retry_fire_info = retry_fire_info.clone();
+            let exec_ref = execution;
+            async move {
+                store::append_events(
+                    conn,
+                    exec_id,
+                    &[WorkflowEvent::WorkflowFailed {
+                        error: error.clone(),
+                    }],
+                    next_event_id,
+                )
+                .await?;
+                update_workflow_execution_failed(conn, exec_id, worker_id, &error, nd_details)
                     .await?;
-                    update_workflow_execution_failed(conn, exec_id, worker_id, &error, nd_details)
-                        .await?;
-                    queue::fail_task(conn, task_id, &error).await?;
-                    // The parent-close cascade is deferred until after the retry decision:
-                    // it must not close detached children on a transient failure that will
-                    // be retried (the retried parent may later succeed). Gated on
-                    // `!retry_committed` below, mirroring the Failed completion triggers.
-                    let mut deferred: Vec<crate::completion_trigger::DeferredTriggerStart> =
-                        Vec::new();
+                queue::fail_task(conn, task_id, &error).await?;
+                let mut deferred: Vec<crate::completion_trigger::DeferredTriggerStart> = Vec::new();
+                let mut deferred_checks: Vec<(ExecutionId, String)> = Vec::new();
 
-                    // Start the retry execution atomically inside this failure transaction.
-                    // Use the retry exec_id as workflow_id so the original FAILED row is
-                    // never sealed as CONTINUED_AS_NEW — result waiters on the original
-                    // exec_id continue to see FAILED rather than an erroneous "success".
-                    // AllowDuplicate is safe because the retry workflow_id is brand-new.
-                    let mut retry_committed = false;
-                    if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_delay))) =
-                        (execution, retry_fire_info)
+                let mut retry_committed = false;
+                if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_delay))) =
+                    (exec_ref, retry_fire_info)
+                    && attempt < policy.max_attempts
+                {
+                    let retry_workflow_id = rid.to_string();
+                    let retry_params = crate::execution::StartWorkflowParams {
+                        workflow_name: &exec_ref.workflow_name,
+                        workflow_id: &retry_workflow_id,
+                        exec_id: rid,
+                        input: exec_ref.input.clone(),
+                        parent_id: None,
+                        queue_name: &exec_ref.queue_name,
+                        execution_timeout: exec_ref.execution_timeout,
+                        memo: exec_ref.memo.clone(),
+                        search_attrs: exec_ref.search_attrs.clone(),
+                        reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
+                        trace_context: None,
+                        max_execution_timeout_ceiling: None,
+                        concurrency_key: concurrency_key.clone(),
+                        concurrency_limit,
+                        priority,
+                        max_workflow_input_bytes: 0,
+                        start_at: None,
+                        delay: start_delay,
+                        max_workflow_start_delay: None,
+                        owner: exec_ref.owner.as_deref(),
+                        runbook_url: exec_ref.runbook_url.as_deref(),
+                        severity: exec_ref.severity.as_deref(),
+                        context_headers: exec_ref
+                            .context_headers
+                            .clone()
+                            .and_then(|v| serde_json::from_value(v).ok()),
+                        sla: exec_ref.sla,
+                        schedule_id: exec_ref.schedule_id,
+                        scheduled_for: exec_ref.scheduled_for,
+                        workflow_attempt: attempt + 1,
+                        workflow_retry_policy: Some(policy),
+                        retry_of_exec_id: Some(exec_id.as_uuid()),
+                        max_workflow_attempts_ceiling: None,
+                        origin: exec_ref.origin.as_deref(),
+                    };
+
+                    match crate::execution::start_or_load_workflow_execution_collect(
+                        conn,
+                        retry_params,
+                        true,
+                        false,
+                    )
+                    .await
                     {
-                        // The retry execution gets its own workflow_id (rid.to_string()) so
-                        // the original FAILED row is never sealed as CONTINUED_AS_NEW.
-                        // Callers follow the chain via retry_of_exec_id.
-                        let retry_workflow_id = rid.to_string();
-                        let retry_params = crate::execution::StartWorkflowParams {
-                            workflow_name: &exec_ref.workflow_name,
-                            workflow_id: &retry_workflow_id,
-                            exec_id: rid,
-                            input: exec_ref.input.clone(),
-                            parent_id: None,
-                            queue_name: &exec_ref.queue_name,
-                            execution_timeout: exec_ref.execution_timeout,
-                            memo: exec_ref.memo.clone(),
-                            search_attrs: exec_ref.search_attrs.clone(),
-                            reuse_policy: crate::types::WorkflowIdReusePolicy::AllowDuplicate,
-                            trace_context: None,
-                            max_execution_timeout_ceiling: None,
-                            concurrency_key: concurrency_key.clone(),
-                            concurrency_limit,
-                            priority,
-                            max_workflow_input_bytes: 0,
-                            // Relative delay, not an absolute start_at: avoids the
-                            // "start_at in the past" rejection for short retry intervals.
-                            start_at: None,
-                            delay: start_delay,
-                            max_workflow_start_delay: None,
-                            owner: exec_ref.owner.as_deref(),
-                            runbook_url: exec_ref.runbook_url.as_deref(),
-                            severity: exec_ref.severity.as_deref(),
-                            context_headers: exec_ref
-                                .context_headers
-                                .clone()
-                                .and_then(|v| serde_json::from_value(v).ok()),
-                            sla: exec_ref.sla,
-                            schedule_id: exec_ref.schedule_id,
-                            scheduled_for: exec_ref.scheduled_for,
-                            workflow_attempt: attempt + 1,
-                            workflow_retry_policy: Some(policy),
-                            retry_of_exec_id: Some(exec_id.as_uuid()),
-                            max_workflow_attempts_ceiling: None,
-                            origin: exec_ref.origin.as_deref(),
-                        };
-
-                        match crate::execution::start_or_load_workflow_execution_collect(
-                            conn,
-                            retry_params,
-                            true,
-                            false,
-                            metrics,
-                        )
-                        .await
-                        {
-                            Ok((_started, retry_deferred)) => {
-                                deferred.extend(retry_deferred);
-                                store::append_single_event(
-                                    conn,
-                                    exec_id,
-                                    WorkflowEvent::WorkflowRetryScheduled {
-                                        retry_exec_id: rid,
-                                        attempt: attempt + 1,
-                                        fire_at,
-                                    },
-                                )
-                                .await?;
-                                retry_committed = true;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    execution_id = %exec_id,
-                                    error = %e,
-                                    "harvest: failed to start retry execution; not retrying"
-                                );
-                            }
+                        Ok((_started, retry_deferred, checks, _cancel_metrics)) => {
+                            deferred.extend(retry_deferred);
+                            deferred_checks.extend(checks);
+                            store::append_single_event(
+                                conn,
+                                exec_id,
+                                WorkflowEvent::WorkflowRetryScheduled {
+                                    retry_exec_id: rid,
+                                    attempt: attempt + 1,
+                                    fire_at,
+                                },
+                            )
+                            .await?;
+                            retry_committed = true;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                execution_id = %exec_id,
+                                error = %e,
+                                "harvest: failed to start retry execution; not retrying"
+                            );
                         }
                     }
-
-                    // Only run the parent-close cascade and evaluate Failed completion
-                    // triggers on the final failure. Neither must fire for a transient
-                    // failure that will be retried — detached children must stay alive and
-                    // compensating/alerting workflows should only run when the chain exhausts.
-                    if !retry_committed {
-                        let cascade = apply_parent_close_cascade(conn, exec_id).await?;
-                        deferred.extend(cascade);
-                        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                            conn,
-                            exec_id,
-                            crate::completion_trigger::TerminalState::Failed,
-                            metrics,
-                        )
-                        .await?;
-                        deferred.extend(triggers);
-                    }
-
-                    Ok((deferred, retry_committed))
                 }
-                .scope_boxed()
-            },
-        )
+
+                if !retry_committed {
+                    let cascade = apply_parent_close_cascade(conn, exec_id).await?;
+                    deferred.extend(cascade);
+                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                        conn,
+                        exec_id,
+                        crate::completion_trigger::TerminalState::Failed,
+                        metrics,
+                    )
+                    .await?;
+                    deferred.extend(triggers);
+                }
+
+                Ok((deferred, retry_committed, deferred_checks))
+            }
+            .scope_boxed()
+        })
         .await?;
 
     if retry_scheduled
@@ -2629,6 +2620,10 @@ async fn persist_workflow_failure(
             delay_secs,
             "harvest: workflow retry scheduled"
         );
+    }
+
+    for check in deferred_checks {
+        let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await;
     }
 
     for start in deferred {
