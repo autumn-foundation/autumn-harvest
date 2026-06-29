@@ -2684,6 +2684,75 @@
       ]
     },
     {
+      "method": "POST",
+      "path": "/workflows/batch_reset",
+      "category": "batch",
+      "read_only": false,
+      "description": "Reset a cohort of workflow executions to a shared semantic point. Resolves the logical anchor per execution and returns a per-execution outcome list. preview=true resolves points without forking (issue #538).",
+      "idempotency": "Not idempotent. Each call forks the matched cohort. Use preview=true to plan first.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "filter",
+            "required": true,
+            "description": "BatchFilter identifying the cohort. Must not be empty."
+          },
+          {
+            "name": "reset_point",
+            "required": true,
+            "description": "Logical anchor: {type: event_id, event_id: N} | {type: first_activity_run, activity_name: S} | {type: last_workflow_task}."
+          },
+          {
+            "name": "reason",
+            "required": true,
+            "description": "Human-readable recovery reason stamped on each fork."
+          },
+          {
+            "name": "operator_id",
+            "required": true,
+            "description": "Operator identity recorded in the audit log."
+          },
+          {
+            "name": "signal_reapply",
+            "required": false,
+            "description": "Signal re-apply policy for forked executions: drop (default) | buffer."
+          },
+          {
+            "name": "preview",
+            "required": false,
+            "description": "true = dry-run: resolve per-execution points without forking."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "preview",
+          "total",
+          "reset_count",
+          "skipped_count",
+          "items"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Empty filter or cohort exceeds DEFAULT_BATCH_RESET_MAX_COHORT (1000)."
+        },
+        {
+          "status": 401,
+          "description": "Missing or invalid admin credentials."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
       "method": "GET",
       "path": "/health",
       "category": "health",

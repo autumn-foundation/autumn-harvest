@@ -70,10 +70,159 @@ impl<'de> Deserialize<'de> for ResetSignalReapplyPolicy {
     }
 }
 
+/// Logical anchor for resolving a reset boundary per-execution (issue #538).
+///
+/// `EventId` preserves the existing raw-id path. The other variants are
+/// resolved against the execution's live event history at reset time, so the
+/// same `ResetPoint` produces the correct — and possibly different — event id
+/// for every execution in a batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResetPoint {
+    /// Raw event id — today's behavior, preserved for backward compatibility.
+    EventId { event_id: i64 },
+    /// Fork just before the **first** `ActivityScheduled` event whose `name`
+    /// matches `activity_name`. Resolved id = (first-schedule-index − 1).
+    FirstActivityRun { activity_name: String },
+    /// Fork at the **most-recent** clean decision boundary (highest index where
+    /// `boundary_validity` returns `true`). Index 0 (`WorkflowStarted`) is
+    /// always valid and acts as the floor.
+    LastWorkflowTask,
+}
+
+/// Machine-readable reason an individual execution was skipped during batch reset.
+///
+/// Skips are not errors: every candidate execution appears in the batch
+/// response with either `outcome = reset` or `outcome = skipped` plus this
+/// reason. The batch never silently drops an execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResetSkipReason {
+    /// `FirstActivityRun` found no `ActivityScheduled` event with that name.
+    NoMatchingActivity { activity_name: String },
+    /// The execution has a `WorkflowContinuedAsNew` in its history; CAN chains
+    /// are out of scope for v1 batch reset.
+    ContinueAsNew,
+    /// The resolved event id is not a valid decision boundary (unresolved side
+    /// effects at that point).
+    InvalidBoundary {
+        resolved_event_id: i64,
+        nearest_valid_before: Option<i64>,
+        nearest_valid_after: Option<i64>,
+    },
+    /// The execution is in a terminal state that is never admissible for batch
+    /// reset (`COMPLETED` or `TERMINATED`).
+    TerminalSource { state: String },
+    /// The execution is a child workflow. Batch reset skips child workflows
+    /// in v1; reset the root parent directly.
+    ChildWorkflow,
+    /// The execution has no history at all (no `WorkflowStarted` event).
+    EmptyHistory,
+}
+
+/// Per-execution outcome in a batch reset response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchResetOutcome {
+    /// The execution was forked at the resolved boundary.
+    Reset,
+    /// The execution was skipped (not an error); see `skip_reason`.
+    Skipped,
+    /// Dry-run: the boundary was resolved but no fork was created.
+    Previewed,
+}
+
+/// One item in the `POST /workflows/batch_reset` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchResetItem {
+    pub exec_id: String,
+    pub outcome: BatchResetOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_event_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_exec_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<ResetSkipReason>,
+}
+
+/// Resolve a logical `ResetPoint` to a raw `reset_to_event_id` for one execution.
+///
+/// This is a **pure function** — it only reads `events` and performs no I/O.
+/// The batch handler calls it on the already-loaded event history for each
+/// candidate execution.
+///
+/// # Errors
+///
+/// Returns `Err(ResetSkipReason)` when the point cannot be resolved for this
+/// history. The batch handler records these as `outcome = skipped`; the single
+/// reset path maps them to a `WorkflowResetError`.
+pub fn resolve_reset_point(
+    events: &[WorkflowEvent],
+    point: &ResetPoint,
+) -> Result<i64, ResetSkipReason> {
+    if events.is_empty() {
+        // EmptyHistory is a skip for any logical point.
+        return Err(ResetSkipReason::EmptyHistory);
+    }
+
+    match point {
+        ResetPoint::EventId { event_id } => Ok(*event_id),
+
+        ResetPoint::FirstActivityRun { activity_name } => {
+            // CAN histories are out of scope; detect them before searching.
+            if events
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. }))
+            {
+                return Err(ResetSkipReason::ContinueAsNew);
+            }
+            // Find the first ActivityScheduled whose name matches.
+            let idx = events
+                .iter()
+                .position(|e| match e {
+                    WorkflowEvent::ActivityScheduled { name, .. } => name == activity_name,
+                    _ => false,
+                })
+                .ok_or_else(|| ResetSkipReason::NoMatchingActivity {
+                    activity_name: activity_name.clone(),
+                })?;
+            // Carry over everything *before* the schedule: resolved id = idx - 1.
+            // idx == 0 is impossible in a well-formed history (WorkflowStarted is
+            // always first), but saturating_sub is correct and safe here.
+            Ok(i64::try_from(idx).unwrap_or(0).saturating_sub(1))
+        }
+
+        ResetPoint::LastWorkflowTask => {
+            if events
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. }))
+            {
+                return Err(ResetSkipReason::ContinueAsNew);
+            }
+            // Walk the full history and pick the highest valid boundary.
+            let last = events.len().saturating_sub(1);
+            let (valid, _) = boundary_validity(events, last);
+            let highest = valid
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(idx, ok)| ok.then_some(idx));
+            let idx = highest.ok_or(ResetSkipReason::EmptyHistory)?;
+            Ok(i64::try_from(idx).unwrap_or(0))
+        }
+    }
+}
+
 /// Request body for resetting one workflow execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowResetRequest {
     pub reset_to_event_id: i64,
+    /// Optional logical reset anchor (issue #538). When `Some`, the anchor is
+    /// resolved against the execution's event history *before* `validate_reset_point`
+    /// so the caller does not need to know the per-execution raw event id.
+    /// When `None`, `reset_to_event_id` is used directly (backward-compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_point: Option<ResetPoint>,
     pub reason: String,
     pub operator_id: String,
     #[serde(default)]
@@ -517,11 +666,16 @@ pub async fn preview_workflow_reset(
     exec_id: ExecutionId,
     request: WorkflowResetRequest,
 ) -> Result<ResetPlan, WorkflowResetError> {
-    let request = request.normalized();
+    let mut request = request.normalized();
     let execution = load_source_execution(conn, exec_id, false).await?;
     validate_source_execution(exec_id, &execution, request.allow_terminal_source)?;
     let rows = load_event_rows(conn, exec_id).await?;
     let events = decode_events(&rows)?;
+    // If a logical ResetPoint was specified, resolve it to a raw event id now.
+    if let Some(ref point) = request.reset_point.clone() {
+        request.reset_to_event_id = resolve_reset_point(&events, point)
+            .map_err(|reason| skip_reason_to_error(exec_id, reason))?;
+    }
     let mut plan = validate_reset_point(&events, request.reset_to_event_id)?;
     attach_side_effect_counts(conn, exec_id, request.signal_reapply, &mut plan).await?;
     Ok(plan)
@@ -541,7 +695,7 @@ pub async fn reset_workflow_execution(
     request: WorkflowResetRequest,
     registry: Option<&HandlerRegistry>,
 ) -> Result<ResetResult, WorkflowResetError> {
-    let request = request.normalized();
+    let mut request = request.normalized();
     let (res, deferred_starts) = conn
         .transaction::<(ResetResult, Vec<DeferredTriggerStart>), WorkflowResetError, _>(|conn| {
             async move {
@@ -550,6 +704,11 @@ pub async fn reset_workflow_execution(
 
                 let rows = load_event_rows(conn, exec_id).await?;
                 let events = decode_events(&rows)?;
+                // Resolve a logical ResetPoint to a raw event id before validation.
+                if let Some(ref point) = request.reset_point.clone() {
+                    request.reset_to_event_id = resolve_reset_point(&events, point)
+                        .map_err(|reason| skip_reason_to_error(exec_id, reason))?;
+                }
                 let plan = validate_reset_point(&events, request.reset_to_event_id)?;
 
                 let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
@@ -657,6 +816,129 @@ fn validate_source_execution(
         return Err(WorkflowResetError::ChildWorkflow { exec_id, parent_id });
     }
     Ok(())
+}
+
+/// Map a `ResetSkipReason` (batch path) to a `WorkflowResetError` (single path).
+///
+/// The single-execution reset/preview endpoints treat skip reasons as hard
+/// errors; the batch endpoint uses the raw `ResetSkipReason` directly.
+fn skip_reason_to_error(exec_id: ExecutionId, reason: ResetSkipReason) -> WorkflowResetError {
+    match reason {
+        ResetSkipReason::ContinueAsNew => WorkflowResetError::ContinueAsNew,
+        ResetSkipReason::TerminalSource { state } => {
+            WorkflowResetError::TerminalSource { exec_id, state }
+        }
+        ResetSkipReason::ChildWorkflow => WorkflowResetError::ChildWorkflow {
+            exec_id,
+            parent_id: uuid::Uuid::nil(),
+        },
+        ResetSkipReason::NoMatchingActivity { activity_name } => {
+            WorkflowResetError::InvalidPoint(ResetInvalidPoint {
+                message: format!("no ActivityScheduled event found for activity '{activity_name}'"),
+                reset_to_event_id: -1,
+                last_event_id: -1,
+                unresolved_side_effects: Vec::new(),
+                nearest_valid_before: None,
+                nearest_valid_after: None,
+            })
+        }
+        ResetSkipReason::EmptyHistory => WorkflowResetError::InvalidPoint(ResetInvalidPoint {
+            message: "execution has no recorded history".to_string(),
+            reset_to_event_id: -1,
+            last_event_id: -1,
+            unresolved_side_effects: Vec::new(),
+            nearest_valid_before: None,
+            nearest_valid_after: None,
+        }),
+        ResetSkipReason::InvalidBoundary {
+            resolved_event_id,
+            nearest_valid_before,
+            nearest_valid_after,
+        } => WorkflowResetError::InvalidPoint(ResetInvalidPoint {
+            message: format!("event {resolved_event_id} is not a valid reset boundary"),
+            reset_to_event_id: resolved_event_id,
+            last_event_id: resolved_event_id,
+            unresolved_side_effects: Vec::new(),
+            nearest_valid_before,
+            nearest_valid_after,
+        }),
+    }
+}
+
+/// Read-only per-execution resolver for batch reset.
+///
+/// Gates source state, resolves the `ResetPoint`, and validates the boundary
+/// for ONE execution. Never mutates any row.
+///
+/// Returns:
+/// - `Ok(Ok((event_id, plan)))` — boundary resolved and valid; ready to fork.
+/// - `Ok(Err(reason))` — batch-skip (CAN, child, terminal, no-match, invalid
+///   boundary, empty history). Never an error; caller records `Skipped`.
+/// - `Err(e)` — storage or DB error; propagated to the caller.
+pub async fn resolve_batch_reset_one(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    point: &ResetPoint,
+    signal_reapply: ResetSignalReapplyPolicy,
+) -> Result<Result<(i64, ResetPlan), ResetSkipReason>, WorkflowResetError> {
+    // Load without locking — preview only.
+    let execution = match harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(database_error)?
+    {
+        Some(e) => e,
+        None => {
+            return Ok(Err(ResetSkipReason::TerminalSource {
+                state: "NOT_FOUND".to_string(),
+            }));
+        }
+    };
+
+    // State gate: batch admits RUNNING|PAUSED|FAILED|CANCELLED|TIMED_OUT;
+    // skips COMPLETED and TERMINATED.
+    match execution.state.as_str() {
+        "RUNNING" | "PAUSED" | "FAILED" | "CANCELLED" | "TIMED_OUT" => {}
+        other => {
+            return Ok(Err(ResetSkipReason::TerminalSource {
+                state: other.to_string(),
+            }));
+        }
+    }
+
+    // Skip child workflows in v1.
+    if execution.parent_id.is_some() {
+        return Ok(Err(ResetSkipReason::ChildWorkflow));
+    }
+
+    let rows = load_event_rows(conn, exec_id).await?;
+    let events = decode_events(&rows)?;
+
+    // Resolve logical point to a raw event id.
+    let resolved_id = match resolve_reset_point(&events, point) {
+        Ok(id) => id,
+        Err(reason) => return Ok(Err(reason)),
+    };
+
+    // Validate the boundary.
+    let mut plan = match validate_reset_point(&events, resolved_id) {
+        Ok(p) => p,
+        Err(invalid) => {
+            return Ok(Err(ResetSkipReason::InvalidBoundary {
+                resolved_event_id: resolved_id,
+                nearest_valid_before: invalid.nearest_valid_before,
+                nearest_valid_after: invalid.nearest_valid_after,
+            }));
+        }
+    };
+
+    // Attach DB counts (tasks/timers/signals) for the preview plan.
+    attach_side_effect_counts(conn, exec_id, signal_reapply, &mut plan).await?;
+
+    Ok(Ok((resolved_id, plan)))
 }
 
 async fn load_source_execution(
@@ -1466,5 +1748,218 @@ mod tests {
             !request.allow_terminal_source,
             "allow_terminal_source must remain false when set via the request body"
         );
+    }
+
+    // ── ResetPoint resolver unit tests (issue #538, pure / no-DB) ────────────
+
+    use super::{BatchResetOutcome, ResetPoint, ResetSkipReason, resolve_reset_point};
+
+    fn started() -> WorkflowEvent {
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    fn activity_scheduled(name: &str) -> WorkflowEvent {
+        WorkflowEvent::ActivityScheduled {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: name.to_string(),
+            input: Value::Null,
+            queue: "default".to_string(),
+        }
+    }
+
+    fn activity_completed(id: crate::types::ActivityExecId) -> WorkflowEvent {
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id,
+            output: Value::Null,
+        }
+    }
+
+    #[test]
+    fn resolve_event_id_passthrough() {
+        let events = vec![started(), activity_scheduled("a")];
+        let result = resolve_reset_point(&events, &ResetPoint::EventId { event_id: 1 });
+        assert_eq!(result, Ok(1));
+    }
+
+    #[test]
+    fn first_activity_run_resolves_to_before_first_schedule() {
+        // History: started(0) + other_activity(1) + target_activity(2)
+        let events = vec![
+            started(),
+            activity_scheduled("other"),
+            activity_scheduled("target"),
+        ];
+        let result = resolve_reset_point(
+            &events,
+            &ResetPoint::FirstActivityRun {
+                activity_name: "target".to_string(),
+            },
+        );
+        // First "target" ActivityScheduled is at index 2 → resolved = 2 - 1 = 1
+        assert_eq!(result, Ok(1));
+    }
+
+    #[test]
+    fn first_activity_run_resolves_to_zero_when_at_index_one() {
+        // History: started(0) + target_activity(1)
+        let events = vec![started(), activity_scheduled("target")];
+        let result = resolve_reset_point(
+            &events,
+            &ResetPoint::FirstActivityRun {
+                activity_name: "target".to_string(),
+            },
+        );
+        // First "target" at index 1 → resolved = 1 - 1 = 0
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn first_activity_run_no_match_returns_skip() {
+        let events = vec![started(), activity_scheduled("other")];
+        let result = resolve_reset_point(
+            &events,
+            &ResetPoint::FirstActivityRun {
+                activity_name: "missing".to_string(),
+            },
+        );
+        assert_eq!(
+            result,
+            Err(ResetSkipReason::NoMatchingActivity {
+                activity_name: "missing".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn last_workflow_task_returns_highest_valid_boundary() {
+        let act_id = crate::types::ActivityExecId::new();
+        // History: started(0) + scheduled(1) + completed(2)
+        // After completed(2) the pending set is empty → index 2 is valid.
+        let events = vec![
+            started(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: act_id,
+                name: "a".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            activity_completed(act_id),
+        ];
+        let result = resolve_reset_point(&events, &ResetPoint::LastWorkflowTask);
+        // index 2 is valid (all side effects resolved)
+        assert_eq!(result, Ok(2));
+    }
+
+    #[test]
+    fn last_workflow_task_with_open_side_effect_falls_back_to_lower_boundary() {
+        // History: started(0) + scheduled(1) — pending activity never completed.
+        // Index 0 is always valid (WorkflowStarted); index 1 is invalid (pending).
+        let events = vec![started(), activity_scheduled("a")];
+        let result = resolve_reset_point(&events, &ResetPoint::LastWorkflowTask);
+        assert_eq!(result, Ok(0));
+    }
+
+    #[test]
+    fn can_history_returns_continue_as_new_skip() {
+        let events = vec![
+            started(),
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: Value::Null,
+            },
+        ];
+        assert_eq!(
+            resolve_reset_point(
+                &events,
+                &ResetPoint::FirstActivityRun {
+                    activity_name: "x".to_string()
+                }
+            ),
+            Err(ResetSkipReason::ContinueAsNew)
+        );
+        assert_eq!(
+            resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
+            Err(ResetSkipReason::ContinueAsNew)
+        );
+    }
+
+    #[test]
+    fn empty_history_returns_empty_history_skip() {
+        assert_eq!(
+            resolve_reset_point(&[], &ResetPoint::LastWorkflowTask),
+            Err(ResetSkipReason::EmptyHistory)
+        );
+        assert_eq!(
+            resolve_reset_point(&[], &ResetPoint::EventId { event_id: 0 }),
+            Err(ResetSkipReason::EmptyHistory)
+        );
+    }
+
+    #[test]
+    fn reset_point_field_is_backward_compatible_on_wire() {
+        // A legacy body without `reset_point` must deserialize with reset_point = None
+        // and a legacy serialized form must NOT include the field.
+        let legacy_body = serde_json::json!({
+            "reset_to_event_id": 5,
+            "reason": "fix",
+            "operator_id": "ops"
+        });
+        let request: super::WorkflowResetRequest =
+            serde_json::from_value(legacy_body).expect("deserializes");
+        assert!(
+            request.reset_point.is_none(),
+            "legacy body without reset_point must deserialize as None"
+        );
+
+        // Serializing a request with reset_point = None must not include the field.
+        let serialized = serde_json::to_value(&request).expect("serializes");
+        assert!(
+            serialized.get("reset_point").is_none(),
+            "reset_point must be absent in serialized form when None"
+        );
+    }
+
+    #[test]
+    fn batch_reset_outcome_serde_roundtrip() {
+        for outcome in [
+            BatchResetOutcome::Reset,
+            BatchResetOutcome::Skipped,
+            BatchResetOutcome::Previewed,
+        ] {
+            let json = serde_json::to_string(&outcome).expect("serialize");
+            let back: BatchResetOutcome = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(outcome, back);
+        }
+    }
+
+    #[test]
+    fn reset_skip_reason_serde_roundtrip() {
+        let reasons = vec![
+            ResetSkipReason::ContinueAsNew,
+            ResetSkipReason::EmptyHistory,
+            ResetSkipReason::ChildWorkflow,
+            ResetSkipReason::TerminalSource {
+                state: "COMPLETED".to_string(),
+            },
+            ResetSkipReason::NoMatchingActivity {
+                activity_name: "act_x".to_string(),
+            },
+            ResetSkipReason::InvalidBoundary {
+                resolved_event_id: 3,
+                nearest_valid_before: Some(2),
+                nearest_valid_after: Some(5),
+            },
+        ];
+        for reason in reasons {
+            let json = serde_json::to_string(&reason).expect("serialize");
+            let back: ResetSkipReason = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(reason, back, "round-trip failed for {json}");
+        }
     }
 }

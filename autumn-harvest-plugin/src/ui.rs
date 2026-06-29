@@ -1507,6 +1507,7 @@ async fn reset_workflow_ui(
 
     let request = WorkflowResetRequest {
         reset_to_event_id,
+        reset_point: None,
         reason,
         operator_id: actor.clone(),
         signal_reapply: ResetSignalReapplyPolicy::default(),

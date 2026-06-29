@@ -117,6 +117,8 @@ pub const OP_WORKFLOW_ERASE_PAYLOADS: &str = "workflow.erase_payloads";
 pub const OP_WORKFLOW_REPLAY_CANARY: &str = "workflow.replay_canary";
 /// Audit operation: Force-retried a backing-off activity task (issue #516).
 pub const OP_ACTIVITY_RETRY_NOW: &str = "activity.retry_now";
+/// Audit operation: Batch-reset workflow executions to a semantic point (issue #538).
+pub const OP_BATCH_RESET: &str = "batch.reset";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -374,6 +376,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "POST /workflows/{id}/activities/{activity_exec_id}/retry-now",
         RouteClass::Mutating,
     ),
+    // Batch reset by semantic point (issue #538): admin-only.
+    ("POST /workflows/batch_reset", RouteClass::Mutating),
 ];
 
 // ── Declarative route manifest ────────────────────────────────────────────────
@@ -424,6 +428,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_REPLAY_CANARY,
     // Force-retry backing-off activity (issue #516)
     OP_ACTIVITY_RETRY_NOW,
+    // Batch reset by semantic point (issue #538)
+    OP_BATCH_RESET,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -636,6 +642,8 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
         "POST /workflows/{id}/activities/{activity_exec_id}/retry-now",
         Some(OP_ACTIVITY_RETRY_NOW),
     ),
+    // Batch reset by semantic point (issue #538)
+    ("POST /workflows/batch_reset", Some(OP_BATCH_RESET)),
 ];
 
 // ── Query filters ─────────────────────────────────────────────────────────────

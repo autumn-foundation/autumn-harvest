@@ -1239,6 +1239,7 @@ async fn workflow_reset_cascades_detached_children() {
         parent_exec_id,
         WorkflowResetRequest {
             reset_to_event_id: 0,
+            reset_point: None,
             reason: "operator reset".to_string(),
             operator_id: "test-operator".to_string(),
             signal_reapply: autumn_harvest::ResetSignalReapplyPolicy::default(),

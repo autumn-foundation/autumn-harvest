@@ -874,6 +874,40 @@ enum WorkflowCommand {
         /// Registered workflow name.
         workflow_name: String,
     },
+    /// Reset a cohort of workflow executions to a shared semantic point (issue #538).
+    ///
+    /// Selects candidates via the filter grammar, resolves the logical anchor
+    /// per execution, and returns a per-execution outcome list. Use
+    /// `--preview` to resolve without forking.
+    BatchReset {
+        /// Inline JSON filter (e.g. `'{"states":["FAILED"],"workflow_name":"my_flow"}'`).
+        #[arg(long, conflicts_with = "filter_file")]
+        filter_json: Option<String>,
+        /// File containing the JSON filter. Use `-` for stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "filter_json")]
+        filter_file: Option<PathBuf>,
+        /// Reset to a specific event ID (preserved for each execution individually).
+        #[arg(long, conflicts_with_all = ["first_activity", "last_workflow_task"])]
+        event_id: Option<i64>,
+        /// Reset each execution just before the first scheduling of this activity name.
+        #[arg(long, value_name = "ACTIVITY_NAME", conflicts_with_all = ["event_id", "last_workflow_task"])]
+        first_activity: Option<String>,
+        /// Reset each execution to the most-recent clean workflow-task boundary.
+        #[arg(long, conflicts_with_all = ["event_id", "first_activity"])]
+        last_workflow_task: bool,
+        /// Recovery reason recorded in reset marker events.
+        #[arg(long)]
+        reason: String,
+        /// Operator identity recorded in reset marker events.
+        #[arg(long, default_value = "cli")]
+        operator_id: String,
+        /// How to handle undelivered source signals.
+        #[arg(long, value_enum, default_value = "drop")]
+        signal_reapply: ResetSignalReapply,
+        /// Resolve the semantic point per execution but do not fork any execution.
+        #[arg(long)]
+        preview: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1111,10 +1145,10 @@ enum ScheduleCommand {
     Runs {
         /// Schedule row ID (UUID).
         id: String,
-        /// Filter by execution state (repeatable), e.g. --state FAILED --state TIMED_OUT.
+        /// Filter by execution state (repeatable), e.g. --state FAILED --state `TIMED_OUT`.
         #[arg(long = "state")]
         state: Vec<String>,
-        /// Filter by dispatch origin (repeatable): scheduled, backfill, manual_trigger.
+        /// Filter by dispatch origin (repeatable): scheduled, backfill, `manual_trigger`.
         #[arg(long = "origin")]
         origin: Vec<String>,
         /// Only runs started at/after this RFC 3339 time or relative duration (e.g. 24h).
@@ -3507,6 +3541,57 @@ fn workflow_request(command: &WorkflowCommand) -> Result<ApiRequest, CliError> {
             "/workflows/types/{}/handlers",
             path_segment(workflow_name),
         ))),
+        WorkflowCommand::BatchReset {
+            filter_json,
+            filter_file,
+            event_id,
+            first_activity,
+            last_workflow_task,
+            reason,
+            operator_id,
+            signal_reapply,
+            preview,
+        } => {
+            let filter = parse_json_source(
+                filter_json.as_deref(),
+                filter_file.as_deref(),
+                "batch reset filter",
+            )?
+            .ok_or_else(|| {
+                CliError::InvalidInput(
+                    "one of --filter-json or --filter-file is required".to_string(),
+                )
+            })?;
+            let reset_point = if let Some(id) = event_id {
+                json!({"type": "event_id", "event_id": id})
+            } else if let Some(name) = first_activity {
+                json!({"type": "first_activity_run", "activity_name": name})
+            } else if *last_workflow_task {
+                json!({"type": "last_workflow_task"})
+            } else {
+                return Err(CliError::InvalidInput(
+                    "one of --event-id, --first-activity, or --last-workflow-task is required"
+                        .to_string(),
+                ));
+            };
+            let mut body = serde_json::Map::new();
+            body.insert("filter".to_string(), filter);
+            body.insert("reset_point".to_string(), reset_point);
+            body.insert("reason".to_string(), Value::String(reason.clone()));
+            body.insert(
+                "operator_id".to_string(),
+                Value::String(operator_id.clone()),
+            );
+            body.insert(
+                "signal_reapply".to_string(),
+                Value::String(signal_reapply.as_wire().to_string()),
+            );
+            body.insert("preview".to_string(), Value::Bool(*preview));
+            Ok(ApiRequest::post(
+                "/workflows/batch_reset".to_string(),
+                Some(Value::Object(body)),
+            ))
+        }
     }
 }
 
@@ -3778,6 +3863,7 @@ fn dag_request(command: &DagCommand, actor: Option<&str>) -> Result<ApiRequest, 
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
     match command {
         ScheduleCommand::List => Ok(ApiRequest::get("/admin/schedules")),
