@@ -794,7 +794,7 @@ async fn query_dead_letters_for_redrive(
 /// Re-enqueues the dead-lettered task onto its original queue with a fresh
 /// retry budget. Unlike [`replay_dead_letter`], a redrive **reactivates** an
 /// owning execution that was sealed `FAILED` at quarantine time (`FAILED →
-/// RUNNING`, appending a [`WorkflowEvent::WorkflowRedriven`] event so replay
+/// RUNNING`, appending a [`crate::event::WorkflowEvent::WorkflowRedriven`] event so replay
 /// resumes from existing history append-only). The whole operation is one
 /// transaction.
 ///
@@ -1254,7 +1254,7 @@ impl DlqAggregateParams {
     ///
     /// # Errors
     ///
-    /// Returns a human-readable error message string on any invalid parameter
+    /// Generates a descriptive error message if any parameter is invalid.
     /// value, or when no `group_by` dimension is supplied.
     pub fn from_query_pairs(
         pairs: &[(String, String)],

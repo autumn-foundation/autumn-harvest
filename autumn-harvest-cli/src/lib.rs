@@ -1111,10 +1111,10 @@ enum ScheduleCommand {
     Runs {
         /// Schedule row ID (UUID).
         id: String,
-        /// Filter by execution state (repeatable), e.g. --state FAILED --state TIMED_OUT.
+        /// Filter by execution state (repeatable), e.g. `--state FAILED --state TIMED_OUT`.
         #[arg(long = "state")]
         state: Vec<String>,
-        /// Filter by dispatch origin (repeatable): scheduled, backfill, manual_trigger.
+        /// Filter by dispatch origin (repeatable): `scheduled`, `backfill`, `manual_trigger`.
         #[arg(long = "origin")]
         origin: Vec<String>,
         /// Only runs started at/after this RFC 3339 time or relative duration (e.g. 24h).
@@ -3778,6 +3778,7 @@ fn dag_request(command: &DagCommand, actor: Option<&str>) -> Result<ApiRequest, 
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn schedule_request(command: &ScheduleCommand) -> Result<ApiRequest, CliError> {
     match command {
         ScheduleCommand::List => Ok(ApiRequest::get("/admin/schedules")),
