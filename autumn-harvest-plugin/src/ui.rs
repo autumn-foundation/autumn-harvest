@@ -1506,7 +1506,7 @@ async fn reset_workflow_ui(
     let reset_to_event_id = form.reset_to_event_id.saturating_sub(1);
 
     let request = WorkflowResetRequest {
-        reset_to_event_id,
+        reset_to_event_id: Some(reset_to_event_id),
         reset_point: None,
         reason,
         operator_id: actor.clone(),

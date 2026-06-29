@@ -243,8 +243,11 @@ pub fn resolve_reset_point(
 /// Request body for resetting one workflow execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowResetRequest {
-    #[serde(default)]
-    pub reset_to_event_id: i64,
+    /// Raw event id to fork at. `None` means unspecified (backward-compatible
+    /// default for requests that only supply `reset_point`). When both are
+    /// `None` the API layer returns a 400 before this struct reaches the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_to_event_id: Option<i64>,
     /// Optional logical reset anchor (issue #538). When `Some`, the anchor is
     /// resolved against the execution's event history *before* `validate_reset_point`
     /// so the caller does not need to know the per-execution raw event id.
@@ -701,10 +704,12 @@ pub async fn preview_workflow_reset(
     let events = decode_events(&rows)?;
     // If a logical ResetPoint was specified, resolve it to a raw event id now.
     if let Some(ref point) = request.reset_point.clone() {
-        request.reset_to_event_id = resolve_reset_point(&events, point)
+        let resolved = resolve_reset_point(&events, point)
             .map_err(|reason| skip_reason_to_error(exec_id, reason))?;
+        request.reset_to_event_id = Some(resolved);
     }
-    let mut plan = validate_reset_point(&events, request.reset_to_event_id)?;
+    let raw_event_id = request.reset_to_event_id.unwrap_or(0);
+    let mut plan = validate_reset_point(&events, raw_event_id)?;
     attach_side_effect_counts(conn, exec_id, request.signal_reapply, &mut plan).await?;
     Ok(plan)
 }
@@ -734,10 +739,12 @@ pub async fn reset_workflow_execution(
                 let events = decode_events(&rows)?;
                 // Resolve a logical ResetPoint to a raw event id before validation.
                 if let Some(ref point) = request.reset_point.clone() {
-                    request.reset_to_event_id = resolve_reset_point(&events, point)
+                    let resolved = resolve_reset_point(&events, point)
                         .map_err(|reason| skip_reason_to_error(exec_id, reason))?;
+                    request.reset_to_event_id = Some(resolved);
                 }
-                let plan = validate_reset_point(&events, request.reset_to_event_id)?;
+                let reset_event_id = request.reset_to_event_id.unwrap_or(0);
+                let plan = validate_reset_point(&events, reset_event_id)?;
 
                 let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
                 let source_next_event_id =
@@ -752,7 +759,7 @@ pub async fn reset_workflow_execution(
                 )
                 .await?;
                 let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
-                copy_carried_events(conn, new_exec_id, &rows, request.reset_to_event_id).await?;
+                copy_carried_events(conn, new_exec_id, &rows, reset_event_id).await?;
                 append_fork_marker(conn, new_exec_id, exec_id, &request, &plan).await?;
 
                 let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
@@ -774,7 +781,7 @@ pub async fn reset_workflow_execution(
                     ResetResult {
                         new_exec_id,
                         reset_from_exec_id: exec_id,
-                        reset_to_event_id: request.reset_to_event_id,
+                        reset_to_event_id: reset_event_id,
                         events_carried_over: plan.events_carried_over,
                         source_tasks_cancelled: source_tasks_cancelled + source_external_cancelled,
                         source_timers_removed,
@@ -1256,7 +1263,7 @@ async fn append_fork_marker(
         new_exec_id,
         &[WorkflowEvent::WorkflowResetFork {
             reset_from_exec_id: source_exec_id,
-            reset_to_event_id: request.reset_to_event_id,
+            reset_to_event_id: request.reset_to_event_id.unwrap_or(0),
             reason: request.reason.clone(),
             operator_id: request.operator_id.clone(),
         }],

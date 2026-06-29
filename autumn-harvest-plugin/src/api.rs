@@ -8806,6 +8806,12 @@ async fn batch_reset_workflows(
                 }
                 Err(e) => {
                     active_conn = None;
+                    // Record the shard as unavailable so the response status
+                    // is "partial" rather than "complete".
+                    unavailable_shards.push(UnavailableShard {
+                        shard_id: shard_id.as_i32(),
+                        reason: format!("DB connection unavailable during reset phase: {e}"),
+                    });
                     items.push(BatchResetItem {
                         exec_id: exec_id_str,
                         outcome: BatchResetOutcome::Skipped,
@@ -8884,7 +8890,7 @@ async fn batch_reset_workflows(
                 } else {
                     // Perform the actual reset.
                     let reset_req = WorkflowResetRequest {
-                        reset_to_event_id: resolved_event_id,
+                        reset_to_event_id: Some(resolved_event_id),
                         reset_point: None,
                         reason: request.reason.clone(),
                         operator_id: request.operator_id.clone(),
@@ -10751,16 +10757,17 @@ async fn reset_workflow(
             return e.into_response();
         }
     };
-    // Validate that the caller specified at least one reset anchor.  With
-    // #[serde(default)] on reset_to_event_id, a body such as {"reason":"…"}
-    // would deserialize as reset_to_event_id=0 and reset_point=None, which
-    // silently resets the workflow to its very beginning — an unintentional
-    // destructive operation.
-    if request.reset_to_event_id == 0 && request.reset_point.is_none() {
+    // Validate that the caller specified at least one reset anchor.  With both
+    // fields defaulting to None/absent, a body such as {"reason":"…"} would
+    // silently resolve to event 0 (WorkflowStarted) — an unintentional
+    // destructive operation.  The explicit value `reset_to_event_id: 0` is
+    // intentional (fork at WorkflowStarted) and is accepted; only the
+    // all-absent case is rejected here.
+    if request.reset_to_event_id.is_none() && request.reset_point.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "one of reset_to_event_id (non-zero) or reset_point must be provided"
+                "error": "one of reset_to_event_id or reset_point must be provided"
             })),
         )
             .into_response();
@@ -11123,7 +11130,7 @@ async fn retry_dag_run(
         request.from_nodes.join(",")
     );
     let reset_request = WorkflowResetRequest {
-        reset_to_event_id: plan.reset_to_event_id,
+        reset_to_event_id: Some(plan.reset_to_event_id),
         reset_point: None,
         reason: augmented_reason,
         operator_id: request.operator_id.trim().to_string(),

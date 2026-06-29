@@ -1238,7 +1238,7 @@ async fn workflow_reset_cascades_detached_children() {
         &mut conn,
         parent_exec_id,
         WorkflowResetRequest {
-            reset_to_event_id: 0,
+            reset_to_event_id: Some(0),
             reset_point: None,
             reason: "operator reset".to_string(),
             operator_id: "test-operator".to_string(),
