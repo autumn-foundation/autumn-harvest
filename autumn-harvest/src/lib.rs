@@ -276,9 +276,10 @@ pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher, SignalOrTimerMatch};
 #[cfg(feature = "db")]
 pub use reset::{
-    ResetInvalidPoint, ResetPlan, ResetResult, ResetSignalReapplyPolicy, ResetUnresolvedSideEffect,
-    WorkflowResetError, WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
-    validate_reset_point,
+    BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPlan, ResetPoint, ResetResult,
+    ResetSignalReapplyPolicy, ResetSkipReason, ResetUnresolvedSideEffect, WorkflowResetError,
+    WorkflowResetRequest, preview_workflow_reset, reset_workflow_execution,
+    resolve_batch_reset_one, resolve_reset_point, validate_reset_point,
 };
 pub use retention::{ArchiverFuture, HistoryArchiver, RetentionConfig};
 #[cfg(feature = "db")]

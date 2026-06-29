@@ -1124,8 +1124,13 @@
         "fields": [
           {
             "name": "reset_to_event_id",
-            "required": true,
-            "description": "Event sequence number to reset to."
+            "required": false,
+            "description": "Event sequence number to reset to. Required when reset_point is absent; mutually exclusive with reset_point."
+          },
+          {
+            "name": "reset_point",
+            "required": false,
+            "description": "Logical reset anchor resolved per-execution at reset time. One of: {\"type\":\"event_id\",\"event_id\":N}, {\"type\":\"first_activity_run\",\"activity_name\":\"name\"}, {\"type\":\"last_workflow_task\"}. Required when reset_to_event_id is absent; mutually exclusive with reset_to_event_id."
           },
           {
             "name": "reason",
@@ -2676,6 +2681,77 @@
         {
           "status": 413,
           "description": "Request exceeds max_items_per_batch or max_total_bytes."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/batch_reset",
+      "category": "batch",
+      "read_only": false,
+      "description": "Reset a cohort of workflow executions to a shared semantic point. Resolves the logical anchor per execution and returns a per-execution outcome list. preview=true resolves points without forking (issue #538).",
+      "idempotency": "Not idempotent. Each call forks the matched cohort. Use preview=true to plan first.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "filter",
+            "required": true,
+            "description": "BatchFilter identifying the cohort. Must not be empty."
+          },
+          {
+            "name": "reset_point",
+            "required": true,
+            "description": "Logical anchor: {type: event_id, event_id: N} | {type: first_activity_run, activity_name: S} | {type: last_workflow_task}."
+          },
+          {
+            "name": "reason",
+            "required": true,
+            "description": "Human-readable recovery reason stamped on each fork."
+          },
+          {
+            "name": "operator_id",
+            "required": true,
+            "description": "Operator identity recorded in the audit log."
+          },
+          {
+            "name": "signal_reapply",
+            "required": false,
+            "description": "Signal re-apply policy for forked executions: drop (default) | buffer."
+          },
+          {
+            "name": "preview",
+            "required": false,
+            "description": "true = dry-run: resolve per-execution points without forking."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "preview",
+          "total",
+          "reset_count",
+          "skipped_count",
+          "items",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Empty filter or cohort exceeds DEFAULT_BATCH_RESET_MAX_COHORT (1000)."
+        },
+        {
+          "status": 401,
+          "description": "Missing or invalid admin credentials."
         },
         {
           "status": 500,

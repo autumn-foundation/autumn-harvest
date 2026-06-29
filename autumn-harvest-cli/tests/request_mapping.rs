@@ -1283,3 +1283,154 @@ fn workflow_retry_activity_maps_to_post_retry_now_route() {
     );
     assert_eq!(request.body, None, "retry-activity sends no body");
 }
+
+// ── batch-reset subcommand (issue #538) ───────────────────────────────────────
+
+#[test]
+fn workflow_batch_reset_first_activity_maps_to_batch_reset_route() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "batch-reset",
+        "--filter-json",
+        r#"{"states":["FAILED"],"workflow_name":"subscription_flow"}"#,
+        "--first-activity",
+        "activity_x",
+        "--reason",
+        "post-deploy fix #1234",
+        "--operator-id",
+        "oncall-jane",
+    ])
+    .expect("batch-reset args should parse");
+    let request = cli.api_request().expect("batch-reset request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/workflows/batch_reset");
+
+    let body = request.body.unwrap();
+    assert_eq!(body["filter"]["states"][0], "FAILED");
+    assert_eq!(body["filter"]["workflow_name"], "subscription_flow");
+    assert_eq!(body["reset_point"]["type"], "first_activity_run");
+    assert_eq!(body["reset_point"]["activity_name"], "activity_x");
+    assert_eq!(body["reason"], "post-deploy fix #1234");
+    assert_eq!(body["operator_id"], "oncall-jane");
+    assert_eq!(body["signal_reapply"], "drop");
+    assert_eq!(body["preview"], false);
+}
+
+#[test]
+fn workflow_batch_reset_event_id_maps_correctly() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "batch-reset",
+        "--filter-json",
+        r#"{"states":["FAILED"]}"#,
+        "--event-id",
+        "42",
+        "--reason",
+        "manual fix",
+    ])
+    .expect("batch-reset --event-id args should parse");
+    let request = cli
+        .api_request()
+        .expect("batch-reset --event-id request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/workflows/batch_reset");
+
+    let body = request.body.unwrap();
+    assert_eq!(body["reset_point"]["type"], "event_id");
+    assert_eq!(body["reset_point"]["event_id"], 42);
+    assert_eq!(body["operator_id"], "cli");
+}
+
+#[test]
+fn workflow_batch_reset_last_workflow_task_maps_correctly() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "batch-reset",
+        "--filter-json",
+        r#"{"states":["FAILED"]}"#,
+        "--last-workflow-task",
+        "--reason",
+        "recover from stuck state",
+    ])
+    .expect("batch-reset --last-workflow-task args should parse");
+    let request = cli
+        .api_request()
+        .expect("batch-reset --last-workflow-task request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/workflows/batch_reset");
+
+    let body = request.body.unwrap();
+    assert_eq!(body["reset_point"]["type"], "last_workflow_task");
+}
+
+#[test]
+fn workflow_batch_reset_preview_flag_sets_preview_true() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "batch-reset",
+        "--filter-json",
+        r#"{"states":["FAILED"]}"#,
+        "--first-activity",
+        "my_activity",
+        "--reason",
+        "dry run check",
+        "--preview",
+    ])
+    .expect("batch-reset --preview args should parse");
+    let request = cli
+        .api_request()
+        .expect("batch-reset --preview request should build");
+
+    let body = request.body.unwrap();
+    assert_eq!(body["preview"], true);
+}
+
+#[test]
+fn workflow_batch_reset_signal_reapply_buffer_maps_correctly() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "batch-reset",
+        "--filter-json",
+        r#"{"states":["FAILED"]}"#,
+        "--first-activity",
+        "my_activity",
+        "--reason",
+        "fix",
+        "--signal-reapply",
+        "buffer",
+    ])
+    .expect("batch-reset --signal-reapply buffer args should parse");
+    let request = cli
+        .api_request()
+        .expect("batch-reset --signal-reapply buffer request should build");
+
+    let body = request.body.unwrap();
+    assert_eq!(body["signal_reapply"], "buffer");
+}
+
+#[test]
+fn workflow_batch_reset_no_point_flag_returns_error() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "batch-reset",
+        "--filter-json",
+        r#"{"states":["FAILED"]}"#,
+        "--reason",
+        "fix",
+    ])
+    .expect("batch-reset parse should succeed (missing point is a runtime error)");
+    let result = cli.api_request();
+    assert!(
+        result.is_err(),
+        "batch-reset without a reset-point flag should return an error"
+    );
+}
