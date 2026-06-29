@@ -8829,21 +8829,18 @@ async fn batch_reset_workflows(
 
         // If the shard's connection failed on a prior item, skip remaining
         // items on that shard without re-attempting acquisition.
-        let conn = match active_conn.as_mut() {
-            Some(c) => c,
-            None => {
-                items.push(BatchResetItem {
-                    exec_id: exec_id_str,
-                    outcome: BatchResetOutcome::Skipped,
-                    resolved_event_id: None,
-                    new_exec_id: None,
-                    skip_reason: Some(ResetSkipReason::InfrastructureError {
-                        message: "DB connection unavailable".to_string(),
-                    }),
-                });
-                skipped_count += 1;
-                continue;
-            }
+        let Some(conn) = active_conn.as_mut() else {
+            items.push(BatchResetItem {
+                exec_id: exec_id_str,
+                outcome: BatchResetOutcome::Skipped,
+                resolved_event_id: None,
+                new_exec_id: None,
+                skip_reason: Some(ResetSkipReason::InfrastructureError {
+                    message: "DB connection unavailable".to_string(),
+                }),
+            });
+            skipped_count += 1;
+            continue;
         };
 
         match resolve_batch_reset_one(conn, exec_id, &request.reset_point, request.signal_reapply)
