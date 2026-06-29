@@ -8675,6 +8675,12 @@ async fn batch_reset_workflows(
     let mut unavailable_shards: Vec<UnavailableShard> = Vec::new();
 
     for (shard_id, shard_pool) in pool.iter_shards() {
+        // Break early once we already know the cohort is too large — no point
+        // querying additional shards when the request will be rejected anyway.
+        if shard_items.len() > DEFAULT_BATCH_RESET_MAX_COHORT {
+            break;
+        }
+
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
             Err(e) => {
@@ -8722,8 +8728,11 @@ async fn batch_reset_workflows(
             }
         }
 
+        // Adjust per-shard limit so we never fetch more than one over the cap
+        // across all shards combined, saving a round-trip on subsequent shards.
+        let remaining_cap = DEFAULT_BATCH_RESET_MAX_COHORT + 1 - shard_items.len();
         let ids: Vec<uuid::Uuid> = match query
-            .limit(i64::try_from(DEFAULT_BATCH_RESET_MAX_COHORT + 1).unwrap_or(i64::MAX))
+            .limit(i64::try_from(remaining_cap).unwrap_or(i64::MAX))
             .load::<uuid::Uuid>(&mut conn)
             .await
         {
@@ -8763,6 +8772,12 @@ async fn batch_reset_workflows(
     let mut reset_count = 0usize;
     let mut skipped_count = 0usize;
 
+    // Reuse connections across contiguous same-shard items — shard_items is
+    // already shard-ordered from the collection phase above, so this reduces
+    // pool acquisitions from O(items) to O(shards).
+    let mut active_conn: Option<PoolConn> = None;
+    let mut active_shard_id: Option<ShardId> = None;
+
     for (exec_uuid, shard_id) in &shard_items {
         let exec_id_str = exec_uuid.to_string();
         let exec_id = match exec_id_str.parse::<ExecutionId>() {
@@ -8782,16 +8797,42 @@ async fn batch_reset_workflows(
             }
         };
 
-        let mut conn = match acquire_conn(pool.pool_for(*shard_id)).await {
-            Ok(c) => c,
-            Err(e) => {
+        // Acquire a new connection only when the shard changes.
+        if active_shard_id != Some(*shard_id) {
+            active_shard_id = Some(*shard_id);
+            match acquire_conn(pool.pool_for(*shard_id)).await {
+                Ok(c) => {
+                    active_conn = Some(c);
+                }
+                Err(e) => {
+                    active_conn = None;
+                    items.push(BatchResetItem {
+                        exec_id: exec_id_str,
+                        outcome: BatchResetOutcome::Skipped,
+                        resolved_event_id: None,
+                        new_exec_id: None,
+                        skip_reason: Some(ResetSkipReason::InfrastructureError {
+                            message: format!("DB connection unavailable: {e}"),
+                        }),
+                    });
+                    skipped_count += 1;
+                    continue;
+                }
+            }
+        }
+
+        // If the shard's connection failed on a prior item, skip remaining
+        // items on that shard without re-attempting acquisition.
+        let conn = match active_conn.as_mut() {
+            Some(c) => c,
+            None => {
                 items.push(BatchResetItem {
-                    exec_id: exec_id_str.clone(),
+                    exec_id: exec_id_str,
                     outcome: BatchResetOutcome::Skipped,
                     resolved_event_id: None,
                     new_exec_id: None,
                     skip_reason: Some(ResetSkipReason::InfrastructureError {
-                        message: format!("DB connection unavailable: {e}"),
+                        message: "DB connection unavailable".to_string(),
                     }),
                 });
                 skipped_count += 1;
@@ -8800,7 +8841,7 @@ async fn batch_reset_workflows(
         };
 
         match resolve_batch_reset_one(
-            &mut conn,
+            conn,
             exec_id,
             &request.reset_point,
             request.signal_reapply,
@@ -8851,7 +8892,7 @@ async fn batch_reset_workflows(
                         allow_terminal_source: true,
                     };
                     match reset_workflow_execution(
-                        &mut conn,
+                        conn,
                         exec_id,
                         reset_req,
                         Some(&runtime.registry),
@@ -10710,6 +10751,21 @@ async fn reset_workflow(
             return e.into_response();
         }
     };
+    // Validate that the caller specified at least one reset anchor.  With
+    // #[serde(default)] on reset_to_event_id, a body such as {"reason":"…"}
+    // would deserialize as reset_to_event_id=0 and reset_point=None, which
+    // silently resets the workflow to its very beginning — an unintentional
+    // destructive operation.
+    if request.reset_to_event_id == 0 && request.reset_point.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "one of reset_to_event_id (non-zero) or reset_point must be provided"
+            })),
+        )
+            .into_response();
+    }
+
     let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
         Ok(conn) => conn,
         Err(e) => return e.into_response(),

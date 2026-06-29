@@ -204,14 +204,36 @@ pub fn resolve_reset_point(
             {
                 return Err(ResetSkipReason::ContinueAsNew);
             }
-            // Walk the full history and pick the highest valid boundary.
+            // Walk the full history and pick the highest valid decision boundary,
+            // skipping terminal and operational lifecycle events. Including a
+            // terminal event (WorkflowFailed, WorkflowCancelled, WorkflowExecutionTimedOut,
+            // WorkflowCompleted) in the fork history causes the replayer to hit that
+            // event and terminate immediately rather than re-running the workflow body.
             let last = events.len().saturating_sub(1);
             let (valid, _) = boundary_validity(events, last);
             let highest = valid
                 .iter()
+                .zip(events.iter())
                 .enumerate()
                 .rev()
-                .find_map(|(idx, ok)| ok.then_some(idx));
+                .find_map(|(idx, (ok, event))| {
+                    if !ok {
+                        return None;
+                    }
+                    // Exclude terminal lifecycle events: including them in the
+                    // fork history causes replay to terminate immediately rather
+                    // than re-running the workflow body.
+                    if matches!(
+                        event,
+                        WorkflowEvent::WorkflowCompleted { .. }
+                            | WorkflowEvent::WorkflowFailed { .. }
+                            | WorkflowEvent::WorkflowCancelled { .. }
+                            | WorkflowEvent::WorkflowExecutionTimedOut { .. }
+                    ) {
+                        return None;
+                    }
+                    Some(idx)
+                });
             let idx = highest.ok_or(ResetSkipReason::EmptyHistory)?;
             Ok(i64::try_from(idx).unwrap_or(0))
         }
@@ -1918,6 +1940,75 @@ mod tests {
         assert_eq!(
             resolve_reset_point(&[], &ResetPoint::EventId { event_id: 0 }),
             Err(ResetSkipReason::EmptyHistory)
+        );
+    }
+
+    // ── LastWorkflowTask terminal-event exclusion (issue #538 / Codex P1) ───
+
+    #[test]
+    fn last_workflow_task_skips_workflow_failed_at_tail() {
+        // History: started(0), scheduled(1), completed(2), failed(3).
+        // Index 3 (WorkflowFailed) must be skipped; highest valid non-terminal
+        // boundary is index 2 (ActivityCompleted, pending=empty).
+        let act_id = crate::types::ActivityExecId::new();
+        let events = vec![
+            started(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: act_id,
+                name: "a".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            activity_completed(act_id),
+            WorkflowEvent::WorkflowFailed {
+                error: "oops".to_string(),
+            },
+        ];
+        assert_eq!(
+            resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
+            Ok(2),
+            "LastWorkflowTask must skip WorkflowFailed and return the prior clean boundary"
+        );
+    }
+
+    #[test]
+    fn last_workflow_task_skips_workflow_cancelled_at_tail() {
+        // History: started(0), cancelled(1).  Only valid non-terminal boundary
+        // is index 0 (WorkflowStarted).
+        let events = vec![
+            started(),
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator cancel".to_string(),
+            },
+        ];
+        assert_eq!(
+            resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
+            Ok(0),
+            "LastWorkflowTask must skip WorkflowCancelled and fall back to WorkflowStarted"
+        );
+    }
+
+    #[test]
+    fn last_workflow_task_skips_workflow_execution_timed_out_at_tail() {
+        let act_id = crate::types::ActivityExecId::new();
+        let events = vec![
+            started(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: act_id,
+                name: "b".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            activity_completed(act_id),
+            WorkflowEvent::WorkflowExecutionTimedOut {
+                deadline: Utc::now(),
+                timed_out_at: Utc::now(),
+            },
+        ];
+        assert_eq!(
+            resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
+            Ok(2),
+            "LastWorkflowTask must skip WorkflowExecutionTimedOut and return the prior clean boundary"
         );
     }
 
