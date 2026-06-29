@@ -35,7 +35,8 @@ use crate::execution::{
     apply_parent_close_cascade, cancel_workflow_execution_collect, parent_close_cascade_event_count,
 };
 use crate::executor::{
-    WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_history_policy_and_caps,
+    WorkflowExecuteSpanMeta, WorkflowOutcome, WorkflowRunConfig,
+    run_workflow_with_state_history_policy_and_caps,
 };
 use crate::external_task;
 use crate::failure::{parse_error_payload, parse_error_payload_full, parse_typed_payload};
@@ -6241,31 +6242,31 @@ async fn process_workflow_task(
             .unwrap_or_default();
 
         let (run_outcome, pending_cmds, execute_span) =
-            run_workflow_with_state_history_policy_and_caps(
-                prepared.exec_id,
-                history_events.clone(),
-                workflow.handler,
-                task.input.clone(),
-                registry.shared_state(),
-                registry.history_policy(),
-                Some(&span_meta),
-                &dq,
-                &du,
-                wf_name,
-                registry.max_activity_input_bytes,
-                registry.max_signal_payload_bytes,
-                workflow
+            run_workflow_with_state_history_policy_and_caps(WorkflowRunConfig {
+                exec_id: prepared.exec_id,
+                history: history_events.clone(),
+                handler: workflow.handler,
+                input: task.input.clone(),
+                state: registry.shared_state(),
+                history_policy: registry.history_policy(),
+                span_meta: Some(&span_meta),
+                declarative_query_handlers: &dq,
+                declarative_update_handlers: &du,
+                workflow_name: wf_name,
+                max_activity_input_bytes: registry.max_activity_input_bytes,
+                max_signal_payload_bytes: registry.max_signal_payload_bytes,
+                max_workflow_input_bytes: workflow
                     .max_input_bytes
                     .map_or(registry.max_workflow_input_bytes, |per| {
                         per.max(registry.max_workflow_input_bytes)
                     }),
-                registry.max_current_details_bytes,
-                exec_context_headers.clone(),
-                registry
+                max_current_details_bytes: registry.max_current_details_bytes,
+                context_headers: exec_context_headers.clone(),
+                payload_offload_threshold: registry
                     .payload_offloader()
                     .map(crate::payload_store::PayloadOffloader::threshold),
-                telemetry.metrics.clone(),
-            )
+                metrics: telemetry.metrics.clone(),
+            })
             .await;
 
         match run_outcome {

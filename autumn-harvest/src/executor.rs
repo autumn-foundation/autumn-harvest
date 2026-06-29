@@ -474,6 +474,27 @@ pub async fn run_workflow_with_state_advancing_clock(
     drive_workflow(ctx, handler, input, span_meta).await
 }
 
+/// Configuration struct to pass many parameters to the workflow executor.
+pub struct WorkflowRunConfig<'a> {
+    pub exec_id: ExecutionId,
+    pub history: Vec<WorkflowEvent>,
+    pub handler: WorkflowHandlerFn,
+    pub input: Value,
+    pub state: SharedState,
+    pub history_policy: WorkflowHistoryPolicy,
+    pub span_meta: Option<&'a WorkflowExecuteSpanMeta>,
+    pub declarative_query_handlers: &'a [&'a QueryHandlerInfo],
+    pub declarative_update_handlers: &'a [&'a UpdateHandlerInfo],
+    pub workflow_name: &'a str,
+    pub max_activity_input_bytes: u64,
+    pub max_signal_payload_bytes: u64,
+    pub max_workflow_input_bytes: u64,
+    pub max_current_details_bytes: usize,
+    pub context_headers: std::collections::HashMap<String, String>,
+    pub payload_offload_threshold: Option<u64>,
+    pub metrics: std::sync::Arc<dyn MetricsRecorder>,
+}
+
 /// Like [`run_workflow_with_state`] but installs explicit history guardrails,
 /// workflow name, and payload size caps into the [`WorkflowContext`].
 #[allow(clippy::too_many_arguments)]
@@ -489,7 +510,7 @@ pub async fn run_workflow_with_state_and_history_policy(
     declarative_update_handlers: &[&UpdateHandlerInfo],
     metrics: std::sync::Arc<dyn MetricsRecorder>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
-    run_workflow_with_state_history_policy_and_caps(
+    run_workflow_with_state_history_policy_and_caps(WorkflowRunConfig {
         exec_id,
         history,
         handler,
@@ -499,71 +520,55 @@ pub async fn run_workflow_with_state_and_history_policy(
         span_meta,
         declarative_query_handlers,
         declarative_update_handlers,
-        "",
-        crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
-        crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
-        crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
-        crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
-        std::collections::HashMap::new(),
-        None,
+        workflow_name: "",
+        max_activity_input_bytes: crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+        max_signal_payload_bytes: crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+        max_workflow_input_bytes: crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+        max_current_details_bytes: crate::context::DEFAULT_CURRENT_DETAILS_CAP_BYTES,
+        context_headers: std::collections::HashMap::new(),
+        payload_offload_threshold: None,
         metrics,
-    )
+    })
     .await
 }
 
 /// Full executor entry point used by the worker, which injects the workflow name
 /// and payload size caps configured on the `BuiltHarvest` instance.
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+#[allow(clippy::implicit_hasher)]
 pub async fn run_workflow_with_state_history_policy_and_caps(
-    exec_id: ExecutionId,
-    history: Vec<WorkflowEvent>,
-    handler: WorkflowHandlerFn,
-    input: Value,
-    state: SharedState,
-    history_policy: WorkflowHistoryPolicy,
-    span_meta: Option<&WorkflowExecuteSpanMeta>,
-    declarative_query_handlers: &[&QueryHandlerInfo],
-    declarative_update_handlers: &[&UpdateHandlerInfo],
-    workflow_name: &str,
-    max_activity_input_bytes: u64,
-    max_signal_payload_bytes: u64,
-    max_workflow_input_bytes: u64,
-    max_current_details_bytes: usize,
-    context_headers: std::collections::HashMap<String, String>,
-    payload_offload_threshold: Option<u64>,
-    metrics: std::sync::Arc<dyn MetricsRecorder>,
+    config: WorkflowRunConfig<'_>,
 ) -> (WorkflowOutcome, Vec<WorkflowCommand>, tracing::Span) {
     let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
-        exec_id,
-        history,
-        state,
-        history_policy,
+        config.exec_id,
+        config.history,
+        config.state,
+        config.history_policy,
     )
-    .with_workflow_name(workflow_name)
-    .with_workflow_id(span_meta.map_or("", |m| m.workflow_id.as_str()))
-    .with_build_id(span_meta.and_then(|m| m.build_id.clone()))
+    .with_workflow_name(config.workflow_name)
+    .with_workflow_id(config.span_meta.map_or("", |m| m.workflow_id.as_str()))
+    .with_build_id(config.span_meta.and_then(|m| m.build_id.clone()))
     .with_payload_caps(
-        max_activity_input_bytes,
+        config.max_activity_input_bytes,
         0,
-        max_signal_payload_bytes,
-        max_workflow_input_bytes,
+        config.max_signal_payload_bytes,
+        config.max_workflow_input_bytes,
     )
-    .with_current_details_cap(max_current_details_bytes)
-    .with_payload_offload_threshold(payload_offload_threshold)
-    .with_context_headers(context_headers)
-    .with_metrics(metrics);
+    .with_current_details_cap(config.max_current_details_bytes)
+    .with_payload_offload_threshold(config.payload_offload_threshold)
+    .with_context_headers(config.context_headers)
+    .with_metrics(config.metrics);
 
     // Auto-register declarative handlers before any workflow code runs.
     // This satisfies the AC: "authors do not call ctx.register_*_handler in
     // their workflow body; the runtime guarantees registration happens first."
-    for h in declarative_query_handlers {
+    for h in config.declarative_query_handlers {
         ctx.register_declarative_query_handler(h);
     }
-    for h in declarative_update_handlers {
+    for h in config.declarative_update_handlers {
         ctx.register_declarative_update_handler(h);
     }
 
-    drive_workflow(ctx, handler, input, span_meta).await
+    drive_workflow(ctx, config.handler, config.input, config.span_meta).await
 }
 
 /// Core executor body: emit the `OTel` span, run the handler with a suspension
