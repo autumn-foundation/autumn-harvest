@@ -2730,11 +2730,13 @@
       "success_response": {
         "status": 200,
         "fields": [
+          "status",
           "preview",
           "total",
           "reset_count",
           "skipped_count",
-          "items"
+          "items",
+          "unavailable_shards"
         ]
       },
       "error_responses": [

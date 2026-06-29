@@ -3642,7 +3642,15 @@ pub const fn management_api_response_fields()
         (
             "POST",
             "/workflows/batch_reset",
-            Some(&["preview", "total", "reset_count", "skipped_count", "items"]),
+            Some(&[
+                "status",
+                "preview",
+                "total",
+                "reset_count",
+                "skipped_count",
+                "items",
+                "unavailable_shards",
+            ]),
         ),
         // ── batch operations ──────────────────────────────────────────────────
         ("GET", "/batch-operations", None), // Vec<BatchJobView> (external model)
@@ -8615,11 +8623,15 @@ struct BatchResetRequest {
 /// Response for `POST /workflows/batch_reset`.
 #[derive(Debug, Serialize)]
 struct BatchResetResponse {
+    /// `"complete"` when all shards were reachable, `"partial"` otherwise.
+    status: &'static str,
     preview: bool,
     total: usize,
     reset_count: usize,
     skipped_count: usize,
     items: Vec<BatchResetItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unavailable_shards: Vec<UnavailableShard>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8660,11 +8672,18 @@ async fn batch_reset_workflows(
     // ── Collect candidate exec_ids across all shards ───────────────────────
     // Collect (exec_id, shard_id) pairs for the per-exec resolve+reset phase.
     let mut shard_items: Vec<(uuid::Uuid, ShardId)> = Vec::new();
+    let mut unavailable_shards: Vec<UnavailableShard> = Vec::new();
 
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
             Ok(c) => c,
-            Err(_e) => continue,
+            Err(e) => {
+                unavailable_shards.push(UnavailableShard {
+                    shard_id: shard_id.as_i32(),
+                    reason: format!("connection unavailable: {e}"),
+                });
+                continue;
+            }
         };
 
         // Build a shard-local query using the BatchFilter (mirror batch.rs pattern).
@@ -8693,9 +8712,15 @@ async fn batch_reset_workflows(
             query = query.filter(harvest_workflow_executions::workflow_name.eq(name));
         }
 
-        // search_attrs filtering is intentionally not applied at the DB level
-        // for batch_reset (consistent with submit_batch_operation) — the
-        // cohort cap guards against runaway selects.
+        // Apply search_attrs JSONB containment predicates.
+        {
+            use diesel::dsl::sql;
+            use diesel::sql_types::{Bool, Jsonb};
+            for predicate in &request.filter.search_attrs {
+                query = query
+                    .filter(sql::<Bool>("search_attrs @> ").bind::<Jsonb, _>(predicate.clone()));
+            }
+        }
 
         let ids: Vec<uuid::Uuid> = match query
             .limit(i64::try_from(DEFAULT_BATCH_RESET_MAX_COHORT + 1).unwrap_or(i64::MAX))
@@ -8703,7 +8728,13 @@ async fn batch_reset_workflows(
             .await
         {
             Ok(ids) => ids,
-            Err(_e) => continue,
+            Err(e) => {
+                unavailable_shards.push(UnavailableShard {
+                    shard_id: shard_id.as_i32(),
+                    reason: format!("query failed: {e}"),
+                });
+                continue;
+            }
         };
 
         for id in ids {
@@ -8736,13 +8767,15 @@ async fn batch_reset_workflows(
         let exec_id_str = exec_uuid.to_string();
         let exec_id = match exec_id_str.parse::<ExecutionId>() {
             Ok(id) => id,
-            Err(_) => {
+            Err(e) => {
                 items.push(BatchResetItem {
                     exec_id: exec_id_str,
                     outcome: BatchResetOutcome::Skipped,
                     resolved_event_id: None,
                     new_exec_id: None,
-                    skip_reason: Some(ResetSkipReason::EmptyHistory),
+                    skip_reason: Some(ResetSkipReason::InfrastructureError {
+                        message: format!("invalid execution UUID: {e}"),
+                    }),
                 });
                 skipped_count += 1;
                 continue;
@@ -8751,13 +8784,15 @@ async fn batch_reset_workflows(
 
         let mut conn = match acquire_conn(pool.pool_for(*shard_id)).await {
             Ok(c) => c,
-            Err(_e) => {
+            Err(e) => {
                 items.push(BatchResetItem {
                     exec_id: exec_id_str.clone(),
                     outcome: BatchResetOutcome::Skipped,
                     resolved_event_id: None,
                     new_exec_id: None,
-                    skip_reason: Some(ResetSkipReason::EmptyHistory),
+                    skip_reason: Some(ResetSkipReason::InfrastructureError {
+                        message: format!("DB connection unavailable: {e}"),
+                    }),
                 });
                 skipped_count += 1;
                 continue;
@@ -8772,7 +8807,7 @@ async fn batch_reset_workflows(
         )
         .await
         {
-            Err(_db_err) => {
+            Err(db_err) => {
                 // DB errors are propagated as skips in batch context to
                 // keep the 100% account-for invariant.
                 items.push(BatchResetItem {
@@ -8780,7 +8815,9 @@ async fn batch_reset_workflows(
                     outcome: BatchResetOutcome::Skipped,
                     resolved_event_id: None,
                     new_exec_id: None,
-                    skip_reason: Some(ResetSkipReason::EmptyHistory),
+                    skip_reason: Some(ResetSkipReason::InfrastructureError {
+                        message: format!("resolve failed: {db_err}"),
+                    }),
                 });
                 skipped_count += 1;
             }
@@ -8803,7 +8840,6 @@ async fn batch_reset_workflows(
                         new_exec_id: None,
                         skip_reason: None,
                     });
-                    reset_count += 1;
                 } else {
                     // Perform the actual reset.
                     let reset_req = WorkflowResetRequest {
@@ -8832,13 +8868,15 @@ async fn batch_reset_workflows(
                             });
                             reset_count += 1;
                         }
-                        Err(_reset_err) => {
+                        Err(reset_err) => {
                             items.push(BatchResetItem {
                                 exec_id: exec_id_str,
                                 outcome: BatchResetOutcome::Skipped,
                                 resolved_event_id: Some(resolved_event_id),
                                 new_exec_id: None,
-                                skip_reason: Some(ResetSkipReason::EmptyHistory),
+                                skip_reason: Some(ResetSkipReason::InfrastructureError {
+                                    message: format!("reset failed: {reset_err}"),
+                                }),
                             });
                             skipped_count += 1;
                         }
@@ -8879,14 +8917,21 @@ async fn batch_reset_workflows(
         let _ = audit::insert_audit(&mut conn, &ar).await;
     }
 
+    let status = if unavailable_shards.is_empty() {
+        "complete"
+    } else {
+        "partial"
+    };
     (
         StatusCode::OK,
         Json(BatchResetResponse {
+            status,
             preview: request.preview,
             total,
             reset_count,
             skipped_count,
             items,
+            unavailable_shards,
         }),
     )
         .into_response()

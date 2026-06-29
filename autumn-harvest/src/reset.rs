@@ -118,6 +118,11 @@ pub enum ResetSkipReason {
     ChildWorkflow,
     /// The execution has no history at all (no `WorkflowStarted` event).
     EmptyHistory,
+    /// An infrastructure failure (UUID parse, DB connection, or reset engine
+    /// error) prevented the execution from being processed. This is distinct
+    /// from a domain skip — the execution was not examined and should be
+    /// retried once the underlying issue is resolved.
+    InfrastructureError { message: String },
 }
 
 /// Per-execution outcome in a batch reset response.
@@ -216,6 +221,7 @@ pub fn resolve_reset_point(
 /// Request body for resetting one workflow execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowResetRequest {
+    #[serde(default)]
     pub reset_to_event_id: i64,
     /// Optional logical reset anchor (issue #538). When `Some`, the anchor is
     /// resolved against the execution's event history *before* `validate_reset_point`
@@ -862,6 +868,16 @@ fn skip_reason_to_error(exec_id: ExecutionId, reason: ResetSkipReason) -> Workfl
             nearest_valid_before,
             nearest_valid_after,
         }),
+        ResetSkipReason::InfrastructureError { message } => {
+            WorkflowResetError::InvalidPoint(ResetInvalidPoint {
+                message,
+                reset_to_event_id: -1,
+                last_event_id: -1,
+                unresolved_side_effects: Vec::new(),
+                nearest_valid_before: None,
+                nearest_valid_after: None,
+            })
+        }
     }
 }
 
@@ -874,7 +890,14 @@ fn skip_reason_to_error(exec_id: ExecutionId, reason: ResetSkipReason) -> Workfl
 /// - `Ok(Ok((event_id, plan)))` — boundary resolved and valid; ready to fork.
 /// - `Ok(Err(reason))` — batch-skip (CAN, child, terminal, no-match, invalid
 ///   boundary, empty history). Never an error; caller records `Skipped`.
-/// - `Err(e)` — storage or DB error; propagated to the caller.
+///
+/// # Errors
+///
+/// Returns `Err(WorkflowResetError)` only for storage or DB failures that
+/// prevent the execution from being examined. Domain-level skips (CAN, child,
+/// terminal state, no matching activity, invalid boundary, empty history) are
+/// returned as `Ok(Err(ResetSkipReason))` so the batch handler can record them
+/// as skipped items without aborting the rest of the cohort.
 pub async fn resolve_batch_reset_one(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -882,20 +905,17 @@ pub async fn resolve_batch_reset_one(
     signal_reapply: ResetSignalReapplyPolicy,
 ) -> Result<Result<(i64, ResetPlan), ResetSkipReason>, WorkflowResetError> {
     // Load without locking — preview only.
-    let execution = match harvest_workflow_executions::table
+    let Some(execution) = harvest_workflow_executions::table
         .find(exec_id.as_uuid())
         .select(WorkflowExecution::as_select())
         .first(conn)
         .await
         .optional()
         .map_err(database_error)?
-    {
-        Some(e) => e,
-        None => {
-            return Ok(Err(ResetSkipReason::TerminalSource {
-                state: "NOT_FOUND".to_string(),
-            }));
-        }
+    else {
+        return Ok(Err(ResetSkipReason::TerminalSource {
+            state: "NOT_FOUND".to_string(),
+        }));
     };
 
     // State gate: batch admits RUNNING|PAUSED|FAILED|CANCELLED|TIMED_OUT;
