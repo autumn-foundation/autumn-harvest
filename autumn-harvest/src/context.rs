@@ -9589,4 +9589,44 @@ mod tests {
         let ctx = ActivityContext::new_test();
         assert!(ctx.headers().is_empty());
     }
+
+    #[tokio::test]
+    async fn context_update_handler_get_mut_unwrap_is_safe() {
+        // This test ensures the Arc::get_mut(&mut ctx).unwrap() calls inside
+        // register_declarative_update_handler and the invoke_update fallback do not panic.
+        let ctx = WorkflowContext::new_test();
+
+        let info = crate::info::UpdateHandlerInfo {
+            name: "test_update",
+            module: "test",
+            workflow: "test_wf",
+            handler: |_ctx, _input| Box::pin(async move { Ok(serde_json::json!("updated")) }),
+            validator: None,
+            has_validator: false,
+            input_type_hint: "",
+            output_type_hint: "",
+        };
+
+        // 1. Test register_declarative_update_handler path
+        ctx.register_declarative_update_handler(&info);
+
+        let future1 = ctx.invoke_update("test_update", serde_json::json!({}));
+        assert!(future1.is_some());
+        let res1 = future1.unwrap().await;
+        assert_eq!(res1.unwrap(), serde_json::json!("updated"));
+
+        // 2. Test invoke_update fallback path
+        // We bypass register_declarative_update_handler and manually inject into declarative_updates
+        // to hit the fallback loop where get_mut is called.
+        let ctx2 = WorkflowContext::new_test();
+        ctx2.declarative_updates
+            .lock()
+            .unwrap()
+            .insert("test_fallback".to_string(), info.handler);
+
+        let future2 = ctx2.invoke_update("test_fallback", serde_json::json!({}));
+        assert!(future2.is_some());
+        let res2 = future2.unwrap().await;
+        assert_eq!(res2.unwrap(), serde_json::json!("updated"));
+    }
 }

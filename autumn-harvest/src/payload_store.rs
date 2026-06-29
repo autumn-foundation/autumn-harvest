@@ -576,4 +576,32 @@ mod tests {
             serde_json::json!("o".repeat(1_000))
         );
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn memstore_handles_concurrent_access_without_panic() {
+        let store = MemStore::new();
+
+        // Spawn multiple concurrent tasks to hit put/get/delete to stress the blobs lock.
+        let mut handles = vec![];
+        for i in 0..100 {
+            let store_clone = store.clone();
+            let unique_payload = format!("test payload for concurrency {i}").into_bytes();
+            handles.push(tokio::spawn(async move {
+                let key = store_clone.put(&unique_payload).await.unwrap();
+                let retrieved = store_clone.get(&key).await.unwrap();
+                assert_eq!(retrieved, unique_payload);
+                if i % 2 == 0 {
+                    store_clone.delete(&key).await.unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Ensure no panics occurred and counts are consistent
+        let puts = store.puts.load(Ordering::SeqCst);
+        assert_eq!(puts, 100);
+    }
 }
