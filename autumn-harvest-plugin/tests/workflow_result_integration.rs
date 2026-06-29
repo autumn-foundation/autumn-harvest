@@ -498,3 +498,59 @@ async fn test_poll_update_result_orphaned() {
     assert_eq!(body["error_type"], "update_orphaned");
     assert_eq!(body["workflow_state"], "COMPLETED");
 }
+
+#[tokio::test]
+async fn test_get_update_result_orphaned_timed_out() {
+    use autumn_harvest::types::UpdateId;
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let exec_id = seed_running(&mut conn, "orphaned-timeout-wf").await;
+    let update_id = UpdateId::new();
+
+    // 1. Append UpdateAdmitted to history
+    let history = store::load_history(&mut conn, exec_id).await.unwrap();
+    let events = vec![WorkflowEvent::UpdateAdmitted {
+        update_id,
+        name: "test_update".to_string(),
+        input: Value::Null,
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &events, history.next_event_id)
+        .await
+        .expect("append admitted update event");
+
+    // 2. Set DB execution state to TIMED_OUT and append WorkflowFailed to history (simulates enforce_workflow_timeout)
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("TIMED_OUT"),
+            harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::error.eq(Some(
+                "timeout: workflow exceeded execution timeout".to_string(),
+            )),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let history2 = store::load_history(&mut conn, exec_id).await.unwrap();
+    let fail_event = vec![WorkflowEvent::WorkflowFailed {
+        error: "timeout: workflow exceeded execution timeout".to_string(),
+    }];
+    store::append_events(&mut conn, exec_id, &fail_event, history2.next_event_id)
+        .await
+        .expect("append WorkflowFailed event");
+
+    // 3. Querying result should return 409 Conflict with workflow_state: "TIMED_OUT"
+    let (status, body) = get_json(
+        &app,
+        &format!("/workflows/{exec_id}/update/{update_id}/result"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["update_id"], update_id.to_string());
+    assert_eq!(body["error_type"], "update_orphaned");
+    assert_eq!(body["workflow_state"], "TIMED_OUT");
+}
