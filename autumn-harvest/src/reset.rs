@@ -220,15 +220,27 @@ pub fn resolve_reset_point(
                     if !ok {
                         return None;
                     }
-                    // Exclude terminal lifecycle events: including them in the
-                    // fork history causes replay to terminate immediately rather
-                    // than re-running the workflow body.
+                    // Exclude terminal and post-terminal tail events: including
+                    // them in the fork history causes replay to terminate
+                    // immediately or execute stale lifecycle side effects rather
+                    // than re-running the workflow body from a clean boundary.
+                    //
+                    // * WorkflowFailed / WorkflowCancelled / WorkflowCompleted /
+                    //   WorkflowExecutionTimedOut — direct terminal events.
+                    // * WorkflowRetryScheduled — appended *after* WorkflowFailed
+                    //   on sealed runs; carrying it into a fork puts WorkflowFailed
+                    //   inside the forked history, which terminates replay.
+                    // * ChildWorkflowCascadeApplied — post-terminal operational
+                    //   tail emitted when the parent close cascade fires; including
+                    //   it would re-trigger the cascade on replay.
                     if matches!(
                         event,
                         WorkflowEvent::WorkflowCompleted { .. }
                             | WorkflowEvent::WorkflowFailed { .. }
                             | WorkflowEvent::WorkflowCancelled { .. }
                             | WorkflowEvent::WorkflowExecutionTimedOut { .. }
+                            | WorkflowEvent::WorkflowRetryScheduled { .. }
+                            | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
                     ) {
                         return None;
                     }
@@ -2016,6 +2028,65 @@ mod tests {
             resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
             Ok(2),
             "LastWorkflowTask must skip WorkflowExecutionTimedOut and return the prior clean boundary"
+        );
+    }
+
+    #[test]
+    fn last_workflow_task_skips_workflow_retry_scheduled_at_tail() {
+        // A FAILED run with an auto-retry linkage appended afterwards:
+        //   started(0), scheduled(1), completed(2), failed(3), retry_scheduled(4).
+        // After completed(2) the pending set is empty, so boundary_validity[4] would
+        // be true — WorkflowRetryScheduled must be explicitly excluded, otherwise the
+        // fork carries WorkflowFailed at index 3 and replay terminates immediately.
+        let act_id = crate::types::ActivityExecId::new();
+        let retry_exec_id = ExecutionId::new();
+        let events = vec![
+            started(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id: act_id,
+                name: "a".to_string(),
+                input: Value::Null,
+                queue: "default".to_string(),
+            },
+            activity_completed(act_id),
+            WorkflowEvent::WorkflowFailed {
+                error: "transient".to_string(),
+            },
+            WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id,
+                attempt: 2,
+                fire_at: Utc::now(),
+            },
+        ];
+        assert_eq!(
+            resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
+            Ok(2),
+            "LastWorkflowTask must skip WorkflowRetryScheduled (and the preceding \
+             WorkflowFailed) and return the prior clean boundary"
+        );
+    }
+
+    #[test]
+    fn last_workflow_task_skips_child_workflow_cascade_applied_at_tail() {
+        // A CANCELLED execution where a parent-close cascade tail event follows:
+        //   started(0), cancelled(1), cascade(2).
+        // WorkflowCancelled is already excluded; ChildWorkflowCascadeApplied must
+        // also be excluded so the cascade is not re-triggered by the fork.
+        let events = vec![
+            started(),
+            WorkflowEvent::WorkflowCancelled {
+                reason: "parent closed".to_string(),
+            },
+            WorkflowEvent::ChildWorkflowCascadeApplied {
+                child_id: ExecutionId::new(),
+                policy: crate::types::ParentClosePolicy::RequestCancel,
+                action: "request_cancel".to_string(),
+            },
+        ];
+        assert_eq!(
+            resolve_reset_point(&events, &ResetPoint::LastWorkflowTask),
+            Ok(0),
+            "LastWorkflowTask must skip ChildWorkflowCascadeApplied and return WorkflowStarted"
         );
     }
 
