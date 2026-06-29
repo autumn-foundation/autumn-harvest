@@ -293,6 +293,7 @@ pub async fn start_or_load_workflow_execution_collect(
     request: StartWorkflowParams<'_>,
     in_outer_transaction: bool,
     reject_fresh_if_debounced: bool,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(StartedWorkflowExecution, Vec<DeferredTriggerStart>)> {
     let exec_id = request.exec_id;
     let shard_id_value = request.shard_id();
@@ -379,7 +380,7 @@ pub async fn start_or_load_workflow_execution_collect(
             conn,
             existing_exec_id,
             "terminated to start new execution",
-            None,
+            metrics,
         )
         .await
         {
@@ -628,7 +629,12 @@ pub async fn start_or_load_workflow_execution_collect(
                             // before replace_execution seals it; issue #383).
                             let mut deferred =
                                 if matches!(existing.state.as_str(), "RUNNING" | "PAUSED") {
-                                    inline_cancel(conn, ExecutionId::from_uuid(existing.id)).await?
+                                    inline_cancel(
+                                        conn,
+                                        ExecutionId::from_uuid(existing.id),
+                                        metrics,
+                                    )
+                                    .await?
                                 } else {
                                     Vec::new()
                                 };
@@ -706,7 +712,20 @@ pub async fn start_or_load_workflow_execution(
     // pre-check cancellation commits and the replacement start then fails, the
     // collect fn spawns the cancellation's follow-ups itself before returning Err.
     let (result, deferred_starts) =
-        start_or_load_workflow_execution_collect(conn, request, false, false).await?;
+        start_or_load_workflow_execution_collect(conn, request, false, false, None).await?;
+    for start in deferred_starts {
+        start.spawn();
+    }
+    Ok(result)
+}
+
+pub async fn start_or_load_workflow_execution_with_metrics(
+    conn: &mut AsyncPgConnection,
+    request: StartWorkflowParams<'_>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<StartedWorkflowExecution> {
+    let (result, deferred_starts) =
+        start_or_load_workflow_execution_collect(conn, request, false, false, metrics).await?;
     for start in deferred_starts {
         start.spawn();
     }
@@ -802,6 +821,7 @@ async fn replace_execution(
 async fn inline_cancel(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<Vec<DeferredTriggerStart>> {
     let reason = "terminated to start new execution";
     let history = store::load_history(conn, exec_id).await?;
@@ -839,6 +859,16 @@ async fn inline_cancel(
     )
     .await?;
     deferred.extend(triggers);
+
+    let workflow_name = if let Ok(exec) = load_execution(conn, exec_id).await {
+        exec.workflow_name
+    } else {
+        String::new()
+    };
+    if !workflow_name.is_empty() {
+        let _ = check_and_report_unfinished_handlers(conn, exec_id, &workflow_name, metrics).await;
+    }
+
     Ok(deferred)
 }
 
@@ -1091,14 +1121,14 @@ pub async fn cancel_workflow_execution_collect(
         .await?;
 
     if cancel_result.newly_cancelled {
-        if let Err(e) = check_and_report_unfinished_handlers(
+        let check_res = check_and_report_unfinished_handlers(
             conn,
             exec_id,
             &cancel_result.workflow_name,
             metrics,
         )
-        .await
-        {
+        .await;
+        if let Err(e) = check_res {
             tracing::error!(exec_id = %exec_id, err = %e, "Failed to check and report unfinished handlers on cancel");
         }
     }
@@ -2234,6 +2264,15 @@ pub async fn signal_with_start_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: SignalWithStartParams<'_>,
 ) -> HarvestResult<SignalWithStartOutcome> {
+    signal_with_start_workflow_execution_with_metrics(conn, request, None).await
+}
+
+#[allow(clippy::too_many_lines)] // orchestrates idempotency, cap checks, start, TOCTOU retry, and signal atomically
+pub async fn signal_with_start_workflow_execution_with_metrics(
+    conn: &mut AsyncPgConnection,
+    request: SignalWithStartParams<'_>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<SignalWithStartOutcome> {
     // Single outer transaction: pre-cancel + start (or attach) + signal insert commit
     // atomically. Inner conn.transaction calls become savepoints under this wrapper.
     conn.transaction::<SignalWithStartOutcome, HarvestError, _>(|conn| {
@@ -2328,6 +2367,7 @@ pub async fn signal_with_start_workflow_execution(
                     build_start_request(request.exec_id, effective_policy),
                     true,
                     true,
+                    metrics,
                 )
                 .await?;
                 for d in deferred {
@@ -2335,9 +2375,10 @@ pub async fn signal_with_start_workflow_execution(
                 }
                 s
             } else {
-                start_or_load_workflow_execution(
+                start_or_load_workflow_execution_with_metrics(
                     conn,
                     build_start_request(request.exec_id, effective_policy),
+                    metrics,
                 )
                 .await?
             };
@@ -2370,9 +2411,10 @@ pub async fn signal_with_start_workflow_execution(
                         | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
                 ) {
                 let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
-                let fresh = start_or_load_workflow_execution(
+                let fresh = start_or_load_workflow_execution_with_metrics(
                     conn,
                     build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
+                    metrics,
                 )
                 .await?;
                 if fresh.created {
@@ -2716,6 +2758,15 @@ pub async fn update_with_start_workflow_execution(
     conn: &mut AsyncPgConnection,
     request: UpdateWithStartParams<'_>,
 ) -> HarvestResult<UpdateWithStartOutcome> {
+    update_with_start_workflow_execution_with_metrics(conn, request, None).await
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn update_with_start_workflow_execution_with_metrics(
+    conn: &mut AsyncPgConnection,
+    request: UpdateWithStartParams<'_>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
+) -> HarvestResult<UpdateWithStartOutcome> {
     conn.transaction::<UpdateWithStartOutcome, HarvestError, _>(|conn| {
         let request = request;
         async move {
@@ -2808,6 +2859,7 @@ pub async fn update_with_start_workflow_execution(
                     build_start_request(request.exec_id, effective_policy),
                     true,
                     true,
+                    metrics,
                 )
                 .await?;
                 for d in deferred {
@@ -2815,9 +2867,10 @@ pub async fn update_with_start_workflow_execution(
                 }
                 s
             } else {
-                start_or_load_workflow_execution(
+                start_or_load_workflow_execution_with_metrics(
                     conn,
                     build_start_request(request.exec_id, effective_policy),
+                    metrics,
                 )
                 .await?
             };
@@ -2847,9 +2900,10 @@ pub async fn update_with_start_workflow_execution(
                         | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
                 ) {
                 let fresh_exec_id = ExecutionId::new_for_shard(started.exec_id.shard());
-                let fresh = start_or_load_workflow_execution(
+                let fresh = start_or_load_workflow_execution_with_metrics(
                     conn,
                     build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
+                    metrics,
                 )
                 .await?;
                 if fresh.created {

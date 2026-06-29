@@ -480,6 +480,7 @@ type FiredDebounce = (
 #[cfg(feature = "db")]
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> crate::error::HarvestResult<Vec<FiredDebounce>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
@@ -529,7 +530,7 @@ async fn fire_due_on_conn(
 
                 let mut results = Vec::with_capacity(due_rows.len());
                 for row in due_rows {
-                    if let Some(item) = fire_claimed_debounce_row(conn, row).await? {
+                    if let Some(item) = fire_claimed_debounce_row(conn, row, metrics).await? {
                         results.push(item);
                     }
                 }
@@ -605,13 +606,13 @@ pub async fn fire_due_debounced_starts(
                 // Spawn this shard's results before moving on; on this shard's own
                 // error the transaction rolled back, so there is nothing committed
                 // to drain and propagating is safe.
-                let fired = fire_due_on_conn(&mut shard_conn).await?;
+                let fired = fire_due_on_conn(&mut shard_conn, Some(metrics)).await?;
                 fired_count += spawn_fired(fired, metrics);
             }
         }
         // Single-shard / no sharded pool: the passed connection is the only shard.
         _ => {
-            let fired = fire_due_on_conn(conn).await?;
+            let fired = fire_due_on_conn(conn, Some(metrics)).await?;
             fired_count += spawn_fired(fired, metrics);
         }
     }
@@ -647,6 +648,7 @@ async fn delete_debounce_row(
 async fn fire_claimed_debounce_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueRow,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> crate::error::HarvestResult<
     Option<(
         String,
@@ -727,8 +729,10 @@ async fn fire_claimed_debounce_row(
     // that rolls back with this transaction on error — the collect fn must not
     // spawn its follow-ups (they'd be orphaned). Deferred starts returned on
     // success are spawned by the caller only after the fire transaction commits.
-    match crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false)
-        .await
+    match crate::execution::start_or_load_workflow_execution_collect(
+        conn, params, true, false, metrics,
+    )
+    .await
     {
         Ok((started, deferred_starts)) => {
             delete_debounce_row(conn, row_id).await?;

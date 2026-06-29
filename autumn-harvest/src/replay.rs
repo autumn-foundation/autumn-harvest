@@ -345,6 +345,7 @@ impl HistoryMatcher {
 
     /// Returns the IDs of all updates that were admitted but have not completed or failed
     /// up to the specified event index.
+    #[must_use]
     pub fn unfinished_update_handlers_at_index(&self, index: usize) -> Vec<UpdateId> {
         let events_slice = &self.events[..index];
         let has_updates = events_slice
@@ -371,16 +372,19 @@ impl HistoryMatcher {
     }
 
     /// Returns the IDs of all updates that were admitted but have not completed or failed.
+    #[must_use]
     pub fn unfinished_update_handlers(&self) -> Vec<UpdateId> {
         self.unfinished_update_handlers_at_index(self.cursor)
     }
 
     /// Returns the IDs of all updates that were admitted but have not completed or failed in the full history.
+    #[must_use]
     pub fn unfinished_update_handlers_at_end(&self) -> Vec<UpdateId> {
         self.unfinished_update_handlers_at_index(self.events.len())
     }
 
     /// Returns the number of unfinished update handlers up to the specified index.
+    #[must_use]
     pub fn unfinished_update_handler_count_at_index(&self, index: usize) -> usize {
         let events_slice = &self.events[..index];
         let has_updates = events_slice
@@ -407,16 +411,19 @@ impl HistoryMatcher {
     }
 
     /// Returns the number of unfinished update handlers.
+    #[must_use]
     pub fn unfinished_update_handler_count(&self) -> usize {
         self.unfinished_update_handler_count_at_index(self.cursor)
     }
 
     /// Returns the number of unfinished update handlers in the full history.
+    #[must_use]
     pub fn unfinished_update_handler_count_at_end(&self) -> usize {
         self.unfinished_update_handler_count_at_index(self.events.len())
     }
 
     /// Returns `true` if all admitted update handlers have completed or failed up to the specified index.
+    #[must_use]
     pub fn all_handlers_finished_at_index(&self, index: usize) -> bool {
         let events_slice = &self.events[..index];
         let has_updates = events_slice
@@ -443,11 +450,13 @@ impl HistoryMatcher {
     }
 
     /// Returns `true` if all admitted update handlers have completed or failed.
+    #[must_use]
     pub fn all_handlers_finished(&self) -> bool {
         self.all_handlers_finished_at_index(self.cursor)
     }
 
     /// Returns `true` if all admitted update handlers have completed or failed in the full history.
+    #[must_use]
     pub fn all_handlers_finished_at_end(&self) -> bool {
         self.all_handlers_finished_at_index(self.events.len())
     }

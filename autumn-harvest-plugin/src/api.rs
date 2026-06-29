@@ -111,8 +111,8 @@ use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, UpdateWithStartOutcome,
     UpdateWithStartParams, WorkflowHandleClient, WorkflowResult, cancel_workflow_execution,
     pause_workflow_execution, resume_workflow_execution, signal_with_start_workflow_execution,
-    start_or_load_workflow_execution, terminate_workflow_execution,
-    update_with_start_workflow_execution,
+    start_or_load_workflow_execution_with_metrics, terminate_workflow_execution,
+    update_with_start_workflow_execution_with_metrics,
 };
 
 use crate::preflight::{PreflightReport, build_preflight_report};
@@ -7573,7 +7573,12 @@ async fn start_workflow(
             },
         };
 
-        match autumn_harvest::event_batch::admit_batched_start(&mut batch_conn, admit_params).await
+        match autumn_harvest::event_batch::admit_batched_start(
+            &mut batch_conn,
+            admit_params,
+            Some(runtime.registry.telemetry().metrics.as_ref()),
+        )
+        .await
         {
             Ok(Some((outcome, deferred_starts))) => {
                 let status = STATUS_SUCCEEDED;
@@ -7707,7 +7712,7 @@ async fn start_workflow(
                 .map_or(sla, |hard| sla.min(hard))
         });
 
-    let result = start_or_load_workflow_execution(
+    let result = start_or_load_workflow_execution_with_metrics(
         &mut conn,
         StartWorkflowParams {
             workflow_name: &workflow_name,
@@ -7749,6 +7754,7 @@ async fn start_workflow(
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             origin: None,
         },
+        Some(runtime.registry.telemetry().metrics.as_ref()),
     )
     .await;
 
@@ -8441,6 +8447,7 @@ async fn batch_start_workflows(
                 },
                 false,
                 item_reject_fresh,
+                Some(runtime.registry.telemetry().metrics.as_ref()),
             )
             .await
             .map(|(started, deferred)| {
@@ -9945,7 +9952,12 @@ async fn update_with_start_workflow(
         reject_fresh_if_debounced,
     };
 
-    let result = update_with_start_workflow_execution(&mut conn, params).await;
+    let result = update_with_start_workflow_execution_with_metrics(
+        &mut conn,
+        params,
+        Some(runtime.registry.telemetry().metrics.as_ref()),
+    )
+    .await;
 
     if let Err(HarvestError::DebounceFreshStart { .. }) = &result {
         // Failed-start audit (parity with the match arms below).
@@ -10136,21 +10148,35 @@ async fn update_with_start_workflow(
                 // still carries execution_id and update_id so callers can retry or
                 // inspect history without losing the context from the admitted update.
                 let poll_status = poll_resp.0.status;
-                let error_msg = axum::body::to_bytes(poll_resp.1, usize::MAX)
+                let body_val = axum::body::to_bytes(poll_resp.1, usize::MAX)
                     .await
-                    .map_or_else(
-                        |_| "update did not complete".to_string(),
-                        |bytes| {
-                            serde_json::from_slice::<Value>(&bytes)
-                                .ok()
-                                .and_then(|v| {
-                                    v.get("error").and_then(|e| e.as_str()).map(String::from)
-                                })
-                                .unwrap_or_else(|| "update did not complete".to_string())
-                        },
-                    );
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
                 let mut resp_body = UpdateWithStartResponse::from_outcome(&outcome);
-                resp_body.result = Some(serde_json::json!({ "error": error_msg }));
+                if let Some(mut val) = body_val {
+                    if val.get("error").is_none()
+                        && val.get("error_type").and_then(Value::as_str) == Some("update_orphaned")
+                    {
+                        let state = val
+                            .get("workflow_state")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                        if let Some(state_str) = state
+                            && let Some(obj) = val.as_object_mut()
+                        {
+                            obj.insert(
+                                "error".to_string(),
+                                Value::String(format!(
+                                    "update orphaned: workflow is in {state_str} state"
+                                )),
+                            );
+                        }
+                    }
+                    resp_body.result = Some(val);
+                } else {
+                    resp_body.result =
+                        Some(serde_json::json!({ "error": "update did not complete" }));
+                }
                 (poll_status, Json(resp_body)).into_response()
             }
         }
@@ -13785,7 +13811,7 @@ async fn trigger_schedule_now(
                 .and_then(|info| info.retry_policy.clone())
         });
 
-    let result = start_or_load_workflow_execution(
+    let result = start_or_load_workflow_execution_with_metrics(
         &mut exec_conn,
         StartWorkflowParams {
             workflow_name: &workflow_name,
@@ -13837,6 +13863,7 @@ async fn trigger_schedule_now(
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
         },
+        Some(runtime.registry.telemetry().metrics.as_ref()),
     )
     .await;
 
@@ -14511,7 +14538,7 @@ async fn schedule_backfill(
                     continue;
                 }
 
-                let result = start_or_load_workflow_execution(
+                let result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
                     StartWorkflowParams {
                         workflow_name: &wf_name,
@@ -14567,6 +14594,7 @@ async fn schedule_backfill(
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
                     },
+                    Some(runtime.registry.telemetry().metrics.as_ref()),
                 )
                 .await;
                 match result {
@@ -14717,7 +14745,7 @@ async fn schedule_backfill(
                     continue;
                 }
 
-                let start_result = start_or_load_workflow_execution(
+                let start_result = start_or_load_workflow_execution_with_metrics(
                     &mut conn,
                     StartWorkflowParams {
                         workflow_name: &dag_name,
@@ -14760,6 +14788,7 @@ async fn schedule_backfill(
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
                     },
+                    Some(runtime.registry.telemetry().metrics.as_ref()),
                 )
                 .await;
                 match start_result {
@@ -20714,29 +20743,23 @@ pub async fn poll_update_result(
                 let h = store::load_history(&mut c, exec_id).await?;
                 // c is dropped here, releasing the connection back to the pool.
                 let mut terminal_state = get_terminal_workflow_state(&h.events);
-                if terminal_state == Some("CANCELLED") {
-                    if let Ok(Some(db_state)) = harvest_workflow_executions::table
-                        .find(exec_id.as_uuid())
-                        .select(harvest_workflow_executions::state)
-                        .first::<String>(&mut c)
-                        .await
-                        .optional()
-                    {
-                        if db_state == "TERMINATED" {
-                            terminal_state = Some("TERMINATED");
-                        }
-                    }
+                if terminal_state == Some("CANCELLED")
+                    && matches!(
+                        harvest_workflow_executions::table
+                            .find(exec_id.as_uuid())
+                            .select(harvest_workflow_executions::state)
+                            .first::<String>(&mut c)
+                            .await
+                            .optional(),
+                        Ok(Some(db_state)) if db_state == "TERMINATED"
+                    )
+                {
+                    terminal_state = Some("TERMINATED");
                 }
                 match HistoryMatcher::new(h.events).match_update(update_id) {
                     HistoryMatch::Matched { output } => Some(Ok(PollOutcome::Matched(output))),
                     HistoryMatch::Failed { error, .. } => Some(Ok(PollOutcome::Failed(error))),
-                    _ => {
-                        if let Some(state) = terminal_state {
-                            Some(Ok(PollOutcome::Orphaned(state.to_string())))
-                        } else {
-                            None
-                        }
-                    }
+                    _ => terminal_state.map(|state| Ok(PollOutcome::Orphaned(state.to_string()))),
                 }
             };
             match result {
@@ -20830,18 +20853,18 @@ async fn get_update_result(
     }
 
     let mut terminal_state = get_terminal_workflow_state(&history.events);
-    if terminal_state == Some("CANCELLED") {
-        if let Ok(Some(db_state)) = harvest_workflow_executions::table
-            .find(exec_id.as_uuid())
-            .select(harvest_workflow_executions::state)
-            .first::<String>(&mut conn)
-            .await
-            .optional()
-        {
-            if db_state == "TERMINATED" {
-                terminal_state = Some("TERMINATED");
-            }
-        }
+    if terminal_state == Some("CANCELLED")
+        && matches!(
+            harvest_workflow_executions::table
+                .find(exec_id.as_uuid())
+                .select(harvest_workflow_executions::state)
+                .first::<String>(&mut conn)
+                .await
+                .optional(),
+            Ok(Some(db_state)) if db_state == "TERMINATED"
+        )
+    {
+        terminal_state = Some("TERMINATED");
     }
     let matcher = HistoryMatcher::new(history.events);
     match matcher.match_update(update_id) {
@@ -20861,8 +20884,17 @@ async fn get_update_result(
             }),
         )
             .into_response(),
-        _ => {
-            if let Some(state) = terminal_state {
+        _ => terminal_state.map_or_else(
+            || {
+                (
+                    axum::http::StatusCode::ACCEPTED,
+                    Json(UpdateAdmittedResponse {
+                        update_id: update_id.to_string(),
+                    }),
+                )
+                    .into_response()
+            },
+            |state| {
                 (
                     axum::http::StatusCode::CONFLICT,
                     Json(UpdateOrphanedResponse {
@@ -20872,16 +20904,8 @@ async fn get_update_result(
                     }),
                 )
                     .into_response()
-            } else {
-                (
-                    axum::http::StatusCode::ACCEPTED,
-                    Json(UpdateAdmittedResponse {
-                        update_id: update_id.to_string(),
-                    }),
-                )
-                    .into_response()
-            }
-        }
+            },
+        ),
     }
 }
 
@@ -23506,7 +23530,7 @@ mod tests {
             )
             .await
             .expect("failed to connect to workflow result database");
-        autumn_harvest::start_or_load_workflow_execution(
+        autumn_harvest::start_or_load_workflow_execution_with_metrics(
             &mut conn,
             autumn_harvest::StartWorkflowParams {
                 workflow_name: "snapshot_listenerless",
@@ -23542,6 +23566,7 @@ mod tests {
                 max_workflow_attempts_ceiling: None,
                 origin: None,
             },
+            None,
         )
         .await
         .expect("workflow execution should be seeded");

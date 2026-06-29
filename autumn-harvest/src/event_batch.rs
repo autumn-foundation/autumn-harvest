@@ -119,6 +119,7 @@ struct FireDueBatchRow {
 pub async fn admit_batched_start(
     conn: &mut AsyncPgConnection,
     params: AdmitBatchParams,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<
     Option<(
         BatchAdmitOutcome,
@@ -274,7 +275,7 @@ pub async fn admit_batched_start(
 
                     let (started, deferred_starts) =
                         crate::execution::start_or_load_workflow_execution_collect(
-                            conn, params, true, false,
+                            conn, params, true, false, metrics,
                         )
                         .await?;
 
@@ -317,6 +318,7 @@ const fn is_transient_error(e: &HarvestError) -> bool {
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     shard_id: Option<i32>,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(
     Vec<String>,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
@@ -385,7 +387,7 @@ async fn fire_due_on_conn(
                     };
 
                     if let Some(row) = due_rows.into_iter().next() {
-                        match fire_claimed_batch_row(conn, row).await {
+                        match fire_claimed_batch_row(conn, row, metrics).await {
                             Ok(Some((exec_id, deferred))) => Ok(Some((exec_id, deferred))),
                             Ok(None) => Ok(None),
                             Err(e) => Err(e),
@@ -412,6 +414,7 @@ async fn fire_due_on_conn(
 async fn fire_claimed_batch_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueBatchRow,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<Option<(String, Vec<crate::completion_trigger::DeferredTriggerStart>)>> {
     use diesel_async::RunQueryDsl;
 
@@ -480,8 +483,10 @@ async fn fire_claimed_batch_row(
         origin: None,
     };
 
-    let start_res =
-        crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false).await;
+    let start_res = crate::execution::start_or_load_workflow_execution_collect(
+        conn, params, true, false, metrics,
+    )
+    .await;
 
     match start_res {
         Ok((started, deferred_starts)) => {
@@ -560,7 +565,7 @@ pub async fn fire_due_event_batches(
     conn: &mut diesel_async::AsyncPgConnection,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
-    _metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<usize> {
     let mut fired_count = 0usize;
     let mut deferred_to_spawn = Vec::new();
@@ -573,13 +578,14 @@ pub async fn fire_due_event_batches(
                     .await
                     .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
                 let (fired, deferred) =
-                    fire_due_on_conn(&mut shard_conn, Some(shard_id.as_i32())).await?;
+                    fire_due_on_conn(&mut shard_conn, Some(shard_id.as_i32()), Some(metrics))
+                        .await?;
                 fired_count += fired.len();
                 deferred_to_spawn.extend(deferred);
             }
         }
     } else {
-        let (fired, deferred) = fire_due_on_conn(conn, None).await?;
+        let (fired, deferred) = fire_due_on_conn(conn, None, Some(metrics)).await?;
         fired_count += fired.len();
         deferred_to_spawn.extend(deferred);
     }

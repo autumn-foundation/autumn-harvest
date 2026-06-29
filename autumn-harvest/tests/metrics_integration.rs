@@ -3070,6 +3070,7 @@ async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
 async fn workflow_completed_with_unfinished_updates_emits_metric() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = AsyncPgConnection::establish(&database_url)
@@ -3105,6 +3106,7 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
         workflow_attempt: 1,
         workflow_retry_policy: None,
         retry_of_exec_id: None,
+        origin: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)

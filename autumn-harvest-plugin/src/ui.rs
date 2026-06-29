@@ -62,7 +62,7 @@ use autumn_harvest::schema::{
     harvest_signals, harvest_task_queue, harvest_timers, harvest_workflow_executions,
 };
 use autumn_harvest::signal::send_signal;
-use autumn_harvest::start_or_load_workflow_execution;
+use autumn_harvest::start_or_load_workflow_execution_with_metrics;
 use autumn_harvest::store::admit_update_event;
 use autumn_harvest::types::{
     ExecutionId as HarvestExecutionId, Priority, ShardId, UpdateId, WorkflowIdReusePolicy,
@@ -6196,7 +6196,7 @@ async fn execute_schedule_trigger_ui(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .or(wf_default_retry_policy);
 
-    let result = start_or_load_workflow_execution(
+    let result = start_or_load_workflow_execution_with_metrics(
         conn,
         StartWorkflowParams {
             workflow_name,
@@ -6236,6 +6236,7 @@ async fn execute_schedule_trigger_ui(
             max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
         },
+        Some(runtime.registry().telemetry().metrics.as_ref()),
     )
     .await;
     let (status, outcome) = if result.is_ok() {

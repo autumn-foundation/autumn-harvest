@@ -1349,6 +1349,10 @@ impl WorkflowContext {
     }
 
     /// Returns `true` if all admitted update handlers have completed or failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal history matcher lock is poisoned.
     #[must_use]
     pub fn all_handlers_finished(&self) -> bool {
         self.matcher
@@ -1358,6 +1362,10 @@ impl WorkflowContext {
     }
 
     /// Returns the number of admitted update handlers that have not completed or failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal history matcher lock is poisoned.
     #[must_use]
     pub fn unfinished_update_handler_count(&self) -> usize {
         self.matcher
@@ -9681,6 +9689,8 @@ mod tests {
         assert_eq!(ctx.unfinished_update_handler_count(), 0);
         assert!(ctx.all_handlers_finished());
         // Since all handlers are finished, this should resolve immediately
-        ctx.await_condition(|| ctx.all_handlers_finished()).await;
+        ctx.await_condition(|| ctx.all_handlers_finished())
+            .await
+            .unwrap();
     }
 }
