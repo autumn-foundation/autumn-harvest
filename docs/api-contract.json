@@ -1124,8 +1124,13 @@
         "fields": [
           {
             "name": "reset_to_event_id",
-            "required": true,
-            "description": "Event sequence number to reset to."
+            "required": false,
+            "description": "Event sequence number to reset to. Required when reset_point is absent; mutually exclusive with reset_point."
+          },
+          {
+            "name": "reset_point",
+            "required": false,
+            "description": "Logical reset anchor resolved per-execution at reset time. One of: {\"type\":\"event_id\",\"event_id\":N}, {\"type\":\"first_activity_run\",\"activity_name\":\"name\"}, {\"type\":\"last_workflow_task\"}. Required when reset_to_event_id is absent; mutually exclusive with reset_to_event_id."
           },
           {
             "name": "reason",

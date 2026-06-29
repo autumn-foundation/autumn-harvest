@@ -3115,6 +3115,7 @@ pub const fn management_api_request_fields()
             "/workflows/{id}/reset",
             Some(&[
                 "reset_to_event_id",
+                "reset_point",
                 "reason",
                 "operator_id",
                 "signal_reapply",
