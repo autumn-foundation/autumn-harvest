@@ -2346,7 +2346,7 @@ async fn persist_workflow_completion(
     output: serde_json::Value,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
-) -> HarvestResult<()> {
+) -> HarvestResult<(ExecutionId, Option<String>)> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
     };
@@ -2384,9 +2384,7 @@ async fn persist_workflow_completion(
         start.spawn();
     }
 
-    check_and_report_unfinished_handlers_for_worker(conn, exec_id, None, metrics).await;
-
-    Ok(())
+    Ok((exec_id, None))
 }
 
 async fn check_and_report_unfinished_handlers_for_worker(
@@ -2433,7 +2431,7 @@ async fn persist_workflow_failure(
     // Priority from the current task so the retry inherits the same queue priority
     // and is not silently demoted behind normal work (issue #523 P2).
     priority: crate::types::Priority,
-) -> HarvestResult<bool> {
+) -> HarvestResult<(bool, (ExecutionId, Option<String>))> {
     let error = error.to_string();
 
     // Pre-compute the retry plan (pure, no DB) before entering the transaction.
@@ -2630,10 +2628,8 @@ async fn persist_workflow_failure(
         start.spawn();
     }
 
-    let workflow_name = execution.map(|exec| exec.workflow_name.as_str());
-    check_and_report_unfinished_handlers_for_worker(conn, exec_id, workflow_name, metrics).await;
-
-    Ok(retry_scheduled)
+    let workflow_name = execution.map(|exec| exec.workflow_name.clone());
+    Ok((retry_scheduled, (exec_id, workflow_name)))
 }
 
 /// Append `UpdateCompleted` or `UpdateFailed` events for each
@@ -3909,7 +3905,7 @@ async fn persist_child_workflow_completion(
     parent_exec_id: ExecutionId,
     output: serde_json::Value,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
-) -> HarvestResult<()> {
+) -> HarvestResult<(ExecutionId, Option<String>)> {
     let event = WorkflowEvent::WorkflowCompleted {
         output: output.clone(),
     };
@@ -3943,8 +3939,7 @@ async fn persist_child_workflow_completion(
         start.spawn();
     }
 
-    check_and_report_unfinished_handlers_for_worker(conn, exec_id, None, metrics).await;
-    Ok(())
+    Ok((exec_id, None))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3958,7 +3953,7 @@ async fn persist_child_workflow_failure(
     error: &str,
     nd_details: Option<&crate::error::NonDeterministicDetails>,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
-) -> HarvestResult<()> {
+) -> HarvestResult<(ExecutionId, Option<String>)> {
     let workflow_failure = WorkflowEvent::WorkflowFailed {
         error: error.to_string(),
     };
@@ -3993,8 +3988,7 @@ async fn persist_child_workflow_failure(
         start.spawn();
     }
 
-    check_and_report_unfinished_handlers_for_worker(conn, exec_id, None, metrics).await;
-    Ok(())
+    Ok((exec_id, None))
 }
 
 /// Perform the DB side-effects for all `SpawnDetachedChildWorkflow` commands in
@@ -5524,7 +5518,7 @@ async fn persist_workflow_outcome(
     // they must not be called here (a failed counter query inside a Postgres
     // transaction aborts the whole transaction).
     update_schedule_counter: bool,
-) -> HarvestResult<bool> {
+) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
     let parent_exec_id = execution.parent_id.map(execution_id_from_uuid);
     // A detached child has parent_close_policy set (non-null). Detached children
     // do NOT wake their parent on completion or failure.
@@ -5532,7 +5526,7 @@ async fn persist_workflow_outcome(
 
     match (outcome, parent_exec_id) {
         (WorkflowOutcome::Completed { output }, Some(parent_id)) if !is_detached_child => {
-            persist_child_workflow_completion(
+            let res = persist_child_workflow_completion(
                 conn,
                 persistence.task.id,
                 persistence.exec_id,
@@ -5542,12 +5536,12 @@ async fn persist_workflow_outcome(
                 output,
                 Some(registry.telemetry().metrics.as_ref()),
             )
-            .await
-            .map(|()| false)
+            .await?;
+            Ok((false, vec![res]))
         }
         (WorkflowOutcome::Completed { output }, _) => {
             // Root workflow or detached child completing — no parent wake.
-            let result = persist_workflow_completion(
+            let res = persist_workflow_completion(
                 conn,
                 persistence.task.id,
                 persistence.exec_id,
@@ -5557,8 +5551,8 @@ async fn persist_workflow_outcome(
                 Some(registry.telemetry().metrics.as_ref()),
                 registry.payload_offloader(),
             )
-            .await;
-            if result.is_ok() && update_schedule_counter {
+            .await?;
+            if update_schedule_counter {
                 crate::scheduler::maybe_reset_schedule_failure_counter(
                     conn,
                     &execution.workflow_id,
@@ -5568,7 +5562,7 @@ async fn persist_workflow_outcome(
                 )
                 .await;
             }
-            result.map(|()| false)
+            Ok((false, vec![res]))
         }
         (
             WorkflowOutcome::Failed {
@@ -5577,7 +5571,7 @@ async fn persist_workflow_outcome(
             },
             Some(parent_id),
         ) if !is_detached_child => {
-            let result = persist_child_workflow_failure(
+            let res = persist_child_workflow_failure(
                 conn,
                 persistence.task.id,
                 persistence.exec_id,
@@ -5588,8 +5582,8 @@ async fn persist_workflow_outcome(
                 non_deterministic_details.as_ref(),
                 Some(registry.telemetry().metrics.as_ref()),
             )
-            .await;
-            if result.is_ok() && update_schedule_counter {
+            .await?;
+            if update_schedule_counter {
                 crate::scheduler::maybe_increment_schedule_failure_counter(
                     conn,
                     &execution.workflow_id,
@@ -5600,7 +5594,7 @@ async fn persist_workflow_outcome(
                 )
                 .await;
             }
-            result.map(|()| false)
+            Ok((false, vec![res]))
         }
         (
             WorkflowOutcome::Failed {
@@ -5612,7 +5606,7 @@ async fn persist_workflow_outcome(
             // Root workflow or detached child failing — no parent wake.
             // Returns true if a retry was scheduled (propagate to caller so
             // the deferred schedule-failure counter can be suppressed).
-            let result = persist_workflow_failure(
+            let (retry_scheduled, res) = persist_workflow_failure(
                 conn,
                 persistence.task.id,
                 persistence.exec_id,
@@ -5629,24 +5623,19 @@ async fn persist_workflow_outcome(
                     .and_then(|c| u32::try_from(c).ok()),
                 crate::types::Priority::from_i32(persistence.task.priority).unwrap_or_default(),
             )
-            .await;
-            if update_schedule_counter {
-                match &result {
-                    Ok(retry_scheduled) if !retry_scheduled => {
-                        crate::scheduler::maybe_increment_schedule_failure_counter(
-                            conn,
-                            &execution.workflow_id,
-                            &execution.workflow_name,
-                            execution.schedule_id,
-                            execution.origin.as_deref(),
-                            registry.telemetry().metrics.as_ref(),
-                        )
-                        .await;
-                    }
-                    _ => {}
-                }
+            .await?;
+            if update_schedule_counter && !retry_scheduled {
+                crate::scheduler::maybe_increment_schedule_failure_counter(
+                    conn,
+                    &execution.workflow_id,
+                    &execution.workflow_name,
+                    execution.schedule_id,
+                    execution.origin.as_deref(),
+                    registry.telemetry().metrics.as_ref(),
+                )
+                .await;
             }
-            result
+            Ok((retry_scheduled, vec![res]))
         }
         (WorkflowOutcome::Suspended { commands }, _) => handle_suspended_workflow(
             conn,
@@ -5659,7 +5648,7 @@ async fn persist_workflow_outcome(
             &commands,
         )
         .await
-        .map(|()| false),
+        .map(|()| (false, Vec::new())),
         (WorkflowOutcome::ContinuedAsNew { input }, _) => {
             // task/worker_id are Copy references; capture before persistence is moved.
             let task = persistence.task;
@@ -5674,7 +5663,7 @@ async fn persist_workflow_outcome(
             .await;
             fail_execution_on_error(conn, task, worker_id, result)
                 .await
-                .map(|()| false)
+                .map(|()| (false, Vec::new()))
         }
     }
 }
@@ -5691,7 +5680,10 @@ enum WorkflowPersistFlow {
     /// `retry_scheduled` is `true` when a workflow-level retry was atomically
     /// started inside the failure transaction; the deferred schedule-failure
     /// counter must be suppressed until the retry chain is exhausted.
-    Persisted { retry_scheduled: bool },
+    Persisted {
+        retry_scheduled: bool,
+        deferred_checks: Vec<(ExecutionId, Option<String>)>,
+    },
 }
 
 /// Map a terminal/suspended outcome to its deferred schedule-failure-counter
@@ -5760,7 +5752,7 @@ async fn persist_terminal_outcome_commands(
     outcome: WorkflowOutcome,
     pending_cmds: &[WorkflowCommand],
     execute_span: &tracing::Span,
-) -> HarvestResult<bool> {
+) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
     let mut next_event_id = persistence.next_event_id;
     persist_update_result_commands(conn, persistence.exec_id, pending_cmds, &mut next_event_id)
         .await?;
@@ -7003,7 +6995,7 @@ async fn process_workflow_task(
                     return Ok(WorkflowPersistFlow::ParkedPaused);
                 }
 
-                let retry_scheduled = if is_terminal_with_commands {
+                let (retry_scheduled, deferred_checks) = if is_terminal_with_commands {
                     persist_terminal_outcome_commands(
                         conn,
                         registry,
@@ -7026,7 +7018,10 @@ async fn process_workflow_task(
                     )
                     .await?
                 };
-                Ok(WorkflowPersistFlow::Persisted { retry_scheduled })
+                Ok(WorkflowPersistFlow::Persisted {
+                    retry_scheduled,
+                    deferred_checks,
+                })
             }
             .scope_boxed()
         })
@@ -7037,7 +7032,10 @@ async fn process_workflow_task(
 
     match persist_flow {
         Ok(WorkflowPersistFlow::ParkedPaused) => return Ok(()),
-        Ok(WorkflowPersistFlow::Persisted { retry_scheduled }) => {
+        Ok(WorkflowPersistFlow::Persisted {
+            retry_scheduled,
+            deferred_checks,
+        }) => {
             // Deferred best-effort schedule counters, in autocommit post-commit.
             // When a retry was scheduled the failure-counter increment is
             // suppressed: one failure chain counts as one failure (issue #523).
@@ -7048,6 +7046,16 @@ async fn process_workflow_task(
             };
             run_deferred_schedule_counter(conn, registry, &prepared.execution, effective_counter)
                 .await;
+
+            for (exec_id, name) in deferred_checks {
+                check_and_report_unfinished_handlers_for_worker(
+                    conn,
+                    exec_id,
+                    name.as_deref(),
+                    Some(registry.telemetry().metrics.as_ref()),
+                )
+                .await;
+            }
         }
         Err(error) => {
             // Preserve per-path error handling: a terminal-with-commands persist
