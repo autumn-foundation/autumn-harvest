@@ -8888,10 +8888,13 @@ async fn batch_reset_workflows(
                         skip_reason: None,
                     });
                 } else {
-                    // Perform the actual reset.
+                    // Perform the actual reset. Pass the original `reset_point` so
+                    // `reset_workflow_execution` re-resolves it to a concrete event id
+                    // under its `FOR UPDATE` row lock, eliminating the TOCTOU window
+                    // between `resolve_batch_reset_one` and the actual fork transaction.
                     let reset_req = WorkflowResetRequest {
-                        reset_to_event_id: Some(resolved_event_id),
-                        reset_point: None,
+                        reset_to_event_id: None,
+                        reset_point: Some(request.reset_point.clone()),
                         reason: request.reason.clone(),
                         operator_id: request.operator_id.clone(),
                         signal_reapply: request.signal_reapply,
@@ -8909,7 +8912,9 @@ async fn batch_reset_workflows(
                             items.push(BatchResetItem {
                                 exec_id: exec_id_str,
                                 outcome: BatchResetOutcome::Reset,
-                                resolved_event_id: Some(resolved_event_id),
+                                // Use the engine's authoritatively-resolved event id (under lock),
+                                // not the speculative value from resolve_batch_reset_one.
+                                resolved_event_id: Some(result.reset_to_event_id),
                                 new_exec_id: Some(result.new_exec_id.to_string()),
                                 skip_reason: None,
                             });
