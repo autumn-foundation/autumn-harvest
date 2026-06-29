@@ -211,41 +211,42 @@ pub fn resolve_reset_point(
             // event and terminate immediately rather than re-running the workflow body.
             let last = events.len().saturating_sub(1);
             let (valid, _) = boundary_validity(events, last);
-            let highest = valid
-                .iter()
-                .zip(events.iter())
-                .enumerate()
-                .rev()
-                .find_map(|(idx, (ok, event))| {
-                    if !ok {
-                        return None;
-                    }
-                    // Exclude terminal and post-terminal tail events: including
-                    // them in the fork history causes replay to terminate
-                    // immediately or execute stale lifecycle side effects rather
-                    // than re-running the workflow body from a clean boundary.
-                    //
-                    // * WorkflowFailed / WorkflowCancelled / WorkflowCompleted /
-                    //   WorkflowExecutionTimedOut — direct terminal events.
-                    // * WorkflowRetryScheduled — appended *after* WorkflowFailed
-                    //   on sealed runs; carrying it into a fork puts WorkflowFailed
-                    //   inside the forked history, which terminates replay.
-                    // * ChildWorkflowCascadeApplied — post-terminal operational
-                    //   tail emitted when the parent close cascade fires; including
-                    //   it would re-trigger the cascade on replay.
-                    if matches!(
-                        event,
-                        WorkflowEvent::WorkflowCompleted { .. }
-                            | WorkflowEvent::WorkflowFailed { .. }
-                            | WorkflowEvent::WorkflowCancelled { .. }
-                            | WorkflowEvent::WorkflowExecutionTimedOut { .. }
-                            | WorkflowEvent::WorkflowRetryScheduled { .. }
-                            | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
-                    ) {
-                        return None;
-                    }
-                    Some(idx)
-                });
+            let highest =
+                valid
+                    .iter()
+                    .zip(events.iter())
+                    .enumerate()
+                    .rev()
+                    .find_map(|(idx, (ok, event))| {
+                        if !ok {
+                            return None;
+                        }
+                        // Exclude terminal and post-terminal tail events: including
+                        // them in the fork history causes replay to terminate
+                        // immediately or execute stale lifecycle side effects rather
+                        // than re-running the workflow body from a clean boundary.
+                        //
+                        // * WorkflowFailed / WorkflowCancelled / WorkflowCompleted /
+                        //   WorkflowExecutionTimedOut — direct terminal events.
+                        // * WorkflowRetryScheduled — appended *after* WorkflowFailed
+                        //   on sealed runs; carrying it into a fork puts WorkflowFailed
+                        //   inside the forked history, which terminates replay.
+                        // * ChildWorkflowCascadeApplied — post-terminal operational
+                        //   tail emitted when the parent close cascade fires; including
+                        //   it would re-trigger the cascade on replay.
+                        if matches!(
+                            event,
+                            WorkflowEvent::WorkflowCompleted { .. }
+                                | WorkflowEvent::WorkflowFailed { .. }
+                                | WorkflowEvent::WorkflowCancelled { .. }
+                                | WorkflowEvent::WorkflowExecutionTimedOut { .. }
+                                | WorkflowEvent::WorkflowRetryScheduled { .. }
+                                | WorkflowEvent::ChildWorkflowCascadeApplied { .. }
+                        ) {
+                            return None;
+                        }
+                        Some(idx)
+                    });
             let idx = highest.ok_or(ResetSkipReason::EmptyHistory)?;
             Ok(i64::try_from(idx).unwrap_or(0))
         }

@@ -8846,13 +8846,8 @@ async fn batch_reset_workflows(
             }
         };
 
-        match resolve_batch_reset_one(
-            conn,
-            exec_id,
-            &request.reset_point,
-            request.signal_reapply,
-        )
-        .await
+        match resolve_batch_reset_one(conn, exec_id, &request.reset_point, request.signal_reapply)
+            .await
         {
             Err(db_err) => {
                 // DB errors are propagated as skips in batch context to
