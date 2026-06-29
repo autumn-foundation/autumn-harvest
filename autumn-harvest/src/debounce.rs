@@ -733,7 +733,7 @@ async fn fire_claimed_debounce_row(
     // that rolls back with this transaction on error — the collect fn must not
     // spawn its follow-ups (they'd be orphaned). Deferred starts returned on
     // success are spawned by the caller only after the fire transaction commits.
-    match crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false)
+    match crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false, None)
         .await
     {
         Ok((started, deferred_starts, deferred_checks, _cancel_metrics)) => {

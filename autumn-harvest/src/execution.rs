@@ -293,6 +293,7 @@ pub async fn start_or_load_workflow_execution_collect(
     request: StartWorkflowParams<'_>,
     in_outer_transaction: bool,
     reject_fresh_if_debounced: bool,
+    metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<(
     StartedWorkflowExecution,
     Vec<DeferredTriggerStart>,
@@ -708,8 +709,17 @@ pub async fn start_or_load_workflow_execution_collect(
                     start.spawn();
                 }
                 for check in deferred_checks {
-                    let _ =
-                        check_and_report_unfinished_handlers(conn, check.0, &check.1, None).await;
+                    let _ = check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics)
+                        .await;
+                }
+                if let Some(m) = metrics {
+                    for (wf_name, q_name) in cancel_metrics {
+                        m.record_workflow_terminal(
+                            &wf_name,
+                            &q_name,
+                            crate::telemetry::WorkflowStatus::Cancelled,
+                        );
+                    }
                 }
             }
             Err(e)
@@ -752,7 +762,7 @@ pub async fn start_or_load_workflow_execution(
     // pre-check cancellation commits and the replacement start then fails, the
     // collect fn spawns the cancellation's follow-ups itself before returning Err.
     let (result, deferred_starts, deferred_checks, _cancel_metrics) =
-        start_or_load_workflow_execution_collect(conn, request, false, false).await?;
+        start_or_load_workflow_execution_collect(conn, request, false, false, None).await?;
     for start in deferred_starts {
         start.spawn();
     }
@@ -768,7 +778,7 @@ pub async fn start_or_load_workflow_execution_with_metrics(
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> HarvestResult<StartedWorkflowExecution> {
     let (result, deferred_starts, deferred_checks, cancel_metrics) =
-        start_or_load_workflow_execution_collect(conn, request, false, false).await?;
+        start_or_load_workflow_execution_collect(conn, request, false, false, metrics).await?;
     for start in deferred_starts {
         start.spawn();
     }
@@ -2524,6 +2534,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                             build_start_request(request.exec_id, effective_policy),
                             true,
                             true,
+                            metrics,
                         )
                         .await?;
                     deferred_starts.append(&mut deferred);
@@ -2537,6 +2548,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                             build_start_request(request.exec_id, effective_policy),
                             true,
                             false,
+                            metrics,
                         )
                         .await?;
                     deferred_starts.append(&mut deferred);
@@ -2582,6 +2594,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                             ),
                             true,
                             false,
+                            metrics,
                         )
                         .await?;
                     deferred_starts.append(&mut deferred);
@@ -3067,6 +3080,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         build_start_request(request.exec_id, effective_policy),
                         true,
                         true,
+                        metrics,
                     )
                     .await?;
                     deferred_starts.append(&mut deferred);
@@ -3079,6 +3093,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         build_start_request(request.exec_id, effective_policy),
                         true,
                         false,
+                        metrics,
                     )
                     .await?;
                     deferred_starts.append(&mut deferred);
@@ -3117,6 +3132,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         build_start_request(fresh_exec_id, WorkflowIdReusePolicy::TerminateIfRunning),
                         true,
                         false,
+                        metrics,
                     )
                     .await?;
                     deferred_starts.append(&mut deferred);

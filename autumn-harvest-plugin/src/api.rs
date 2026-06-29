@@ -8448,6 +8448,7 @@ async fn batch_start_workflows(
                 },
                 false,
                 item_reject_fresh,
+                Some(runtime.registry.telemetry().metrics.as_ref()),
             )
             .await;
 

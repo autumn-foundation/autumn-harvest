@@ -2558,6 +2558,7 @@ async fn persist_workflow_failure(
                         retry_params,
                         true,
                         false,
+                        metrics,
                     )
                     .await
                     {
