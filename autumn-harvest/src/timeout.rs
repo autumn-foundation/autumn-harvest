@@ -665,6 +665,17 @@ async fn enforce_workflow_timeout(
         start.spawn();
     }
 
+    if let Err(e) =
+        check_and_report_unfinished_handlers(conn, exec_id, &execution.workflow_name, Some(metrics))
+            .await
+    {
+        tracing::error!(
+            exec_id = %exec_id,
+            err = %e,
+            "Failed to check and report unfinished handlers on workflow timeout"
+        );
+    }
+
     // Best-effort: count task-level timeouts toward the schedule auto-pause threshold.
     // Called AFTER the transaction commits to avoid aborting the transition on a
     // counter query failure.

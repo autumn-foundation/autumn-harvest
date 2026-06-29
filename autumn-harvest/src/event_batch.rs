@@ -177,11 +177,12 @@ pub async fn admit_batched_start(
     let payload = params.payload;
     let max_size = params.max_size;
 
-    let (outcome, deferred_starts, deferred_checks) = conn
+    let (outcome, deferred_starts, deferred_checks, cancel_metrics) = conn
         .transaction::<(
             BatchAdmitOutcome,
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
+            Vec<(String, String)>,
         ), HarvestError, _>(|conn| {
             Box::pin(async move {
                 let row: UpsertBatchRow = diesel::sql_query(sql)
@@ -214,86 +215,90 @@ pub async fn admit_batched_start(
                 }
 
                 let is_flushed = row.current_size >= row.max_size;
-                let (flushed_execution_id, pending_deferred, deferred_checks) = if is_flushed {
-                    let exec_id =
-                        ExecutionId::new_for_shard(crate::types::ShardId::new(row.shard_id));
-                    let reuse_policy = opts
-                        .reuse_policy
-                        .as_deref()
-                        .and_then(parse_reuse_policy)
-                        .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
+                let (flushed_execution_id, pending_deferred, deferred_checks, cancel_metrics) =
+                    if is_flushed {
+                        let exec_id =
+                            ExecutionId::new_for_shard(crate::types::ShardId::new(row.shard_id));
+                        let reuse_policy = opts
+                            .reuse_policy
+                            .as_deref()
+                            .and_then(parse_reuse_policy)
+                            .unwrap_or(crate::types::WorkflowIdReusePolicy::AllowDuplicate);
 
-                    let execution_timeout = opts
-                        .execution_timeout_secs
-                        .and_then(chrono::Duration::try_seconds);
-                    let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
-                    let max_execution_timeout_ceiling = opts
-                        .max_execution_timeout_ceiling_secs
-                        .and_then(chrono::Duration::try_seconds);
-                    let priority = opts
-                        .priority
-                        .and_then(crate::types::Priority::from_i32)
-                        .unwrap_or_default();
+                        let execution_timeout = opts
+                            .execution_timeout_secs
+                            .and_then(chrono::Duration::try_seconds);
+                        let sla = opts.sla_secs.and_then(chrono::Duration::try_seconds);
+                        let max_execution_timeout_ceiling = opts
+                            .max_execution_timeout_ceiling_secs
+                            .and_then(chrono::Duration::try_seconds);
+                        let priority = opts
+                            .priority
+                            .and_then(crate::types::Priority::from_i32)
+                            .unwrap_or_default();
 
-                    let params = crate::execution::StartWorkflowParams {
-                        workflow_name: &row.workflow_name,
-                        workflow_id: &row.workflow_id,
-                        exec_id,
-                        input: row
-                            .buffered_payloads
-                            .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
-                        parent_id: None,
-                        queue_name: &row.queue_name,
-                        execution_timeout,
-                        memo: opts.memo,
-                        search_attrs: opts.search_attrs,
-                        reuse_policy,
-                        trace_context: opts.trace_context,
-                        max_execution_timeout_ceiling,
-                        concurrency_key: opts.concurrency_key,
-                        concurrency_limit: opts.concurrency_limit,
-                        priority,
-                        max_workflow_input_bytes: opts.max_workflow_input_bytes.unwrap_or(u64::MAX),
-                        start_at: None,
-                        delay: None,
-                        max_workflow_start_delay: None,
-                        owner: opts.owner.as_deref(),
-                        runbook_url: opts.runbook_url.as_deref(),
-                        severity: opts.severity.as_deref(),
-                        context_headers: opts.context_headers,
-                        sla,
-                        schedule_id: None,
-                        scheduled_for: None,
-                        workflow_attempt: 1,
-                        workflow_retry_policy: opts
-                            .workflow_retry_policy
-                            .clone()
-                            .and_then(|v| serde_json::from_value(v).ok()),
-                        retry_of_exec_id: None,
-                        max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
-                        origin: None,
-                    };
+                        let params = crate::execution::StartWorkflowParams {
+                            workflow_name: &row.workflow_name,
+                            workflow_id: &row.workflow_id,
+                            exec_id,
+                            input: row
+                                .buffered_payloads
+                                .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                            parent_id: None,
+                            queue_name: &row.queue_name,
+                            execution_timeout,
+                            memo: opts.memo,
+                            search_attrs: opts.search_attrs,
+                            reuse_policy,
+                            trace_context: opts.trace_context,
+                            max_execution_timeout_ceiling,
+                            concurrency_key: opts.concurrency_key,
+                            concurrency_limit: opts.concurrency_limit,
+                            priority,
+                            max_workflow_input_bytes: opts
+                                .max_workflow_input_bytes
+                                .unwrap_or(u64::MAX),
+                            start_at: None,
+                            delay: None,
+                            max_workflow_start_delay: None,
+                            owner: opts.owner.as_deref(),
+                            runbook_url: opts.runbook_url.as_deref(),
+                            severity: opts.severity.as_deref(),
+                            context_headers: opts.context_headers,
+                            sla,
+                            schedule_id: None,
+                            scheduled_for: None,
+                            workflow_attempt: 1,
+                            workflow_retry_policy: opts
+                                .workflow_retry_policy
+                                .clone()
+                                .and_then(|v| serde_json::from_value(v).ok()),
+                            retry_of_exec_id: None,
+                            max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
+                            origin: None,
+                        };
 
-                    let (started, deferred_starts, deferred_checks, _cancel_metrics) =
-                        crate::execution::start_or_load_workflow_execution_collect(
-                            conn, params, true, false, None,
+                        let (started, deferred_starts, deferred_checks, cancel_metrics) =
+                            crate::execution::start_or_load_workflow_execution_collect(
+                                conn, params, true, false, None,
+                            )
+                            .await?;
+
+                        diesel::sql_query("DELETE FROM harvest_event_batches WHERE id = $1")
+                            .bind::<diesel::sql_types::Uuid, _>(row.id)
+                            .execute(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
+
+                        (
+                            Some(started.exec_id.to_string()),
+                            deferred_starts,
+                            deferred_checks,
+                            cancel_metrics,
                         )
-                        .await?;
-
-                    diesel::sql_query("DELETE FROM harvest_event_batches WHERE id = $1")
-                        .bind::<diesel::sql_types::Uuid, _>(row.id)
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
-
-                    (
-                        Some(started.exec_id.to_string()),
-                        deferred_starts,
-                        deferred_checks,
-                    )
-                } else {
-                    (None, Vec::new(), Vec::new())
-                };
+                    } else {
+                        (None, Vec::new(), Vec::new(), Vec::new())
+                    };
 
                 Ok((
                     BatchAdmitOutcome {
@@ -307,6 +312,7 @@ pub async fn admit_batched_start(
                     },
                     pending_deferred,
                     deferred_checks,
+                    cancel_metrics,
                 ))
             })
         })
@@ -317,6 +323,16 @@ pub async fn admit_batched_start(
             conn, check.0, &check.1, metrics,
         )
         .await;
+    }
+
+    if let Some(m) = metrics {
+        for (wf_name, q_name) in cancel_metrics {
+            m.record_workflow_terminal(
+                &wf_name,
+                &q_name,
+                crate::telemetry::WorkflowStatus::Cancelled,
+            );
+        }
     }
 
     Ok(Some((outcome, deferred_starts)))
@@ -384,6 +400,7 @@ async fn fire_due_on_conn(
             String,
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             Vec<(ExecutionId, String)>,
+            Vec<(String, String)>,
         )> = conn
             .transaction(|conn| {
                 Box::pin(async move {
@@ -406,8 +423,8 @@ async fn fire_due_on_conn(
 
                     if let Some(row) = due_rows.into_iter().next() {
                         match fire_claimed_batch_row(conn, row).await {
-                            Ok(Some((exec_id, deferred, checks))) => {
-                                Ok(Some((exec_id, deferred, checks)))
+                            Ok(Some((exec_id, deferred, checks, cancel_metrics))) => {
+                                Ok(Some((exec_id, deferred, checks, cancel_metrics)))
                             }
                             Ok(None) => Ok(None),
                             Err(e) => Err(e),
@@ -419,7 +436,7 @@ async fn fire_due_on_conn(
             })
             .await?;
 
-        if let Some((exec_id, deferred, checks)) = processed {
+        if let Some((exec_id, deferred, checks, cancel_metrics)) = processed {
             fired_ids.push(exec_id);
             deferred_starts.extend(deferred);
             for check in checks {
@@ -427,6 +444,15 @@ async fn fire_due_on_conn(
                     conn, check.0, &check.1, metrics,
                 )
                 .await;
+            }
+            if let Some(m) = metrics {
+                for (wf_name, q_name) in cancel_metrics {
+                    m.record_workflow_terminal(
+                        &wf_name,
+                        &q_name,
+                        crate::telemetry::WorkflowStatus::Cancelled,
+                    );
+                }
             }
         } else {
             break;
@@ -445,6 +471,7 @@ async fn fire_claimed_batch_row(
         String,
         Vec<crate::completion_trigger::DeferredTriggerStart>,
         Vec<(ExecutionId, String)>,
+        Vec<(String, String)>,
     )>,
 > {
     use diesel_async::RunQueryDsl;
@@ -515,10 +542,11 @@ async fn fire_claimed_batch_row(
     };
 
     let start_res =
-        crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false, None).await;
+        crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false, None)
+            .await;
 
     match start_res {
-        Ok((started, deferred_starts, deferred_checks, _cancel_metrics)) => {
+        Ok((started, deferred_starts, deferred_checks, cancel_metrics)) => {
             diesel::sql_query("DELETE FROM harvest_event_batches WHERE id = $1")
                 .bind::<diesel::sql_types::Uuid, _>(row_id)
                 .execute(conn)
@@ -537,6 +565,7 @@ async fn fire_claimed_batch_row(
                 started.exec_id.to_string(),
                 deferred_starts,
                 deferred_checks,
+                cancel_metrics,
             )))
         }
         Err(crate::error::HarvestError::AlreadyExists { .. }) => {

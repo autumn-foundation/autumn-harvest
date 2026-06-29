@@ -473,6 +473,7 @@ type FiredDebounce = (
     String,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
     Vec<(crate::types::ExecutionId, String)>,
+    Vec<(String, String)>,
 );
 
 /// Scan and fire due debounce rows on a single shard connection. Returns the
@@ -578,7 +579,7 @@ pub async fn fire_due_debounced_starts(
         conn: &mut diesel_async::AsyncPgConnection,
     ) -> usize {
         let count = fired.len();
-        for (workflow_name, queue_name, deferred_starts, deferred_checks) in fired {
+        for (workflow_name, queue_name, deferred_starts, deferred_checks, cancel_metrics) in fired {
             for start in deferred_starts {
                 start.spawn();
             }
@@ -590,6 +591,13 @@ pub async fn fire_due_debounced_starts(
                     Some(metrics),
                 )
                 .await;
+            }
+            for (wf_name, q_name) in cancel_metrics {
+                metrics.record_workflow_terminal(
+                    &wf_name,
+                    &q_name,
+                    crate::telemetry::WorkflowStatus::Cancelled,
+                );
             }
             metrics.record_debounce_fired(&workflow_name, &queue_name);
         }
@@ -733,10 +741,12 @@ async fn fire_claimed_debounce_row(
     // that rolls back with this transaction on error — the collect fn must not
     // spawn its follow-ups (they'd be orphaned). Deferred starts returned on
     // success are spawned by the caller only after the fire transaction commits.
-    match crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false, None)
-        .await
+    match crate::execution::start_or_load_workflow_execution_collect(
+        conn, params, true, false, None,
+    )
+    .await
     {
-        Ok((started, deferred_starts, deferred_checks, _cancel_metrics)) => {
+        Ok((started, deferred_starts, deferred_checks, cancel_metrics)) => {
             delete_debounce_row(conn, row_id).await?;
             tracing::info!(
                 workflow_name = %workflow_name,
@@ -750,6 +760,7 @@ async fn fire_claimed_debounce_row(
                 queue_name,
                 deferred_starts,
                 deferred_checks,
+                cancel_metrics,
             )))
         }
         // The target workflow_id is already taken under the reuse policy, so the
