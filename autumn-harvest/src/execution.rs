@@ -1470,7 +1470,7 @@ pub async fn resume_workflow_execution(
 /// `WorkflowFailed` event) at quarantine time, so a redrive must reopen the run
 /// before re-enqueuing. It:
 ///
-/// 1. appends a [`WorkflowEvent::WorkflowRedriven`] event **after** the
+/// 1. appends a [`crate::event::WorkflowEvent::WorkflowRedriven`] event **after** the
 ///    superseded terminal `WorkflowFailed` (append-only — no existing event is
 ///    rewritten, removed, or reordered), and
 /// 2. transitions the execution `FAILED → RUNNING`, clearing the recorded

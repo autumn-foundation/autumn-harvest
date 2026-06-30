@@ -65,7 +65,7 @@ pub struct WorkflowExecuteSpanMeta {
     /// Logical workflow name (recorded as `harvest.workflow.id`).
     pub workflow_name: String,
     /// Business-level workflow identifier (e.g. `"subscription-123"`).
-    /// Forwarded to [`WorkflowContext`] so [`WorkflowLogger`] can tag events.
+    /// Forwarded to [`WorkflowContext`] so [`crate::context::WorkflowLogger`] can tag events.
     pub workflow_id: String,
     /// Shard identifier (recorded as `harvest.shard.id`).
     pub shard_id: i64,
@@ -130,7 +130,7 @@ pub async fn run_workflow_strict(
 
 /// Like [`run_workflow_strict`] but enables the advancing virtual clock (issue #526).
 ///
-/// Used by [`WorkflowReplayer::with_advancing_timer_clock`] so that
+/// Used by [`crate::testing::WorkflowReplayer::with_advancing_timer_clock`] so that
 /// `replay_check` on a [`TestRunOutcome`](crate::testing::TestRunOutcome) can
 /// verify time-branching workflows without false non-determinism failures.
 #[cfg(any(test, feature = "testing"))]
