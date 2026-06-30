@@ -1314,8 +1314,9 @@ fn extract_signal_external_workflow(commands: Vec<WorkflowCommand>) -> Vec<Signa
 fn split_mixed_signal_batch(
     commands: Vec<WorkflowCommand>,
 ) -> (Vec<SignalBatchItem>, Vec<WorkflowCommand>) {
-    let mut signal_items = Vec::new();
-    let mut remaining = Vec::new();
+    // ⚡ Bolt: Pre-allocate vectors using known capacity to avoid intermediate allocations
+    let mut signal_items = Vec::with_capacity(commands.len());
+    let mut remaining = Vec::with_capacity(commands.len());
     for cmd in commands {
         match cmd {
             WorkflowCommand::SignalExternalWorkflow {
