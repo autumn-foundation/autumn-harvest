@@ -20766,19 +20766,18 @@ pub async fn poll_update_result(
                 let h = store::load_history(&mut c, exec_id).await?;
                 // c is dropped here, releasing the connection back to the pool.
                 let mut terminal_state = get_terminal_workflow_state(&h.events);
-                if terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED") {
-                    if let Ok(Some(db_state)) = harvest_workflow_executions::table
+                if (terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED"))
+                    && let Ok(Some(db_state)) = harvest_workflow_executions::table
                         .find(exec_id.as_uuid())
                         .select(harvest_workflow_executions::state)
                         .first::<String>(&mut c)
                         .await
                         .optional()
-                    {
-                        if terminal_state == Some("CANCELLED") && db_state == "TERMINATED" {
-                            terminal_state = Some("TERMINATED");
-                        } else if terminal_state == Some("FAILED") && db_state == "TIMED_OUT" {
-                            terminal_state = Some("TIMED_OUT");
-                        }
+                {
+                    if terminal_state == Some("CANCELLED") && db_state == "TERMINATED" {
+                        terminal_state = Some("TERMINATED");
+                    } else if terminal_state == Some("FAILED") && db_state == "TIMED_OUT" {
+                        terminal_state = Some("TIMED_OUT");
                     }
                 }
                 match HistoryMatcher::new(h.events).match_update(update_id) {
@@ -20878,19 +20877,18 @@ async fn get_update_result(
     }
 
     let mut terminal_state = get_terminal_workflow_state(&history.events);
-    if terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED") {
-        if let Ok(Some(db_state)) = harvest_workflow_executions::table
+    if (terminal_state == Some("CANCELLED") || terminal_state == Some("FAILED"))
+        && let Ok(Some(db_state)) = harvest_workflow_executions::table
             .find(exec_id.as_uuid())
             .select(harvest_workflow_executions::state)
             .first::<String>(&mut conn)
             .await
             .optional()
-        {
-            if terminal_state == Some("CANCELLED") && db_state == "TERMINATED" {
-                terminal_state = Some("TERMINATED");
-            } else if terminal_state == Some("FAILED") && db_state == "TIMED_OUT" {
-                terminal_state = Some("TIMED_OUT");
-            }
+    {
+        if terminal_state == Some("CANCELLED") && db_state == "TERMINATED" {
+            terminal_state = Some("TERMINATED");
+        } else if terminal_state == Some("FAILED") && db_state == "TIMED_OUT" {
+            terminal_state = Some("TIMED_OUT");
         }
     }
     let matcher = HistoryMatcher::new(history.events);
