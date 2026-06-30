@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 //! Replay-fidelity test for large-payload offloading (issue #524).
 //!
 //! Demonstrates that a recorded history whose payloads were offloaded to an

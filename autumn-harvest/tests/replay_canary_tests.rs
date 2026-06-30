@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 #![cfg(feature = "db")]
 
 use chrono::Utc;

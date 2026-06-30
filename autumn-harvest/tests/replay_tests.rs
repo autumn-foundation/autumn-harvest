@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 //! Replay engine correctness tests — pure unit tests, no database required.
 //!
 //! These tests exercise the executor's replay logic by constructing synthetic

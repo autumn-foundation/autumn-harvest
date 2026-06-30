@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 //! Integration tests for DAG dynamic task mapping (issue #485).
 //!
 //! Requires features: `unified-dag-execution` + `testing`.

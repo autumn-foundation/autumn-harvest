@@ -26,7 +26,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the JSON fixture file containing a HistorySnapshot or HistoryExportDocument.
+    /// Path to the JSON fixture file containing a `HistorySnapshot` or `HistoryExportDocument`.
     #[arg(long)]
     json_path: PathBuf,
 }
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let doc: HistoryExportDocument = serde_json::from_str(&json)?;
         doc.events
             .into_iter()
-            .map(|val| serde_json::from_value(val))
+            .map(serde_json::from_value)
             .collect::<Result<Vec<_>, _>>()?
     } else if json.contains("\"events\":") {
         // Try parsing as HistorySnapshot
@@ -52,7 +52,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         serde_json::from_str(&json)?
     };
 
-    println!("Loaded {} events from {:?}", events.len(), args.json_path);
+    println!(
+        "Loaded {} events from {:?}",
+        events.len(),
+        args.json_path.display()
+    );
 
     let analyzer = HistoryAnalyzer::with_default_rules();
     let warnings = analyzer.analyze(&events);

@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 #![cfg(all(feature = "db", feature = "testing"))]
 
 //! Real-Postgres integration tests for [`WorkflowReplayer::replay_from_db`].

@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 //! Tests for `#[dag]` lowering onto the workflow execution path (issue #256, Step 1).
 //!
 //! Requires features: `unified-dag-execution` + `testing`.

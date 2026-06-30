@@ -46,7 +46,6 @@ impl HistoryAnalyzer {
             .with_rule(SequentialActivitiesRule::new(5))
     }
 
-
     /// Add a rule to the analyzer.
     #[must_use]
     pub fn with_rule(mut self, rule: impl AnalyzerRule + 'static) -> Self {
@@ -236,7 +235,6 @@ impl AnalyzerRule for LargePayloadRule {
     }
 }
 
-
 /// Flags workflows that execute multiple activities sequentially without concurrency.
 ///
 /// Sequential execution of many activities often indicates a missed opportunity
@@ -266,16 +264,20 @@ impl AnalyzerRule for SequentialActivitiesRule {
 
         for event in history {
             match event {
-                WorkflowEvent::ActivityScheduled { .. } | WorkflowEvent::LocalActivityScheduled { .. } => {
+                WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::LocalActivityScheduled { .. } => {
                     active_activities += 1;
                     if active_activities > 1 {
                         // Concurrency detected! Reset sequential count.
                         sequential_count = 0;
                     }
                 }
-                WorkflowEvent::ActivityCompleted { .. } | WorkflowEvent::ActivityFailed { .. }
-                | WorkflowEvent::ActivityTimedOut { .. } | WorkflowEvent::LocalActivityCompleted { .. }
-                | WorkflowEvent::LocalActivityFailed { .. } | WorkflowEvent::LocalActivityExhausted { .. } => {
+                WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::LocalActivityExhausted { .. } => {
                     if active_activities > 0 {
                         active_activities -= 1;
                         if active_activities == 0 {
@@ -306,7 +308,6 @@ mod tests {
     use super::*;
     use crate::types::{ActivityExecId, TimerId};
     use chrono::Utc;
-
 
     #[test]
     fn sequential_activities_rule_flags_over_threshold() {
@@ -352,7 +353,11 @@ mod tests {
         let warnings = rule.analyze(&history);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].rule_name, "SequentialActivities");
-        assert!(warnings[0].message.contains("3 activities executed strictly sequentially"));
+        assert!(
+            warnings[0]
+                .message
+                .contains("3 activities executed strictly sequentially")
+        );
     }
 
     #[test]
@@ -399,9 +404,11 @@ mod tests {
         ];
 
         let warnings = rule.analyze(&history);
-        assert!(warnings.is_empty(), "Concurrency should reset sequential count");
+        assert!(
+            warnings.is_empty(),
+            "Concurrency should reset sequential count"
+        );
     }
-
 
     #[test]
     fn excessive_retries_flags_activities_over_threshold() {

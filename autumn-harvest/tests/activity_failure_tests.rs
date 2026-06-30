@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 //! Tests for the typed activity failure surface (issue #227).
 //!
 //! These tests exercise:

@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 //! Tests for `WorkflowTestEnv` — the in-process workflow unit-test harness (issue #250).
 //!
 //! Three required example tests per AC:

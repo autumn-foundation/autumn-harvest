@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 //! Tests for `WorkflowReplayer` — the replay harness described in issue #135.
 //!
 //! These tests exercise the public API in `autumn_harvest::testing`:

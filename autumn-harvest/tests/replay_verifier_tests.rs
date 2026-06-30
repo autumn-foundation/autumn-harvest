@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 //! Integration tests for `ReplayVerifier` — the batch CI replay gate (issue #251).
 //!
 //! These tests exercise the three scenarios described in the acceptance criteria:

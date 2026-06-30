@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 #![cfg(feature = "db")]
 #![allow(
     clippy::too_many_lines,
