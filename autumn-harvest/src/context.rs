@@ -2241,133 +2241,14 @@ impl WorkflowContext {
     /// # Panics
     ///
     /// Panics if the internal matcher or commands mutex is poisoned.
-    #[allow(clippy::too_many_lines)]
     pub async fn execute_activity_raw(
         &self,
         name: &str,
         input: Value,
         queue: &str,
     ) -> HarvestResult<Value> {
-        // Step 1: Match against history (lock is dropped before any .await).
-        let history_match = if self.strict_replay {
-            self.match_history(|m| m.match_activity_strict(name, &input))
-        } else {
-            self.match_history(|m| m.match_activity(name))
-        };
-
-        match history_match {
-            HistoryMatch::Matched { output } => Ok(output),
-
-            HistoryMatch::Failed {
-                error,
-                attempt,
-                error_type,
-                details,
-            } => Err(HarvestError::ActivityFailed {
-                name: name.to_string(),
-                attempt,
-                error_type,
-                details,
-                source: error.into(),
-            }),
-
-            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
-                timeout_type,
-                task_name: name.to_string(),
-            }),
-
-            HistoryMatch::Diverged {
-                expected,
-                actual,
-                event_index,
-            } => Err(self.nd_error(
-                format!("activity mismatch: expected {expected}, got {actual}"),
-                event_index,
-                Some(expected),
-                Some(actual),
-            )),
-
-            HistoryMatch::ActivityInProgress { activity_id } => {
-                let (tx, rx) = oneshot::channel();
-                self.push_command(WorkflowCommand::WaitForActivity {
-                    activity_id,
-                    result_tx: tx,
-                });
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
-            }
-
-            HistoryMatch::AwaitingExternalCompletion { .. }
-            | HistoryMatch::ChildInProgress { .. }
-            | HistoryMatch::LocalActivityInProgress { .. }
-            | HistoryMatch::ExternalSignalInProgress { .. }
-            | HistoryMatch::ExternalSignalFailed { .. }
-            | HistoryMatch::ExternalCancelInProgress { .. }
-            | HistoryMatch::ExternalCancelFailed { .. }
-            | HistoryMatch::DetachedChildSpawned { .. } => {
-                unreachable!(
-                    "match_activity never returns AwaitingExternalCompletion, ChildInProgress, \
-                     LocalActivityInProgress, or ExternalSignalInProgress"
-                )
-            }
-
-            HistoryMatch::NoMatch => {
-                // Strict replay: a command with no matching history entry means
-                // the new code issues a command the recorded history never saw.
-                self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
-
-                // Enforce activity input payload cap before scheduling.
-                let effective_cap = {
-                    let global = self.payload_max_activity_input;
-                    self.activity_input_cap_overrides
-                        .get(name)
-                        .copied()
-                        .map_or(global, |ov| global.max(ov))
-                };
-                let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if effective_cap > 0
-                    && observed > effective_cap
-                    && !self.offload_will_apply(observed)
-                {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::ActivityInput,
-                        observed_bytes: observed,
-                        cap_bytes: effective_cap,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: Some(name.to_string()),
-                    });
-                }
-
-                // Live execution: emit a ScheduleActivity command and suspend
-                // until the worker sends the result through the oneshot channel.
-                let activity_id = self.next_activity_id();
-                let (tx, rx) = oneshot::channel();
-
-                self.push_command(WorkflowCommand::ScheduleActivity {
-                    activity_id,
-                    name: name.to_string(),
-                    input,
-                    queue: queue.to_string(),
-                    retry_policy_override: None,
-                    start_to_close_override: None,
-                    result_tx: tx,
-                });
-
-                // Suspend the coroutine until the worker resolves this activity.
-                match rx.await {
-                    Ok(Ok(output)) => Ok(output),
-                    Ok(Err(error)) => Err(HarvestError::activity_failed(name, 1, &error)),
-                    Err(_) => Err(HarvestError::Cancelled(format!(
-                        "activity '{name}' cancelled: result channel dropped"
-                    ))),
-                }
-            }
-        }
+        self.execute_activity_raw_with_opts(name, input, queue, None, None)
+            .await
     }
 
     /// Like [`execute_activity_raw`](Self::execute_activity_raw) but allows
