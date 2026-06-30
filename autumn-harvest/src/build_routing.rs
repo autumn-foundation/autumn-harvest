@@ -677,3 +677,119 @@ pub fn merge_reachability(per_shard: Vec<Vec<BuildReachability>>) -> Vec<BuildRe
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_compatibility_set_is_eligible() {
+        let mut compat = BuildCompatibilitySet::new();
+
+        // Rule 1: No requirement
+        assert!(compat.is_eligible("build-A", None));
+        assert!(compat.is_eligible("", None));
+
+        // Rule 2: Legacy worker (empty build_id)
+        assert!(compat.is_eligible("", Some("build-A")));
+
+        // Rule 3: Exact match
+        assert!(compat.is_eligible("build-A", Some("build-A")));
+        assert!(!compat.is_eligible("build-B", Some("build-A")));
+
+        // Rule 4: Explicit declaration
+        compat.add_declaration("build-B", "build-A");
+        assert!(compat.is_eligible("build-B", Some("build-A")));
+        assert!(!compat.is_eligible("build-C", Some("build-A")));
+
+        // Test removing declaration
+        compat.remove_declaration("build-B", "build-A");
+        assert!(!compat.is_eligible("build-B", Some("build-A")));
+
+        // Remove non-existent declaration shouldn't panic
+        compat.remove_declaration("build-Z", "build-A");
+    }
+
+    #[test]
+    fn test_merge_reachability_sums_counters() {
+        let r1 = BuildReachability {
+            build_id: "build-A".to_string(),
+            open_executions: 10,
+            pending_tasks: 5,
+            active_workers: 2,
+            stale_workers: 1,
+            safe_to_retire: true, // Should be recomputed
+        };
+
+        let r2 = BuildReachability {
+            build_id: "build-A".to_string(),
+            open_executions: 5,
+            pending_tasks: 2,
+            active_workers: 3,
+            stale_workers: 0,
+            safe_to_retire: true,
+        };
+
+        let merged = merge_reachability(vec![vec![r1], vec![r2]]);
+
+        assert_eq!(merged.len(), 1);
+        let m = &merged[0];
+        assert_eq!(m.build_id, "build-A");
+        assert_eq!(m.open_executions, 15);
+        assert_eq!(m.pending_tasks, 7);
+        assert_eq!(m.active_workers, 5);
+        assert_eq!(m.stale_workers, 1);
+        assert!(!m.safe_to_retire); // 15 + 7 > 0
+    }
+
+    #[test]
+    fn test_merge_reachability_computes_safe_to_retire() {
+        let r1 = BuildReachability {
+            build_id: "build-A".to_string(),
+            open_executions: 0,
+            pending_tasks: 0,
+            active_workers: 0,
+            stale_workers: 0,
+            safe_to_retire: false, // Initial value
+        };
+
+        let r2 = BuildReachability {
+            build_id: "build-A".to_string(),
+            open_executions: 0,
+            pending_tasks: 0,
+            active_workers: 0,
+            stale_workers: 0,
+            safe_to_retire: false,
+        };
+
+        let merged = merge_reachability(vec![vec![r1], vec![r2]]);
+
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].safe_to_retire); // 0 + 0 == 0
+    }
+
+    #[test]
+    fn test_merge_reachability_sorts_by_build_id() {
+        let r_b = BuildReachability {
+            build_id: "build-B".to_string(),
+            open_executions: 0,
+            pending_tasks: 0,
+            active_workers: 0,
+            stale_workers: 0,
+            safe_to_retire: false,
+        };
+        let r_a = BuildReachability {
+            build_id: "build-A".to_string(),
+            open_executions: 0,
+            pending_tasks: 0,
+            active_workers: 0,
+            stale_workers: 0,
+            safe_to_retire: false,
+        };
+
+        let merged = merge_reachability(vec![vec![r_b, r_a]]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].build_id, "build-A");
+        assert_eq!(merged[1].build_id, "build-B");
+    }
+}
