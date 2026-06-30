@@ -742,8 +742,8 @@ pub async fn reset_workflow_execution(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ResetResult, WorkflowResetError> {
     let mut request = request.normalized();
-    let (res, deferred_starts) = conn
-        .transaction::<(ResetResult, Vec<DeferredTriggerStart>), WorkflowResetError, _>(|conn| {
+    let (res, deferred_starts, workflow_name) = conn
+        .transaction::<(ResetResult, Vec<DeferredTriggerStart>, String), WorkflowResetError, _>(|conn| {
             async move {
                 let source = load_source_execution(conn, exec_id, true).await?;
                 validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
@@ -808,6 +808,7 @@ pub async fn reset_workflow_execution(
                         },
                     },
                     deferred,
+                    source.workflow_name,
                 ))
             }
             .scope_boxed()
@@ -816,6 +817,27 @@ pub async fn reset_workflow_execution(
 
     for start in deferred_starts {
         start.spawn();
+    }
+
+    let metrics = registry.map(|r| {
+        let rec: &(dyn crate::telemetry::MetricsRecorder + Send + Sync) =
+            r.telemetry().metrics.as_ref();
+        rec
+    });
+
+    if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+        conn,
+        exec_id,
+        &workflow_name,
+        metrics,
+    )
+    .await
+    {
+        tracing::error!(
+            exec_id = %exec_id,
+            err = %e,
+            "Failed to check and report unfinished handlers on workflow reset"
+        );
     }
 
     Ok(res)
