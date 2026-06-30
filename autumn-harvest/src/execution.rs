@@ -915,7 +915,8 @@ async fn inline_cancel(
         .map_err(database_error)?;
     queue::fail_open_tasks_for_execution(conn, exec_id, &format!("workflow cancelled: {reason}"))
         .await?;
-    let mut deferred = Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    let (mut deferred, closed_children) =
+        Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
         conn,
         exec_id,
@@ -933,6 +934,7 @@ async fn inline_cancel(
     if !workflow_name.is_empty() {
         deferred_checks.push((exec_id, workflow_name));
     }
+    deferred_checks.extend(closed_children);
 
     Ok(deferred)
 }
@@ -1042,7 +1044,7 @@ pub async fn cancel_workflow_execution_collect(
         reason.to_string()
     };
 
-    let (cancel_result, deferred_starts) = conn
+    let (cancel_result, deferred_starts, closed_children) = conn
         .transaction::<_, HarvestError, _>(|conn| {
             async move {
                 let execution = harvest_workflow_executions::table
@@ -1066,6 +1068,7 @@ pub async fn cancel_workflow_execution_collect(
                     "CANCELLED" => {
                         return Ok((
                             CancelledWorkflowExecution::idempotent(exec_id, execution),
+                            Vec::new(),
                             Vec::new(),
                         ));
                     }
@@ -1162,7 +1165,8 @@ pub async fn cancel_workflow_execution_collect(
                     format!("child workflow cancelled: {reason}"),
                 )
                 .await?;
-                let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                let (mut deferred, closed_children) =
+                    apply_parent_close_cascade(conn, exec_id).await?;
                 let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                     conn,
                     exec_id,
@@ -1183,6 +1187,7 @@ pub async fn cancel_workflow_execution_collect(
                         prior_state,
                     ),
                     deferred,
+                    closed_children,
                 ))
             }
             .scope_boxed()
@@ -1199,6 +1204,7 @@ pub async fn cancel_workflow_execution_collect(
     } else {
         None
     };
+    deferred_checks.extend(closed_children);
 
     Ok((
         cancel_result,
@@ -1783,45 +1789,57 @@ pub(crate) async fn parent_close_cascade_event_count(
 pub(crate) async fn apply_parent_close_cascade(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
-) -> HarvestResult<Vec<DeferredTriggerStart>> {
+) -> HarvestResult<(Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
     use crate::store;
 
     // PAUSED is a non-terminal active state (issue #383): a paused child is
     // still an active child, so the parent-close cascade must reach it too —
     // otherwise it could be resumed after the parent closed despite a
     // RequestCancel/Terminate policy.
-    let running_children: Vec<(Uuid, Option<String>)> = harvest_workflow_executions::table
+    let running_children: Vec<(Uuid, String, Option<String>)> = harvest_workflow_executions::table
         .filter(harvest_workflow_executions::parent_id.eq(Some(parent_exec_id.as_uuid())))
         .filter(harvest_workflow_executions::parent_close_policy.is_not_null())
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .select((
             harvest_workflow_executions::id,
+            harvest_workflow_executions::workflow_name,
             harvest_workflow_executions::parent_close_policy,
         ))
-        .load::<(Uuid, Option<String>)>(conn)
+        .load::<(Uuid, String, Option<String>)>(conn)
         .await
         .map_err(database_error)?;
 
     let mut deferred = Vec::new();
+    let mut closed_children = Vec::new();
 
-    for (child_uuid, policy_opt) in running_children {
+    for (child_uuid, child_workflow_name, policy_opt) in running_children {
         let child_exec_id = ExecutionId::from_uuid(child_uuid);
         let policy_str = policy_opt.expect("filtered by is_not_null");
         let policy = policy_str
             .parse::<ParentClosePolicy>()
             .map_err(HarvestError::Config)?;
 
-        let (action, mut child_deferred) = match policy {
-            ParentClosePolicy::Abandon => (None, Vec::new()),
+        let (action, mut child_deferred, mut child_closed) = match policy {
+            ParentClosePolicy::Abandon => (None, Vec::new(), Vec::new()),
             ParentClosePolicy::RequestCancel => {
-                let (success, d) =
-                    cascade_cancel_detached_child(conn, child_exec_id, "parent closed").await?;
-                (success.then_some("request_cancel"), d)
+                let (success, d, c) = cascade_cancel_detached_child(
+                    conn,
+                    child_exec_id,
+                    &child_workflow_name,
+                    "parent closed",
+                )
+                .await?;
+                (success.then_some("request_cancel"), d, c)
             }
             ParentClosePolicy::Terminate => {
-                let (success, d) =
-                    cascade_terminate_detached_child(conn, child_exec_id, "ParentClosed").await?;
-                (success.then_some("terminate"), d)
+                let (success, d, c) = cascade_terminate_detached_child(
+                    conn,
+                    child_exec_id,
+                    &child_workflow_name,
+                    "ParentClosed",
+                )
+                .await?;
+                (success.then_some("terminate"), d, c)
             }
         };
 
@@ -1830,6 +1848,7 @@ pub(crate) async fn apply_parent_close_cascade(
         };
 
         deferred.append(&mut child_deferred);
+        closed_children.append(&mut child_closed);
 
         store::append_single_event(
             conn,
@@ -1843,14 +1862,18 @@ pub(crate) async fn apply_parent_close_cascade(
         .await?;
     }
 
-    Ok(deferred)
+    Ok((deferred, closed_children))
 }
 
 async fn cascade_cancel_detached_child(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    workflow_name: &str,
     reason: &str,
-) -> HarvestResult<(bool, Vec<DeferredTriggerStart>)> {
+) -> HarvestResult<(bool, Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
+    let mut deferred_starts = Vec::new();
+    let mut closed_executions = Vec::new();
+
     let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .set((
@@ -1867,8 +1890,10 @@ async fn cascade_cancel_detached_child(
         .await
         .map_err(database_error)?;
     if updated == 0 {
-        return Ok((false, Vec::new()));
+        return Ok((false, deferred_starts, closed_executions));
     }
+    closed_executions.push((exec_id, workflow_name.to_string()));
+
     store::append_single_event(
         conn,
         exec_id,
@@ -1883,7 +1908,11 @@ async fn cascade_cancel_detached_child(
         &format!("workflow cancelled by parent close: {reason}"),
     )
     .await?;
-    let mut deferred = Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    let (mut child_deferred, mut child_closed) =
+        Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    deferred_starts.append(&mut child_deferred);
+    closed_executions.append(&mut child_closed);
+
     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
         conn,
         exec_id,
@@ -1891,15 +1920,19 @@ async fn cascade_cancel_detached_child(
         None,
     )
     .await?;
-    deferred.extend(triggers);
-    Ok((true, deferred))
+    deferred_starts.extend(triggers);
+    Ok((true, deferred_starts, closed_executions))
 }
 
 async fn cascade_terminate_detached_child(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    workflow_name: &str,
     reason: &str,
-) -> HarvestResult<(bool, Vec<DeferredTriggerStart>)> {
+) -> HarvestResult<(bool, Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>)> {
+    let mut deferred_starts = Vec::new();
+    let mut closed_executions = Vec::new();
+
     let updated = diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
         .filter(harvest_workflow_executions::state.eq_any(["RUNNING", "PAUSED"]))
         .set((
@@ -1916,8 +1949,10 @@ async fn cascade_terminate_detached_child(
         .await
         .map_err(database_error)?;
     if updated == 0 {
-        return Ok((false, Vec::new()));
+        return Ok((false, deferred_starts, closed_executions));
     }
+    closed_executions.push((exec_id, workflow_name.to_string()));
+
     store::append_single_event(
         conn,
         exec_id,
@@ -1932,7 +1967,11 @@ async fn cascade_terminate_detached_child(
         &format!("workflow terminated by parent close: {reason}"),
     )
     .await?;
-    let mut deferred = Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    let (mut child_deferred, mut child_closed) =
+        Box::pin(apply_parent_close_cascade(conn, exec_id)).await?;
+    deferred_starts.append(&mut child_deferred);
+    closed_executions.append(&mut child_closed);
+
     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
         conn,
         exec_id,
@@ -1940,8 +1979,8 @@ async fn cascade_terminate_detached_child(
         None,
     )
     .await?;
-    deferred.extend(triggers);
-    Ok((true, deferred))
+    deferred_starts.extend(triggers);
+    Ok((true, deferred_starts, closed_executions))
 }
 
 /// Hard-finalize a workflow execution to `TERMINATED` regardless of its
@@ -1986,7 +2025,7 @@ pub async fn terminate_workflow_execution_collect(
         reason.to_string()
     };
 
-    let (cancel_result, deferred_starts) = conn
+    let (cancel_result, deferred_starts, closed_children) = conn
         .transaction::<_, HarvestError, _>(|conn| {
             async move {
                 let execution = harvest_workflow_executions::table
@@ -2008,6 +2047,7 @@ pub async fn terminate_workflow_execution_collect(
                 if crate::erase::is_terminal_state(&execution.state) {
                     return Ok((
                         CancelledWorkflowExecution::idempotent(exec_id, execution),
+                        Vec::new(),
                         Vec::new(),
                     ));
                 }
@@ -2081,7 +2121,8 @@ pub async fn terminate_workflow_execution_collect(
                     format!("child workflow terminated: {reason}"),
                 )
                 .await?;
-                let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                let (mut deferred, closed_children) =
+                    apply_parent_close_cascade(conn, exec_id).await?;
                 // Force-terminate fires `Terminated` completion triggers, NOT
                 // `Cancelled` — a force-kill is distinct from a cooperative
                 // cancellation downstream (issue #504). Operators opt into
@@ -2108,6 +2149,7 @@ pub async fn terminate_workflow_execution_collect(
                         prior_state,
                     ),
                     deferred,
+                    closed_children,
                 ))
             }
             .scope_boxed()
@@ -2128,6 +2170,7 @@ pub async fn terminate_workflow_execution_collect(
             ));
         }
     }
+    deferred_checks.extend(closed_children);
 
     Ok((
         cancel_result,

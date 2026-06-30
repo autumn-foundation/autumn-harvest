@@ -466,8 +466,16 @@ async fn commit_workflow_execution_timeout(
     timeout_event: &WorkflowEvent,
     error_msg: &str,
     metrics: Option<&(dyn MetricsRecorder + Send + Sync)>,
-) -> HarvestResult<(bool, Vec<crate::completion_trigger::DeferredTriggerStart>)> {
-    conn.transaction::<(bool, Vec<crate::completion_trigger::DeferredTriggerStart>), HarvestError, _>(|conn| {
+) -> HarvestResult<(
+    bool,
+    Vec<crate::completion_trigger::DeferredTriggerStart>,
+    Vec<(ExecutionId, String)>,
+)> {
+    conn.transaction::<(
+        bool,
+        Vec<crate::completion_trigger::DeferredTriggerStart>,
+        Vec<(ExecutionId, String)>,
+    ), HarvestError, _>(|conn| {
         let timeout_event = timeout_event.clone();
         let error_msg = error_msg.to_owned();
         async move {
@@ -483,7 +491,7 @@ async fn commit_workflow_execution_timeout(
 
             match current_state.as_deref() {
                 Some("RUNNING") => {}
-                _ => return Ok((false, Vec::new())),
+                _ => return Ok((false, Vec::new(), Vec::new())),
             }
 
             store::append_single_event(conn, exec_id, timeout_event).await?;
@@ -517,7 +525,7 @@ async fn commit_workflow_execution_timeout(
                 .await?;
             }
 
-            let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+            let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
             let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                 conn,
                 exec_id,
@@ -526,7 +534,7 @@ async fn commit_workflow_execution_timeout(
             )
             .await?;
             deferred.extend(triggers);
-            Ok((true, deferred))
+            Ok((true, deferred, closed_children))
         }
         .scope_boxed()
     })
@@ -625,44 +633,55 @@ async fn enforce_workflow_timeout(
         error: error.clone(),
     };
 
-    let deferred_starts = conn
-        .transaction::<Vec<crate::completion_trigger::DeferredTriggerStart>, HarvestError, _>(
-            |conn| {
-                let error = error.clone();
-                async move {
-                    store::append_events(conn, exec_id, &[workflow_event], history.next_event_id)
-                        .await?;
-                    update_workflow_execution_timed_out(conn, exec_id, &error).await?;
-                    queue::fail_task(conn, task.id, &error).await?;
-                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
-                    let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+    let (deferred_starts, closed_children) = conn
+        .transaction::<_, HarvestError, _>(|conn| {
+            let error = error.clone();
+            async move {
+                store::append_events(conn, exec_id, &[workflow_event], history.next_event_id)
+                    .await?;
+                update_workflow_execution_timed_out(conn, exec_id, &error).await?;
+                queue::fail_task(conn, task.id, &error).await?;
+                let (mut deferred, closed_children) =
+                    apply_parent_close_cascade(conn, exec_id).await?;
+                let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
+                    conn,
+                    exec_id,
+                    crate::completion_trigger::TerminalState::TimedOut,
+                    Some(metrics),
+                )
+                .await?;
+                deferred.extend(triggers);
+                if execution.parent_close_policy.is_none()
+                    && let Some(parent_uuid) = execution.parent_id
+                {
+                    wake_parent_for_child_timeout(
                         conn,
+                        execution_id_from_uuid(parent_uuid),
                         exec_id,
-                        crate::completion_trigger::TerminalState::TimedOut,
-                        Some(metrics),
+                        &error,
                     )
                     .await?;
-                    deferred.extend(triggers);
-                    if execution.parent_close_policy.is_none()
-                        && let Some(parent_uuid) = execution.parent_id
-                    {
-                        wake_parent_for_child_timeout(
-                            conn,
-                            execution_id_from_uuid(parent_uuid),
-                            exec_id,
-                            &error,
-                        )
-                        .await?;
-                    }
-                    Ok(deferred)
                 }
-                .scope_boxed()
-            },
-        )
+                Ok((deferred, closed_children))
+            }
+            .scope_boxed()
+        })
         .await?;
 
     for start in deferred_starts {
         start.spawn();
+    }
+
+    for (child_id, child_name) in closed_children {
+        if let Err(e) =
+            check_and_report_unfinished_handlers(conn, child_id, &child_name, Some(metrics)).await
+        {
+            tracing::error!(
+                child_id = %child_id,
+                err = %e,
+                "Failed to check and report unfinished handlers on cascaded child in workflow timeout"
+            );
+        }
     }
 
     if let Err(e) =
@@ -842,8 +861,8 @@ pub async fn enforce_workflow_execution_timeouts(
         )
         .await;
 
-        let (timed_out_applied, deferred_starts) = match result {
-            Ok((applied, deferred)) => (applied, deferred),
+        let (timed_out_applied, deferred_starts, closed_children) = match result {
+            Ok((applied, deferred, closed)) => (applied, deferred, closed),
             Err(error) => {
                 tracing::error!(
                     exec_id = %exec_id,
@@ -862,6 +881,23 @@ pub async fn enforce_workflow_execution_timeouts(
 
         for start in deferred_starts {
             start.spawn();
+        }
+
+        for (child_id, child_name) in closed_children {
+            if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+                conn,
+                child_id,
+                &child_name,
+                Some(metrics),
+            )
+            .await
+            {
+                tracing::error!(
+                    child_id = %child_id,
+                    err = %e,
+                    "Failed to check and report unfinished handlers on cascaded child in timeout"
+                );
+            }
         }
 
         if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
@@ -1769,8 +1805,12 @@ pub async fn enforce_workflow_history_ceiling(
         let workflow_name = row.workflow_name.clone();
         let queue_name = row.queue_name.clone();
 
-        let (applied, deferred_starts) = conn
-            .transaction::<(bool, Vec<crate::completion_trigger::DeferredTriggerStart>), HarvestError, _>(|conn| {
+        let (applied, deferred_starts, closed_children) = conn
+            .transaction::<(
+                bool,
+                Vec<crate::completion_trigger::DeferredTriggerStart>,
+                Vec<(ExecutionId, String)>,
+            ), HarvestError, _>(|conn| {
                 let fail_event = fail_event.clone();
                 let error_msg = error_msg.clone();
                 async move {
@@ -1786,7 +1826,7 @@ pub async fn enforce_workflow_history_ceiling(
                         .map_err(crate::error::database_error)?;
 
                     if current_state.as_deref() != Some("RUNNING") {
-                        return Ok((false, Vec::new()));
+                        return Ok((false, Vec::new(), Vec::new()));
                     }
 
                     store::append_single_event(conn, exec_id, fail_event).await?;
@@ -1832,7 +1872,8 @@ pub async fn enforce_workflow_history_ceiling(
                         .await?;
                     }
 
-                    let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+                    let (mut deferred, closed_children) =
+                        apply_parent_close_cascade(conn, exec_id).await?;
                     let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
                         conn,
                         exec_id,
@@ -1841,7 +1882,7 @@ pub async fn enforce_workflow_history_ceiling(
                     )
                     .await?;
                     deferred.extend(triggers);
-                    Ok((true, deferred))
+                    Ok((true, deferred, closed_children))
                 }
                 .scope_boxed()
             })
@@ -1881,6 +1922,23 @@ pub async fn enforce_workflow_history_ceiling(
                 err = %e,
                 "Failed to check and report unfinished handlers on history ceiling enforcement"
             );
+        }
+
+        for (child_id, child_name) in closed_children {
+            if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+                conn,
+                child_id,
+                &child_name,
+                Some(metrics),
+            )
+            .await
+            {
+                tracing::error!(
+                    child_id = %child_id,
+                    err = %e,
+                    "Failed to check and report unfinished handlers on cascaded child execution in history ceiling"
+                );
+            }
         }
 
         // Best-effort: count ceiling failures toward the schedule auto-pause threshold.

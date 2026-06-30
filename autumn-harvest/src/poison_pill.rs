@@ -243,6 +243,7 @@ mod scanner {
     ) -> HarvestResult<(
         Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
         Vec<DeferredTriggerStart>,
+        Vec<(ExecutionId, String)>,
     )> {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
 
@@ -281,7 +282,7 @@ mod scanner {
             origin,
         )) = current
         else {
-            return Ok((None, Vec::new()));
+            return Ok((None, Vec::new(), Vec::new()));
         };
         // PAUSED is a non-terminal active state (issue #383): an in-flight
         // activity that was admitted before the pause can still be running, so a
@@ -289,7 +290,7 @@ mod scanner {
         // owning workflow rather than leave it parked in PAUSED forever with a
         // dead task. Treat PAUSED like RUNNING here.
         if state != "RUNNING" && state != "PAUSED" {
-            return Ok((None, Vec::new()));
+            return Ok((None, Vec::new(), Vec::new()));
         }
 
         let history = crate::store::load_history(conn, exec_id).await?;
@@ -347,7 +348,7 @@ mod scanner {
             .map_err(crate::error::database_error)?;
         }
 
-        let mut deferred = apply_parent_close_cascade(conn, exec_id).await?;
+        let (mut deferred, closed_children) = apply_parent_close_cascade(conn, exec_id).await?;
         let failed_triggers = crate::completion_trigger::evaluate_triggers_for_execution(
             conn,
             exec_id,
@@ -379,6 +380,7 @@ mod scanner {
         Ok((
             Some((workflow_id, workflow_name, schedule_id, origin)),
             deferred,
+            closed_children,
         ))
     }
 
@@ -445,15 +447,16 @@ mod scanner {
         // workflow's (id, name, schedule_id, origin) when it was actually failed
         // RUNNING → FAILED so the schedule failure counter can be bumped (with
         // the correct origin) after commit.
-        let (acted, failed_workflow, deferred_starts) = conn
+        let (acted, failed_workflow, deferred_starts, closed_children) = conn
             .transaction::<(
                 bool,
                 Option<(String, String, Option<uuid::Uuid>, Option<String>)>,
                 Vec<DeferredTriggerStart>,
+                Vec<(ExecutionId, String)>,
             ), HarvestError, _>(|conn| {
                 async move {
                     let Some(worker_id) = worker else {
-                        return Ok((false, None, Vec::new()));
+                        return Ok((false, None, Vec::new(), Vec::new()));
                     };
                     let current: Option<(String, Option<String>, i32)> = dsl::harvest_task_queue
                         .find(task_id)
@@ -468,10 +471,10 @@ mod scanner {
                             if state == "RUNNING"
                                 && wid == worker_id
                                 && strikes == prior_strikes => {}
-                        _ => return Ok((false, None, Vec::new())),
+                        _ => return Ok((false, None, Vec::new(), Vec::new())),
                     }
                     if !worker_still_dead(conn, &worker_id, worker_stale_secs).await? {
-                        return Ok((false, None, Vec::new()));
+                        return Ok((false, None, Vec::new(), Vec::new()));
                     }
 
                     dead_letter(conn, &entry).await?;
@@ -488,14 +491,14 @@ mod scanner {
                         .await
                         .map_err(crate::error::database_error)?;
 
-                    let (failed_workflow, deferred) = match workflow_exec_id {
+                    let (failed_workflow, deferred, closed_children) = match workflow_exec_id {
                         Some(exec_uuid) => {
                             fail_owning_workflow(conn, execution_id_from_uuid(exec_uuid), &error)
                                 .await?
                         }
-                        None => (None, Vec::new()),
+                        None => (None, Vec::new(), Vec::new()),
                     };
-                    Ok((true, failed_workflow, deferred))
+                    Ok((true, failed_workflow, deferred, closed_children))
                 }
                 .scope_boxed()
             })
@@ -513,6 +516,25 @@ mod scanner {
                     &task.queue_name,
                     crate::telemetry::WorkflowStatus::Failed,
                 );
+
+                if let Some(exec_uuid) = task.workflow_exec_id {
+                    let exec_id = execution_id_from_uuid(exec_uuid);
+                    if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+                        conn,
+                        exec_id,
+                        &workflow_name,
+                        Some(metrics),
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            exec_id = %exec_id,
+                            err = %e,
+                            "Failed to check and report unfinished handlers on poison pill workflow failure"
+                        );
+                    }
+                }
+
                 crate::scheduler::maybe_increment_schedule_failure_counter(
                     conn,
                     &workflow_id,
@@ -523,6 +545,24 @@ mod scanner {
                 )
                 .await;
             }
+
+            for (child_id, child_name) in closed_children {
+                if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+                    conn,
+                    child_id,
+                    &child_name,
+                    Some(metrics),
+                )
+                .await
+                {
+                    tracing::error!(
+                        child_id = %child_id,
+                        err = %e,
+                        "Failed to check and report unfinished handlers on cascaded child in poison pill"
+                    );
+                }
+            }
+
             for start in deferred_starts {
                 start.spawn();
             }
