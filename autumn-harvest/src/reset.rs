@@ -735,6 +735,7 @@ pub async fn preview_workflow_reset(
 /// # Errors
 ///
 /// Returns [`WorkflowResetError`] if validation fails or any persistence step fails.
+#[allow(clippy::too_many_lines)]
 pub async fn reset_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
