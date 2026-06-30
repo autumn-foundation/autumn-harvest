@@ -36,6 +36,17 @@ impl HistoryAnalyzer {
         Self { rules: Vec::new() }
     }
 
+    /// Create a new analyzer with the default set of rules.
+    #[must_use]
+    pub fn with_default_rules() -> Self {
+        Self::new()
+            .with_rule(ExcessiveRetriesRule::new(3))
+            .with_rule(SuspiciousTimerRule::new())
+            .with_rule(LargePayloadRule::new(1024 * 1024))
+            .with_rule(SequentialActivitiesRule::new(5))
+    }
+
+
     /// Add a rule to the analyzer.
     #[must_use]
     pub fn with_rule(mut self, rule: impl AnalyzerRule + 'static) -> Self {
@@ -225,11 +236,172 @@ impl AnalyzerRule for LargePayloadRule {
     }
 }
 
+
+/// Flags workflows that execute multiple activities sequentially without concurrency.
+///
+/// Sequential execution of many activities often indicates a missed opportunity
+/// to use `futures::join_all` or a DAG to reduce total workflow latency.
+pub struct SequentialActivitiesRule {
+    threshold: usize,
+}
+
+impl SequentialActivitiesRule {
+    /// Create a new `SequentialActivitiesRule` with the given sequential threshold.
+    #[must_use]
+    pub const fn new(threshold: usize) -> Self {
+        Self { threshold }
+    }
+}
+
+impl AnalyzerRule for SequentialActivitiesRule {
+    fn name(&self) -> &'static str {
+        "SequentialActivities"
+    }
+
+    fn analyze(&self, history: &[WorkflowEvent]) -> Vec<AnalyzerWarning> {
+        let mut warnings = Vec::new();
+        let mut sequential_count = 0;
+        let mut active_activities = 0;
+        let mut max_sequential = 0;
+
+        for event in history {
+            match event {
+                WorkflowEvent::ActivityScheduled { .. } | WorkflowEvent::LocalActivityScheduled { .. } => {
+                    active_activities += 1;
+                    if active_activities > 1 {
+                        // Concurrency detected! Reset sequential count.
+                        sequential_count = 0;
+                    }
+                }
+                WorkflowEvent::ActivityCompleted { .. } | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. } | WorkflowEvent::LocalActivityCompleted { .. }
+                | WorkflowEvent::LocalActivityFailed { .. } | WorkflowEvent::LocalActivityExhausted { .. } => {
+                    if active_activities > 0 {
+                        active_activities -= 1;
+                        if active_activities == 0 {
+                            sequential_count += 1;
+                            max_sequential = max_sequential.max(sequential_count);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if max_sequential >= self.threshold {
+            warnings.push(AnalyzerWarning {
+                rule_name: self.name().to_string(),
+                message: format!(
+                    "Found {max_sequential} activities executed strictly sequentially. Consider running them concurrently using `futures::join_all` or a DAG."
+                ),
+            });
+        }
+
+        warnings
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{ActivityExecId, TimerId};
     use chrono::Utc;
+
+
+    #[test]
+    fn sequential_activities_rule_flags_over_threshold() {
+        let rule = SequentialActivitiesRule::new(3);
+
+        let id1 = ActivityExecId::new();
+        let id2 = ActivityExecId::new();
+        let id3 = ActivityExecId::new();
+
+        let history = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id1,
+                name: "Task1".to_string(),
+                input: serde_json::Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id1,
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id2,
+                name: "Task2".to_string(),
+                input: serde_json::Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id2,
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id3,
+                name: "Task3".to_string(),
+                input: serde_json::Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id3,
+                output: serde_json::Value::Null,
+            },
+        ];
+
+        let warnings = rule.analyze(&history);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].rule_name, "SequentialActivities");
+        assert!(warnings[0].message.contains("3 activities executed strictly sequentially"));
+    }
+
+    #[test]
+    fn sequential_activities_rule_ignores_concurrent_activities() {
+        let rule = SequentialActivitiesRule::new(3);
+
+        let id1 = ActivityExecId::new();
+        let id2 = ActivityExecId::new();
+        let id3 = ActivityExecId::new();
+
+        let history = vec![
+            // A & B concurrent
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id1,
+                name: "Task1".to_string(),
+                input: serde_json::Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id2,
+                name: "Task2".to_string(),
+                input: serde_json::Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id1,
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id2,
+                output: serde_json::Value::Null,
+            },
+            // C sequential after A & B
+            WorkflowEvent::ActivityScheduled {
+                activity_id: id3,
+                name: "Task3".to_string(),
+                input: serde_json::Value::Null,
+                queue: "default".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: id3,
+                output: serde_json::Value::Null,
+            },
+        ];
+
+        let warnings = rule.analyze(&history);
+        assert!(warnings.is_empty(), "Concurrency should reset sequential count");
+    }
+
 
     #[test]
     fn excessive_retries_flags_activities_over_threshold() {

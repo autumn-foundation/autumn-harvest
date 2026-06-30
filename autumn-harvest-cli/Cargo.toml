@@ -30,6 +30,11 @@ path = "src/main.rs"
 name = "harvest-replay"
 path = "src/bin/harvest_replay.rs"
 
+
+[[bin]]
+name = "harvest-analyze"
+path = "src/bin/harvest_analyze.rs"
+
 [dev-dependencies]
 tempfile = "3"
 
