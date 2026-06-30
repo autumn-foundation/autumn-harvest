@@ -1868,6 +1868,21 @@ pub async fn enforce_workflow_history_ceiling(
             crate::telemetry::WorkflowStatus::Failed,
         );
 
+        if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+            conn,
+            exec_id,
+            &workflow_name,
+            Some(metrics),
+        )
+        .await
+        {
+            tracing::error!(
+                exec_id = %exec_id,
+                err = %e,
+                "Failed to check and report unfinished handlers on history ceiling enforcement"
+            );
+        }
+
         // Best-effort: count ceiling failures toward the schedule auto-pause threshold.
         // Called after the transaction commits so a counter query failure cannot
         // roll back the terminal transition.

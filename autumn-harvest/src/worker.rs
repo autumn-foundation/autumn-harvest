@@ -6065,7 +6065,7 @@ async fn fail_workflow_for_history_cap(
         cap,
         workflow_type: execution.workflow_name.clone(),
     };
-    move_workflow_to_dlq_for_history_cap(
+    let deferred = move_workflow_to_dlq_for_history_cap(
         conn,
         task,
         exec_id,
@@ -6074,7 +6074,17 @@ async fn fail_workflow_for_history_cap(
         execution.parent_id.map(execution_id_from_uuid),
         reason,
     )
-    .await
+    .await?;
+
+    check_and_report_unfinished_handlers_for_worker(
+        conn,
+        exec_id,
+        Some(&execution.workflow_name),
+        Some(telemetry.metrics.as_ref()),
+    )
+    .await;
+
+    Ok(deferred)
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
