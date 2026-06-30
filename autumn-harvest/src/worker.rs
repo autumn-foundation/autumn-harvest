@@ -5654,6 +5654,8 @@ async fn persist_workflow_outcome(
             // task/worker_id are Copy references; capture before persistence is moved.
             let task = persistence.task;
             let worker_id = persistence.worker_id;
+            let exec_id = persistence.exec_id;
+            let workflow_name = execution.workflow_name.clone();
             let result = persist_workflow_continue_as_new(
                 conn,
                 persistence,
@@ -5664,7 +5666,7 @@ async fn persist_workflow_outcome(
             .await;
             fail_execution_on_error(conn, task, worker_id, result)
                 .await
-                .map(|()| (false, Vec::new()))
+                .map(|()| (false, vec![(exec_id, Some(workflow_name))]))
         }
     }
 }
