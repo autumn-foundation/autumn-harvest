@@ -1137,6 +1137,19 @@ impl WorkflowSchedule {
         self
     }
 
+    /// Set a remaining-action budget for this schedule (issue #543).
+    ///
+    /// An alias for [`with_max_runs`](Self::with_max_runs) — `max_runs`/`runs_started`
+    /// on `harvest_schedules` already implement the "declare a firing budget, decrement
+    /// exactly-once per actually-started run under the HA claim (#350), never consumed
+    /// by a suppressed firing" contract issue #543 asks for. This method exists so
+    /// callers can spell the intent as "N actions remaining" without needing to know
+    /// the underlying total-budget representation.
+    #[must_use]
+    pub const fn with_limited_actions(self, limit: u32) -> Self {
+        self.with_max_runs(limit)
+    }
+
     /// Set a default retry policy for runs started by this schedule (issue #523).
     ///
     /// Each run started by this schedule will use this as its retry policy
@@ -1514,6 +1527,52 @@ mod tests {
         // All rules fire vacuously when there are no upstreams
         assert!(TriggerRule::AllSuccess.should_run(&[]));
         assert!(TriggerRule::AllDone.should_run(&[]));
+    }
+
+    // ── Bounded schedules (issue #543 / #478) ───────────────────────────────────
+
+    #[test]
+    fn workflow_schedule_with_limited_actions_sets_max_runs() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_limited_actions(5);
+        assert_eq!(sched.max_runs, Some(5));
+    }
+
+    #[test]
+    fn workflow_schedule_with_limited_actions_zero_normalises_to_none() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual).with_limited_actions(0);
+        assert_eq!(
+            sched.max_runs, None,
+            "limited_actions(0) must behave identically to max_runs(0) — no limit, \
+             not an unfireable schedule"
+        );
+    }
+
+    #[test]
+    fn workflow_schedule_with_limited_actions_matches_with_max_runs() {
+        let via_limited = WorkflowSchedule::new("my_wf", Schedule::Manual).with_limited_actions(3);
+        let via_max_runs = WorkflowSchedule::new("my_wf", Schedule::Manual).with_max_runs(3);
+        assert_eq!(via_limited.max_runs, via_max_runs.max_runs);
+    }
+
+    #[test]
+    fn workflow_schedule_end_at_and_limited_actions_default_to_none() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual);
+        assert_eq!(sched.end_at, None);
+        assert_eq!(
+            sched.max_runs, None,
+            "unbounded by default — today's behaviour"
+        );
+    }
+
+    #[test]
+    fn workflow_schedule_with_limited_actions_composes_with_jitter_and_overlap() {
+        let sched = WorkflowSchedule::new("my_wf", Schedule::Manual)
+            .with_limited_actions(10)
+            .with_jitter(Duration::from_secs(60))
+            .with_overlap_policy(OverlapPolicy::CancelOther);
+        assert_eq!(sched.max_runs, Some(10));
+        assert_eq!(sched.jitter, Duration::from_secs(60));
+        assert_eq!(sched.overlap_policy, OverlapPolicy::CancelOther);
     }
 
     // ── SkipPolicy ────────────────────────────────────────────────────────────
