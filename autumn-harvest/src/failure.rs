@@ -28,6 +28,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::policy::RetryPolicy;
+
 /// Stable error-type name for circuit-breaker short-circuit failures (issue #369).
 ///
 /// Synthesised when an activity's circuit breaker is open. Workflow authors
@@ -252,6 +254,44 @@ pub fn parse_error_payload_full(payload: &str) -> ActivityFailure {
     }
 }
 
+/// Whether `error` is non-retryable under the shared retry-termination rule
+/// (issue #227): the typed payload's own `non_retryable` flag, or the
+/// resolved policy's `non_retryable_errors` list (which also matches legacy
+/// `Err(String)` values the typed flag never sees). Used by the `db`-gated
+/// live worker's retry/circuit-breaker classification (`worker.rs`); the
+/// DB-less `WorkflowSimulator` test harness (`simulator.rs`) calls
+/// [`classify_activity_error`] directly instead, so the two callers share
+/// one rule without pulling `worker.rs` into a `--no-default-features` build.
+#[cfg(feature = "db")]
+#[must_use]
+pub(crate) fn failure_is_non_retryable(error: &str, retry_policy: Option<&RetryPolicy>) -> bool {
+    classify_activity_error(error, retry_policy).1
+}
+
+/// Parse `error` once and return both the recovered [`ActivityFailure`]
+/// (equivalent to [`parse_error_payload_full`]) and whether it is
+/// non-retryable (equivalent to [`failure_is_non_retryable`]), without
+/// deserializing the wire payload twice.
+#[must_use]
+pub(crate) fn classify_activity_error(
+    error: &str,
+    retry_policy: Option<&RetryPolicy>,
+) -> (ActivityFailure, bool) {
+    let typed = parse_typed_payload(error);
+    let non_retryable = typed.as_ref().is_some_and(|f| f.non_retryable)
+        || retry_policy.is_some_and(|policy| {
+            let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
+            policy.is_non_retryable(typed_error_type, error)
+        });
+    let failure = typed.unwrap_or_else(|| ActivityFailure {
+        error_type: "Error".to_string(),
+        message: error.to_string(),
+        details: None,
+        non_retryable: false,
+    });
+    (failure, non_retryable)
+}
+
 // ---------------------------------------------------------------------------
 // Tests (red phase: written before implementation compiles)
 // ---------------------------------------------------------------------------
@@ -416,5 +456,69 @@ mod tests {
         let (error_type, non_retryable, _) = parse_error_payload(&payload);
         assert_eq!(error_type, "CircuitOpen");
         assert!(non_retryable);
+    }
+
+    #[test]
+    fn classify_activity_error_matches_parse_error_payload_full_for_legacy() {
+        let (failure, non_retryable) = classify_activity_error("connection refused", None);
+        assert_eq!(failure, parse_error_payload_full("connection refused"));
+        assert!(!non_retryable);
+    }
+
+    #[test]
+    fn classify_activity_error_matches_parse_error_payload_full_for_typed() {
+        let payload =
+            ActivityFailure::retryable("UpstreamTimeout", "gateway timed out").into_error_payload();
+        let (failure, non_retryable) = classify_activity_error(&payload, None);
+        assert_eq!(failure, parse_error_payload_full(&payload));
+        assert!(!non_retryable);
+    }
+
+    #[test]
+    fn classify_activity_error_honours_typed_non_retryable_flag() {
+        let payload =
+            ActivityFailure::non_retryable("InvalidInput", "bad request").into_error_payload();
+        let (failure, non_retryable) = classify_activity_error(&payload, None);
+        assert!(non_retryable);
+        assert_eq!(failure.error_type, "InvalidInput");
+    }
+
+    #[test]
+    fn classify_activity_error_honours_policy_non_retryable_errors_list() {
+        let policy = crate::policy::RetryPolicy {
+            max_attempts: 5,
+            initial_interval: std::time::Duration::from_secs(1),
+            backoff_coefficient: 1.0,
+            max_interval: std::time::Duration::from_secs(1),
+            non_retryable_errors: vec!["bad input".to_string()],
+            jitter: crate::policy::JitterPolicy::None,
+        };
+        let (_, non_retryable) = classify_activity_error("bad input", Some(&policy));
+        assert!(non_retryable);
+    }
+
+    #[test]
+    fn classify_activity_error_legacy_never_matches_policy_error_synthetic_type() {
+        // Regression guard for issue #227: a policy listing "Error" (the
+        // synthetic legacy error_type) must not halt retries on every
+        // untyped `Err(String)` failure.
+        let policy = crate::policy::RetryPolicy {
+            max_attempts: 5,
+            initial_interval: std::time::Duration::from_secs(1),
+            backoff_coefficient: 1.0,
+            max_interval: std::time::Duration::from_secs(1),
+            non_retryable_errors: vec!["Error".to_string()],
+            jitter: crate::policy::JitterPolicy::None,
+        };
+        let (_, non_retryable) = classify_activity_error("some transient failure", Some(&policy));
+        assert!(!non_retryable);
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn failure_is_non_retryable_delegates_to_classify_activity_error() {
+        let payload = ActivityFailure::non_retryable("X", "y").into_error_payload();
+        assert!(failure_is_non_retryable(&payload, None));
+        assert!(!failure_is_non_retryable("plain string", None));
     }
 }
