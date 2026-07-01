@@ -81,7 +81,7 @@ impl AnalyzerRule for ExcessiveRetriesRule {
 
     fn analyze(&self, history: &[WorkflowEvent]) -> Vec<AnalyzerWarning> {
         let mut warnings = Vec::new();
-        let mut activity_names = HashMap::new();
+        let mut activity_names: HashMap<&crate::types::ActivityExecId, &str> = HashMap::new();
         // Falls back to the most recently scheduled activity's name when an
         // `ActivityFailed` event's id has no exact match. Some history
         // producers intentionally emit `ActivityFailed` events for retry
@@ -90,15 +90,17 @@ impl AnalyzerRule for ExcessiveRetriesRule {
         // per-attempt retry events, `simulator.rs`), so an exact-id-only
         // lookup would misreport those as "Unknown" even though the
         // surrounding history unambiguously identifies the activity.
-        let mut last_scheduled_name: Option<String> = None;
+        // Both maps borrow from `history` rather than cloning — the names
+        // are only ever used to format a warning message.
+        let mut last_scheduled_name: Option<&str> = None;
 
         for event in history {
             match event {
                 WorkflowEvent::ActivityScheduled {
                     activity_id, name, ..
                 } => {
-                    activity_names.insert(*activity_id, name.clone());
-                    last_scheduled_name = Some(name.clone());
+                    activity_names.insert(activity_id, name.as_str());
+                    last_scheduled_name = Some(name.as_str());
                 }
                 WorkflowEvent::ActivityFailed {
                     activity_id,
@@ -107,9 +109,9 @@ impl AnalyzerRule for ExcessiveRetriesRule {
                 } if *attempt > self.threshold => {
                     let name = activity_names
                         .get(activity_id)
-                        .cloned()
-                        .or_else(|| last_scheduled_name.clone())
-                        .unwrap_or_else(|| "Unknown".to_string());
+                        .copied()
+                        .or(last_scheduled_name)
+                        .unwrap_or("Unknown");
                     warnings.push(AnalyzerWarning {
                         rule_name: self.name().to_string(),
                         message: format!(
