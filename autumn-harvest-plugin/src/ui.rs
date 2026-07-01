@@ -4489,7 +4489,7 @@ enum DagNodeState {
     /// Skipped because a trigger rule evaluated to false over upstream statuses.
     Skipped,
     /// Skipped because a data-dependent condition predicate evaluated to false
-    /// (issue #482).  Distinct from [`Skipped`] so the UI can show a different
+    /// (issue #482).  Distinct from `Skipped` so the UI can show a different
     /// label ("Skipped (condition)").
     SkippedByCondition,
     Unknown,

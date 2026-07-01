@@ -4501,7 +4501,7 @@ async fn list_workflows(
 /// `GET /workflows/registered` — list all registered workflow types with
 /// their optional JSON Schema, description, and type information (issue #373).
 ///
-/// Returns an array of [`RegisteredWorkflowRecord`] objects sorted by name.
+/// Returns an array of `RegisteredWorkflowRecord` objects sorted by name.
 /// Workflows that have not opted into schema publishing return `null` for
 /// `input_schema`, `output_schema`, and `error_schema`.
 async fn list_registered_workflows(
@@ -4521,7 +4521,7 @@ async fn list_registered_workflows(
 /// `GET /workflows/registered/{name}/schema` — return the schema record for a
 /// single registered workflow type (issue #373).
 ///
-/// Returns `200` with the [`RegisteredWorkflowRecord`] when the workflow is
+/// Returns `200` with the `RegisteredWorkflowRecord` when the workflow is
 /// known, or `404` when the name is not registered.
 async fn get_registered_workflow_schema(
     Extension(api_state): Extension<HarvestApiState>,
