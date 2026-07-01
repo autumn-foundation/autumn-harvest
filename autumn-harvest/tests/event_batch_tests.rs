@@ -145,7 +145,10 @@ async fn test_event_batch_accumulation_and_size_flush() {
         max_size: 3,
         shard_id: 0,
     };
-    let (o1, _deferred_starts1) = admit_batched_start(&mut conn, p1).await.unwrap().unwrap();
+    let (o1, _deferred_starts1) = admit_batched_start(&mut conn, p1, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(o1.pending_count, 1);
     assert!(!o1.is_flushed);
 
@@ -161,7 +164,10 @@ async fn test_event_batch_accumulation_and_size_flush() {
         max_size: 3,
         shard_id: 0,
     };
-    let (o2, _deferred_starts2) = admit_batched_start(&mut conn, p2).await.unwrap().unwrap();
+    let (o2, _deferred_starts2) = admit_batched_start(&mut conn, p2, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(o2.pending_count, 2);
     assert!(!o2.is_flushed);
 
@@ -177,7 +183,10 @@ async fn test_event_batch_accumulation_and_size_flush() {
         max_size: 3,
         shard_id: 0,
     };
-    let (o3, _deferred_starts3) = admit_batched_start(&mut conn, p3).await.unwrap().unwrap();
+    let (o3, _deferred_starts3) = admit_batched_start(&mut conn, p3, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(o3.pending_count, 3);
     assert!(o3.is_flushed);
     assert!(o3.flushed_execution_id.is_some());
@@ -198,7 +207,10 @@ async fn test_event_batch_time_flush() {
         max_size: 5,
         shard_id: 0,
     };
-    let (o, _deferred_starts) = admit_batched_start(&mut conn, p).await.unwrap().unwrap();
+    let (o, _deferred_starts) = admit_batched_start(&mut conn, p, None)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(o.pending_count, 1);
     assert!(!o.is_flushed);
 

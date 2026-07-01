@@ -348,6 +348,12 @@ pub const METRIC_WORKFLOW_PAUSED: &str = "harvest.workflow.paused";
 /// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_PAUSE_DURATION: &str = "harvest.workflow.pause_duration";
 
+/// Counter: incremented when a workflow execution reaches a terminal state
+/// with unfinished update/signal handlers (issue #536).
+///
+/// Labeled by `workflow` (workflow name) and `kind` (handler kind, e.g. "update").
+pub const METRIC_WORKFLOW_UNFINISHED_HANDLERS: &str = "harvest.workflow.unfinished_handlers";
+
 /// Counter: incremented each time a poison-pill task is quarantined to the
 /// dead-letter queue after crashing `poison_pill_threshold` workers in a row
 /// (issue #367).
@@ -947,6 +953,11 @@ pub trait MetricsRecorder: Send + Sync {
     /// A workflow task entered the executor on a worker.
     fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    /// A workflow execution reached a terminal state with unfinished update/signal handlers (issue #536).
+    fn record_workflow_unfinished_handlers(&self, workflow_name: &str, kind: &str, count: u64) {
+        let _ = (workflow_name, kind, count);
     }
 
     /// A workflow task finished an executor cycle.

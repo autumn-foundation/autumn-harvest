@@ -30,10 +30,10 @@ use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_ACTIVITY_DURATION, METRIC_DLQ_ENTRIES, METRIC_QUEUE_DEPTH,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_SCHEDULE_TO_START,
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_STARTED, MetricsRecorder, TelemetryConfig,
-    WorkflowStatus,
+    METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
+    MetricsRecorder, TelemetryConfig, WorkflowStatus,
 };
-use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, ShardId};
+use autumn_harvest::types::{ActivityExecId, ExecutionId, ParentClosePolicy, ShardId, UpdateId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, RetryPolicy, WorkflowContext, WorkflowHistoryPolicy};
 use chrono::Utc;
@@ -277,6 +277,17 @@ impl MetricsRecorder for RecordingMetrics {
             ],
         );
     }
+
+    fn record_workflow_unfinished_handlers(&self, workflow_name: &str, kind: &str, count: u64) {
+        self.push(
+            METRIC_WORKFLOW_UNFINISHED_HANDLERS,
+            vec![
+                ("workflow", workflow_name.to_owned()),
+                ("kind", kind.to_owned()),
+                ("count", count.to_string()),
+            ],
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +441,13 @@ fn metrics_test_workflow<'a>(
             .await
             .map_err(|e| e.to_string())
     })
+}
+
+fn unfinished_updates_test_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(serde_json::json!({"completed": true})) })
 }
 
 fn metrics_activity<'a>(
@@ -3048,5 +3066,136 @@ async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
     assert!(
         ages_saturated.is_empty(),
         "task behind a saturated concurrency cap must be excluded; got {ages_saturated:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn workflow_completed_with_unfinished_updates_emits_metric() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("failed to connect");
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let workflow_input = serde_json::json!({});
+
+    let exec_row = NewWorkflowExecution {
+        id: exec_id.as_uuid(),
+        workflow_name: "unfinished_updates_test_workflow",
+        workflow_id: &format!("unfinished-updates-{}", Uuid::new_v4()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: workflow_input.clone(),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&exec_row)
+        .execute(&mut conn)
+        .await
+        .expect("failed to insert workflow execution row");
+
+    // Append WorkflowStarted AND UpdateAdmitted to history.
+    let update_id = UpdateId::new();
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[
+            WorkflowEvent::WorkflowStarted {
+                input: workflow_input.clone(),
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::UpdateAdmitted {
+                update_id,
+                name: "unresolved_update".to_string(),
+                input: serde_json::json!({}),
+                timestamp: Utc::now(),
+            },
+        ],
+        0,
+    )
+    .await
+    .expect("append events failed");
+
+    let mut enqueue_params =
+        EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    enqueue_params.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue_params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+    queue_mod::enqueue(&mut conn, &enqueue_params)
+        .await
+        .expect("enqueue failed");
+
+    let recording = Arc::new(RecordingMetrics::default());
+    let telemetry = Arc::new(
+        TelemetryConfig::builder()
+            .metrics(Arc::clone(&recording) as Arc<dyn MetricsRecorder>)
+            .build(),
+    );
+
+    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
+        vec![WorkflowInfo {
+            name: "unfinished_updates_test_workflow",
+            module: "metrics_integration",
+            handler: unfinished_updates_test_workflow,
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+        }],
+        vec![],
+        autumn_harvest::context::empty_shared_state(),
+        telemetry,
+    ));
+
+    let worker = build_worker("metrics-worker-unfinished", registry);
+    let pool = build_test_pool(&database_url);
+
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    wait_for_completed(&database_url, exec_id).await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join cleanly");
+
+    let names = recording.names();
+    assert!(
+        names.contains(&METRIC_WORKFLOW_UNFINISHED_HANDLERS),
+        "harvest.workflow.unfinished_handlers must be emitted; got: {names:?}"
     );
 }

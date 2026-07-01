@@ -17,7 +17,7 @@ use uuid::Uuid;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::shard::ShardRouter;
 use autumn_harvest::types::{ExecutionId, Priority};
-use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
+use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution_with_metrics};
 
 use crate::config::HarvestOutboxConfig;
 use crate::state::HarvestDbPool;
@@ -305,7 +305,7 @@ pub(crate) async fn dispatch_workflow_start_request(
         .and_then(|registry| registry.max_workflow_attempts_ceiling);
     let sla = info_sla.and_then(|d| chrono::Duration::from_std(d).ok());
 
-    let start = start_or_load_workflow_execution(
+    let start = start_or_load_workflow_execution_with_metrics(
         &mut conn,
         StartWorkflowParams {
             workflow_name: &request.workflow_name,
@@ -341,6 +341,10 @@ pub(crate) async fn dispatch_workflow_start_request(
             // Outbox delivery is not a schedule fire (issue #534).
             origin: None,
         },
+        registry_ext.as_ref().map(|r| {
+            r.telemetry().metrics.as_ref()
+                as &(dyn autumn_harvest::telemetry::MetricsRecorder + Send + Sync)
+        }),
     )
     .await?;
 

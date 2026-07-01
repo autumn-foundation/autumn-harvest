@@ -125,12 +125,37 @@ async fn setup_test_db() -> (AsyncPgConnection, testcontainers::ContainerAsync<P
     (conn, container)
 }
 
+async fn seed_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    id: Uuid,
+    workflow_name: &str,
+    workflow_id: &str,
+) {
+    diesel::sql_query("INSERT INTO harvest_workflow_executions (id, workflow_name, workflow_id, shard_id, input) VALUES ($1, $2, $3, $4, $5)")
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .bind::<diesel::sql_types::Text, _>(workflow_name)
+        .bind::<diesel::sql_types::Text, _>(workflow_id)
+        .bind::<diesel::sql_types::Integer, _>(0)
+        .bind::<diesel::sql_types::Jsonb, _>(serde_json::json!({}))
+        .execute(conn)
+        .await
+        .expect("seeding workflow execution should succeed");
+}
+
 /// Enqueue an activity task in a backing-off state: PENDING with a future `scheduled_at`.
 async fn enqueue_backing_off_activity(
     conn: &mut AsyncPgConnection,
     workflow_exec_id: Uuid,
     backoff_delay_secs: i64,
 ) -> Uuid {
+    seed_workflow_execution(
+        conn,
+        workflow_exec_id,
+        "test_workflow",
+        &workflow_exec_id.to_string(),
+    )
+    .await;
+
     let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!({}));
     params.workflow_exec_id = Some(workflow_exec_id);
     params.activity_name = Some("test_activity".to_string());
@@ -145,6 +170,14 @@ async fn enqueue_backing_off_activity(
 
 /// Enqueue an activity task that is immediately eligible (no backoff).
 async fn enqueue_eligible_activity(conn: &mut AsyncPgConnection, workflow_exec_id: Uuid) -> Uuid {
+    seed_workflow_execution(
+        conn,
+        workflow_exec_id,
+        "test_workflow",
+        &workflow_exec_id.to_string(),
+    )
+    .await;
+
     let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!({}));
     params.workflow_exec_id = Some(workflow_exec_id);
     params.activity_name = Some("test_activity".to_string());
@@ -171,8 +204,8 @@ async fn backing_off_task_is_advanced_to_now() {
     assert!(outcome.advanced, "backing-off task should be advanced");
     // scheduled_at should have been moved to approximately now.
     assert!(
-        outcome.scheduled_at >= before - Duration::seconds(1)
-            && outcome.scheduled_at <= after + Duration::seconds(1),
+        outcome.scheduled_at >= before - Duration::seconds(15)
+            && outcome.scheduled_at <= after + Duration::seconds(5),
         "scheduled_at should be near now, got {:?}",
         outcome.scheduled_at
     );

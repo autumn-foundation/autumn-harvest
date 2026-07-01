@@ -1348,6 +1348,32 @@ impl WorkflowContext {
         self.build_id.as_deref()
     }
 
+    /// Returns `true` if all admitted update handlers have completed or failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal history matcher lock is poisoned.
+    #[must_use]
+    pub fn all_handlers_finished(&self) -> bool {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .all_handlers_finished()
+    }
+
+    /// Returns the number of admitted update handlers that have not completed or failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal history matcher lock is poisoned.
+    #[must_use]
+    pub fn unfinished_update_handler_count(&self) -> usize {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .unfinished_update_handler_count()
+    }
+
     // ── Last-completion-result carryover (issue #488) ─────────────────────────
 
     /// Returns the deserialized output of the most recent prior COMPLETED run of the same
@@ -9588,5 +9614,83 @@ mod tests {
     fn activity_context_headers_empty_on_default() {
         let ctx = ActivityContext::new_test();
         assert!(ctx.headers().is_empty());
+    }
+
+    // ── Orphaned update handler check tests (issue #536) ──────────────────
+
+    #[test]
+    fn test_unfinished_update_handler_accessors() {
+        let update_id1 = UpdateId::new();
+        let update_id2 = UpdateId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::UpdateAdmitted {
+                update_id: update_id1,
+                name: "update_1".into(),
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::UpdateAdmitted {
+                update_id: update_id2,
+                name: "update_2".into(),
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::UpdateCompleted {
+                update_id: update_id1,
+                output: Value::Null,
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // We expect update_id2 to be unfinished, while update_id1 is finished.
+        assert_eq!(
+            ctx.matcher
+                .lock()
+                .unwrap()
+                .unfinished_update_handler_count_at_end(),
+            1
+        );
+        assert!(!ctx.matcher.lock().unwrap().all_handlers_finished_at_end());
+    }
+
+    #[tokio::test]
+    async fn test_await_all_handlers_finished() {
+        let update_id = UpdateId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::UpdateAdmitted {
+                update_id,
+                name: "update_1".into(),
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::UpdateCompleted {
+                update_id,
+                output: Value::Null,
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        assert_eq!(ctx.unfinished_update_handler_count(), 0);
+        assert!(ctx.all_handlers_finished());
+        // Since all handlers are finished, this should resolve immediately
+        ctx.await_condition(|| ctx.all_handlers_finished())
+            .await
+            .unwrap();
     }
 }

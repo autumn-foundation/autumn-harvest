@@ -735,6 +735,7 @@ pub async fn preview_workflow_reset(
 /// # Errors
 ///
 /// Returns [`WorkflowResetError`] if validation fails or any persistence step fails.
+#[allow(clippy::too_many_lines)]
 pub async fn reset_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -742,8 +743,13 @@ pub async fn reset_workflow_execution(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ResetResult, WorkflowResetError> {
     let mut request = request.normalized();
-    let (res, deferred_starts) = conn
-        .transaction::<(ResetResult, Vec<DeferredTriggerStart>), WorkflowResetError, _>(|conn| {
+    let (res, deferred_starts, workflow_name, closed_children) = conn
+        .transaction::<(
+            ResetResult,
+            Vec<DeferredTriggerStart>,
+            String,
+            Vec<(ExecutionId, String)>,
+        ), WorkflowResetError, _>(|conn| {
             async move {
                 let source = load_source_execution(conn, exec_id, true).await?;
                 validate_source_execution(exec_id, &source, request.allow_terminal_source)?;
@@ -763,7 +769,7 @@ pub async fn reset_workflow_execution(
                 let source_next_event_id =
                     rows.last().map_or(0, |row| row.event_id.saturating_add(1));
 
-                let deferred = terminate_source_execution(
+                let (deferred, closed_children) = terminate_source_execution(
                     conn,
                     exec_id,
                     new_exec_id,
@@ -808,6 +814,8 @@ pub async fn reset_workflow_execution(
                         },
                     },
                     deferred,
+                    source.workflow_name,
+                    closed_children,
                 ))
             }
             .scope_boxed()
@@ -816,6 +824,44 @@ pub async fn reset_workflow_execution(
 
     for start in deferred_starts {
         start.spawn();
+    }
+
+    let metrics = registry.map(|r| {
+        let rec: &(dyn crate::telemetry::MetricsRecorder + Send + Sync) =
+            r.telemetry().metrics.as_ref();
+        rec
+    });
+
+    if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+        conn,
+        exec_id,
+        &workflow_name,
+        metrics,
+    )
+    .await
+    {
+        tracing::error!(
+            exec_id = %exec_id,
+            err = %e,
+            "Failed to check and report unfinished handlers on workflow reset"
+        );
+    }
+
+    for (child_id, child_name) in closed_children {
+        if let Err(e) = crate::execution::check_and_report_unfinished_handlers(
+            conn,
+            child_id,
+            &child_name,
+            metrics,
+        )
+        .await
+        {
+            tracing::error!(
+                child_id = %child_id,
+                err = %e,
+                "Failed to check and report unfinished handlers on cascaded child in reset"
+            );
+        }
     }
 
     Ok(res)
@@ -1121,7 +1167,7 @@ async fn terminate_source_execution(
     new_exec_id: ExecutionId,
     request: &WorkflowResetRequest,
     source_next_event_id: i32,
-) -> Result<Vec<DeferredTriggerStart>, WorkflowResetError> {
+) -> Result<(Vec<DeferredTriggerStart>, Vec<(ExecutionId, String)>), WorkflowResetError> {
     crate::store::append_events(
         conn,
         source_exec_id,
@@ -1166,9 +1212,9 @@ async fn terminate_source_execution(
         .execute(conn)
         .await
         .map_err(database_error)?;
-    let deferred = apply_parent_close_cascade(conn, source_exec_id).await?;
+    let (deferred, closed_children) = apply_parent_close_cascade(conn, source_exec_id).await?;
 
-    Ok(deferred)
+    Ok((deferred, closed_children))
 }
 
 async fn insert_fork_execution(

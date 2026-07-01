@@ -435,11 +435,11 @@ async fn start_harvest_runtime(
                     .and_then(|registry| {
                         registry.workflows.get("webhook_delivery").map(|wf| {
                             (
-                                wf.owner,
-                                wf.runbook_url,
+                                wf.owner.clone(),
+                                wf.runbook_url.clone(),
                                 wf.severity,
                                 wf.sla,
-                                wf.retry_policy,
+                                wf.retry_policy.clone(),
                             )
                         })
                     })

@@ -472,14 +472,17 @@ type FiredDebounce = (
     String,
     String,
     Vec<crate::completion_trigger::DeferredTriggerStart>,
+    Vec<(crate::types::ExecutionId, String)>,
+    Vec<(String, String)>,
 );
 
 /// Scan and fire due debounce rows on a single shard connection. Returns the
-/// fired records (`workflow_name`, `queue_name`, deferred trigger-starts) for the
+/// fired records (`workflow_name`, `queue_name`, deferred trigger-starts, deferred checks) for the
 /// caller to spawn + record metrics after all shards are processed.
 #[cfg(feature = "db")]
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
+    _metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
 ) -> crate::error::HarvestResult<Vec<FiredDebounce>> {
     use diesel_async::{AsyncConnection, RunQueryDsl};
 
@@ -570,14 +573,31 @@ pub async fn fire_due_debounced_starts(
     // Done per-shard immediately after that shard's claim transaction commits, so
     // an error on a *later* shard can never drop an earlier shard's already-
     // committed completion-trigger/parent-close follow-ups (Codex 580).
-    fn spawn_fired(
+    async fn spawn_fired(
         fired: Vec<FiredDebounce>,
         metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
+        conn: &mut diesel_async::AsyncPgConnection,
     ) -> usize {
         let count = fired.len();
-        for (workflow_name, queue_name, deferred_starts) in fired {
+        for (workflow_name, queue_name, deferred_starts, deferred_checks, cancel_metrics) in fired {
             for start in deferred_starts {
                 start.spawn();
+            }
+            for check in deferred_checks {
+                let _ = crate::execution::check_and_report_unfinished_handlers(
+                    conn,
+                    check.0,
+                    &check.1,
+                    Some(metrics),
+                )
+                .await;
+            }
+            for (wf_name, q_name) in cancel_metrics {
+                metrics.record_workflow_terminal(
+                    &wf_name,
+                    &q_name,
+                    crate::telemetry::WorkflowStatus::Cancelled,
+                );
             }
             metrics.record_debounce_fired(&workflow_name, &queue_name);
         }
@@ -605,14 +625,14 @@ pub async fn fire_due_debounced_starts(
                 // Spawn this shard's results before moving on; on this shard's own
                 // error the transaction rolled back, so there is nothing committed
                 // to drain and propagating is safe.
-                let fired = fire_due_on_conn(&mut shard_conn).await?;
-                fired_count += spawn_fired(fired, metrics);
+                let fired = fire_due_on_conn(&mut shard_conn, Some(metrics)).await?;
+                fired_count += spawn_fired(fired, metrics, &mut shard_conn).await;
             }
         }
         // Single-shard / no sharded pool: the passed connection is the only shard.
         _ => {
-            let fired = fire_due_on_conn(conn).await?;
-            fired_count += spawn_fired(fired, metrics);
+            let fired = fire_due_on_conn(conn, Some(metrics)).await?;
+            fired_count += spawn_fired(fired, metrics, conn).await;
         }
     }
 
@@ -647,13 +667,7 @@ async fn delete_debounce_row(
 async fn fire_claimed_debounce_row(
     conn: &mut diesel_async::AsyncPgConnection,
     row: FireDueRow,
-) -> crate::error::HarvestResult<
-    Option<(
-        String,
-        String,
-        Vec<crate::completion_trigger::DeferredTriggerStart>,
-    )>,
-> {
+) -> crate::error::HarvestResult<Option<FiredDebounce>> {
     let opts: DebounceStartOptions = serde_json::from_value(row.start_options).unwrap_or_default();
 
     let shard = crate::types::ShardId::new(row.shard_id);
@@ -727,10 +741,12 @@ async fn fire_claimed_debounce_row(
     // that rolls back with this transaction on error — the collect fn must not
     // spawn its follow-ups (they'd be orphaned). Deferred starts returned on
     // success are spawned by the caller only after the fire transaction commits.
-    match crate::execution::start_or_load_workflow_execution_collect(conn, params, true, false)
-        .await
+    match crate::execution::start_or_load_workflow_execution_collect(
+        conn, params, true, false, None,
+    )
+    .await
     {
-        Ok((started, deferred_starts)) => {
+        Ok((started, deferred_starts, deferred_checks, cancel_metrics)) => {
             delete_debounce_row(conn, row_id).await?;
             tracing::info!(
                 workflow_name = %workflow_name,
@@ -739,7 +755,13 @@ async fn fire_claimed_debounce_row(
                 queue = %queue_name,
                 "debounced start fired",
             );
-            Ok(Some((started.workflow_name, queue_name, deferred_starts)))
+            Ok(Some((
+                started.workflow_name,
+                queue_name,
+                deferred_starts,
+                deferred_checks,
+                cancel_metrics,
+            )))
         }
         // The target workflow_id is already taken under the reuse policy, so the
         // debounce intent can't produce a new run. Drop the record so the

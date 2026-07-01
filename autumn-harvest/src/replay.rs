@@ -343,6 +343,124 @@ impl HistoryMatcher {
         }
     }
 
+    /// Returns the IDs of all updates that were admitted but have not completed or failed
+    /// up to the specified event index.
+    #[must_use]
+    pub fn unfinished_update_handlers_at_index(&self, index: usize) -> Vec<UpdateId> {
+        let events_slice = &self.events[..index];
+        let has_updates = events_slice
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
+        if !has_updates {
+            return Vec::new();
+        }
+
+        let mut active = HashSet::new();
+        for event in events_slice {
+            match event {
+                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
+                    active.insert(*update_id);
+                }
+                WorkflowEvent::UpdateCompleted { update_id, .. }
+                | WorkflowEvent::UpdateFailed { update_id, .. } => {
+                    active.remove(update_id);
+                }
+                _ => {}
+            }
+        }
+        active.into_iter().collect()
+    }
+
+    /// Returns the IDs of all updates that were admitted but have not completed or failed.
+    #[must_use]
+    pub fn unfinished_update_handlers(&self) -> Vec<UpdateId> {
+        self.unfinished_update_handlers_at_index(self.cursor)
+    }
+
+    /// Returns the IDs of all updates that were admitted but have not completed or failed in the full history.
+    #[must_use]
+    pub fn unfinished_update_handlers_at_end(&self) -> Vec<UpdateId> {
+        self.unfinished_update_handlers_at_index(self.events.len())
+    }
+
+    /// Returns the number of unfinished update handlers up to the specified index.
+    #[must_use]
+    pub fn unfinished_update_handler_count_at_index(&self, index: usize) -> usize {
+        let events_slice = &self.events[..index];
+        let has_updates = events_slice
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
+        if !has_updates {
+            return 0;
+        }
+
+        let mut active = HashSet::new();
+        for event in events_slice {
+            match event {
+                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
+                    active.insert(*update_id);
+                }
+                WorkflowEvent::UpdateCompleted { update_id, .. }
+                | WorkflowEvent::UpdateFailed { update_id, .. } => {
+                    active.remove(update_id);
+                }
+                _ => {}
+            }
+        }
+        active.len()
+    }
+
+    /// Returns the number of unfinished update handlers.
+    #[must_use]
+    pub fn unfinished_update_handler_count(&self) -> usize {
+        self.unfinished_update_handler_count_at_index(self.cursor)
+    }
+
+    /// Returns the number of unfinished update handlers in the full history.
+    #[must_use]
+    pub fn unfinished_update_handler_count_at_end(&self) -> usize {
+        self.unfinished_update_handler_count_at_index(self.events.len())
+    }
+
+    /// Returns `true` if all admitted update handlers have completed or failed up to the specified index.
+    #[must_use]
+    pub fn all_handlers_finished_at_index(&self, index: usize) -> bool {
+        let events_slice = &self.events[..index];
+        let has_updates = events_slice
+            .iter()
+            .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
+        if !has_updates {
+            return true;
+        }
+
+        let mut active = HashSet::new();
+        for event in events_slice {
+            match event {
+                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
+                    active.insert(*update_id);
+                }
+                WorkflowEvent::UpdateCompleted { update_id, .. }
+                | WorkflowEvent::UpdateFailed { update_id, .. } => {
+                    active.remove(update_id);
+                }
+                _ => {}
+            }
+        }
+        active.is_empty()
+    }
+
+    /// Returns `true` if all admitted update handlers have completed or failed.
+    #[must_use]
+    pub fn all_handlers_finished(&self) -> bool {
+        self.all_handlers_finished_at_index(self.cursor)
+    }
+
+    /// Returns `true` if all admitted update handlers have completed or failed in the full history.
+    #[must_use]
+    pub fn all_handlers_finished_at_end(&self) -> bool {
+        self.all_handlers_finished_at_index(self.events.len())
+    }
+
     /// Returns `true` for operator pause/resume lifecycle events (issue #383),
     /// which are transparent no-ops for command-dispatch replay.
     const fn is_pause_lifecycle_event(event: &WorkflowEvent) -> bool {
