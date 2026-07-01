@@ -440,8 +440,44 @@ pub fn task_duration(s: &str) -> Option<std::time::Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::task_duration;
+    use super::{parse_byte_size, task_duration};
     use std::time::Duration;
+
+    #[test]
+    fn parse_byte_size_table_driven() {
+        let cases = vec![
+            // Happy path tests with common suffixes
+            ("10", Some(10)),
+            ("10KB", Some(10_000)),
+            ("10KiB", Some(10_240)),
+            ("2MB", Some(2_000_000)),
+            ("2MiB", Some(2_097_152)),
+            ("1GB", Some(1_000_000_000)),
+            ("1GiB", Some(1_073_741_824)),
+            // Whitespace padding
+            ("  5 MiB  ", Some(5 * 1024 * 1024)),
+            ("10  KiB", Some(10 * 1024)), // Because strip_suffix removes "KiB", leaving "10  ", which trim() inside parse() will successfully parse to 10
+            ("10", Some(10)),             // plain bytes
+            // Invalid formats
+            ("", None),
+            ("   ", None),
+            ("invalid", None),
+            ("10 PB", None),
+            ("-10 MB", None), // Rejects negative
+            // Overflow handling
+            ("18446744073709551615", Some(18_446_744_073_709_551_615)), // max u64
+            ("18446744073709551616", None),                             // max u64 + 1
+            ("18446744073709551615MB", None),                           // Overflow in checked_mul
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_byte_size(input),
+                expected,
+                "Failed on input: '{input}'"
+            );
+        }
+    }
 
     #[cfg(feature = "db")]
     #[test]
