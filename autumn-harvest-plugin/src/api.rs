@@ -11999,6 +11999,16 @@ fn effective_fire_time(
     chrono::Duration::from_std(offset).ok().map(|d| t + d)
 }
 
+/// Derived remaining run budget (issue #478 / #543): `max_runs - runs_started`,
+/// clamped to zero. Single source of truth for every `harvest_schedules` read
+/// site that surfaces this value — keep the live scheduler's exhaustion check
+/// (`scheduler.rs`, `tick_one_workflow_schedule`) in sync with this formula
+/// when either changes. Callers map this over an `Option<i32> max_runs`
+/// (`None` = unlimited, so there is no budget to derive).
+fn remaining_runs_budget(max_runs: i32, runs_started: i32) -> i32 {
+    (max_runs - runs_started).max(0)
+}
+
 async fn list_schedules(
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<ScheduleEntry>>, AutumnError> {
@@ -12026,7 +12036,9 @@ async fn list_schedules(
             let eft = effective_fire_time(s.id, s.next_run_at, s.jitter_secs);
             let buffered_count =
                 autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
-            let remaining_runs = s.max_runs.map(|max| (max - s.runs_started).max(0));
+            let remaining_runs = s
+                .max_runs
+                .map(|max| remaining_runs_budget(max, s.runs_started));
             let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
                 s.catchup_policy.as_deref(),
                 s.catchup_window_secs,
@@ -12119,7 +12131,9 @@ async fn get_schedule(
         .map(BackfillSummary::from);
 
     let buffered_count = autumn_harvest::scheduler::parse_buffered_runs_pub(&s.buffered_runs).len();
-    let remaining_runs = s.max_runs.map(|max| (max - s.runs_started).max(0));
+    let remaining_runs = s
+        .max_runs
+        .map(|max| remaining_runs_budget(max, s.runs_started));
     let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
         s.catchup_policy.as_deref(),
         s.catchup_window_secs,
@@ -12566,7 +12580,9 @@ async fn upsert_workflow_schedule_and_read_back(
         .map_err(map_error)?;
     let buffered_count =
         autumn_harvest::scheduler::parse_buffered_runs_pub(&row.buffered_runs).len();
-    let remaining_runs = row.max_runs.map(|max| (max - row.runs_started).max(0));
+    let remaining_runs = row
+        .max_runs
+        .map(|max| remaining_runs_budget(max, row.runs_started));
     let effective_policy = autumn_harvest::policy::CatchupPolicy::from_db(
         row.catchup_policy.as_deref(),
         row.catchup_window_secs,
@@ -19433,6 +19449,15 @@ fn build_preview_entry(
 /// calendar-suppressed entry (`effective_at.is_none()`) passes through without
 /// consuming budget, mirroring the scheduler's live "skipped firings do not
 /// consume a remaining action" contract.
+///
+/// **Known approximation:** the preview is stateless (see `would_skip_if_active`
+/// on [`ScheduleFirePreviewEntry`]) and cannot see future concurrency, so it has
+/// no way to know which entries an `OverlapPolicy::Skip`/`BufferOne` schedule
+/// will actually drop at dispatch time without consuming budget. Every
+/// calendar-visible entry is conservatively assumed to consume one unit of
+/// budget here, which is a worst case: a schedule whose overlap policy skips
+/// some firings at runtime may end up covering *more* wall-clock time than this
+/// truncation shows, never less.
 fn truncate_preview_entries_by_bounds(
     entries: Vec<ScheduleFirePreviewEntry>,
     end_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -19495,16 +19520,22 @@ fn parse_from_param(from: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>,
 
 /// Build the zero-entry preview response shared by the paused, exhausted, and
 /// unparsable-schedule short-circuits in [`preview_schedule_firings_handler`].
+///
+/// `pause_reason` is only surfaced when `is_paused` is true. Some legacy pause
+/// paths (e.g. `PATCH /dags/{dag_name}`) clear `is_paused` without also
+/// clearing `pause_reason`, so reading the raw column unconditionally could
+/// leak a stale reason for a schedule that is not actually paused.
 fn empty_preview_response(
     schedule: &HarvestSchedule,
     remaining_runs: Option<i32>,
     from: chrono::DateTime<chrono::Utc>,
     count: usize,
 ) -> serde_json::Value {
+    let pause_reason = schedule.is_paused.then(|| schedule.pause_reason.clone());
     serde_json::json!({
         "entries": [],
         "is_paused": schedule.is_paused,
-        "pause_reason": schedule.pause_reason,
+        "pause_reason": pause_reason.flatten(),
         "from": from,
         "count_requested": count,
         "end_at": schedule.end_at,
@@ -19529,12 +19560,11 @@ async fn preview_schedule_firings_handler(
     // load_schedule_by_id fans out across all shards so schedules on any shard are found.
     let schedule = load_schedule_by_id(&api_state, id).await?;
 
-    // Derived remaining run budget (issue #478 / #543): `max_runs - runs_started`,
-    // `null` when `max_runs` is unset. Surfaced on every branch below so a caller
-    // can see why a schedule is bounded even when it returns zero entries.
+    // Surfaced on every branch below so a caller can see why a schedule is
+    // bounded even when it returns zero entries.
     let remaining_runs = schedule
         .max_runs
-        .map(|max| (max - schedule.runs_started).max(0));
+        .map(|max| remaining_runs_budget(max, schedule.runs_started));
 
     // Paused schedules return zero entries with a paused reason summary.
     //
@@ -24243,6 +24273,21 @@ mod tests {
         );
     }
 
+    // ── Shared remaining-run-budget derivation (issue #543 / #478) ─────────────
+
+    #[test]
+    fn remaining_runs_budget_subtracts_runs_started() {
+        assert_eq!(remaining_runs_budget(5, 3), 2);
+    }
+
+    #[test]
+    fn remaining_runs_budget_clamps_to_zero_when_runs_started_exceeds_max() {
+        // Defensive clamp: runs_started should never exceed max_runs in practice
+        // (the live scheduler only increments it under a budget-checked guard),
+        // but a stale read must not report a negative remaining budget.
+        assert_eq!(remaining_runs_budget(3, 5), 0);
+    }
+
     // ── Preview bound truncation (issue #543 — end_at / remaining-run budget) ──
 
     fn preview_entry_at(
@@ -24260,6 +24305,88 @@ mod tests {
             },
         };
         build_preview_entry(&raw, raw.effective_at, 0, "UTC", "skip")
+    }
+
+    /// Minimal `HarvestSchedule` fixture for `empty_preview_response` tests. Callers
+    /// override only the fields they care about via struct-update syntax.
+    fn test_harvest_schedule() -> autumn_harvest::models::HarvestSchedule {
+        let now = chrono::Utc::now();
+        autumn_harvest::models::HarvestSchedule {
+            id: uuid::Uuid::nil(),
+            dag_name: None,
+            schedule_expr: Some("invalid cron".to_string()),
+            timezone: "UTC".to_string(),
+            catchup: false,
+            max_active_runs: 1,
+            is_paused: false,
+            last_run_at: None,
+            next_run_at: None,
+            created_at: now,
+            updated_at: now,
+            workflow_name: Some("test_workflow".to_string()),
+            workflow_input: None,
+            queue_name: Some("default".to_string()),
+            paused_at: None,
+            paused_by: None,
+            pause_reason: None,
+            jitter_secs: 0,
+            overlap_policy: "skip".to_string(),
+            buffered_runs: serde_json::Value::Array(vec![]),
+            buffer_all_max: 100,
+            calendar_name: None,
+            skip_policy: "skip".to_string(),
+            fire_claim_token: None,
+            fire_claimed_until: None,
+            consecutive_failure_limit: None,
+            consecutive_failure_count: 0,
+            auto_paused_at: None,
+            end_at: None,
+            max_runs: None,
+            runs_started: 0,
+            exhausted_at: None,
+            exhausted_reason: None,
+            catchup_policy: None,
+            catchup_window_secs: None,
+            last_catchup_dropped: 0,
+            last_catchup_at: None,
+            retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn empty_preview_response_surfaces_pause_reason_when_paused() {
+        use chrono::TimeZone as _;
+        let schedule = autumn_harvest::models::HarvestSchedule {
+            is_paused: true,
+            pause_reason: Some("operator hold".to_string()),
+            ..test_harvest_schedule()
+        };
+        let from = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let response = empty_preview_response(&schedule, None, from, 10);
+        assert_eq!(response["is_paused"], serde_json::json!(true));
+        assert_eq!(response["pause_reason"], serde_json::json!("operator hold"));
+    }
+
+    #[test]
+    fn empty_preview_response_hides_stale_pause_reason_when_not_paused() {
+        // A legacy pause path (e.g. PATCH /dags/{dag_name}) can clear `is_paused`
+        // without clearing `pause_reason`, leaving a stale non-null reason on an
+        // active schedule's row. `empty_preview_response` must not leak it.
+        use chrono::TimeZone as _;
+        let schedule = autumn_harvest::models::HarvestSchedule {
+            is_paused: false,
+            pause_reason: Some("stale reason from a prior pause".to_string()),
+            ..test_harvest_schedule()
+        };
+        let from = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
+        let response = empty_preview_response(&schedule, None, from, 10);
+        assert_eq!(response["is_paused"], serde_json::json!(false));
+        assert_eq!(
+            response["pause_reason"],
+            serde_json::Value::Null,
+            "pause_reason must not be surfaced for a schedule that is not paused, \
+             even if the DB row has a stale value"
+        );
     }
 
     #[test]
@@ -24328,6 +24455,31 @@ mod tests {
             3,
             "a calendar-skipped entry between two budgeted fires must survive and not \
              itself be counted against the budget"
+        );
+    }
+
+    #[test]
+    fn truncate_preview_entries_would_skip_if_active_entries_still_consume_budget() {
+        // Documents the deliberate worst-case approximation: the preview cannot see
+        // future concurrency, so an entry flagged `would_skip_if_active` (overlap
+        // policy could drop it at dispatch time) is still treated as consuming
+        // budget here — never optimistically assumed to be free. See the doc
+        // comment on `truncate_preview_entries_by_bounds`.
+        use chrono::TimeZone as _;
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t1 = t0 + chrono::Duration::hours(1);
+        let entries = vec![preview_entry_at(t0, true), preview_entry_at(t1, true)];
+        assert!(
+            entries.iter().all(|e| e.would_skip_if_active),
+            "preview_entry_at uses overlap_policy \"skip\", so every firing entry \
+             must be flagged would_skip_if_active"
+        );
+        let out = truncate_preview_entries_by_bounds(entries, None, Some(1));
+        assert_eq!(
+            out.len(),
+            1,
+            "a would_skip_if_active entry still consumes one unit of budget — the \
+             truncation is a conservative worst case, not an optimistic forecast"
         );
     }
 
