@@ -2584,6 +2584,70 @@ impl HistoryMatcher {
         HistoryMatch::NoMatch
     }
 
+    /// Full-history scan for push-based signal handler dispatch (issue #546).
+    ///
+    /// Unlike [`match_signal`](Self::match_signal), which resolves a single
+    /// pull-based wait at the current cursor position, this drains **every**
+    /// recorded `SignalReceived { signal_name }` event not yet claimed by
+    /// anything else (a prior pull-based match, a prior handler dispatch, or a
+    /// cursor-based scan for something else that stashed it in transit), in
+    /// ascending event order. Mirrors
+    /// [`drain_admitted_updates`](Self::drain_admitted_updates): a full scan
+    /// independent of the main replay cursor, so a signal handler registered
+    /// at the top of a workflow function (before any cursor advancement has
+    /// occurred this cycle) still sees every signal already recorded for its
+    /// name.
+    ///
+    /// Draining marks the returned event indices consumed, so a later
+    /// `wait_for_signal`/`receive_signal` call for the same name will not see
+    /// them again, and vice versa — the two consumption styles never
+    /// double-deliver a single `SignalReceived` event. Calling this again for
+    /// the same `signal_name` within the same [`HistoryMatcher`] instance
+    /// returns an empty `Vec` — idempotent by construction, since every match
+    /// is drained on first call.
+    pub fn drain_signal_events(&mut self, signal_name: &str) -> Vec<Value> {
+        let mut results = Vec::new();
+
+        // 1. Claim anything already stashed by an earlier scan for something
+        //    else (e.g. a `match_activity` call that scanned past this signal
+        //    on its way to an unrelated activity event). `pending_signals` is
+        //    a FIFO queue in ascending event-index order, and by construction
+        //    every stashed entry has a lower event index than anything an
+        //    as-yet-unrun scan could find in step 2 below (scans only ever
+        //    move forward and stash exactly what they pass over).
+        let mut remaining = VecDeque::new();
+        while let Some((name, payload, idx)) = self.pending_signals.pop_front() {
+            if name == signal_name {
+                results.push(payload);
+            } else {
+                remaining.push_back((name, payload, idx));
+            }
+        }
+        self.pending_signals = remaining;
+
+        // 2. Claim any further matching events nobody has scanned yet at all
+        //    (e.g. registration happens before any other cursor-based scan has
+        //    run this cycle). Scanning `self.events` directly -- not the
+        //    cursor -- is deliberate: push dispatch is independent of wherever
+        //    the main replay cursor happens to sit.
+        for (idx, event) in self.events.iter().enumerate() {
+            if self.is_consumed(idx) {
+                continue;
+            }
+            if let WorkflowEvent::SignalReceived {
+                signal_name: recorded_name,
+                payload,
+            } = event
+                && recorded_name == signal_name
+            {
+                results.push(payload.clone());
+                self.consumed_signal_events.insert(idx);
+            }
+        }
+
+        results
+    }
+
     /// Settle the bookkeeping for a signal-branch win of a signal-or-deadline
     /// race (issue #476): consume the winning `SignalReceived` event, consume
     /// the stray `TimerFired` of the race timer if it is already recorded (if
@@ -4505,6 +4569,156 @@ mod tests {
                 output: serde_json::json!({"reason": "manual"}),
             }
         );
+    }
+
+    // ── drain_signal_events (issue #546: push-based signal handlers) ───────
+
+    #[test]
+    fn drain_signal_events_returns_matching_payloads_in_order() {
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"seq": 2}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let drained = matcher.drain_signal_events("cancel");
+        assert_eq!(
+            drained,
+            vec![serde_json::json!({"seq": 1}), serde_json::json!({"seq": 2})]
+        );
+    }
+
+    #[test]
+    fn drain_signal_events_ignores_other_names() {
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let drained = matcher.drain_signal_events("cancel");
+        assert_eq!(drained, vec![serde_json::json!({"reason": "manual"})]);
+    }
+
+    #[test]
+    fn drain_signal_events_is_idempotent_within_one_matcher() {
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "cancel".into(),
+            payload: serde_json::json!({"reason": "manual"}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let first = matcher.drain_signal_events("cancel");
+        assert_eq!(first, vec![serde_json::json!({"reason": "manual"})]);
+
+        // Calling again must not re-deliver the same event.
+        let second = matcher.drain_signal_events("cancel");
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn drain_signal_events_claims_events_already_stashed_by_another_scan() {
+        // An earlier scan for an unrelated activity stashes the "cancel" signal
+        // into `pending_signals` on its way past it. `drain_signal_events` must
+        // still find it there even though it never appeared at the raw scan
+        // position the drain itself would have looked at.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        // Scanning for the activity stashes the interleaved "cancel" signal.
+        let activity_result = matcher.match_activity("send_email");
+        assert!(matches!(activity_result, HistoryMatch::Matched { .. }));
+
+        let drained = matcher.drain_signal_events("cancel");
+        assert_eq!(drained, vec![serde_json::json!({"reason": "manual"})]);
+    }
+
+    #[test]
+    fn drain_signal_events_does_not_steal_from_pull_based_wait() {
+        // A later `wait_for_signal`/`match_signal` call for the same name must
+        // never see an event that a prior `drain_signal_events` call already
+        // claimed (issue #546 AC: no double-delivery between push and pull).
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "cancel".into(),
+            payload: serde_json::json!({"reason": "manual"}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let drained = matcher.drain_signal_events("cancel");
+        assert_eq!(drained, vec![serde_json::json!({"reason": "manual"})]);
+
+        let pulled = matcher.match_signal("cancel");
+        assert_eq!(
+            pulled,
+            HistoryMatch::NoMatch,
+            "the signal was already claimed by the push handler drain"
+        );
+    }
+
+    #[test]
+    fn match_signal_does_not_steal_from_a_prior_drain_registration() {
+        // Symmetric to the above: once `match_signal` (pull) has consumed an
+        // event, a later `drain_signal_events` call for the same name must not
+        // see it again either.
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"seq": 2}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let pulled = matcher.match_signal("cancel");
+        assert_eq!(
+            pulled,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"seq": 1})
+            }
+        );
+
+        let drained = matcher.drain_signal_events("cancel");
+        assert_eq!(
+            drained,
+            vec![serde_json::json!({"seq": 2})],
+            "only the not-yet-pulled event should be delivered to the handler"
+        );
+    }
+
+    #[test]
+    fn drain_signal_events_returns_empty_when_none_recorded() {
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "approved".into(),
+            payload: serde_json::json!({"ok": true}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let drained = matcher.drain_signal_events("cancel");
+        assert!(drained.is_empty());
     }
 
     #[test]

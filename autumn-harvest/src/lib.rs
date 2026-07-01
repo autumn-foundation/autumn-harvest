@@ -126,6 +126,8 @@ pub mod reset;
 pub mod retention;
 pub mod saga;
 pub mod shard;
+/// Signal handler registry for push-based reactive signal handling (issue #546).
+pub mod signal_handler;
 pub mod simulator;
 /// OpenTelemetry integration: trace-context propagation and metrics.
 pub mod telemetry;
@@ -296,6 +298,7 @@ pub use scheduler::{
 pub use shard::ShardRouter;
 #[cfg(feature = "db")]
 pub use shard::ShardedDbPool;
+pub use signal_handler::SignalHandlerRegistry;
 pub use simulator::{SimulatorResult, WorkflowSimulator};
 #[cfg(feature = "db")]
 pub use store::AwaitMode;

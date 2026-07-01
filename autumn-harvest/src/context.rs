@@ -24,6 +24,7 @@ use crate::error::{HarvestError, HarvestResult, NonDeterministicDetails, Payload
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
+use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
     IdempotencyKey, TimerId, UpdateId,
@@ -742,6 +743,10 @@ pub struct WorkflowContext {
     update_registry: Mutex<UpdateRegistry>,
     /// Declarative update handlers registered via `register_declarative_update_handler`.
     declarative_updates: Mutex<std::collections::HashMap<String, crate::info::UpdateHandlerFn>>,
+    /// In-memory push-based signal handlers (issue #546), not persisted to
+    /// history. Registration is idempotent -- the first registration wins on
+    /// each replay, mirroring `update_registry`.
+    signal_registry: Mutex<SignalHandlerRegistry>,
     /// Cancellation reason captured from a `WorkflowCancelled` event in history,
     /// if any. When set, `is_cancelled()` returns true and `check_cancellation()`
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
@@ -973,6 +978,7 @@ impl WorkflowContext {
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
+            signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
@@ -1082,6 +1088,7 @@ impl WorkflowContext {
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
+            signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
@@ -1128,6 +1135,7 @@ impl WorkflowContext {
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
+            signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             cancellation_reason: None,
             strict_replay: false,
             canary_mode: false,
@@ -4907,6 +4915,151 @@ impl WorkflowContext {
         result
     }
 
+    // ── Signal handlers (issue #546) ────────────────────────────────────
+
+    /// Register a push-based signal handler with an untyped JSON payload.
+    ///
+    /// Unlike [`wait_for_signal`](Self::wait_for_signal), which blocks a single
+    /// specific point in the workflow body waiting for the next matching
+    /// signal, a signal handler is dispatched automatically for **every**
+    /// matching `SignalReceived` event already recorded in history at the
+    /// point of registration -- including ones delivered before the handler
+    /// existed (e.g. a signal that arrived on an earlier workflow-task cycle,
+    /// before this cycle's code reached the registration call). No signal is
+    /// silently dropped.
+    ///
+    /// Handlers are **fire-and-forget**: they run synchronously, inline, and
+    /// return nothing. There is no validator and no completion event -- that
+    /// is the `update` primitive's job (issue #140). A handler is expected to
+    /// mutate author-captured state (e.g. an `Arc<Mutex<T>>` declared at the
+    /// top of the workflow body), which downstream code in the same cycle can
+    /// then observe immediately.
+    ///
+    /// Registration is **idempotent** -- calling this with the same `name`
+    /// multiple times (e.g. on every replay cycle at the top of the workflow
+    /// function, as is idiomatic) is a no-op after the first call within a
+    /// cycle for storage purposes; dispatch itself is naturally idempotent
+    /// too, since every matching event is drained (and marked consumed) the
+    /// first time it is found.
+    ///
+    /// A signal name that is never registered with a handler, or is only ever
+    /// consumed by [`wait_for_signal`](Self::wait_for_signal), is completely
+    /// unaffected by this method -- the existing pull-based buffered behavior
+    /// is preserved exactly. The two consumption styles for the *same* name
+    /// coexist without double-delivering a single `SignalReceived` event:
+    /// whichever style claims an event first (in code-execution order) is the
+    /// one that receives it.
+    ///
+    /// For a typed payload, use
+    /// [`register_signal_handler`](Self::register_signal_handler) instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal signal registry mutex is poisoned.
+    pub fn register_signal_handler_raw<H>(&self, name: &str, handler: H)
+    where
+        H: Fn(Value) + Send + Sync + 'static,
+    {
+        let boxed: BoxSignalHandler = Arc::new(handler);
+        self.register_and_dispatch_signal_handler(name, boxed);
+    }
+
+    /// Register a **typed** push-based signal handler.
+    ///
+    /// The engine deserializes each matching `SignalReceived` payload as `Req`
+    /// before calling `handler`. A payload that fails to deserialize is
+    /// logged and dropped (the handler is never invoked for it) rather than
+    /// panicking the workflow task -- signals are fire-and-forget by
+    /// contract, so there is no caller waiting on a rejection.
+    ///
+    /// See [`register_signal_handler_raw`](Self::register_signal_handler_raw)
+    /// for the full dispatch contract (buffering, idempotency, coexistence
+    /// with pull-based `wait_for_signal`).
+    ///
+    /// ```rust
+    /// use std::sync::{Arc, Mutex};
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// #[derive(serde::Deserialize)]
+    /// struct CancelRequest { reason: String }
+    ///
+    /// # fn example(ctx: &WorkflowContext) {
+    /// let cancelled_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    /// let state = cancelled_reason.clone();
+    /// ctx.register_signal_handler("cancel", move |req: CancelRequest| {
+    ///     *state.lock().unwrap() = Some(req.reason);
+    /// });
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal signal registry mutex is poisoned.
+    pub fn register_signal_handler<Req, H>(&self, name: &str, handler: H)
+    where
+        Req: serde::de::DeserializeOwned + 'static,
+        H: Fn(Req) + Send + Sync + 'static,
+    {
+        let name_for_log = name.to_string();
+        self.register_signal_handler_raw(
+            name,
+            move |payload: Value| match serde_json::from_value::<Req>(payload) {
+                Ok(req) => handler(req),
+                Err(e) => {
+                    tracing::warn!(
+                        signal = %name_for_log,
+                        error = %e,
+                        "signal handler payload deserialization failed; delivery dropped"
+                    );
+                }
+            },
+        );
+    }
+
+    /// Returns the sorted names of all registered push-based signal handlers.
+    ///
+    /// Parity with [`list_query_names`](Self::list_query_names).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal signal registry mutex is poisoned.
+    #[must_use]
+    pub fn list_signal_handler_names(&self) -> Vec<String> {
+        self.signal_registry
+            .lock()
+            .expect("signal_registry lock poisoned")
+            .list_names()
+    }
+
+    /// Registers `handler` under `name` (idempotent, first wins) and
+    /// immediately drains + dispatches every currently-recorded, not-yet-claimed
+    /// `SignalReceived` event for `name`, in event order.
+    fn register_and_dispatch_signal_handler(&self, name: &str, handler: BoxSignalHandler) {
+        self.signal_registry
+            .lock()
+            .expect("signal_registry lock poisoned")
+            .register(name, handler);
+
+        let payloads = self.match_history(|m| m.drain_signal_events(name));
+        if payloads.is_empty() {
+            return;
+        }
+
+        // Re-fetch the (possibly earlier-registered, first-wins) handler so a
+        // redundant registration call with a different closure still dispatches
+        // through the one actually stored.
+        let dispatch_handler = self
+            .signal_registry
+            .lock()
+            .expect("signal_registry lock poisoned")
+            .get(name);
+        if let Some(h) = dispatch_handler {
+            for payload in payloads {
+                invoke_signal_handler(&h, name, payload);
+            }
+        }
+    }
+
     // ── Command drain ─────────────────────────────────────────────────
 
     /// Set a durable, human-readable status breadcrumb for this execution (issue #473).
@@ -5987,6 +6140,211 @@ mod tests {
     use crate::error::TimeoutType;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+
+    // ── Signal handlers (issue #546) ────────────────────────────────────────
+
+    fn started_event() -> WorkflowEvent {
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    #[test]
+    fn register_signal_handler_raw_is_idempotent() {
+        let ctx = WorkflowContext::new_test();
+        // Registering twice must not panic or error.
+        ctx.register_signal_handler_raw("cancel", |_payload: Value| {});
+        ctx.register_signal_handler_raw("cancel", |_payload: Value| {});
+        assert!(
+            ctx.list_signal_handler_names()
+                .contains(&"cancel".to_string())
+        );
+    }
+
+    #[test]
+    fn register_signal_handler_raw_emits_no_commands() {
+        let ctx = WorkflowContext::new_test();
+        ctx.register_signal_handler_raw("cancel", |_payload: Value| {});
+        let cmds = ctx.drain_commands();
+        assert!(cmds.is_empty(), "registration must not emit any commands");
+    }
+
+    #[test]
+    fn register_signal_handler_raw_dispatches_already_buffered_signal() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "user_requested"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![serde_json::json!({"reason": "user_requested"})],
+            "signal delivered before the handler existed must still be dispatched \
+             once the handler is registered in the same workflow task"
+        );
+    }
+
+    #[test]
+    fn register_signal_handler_typed_deserializes_payload() {
+        #[derive(serde::Deserialize)]
+        struct CancelRequest {
+            reason: String,
+        }
+
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "budget_exceeded"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let received: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler("cancel", move |req: CancelRequest| {
+            received_clone.lock().unwrap().push(req.reason);
+        });
+
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec!["budget_exceeded".to_string()]
+        );
+    }
+
+    #[test]
+    fn register_signal_handler_multiple_events_dispatched_in_order() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!(1),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!(2),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let received: Arc<std::sync::Mutex<Vec<i64>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone
+                .lock()
+                .unwrap()
+                .push(payload.as_i64().unwrap());
+        });
+
+        assert_eq!(*received.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn register_signal_handler_does_not_dispatch_when_no_signal_recorded() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started_event()]);
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn register_signal_handler_does_not_fire_for_other_names() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn signal_handler_and_wait_for_signal_do_not_double_deliver() {
+        // Two "cancel" signals recorded. The push handler (registered first,
+        // as is idiomatic at the top of a workflow body) claims both; a later
+        // pull-based wait_for_signal for the same name must not also see them.
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!(1),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        assert_eq!(*received.lock().unwrap(), vec![serde_json::json!(1)]);
+
+        // A pull-based wait for the same name, later in the same task, must
+        // not see the already-dispatched event -- it should behave as NoMatch
+        // (i.e. suspend for a future occurrence), not replay/return it again.
+        let history_match = ctx.match_history(|m| m.match_signal("cancel"));
+        assert_eq!(history_match, HistoryMatch::NoMatch);
+    }
+
+    #[test]
+    fn list_signal_handler_names_returns_sorted_names() {
+        let ctx = WorkflowContext::new_test();
+        ctx.register_signal_handler_raw("zeta", |_: Value| {});
+        ctx.register_signal_handler_raw("alpha", |_: Value| {});
+        ctx.register_signal_handler_raw("mid", |_: Value| {});
+        assert_eq!(
+            ctx.list_signal_handler_names(),
+            vec!["alpha".to_string(), "mid".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn register_signal_handler_typed_deserialization_failure_does_not_panic() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct CancelRequest {
+            reason: String,
+        }
+
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                // Missing the required "reason" field.
+                payload: serde_json::json!({}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // Must not panic even though the payload cannot deserialize into CancelRequest.
+        ctx.register_signal_handler("cancel", |_req: CancelRequest| {
+            panic!("handler must never run on a deserialization failure");
+        });
+    }
 
     #[test]
     fn workflow_context_history_event_count_reports_loaded_history() {

@@ -948,4 +948,71 @@ mod tests {
             other => panic!("expected Completed, got {other:?}"),
         }
     }
+
+    /// A workflow that reacts to a `cancel` signal via a push-based handler
+    /// (issue #546) instead of a hand-coded `wait_for_signal` interleave.
+    fn signal_handler_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let cancelled = std::sync::Arc::new(std::sync::Mutex::new(false));
+            let c = cancelled.clone();
+            ctx.register_signal_handler_raw("cancel", move |_payload| {
+                *c.lock().unwrap() = true;
+            });
+            Ok(serde_json::json!({"cancelled": *cancelled.lock().unwrap()}))
+        })
+    }
+
+    #[tokio::test]
+    async fn executor_dispatches_signal_handler_end_to_end() {
+        // The full production path: run_workflow drives the workflow function
+        // exactly as the worker would, with a signal already recorded in
+        // history before the handler is registered.
+        let exec_id = ExecutionId::new();
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "user_requested"}),
+            },
+        ];
+
+        let outcome = run_workflow(exec_id, history, signal_handler_workflow, Value::Null).await;
+
+        match outcome {
+            WorkflowOutcome::Completed { output } => {
+                assert_eq!(output, serde_json::json!({"cancelled": true}));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_signal_handler_workflow_completes_with_no_signal_recorded() {
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+
+        let outcome = run_workflow(exec_id, history, signal_handler_workflow, Value::Null).await;
+
+        match outcome {
+            WorkflowOutcome::Completed { output } => {
+                assert_eq!(output, serde_json::json!({"cancelled": false}));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
 }
