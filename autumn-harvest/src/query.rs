@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::error::{HarvestError, HarvestResult};
+use crate::error::{HarvestError, HarvestResult, panic_message};
 
 /// A type-erased query handler: receives JSON args, returns JSON result or error.
 ///
@@ -135,14 +135,7 @@ impl QueryRegistry {
         // Wrap in catch_unwind so a panicking handler doesn't crash the worker.
         // Panics → QueryHandlerPanicked (503); intentional Err returns → QueryHandlerFailed (400).
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(args)))
-            .map_err(|e| {
-                let msg = e
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| e.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                HarvestError::QueryHandlerPanicked(msg)
-            })?
+            .map_err(|e| HarvestError::QueryHandlerPanicked(panic_message(e)))?
             .map_err(HarvestError::QueryHandlerFailed)
     }
 

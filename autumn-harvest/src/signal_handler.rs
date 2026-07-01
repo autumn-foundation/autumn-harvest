@@ -13,6 +13,16 @@
 //! mutation of author-captured state (e.g. `Arc<Mutex<T>>`) is visible to the
 //! rest of the workflow body within the same cycle. There is no suspension
 //! shape to reason about and no completion event to persist.
+//!
+//! Because there is no completion event, dispatch is **per-cycle, not
+//! once-ever**: a fresh `SignalHandlerRegistry` is built for every workflow
+//! replay/live cycle, so the same recorded `SignalReceived` event is
+//! redelivered on every subsequent cycle for the life of the execution, not
+//! just the first time it is seen. That is correct for reconstructing
+//! in-memory state (the captured `Arc<Mutex<T>>` is rebuilt fresh each cycle
+//! too), but not for a non-idempotent side effect performed directly inside a
+//! handler — see `WorkflowContext::register_signal_handler_raw`'s docs for
+//! the full guidance.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,17 +51,19 @@ impl SignalHandlerRegistry {
         Self::default()
     }
 
-    /// Register a handler under `name`.
+    /// Register a handler under `name` and return the handler that actually
+    /// won registration.
     ///
-    /// If `name` is already registered, this is a no-op (first registration wins).
-    pub fn register(&mut self, name: &str, handler: BoxSignalHandler) {
-        self.handlers.entry(name.to_string()).or_insert(handler);
-    }
-
-    /// Returns `true` if a handler is registered under `name`.
-    #[must_use]
-    pub fn contains(&self, name: &str) -> bool {
-        self.handlers.contains_key(name)
+    /// If `name` is already registered, this is a no-op (first registration
+    /// wins) and the *existing* handler is returned rather than `handler`, so
+    /// a caller that immediately needs to dispatch through the resolved
+    /// handler (as `WorkflowContext::register_and_dispatch_signal_handler`
+    /// does) never has to re-acquire the registry lock and look it back up.
+    pub fn register(&mut self, name: &str, handler: BoxSignalHandler) -> BoxSignalHandler {
+        self.handlers
+            .entry(name.to_string())
+            .or_insert(handler)
+            .clone()
     }
 
     /// Returns a cloned handler for `name`, if registered.
@@ -70,20 +82,24 @@ impl SignalHandlerRegistry {
     }
 }
 
-/// Invoke a signal handler, guarding against a panicking handler crashing the
-/// workflow task (mirrors `QueryRegistry::execute_with_args`'s `catch_unwind`).
+/// Invoke a signal handler, catching a panic at this call boundary instead of
+/// letting it propagate out (mirrors `QueryRegistry::execute_with_args`'s
+/// `catch_unwind`).
 ///
-/// Signals are fire-and-forget: a panicking handler is logged and the
-/// delivery is dropped, rather than propagating a panic up through the
-/// workflow task.
+/// Signals are fire-and-forget: a panicking handler's panic is logged here
+/// and this one delivery is dropped, rather than propagating past this call.
+/// This does **not** protect against a handler that panics while holding a
+/// lock on its own captured `std::sync::Mutex`: that mutex still poisons per
+/// ordinary Rust semantics regardless of this `catch_unwind`, and a *later*
+/// `.lock().unwrap()` on the same mutex elsewhere in the workflow body will
+/// still panic (uncaught) when it runs. Handler authors sharing a mutex with
+/// other workflow code should keep critical sections trivially short/
+/// infallible, or recover with
+/// `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)`.
 pub fn invoke_signal_handler(handler: &BoxSignalHandler, signal_name: &str, payload: Value) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(payload)));
     if let Err(e) = result {
-        let msg = e
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| e.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "unknown panic".to_string());
+        let msg = crate::error::panic_message(e);
         tracing::warn!(
             signal = signal_name,
             panic = %msg,
@@ -99,7 +115,7 @@ mod tests {
     #[test]
     fn register_and_get_round_trips() {
         let mut registry = SignalHandlerRegistry::new();
-        assert!(!registry.contains("cancel"));
+        assert!(registry.get("cancel").is_none());
 
         let calls: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
         let calls_clone = calls.clone();
@@ -108,7 +124,6 @@ mod tests {
             Arc::new(move |payload| calls_clone.lock().unwrap().push(payload)),
         );
 
-        assert!(registry.contains("cancel"));
         let handler = registry.get("cancel").expect("handler must be present");
         handler(serde_json::json!({"reason": "user_requested"}));
         assert_eq!(
@@ -129,17 +144,26 @@ mod tests {
             Arc::new(move |_| calls_first.lock().unwrap().push("first")),
         );
         let calls_second = calls.clone();
-        registry.register(
+        let resolved = registry.register(
             "cancel",
             Arc::new(move |_| calls_second.lock().unwrap().push("second")),
+        );
+
+        // register() itself must return the winning (first) handler, so a
+        // caller never needs a second lookup to dispatch through it.
+        resolved(Value::Null);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["first"],
+            "register() should return the first-registered handler"
         );
 
         let handler = registry.get("cancel").expect("handler must be present");
         handler(Value::Null);
         assert_eq!(
             *calls.lock().unwrap(),
-            vec!["first"],
-            "first registration should win"
+            vec!["first", "first"],
+            "first registration should win for get() too"
         );
     }
 

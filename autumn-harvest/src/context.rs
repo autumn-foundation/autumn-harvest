@@ -4547,14 +4547,7 @@ impl WorkflowContext {
         if let Some(h) = decl_handler {
             // Pass self so the handler can access ctx.state::<T>().
             return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(self, args)))
-                .map_err(|e| {
-                    let msg = e
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| e.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_string());
-                    HarvestError::QueryHandlerPanicked(msg)
-                })?
+                .map_err(|e| HarvestError::QueryHandlerPanicked(crate::error::panic_message(e)))?
                 .map_err(HarvestError::QueryHandlerFailed);
         }
 
@@ -4938,9 +4931,28 @@ impl WorkflowContext {
     /// Registration is **idempotent** -- calling this with the same `name`
     /// multiple times (e.g. on every replay cycle at the top of the workflow
     /// function, as is idiomatic) is a no-op after the first call within a
-    /// cycle for storage purposes; dispatch itself is naturally idempotent
-    /// too, since every matching event is drained (and marked consumed) the
-    /// first time it is found.
+    /// cycle for storage purposes.
+    ///
+    /// **Dispatch is per-cycle, not once-ever.** Unlike the `update`
+    /// primitive (whose handler is guarded by a persisted `UpdateCompleted`/
+    /// `UpdateFailed` event and is therefore skipped on replay),  a signal
+    /// handler has no persisted "already delivered" marker. Every recorded
+    /// `SignalReceived` event for `name` is drained and dispatched exactly
+    /// once **per [`HistoryMatcher`](crate::replay::HistoryMatcher) instance**
+    /// -- i.e. once per registration call within a single workflow-task
+    /// cycle -- but a *new* cycle (the next activity/timer/signal
+    /// completion, a worker restart, a warm-cache eviction) rebuilds the
+    /// matcher from the full recorded history and redelivers the *same*
+    /// historical signals again. That is safe and correct for reconstructing
+    /// in-memory state, because the captured `Arc<Mutex<T>>` is itself
+    /// rebuilt from scratch at the top of the same cycle -- replaying the
+    /// same signals into it always reconstructs the same final value,
+    /// exactly like the rest of the workflow body's plain Rust logic. It is
+    /// **not** safe for a non-idempotent side effect (an external call, a
+    /// log line meant to fire once): that side effect repeats on every
+    /// subsequent replay of the same history. Keep handlers limited to
+    /// mutating captured state; route side effects through a regular
+    /// activity instead.
     ///
     /// A signal name that is never registered with a handler, or is only ever
     /// consumed by [`wait_for_signal`](Self::wait_for_signal), is completely
@@ -4948,14 +4960,34 @@ impl WorkflowContext {
     /// is preserved exactly. The two consumption styles for the *same* name
     /// coexist without double-delivering a single `SignalReceived` event:
     /// whichever style claims an event first (in code-execution order) is the
-    /// one that receives it.
+    /// one that receives it. This also holds against a `receive_signal_timeout`
+    /// / `wait_for_signal_timeout` race (issue #476) for the same name: a
+    /// signal that is the resolution of a still-open race is reserved for
+    /// that race and is never claimed by a push handler, so mixing both
+    /// styles for one signal name cannot silently flip a race outcome.
+    ///
+    /// Must be called from the main workflow body, not from inside an
+    /// `#[update]`/`register_update_handler` closure or a query handler: those
+    /// run against a separate, throwaway [`WorkflowContext`] created fresh per
+    /// invocation (see [`new_for_handler`](Self::new_for_handler)), so a
+    /// registration made there is discarded the instant the handler returns
+    /// and will never fire.
     ///
     /// For a typed payload, use
     /// [`register_signal_handler`](Self::register_signal_handler) instead.
     ///
     /// # Panics
     ///
-    /// Panics if the internal signal registry mutex is poisoned.
+    /// Panics if the internal signal registry mutex is poisoned. If the
+    /// handler closure itself panics, [`invoke_signal_handler`] catches it at
+    /// the dispatch boundary and logs it rather than propagating -- but note
+    /// that if the handler panics *while holding a lock* on its own captured
+    /// `Mutex`, that mutex is poisoned by ordinary Rust semantics regardless
+    /// of this catch, and a later `.lock().unwrap()` on the very same mutex
+    /// elsewhere in the same cycle will still panic. Prefer
+    /// `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)` (or keep
+    /// critical sections trivially short and infallible) if a handler shares
+    /// a mutex with other code in the workflow body.
     pub fn register_signal_handler_raw<H>(&self, name: &str, handler: H)
     where
         H: Fn(Value) + Send + Sync + 'static,
@@ -5034,29 +5066,30 @@ impl WorkflowContext {
     /// Registers `handler` under `name` (idempotent, first wins) and
     /// immediately drains + dispatches every currently-recorded, not-yet-claimed
     /// `SignalReceived` event for `name`, in event order.
+    ///
+    /// Deliberately fuses "store the handler" and "run it for whatever is
+    /// already recorded" into one call, unlike `register_update_handler`
+    /// (store-only; a separate `execute_admitted_update` call runs it) and
+    /// `register_query_handler` (store-only; never auto-runs). Signals have
+    /// no completion event and no caller waiting on a result, so there is no
+    /// second, author-driven step to hand dispatch off to -- deferring it
+    /// would just mean adding one anyway. Fusing keeps the "register once at
+    /// the top of the function" idiom self-sufficient: whatever the workflow
+    /// registers for is delivered without a second call the author must
+    /// remember to make.
     fn register_and_dispatch_signal_handler(&self, name: &str, handler: BoxSignalHandler) {
-        self.signal_registry
+        // `register` returns the handler that actually won registration
+        // (itself on a fresh name, or the earlier-registered one on a
+        // redundant call) so dispatch below never needs a second lock/lookup.
+        let resolved = self
+            .signal_registry
             .lock()
             .expect("signal_registry lock poisoned")
             .register(name, handler);
 
         let payloads = self.match_history(|m| m.drain_signal_events(name));
-        if payloads.is_empty() {
-            return;
-        }
-
-        // Re-fetch the (possibly earlier-registered, first-wins) handler so a
-        // redundant registration call with a different closure still dispatches
-        // through the one actually stored.
-        let dispatch_handler = self
-            .signal_registry
-            .lock()
-            .expect("signal_registry lock poisoned")
-            .get(name);
-        if let Some(h) = dispatch_handler {
-            for payload in payloads {
-                invoke_signal_handler(&h, name, payload);
-            }
+        for payload in payloads {
+            invoke_signal_handler(&resolved, name, payload);
         }
     }
 
