@@ -1777,6 +1777,23 @@ pub struct WorkerConfig {
     ///
     /// Defaults to **1 hour**. Override via `with_default_debounce_max_wait`.
     pub default_debounce_max_wait: Duration,
+    /// Opt-in adaptive dispatch-slot tuner (issue #548).
+    ///
+    /// When `Some`, both dispatch semaphores (`max_concurrent_workflows` /
+    /// `max_concurrent_activities`) are auto-resized within
+    /// `[SlotTunerConfig::min_slots, SlotTunerConfig::max_slots]`, driven by
+    /// in-process slot utilization, worker DB-pool pressure, and recent
+    /// claim-to-dispatch permit-wait latency. The controller never resizes
+    /// below `min_slots` (liveness floor) or above `max_slots` (hard safety
+    /// cap); a shrink decision only withholds *new* permits and never cancels
+    /// or reclaims an already-dispatched task, so graceful shutdown and
+    /// draining are unaffected.
+    ///
+    /// **Defaults to `None`: byte-for-byte identical fixed-concurrency
+    /// behaviour** — the worker uses `max_concurrent_workflows` /
+    /// `max_concurrent_activities` exactly as it does today. Set via
+    /// `with_slot_tuner`.
+    pub slot_tuner: Option<crate::slot_tuner::SlotTunerConfig>,
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
@@ -1810,6 +1827,7 @@ impl Default for WorkerConfig {
             labels: std::collections::HashMap::new(),
             max_workflow_history_events: None,
             default_debounce_max_wait: DEFAULT_DEBOUNCE_MAX_WAIT,
+            slot_tuner: None,
             #[cfg(feature = "db")]
             sharded_pool: None,
         }
@@ -2134,6 +2152,23 @@ impl WorkerConfig {
         self
     }
 
+    /// Install an adaptive dispatch-slot tuner (issue #548).
+    ///
+    /// Both dispatch semaphores are auto-resized within
+    /// `[cfg.min_slots, cfg.max_slots]`. When this method is never called
+    /// (`slot_tuner` stays `None`), the worker's fixed-concurrency semaphore
+    /// behaviour is byte-for-byte identical to today.
+    ///
+    /// See [`crate::slot_tuner`] for the default controller's signals
+    /// (slot utilization, worker DB-pool pressure, claim-to-dispatch permit
+    /// wait) and `docs/operations/adaptive-slot-tuner.md` for the operator
+    /// guide.
+    #[must_use]
+    pub fn with_slot_tuner(mut self, cfg: crate::slot_tuner::SlotTunerConfig) -> Self {
+        self.slot_tuner = Some(cfg);
+        self
+    }
+
     #[cfg(feature = "db")]
     /// Set the sharded database pool for exact shard routing.
     #[must_use]
@@ -2252,6 +2287,17 @@ mod tests {
     fn worker_config_builder_adds_queues() {
         let config = WorkerConfig::default().with_queues(["email-workers", "etl"]);
         assert!(config.queues.contains(&"email-workers".to_string()));
+    }
+
+    #[test]
+    fn with_slot_tuner_sets_config_and_default_is_none() {
+        assert!(WorkerConfig::default().slot_tuner.is_none());
+
+        let config =
+            WorkerConfig::default().with_slot_tuner(crate::slot_tuner::SlotTunerConfig::new(5, 50));
+        let tuner = config.slot_tuner.expect("slot_tuner must be set");
+        assert_eq!(tuner.min_slots, 5);
+        assert_eq!(tuner.max_slots, 50);
     }
 
     #[test]

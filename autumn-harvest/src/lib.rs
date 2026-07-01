@@ -127,6 +127,8 @@ pub mod retention;
 pub mod saga;
 pub mod shard;
 pub mod simulator;
+/// Adaptive worker dispatch-slot tuner (issue #548).
+pub mod slot_tuner;
 /// OpenTelemetry integration: trace-context propagation and metrics.
 pub mod telemetry;
 #[cfg(any(test, feature = "testing"))]

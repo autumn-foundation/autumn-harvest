@@ -547,6 +547,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )
@@ -765,6 +766,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )
@@ -923,6 +925,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )
@@ -1076,6 +1079,7 @@ async fn activity_without_cancellation_check_completes_normally() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )
