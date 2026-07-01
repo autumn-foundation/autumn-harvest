@@ -19423,6 +19423,43 @@ fn build_preview_entry(
     }
 }
 
+/// Truncate preview entries to reflect a schedule's `end_at` cutoff and remaining
+/// run budget (`max_runs - runs_started`) (issue #543 / #478).
+///
+/// Entries at or after `end_at` are dropped, along with everything after them
+/// (entries are chronologically ordered, so once the cutoff is crossed nothing
+/// later can fire either). When `remaining_budget` is `Some(n)`, only the first
+/// `n` *actually-firing* entries (`effective_at.is_some()`) are kept; a
+/// calendar-suppressed entry (`effective_at.is_none()`) passes through without
+/// consuming budget, mirroring the scheduler's live "skipped firings do not
+/// consume a remaining action" contract.
+fn truncate_preview_entries_by_bounds(
+    entries: Vec<ScheduleFirePreviewEntry>,
+    end_at: Option<chrono::DateTime<chrono::Utc>>,
+    remaining_budget: Option<i32>,
+) -> Vec<ScheduleFirePreviewEntry> {
+    let mut budget = remaining_budget;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(cutoff) = end_at {
+            let compare_at = entry.effective_at.unwrap_or(entry.scheduled_at);
+            if compare_at >= cutoff {
+                break;
+            }
+        }
+        if entry.effective_at.is_some()
+            && let Some(remaining) = budget
+        {
+            if remaining <= 0 {
+                break;
+            }
+            budget = Some(remaining - 1);
+        }
+        out.push(entry);
+    }
+    out
+}
+
 /// Format a UTC timestamp in the given IANA timezone as RFC 3339.
 /// Falls back to UTC representation when the timezone name is unknown.
 fn format_in_timezone(utc: chrono::DateTime<chrono::Utc>, tz_name: &str) -> String {
@@ -19456,6 +19493,26 @@ fn parse_from_param(from: Option<&str>) -> Result<chrono::DateTime<chrono::Utc>,
     )
 }
 
+/// Build the zero-entry preview response shared by the paused, exhausted, and
+/// unparsable-schedule short-circuits in [`preview_schedule_firings_handler`].
+fn empty_preview_response(
+    schedule: &HarvestSchedule,
+    remaining_runs: Option<i32>,
+    from: chrono::DateTime<chrono::Utc>,
+    count: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "entries": [],
+        "is_paused": schedule.is_paused,
+        "pause_reason": schedule.pause_reason,
+        "from": from,
+        "count_requested": count,
+        "end_at": schedule.end_at,
+        "remaining_runs": remaining_runs,
+        "exhausted_reason": schedule.exhausted_reason,
+    })
+}
+
 /// `GET /admin/schedules/{id}/preview?count=N&from=<ISO8601>` — preview the next N
 /// planned firing instants for a saved schedule (issue #348 supersedes issue #337).
 async fn preview_schedule_firings_handler(
@@ -19472,17 +19529,28 @@ async fn preview_schedule_firings_handler(
     // load_schedule_by_id fans out across all shards so schedules on any shard are found.
     let schedule = load_schedule_by_id(&api_state, id).await?;
 
+    // Derived remaining run budget (issue #478 / #543): `max_runs - runs_started`,
+    // `null` when `max_runs` is unset. Surfaced on every branch below so a caller
+    // can see why a schedule is bounded even when it returns zero entries.
+    let remaining_runs = schedule
+        .max_runs
+        .map(|max| (max - schedule.runs_started).max(0));
+
     // Paused schedules return zero entries with a paused reason summary.
-    if schedule.is_paused {
+    //
+    // Exhausted schedules (issue #478 / #543 — end_at reached or run budget spent)
+    // are permanently terminal: they will never fire again, so the preview must
+    // report zero entries rather than projecting fire times the live scheduler
+    // will never actually dispatch.
+    if schedule.is_paused || schedule.exhausted_at.is_some() {
         return Ok((
             StatusCode::OK,
-            Json(serde_json::json!({
-                "entries": [],
-                "is_paused": true,
-                "pause_reason": schedule.pause_reason,
-                "from": from,
-                "count_requested": count,
-            })),
+            Json(empty_preview_response(
+                &schedule,
+                remaining_runs,
+                from,
+                count,
+            )),
         ));
     }
 
@@ -19493,13 +19561,12 @@ async fn preview_schedule_firings_handler(
     let Some(ref sched) = parsed_schedule else {
         return Ok((
             StatusCode::OK,
-            Json(serde_json::json!({
-                "entries": [],
-                "is_paused": false,
-                "pause_reason": serde_json::Value::Null,
-                "from": from,
-                "count_requested": count,
-            })),
+            Json(empty_preview_response(
+                &schedule,
+                remaining_runs,
+                from,
+                count,
+            )),
         ));
     };
 
@@ -19555,6 +19622,11 @@ async fn preview_schedule_firings_handler(
         })
         .collect();
 
+    // Truncate at the end_at cutoff and remaining run budget (issue #543 / #478) so
+    // the preview never projects fire times the live scheduler would refuse to
+    // dispatch.
+    let entries = truncate_preview_entries_by_bounds(entries, schedule.end_at, remaining_runs);
+
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
@@ -19563,6 +19635,9 @@ async fn preview_schedule_firings_handler(
             "pause_reason": serde_json::Value::Null,
             "from": from,
             "count_requested": count,
+            "end_at": schedule.end_at,
+            "remaining_runs": remaining_runs,
+            "exhausted_reason": schedule.exhausted_reason,
         })),
     ))
 }
@@ -24165,6 +24240,106 @@ mod tests {
         assert!(
             entry.jitter_latest_at.is_none(),
             "jitter_latest_at must be None when jitter_secs overflows DateTime"
+        );
+    }
+
+    // ── Preview bound truncation (issue #543 — end_at / remaining-run budget) ──
+
+    fn preview_entry_at(
+        fire: chrono::DateTime<chrono::Utc>,
+        fires: bool,
+    ) -> ScheduleFirePreviewEntry {
+        use autumn_harvest::calendar::ScheduleFirePreview;
+        let raw = ScheduleFirePreview {
+            scheduled_at: fire,
+            effective_at: if fires { Some(fire) } else { None },
+            reason: if fires {
+                "Fired".to_string()
+            } else {
+                "SkippedByCalendar:test".to_string()
+            },
+        };
+        build_preview_entry(&raw, raw.effective_at, 0, "UTC", "skip")
+    }
+
+    #[test]
+    fn truncate_preview_entries_no_bounds_passes_through_unchanged() {
+        use chrono::TimeZone as _;
+        let fire = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let entries = vec![preview_entry_at(fire, true), preview_entry_at(fire, true)];
+        let out = truncate_preview_entries_by_bounds(entries, None, None);
+        assert_eq!(out.len(), 2, "no bounds must not truncate anything");
+    }
+
+    #[test]
+    fn truncate_preview_entries_drops_entries_at_or_after_end_at() {
+        use chrono::TimeZone as _;
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t1 = t0 + chrono::Duration::hours(1);
+        let t2 = t0 + chrono::Duration::hours(2);
+        let entries = vec![
+            preview_entry_at(t0, true),
+            preview_entry_at(t1, true),
+            preview_entry_at(t2, true),
+        ];
+        // end_at == t1: t1 is >= end_at so it (and everything after) is dropped.
+        let out = truncate_preview_entries_by_bounds(entries, Some(t1), None);
+        assert_eq!(
+            out.len(),
+            1,
+            "only the entry strictly before end_at must survive"
+        );
+        assert_eq!(out[0].scheduled_at, t0);
+    }
+
+    #[test]
+    fn truncate_preview_entries_stops_after_remaining_budget_is_exhausted() {
+        use chrono::TimeZone as _;
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t1 = t0 + chrono::Duration::hours(1);
+        let t2 = t0 + chrono::Duration::hours(2);
+        let entries = vec![
+            preview_entry_at(t0, true),
+            preview_entry_at(t1, true),
+            preview_entry_at(t2, true),
+        ];
+        let out = truncate_preview_entries_by_bounds(entries, None, Some(2));
+        assert_eq!(
+            out.len(),
+            2,
+            "only the first `remaining` actually-firing entries survive"
+        );
+    }
+
+    #[test]
+    fn truncate_preview_entries_calendar_skipped_entries_do_not_consume_budget() {
+        use chrono::TimeZone as _;
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t1 = t0 + chrono::Duration::hours(1);
+        let t2 = t0 + chrono::Duration::hours(2);
+        let entries = vec![
+            preview_entry_at(t0, true),
+            preview_entry_at(t1, false), // calendar-suppressed — must not consume budget
+            preview_entry_at(t2, true),
+        ];
+        let out = truncate_preview_entries_by_bounds(entries, None, Some(2));
+        assert_eq!(
+            out.len(),
+            3,
+            "a calendar-skipped entry between two budgeted fires must survive and not \
+             itself be counted against the budget"
+        );
+    }
+
+    #[test]
+    fn truncate_preview_entries_zero_budget_yields_no_entries() {
+        use chrono::TimeZone as _;
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let entries = vec![preview_entry_at(t0, true)];
+        let out = truncate_preview_entries_by_bounds(entries, None, Some(0));
+        assert!(
+            out.is_empty(),
+            "zero remaining budget must suppress all future fires"
         );
     }
 
