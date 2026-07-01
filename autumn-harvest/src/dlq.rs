@@ -1645,7 +1645,7 @@ pub async fn aggregate_dead_letters(
         HashMap::new()
     };
 
-    let mut groups: HashMap<Vec<Option<String>>, DlqRawGroup> = HashMap::new();
+    let mut groups: HashMap<Vec<Option<String>>, DlqRawGroup> = HashMap::with_capacity(rows.len());
     for (id, exec_id, activity_name, queue_name, task_type, failed_at, error) in rows {
         let key: Vec<Option<String>> = params
             .group_by
