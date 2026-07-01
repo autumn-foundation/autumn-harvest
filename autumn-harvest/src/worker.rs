@@ -39,7 +39,9 @@ use crate::executor::{
     WorkflowExecuteSpanMeta, WorkflowOutcome, run_workflow_with_state_history_policy_and_caps,
 };
 use crate::external_task;
-use crate::failure::{parse_error_payload, parse_error_payload_full, parse_typed_payload};
+use crate::failure::{
+    failure_is_non_retryable, parse_error_payload, parse_error_payload_full, parse_typed_payload,
+};
 use crate::info::{ActivityInfo, QueryHandlerInfo, UpdateHandlerInfo, WorkflowInfo};
 use crate::models::{
     HarvestTimer, NewHarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
@@ -1943,23 +1945,6 @@ pub(crate) fn chrono_duration_from_secs(
             "activity {field_name} exceeds chrono::Duration bounds"
         ))
     })
-}
-
-/// Whether `error` is non-retryable under the same rules `next_retry_delay`
-/// applies: the typed-payload `non_retryable` flag *and* the retry policy's
-/// `non_retryable_errors` list (which also matches legacy `Err(String)` values
-/// the typed flag never sees). The circuit breaker reuses this so a burst of
-/// permanent failures — typed or legacy — never trips the circuit.
-fn failure_is_non_retryable(error: &str, retry_policy: Option<&RetryPolicy>) -> bool {
-    let typed = parse_typed_payload(error);
-    if typed.as_ref().is_some_and(|f| f.non_retryable) {
-        return true;
-    }
-    if let Some(policy) = retry_policy {
-        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
-        return policy.is_non_retryable(typed_error_type, error);
-    }
-    false
 }
 
 fn next_retry_delay(

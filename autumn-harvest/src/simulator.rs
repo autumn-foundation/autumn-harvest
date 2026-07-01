@@ -11,7 +11,6 @@ use serde_json::Value;
 use crate::context::{SharedState, WorkflowCommand, empty_shared_state};
 use crate::event::WorkflowEvent;
 use crate::executor::{WorkflowOutcome, run_workflow_with_state};
-use crate::failure::parse_typed_payload;
 use crate::info::WorkflowHandlerFn;
 use crate::policy::RetryPolicy;
 use crate::types::{ActivityExecId, ExecutionId, WorkerId};
@@ -157,8 +156,10 @@ impl WorkflowSimulator {
     /// Resolve the effective retry policy for a `ScheduleActivity` command:
     /// the call-site override (from `execute_activity_with_opts`) wins,
     /// then the explicit per-mock override, then the `ActivityInfo` default.
-    /// `None` means a single attempt only — no retries — matching the live
-    /// worker's `max_attempts = retry_policy.map_or(1, |p| p.max_attempts)`.
+    /// `None` means no policy is configured at all — the live worker's
+    /// `queue::EnqueueParams::new()` default of 3 attempts (flat 1s delay)
+    /// applies, not a single attempt; see the `max_attempts` comment at the
+    /// `ScheduleActivity` call site.
     fn resolve_retry_policy(
         &self,
         name: &str,
@@ -292,9 +293,14 @@ impl WorkflowSimulator {
                     });
 
                     let retry_policy = self.resolve_retry_policy(&name, retry_policy_override);
-                    // Mirrors the live worker: `max_attempts = 1` (no retries)
-                    // when no retry policy resolves at all.
-                    let max_attempts = retry_policy.as_ref().map_or(1, |p| p.max_attempts.max(1));
+                    // Mirrors the live worker's regular (queue-dispatched)
+                    // activity default: `queue::EnqueueParams::new()` sets
+                    // `max_attempts = 3` and is only lowered/raised when a
+                    // retry policy actually resolves (`worker.rs`'s
+                    // `effective_retry` gate); with no policy at all,
+                    // `next_retry_delay` retries up to that default with a
+                    // flat 1s delay instead of giving up after one attempt.
+                    let max_attempts = retry_policy.as_ref().map_or(3, |p| p.max_attempts.max(1));
                     let mock = self.activity_mocks.get(&name);
 
                     let mut attempt: u32 = 1;
@@ -311,57 +317,53 @@ impl WorkflowSimulator {
                                 break;
                             }
                             Err(raw_error) => {
-                                // Classification mirrors the live worker's
-                                // `failure_is_non_retryable`/`finalize_activity_failure`
-                                // (issue #227): the typed payload's own
-                                // `non_retryable` flag, or the policy's
-                                // `non_retryable_errors` list, short-circuits
-                                // retries; the event's stored `non_retryable`
-                                // field reflects only the payload's own flag,
-                                // exactly as production persists it.
-                                let non_retryable_by_policy = activity_error_is_non_retryable(
-                                    &raw_error,
-                                    retry_policy.as_ref(),
-                                );
+                                // Single parse recovers both the persisted
+                                // `ActivityFailure` and the retry-termination
+                                // decision (issue #227), shared with the live
+                                // worker via `crate::failure::classify_activity_error`.
+                                let (failure, non_retryable_by_policy) =
+                                    crate::failure::classify_activity_error(
+                                        &raw_error,
+                                        retry_policy.as_ref(),
+                                    );
                                 let terminal = attempt >= max_attempts || non_retryable_by_policy;
-                                let failure = crate::failure::parse_error_payload_full(&raw_error);
 
-                                if terminal {
-                                    history.push(WorkflowEvent::ActivityFailed {
-                                        activity_id,
-                                        error: failure.message,
-                                        attempt,
-                                        error_type: failure.error_type,
-                                        non_retryable: failure.non_retryable,
-                                        details: failure.details,
-                                    });
-                                    break;
-                                }
-
-                                // Non-terminal attempt: recorded for
-                                // observability (issue #541 AC1/AC2) using a
-                                // synthetic activity_id distinct from the
-                                // scheduled activity's real id. Production
-                                // never persists an event for a requeued
-                                // retry (`queue::requeue_for_retry` writes no
-                                // event) — `HistoryMatcher::scan_activity_terminal`
-                                // returns the *first* `ActivityFailed` it
-                                // finds for a given `activity_id`, so reusing
-                                // the real id here would make the eventual
-                                // `ActivityCompleted` unreachable on the next
-                                // replay pass. A distinct id is silently
-                                // skipped by that scan (unrelated-activity
-                                // event), so it is purely observational and
-                                // never affects control flow. Backoff is
-                                // logical-only: no real-time sleep (AC6).
+                                // Non-terminal attempts get a synthetic
+                                // activity_id distinct from the real one:
+                                // production never persists an event for a
+                                // requeued retry, and `HistoryMatcher::
+                                // scan_activity_terminal` returns the *first*
+                                // `ActivityFailed` matching `activity_id`, so
+                                // reusing the real id would shadow the
+                                // eventual terminal event. A distinct id is
+                                // silently skipped by that scan (unrelated-
+                                // activity event) — purely observational
+                                // (issue #541 AC1/AC2), never affecting
+                                // control flow. Caveat: a history containing
+                                // these events must not be fed into id-keyed
+                                // tooling that expects every `ActivityFailed`
+                                // to have a matching `ActivityScheduled` (e.g.
+                                // `test_generator.rs`'s mock generator, or
+                                // `analyzer.rs`'s `ExcessiveRetriesRule`,
+                                // which would misreport the activity name for
+                                // these events).
+                                let event_id = if terminal {
+                                    activity_id
+                                } else {
+                                    ActivityExecId::new()
+                                };
                                 history.push(WorkflowEvent::ActivityFailed {
-                                    activity_id: ActivityExecId::new(),
+                                    activity_id: event_id,
                                     error: failure.message,
                                     attempt,
                                     error_type: failure.error_type,
                                     non_retryable: failure.non_retryable,
                                     details: failure.details,
                                 });
+
+                                if terminal {
+                                    break;
+                                }
                                 attempt += 1;
                             }
                         }
@@ -442,23 +444,6 @@ impl WorkflowSimulator {
         }
         advanced
     }
-}
-
-/// Whether `error` should skip remaining retry attempts, mirroring the live
-/// worker's retry-termination rule (issue #227 / `failure_is_non_retryable`
-/// in `worker.rs`): the typed payload's own `non_retryable` flag, *or* the
-/// resolved policy's `non_retryable_errors` list (which also matches legacy
-/// `Err(String)` payloads the typed flag never sees).
-fn activity_error_is_non_retryable(error: &str, retry_policy: Option<&RetryPolicy>) -> bool {
-    let typed = parse_typed_payload(error);
-    if typed.as_ref().is_some_and(|f| f.non_retryable) {
-        return true;
-    }
-    if let Some(policy) = retry_policy {
-        let typed_error_type = typed.as_ref().map(|f| f.error_type.as_str());
-        return policy.is_non_retryable(typed_error_type, error);
-    }
-    false
 }
 
 #[cfg(test)]
@@ -711,6 +696,37 @@ mod tests {
             terminal_attempts.contains(&3),
             "the terminal ActivityFailed must carry attempt 3, got {terminal_attempts:?}"
         );
+    }
+
+    /// Regression test (code review, issue #541): when NO retry policy
+    /// resolves at all (no `with_activity_info`, no `with_retry_policy`, no
+    /// call-site override), the simulator must match the live worker's
+    /// regular-activity default of 3 attempts — `queue::EnqueueParams::new()`
+    /// defaults `max_attempts` to 3, and `next_retry_delay` retries up to
+    /// that default with a flat 1s delay when no policy is configured — not
+    /// give up after a single attempt.
+    #[tokio::test]
+    async fn test_simulator_default_no_policy_matches_production_three_attempts() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = calls.clone();
+
+        let sim = WorkflowSimulator::new(single_activity_workflow).mock_activity(
+            "flaky",
+            move |_input| {
+                calls_clone.fetch_add(1, Ordering::SeqCst);
+                Err("always fails".to_string())
+            },
+        );
+
+        let res = sim.run(serde_json::json!("input")).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "with no retry policy configured anywhere, the simulator must retry \
+             up to the live worker's un-configured default of 3 attempts"
+        );
+        assert!(res.final_output.is_err());
     }
 
     /// AC4: a non-retryable typed failure stops the retry loop after attempt 1

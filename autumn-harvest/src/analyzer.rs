@@ -82,6 +82,15 @@ impl AnalyzerRule for ExcessiveRetriesRule {
     fn analyze(&self, history: &[WorkflowEvent]) -> Vec<AnalyzerWarning> {
         let mut warnings = Vec::new();
         let mut activity_names = HashMap::new();
+        // Falls back to the most recently scheduled activity's name when an
+        // `ActivityFailed` event's id has no exact match. Some history
+        // producers intentionally emit `ActivityFailed` events for retry
+        // attempts under a synthetic id with no corresponding
+        // `ActivityScheduled` (e.g. `WorkflowSimulator`'s observational
+        // per-attempt retry events, `simulator.rs`), so an exact-id-only
+        // lookup would misreport those as "Unknown" even though the
+        // surrounding history unambiguously identifies the activity.
+        let mut last_scheduled_name: Option<String> = None;
 
         for event in history {
             match event {
@@ -89,6 +98,7 @@ impl AnalyzerRule for ExcessiveRetriesRule {
                     activity_id, name, ..
                 } => {
                     activity_names.insert(*activity_id, name.clone());
+                    last_scheduled_name = Some(name.clone());
                 }
                 WorkflowEvent::ActivityFailed {
                     activity_id,
@@ -97,7 +107,9 @@ impl AnalyzerRule for ExcessiveRetriesRule {
                 } if *attempt > self.threshold => {
                     let name = activity_names
                         .get(activity_id)
-                        .map_or("Unknown", |n| n.as_str());
+                        .cloned()
+                        .or_else(|| last_scheduled_name.clone())
+                        .unwrap_or_else(|| "Unknown".to_string());
                     warnings.push(AnalyzerWarning {
                         rule_name: self.name().to_string(),
                         message: format!(
@@ -275,6 +287,48 @@ mod tests {
         assert_eq!(warnings[0].rule_name, "ExcessiveRetries");
         assert!(warnings[0].message.contains("BillingTask"));
         assert!(warnings[0].message.contains("failed 3 times"));
+    }
+
+    /// Regression test (code review, issue #541): a history producer may
+    /// emit `ActivityFailed` events under a synthetic id with no matching
+    /// `ActivityScheduled` (e.g. `WorkflowSimulator`'s observational
+    /// per-attempt retry events). The rule must still resolve the activity's
+    /// name from the most recently scheduled activity instead of reporting
+    /// "Unknown".
+    #[test]
+    fn excessive_retries_resolves_name_for_unscheduled_activity_id() {
+        let rule = ExcessiveRetriesRule::new(1);
+        let scheduled_id = ActivityExecId::new();
+        let synthetic_id = ActivityExecId::new();
+        assert_ne!(scheduled_id, synthetic_id);
+
+        let history = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id: scheduled_id,
+                name: "ChargeCard".to_string(),
+                input: serde_json::Value::Null,
+                queue: "default".to_string(),
+            },
+            // Non-terminal retry-attempt event under a synthetic id, as
+            // WorkflowSimulator's retry loop emits for observability.
+            WorkflowEvent::ActivityFailed {
+                activity_id: synthetic_id,
+                error: "transient".to_string(),
+                attempt: 2,
+                error_type: "Error".into(),
+                non_retryable: false,
+                details: None,
+            },
+        ];
+
+        let warnings = rule.analyze(&history);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].message.contains("ChargeCard"),
+            "must resolve the real activity name, not 'Unknown': {}",
+            warnings[0].message
+        );
+        assert!(!warnings[0].message.contains("Unknown"));
     }
 
     #[test]
