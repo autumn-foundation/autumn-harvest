@@ -19466,6 +19466,15 @@ fn truncate_preview_entries_by_bounds(
     let mut budget = remaining_budget;
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
+        // Checked unconditionally, not just for budget-consuming entries: once the
+        // budget is spent the schedule is permanently terminal, so even a
+        // calendar-suppressed entry (which itself never consumes budget) must not
+        // be shown past that point.
+        if let Some(remaining) = budget
+            && remaining <= 0
+        {
+            break;
+        }
         if let Some(cutoff) = end_at {
             let compare_at = entry.effective_at.unwrap_or(entry.scheduled_at);
             if compare_at >= cutoff {
@@ -19475,9 +19484,6 @@ fn truncate_preview_entries_by_bounds(
         if entry.effective_at.is_some()
             && let Some(remaining) = budget
         {
-            if remaining <= 0 {
-                break;
-            }
             budget = Some(remaining - 1);
         }
         out.push(entry);
@@ -19571,8 +19577,13 @@ async fn preview_schedule_firings_handler(
     // Exhausted schedules (issue #478 / #543 — end_at reached or run budget spent)
     // are permanently terminal: they will never fire again, so the preview must
     // report zero entries rather than projecting fire times the live scheduler
-    // will never actually dispatch.
-    if schedule.is_paused || schedule.exhausted_at.is_some() {
+    // will never actually dispatch. A budget that has already reached zero is
+    // handled the same way even if the row hasn't transitioned to `exhausted_at`
+    // yet (the live scheduler sets it eagerly, but this check is an inexpensive,
+    // harmless belt-and-suspenders match — `truncate_preview_entries_by_bounds`
+    // would produce an empty list for `Some(0)` regardless, so this only skips
+    // the unnecessary schedule-parsing and calendar-exclusion work).
+    if schedule.is_paused || schedule.exhausted_at.is_some() || remaining_runs == Some(0) {
         return Ok((
             StatusCode::OK,
             Json(empty_preview_response(
@@ -24493,6 +24504,31 @@ mod tests {
             out.is_empty(),
             "zero remaining budget must suppress all future fires"
         );
+    }
+
+    #[test]
+    fn truncate_preview_entries_calendar_skipped_entry_after_budget_exhausted_is_dropped() {
+        // Regression test: a calendar-suppressed entry (effective_at.is_none())
+        // never itself consumes budget, but that must not let it slip past the
+        // budget-exhausted cutoff once a prior entry has already spent the last
+        // unit — the schedule is permanently terminal at that point, skipped or not.
+        use chrono::TimeZone as _;
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        let t1 = t0 + chrono::Duration::hours(1);
+        let t2 = t0 + chrono::Duration::hours(2);
+        let entries = vec![
+            preview_entry_at(t0, true),  // consumes the only unit of budget
+            preview_entry_at(t1, false), // calendar-suppressed — must NOT survive
+            preview_entry_at(t2, true),
+        ];
+        let out = truncate_preview_entries_by_bounds(entries, None, Some(1));
+        assert_eq!(
+            out.len(),
+            1,
+            "once the budget hits zero, no further entries (fired or skipped) may \
+             be shown, even calendar-suppressed ones"
+        );
+        assert_eq!(out[0].scheduled_at, t0);
     }
 
     #[test]
