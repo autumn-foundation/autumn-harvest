@@ -257,7 +257,7 @@ async fn get_json(app: &HarvestApiApp, uri: &str) -> (StatusCode, Value) {
     (status, json)
 }
 
-/// Seed one workflow execution on `url`/`shard` and force its state/started_at.
+/// Seed one workflow execution on `url`/`shard` and force its `state`/`started_at`.
 async fn seed_execution(
     url: &str,
     shard: i32,
@@ -534,5 +534,5 @@ async fn one_shard_down_is_partial_not_500() {
         "the down shard is named in the report"
     );
     assert_eq!(unavailable[0]["shard_id"], 1);
-    assert!(unavailable[0]["reason"].as_str().unwrap().len() > 0);
+    assert!(!unavailable[0]["reason"].as_str().unwrap().is_empty());
 }
