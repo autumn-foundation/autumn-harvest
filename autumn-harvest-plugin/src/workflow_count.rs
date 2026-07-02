@@ -20,23 +20,36 @@
 //! The number of distinct groups returned is capped at `limit_groups`
 //! (default [`DEFAULT_LIMIT_GROUPS`], max [`MAX_LIMIT_GROUPS`]); the long tail
 //! is rolled into a single `{"other": true}` group so a pathological number of
-//! workflow types can never produce an unbounded payload. Mirrors the DLQ
-//! aggregation endpoint's `_other` rollup (issue #385).
+//! workflow types can never produce an unbounded payload, via the same
+//! [`rollup_top_n`](autumn_harvest::dlq::rollup_top_n) helper the DLQ
+//! aggregation endpoint's `_other` rollup (issue #385) uses.
 //!
 //! ## Partial answers
 //!
-//! When a shard is unreachable it is named in the `unavailable_shards` field
-//! (never silently dropped) and `status` becomes `partial` (some shards
-//! inspected) or `unavailable` (none inspected) — the call never fails
-//! wholesale, matching the shard-health `degraded` contract.
+//! Every shard the router knows about (`readable_shards`/`default_shard`),
+//! not just the ones with a live connection pool right now, is included in
+//! the fan-out via [`shard_fanout::expected_shards`] — a shard mid a
+//! shard-add rollout that has no pool wired up yet is reported `unavailable`
+//! rather than silently omitted, so `status` can never read `complete` while
+//! a known shard was never queried. When a shard is unreachable it is named
+//! in the `unavailable_shards` field (never silently dropped) and `status`
+//! becomes `partial` (some shards inspected) or `unavailable` (none
+//! inspected) — the call never fails wholesale, matching the shard-health
+//! `degraded` contract.
 
 use std::collections::HashMap;
 
-use autumn_harvest::execution::{WorkflowCountDimension, WorkflowCountRow};
+use autumn_harvest::dlq::rollup_top_n;
+use autumn_harvest::execution::{
+    WorkflowCountDimension, WorkflowCountQuery, WorkflowCountRow, count_workflow_executions_grouped,
+};
+use autumn_harvest::worker::DbPool;
 use chrono::{DateTime, Utc};
+use futures::future::join_all;
 use serde::Serialize;
 
-use crate::shard_fanout::ShardObservation;
+use crate::api::HarvestApiState;
+use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
 
 /// Default cap on the number of `(state, workflow_name)` groups returned.
 pub const DEFAULT_LIMIT_GROUPS: u32 = 50;
@@ -44,16 +57,11 @@ pub const DEFAULT_LIMIT_GROUPS: u32 = 50;
 pub const MAX_LIMIT_GROUPS: u32 = 500;
 
 /// Cross-shard completeness of a count response.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowCountReportStatus {
-    /// Every configured shard was inspected.
-    Complete,
-    /// At least one shard was inspected and at least one was unavailable.
-    Partial,
-    /// No shard could be inspected.
-    Unavailable,
-}
+///
+/// A type alias onto the shared [`FanoutStatus`] (rather than its own enum)
+/// so the complete/partial/unavailable derivation rule lives in exactly one
+/// place, alongside `workflow_reachability`'s and `schedule_runs`' reports.
+pub type WorkflowCountReportStatus = FanoutStatus;
 
 /// A shard that could not be queried for this snapshot.
 #[derive(Debug, Clone, Serialize)]
@@ -252,16 +260,6 @@ impl WorkflowCountParams {
     }
 }
 
-const fn report_status(no_inspected: bool, has_unavailable: bool) -> WorkflowCountReportStatus {
-    if no_inspected {
-        WorkflowCountReportStatus::Unavailable
-    } else if has_unavailable {
-        WorkflowCountReportStatus::Partial
-    } else {
-        WorkflowCountReportStatus::Complete
-    }
-}
-
 /// A merge key: `(state, workflow_name)`, each `None` when not grouped by.
 type CountKey = (Option<String>, Option<String>);
 
@@ -269,10 +267,9 @@ type CountKey = (Option<String>, Option<String>);
 /// no DB).
 ///
 /// Counts sum across shards; groups are ordered by descending count (ties
-/// broken by key for determinism). When more than `limit_groups` distinct
-/// groups exist, the long tail is rolled into a single `other: true` group so
-/// the per-group counts reconcile to `total`, and `truncated` is set to
-/// `true`. `status` is `complete` only when every shard was inspected.
+/// broken by key for determinism) and rolled up via the shared
+/// [`rollup_top_n`] bounded-cardinality helper. `status` is `complete` only
+/// when every shard was inspected.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
 pub fn build_count_response(
@@ -303,51 +300,117 @@ pub fn build_count_response(
         }
     }
 
-    let mut groups: Vec<(CountKey, i64)> = merged.into_iter().collect();
-    groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let total: i64 = merged.values().sum();
+    let groups: Vec<(CountKey, i64)> = merged.into_iter().collect();
 
-    let total: i64 = groups.iter().map(|(_, count)| count).sum();
-
-    let mut out = Vec::new();
-    let mut truncated = false;
-    if groups.len() > limit_groups {
-        let other_count: i64 = groups[limit_groups..].iter().map(|(_, count)| count).sum();
-        for ((state, workflow_name), count) in &groups[..limit_groups] {
-            out.push(WorkflowCountGroupEntry {
-                state: state.clone(),
-                workflow_name: workflow_name.clone(),
-                count: *count,
-                other: false,
-            });
-        }
-        if other_count > 0 {
-            out.push(WorkflowCountGroupEntry {
-                state: None,
-                workflow_name: None,
-                count: other_count,
-                other: true,
-            });
-            truncated = true;
-        }
-    } else {
-        for ((state, workflow_name), count) in groups {
-            out.push(WorkflowCountGroupEntry {
-                state,
-                workflow_name,
-                count,
-                other: false,
-            });
-        }
-    }
+    let (out, truncated) = rollup_top_n(
+        groups,
+        limit_groups,
+        |count| *count,
+        |(state, workflow_name), count| WorkflowCountGroupEntry {
+            state,
+            workflow_name,
+            count,
+            other: false,
+        },
+        |other_count| WorkflowCountGroupEntry {
+            state: None,
+            workflow_name: None,
+            count: other_count,
+            other: true,
+        },
+    );
 
     WorkflowCountResponse {
-        status: report_status(inspected == 0, !unavailable_shards.is_empty()),
+        status: FanoutStatus::from_counts(inspected, unavailable_shards.len()),
         as_of,
         groups: out,
         total,
         truncated,
         unavailable_shards,
     }
+}
+
+/// Query one shard for its grouped counts (issue #544).
+///
+/// Returns a [`ShardObservation`] rather than propagating errors so a single
+/// unreachable shard never fails the whole fan-out — the caller folds it into
+/// `unavailable_shards` and a `partial`/`unavailable` status instead.
+async fn observe_shard(
+    shard_id: i32,
+    pool: Option<DbPool>,
+    query: &WorkflowCountQuery,
+) -> ShardObservation<WorkflowCountRow> {
+    let Some(pool) = pool else {
+        return ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!("shard {shard_id} has no configured storage pool")),
+        };
+    };
+    let Ok(mut conn) = pool.get().await else {
+        return ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(format!(
+                "database connection for shard {shard_id} could not be acquired"
+            )),
+        };
+    };
+    match count_workflow_executions_grouped(&mut conn, shard_id, query).await {
+        Ok(rows) => ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(e) => ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+/// Build the grouped workflow-count report for `GET /workflows/count`
+/// (issue #544).
+///
+/// Fans the query out across [`shard_fanout::expected_shards`] — every shard
+/// with a live pool *and* every shard the router already knows about — so a
+/// shard mid a shard-add rollout is reported `unavailable` rather than
+/// silently skipped, then queries all of them concurrently (`join_all`)
+/// rather than one at a time.
+///
+/// Never fails outright: a missing storage pool (or an unreachable shard)
+/// surfaces as `status: unavailable`/`partial` in the response, matching
+/// `workflow_reachability`'s and the shard-health "never fail wholesale"
+/// contract.
+pub async fn build_workflow_count_report(
+    api_state: &HarvestApiState,
+    params: WorkflowCountParams,
+) -> WorkflowCountResponse {
+    let as_of = Utc::now();
+    let pools = shard_fanout::pools_by_shard(api_state);
+    let expected = shard_fanout::expected_shards(api_state, &pools);
+    let limit_groups = params.limit_groups as usize;
+
+    let query = WorkflowCountQuery {
+        group_by: params.group_by,
+        workflow_name: params.workflow_name,
+        states: params.states,
+        started_after: params.started_after,
+        started_before: params.started_before,
+    };
+
+    let observations = expected
+        .iter()
+        .map(|shard_id| {
+            let pool = pools.get(shard_id).cloned();
+            observe_shard(*shard_id, pool, &query)
+        })
+        .collect::<Vec<_>>();
+    let observations = join_all(observations).await;
+
+    build_count_response(as_of, limit_groups, observations)
 }
 
 #[cfg(test)]

@@ -3843,9 +3843,14 @@ pub struct WorkflowCountRow {
     pub count: i64,
 }
 
-const COUNT_TOTAL_SQL: &str = r"
-SELECT COUNT(*)::BIGINT AS count
-FROM harvest_workflow_executions
+/// `WHERE` clause shared by all four `COUNT_*_SQL` shapes below (issue #544).
+///
+/// Factored into one constant so a future filter addition (e.g. `queue_name`)
+/// is edited in exactly one place instead of four SQL strings kept in lockstep
+/// by hand — a mismatch between them would silently produce a filter that
+/// works for some `group_by` combinations but not others, with no compiler
+/// check to catch the omission.
+const COUNT_WHERE_CLAUSE: &str = r"
 WHERE shard_id = $1::INT4
   AND ($2::TEXT IS NULL OR workflow_name = $2::TEXT)
   AND ($3::TEXT[] IS NULL OR state = ANY($3::TEXT[]))
@@ -3853,38 +3858,35 @@ WHERE shard_id = $1::INT4
   AND ($5::TIMESTAMPTZ IS NULL OR started_at <= $5::TIMESTAMPTZ)
 ";
 
-const COUNT_BY_STATE_SQL: &str = r"
-SELECT state::TEXT AS state, COUNT(*)::BIGINT AS count
-FROM harvest_workflow_executions
-WHERE shard_id = $1::INT4
-  AND ($2::TEXT IS NULL OR workflow_name = $2::TEXT)
-  AND ($3::TEXT[] IS NULL OR state = ANY($3::TEXT[]))
-  AND ($4::TIMESTAMPTZ IS NULL OR started_at >= $4::TIMESTAMPTZ)
-  AND ($5::TIMESTAMPTZ IS NULL OR started_at <= $5::TIMESTAMPTZ)
-GROUP BY state
-";
+fn count_total_sql() -> String {
+    format!(
+        "SELECT COUNT(*)::BIGINT AS count\nFROM harvest_workflow_executions\n{COUNT_WHERE_CLAUSE}"
+    )
+}
 
-const COUNT_BY_WORKFLOW_NAME_SQL: &str = r"
-SELECT workflow_name::TEXT AS workflow_name, COUNT(*)::BIGINT AS count
-FROM harvest_workflow_executions
-WHERE shard_id = $1::INT4
-  AND ($2::TEXT IS NULL OR workflow_name = $2::TEXT)
-  AND ($3::TEXT[] IS NULL OR state = ANY($3::TEXT[]))
-  AND ($4::TIMESTAMPTZ IS NULL OR started_at >= $4::TIMESTAMPTZ)
-  AND ($5::TIMESTAMPTZ IS NULL OR started_at <= $5::TIMESTAMPTZ)
-GROUP BY workflow_name
-";
+fn count_by_state_sql() -> String {
+    format!(
+        "SELECT state::TEXT AS state, COUNT(*)::BIGINT AS count\n\
+         FROM harvest_workflow_executions\n\
+         {COUNT_WHERE_CLAUSE}GROUP BY state"
+    )
+}
 
-const COUNT_BY_STATE_AND_WORKFLOW_NAME_SQL: &str = r"
-SELECT state::TEXT AS state, workflow_name::TEXT AS workflow_name, COUNT(*)::BIGINT AS count
-FROM harvest_workflow_executions
-WHERE shard_id = $1::INT4
-  AND ($2::TEXT IS NULL OR workflow_name = $2::TEXT)
-  AND ($3::TEXT[] IS NULL OR state = ANY($3::TEXT[]))
-  AND ($4::TIMESTAMPTZ IS NULL OR started_at >= $4::TIMESTAMPTZ)
-  AND ($5::TIMESTAMPTZ IS NULL OR started_at <= $5::TIMESTAMPTZ)
-GROUP BY state, workflow_name
-";
+fn count_by_workflow_name_sql() -> String {
+    format!(
+        "SELECT workflow_name::TEXT AS workflow_name, COUNT(*)::BIGINT AS count\n\
+         FROM harvest_workflow_executions\n\
+         {COUNT_WHERE_CLAUSE}GROUP BY workflow_name"
+    )
+}
+
+fn count_by_state_and_workflow_name_sql() -> String {
+    format!(
+        "SELECT state::TEXT AS state, workflow_name::TEXT AS workflow_name, COUNT(*)::BIGINT AS count\n\
+         FROM harvest_workflow_executions\n\
+         {COUNT_WHERE_CLAUSE}GROUP BY state, workflow_name"
+    )
+}
 
 #[derive(Debug, diesel::QueryableByName)]
 struct CountTotalSqlRow {
@@ -3959,7 +3961,7 @@ pub async fn count_workflow_executions_grouped(
 
     match (group_state, group_workflow_name) {
         (true, true) => {
-            let rows = diesel::sql_query(COUNT_BY_STATE_AND_WORKFLOW_NAME_SQL)
+            let rows = diesel::sql_query(count_by_state_and_workflow_name_sql())
                 .bind::<Integer, _>(shard_id)
                 .bind::<Nullable<Text>, _>(workflow_name)
                 .bind::<Nullable<Array<Text>>, _>(states)
@@ -3978,7 +3980,7 @@ pub async fn count_workflow_executions_grouped(
                 .collect())
         }
         (true, false) => {
-            let rows = diesel::sql_query(COUNT_BY_STATE_SQL)
+            let rows = diesel::sql_query(count_by_state_sql())
                 .bind::<Integer, _>(shard_id)
                 .bind::<Nullable<Text>, _>(workflow_name)
                 .bind::<Nullable<Array<Text>>, _>(states)
@@ -3997,7 +3999,7 @@ pub async fn count_workflow_executions_grouped(
                 .collect())
         }
         (false, true) => {
-            let rows = diesel::sql_query(COUNT_BY_WORKFLOW_NAME_SQL)
+            let rows = diesel::sql_query(count_by_workflow_name_sql())
                 .bind::<Integer, _>(shard_id)
                 .bind::<Nullable<Text>, _>(workflow_name)
                 .bind::<Nullable<Array<Text>>, _>(states)
@@ -4016,7 +4018,7 @@ pub async fn count_workflow_executions_grouped(
                 .collect())
         }
         (false, false) => {
-            let row = diesel::sql_query(COUNT_TOTAL_SQL)
+            let row = diesel::sql_query(count_total_sql())
                 .bind::<Integer, _>(shard_id)
                 .bind::<Nullable<Text>, _>(workflow_name)
                 .bind::<Nullable<Array<Text>>, _>(states)

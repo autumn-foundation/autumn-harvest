@@ -109,8 +109,7 @@ use autumn_harvest::workers::{
 use autumn_harvest::{HistoryMatch, HistoryMatcher, WorkflowEvent};
 use autumn_harvest::{
     SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams, UpdateWithStartOutcome,
-    UpdateWithStartParams, WorkflowCountQuery, WorkflowCountRow, WorkflowHandleClient,
-    WorkflowResult, cancel_workflow_execution, count_workflow_executions_grouped,
+    UpdateWithStartParams, WorkflowHandleClient, WorkflowResult, cancel_workflow_execution,
     pause_workflow_execution, resume_workflow_execution,
     signal_with_start_workflow_execution_with_metrics,
     start_or_load_workflow_execution_with_metrics, terminate_workflow_execution,
@@ -119,7 +118,6 @@ use autumn_harvest::{
 
 use crate::preflight::{PreflightReport, build_preflight_report};
 use crate::schedule_runs;
-use crate::shard_fanout::ShardObservation;
 use crate::shard_health::{ShardHealthReport, ShardReadiness, build_shard_health_report};
 use crate::state::HarvestDbPool;
 use crate::version_gate_retirement::{RetirementCheckQuery, build_retirement_check_report};
@@ -4535,49 +4533,9 @@ async fn count_workflows(
 ) -> Result<Json<WorkflowCountResponse>, AutumnError> {
     let params = WorkflowCountParams::from_query_pairs(&pairs, KNOWN_WORKFLOW_STATES)
         .map_err(AutumnError::bad_request_msg)?;
-    let as_of = chrono::Utc::now();
-    let pool = api_state.storage_pool().map_err(map_error)?;
-
-    let query = WorkflowCountQuery {
-        group_by: params.group_by.clone(),
-        workflow_name: params.workflow_name.clone(),
-        states: params.states.clone(),
-        started_after: params.started_after,
-        started_before: params.started_before,
-    };
-
-    let mut observations: Vec<ShardObservation<WorkflowCountRow>> = Vec::new();
-    for (shard, shard_pool) in pool.iter_shards() {
-        let shard_id = shard.as_i32();
-        let observation = match shard_pool.get().await {
-            Ok(mut conn) => {
-                match count_workflow_executions_grouped(&mut conn, shard_id, &query).await {
-                    Ok(rows) => ShardObservation {
-                        shard_id,
-                        rows,
-                        error: None,
-                    },
-                    Err(e) => ShardObservation {
-                        shard_id,
-                        rows: Vec::new(),
-                        error: Some(e.to_string()),
-                    },
-                }
-            }
-            Err(e) => ShardObservation {
-                shard_id,
-                rows: Vec::new(),
-                error: Some(e.to_string()),
-            },
-        };
-        observations.push(observation);
-    }
-
-    Ok(Json(workflow_count::build_count_response(
-        as_of,
-        params.limit_groups as usize,
-        observations,
-    )))
+    Ok(Json(
+        workflow_count::build_workflow_count_report(&api_state, params).await,
+    ))
 }
 
 /// `GET /workflows/registered` — list all registered workflow types with
