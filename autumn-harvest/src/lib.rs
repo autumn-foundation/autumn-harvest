@@ -64,6 +64,7 @@ pub mod context;
 pub mod critical_path;
 pub mod dag;
 /// Export format types for Directed Acyclic Graphs (DAGs) representing workflows.
+pub mod dag_critical_path_export;
 pub mod dag_export;
 pub mod dag_linter;
 #[cfg(feature = "testing")]
@@ -210,6 +211,7 @@ pub use dag::{
     DagBuildError, DagBuilder, DagCondition, DagDefinition, DagDispatchDecision, DagMapTaskRef,
     DagTask, DagTaskRef,
 };
+pub use dag_critical_path_export::export_critical_path_mermaid;
 pub use dag_export::{export_dot, export_mermaid};
 pub use dag_linter::{
     DagLinter, DagRule, DagWarning, ExcessiveParallelismRule, MissingRetryPolicyRule,
