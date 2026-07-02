@@ -201,7 +201,6 @@ impl UsageParams {
 /// Returns [`UsageGroupCapExceeded`] when the merged group count exceeds
 /// `max_groups`, checked after the cross-shard merge but before the
 /// response is constructed (no extra DB round-trip).
-#[allow(clippy::needless_pass_by_value)]
 pub fn build_usage_response(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
@@ -212,12 +211,12 @@ pub fn build_usage_response(
     let (inspected, unavailable_shards) = shard_fanout::summarize_shard_errors(&observations);
 
     let mut merged: BTreeMap<String, UsageGroupRecord> = BTreeMap::new();
-    for observation in &observations {
-        for row in &observation.rows {
+    for observation in observations {
+        for row in observation.rows {
             let entry = merged
-                .entry(row.group.clone())
-                .or_insert_with(|| UsageGroupRecord {
-                    group: row.group.clone(),
+                .entry(row.group)
+                .or_insert_with_key(|group| UsageGroupRecord {
+                    group: group.clone(),
                     workflow_starts: 0,
                     completed: 0,
                     failed: 0,
