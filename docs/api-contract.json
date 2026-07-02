@@ -3415,6 +3415,10 @@
           "description": "Missing from/to, malformed timestamp, from after to, window wider than the configurable ceiling (default 90 days, names the ceiling), or an unrecognized group_by dimension."
         },
         {
+          "status": 413,
+          "description": "The merged group count exceeds the configurable cap (default 10,000, names the cap and the actual count); narrow the window or choose a lower-cardinality group_by key. A hard failure rather than a silent rollup, since a chargeback report must never drop a low-volume tenant's data."
+        },
+        {
           "status": 500,
           "description": "Database error."
         }
