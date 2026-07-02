@@ -894,22 +894,26 @@ impl WorkflowContext {
     ///
     /// Runs after every [`match_history`](Self::match_history) call so a
     /// handler fires exactly when the workflow's own code-driven cursor
-    /// progression passes its recorded position -- never ahead of it. This
-    /// closes a real ordering bug in the original implementation: an eager,
-    /// cursor-independent full-history scan (the original
-    /// `drain_signal_events`) could dispatch a handler for a signal recorded
-    /// *after* an activity or timer the workflow hadn't reached yet in this
-    /// replay cycle, silently reordering observable side effects relative to
-    /// history. [`HistoryMatcher::claim_pending_signal`] only inspects
-    /// signals already drained into `pending_signals` by the same
-    /// cursor-bound sweep every other `match_*` call opens with
+    /// progression passes its recorded position -- never ahead of it. An
+    /// eager, cursor-independent full-history scan (the original
+    /// `drain_signal_events`) could otherwise dispatch a handler for a
+    /// signal recorded *after* an activity or timer the workflow hadn't
+    /// reached yet in this replay cycle, silently reordering observable side
+    /// effects relative to history. [`HistoryMatcher::claim_pending_signal`]
+    /// only inspects signals already drained into `pending_signals` by the
+    /// same cursor-bound sweep every other `match_*` call opens with
     /// (`prepare_match`), so it can never reach ahead of wherever the
     /// workflow's code has actually driven the matcher so far.
     ///
     /// Claims across all registered handler names are collected and sorted
     /// by event index *before* any dispatch, so two differently-named
     /// handlers fire in true historical order relative to each other, not
-    /// just self-consistently within one name.
+    /// just self-consistently within one name -- this is why registration
+    /// itself does not dispatch inline (see
+    /// [`register_and_dispatch_signal_handler`](Self::register_and_dispatch_signal_handler)):
+    /// a pump triggered from a single registration call could only ever see
+    /// the handlers registered so far, not ones about to register on the
+    /// next line.
     fn pump_signal_handlers(&self) {
         let names = self
             .signal_registry
@@ -944,6 +948,24 @@ impl WorkflowContext {
                 invoke_signal_handler(&handler, &name, payload);
             }
         }
+    }
+
+    /// Forces one [`pump_signal_handlers`](Self::pump_signal_handlers) sweep
+    /// via [`match_history`](Self::match_history)'s post-hook.
+    ///
+    /// Every other trigger for the pump is a byproduct of some other
+    /// cursor-advancing call (an activity/timer/signal match). A workflow
+    /// cycle that registers a handler and then does nothing else that
+    /// touches history before completing would otherwise never flush a
+    /// signal already recorded and claimable at that point. The executor
+    /// calls this once per cycle, right after the handler function returns
+    /// -- and, on the strict/canary replay paths, *before* the subsequent
+    /// `history_has_unconsumed_events()` check, so a signal a registered
+    /// handler was going to claim is never mistaken for genuinely unconsumed
+    /// history (issue #546 post-ship hardening). A no-op when no handlers
+    /// are registered (the overwhelmingly common case).
+    pub(crate) fn flush_pending_signal_handlers(&self) {
+        self.match_history(|_| ());
     }
 
     pub(crate) fn is_timer_started_next(&self, timer_id: &str) -> bool {
@@ -4982,12 +5004,29 @@ impl WorkflowContext {
     /// before this cycle's code reached the registration call). No signal is
     /// silently dropped.
     ///
-    /// Handlers are **fire-and-forget**: they run synchronously, inline, and
-    /// return nothing. There is no validator and no completion event -- that
-    /// is the `update` primitive's job (issue #140). A handler is expected to
-    /// mutate author-captured state (e.g. an `Arc<Mutex<T>>` declared at the
-    /// top of the workflow body), which downstream code in the same cycle can
-    /// then observe immediately.
+    /// Handlers are **fire-and-forget**: they run synchronously and return
+    /// nothing. There is no validator and no completion event -- that is the
+    /// `update` primitive's job (issue #140). A handler is expected to mutate
+    /// author-captured state (e.g. an `Arc<Mutex<T>>` declared at the top of
+    /// the workflow body).
+    ///
+    /// **Dispatch timing.** Registration itself only stores the handler --
+    /// it does not fire inline. Dispatch happens the next time the workflow
+    /// body makes any other history-consulting call (an activity, timer,
+    /// child workflow, another signal wait, a deterministic primitive like
+    /// `system_now`/`new_uuid`/`side_effect`, etc.), and at the latest once
+    /// more when the workflow-task cycle finishes, so a handler is always
+    /// guaranteed to have run by the time this cycle's outcome is decided.
+    /// This is deliberate, not a limitation of "immediate" dispatch: an
+    /// eager per-registration pump cannot know about a *different* handler
+    /// about to register on the next line, so it can't order the two
+    /// correctly against interleaved history for different signal names --
+    /// see [`register_and_dispatch_signal_handler`](Self::register_and_dispatch_signal_handler)'s
+    /// doc comment for the full rationale. A workflow that reads
+    /// handler-mutated state should do so after at least one such call (a
+    /// loop with an activity/timer between registration and the read is the
+    /// idiomatic shape); reading it on the literal next line with nothing
+    /// else in between is not supported.
     ///
     /// Registration is **idempotent** -- calling this with the same `name`
     /// multiple times (e.g. on every replay cycle at the top of the workflow
@@ -5124,49 +5163,32 @@ impl WorkflowContext {
             .list_names()
     }
 
-    /// Registers `handler` under `name` (idempotent, first wins) and
-    /// immediately drains + dispatches every currently-recorded, not-yet-claimed
-    /// `SignalReceived` event for `name`, in event order.
+    /// Registers `handler` under `name` (idempotent, first wins). Storage
+    /// only -- see the module-level dispatch contract below for when the
+    /// handler actually fires.
     ///
-    /// Deliberately fuses "store the handler" and "run it for whatever is
-    /// already recorded" into one call, unlike `register_update_handler`
-    /// (store-only; a separate `execute_admitted_update` call runs it) and
-    /// `register_query_handler` (store-only; never auto-runs). Signals have
-    /// no completion event and no caller waiting on a result, so there is no
-    /// second, author-driven step to hand dispatch off to -- deferring it
-    /// would just mean adding one anyway. Fusing keeps the "register once at
-    /// the top of the function" idiom self-sufficient: whatever the workflow
-    /// registers for is delivered without a second call the author must
-    /// remember to make.
+    /// Deliberately does **not** dispatch inline (PR #890 review, "preserve
+    /// signal history order across handlers"): an earlier version pumped
+    /// eagerly at each registration call so a signal already recorded before
+    /// the cursor's current position would be delivered on the same line.
+    /// That worked for a single handler, but broke ordering across
+    /// *different* handler names registered back-to-back with no
+    /// intervening command -- at the moment the first name registers, the
+    /// second literally hasn't executed its own `register_*` call yet, so
+    /// the first pump can never know to wait for it. Dispatch is instead
+    /// deferred to [`pump_signal_handlers`](Self::pump_signal_handlers),
+    /// triggered by [`match_history`](Self::match_history)'s post-hook: the
+    /// first real cursor-advancing call made *after* every handler this
+    /// cycle has registered (an activity/timer/signal wait, or -- if the
+    /// workflow body does nothing else -- the executor's end-of-cycle flush)
+    /// considers every currently-registered name together and sorts by
+    /// event index, so cross-name ordering always follows history rather
+    /// than registration order.
     fn register_and_dispatch_signal_handler(&self, name: &str, handler: BoxSignalHandler) {
         self.signal_registry
             .lock()
             .expect("signal_registry lock poisoned")
             .register(name, handler);
-
-        // Registering alone stores the handler; `match_history`'s post-hook
-        // (`pump_signal_handlers`) does the actual cursor-bound sweep and
-        // dispatch (see its doc comment). Trigger it immediately with a
-        // no-op closure so a signal already recorded before wherever the
-        // cursor currently sits is delivered as soon as its handler exists,
-        // matching the documented "visible within the same cycle" contract.
-        //
-        // Residual limitation (PR #890 review, "preserve signal history
-        // order across handlers"): if two handlers for DIFFERENT names are
-        // registered on consecutive lines with no other command in between,
-        // and BOTH names already have a recorded signal at that point, each
-        // registration's own eager pump can only sort claims among handlers
-        // that already exist -- so the second handler's earlier-recorded
-        // signal cannot retroactively be reordered ahead of the first
-        // handler's already-dispatched one. This is unavoidable without
-        // giving up same-cycle dispatch visibility entirely (there is no
-        // signal that "no more handlers are about to register" short of the
-        // workflow body actually reaching a real command). Once any real
-        // command (activity/timer/child workflow/etc.) separates
-        // registration from the signals, a single pump call considers every
-        // handler registered so far together and sorts by event index, so
-        // cross-name ordering is correct in that -- far more common -- case.
-        self.match_history(|_| ());
     }
 
     // ── Command drain ─────────────────────────────────────────────────
@@ -6283,7 +6305,11 @@ mod tests {
     }
 
     #[test]
-    fn register_signal_handler_raw_dispatches_already_buffered_signal() {
+    fn register_signal_handler_raw_dispatches_already_buffered_signal_once_flushed() {
+        // Dispatch is deferred: registration only stores the handler.
+        // `flush_pending_signal_handlers` mirrors the trigger every other
+        // history-consulting call (activity/timer/deterministic primitive)
+        // provides naturally, and the executor's own end-of-cycle flush.
         let events = vec![
             started_event(),
             WorkflowEvent::SignalReceived {
@@ -6298,12 +6324,13 @@ mod tests {
         ctx.register_signal_handler_raw("cancel", move |payload: Value| {
             received_clone.lock().unwrap().push(payload);
         });
+        ctx.flush_pending_signal_handlers();
 
         assert_eq!(
             *received.lock().unwrap(),
             vec![serde_json::json!({"reason": "user_requested"})],
             "signal delivered before the handler existed must still be dispatched \
-             once the handler is registered in the same workflow task"
+             once the handler is registered and the cycle is flushed"
         );
     }
 
@@ -6328,6 +6355,7 @@ mod tests {
         ctx.register_signal_handler("cancel", move |req: CancelRequest| {
             received_clone.lock().unwrap().push(req.reason);
         });
+        ctx.flush_pending_signal_handlers();
 
         assert_eq!(
             *received.lock().unwrap(),
@@ -6358,6 +6386,7 @@ mod tests {
                 .unwrap()
                 .push(payload.as_i64().unwrap());
         });
+        ctx.flush_pending_signal_handlers();
 
         assert_eq!(*received.lock().unwrap(), vec![1, 2]);
     }
@@ -6410,6 +6439,7 @@ mod tests {
         ctx.register_signal_handler_raw("cancel", move |payload: Value| {
             received_clone.lock().unwrap().push(payload);
         });
+        ctx.flush_pending_signal_handlers();
         assert_eq!(*received.lock().unwrap(), vec![serde_json::json!(1)]);
 
         // A pull-based wait for the same name, later in the same task, must
@@ -6480,15 +6510,14 @@ mod tests {
         // Regression (PR #890 review, "preserve signal history order across
         // handlers", replay.rs:2745): history records "pause" before
         // "cancel", but the workflow body registers the "cancel" handler
-        // first. Once a real command (here, an activity) separates
-        // registration from both signals, a single pump call considers every
-        // handler registered so far together and sorts by event index --
-        // dispatch follows SignalReceived history order (pause, then
-        // cancel), not the order the two `register_*` calls happened to run
-        // in. (A handler registered eagerly with no intervening command at
-        // all still dispatches at registration time for same-cycle
-        // visibility -- see `register_and_dispatch_signal_handler`'s doc
-        // comment for that narrower residual case.)
+        // first. A real command (here, an activity) separates registration
+        // from both signals; the pump triggered by matching it considers
+        // every handler registered so far together and sorts by event
+        // index -- dispatch follows SignalReceived history order (pause,
+        // then cancel), not the order the two `register_*` calls happened to
+        // run in. See `signal_handlers_dispatch_in_history_order_with_zero_intervening_commands`
+        // for the same guarantee with nothing at all between the two
+        // registrations.
         let activity_id = ActivityExecId::new();
         let events = vec![
             started_event(),
@@ -6543,6 +6572,60 @@ mod tests {
             *order.lock().unwrap(),
             vec!["pause", "cancel"],
             "dispatch must follow SignalReceived history order, not registration order"
+        );
+    }
+
+    #[test]
+    fn signal_handlers_dispatch_in_history_order_with_zero_intervening_commands() {
+        // The case an earlier eager-per-registration design could not fix
+        // (PR #890 review follow-up, context.rs:5169): history records
+        // "pause" before "cancel", the workflow body registers "cancel"
+        // then "pause" back-to-back with *nothing* in between, and BOTH
+        // signals are already recorded before either `register_*` call
+        // runs. Because dispatch is deferred (neither registration pumps
+        // inline), a single flush considers both handlers together and
+        // sorts by event index -- "pause" still fires first, matching
+        // history order despite the reversed registration order and the
+        // total absence of any intervening activity/timer/etc.
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "pause".into(),
+                payload: serde_json::json!("pause-payload"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!("cancel-payload"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let order: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+
+        let order_for_cancel = order.clone();
+        ctx.register_signal_handler_raw("cancel", move |_payload: Value| {
+            order_for_cancel.lock().unwrap().push("cancel");
+        });
+        let order_for_pause = order.clone();
+        ctx.register_signal_handler_raw("pause", move |_payload: Value| {
+            order_for_pause.lock().unwrap().push("pause");
+        });
+
+        // Neither registration dispatches inline -- nothing has fired yet.
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "dispatch must be deferred, not fired inline per registration call"
+        );
+
+        // Mirrors the executor's end-of-cycle flush.
+        ctx.flush_pending_signal_handlers();
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["pause", "cancel"],
+            "dispatch must follow SignalReceived history order even with zero \
+             intervening commands between the two registrations"
         );
     }
 

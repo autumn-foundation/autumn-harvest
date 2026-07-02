@@ -176,6 +176,13 @@ async fn run_strict_with_ctx(
             // surface it before the other completion checks.
             Ok(Ok(output)) => ctx.take_deferred_nd_error().map_or_else(
                 || {
+                    // Issue #546 post-ship hardening: flush any push-based signal
+                    // handler whose target became claimable but was never picked
+                    // up by a real cursor-advancing call this cycle, BEFORE the
+                    // unconsumed-history check below (so a signal a registered
+                    // handler would have claimed is never mistaken for genuinely
+                    // unconsumed history).
+                    ctx.flush_pending_signal_handlers();
                     if ctx.history_has_unconsumed_events() {
                         let nd = ctx.take_nd_details().or_else(|| {
                             Some(crate::error::NonDeterministicDetails {
@@ -233,6 +240,8 @@ async fn run_strict_with_ctx(
             // A primitive may have drifted before the workflow returned Err from
             // its own logic; prefer the non-determinism error (issue #384).
             Ok(Err(error)) => {
+                // See the `Ok(Ok(output))` arm above (issue #546).
+                ctx.flush_pending_signal_handlers();
                 let details = ctx.take_nd_details();
                 ctx.take_deferred_nd_error().map_or(
                     WorkflowOutcome::Failed {
@@ -305,6 +314,13 @@ pub(crate) async fn run_workflow_canary(
         match timeout_result {
             Ok(Ok(output)) => ctx.take_deferred_nd_error().map_or_else(
                 || {
+                    // Issue #546 post-ship hardening: flush any push-based signal
+                    // handler whose target became claimable but was never picked
+                    // up by a real cursor-advancing call this cycle, BEFORE the
+                    // unconsumed-history check below (so a signal a registered
+                    // handler would have claimed is never mistaken for genuinely
+                    // unconsumed history).
+                    ctx.flush_pending_signal_handlers();
                     if ctx.history_has_unconsumed_events() {
                         let nd = ctx.take_nd_details().or_else(|| {
                             Some(crate::error::NonDeterministicDetails {
@@ -356,6 +372,8 @@ pub(crate) async fn run_workflow_canary(
                 },
             ),
             Ok(Err(error)) => {
+                // See the `Ok(Ok(output))` arm above (issue #546).
+                ctx.flush_pending_signal_handlers();
                 let details = ctx.take_nd_details();
                 ctx.take_deferred_nd_error().map_or(
                     WorkflowOutcome::Failed {
@@ -624,6 +642,12 @@ async fn drive_workflow(
             // execute_admitted_update) so the worker can persist them before the
             // terminal WorkflowCompleted/WorkflowFailed event.
             Ok(Ok(output)) => {
+                // Issue #546 post-ship hardening: flush any push-based signal
+                // handler whose target became claimable but was never picked
+                // up by a real cursor-advancing call this cycle (a workflow
+                // that registers a handler and then completes without ever
+                // awaiting an activity/timer/signal).
+                ctx.flush_pending_signal_handlers();
                 // A plain-value built-in primitive (system_now/new_uuid/random_*)
                 // may have absorbed a replay divergence and recorded it as a
                 // deferred non-determinism error (issue #384). Surface it as a
@@ -641,6 +665,8 @@ async fn drive_workflow(
             // A primitive may have drifted before the workflow returned Err from
             // its own logic; prefer the non-determinism error (issue #384).
             Ok(Err(error)) => {
+                // See the `Ok(Ok(output))` arm above (issue #546).
+                ctx.flush_pending_signal_handlers();
                 let details = ctx.take_nd_details();
                 let outcome = ctx.take_deferred_nd_error().map_or(
                     WorkflowOutcome::Failed {
@@ -951,6 +977,14 @@ mod tests {
 
     /// A workflow that reacts to a `cancel` signal via a push-based handler
     /// (issue #546) instead of a hand-coded `wait_for_signal` interleave.
+    ///
+    /// Dispatch is deferred to the next history-consulting call (see
+    /// `register_and_dispatch_signal_handler`'s doc comment), so this reads
+    /// the handler-mutated flag *after* a trivial deterministic primitive
+    /// call rather than on the literal next line -- `ctx.system_now()` is
+    /// cheap, replay-safe, and (like any other `match_history`-routed call)
+    /// triggers the pump. A real workflow would typically have an actual
+    /// activity/timer/loop in between instead.
     fn signal_handler_workflow<'a>(
         ctx: &'a WorkflowContext,
         _input: Value,
@@ -961,6 +995,7 @@ mod tests {
             ctx.register_signal_handler_raw("cancel", move |_payload| {
                 *c.lock().unwrap() = true;
             });
+            let _ = ctx.system_now();
             Ok(serde_json::json!({"cancelled": *cancelled.lock().unwrap()}))
         })
     }
