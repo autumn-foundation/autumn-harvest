@@ -344,9 +344,21 @@ pub enum WorkflowCommand {
     /// restarts. Last-write-wins: the worker takes the **last** `SetCurrentDetails`
     /// command from the drained list and persists only that value.
     /// No `WorkflowEvent` is appended — zero footprint in `harvest_events`.
+    ///
+    /// `explicit_clear` (issue #593, hardened post-review) is decided from the
+    /// **caller's raw, pre-truncation** input: `true` only when the workflow
+    /// author literally called `set_current_details("")`. This is deliberately
+    /// *not* re-derived from `value.is_empty()`, because a non-empty input can
+    /// truncate down to an empty string when `current_details_cap` is `0` (or
+    /// smaller than the input's first UTF-8 character) -- that is a capacity
+    /// artifact, not an author-intended clear, and must not silently erase an
+    /// existing breadcrumb.
     SetCurrentDetails {
         /// The human-readable status string, already capped by the context.
         value: String,
+        /// `true` iff the author's original (pre-cap) input was the empty
+        /// string -- the only condition that should clear the column.
+        explicit_clear: bool,
     },
     /// Spawn a child workflow in detached mode and return its `ExecutionId`
     /// immediately without suspending the parent.
@@ -505,9 +517,13 @@ impl std::fmt::Debug for WorkflowCommand {
                 .debug_struct("UpsertSearchAttributes")
                 .field("keys", &patch.keys())
                 .finish(),
-            Self::SetCurrentDetails { value } => f
+            Self::SetCurrentDetails {
+                value,
+                explicit_clear,
+            } => f
                 .debug_struct("SetCurrentDetails")
                 .field("value", value)
+                .field("explicit_clear", explicit_clear)
                 .finish(),
             Self::RecordUpdateResult { update_id, result } => f
                 .debug_struct("RecordUpdateResult")
@@ -5197,6 +5213,8 @@ impl WorkflowContext {
     ///
     /// Calls are **last-write-wins**: the worker takes the most recently emitted
     /// value and overwrites `harvest_workflow_executions.current_details`.
+    /// Passing an empty string **clears** the breadcrumb (persists `NULL`
+    /// rather than an empty string) — issue #593.
     ///
     /// The value is **suppressed during replay** (zero new `harvest_events` rows,
     /// zero replay-determinism impact), mirroring the zero-footprint contract of
@@ -5204,7 +5222,12 @@ impl WorkflowContext {
     ///
     /// The value is capped at [`DEFAULT_CURRENT_DETAILS_CAP_BYTES`] (configurable
     /// via `HarvestBuilder::with_current_details_cap`). Values longer than the cap
-    /// are truncated to the cap boundary on a UTF-8 character boundary.
+    /// are truncated to the cap boundary on a UTF-8 character boundary. The
+    /// clear decision is made from the **pre-truncation** input, so a non-empty
+    /// status that happens to truncate down to an empty string under an
+    /// extreme cap (e.g. `0`, or smaller than its first UTF-8 character) is
+    /// dropped as a no-op rather than misread as an explicit clear -- it never
+    /// erases a previously stored breadcrumb (post-review hardening, #593).
     ///
     /// Operators can read the latest value from `GET /workflows/{id}` and
     /// `GET /workflows` without fan-out queries or a live worker.
@@ -5213,6 +5236,7 @@ impl WorkflowContext {
             return;
         }
         let raw = details.into();
+        let explicit_clear = raw.is_empty();
         let capped = if raw.len() > self.current_details_cap {
             // floor_char_boundary is not yet stable (tracking #93743); scan back
             // manually to the nearest valid UTF-8 character boundary.
@@ -5224,7 +5248,10 @@ impl WorkflowContext {
         } else {
             raw
         };
-        self.push_command(WorkflowCommand::SetCurrentDetails { value: capped });
+        self.push_command(WorkflowCommand::SetCurrentDetails {
+            value: capped,
+            explicit_clear,
+        });
     }
 
     /// Drain all accumulated commands. Called by the worker after the
@@ -10107,8 +10134,19 @@ mod tests {
     /// Helper: extract the last `SetCurrentDetails` value from a command list.
     fn last_set_current_details(cmds: &[WorkflowCommand]) -> Option<&str> {
         cmds.iter().rev().find_map(|cmd| {
-            if let WorkflowCommand::SetCurrentDetails { value } = cmd {
+            if let WorkflowCommand::SetCurrentDetails { value, .. } = cmd {
                 Some(value.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Helper: extract the last `SetCurrentDetails` command's `explicit_clear` flag.
+    fn last_set_current_details_explicit_clear(cmds: &[WorkflowCommand]) -> Option<bool> {
+        cmds.iter().rev().find_map(|cmd| {
+            if let WorkflowCommand::SetCurrentDetails { explicit_clear, .. } = cmd {
+                Some(*explicit_clear)
             } else {
                 None
             }
@@ -10122,8 +10160,8 @@ mod tests {
         let cmds = ctx.drain_commands();
         assert_eq!(cmds.len(), 1, "exactly one command should be pushed");
         assert!(
-            matches!(&cmds[0], WorkflowCommand::SetCurrentDetails { value } if value == "Step 3/5: awaiting vendor approval"),
-            "command must be SetCurrentDetails with the correct value"
+            matches!(&cmds[0], WorkflowCommand::SetCurrentDetails { value, explicit_clear } if value == "Step 3/5: awaiting vendor approval" && !explicit_clear),
+            "command must be SetCurrentDetails with the correct value and explicit_clear=false"
         );
     }
 
@@ -10224,6 +10262,67 @@ mod tests {
             "stored length {} exceeds cap 5",
             stored.len()
         );
+    }
+
+    #[test]
+    fn set_current_details_empty_string_pushes_empty_command() {
+        // The context's job is only to forward the raw value (capped, replay-
+        // gated); interpreting an empty string as "clear to NULL" is the
+        // worker's responsibility (`worker::latest_current_details_update`,
+        // issue #593). This test locks in that the empty string reaches the
+        // drained command list unfiltered, with `explicit_clear = true`, so
+        // the worker-side clear signal is never silently dropped at the
+        // context layer.
+        let ctx = WorkflowContext::new_test();
+        ctx.set_current_details("in progress");
+        ctx.set_current_details("");
+        let cmds = ctx.drain_commands();
+        assert_eq!(
+            last_set_current_details(&cmds),
+            Some(""),
+            "an empty-string call must still push a SetCurrentDetails command \
+             carrying an empty value, so the worker can resolve it to a clear"
+        );
+        assert_eq!(
+            last_set_current_details_explicit_clear(&cmds),
+            Some(true),
+            "an author-supplied empty string must be marked explicit_clear"
+        );
+    }
+
+    #[test]
+    fn set_current_details_truncated_to_empty_is_not_marked_explicit_clear() {
+        // Post-review hardening (issue #593, PR #894): a non-empty status can
+        // truncate down to an empty string when current_details_cap is 0 (or
+        // smaller than the input's first UTF-8 character). That must NOT be
+        // confused with an author-issued clear -- explicit_clear is decided
+        // from the pre-truncation input, which was non-empty here.
+        let ctx = WorkflowContext::new_test().with_current_details_cap(0);
+        ctx.set_current_details("😀 running a very long status");
+        let cmds = ctx.drain_commands();
+        assert_eq!(
+            last_set_current_details(&cmds),
+            Some(""),
+            "a cap of 0 truncates any non-empty input down to an empty string"
+        );
+        assert_eq!(
+            last_set_current_details_explicit_clear(&cmds),
+            Some(false),
+            "a non-empty input that truncates to empty must NOT be marked \
+             explicit_clear -- only a literal empty-string call should clear"
+        );
+    }
+
+    #[test]
+    fn set_current_details_explicit_empty_under_tiny_cap_is_still_marked_explicit_clear() {
+        // An author-issued empty string is still explicit_clear even when the
+        // cap is degenerate -- the flag is orthogonal to the cap because it is
+        // decided before truncation runs at all.
+        let ctx = WorkflowContext::new_test().with_current_details_cap(0);
+        ctx.set_current_details("");
+        let cmds = ctx.drain_commands();
+        assert_eq!(last_set_current_details(&cmds), Some(""));
+        assert_eq!(last_set_current_details_explicit_clear(&cmds), Some(true));
     }
 
     // ── Context headers — WorkflowContext ────────────────────────────────────

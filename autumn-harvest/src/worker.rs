@@ -2790,28 +2790,81 @@ async fn persist_search_attrs_from_commands(
     store::update_search_attrs(conn, exec_id, &merged).await
 }
 
+/// The effective DB write resolved from the last `SetCurrentDetails` command
+/// in a cycle, if any (issue #593). A 3-way enum rather than
+/// `Option<Option<&str>>` (`clippy::option_option`) -- all three states are
+/// meaningfully distinct outcomes, not a nested-optionality artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentDetailsUpdate<'a> {
+    /// No `SetCurrentDetails` command was present this cycle, or the last
+    /// one's value was truncated down to empty without an explicit clear --
+    /// skip the write and preserve whatever is already stored.
+    NoOp,
+    /// The last command was an author-issued explicit clear -- clear the
+    /// column to `NULL`.
+    Clear,
+    /// The last command sets the column to this value.
+    Set(&'a str),
+}
+
+/// Determines the last `SetCurrentDetails` command's effective DB write, if
+/// any (issue #593). Pure, no-DB decision function factored out of
+/// [`persist_current_details_from_commands`] so the last-write-wins /
+/// empty-clears contract is directly unit-testable.
+///
+/// The clear decision is read from the command's `explicit_clear` flag --
+/// set by the context from the caller's *pre-truncation* input -- rather than
+/// from `value.is_empty()`. A non-empty input can truncate down to an empty
+/// string when `current_details_cap` is `0` (or smaller than the input's
+/// first UTF-8 character); that is a capacity artifact, not an author-issued
+/// clear, so it resolves to `NoOp` (preserve whatever is already stored)
+/// instead of erasing an existing breadcrumb (post-review hardening, PR #894).
+fn latest_current_details_update(commands: &[WorkflowCommand]) -> CurrentDetailsUpdate<'_> {
+    let Some((value, explicit_clear)) = commands.iter().rev().find_map(|cmd| {
+        if let WorkflowCommand::SetCurrentDetails {
+            value,
+            explicit_clear,
+        } = cmd
+        {
+            Some((value.as_str(), *explicit_clear))
+        } else {
+            None
+        }
+    }) else {
+        return CurrentDetailsUpdate::NoOp;
+    };
+    if explicit_clear {
+        CurrentDetailsUpdate::Clear
+    } else if value.is_empty() {
+        CurrentDetailsUpdate::NoOp
+    } else {
+        CurrentDetailsUpdate::Set(value)
+    }
+}
+
 /// Persist the last `SetCurrentDetails` command to the execution row (issue #473).
 ///
 /// Scans `commands` for [`WorkflowCommand::SetCurrentDetails`] variants and
 /// writes the **last** value (last-write-wins) to
-/// `harvest_workflow_executions.current_details` in a single `UPDATE`.
-/// Does nothing when no `SetCurrentDetails` command is present.
+/// `harvest_workflow_executions.current_details` in a single `UPDATE`. An
+/// explicit (author-issued) empty-string call clears the column to `NULL`
+/// (issue #593). Does nothing when no `SetCurrentDetails` command is present,
+/// or when the last command's value was truncated down to empty by an
+/// extreme cap rather than explicitly cleared (see
+/// [`latest_current_details_update`]).
 async fn persist_current_details_from_commands(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<()> {
-    // Last-write-wins: take the last SetCurrentDetails value in the command list.
-    let last = commands.iter().rev().find_map(|cmd| {
-        if let WorkflowCommand::SetCurrentDetails { value } = cmd {
-            Some(value.as_str())
-        } else {
-            None
+    match latest_current_details_update(commands) {
+        CurrentDetailsUpdate::NoOp => {}
+        CurrentDetailsUpdate::Clear => {
+            store::update_current_details(conn, exec_id, None).await?;
         }
-    });
-
-    if let Some(details) = last {
-        store::update_current_details(conn, exec_id, details).await?;
+        CurrentDetailsUpdate::Set(details) => {
+            store::update_current_details(conn, exec_id, Some(details)).await?;
+        }
     }
     Ok(())
 }
@@ -10501,6 +10554,197 @@ mod tests {
         let mut cfg = default_runtime_config();
         cfg.workflow_task_timeout = Duration::ZERO;
         assert!(cfg.workflow_task_timeout.is_zero());
+    }
+
+    // ── current_details empty-string-clears tests (issue #593) ────────────
+    //
+    // `latest_current_details_update` is the pure decision function behind
+    // `persist_current_details_from_commands`: it scans a command list for
+    // the last `SetCurrentDetails` and reports what the DB write should be.
+    // `CurrentDetailsUpdate::NoOp` = no command present this cycle, or the
+    // last command's `explicit_clear` is false and its value is empty (a
+    // truncation artifact -- preserve whatever is already stored). `Clear` =
+    // the last command has `explicit_clear = true`, which must clear
+    // `current_details` to SQL NULL. `Set(s)` = set `current_details` to `s`.
+
+    #[test]
+    fn latest_current_details_update_none_when_no_command() {
+        let cmds: Vec<WorkflowCommand> = Vec::new();
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::NoOp
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_returns_set_value() {
+        let cmds = vec![WorkflowCommand::SetCurrentDetails {
+            value: "step 2/4: processing payment".to_string(),
+            explicit_clear: false,
+        }];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Set("step 2/4: processing payment")
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_last_write_wins() {
+        let cmds = vec![
+            WorkflowCommand::SetCurrentDetails {
+                value: "first".to_string(),
+                explicit_clear: false,
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: "second".to_string(),
+                explicit_clear: false,
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: "third".to_string(),
+                explicit_clear: false,
+            },
+        ];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Set("third")
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_explicit_clear_clears() {
+        let cmds = vec![WorkflowCommand::SetCurrentDetails {
+            value: String::new(),
+            explicit_clear: true,
+        }];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Clear,
+            "an author-issued empty string (explicit_clear=true) must resolve to a clear (NULL)"
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_set_then_explicit_clear_clears() {
+        let cmds = vec![
+            WorkflowCommand::SetCurrentDetails {
+                value: "in progress".to_string(),
+                explicit_clear: false,
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: String::new(),
+                explicit_clear: true,
+            },
+        ];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Clear,
+            "last-write-wins applies to clears too: a trailing explicit clear wins"
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_explicit_clear_then_set_overwrites_clear() {
+        let cmds = vec![
+            WorkflowCommand::SetCurrentDetails {
+                value: String::new(),
+                explicit_clear: true,
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: "now running".to_string(),
+                explicit_clear: false,
+            },
+        ];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Set("now running")
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_ignores_other_command_types() {
+        let cmds = vec![
+            WorkflowCommand::RecordMarker {
+                name: "unrelated".to_string(),
+                details: Value::Null,
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: "the real status".to_string(),
+                explicit_clear: false,
+            },
+            WorkflowCommand::RecordMarker {
+                name: "also-unrelated".to_string(),
+                details: Value::Null,
+            },
+        ];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Set("the real status")
+        );
+    }
+
+    // ── Truncated-to-empty vs. explicit clear (post-review hardening,
+    //    issue #593 / PR #894) ────────────────────────────────────────────
+    //
+    // A non-empty status can truncate down to an empty `value` when
+    // `current_details_cap` is 0 (or smaller than the input's first UTF-8
+    // character). That must resolve to `NoOp` -- preserving whatever is
+    // already stored -- rather than being confused with an author-issued
+    // `set_current_details("")` clear.
+
+    #[test]
+    fn latest_current_details_update_truncated_to_empty_without_explicit_clear_is_noop() {
+        let cmds = vec![WorkflowCommand::SetCurrentDetails {
+            value: String::new(),
+            explicit_clear: false,
+        }];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::NoOp,
+            "a value truncated down to empty without explicit_clear must not \
+             clear the column -- it must be a no-op that preserves the \
+             existing breadcrumb"
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_trailing_truncated_noop_does_not_fall_back_to_earlier_set() {
+        // Last-write-wins means the LAST command decides the outcome, even
+        // when that outcome is an unrepresentable NoOp -- it must not silently
+        // fall back to an earlier, valid Set in the same cycle. Falling back
+        // would surprise the workflow author, who believes their last call
+        // is the one that took effect.
+        let cmds = vec![
+            WorkflowCommand::SetCurrentDetails {
+                value: "real status".to_string(),
+                explicit_clear: false,
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: String::new(),
+                explicit_clear: false,
+            },
+        ];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::NoOp
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_explicit_clear_after_truncated_noop_still_clears() {
+        let cmds = vec![
+            WorkflowCommand::SetCurrentDetails {
+                value: String::new(),
+                explicit_clear: false,
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: String::new(),
+                explicit_clear: true,
+            },
+        ];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Clear
+        );
     }
 
     #[test]

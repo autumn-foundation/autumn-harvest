@@ -1122,17 +1122,22 @@ pub async fn update_search_attrs<S: std::hash::BuildHasher + Sync>(
 ///
 /// Called by the worker after each execution cycle when the workflow author
 /// called `ctx.set_current_details(...)` during live (non-replay) execution.
-/// Uses a simple overwrite; the application layer enforces last-write-wins by
-/// calling `take_current_details()` on the context, which drains the field.
+/// Uses a simple overwrite; the application layer enforces last-write-wins
+/// (and empty-string-clears, issue #593) via
+/// `worker::latest_current_details_update`, which resolves the command list
+/// to the single effective write before this function is ever called.
+///
+/// `details = None` clears the column to SQL `NULL` (the workflow called
+/// `set_current_details("")`); `details = Some(s)` sets it to `s`.
 pub async fn update_current_details(
     conn: &mut AsyncPgConnection,
     exec_id: crate::types::ExecutionId,
-    details: &str,
+    details: Option<&str>,
 ) -> crate::error::HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
     diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
-        .set(dsl::current_details.eq(Some(details)))
+        .set(dsl::current_details.eq(details))
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
