@@ -238,6 +238,7 @@ fn build_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
                 max_workflow_history_events: None,
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )

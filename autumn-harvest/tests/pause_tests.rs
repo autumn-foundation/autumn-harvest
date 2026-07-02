@@ -201,6 +201,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             max_workflow_history_events: None,
             shard_notification_database_urls: Vec::new(),
             sharded_pool: None,
+            slot_tuner: None,
         },
         registry,
     )

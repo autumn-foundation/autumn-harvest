@@ -225,6 +225,7 @@ fn make_worker(_db_url: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )

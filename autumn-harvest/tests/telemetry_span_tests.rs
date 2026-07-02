@@ -443,6 +443,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         max_workflow_history_events: None,
                         shard_notification_database_urls: Vec::new(),
                         sharded_pool: None,
+                        slot_tuner: None,
                     },
                     registry,
                 )
