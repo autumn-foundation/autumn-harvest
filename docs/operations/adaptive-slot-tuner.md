@@ -123,29 +123,28 @@ When a tuner is configured, a dispatch semaphore is created with
 - **Grow** simply drops withheld permits, making them available for
   dispatch.
 - **Shrink** opportunistically re-acquires *free* permits back into the
-  withheld set. It never blocks and it never revokes a permit already held
-  by an in-flight task — a shrink decision only withholds *new* permits as
-  they are returned, so the in-flight count naturally falls to the new
-  target over time rather than being forced down immediately.
+  withheld set on every control-loop tick. It never blocks and it never
+  revokes a permit already held by an in-flight task.
 
-**Known limitation — shrink can be starved by a dispatch backlog.**
-`dispatch_task` spawns every claimed task as a queueing `semaphore.acquire()`,
-and claiming is not throttled against the live target: under a real backlog
-(claims outrunning dispatch capacity), the semaphore's wait queue is
-continuously non-empty. `tokio::sync::Semaphore` always assigns a released
-permit directly to the oldest queued waiter before it is ever visible to a
-concurrent `try_acquire()` — the mechanism shrink uses — so a shrink
-decision can lose that race indefinitely for as long as the backlog
-persists. This is exactly the scenario a pool-protecting shrink is meant to
-help with, so it is a real gap, not a cosmetic one: under sustained
-over-claim, live concurrency may not come down until the backlog itself
-drains by other means (e.g. the DB pool recovering enough for claimed tasks
-to complete). A correct fix requires either making shrink a queued acquire
-that competes fairly in the same FIFO, or throttling `dispatch_task`/the
-poll loop so claims never outrun the live target (keeping the wait queue
-empty). Both are redesigns of the shared dispatch path used by every
-worker, tuned or not, and are tracked as follow-up work under issue #548
-rather than included in the initial implementation.
+**Fair-queue fallback for a busy worker.** `dispatch_task` spawns every
+claimed task as a queueing `semaphore.acquire()`, and claiming is not
+throttled against the live target — under a real backlog (claims outrunning
+dispatch capacity), the semaphore's wait queue can be continuously
+non-empty. `tokio::sync::Semaphore` always assigns a released permit
+directly to the oldest queued waiter before it is ever visible to a
+concurrent `try_acquire()`, so a shrink that only ever tried `try_acquire`
+could lose that race indefinitely for as long as the backlog persisted —
+exactly the scenario a pool-protecting shrink exists to help with. When the
+opportunistic `try_acquire` can't land a shrink in one tick, the runtime
+instead joins the semaphore's own fair FIFO queue with a background
+`acquire_owned()` (at most one such request in flight at a time). Once
+queued there, nothing can "cut in front" of it — tokio's queue guarantees
+eventual forward progress, so the shrink is retried on later ticks and
+lands as soon as its turn comes up, rather than needing to win a race
+against `try_acquire` on every single attempt. If a later tick decides to
+grow instead (reversing the earlier intent), any outstanding queued
+request is cancelled rather than left to compete with the grow's own
+permit release.
 
 This means **graceful shutdown and draining are unaffected for already-running
 work**: a shrink decision never cancels or reclaims an already-dispatched
