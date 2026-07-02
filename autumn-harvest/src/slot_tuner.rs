@@ -25,7 +25,7 @@
 //! When a tuner is configured, a dispatch semaphore is created with
 //! `max_slots` total permits. The runtime immediately withholds
 //! `max_slots - initial_target` of them as owned permits it holds itself.
-//! **Grow** drops withheld permits (making them available for dispatch).
+//! **Grow** releases withheld permits (making them available for dispatch).
 //! **Shrink** opportunistically re-acquires free permits back into the
 //! withheld set — it never blocks and never revokes a permit already held by
 //! an in-flight task, so a shrink decision only withholds *new* permits until
@@ -109,7 +109,8 @@ pub enum SlotTunerAction {
 /// worker's existing monitoring cadence — see [`spawn_slot_tuner_loop`]) and
 /// must be a **pure, fast, non-blocking** function: it runs on the same task
 /// as the loop's sleep/cancel select, off the hot dispatch path, but a slow
-/// or panicking implementation still delays the next tick.
+/// or panicking implementation still delays the next tick for both slot
+/// types (workflow and activity share one control-loop task).
 pub trait SlotTuner: Send + Sync {
     /// Decide the next action given the current observations.
     fn decide(&self, observations: &SlotObservations) -> SlotTunerAction;
@@ -189,9 +190,9 @@ pub struct SlotTunerConfig {
     /// The controller never resizes above this many slots (hard safety cap).
     pub max_slots: usize,
     /// The controller instance. Both the workflow and activity dispatch
-    /// semaphores get their own independent instance of this same
-    /// configuration and share this one `[min_slots, max_slots]` band
-    /// (per-type bands are a documented follow-up, not this slice).
+    /// semaphores share this same instance (its `decide` method is pure and
+    /// stateless, so sharing is safe) and this one `[min_slots, max_slots]`
+    /// band (per-type bands are a documented follow-up, not this slice).
     pub tuner: Arc<dyn SlotTuner>,
 }
 
@@ -227,11 +228,33 @@ impl SlotTunerConfig {
     }
 }
 
-/// Clamp `configured_max` (the worker's static `max_concurrent_*` value) into
-/// `[min_slots, max_slots]` to produce the initial live target when a tuner is
-/// installed.
+/// Normalize a possibly-degenerate `[min_slots, max_slots]` band.
+///
+/// `max_slots` is the hard safety cap and always wins: when `min_slots >
+/// max_slots` the band collapses to the single point `max_slots` rather than
+/// producing an invalid `(lo, hi)` pair with `lo > hi` — capacity is never
+/// widened past the operator's stated ceiling just because the floor was
+/// misconfigured above it. This makes `[min_slots, max_slots]` a true
+/// mathematical interval (`lo <= hi`) everywhere it's consumed, so callers
+/// (notably `.clamp()`, which panics on `min > max`) never see an invalid
+/// range.
+#[must_use]
+pub const fn effective_band(min_slots: usize, max_slots: usize) -> (usize, usize) {
+    if min_slots <= max_slots {
+        (min_slots, max_slots)
+    } else {
+        (max_slots, max_slots)
+    }
+}
+
+/// Clamp `configured_max` into the initial live target for a tuned slot.
+///
+/// `configured_max` is the worker's static `max_concurrent_*` value; the
+/// result is clamped into `[min_slots, max_slots]`. Tolerates a degenerate
+/// (`min_slots > max_slots`) band via [`effective_band`].
 #[must_use]
 pub const fn initial_target(configured_max: usize, min_slots: usize, max_slots: usize) -> usize {
+    let (min_slots, max_slots) = effective_band(min_slots, max_slots);
     if configured_max < min_slots {
         min_slots
     } else if configured_max > max_slots {
@@ -242,6 +265,7 @@ pub const fn initial_target(configured_max: usize, min_slots: usize, max_slots: 
 }
 
 /// Apply a [`SlotTunerAction`] to `current`, clamped to `[min_slots, max_slots]`.
+/// Tolerates a degenerate (`min_slots > max_slots`) band via [`effective_band`].
 ///
 /// Returns the new target and the [`TunerDecision`] that actually took effect
 /// — a `Grow`/`Shrink` that is fully absorbed by the clamp (the target does
@@ -254,6 +278,7 @@ pub const fn apply_action(
     min_slots: usize,
     max_slots: usize,
 ) -> (usize, TunerDecision) {
+    let (min_slots, max_slots) = effective_band(min_slots, max_slots);
     let proposed = match action {
         SlotTunerAction::Grow(step) => current.saturating_add(step),
         SlotTunerAction::Shrink(step) => current.saturating_sub(step),
@@ -279,9 +304,14 @@ pub const fn apply_action(
 /// Pure config-time sanity checks for a `[min_slots, max_slots]` band against
 /// the worker's statically-configured `max_concurrent_*` value.
 ///
-/// Returns human-readable warning strings; never errors — a misconfigured
-/// band degrades to an inert (but harmless) tuner rather than failing worker
-/// startup, matching the `queue_weights` precedent.
+/// Returns human-readable warning strings for conditions that degrade the
+/// tuner but leave the worker able to dispatch (a degenerate `min_slots >
+/// max_slots` band, or a configured value outside the band) — these never
+/// fail worker startup, matching the `queue_weights` precedent. `max_slots ==
+/// 0` is **not** included here: it makes the dispatch semaphore permanently
+/// empty, which is a hard startup failure handled separately by
+/// `WorkerRuntimeConfig::validate` (a warning would leave a "healthy-looking"
+/// worker that can never dispatch a single task).
 #[must_use]
 pub fn validate_band(min_slots: usize, max_slots: usize, configured_max: usize) -> Vec<String> {
     let mut warnings = Vec::new();
@@ -290,9 +320,6 @@ pub fn validate_band(min_slots: usize, max_slots: usize, configured_max: usize) 
             "slot_tuner min_slots ({min_slots}) is greater than max_slots ({max_slots}); \
              the tuner will be inert at max_slots"
         ));
-    }
-    if max_slots == 0 {
-        warnings.push("slot_tuner max_slots is 0; dispatch will be permanently blocked".into());
     }
     if configured_max < min_slots || configured_max > max_slots {
         warnings.push(format!(
@@ -303,21 +330,30 @@ pub fn validate_band(min_slots: usize, max_slots: usize, configured_max: usize) 
     warnings
 }
 
-/// Available dispatch permits for a slot type, accounting for permits the
-/// tuner is currently withholding.
+/// Compute `(in_use, available)` dispatch-slot counts from a semaphore
+/// reading against a target (issue #531; shared with `worker.rs`'s
+/// slot-occupancy sampler and this module's own control loop so both derive
+/// occupancy the same way).
 ///
-/// `raw_available` is `Semaphore::available_permits()`, which counts
-/// withheld permits as "available" even though they are not offered to
-/// dispatch. The true dispatchable count is `raw_available` minus whatever
-/// is currently withheld, i.e. `permit_total - live_target`.
+/// `available` is clamped to `target` so a transient over-count (e.g. a
+/// permit released just before the read) can never produce a negative
+/// `in_use`. Invariant: `in_use + available == target`.
+///
+/// Note: `available_permits()` on a semaphore behind a [`TunedSlotRuntime`]
+/// already excludes any withheld permits (they are genuinely acquired and
+/// held, not merely reserved), so no separate "subtract withheld" step is
+/// needed — passing the live target as `target` and a raw
+/// `Semaphore::available_permits()` reading as `available_permits` here is
+/// sufficient and correct for both a tuned and an untuned semaphore.
 #[must_use]
-pub const fn tuned_available(
-    permit_total: usize,
-    live_target: usize,
-    raw_available: usize,
-) -> usize {
-    let withheld = permit_total.saturating_sub(live_target);
-    raw_available.saturating_sub(withheld)
+pub(crate) const fn slot_occupancy(target: usize, available_permits: usize) -> (u64, u64) {
+    let available = if available_permits > target {
+        target
+    } else {
+        available_permits
+    };
+    let in_use = target - available;
+    (in_use as u64, available as u64)
 }
 
 /// Runtime handle for one tuned dispatch semaphore.
@@ -326,10 +362,20 @@ pub const fn tuned_available(
 /// `max_slots` and the live target) and the shared `live_target` cell the
 /// worker's slot-occupancy sampler (issue #531) reads so its gauges stay
 /// consistent with the tuned value rather than the static configured max.
+///
+/// `min_slots`/`max_slots` are normalized via [`effective_band`] at
+/// construction, so `min_slots <= max_slots` is a class invariant for every
+/// live `TunedSlotRuntime` — callers (notably `resize_toward`'s `.clamp()`,
+/// which panics on an invalid range) never need to re-check band validity.
 #[derive(Debug)]
 pub struct TunedSlotRuntime {
     semaphore: Arc<Semaphore>,
     live_target: Arc<AtomicUsize>,
+    /// Permits currently withheld from dispatch. May contain a mix of one
+    /// "large" merged permit (from the bulk acquire at construction) and
+    /// several single-permit entries (each pushed by a later opportunistic
+    /// shrink) — `resize_toward`'s grow path is permit-count-aware and
+    /// correctly releases only part of an entry when needed.
     withheld: Vec<OwnedSemaphorePermit>,
     min_slots: usize,
     max_slots: usize,
@@ -339,6 +385,11 @@ impl TunedSlotRuntime {
     /// Create a runtime over a semaphore that already has `max_slots` total
     /// permits, immediately withholding permits down to the clamped initial
     /// target derived from `configured_max`.
+    ///
+    /// The initial withhold is a single bulk `try_acquire_many_owned` call
+    /// (not a per-permit loop): the semaphore was just created with exactly
+    /// `max_slots` permits and nothing has been dispatched yet, so the full
+    /// `to_withhold` amount is always available in one shot.
     #[must_use]
     pub fn new(
         semaphore: Arc<Semaphore>,
@@ -346,19 +397,25 @@ impl TunedSlotRuntime {
         min_slots: usize,
         max_slots: usize,
     ) -> Self {
+        let (min_slots, max_slots) = effective_band(min_slots, max_slots);
         let target = initial_target(configured_max, min_slots, max_slots);
         let to_withhold = max_slots.saturating_sub(target);
-        let mut withheld = Vec::with_capacity(to_withhold);
-        for _ in 0..to_withhold {
-            match Arc::clone(&semaphore).try_acquire_owned() {
-                Ok(permit) => withheld.push(permit),
-                // The semaphore was constructed with fewer than max_slots
-                // permits (a caller bug) — stop withholding rather than
-                // panicking; the live target will simply read higher than
-                // the true capacity until corrected.
-                Err(_) => break,
-            }
-        }
+        let withheld = u32::try_from(to_withhold).map_or_else(
+            |_| Vec::new(),
+            |n| {
+                if n == 0 {
+                    Vec::new()
+                } else {
+                    // The semaphore was constructed with fewer than
+                    // max_slots permits (a caller bug) — stop withholding
+                    // rather than panicking; the live target will simply
+                    // read higher than the true capacity until corrected.
+                    Arc::clone(&semaphore)
+                        .try_acquire_many_owned(n)
+                        .map_or_else(|_| Vec::new(), |permit| vec![permit])
+                }
+            },
+        );
         Self {
             semaphore,
             live_target: Arc::new(AtomicUsize::new(target)),
@@ -391,15 +448,29 @@ impl TunedSlotRuntime {
         let current = self.live_target();
 
         if desired > current {
-            let mut released = 0;
-            while self.live_target.load(Ordering::Relaxed) < desired {
-                if self.withheld.pop().is_none() {
+            let mut remaining = desired - current;
+            while remaining > 0 {
+                let Some(mut permit) = self.withheld.pop() else {
+                    break;
+                };
+                let held = permit.num_permits();
+                if held <= remaining {
+                    remaining -= held;
+                    drop(permit);
+                } else if let Some(release) = permit.split(remaining) {
+                    drop(release);
+                    self.withheld.push(permit);
+                    remaining = 0;
+                } else {
+                    // Should be unreachable (held > remaining implies
+                    // split(remaining) succeeds), but never lose the
+                    // permit if it somehow does.
+                    self.withheld.push(permit);
                     break;
                 }
-                self.live_target.fetch_add(1, Ordering::Relaxed);
-                released += 1;
             }
-            let _ = released;
+            let released = (desired - current) - remaining;
+            self.live_target.fetch_add(released, Ordering::Relaxed);
         } else if desired < current {
             while self.live_target.load(Ordering::Relaxed) > desired {
                 match Arc::clone(&self.semaphore).try_acquire_owned() {
@@ -428,34 +499,96 @@ impl TunedSlotRuntime {
     }
 }
 
-/// Spawn the adaptive slot-tuner control loop for one dispatch slot type.
+/// One dispatch semaphore's tuned runtime plus its permit-wait accumulator.
 ///
-/// Runs on the worker's existing monitoring cadence (`interval`, the same
-/// `poll_interval` the timeout/poison-pill checkers use) via a
-/// `tokio::select! { cancel, sleep }` loop, mirroring
-/// `poison_pill::spawn_poison_pill_reclaimer`. This decouples the control
-/// loop from the hot dispatch path entirely: dispatch only ever touches a
-/// lock-free `AtomicU64` (`permit_wait_micros`) to record the longest recent
-/// permit wait, never the tuner itself.
+/// Bundled so [`spawn_slot_tuner_loop`] can drive both slot types from one
+/// shared control loop.
+pub struct TunedSlot {
+    /// The runtime this tick resizes.
+    pub runtime: TunedSlotRuntime,
+    /// Longest permit wait observed since the last tick; reset to 0 each
+    /// tick via `swap`.
+    pub permit_wait_micros: Arc<AtomicU64>,
+    /// The bounded label this slot's telemetry is emitted under.
+    pub slot_type: SlotType,
+}
+
+/// Apply one control-loop tick to a single [`TunedSlot`], given the tick's
+/// shared pool-pressure sample. Returns the [`TunerDecision`] that took
+/// effect, for the caller to emit telemetry with.
+fn tick_one(
+    slot: &mut TunedSlot,
+    tuner: &dyn SlotTuner,
+    pressure: Option<PoolPressure>,
+) -> TunerDecision {
+    let current_target = slot.runtime.live_target();
+    let raw_available = slot.runtime.semaphore.available_permits();
+    let (in_use, _available) = slot_occupancy(current_target, raw_available);
+
+    let wait_micros = slot.permit_wait_micros.swap(0, Ordering::Relaxed);
+    let max_permit_wait = if wait_micros == 0 {
+        None
+    } else {
+        Some(Duration::from_micros(wait_micros))
+    };
+
+    let observations = SlotObservations {
+        current_target,
+        min_slots: slot.runtime.min_slots,
+        max_slots: slot.runtime.max_slots,
+        in_use: usize::try_from(in_use).unwrap_or(usize::MAX),
+        pool: pressure,
+        max_permit_wait,
+    };
+
+    let action = tuner.decide(&observations);
+    let (new_target, decision) = apply_action(
+        current_target,
+        action,
+        slot.runtime.min_slots,
+        slot.runtime.max_slots,
+    );
+    slot.runtime.resize_toward(new_target);
+    decision
+}
+
+/// Spawn the adaptive slot-tuner control loop for both dispatch slot types on
+/// one shared cadence.
+///
+/// Runs as a single task with one `poll_interval` timer, via a
+/// `tokio::select! { cancel, sleep }` loop mirroring
+/// `poison_pill::spawn_poison_pill_reclaimer`. Worker DB-pool pressure is
+/// sampled **exactly once per tick** and applied to both the workflow and
+/// activity controller decisions — pool pressure is a worker-wide signal
+/// (both slot types dispatch against the same connection pool), so sampling
+/// it twice per tick (once per slot type, on independent timers) would
+/// double the pool status-lock contention for no benefit. Each slot type
+/// still gets its own independent `SlotObservations`, `decide()` call,
+/// target, and telemetry emission — only the tick cadence and the
+/// pool-pressure sample are shared.
+///
+/// This decouples the control loop from the hot dispatch path entirely:
+/// dispatch only ever touches a lock-free `AtomicU64` per slot type to
+/// record the longest recent permit wait, never the tuner itself.
 ///
 /// Runs regardless of whether a metrics recorder is configured — unlike a
 /// pure sampler, the tuner is a controller with a real effect on dispatch
 /// capacity, so it must not be silently disabled by `is_enabled() == false`.
 /// Telemetry emission (not the control decision) is what's gated.
 ///
-/// On cancellation, every withheld permit is released before the task
-/// returns so a subsequent `drain_in_flight` can observe full capacity.
+/// On cancellation, every withheld permit (for both slot types) is released
+/// before the task returns so a subsequent `drain_in_flight` can observe
+/// full capacity.
 ///
 /// Best-effort, not a hard rate guarantee: a controller that misbehaves (or a
-/// custom `SlotTuner` implementation) can at most leave the target anywhere
-/// within `[min_slots, max_slots]` — it can never withhold below the floor.
-#[allow(clippy::too_many_arguments)]
+/// custom `SlotTuner` implementation) can at most leave a target anywhere
+/// within its own `[min_slots, max_slots]` — it can never withhold below the
+/// floor.
 pub fn spawn_slot_tuner_loop(
-    mut runtime: TunedSlotRuntime,
+    mut workflow: TunedSlot,
+    mut activity: TunedSlot,
     tuner: Arc<dyn SlotTuner>,
-    slot_type: SlotType,
     pool_pressure: impl Fn() -> Option<PoolPressure> + Send + 'static,
-    permit_wait_micros: Arc<AtomicU64>,
     cancel: CancellationToken,
     interval: Duration,
     telemetry: Arc<TelemetryConfig>,
@@ -468,45 +601,42 @@ pub fn spawn_slot_tuner_loop(
                 () = tokio::time::sleep(interval) => {}
             }
 
-            let current_target = runtime.live_target();
-            let raw_available = runtime.semaphore.available_permits();
-            let in_use = current_target.saturating_sub(tuned_available(
-                runtime.max_slots,
-                current_target,
-                raw_available,
-            ));
-
-            let wait_micros = permit_wait_micros.swap(0, Ordering::Relaxed);
-            let max_permit_wait = if wait_micros == 0 {
-                None
-            } else {
-                Some(Duration::from_micros(wait_micros))
-            };
-
-            let observations = SlotObservations {
-                current_target,
-                min_slots: runtime.min_slots,
-                max_slots: runtime.max_slots,
-                in_use,
-                pool: pool_pressure(),
-                max_permit_wait,
-            };
-
-            let action = tuner.decide(&observations);
-            let (new_target, decision) =
-                apply_action(current_target, action, runtime.min_slots, runtime.max_slots);
-            runtime.resize_toward(new_target);
+            let pressure = pool_pressure();
+            let workflow_decision = tick_one(&mut workflow, &*tuner, pressure);
+            let activity_decision = tick_one(&mut activity, &*tuner, pressure);
 
             if telemetry.metrics.is_enabled() {
+                telemetry.metrics.record_worker_slot_target(
+                    workflow.slot_type,
+                    workflow.runtime.live_target() as u64,
+                );
                 telemetry
                     .metrics
-                    .record_worker_slot_target(slot_type, runtime.live_target() as u64);
-                telemetry.metrics.record_tuner_decision(slot_type, decision);
+                    .record_tuner_decision(workflow.slot_type, workflow_decision);
+                telemetry.metrics.record_worker_slot_target(
+                    activity.slot_type,
+                    activity.runtime.live_target() as u64,
+                );
+                telemetry
+                    .metrics
+                    .record_tuner_decision(activity.slot_type, activity_decision);
             }
         }
 
-        runtime.release_all_withheld();
+        workflow.runtime.release_all_withheld();
+        activity.runtime.release_all_withheld();
     })
+}
+
+#[cfg(test)]
+impl TunedSlot {
+    fn new_for_test(runtime: TunedSlotRuntime, slot_type: SlotType) -> Self {
+        Self {
+            runtime,
+            permit_wait_micros: Arc::new(AtomicU64::new(0)),
+            slot_type,
+        }
+    }
 }
 
 // `TunedSlotRuntime` holds `OwnedSemaphorePermit`s, which clippy treats as a
@@ -643,10 +773,75 @@ mod tests {
     }
 
     #[test]
+    fn apply_action_tolerates_degenerate_band_without_panicking() {
+        // min > max: effective_band collapses to (5, 5); a Grow request must
+        // clamp to the single point rather than panicking on an invalid range.
+        let (target, decision) = apply_action(5, SlotTunerAction::Grow(10), 50, 5);
+        assert_eq!(target, 5);
+        assert_eq!(decision, TunerDecision::Hold);
+    }
+
+    #[test]
     fn initial_target_clamps_configured_max_into_band() {
         assert_eq!(initial_target(20, 4, 10), 10);
         assert_eq!(initial_target(20, 30, 100), 30);
         assert_eq!(initial_target(20, 4, 100), 20);
+    }
+
+    #[test]
+    fn initial_target_tolerates_degenerate_band() {
+        assert_eq!(initial_target(20, 50, 5), 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // effective_band
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn effective_band_passes_through_valid_range() {
+        assert_eq!(effective_band(2, 40), (2, 40));
+        assert_eq!(effective_band(5, 5), (5, 5));
+    }
+
+    #[test]
+    fn effective_band_collapses_degenerate_range_to_max() {
+        assert_eq!(effective_band(50, 5), (5, 5));
+    }
+
+    // -----------------------------------------------------------------------
+    // slot_occupancy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn slot_occupancy_invariant_holds() {
+        for max in [0usize, 1, 8, 20, 100] {
+            for avail in 0..=max {
+                let (in_use, available) = slot_occupancy(max, avail);
+                assert_eq!(in_use + available, max as u64);
+                assert_eq!(available, avail as u64);
+                assert_eq!(in_use, (max - avail) as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn slot_occupancy_clamps_over_count() {
+        let (in_use, available) = slot_occupancy(8, 12);
+        assert_eq!(in_use, 0);
+        assert_eq!(available, 8);
+    }
+
+    #[test]
+    fn slot_occupancy_reports_full_availability_when_nothing_withheld_or_in_flight() {
+        // Regression test for the tuned_available double-subtraction bug
+        // (issue #548 review): a real semaphore's available_permits() after
+        // TunedSlotRuntime withholding already excludes withheld permits, so
+        // occupancy against the live target alone (no separate "subtract
+        // withheld" step) must report the full target as available when
+        // nothing is in flight.
+        let (in_use, available) = slot_occupancy(20, 20);
+        assert_eq!(in_use, 0);
+        assert_eq!(available, 20);
     }
 
     // -----------------------------------------------------------------------
@@ -679,9 +874,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_band_flags_zero_max() {
+    fn validate_band_does_not_flag_zero_max() {
+        // max_slots == 0 is a hard startup error (WorkerRuntimeConfig::validate),
+        // not a soft warning here — see the doc comment on validate_band.
         let warnings = validate_band(0, 0, 0);
-        assert!(warnings.iter().any(|w| w.contains("max_slots is 0")));
+        assert!(!warnings.iter().any(|w| w.contains("max_slots is 0")));
     }
 
     #[test]
@@ -701,24 +898,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // tuned_available
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn tuned_available_subtracts_withheld_from_raw() {
-        // permit_total 100, live_target 20 => 80 withheld; raw_available 100
-        // (withheld permits still count toward available_permits()).
-        assert_eq!(tuned_available(100, 20, 100), 20);
-    }
-
-    #[test]
-    fn tuned_available_reflects_in_flight_usage() {
-        // permit_total 100, live_target 20, 5 of the 20 dispatchable permits
-        // are in flight => raw_available is 95 (100 - 5 in-flight).
-        assert_eq!(tuned_available(100, 20, 95), 15);
-    }
-
-    // -----------------------------------------------------------------------
     // TunedSlotRuntime — real tokio::sync::Semaphore, no DB
     // -----------------------------------------------------------------------
 
@@ -731,12 +910,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tuned_runtime_construction_uses_single_bulk_acquire() {
+        // The withheld set should be a single merged permit (bulk acquire),
+        // not 80 individual entries, after construction.
+        let semaphore = Arc::new(Semaphore::new(100));
+        let runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 20, 10, 100);
+        assert_eq!(runtime.withheld.len(), 1);
+        assert_eq!(runtime.withheld[0].num_permits(), 80);
+    }
+
+    #[tokio::test]
+    async fn tuned_runtime_with_degenerate_band_does_not_panic_and_settles_at_max() {
+        let semaphore = Arc::new(Semaphore::new(5));
+        let mut runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 20, 50, 5);
+        // effective_band(50, 5) == (5, 5): target must be 5, not panic.
+        assert_eq!(runtime.live_target(), 5);
+        // resize_toward must not panic even when asked to move far outside
+        // the (collapsed) band.
+        let new_target = runtime.resize_toward(100);
+        assert_eq!(new_target, 5);
+        let new_target = runtime.resize_toward(0);
+        assert_eq!(new_target, 5);
+    }
+
+    #[tokio::test]
     async fn resize_grow_releases_withheld_permits() {
         let semaphore = Arc::new(Semaphore::new(100));
         let mut runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 20, 10, 100);
         let new_target = runtime.resize_toward(30);
         assert_eq!(new_target, 30);
         assert_eq!(semaphore.available_permits(), 30);
+    }
+
+    #[tokio::test]
+    async fn resize_grow_partially_splits_the_bulk_withheld_permit() {
+        // Growing by less than the full withheld amount must release only
+        // the requested portion, keeping the remainder withheld (not release
+        // the whole merged permit).
+        let semaphore = Arc::new(Semaphore::new(100));
+        let mut runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 20, 10, 100);
+        assert_eq!(semaphore.available_permits(), 20);
+
+        let new_target = runtime.resize_toward(23);
+        assert_eq!(new_target, 23);
+        assert_eq!(semaphore.available_permits(), 23);
+
+        // A further partial grow continues to split from the same
+        // remaining withheld permit correctly.
+        let new_target = runtime.resize_toward(25);
+        assert_eq!(new_target, 25);
+        assert_eq!(semaphore.available_permits(), 25);
     }
 
     #[tokio::test]
@@ -773,18 +996,20 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_releases_all_withheld_permits_for_drain() {
-        let semaphore = Arc::new(Semaphore::new(100));
-        let runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 20, 10, 100);
-        assert_eq!(semaphore.available_permits(), 20);
+        let workflow_semaphore = Arc::new(Semaphore::new(100));
+        let activity_semaphore = Arc::new(Semaphore::new(50));
+        let workflow_runtime = TunedSlotRuntime::new(Arc::clone(&workflow_semaphore), 20, 10, 100);
+        let activity_runtime = TunedSlotRuntime::new(Arc::clone(&activity_semaphore), 10, 5, 50);
+        assert_eq!(workflow_semaphore.available_permits(), 20);
+        assert_eq!(activity_semaphore.available_permits(), 10);
 
         let cancel = CancellationToken::new();
         let telemetry = Arc::new(TelemetryConfig::default());
         let handle = spawn_slot_tuner_loop(
-            runtime,
+            TunedSlot::new_for_test(workflow_runtime, SlotType::Workflow),
+            TunedSlot::new_for_test(activity_runtime, SlotType::Activity),
             Arc::new(DefaultSlotTuner::default()),
-            SlotType::Workflow,
             || None,
-            Arc::new(AtomicU64::new(0)),
             cancel.clone(),
             Duration::from_secs(3600),
             telemetry,
@@ -793,13 +1018,14 @@ mod tests {
         cancel.cancel();
         handle.await.expect("tuner loop task must not panic");
 
-        // All 100 permits must now be acquirable — drain_in_flight's
-        // acquire_many(max_slots) must be able to complete.
-        let _all = semaphore.acquire_many(100).await.unwrap();
+        // All permits must now be acquirable — drain_in_flight's
+        // acquire_many(max_slots) must be able to complete for both semaphores.
+        let _wf = workflow_semaphore.acquire_many(100).await.unwrap();
+        let _act = activity_semaphore.acquire_many(50).await.unwrap();
     }
 
     #[tokio::test]
-    async fn tuner_loop_applies_decision_each_tick() {
+    async fn tuner_loop_applies_decision_each_tick_for_both_slot_types() {
         struct AlwaysGrow;
         impl SlotTuner for AlwaysGrow {
             fn decide(&self, _observations: &SlotObservations) -> SlotTunerAction {
@@ -810,26 +1036,69 @@ mod tests {
             }
         }
 
-        let semaphore = Arc::new(Semaphore::new(30));
-        let runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 5, 5, 30);
+        let workflow_semaphore = Arc::new(Semaphore::new(30));
+        let activity_semaphore = Arc::new(Semaphore::new(15));
+        let workflow_runtime = TunedSlotRuntime::new(Arc::clone(&workflow_semaphore), 5, 5, 30);
+        let activity_runtime = TunedSlotRuntime::new(Arc::clone(&activity_semaphore), 3, 3, 15);
         let cancel = CancellationToken::new();
         let telemetry = Arc::new(TelemetryConfig::default());
         let handle = spawn_slot_tuner_loop(
-            runtime,
+            TunedSlot::new_for_test(workflow_runtime, SlotType::Workflow),
+            TunedSlot::new_for_test(activity_runtime, SlotType::Activity),
             Arc::new(AlwaysGrow),
-            SlotType::Activity,
             || None,
-            Arc::new(AtomicU64::new(0)),
             cancel.clone(),
             Duration::from_millis(5),
             telemetry,
         );
 
-        // Give the loop several ticks to converge and clamp at max_slots.
+        // Give the loop several ticks to converge and clamp both slot types
+        // at their respective max_slots.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(semaphore.available_permits(), 30);
+        assert_eq!(workflow_semaphore.available_permits(), 30);
+        assert_eq!(activity_semaphore.available_permits(), 15);
 
         cancel.cancel();
         handle.await.expect("tuner loop task must not panic");
+    }
+
+    #[tokio::test]
+    async fn tuner_loop_samples_pool_pressure_once_per_tick_for_both_slot_types() {
+        // Regression test: pool pressure must be sampled ONCE per tick and
+        // shared between the workflow and activity decisions, not sampled
+        // independently per slot type.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = Arc::clone(&calls);
+
+        let workflow_semaphore = Arc::new(Semaphore::new(10));
+        let activity_semaphore = Arc::new(Semaphore::new(10));
+        let workflow_runtime = TunedSlotRuntime::new(Arc::clone(&workflow_semaphore), 5, 5, 10);
+        let activity_runtime = TunedSlotRuntime::new(Arc::clone(&activity_semaphore), 5, 5, 10);
+        let cancel = CancellationToken::new();
+        let telemetry = Arc::new(TelemetryConfig::default());
+        let handle = spawn_slot_tuner_loop(
+            TunedSlot::new_for_test(workflow_runtime, SlotType::Workflow),
+            TunedSlot::new_for_test(activity_runtime, SlotType::Activity),
+            Arc::new(DefaultSlotTuner::default()),
+            move || {
+                calls_for_closure.fetch_add(1, Ordering::Relaxed);
+                None
+            },
+            cancel.clone(),
+            Duration::from_millis(20),
+            telemetry,
+        );
+
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        cancel.cancel();
+        handle.await.expect("tuner loop task must not panic");
+
+        // ~5 ticks elapsed (110ms / 20ms); pool_pressure must be called
+        // exactly once per tick, not twice (once per slot type).
+        let observed = calls.load(Ordering::Relaxed);
+        assert!(
+            (3..=7).contains(&observed),
+            "expected ~5 pool_pressure calls (one per tick), got {observed}"
+        );
     }
 }

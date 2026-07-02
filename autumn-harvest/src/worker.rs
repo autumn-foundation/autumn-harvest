@@ -175,10 +175,23 @@ impl WorkerRuntimeConfig {
                 }
             }
         }
-        // A misconfigured slot-tuner band never fails worker startup — it
-        // degrades to an inert (but harmless) tuner, matching the
-        // queue_weights precedent above.
+        // A degenerate band (min_slots > max_slots, or a configured value
+        // outside the band) never fails worker startup — it degrades to an
+        // inert (but harmless) tuner, matching the queue_weights precedent
+        // above. `max_slots == 0` is different in kind, not just degree: it
+        // makes the dispatch semaphore permanently empty, so the worker
+        // would register as healthy in the fleet table and heartbeat
+        // normally while being structurally unable to dispatch a single
+        // task — a silent, hard-to-diagnose outage. That case is rejected
+        // here instead of merely warned about.
         if let Some(tuner) = &self.slot_tuner {
+            if tuner.max_slots == 0 {
+                return Err(HarvestError::Config(
+                    "slot_tuner max_slots is 0; the dispatch semaphore would have zero permits \
+                     and this worker could never dispatch a task"
+                        .into(),
+                ));
+            }
             for warning in crate::slot_tuner::validate_band(
                 tuner.min_slots,
                 tuner.max_slots,
@@ -7544,18 +7557,6 @@ fn spawn_dlq_depth_sampler(
     })
 }
 
-/// Compute `(in_use, available)` dispatch-slot counts from a semaphore reading
-/// (issue #531).
-///
-/// `available` is clamped to `configured_max` so a transient over-count (e.g. a
-/// permit released just before the read) can never produce a negative `in_use`.
-/// Invariant: `in_use + available == configured_max`.
-fn slot_occupancy(configured_max: usize, available_permits: usize) -> (u64, u64) {
-    let available = available_permits.min(configured_max);
-    let in_use = configured_max - available;
-    (in_use as u64, available as u64)
-}
-
 /// Spawn the worker slot-occupancy sampler (issue #531).
 ///
 /// Reads the two dispatch `Semaphore`s' `available_permits()` against the
@@ -7567,18 +7568,16 @@ fn slot_occupancy(configured_max: usize, available_permits: usize) -> (u64, u64)
 ///
 /// `*_slot_target` is always present (issue #548): equal to the static
 /// `max_concurrent_*` and never mutated when no slot tuner is configured, so
-/// this sampler's output is byte-identical to before the tuner existed. When
-/// a tuner is configured, `available_permits()` counts tuner-withheld
-/// permits as "available" even though they are not offered to dispatch, so
-/// `slot_tuner::tuned_available` is used to net those out before computing
-/// occupancy against the live target rather than `permit_total`.
-#[allow(clippy::too_many_arguments)]
+/// this sampler's output is byte-identical to before the tuner existed.
+/// `Semaphore::available_permits()` already excludes any tuner-withheld
+/// permits (they are genuinely acquired and held, not merely reserved), so
+/// `crate::slot_tuner::slot_occupancy` computes occupancy directly from the
+/// live target and the raw available-permits reading — see that function's
+/// doc comment for why no separate "subtract withheld" step is needed.
 fn spawn_worker_slot_sampler(
     workflow_semaphore: Arc<Semaphore>,
-    workflow_permit_total: usize,
     workflow_slot_target: Arc<AtomicUsize>,
     activity_semaphore: Arc<Semaphore>,
-    activity_permit_total: usize,
     activity_slot_target: Arc<AtomicUsize>,
     cancel: CancellationToken,
     telemetry: Arc<crate::telemetry::TelemetryConfig>,
@@ -7595,12 +7594,10 @@ fn spawn_worker_slot_sampler(
             // UFCS avoids ambiguity with `RunQueryDsl::load` (in scope in this
             // module), which also matches a by-value `.load(...)` call.
             let wf_target = AtomicUsize::load(&workflow_slot_target, Ordering::Relaxed);
-            let wf_dispatchable = crate::slot_tuner::tuned_available(
-                workflow_permit_total,
+            let (wf_in_use, wf_available) = crate::slot_tuner::slot_occupancy(
                 wf_target,
                 workflow_semaphore.available_permits(),
             );
-            let (wf_in_use, wf_available) = slot_occupancy(wf_target, wf_dispatchable);
             telemetry
                 .metrics
                 .record_worker_slots(SlotType::Workflow, wf_in_use, wf_available);
@@ -7608,12 +7605,10 @@ fn spawn_worker_slot_sampler(
             // Activity read is a separate snapshot; cross-type totals may reflect
             // different instants when a task is dispatched between the two reads.
             let act_target = AtomicUsize::load(&activity_slot_target, Ordering::Relaxed);
-            let act_dispatchable = crate::slot_tuner::tuned_available(
-                activity_permit_total,
+            let (act_in_use, act_available) = crate::slot_tuner::slot_occupancy(
                 act_target,
                 activity_semaphore.available_permits(),
             );
-            let (act_in_use, act_available) = slot_occupancy(act_target, act_dispatchable);
             telemetry
                 .metrics
                 .record_worker_slots(SlotType::Activity, act_in_use, act_available);
@@ -7852,6 +7847,17 @@ pub struct Worker {
     /// Longest claim-to-dispatch permit-wait for the activity semaphore
     /// (issue #548). See `workflow_permit_wait_micros`.
     activity_permit_wait_micros: Option<Arc<AtomicU64>>,
+    /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
+    /// #548 review). Guards against a hypothetical second invocation (e.g. a
+    /// future caller wrapping `run`/`run_with_listener` in a retry loop)
+    /// constructing a second `TunedSlotRuntime` over the same semaphore,
+    /// which would race the first tuner-loop task over the same withheld
+    /// permits and corrupt both the effective concurrency band and the
+    /// `slot_target` gauges. No production call site does this today (see
+    /// the doc comment on `spawn_monitoring_tasks`), but the guard is cheap
+    /// (a single `AtomicBool`, trivial `Drop`) and turns a silent state race
+    /// into a loud, diagnosable error instead.
+    monitoring_started: std::sync::atomic::AtomicBool,
     /// Cancellation token for graceful shutdown.
     shutdown: CancellationToken,
     /// Set (and refreshed on every heartbeat) by the heartbeat task while the
@@ -8184,6 +8190,7 @@ impl Worker {
             activity_permit_total: activity_parts.permit_total,
             workflow_permit_wait_micros: workflow_parts.permit_wait_micros,
             activity_permit_wait_micros: activity_parts.permit_wait_micros,
+            monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             remote_drain_deadline: Arc::new(Mutex::new(None)),
             drain_deadline_max: Arc::new(Mutex::new(None)),
@@ -8706,12 +8713,16 @@ impl Worker {
         tracing::info!(worker_id = %self.config.worker_id, "worker stopped");
     }
 
-    // significant_drop_tightening: the extracted `workflow_runtime`/
-    // `activity_runtime` bindings are moved into their `if let Some(runtime)`
-    // arm (or dropped immediately in the `None` arm) — clippy's move
-    // analysis doesn't see through this pattern and flags the outer `let` as
-    // living to the end of the block, which it does not.
-    #[allow(clippy::too_many_lines)]
+    // significant_drop_tightening: `workflow_runtime`/`activity_runtime`
+    // (each holding withheld `OwnedSemaphorePermit`s — a "significant drop"
+    // type) are constructed, read via `live_target_cell()`, and then moved
+    // into their `TunedSlot` a few statements later for the tuner-loop
+    // spawn. Clippy's suggested fix — collapsing construction directly into
+    // `.live_target_cell()` — would drop the runtime (and release its
+    // withheld permits back into the semaphore) immediately, which is
+    // exactly the bug this withholding scheme exists to prevent. The lint
+    // is a false positive here: both bindings genuinely have two uses.
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     fn spawn_monitoring_tasks(&self, pool: &DbPool) -> WorkerMonitoringHandles {
         // Pools the queue-depth/age, concurrency, rate-limit, and history-
         // oversized samplers aggregate over (issue #522 review). When a
@@ -8883,13 +8894,20 @@ impl Worker {
             self.registry.history_policy().continue_as_new_threshold(),
             self.config.poll_interval,
         );
-        // Adaptive slot-tuner control loops (issue #548): only spawned when
+        // Adaptive slot-tuner control loop (issue #548): only spawned when
         // `WorkerConfig::with_slot_tuner` was configured. Unlike the sampler
         // below, this is NOT gated on `metrics.is_enabled()` — it is a
         // controller with a real effect on dispatch capacity, not a pure
         // observability sampler, so it must keep running even when no
         // metrics recorder is installed. Only the per-tick telemetry
         // emission inside the loop is gated.
+        //
+        // Both slot types are driven by ONE shared control-loop task (see
+        // `crate::slot_tuner::spawn_slot_tuner_loop`): pool-pressure is a
+        // worker-wide signal (both semaphores dispatch against the same
+        // connection pool), so sampling it once per tick and reusing it for
+        // both decisions avoids doubling the pool status-lock contention
+        // that two independent per-type loops would cause.
         //
         // `TunedSlotRuntime` (which owns `OwnedSemaphorePermit`s) is
         // constructed here — a local, not a `Worker` field — and immediately
@@ -8898,77 +8916,85 @@ impl Worker {
         // `run_with_listener` / the multi-shard `run`), so no task can ever
         // be dispatched against the semaphore before it is withheld down to
         // the initial target here.
+        //
+        // `monitoring_started` guards specifically against a second
+        // invocation of this function on the same `Worker` (e.g. a
+        // hypothetical future caller wrapping `run`/`run_with_listener` in a
+        // retry loop): constructing a second `TunedSlotRuntime` over the
+        // same semaphore would race the first tuner-loop task over the same
+        // withheld permits. No production call site does this today, but
+        // the guard converts a silent state race into a loud, diagnosable
+        // log line instead. It does not gate the harmless (if redundant)
+        // samplers spawned elsewhere in this function.
+        let already_monitoring = self
+            .monitoring_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        if already_monitoring && self.config.slot_tuner.is_some() {
+            tracing::error!(
+                worker_id = %self.config.worker_id,
+                "spawn_monitoring_tasks called more than once on the same Worker; skipping \
+                 slot-tuner re-initialization to avoid racing a second TunedSlotRuntime over \
+                 the same dispatch semaphore (this should never happen in normal operation)"
+            );
+        }
         let mut slot_tuners: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        let workflow_slot_target = if let Some(tuner_cfg) = self.config.slot_tuner.clone() {
-            let runtime = crate::slot_tuner::TunedSlotRuntime::new(
-                Arc::clone(&self.workflow_semaphore),
-                self.config.max_concurrent_workflows,
-                tuner_cfg.min_slots,
-                tuner_cfg.max_slots,
-            );
-            let slot_target = runtime.live_target_cell();
-            let pool_for_pressure = pool.clone();
-            let permit_wait = self
-                .workflow_permit_wait_micros
-                .clone()
-                .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-            slot_tuners.push(crate::slot_tuner::spawn_slot_tuner_loop(
-                runtime,
-                Arc::clone(&tuner_cfg.tuner),
-                SlotType::Workflow,
-                move || {
-                    let status = pool_for_pressure.status();
-                    Some(crate::slot_tuner::PoolPressure {
-                        max_size: status.max_size,
-                        size: status.size,
-                        available: status.available,
-                        waiting: status.waiting,
-                    })
-                },
-                permit_wait,
-                self.shutdown.clone(),
-                self.config.poll_interval,
-                self.registry.telemetry().clone(),
-            ));
-            slot_target
-        } else {
-            Arc::new(AtomicUsize::new(self.workflow_permit_total))
-        };
-        let activity_slot_target = if let Some(tuner_cfg) = self.config.slot_tuner.clone() {
-            let runtime = crate::slot_tuner::TunedSlotRuntime::new(
-                Arc::clone(&self.activity_semaphore),
-                self.config.max_concurrent_activities,
-                tuner_cfg.min_slots,
-                tuner_cfg.max_slots,
-            );
-            let slot_target = runtime.live_target_cell();
-            let pool_for_pressure = pool.clone();
-            let permit_wait = self
-                .activity_permit_wait_micros
-                .clone()
-                .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-            slot_tuners.push(crate::slot_tuner::spawn_slot_tuner_loop(
-                runtime,
-                Arc::clone(&tuner_cfg.tuner),
-                SlotType::Activity,
-                move || {
-                    let status = pool_for_pressure.status();
-                    Some(crate::slot_tuner::PoolPressure {
-                        max_size: status.max_size,
-                        size: status.size,
-                        available: status.available,
-                        waiting: status.waiting,
-                    })
-                },
-                permit_wait,
-                self.shutdown.clone(),
-                self.config.poll_interval,
-                self.registry.telemetry().clone(),
-            ));
-            slot_target
-        } else {
-            Arc::new(AtomicUsize::new(self.activity_permit_total))
-        };
+        let (workflow_slot_target, activity_slot_target) =
+            if !already_monitoring && let Some(tuner_cfg) = self.config.slot_tuner.clone() {
+                let workflow_runtime = crate::slot_tuner::TunedSlotRuntime::new(
+                    Arc::clone(&self.workflow_semaphore),
+                    self.config.max_concurrent_workflows,
+                    tuner_cfg.min_slots,
+                    tuner_cfg.max_slots,
+                );
+                let activity_runtime = crate::slot_tuner::TunedSlotRuntime::new(
+                    Arc::clone(&self.activity_semaphore),
+                    self.config.max_concurrent_activities,
+                    tuner_cfg.min_slots,
+                    tuner_cfg.max_slots,
+                );
+                let workflow_slot_target = workflow_runtime.live_target_cell();
+                let activity_slot_target = activity_runtime.live_target_cell();
+                let workflow_permit_wait = self
+                    .workflow_permit_wait_micros
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+                let activity_permit_wait = self
+                    .activity_permit_wait_micros
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
+                let pool_for_pressure = pool.clone();
+                slot_tuners.push(crate::slot_tuner::spawn_slot_tuner_loop(
+                    crate::slot_tuner::TunedSlot {
+                        runtime: workflow_runtime,
+                        permit_wait_micros: workflow_permit_wait,
+                        slot_type: SlotType::Workflow,
+                    },
+                    crate::slot_tuner::TunedSlot {
+                        runtime: activity_runtime,
+                        permit_wait_micros: activity_permit_wait,
+                        slot_type: SlotType::Activity,
+                    },
+                    Arc::clone(&tuner_cfg.tuner),
+                    move || {
+                        let status = pool_for_pressure.status();
+                        Some(crate::slot_tuner::PoolPressure {
+                            max_size: status.max_size,
+                            size: status.size,
+                            available: status.available,
+                            waiting: status.waiting,
+                        })
+                    },
+                    self.shutdown.clone(),
+                    self.config.poll_interval,
+                    self.registry.telemetry().clone(),
+                ));
+                (workflow_slot_target, activity_slot_target)
+            } else {
+                (
+                    Arc::new(AtomicUsize::new(self.workflow_permit_total)),
+                    Arc::new(AtomicUsize::new(self.activity_permit_total)),
+                )
+            };
 
         // Worker slot-occupancy gauges (issue #531): a pure in-memory read of the
         // two dispatch semaphores against their configured maxima, on the same
@@ -8977,10 +9003,8 @@ impl Worker {
         let worker_slot_sampler = self.registry.telemetry().metrics.is_enabled().then(|| {
             spawn_worker_slot_sampler(
                 Arc::clone(&self.workflow_semaphore),
-                self.workflow_permit_total,
                 workflow_slot_target,
                 Arc::clone(&self.activity_semaphore),
-                self.activity_permit_total,
                 activity_slot_target,
                 self.shutdown.clone(),
                 self.registry.telemetry().clone(),
@@ -9486,6 +9510,25 @@ impl Worker {
     /// Spawn a bounded Tokio task for the claimed work item.
     #[allow(clippy::too_many_lines)]
     fn dispatch_task(&self, task: TaskQueueItem, pool: &DbPool) {
+        // Debug-only tripwire (issue #548 review): dispatch must never race
+        // ahead of `spawn_monitoring_tasks`, which withholds a tuned
+        // semaphore's permits down to the operator's initial target. A
+        // dispatch that lands before that withholding runs would see the
+        // full un-withheld `max_slots` capacity instead. Both public entry
+        // points (`run`, `run_with_listener`) already call
+        // `spawn_monitoring_tasks` unconditionally before dispatch can
+        // start, so this should never fire in practice — it exists to catch
+        // a future ordering regression loudly in tests/CI rather than
+        // silently over-provisioning capacity in production. Zero cost in
+        // release builds.
+        debug_assert!(
+            std::sync::atomic::AtomicBool::load(
+                &self.monitoring_started,
+                std::sync::atomic::Ordering::SeqCst
+            ),
+            "dispatch_task called before spawn_monitoring_tasks initialized the worker; \
+             a tuned semaphore would not yet be withheld to its initial target"
+        );
         let kind = match ClaimedTaskKind::from_db(&task.task_type) {
             Ok(kind) => kind,
             Err(error) => {
@@ -10264,43 +10307,9 @@ mod tests {
     use serde_json::Value;
     use tokio::sync::oneshot;
 
-    #[test]
-    fn slot_occupancy_invariant_holds() {
-        // AC (issue #531): in_use + available == configured_max for each slot
-        // type within one sampler interval. Exhaustively check the domain.
-        for max in [0usize, 1, 8, 20, 100] {
-            for avail in 0..=max {
-                let (in_use, available) = slot_occupancy(max, avail);
-                assert_eq!(
-                    in_use + available,
-                    max as u64,
-                    "max={max} avail={avail}: in_use+available must equal max"
-                );
-                assert_eq!(available, avail as u64);
-                assert_eq!(in_use, (max - avail) as u64);
-            }
-        }
-    }
-
-    #[test]
-    fn slot_occupancy_clamps_over_count() {
-        // Defensive: a transient permit over-count (available > max) must never
-        // underflow in_use — it clamps to (0, max).
-        let (in_use, available) = slot_occupancy(8, 12);
-        assert_eq!(in_use, 0);
-        assert_eq!(available, 8);
-    }
-
-    #[tokio::test]
-    async fn slot_occupancy_reflects_acquired_permits() {
-        // Acquiring 3 of 8 permits leaves 5 available and reports 3 in use.
-        let sem = Arc::new(Semaphore::new(8));
-        let _p1 = sem.acquire().await.expect("acquire");
-        let _p2 = sem.acquire().await.expect("acquire");
-        let _p3 = sem.acquire().await.expect("acquire");
-        let (in_use, available) = slot_occupancy(8, sem.available_permits());
-        assert_eq!((in_use, available), (3, 5));
-    }
+    // slot_occupancy (issue #531) moved to crate::slot_tuner; its unit tests
+    // now live in slot_tuner.rs's test module alongside the tuner logic that
+    // consumes it.
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
@@ -10362,6 +10371,17 @@ mod tests {
         // reported via tracing::warn! only (issue #548, queue_weights
         // precedent).
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_config_validate_rejects_zero_max_slots() {
+        let mut cfg = default_runtime_config();
+        cfg.slot_tuner = Some(crate::slot_tuner::SlotTunerConfig::new(0, 0));
+        // max_slots == 0 makes the dispatch semaphore permanently empty; this
+        // must be a hard startup error, not a warning (issue #548 review) —
+        // a worker that can never dispatch a task must never look healthy.
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_slots is 0"));
     }
 
     // ── Workflow-task timeout tests (issue #494) ──────────────────────────
