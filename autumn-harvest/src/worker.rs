@@ -192,6 +192,21 @@ impl WorkerRuntimeConfig {
                         .into(),
                 ));
             }
+            // `min_slots == 0` is a liveness hazard, not just a degenerate
+            // band: the default controller's grow signal depends on
+            // observing a claim-to-dispatch permit wait, which requires a
+            // task to actually be dispatched. If pool pressure ever shrinks
+            // the target to 0, no task can dispatch, so no permit wait is
+            // ever recorded and the worker is permanently stuck at zero
+            // capacity — the same silent-outage shape as `max_slots == 0`.
+            if tuner.min_slots == 0 {
+                return Err(HarvestError::Config(
+                    "slot_tuner min_slots is 0; the tuner could shrink to 0 slots and become \
+                     permanently stuck there, since no task could dispatch to ever trigger a \
+                     grow decision"
+                        .into(),
+                ));
+            }
             for warning in crate::slot_tuner::validate_band(
                 tuner.min_slots,
                 tuner.max_slots,
@@ -7908,6 +7923,15 @@ struct WorkerMonitoringHandles {
     /// Adaptive slot-tuner control loops (issue #548). Empty when no tuner
     /// is configured.
     slot_tuners: Vec<tokio::task::JoinHandle<()>>,
+    /// The live dispatch-slot target for each semaphore (issue #548 review):
+    /// the tuner's current resize target when a tuner is configured, or a
+    /// fixed atomic holding the configured max otherwise. Threaded into
+    /// `spawn_heartbeat_task` so fleet in-flight accounting tracks the
+    /// worker's *actual* current capacity rather than the static
+    /// `max_concurrent_*` config value, which would silently diverge from
+    /// reality once the tuner resizes away from its initial target.
+    workflow_slot_target: Arc<AtomicUsize>,
+    activity_slot_target: Arc<AtomicUsize>,
 }
 
 /// Spawn the bounded-pause auto-resume scanner (issue #383).
@@ -8442,10 +8466,19 @@ impl Worker {
         let heartbeat_cancel = CancellationToken::new();
 
         // Spawn one heartbeat task per shard pool so every shard's harvest_workers
-        // table reflects this worker.
+        // table reflects this worker. All shards' heartbeats share the same
+        // live-target atomics from the single `spawn_monitoring_tasks` call
+        // above, so every shard's row reports the same tuned in-flight view.
         let heartbeat_handles: Vec<_> = shard_targets
             .iter()
-            .map(|(_, shard_pool)| self.spawn_heartbeat_task(shard_pool, heartbeat_cancel.clone()))
+            .map(|(_, shard_pool)| {
+                self.spawn_heartbeat_task(
+                    shard_pool,
+                    Arc::clone(&monitors.workflow_slot_target),
+                    Arc::clone(&monitors.activity_slot_target),
+                    heartbeat_cancel.clone(),
+                )
+            })
             .collect();
 
         // Build per-shard listeners from shard_notification_database_urls.
@@ -8690,7 +8723,12 @@ impl Worker {
 
         let monitors = self.spawn_monitoring_tasks(pool);
         let heartbeat_cancel = CancellationToken::new();
-        let heartbeat_handle = self.spawn_heartbeat_task(pool, heartbeat_cancel.clone());
+        let heartbeat_handle = self.spawn_heartbeat_task(
+            pool,
+            Arc::clone(&monitors.workflow_slot_target),
+            Arc::clone(&monitors.activity_slot_target),
+            heartbeat_cancel.clone(),
+        );
 
         self.run_poll_loop(pool, listener).await;
 
@@ -9003,9 +9041,9 @@ impl Worker {
         let worker_slot_sampler = self.registry.telemetry().metrics.is_enabled().then(|| {
             spawn_worker_slot_sampler(
                 Arc::clone(&self.workflow_semaphore),
-                workflow_slot_target,
+                Arc::clone(&workflow_slot_target),
                 Arc::clone(&self.activity_semaphore),
-                activity_slot_target,
+                Arc::clone(&activity_slot_target),
                 self.shutdown.clone(),
                 self.registry.telemetry().clone(),
                 self.config.poll_interval,
@@ -9055,12 +9093,24 @@ impl Worker {
             worker_slot_sampler,
             stranded_work_sampler,
             slot_tuners,
+            workflow_slot_target,
+            activity_slot_target,
         }
     }
 
+    // `workflow_slot_target`/`activity_slot_target` come from
+    // `spawn_monitoring_tasks`'s `WorkerMonitoringHandles` (issue #548
+    // review): the heartbeat's reported in-flight count must track the
+    // dispatch semaphores' *current* tuned target, not the static
+    // `max_concurrent_*` config value, since a tuner can resize away from
+    // that value at any time. Untuned workers pass an atomic fixed at the
+    // configured max, so `compute_in_flight`'s accounting is byte-identical
+    // to before this field existed.
     fn spawn_heartbeat_task(
         &self,
         pool: &DbPool,
+        workflow_slot_target: Arc<AtomicUsize>,
+        activity_slot_target: Arc<AtomicUsize>,
         heartbeat_cancel: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         // Spawn the heartbeat background task with a dedicated cancel token so
@@ -9090,9 +9140,9 @@ impl Worker {
                 labels: self.config.labels.clone(),
             },
             Arc::clone(&self.workflow_semaphore),
-            self.config.max_concurrent_workflows,
+            workflow_slot_target,
             Arc::clone(&self.activity_semaphore),
-            self.config.max_concurrent_activities,
+            activity_slot_target,
             self.config.worker_heartbeat_interval,
             heartbeat_cancel,
             self.shutdown.clone(),
@@ -10382,6 +10432,18 @@ mod tests {
         // a worker that can never dispatch a task must never look healthy.
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_slots is 0"));
+    }
+
+    #[test]
+    fn runtime_config_validate_rejects_zero_min_slots() {
+        let mut cfg = default_runtime_config();
+        cfg.slot_tuner = Some(crate::slot_tuner::SlotTunerConfig::new(0, 10));
+        // min_slots == 0 lets the tuner shrink to 0 slots under pool
+        // pressure and get permanently stuck there, since no task can ever
+        // dispatch to produce the permit-wait signal a grow decision
+        // requires (issue #548 review). Hard error, matching max_slots == 0.
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("min_slots is 0"));
     }
 
     // ── Workflow-task timeout tests (issue #494) ──────────────────────────

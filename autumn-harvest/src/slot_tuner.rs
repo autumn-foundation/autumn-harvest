@@ -400,25 +400,26 @@ impl TunedSlotRuntime {
         let (min_slots, max_slots) = effective_band(min_slots, max_slots);
         let target = initial_target(configured_max, min_slots, max_slots);
         let to_withhold = max_slots.saturating_sub(target);
-        let withheld = u32::try_from(to_withhold).map_or_else(
-            |_| Vec::new(),
-            |n| {
-                if n == 0 {
-                    Vec::new()
-                } else {
-                    // The semaphore was constructed with fewer than
-                    // max_slots permits (a caller bug) — stop withholding
-                    // rather than panicking; the live target will simply
-                    // read higher than the true capacity until corrected.
-                    Arc::clone(&semaphore)
-                        .try_acquire_many_owned(n)
-                        .map_or_else(|_| Vec::new(), |permit| vec![permit])
-                }
-            },
-        );
+        // Tracks what was actually withheld, not just what was intended.
+        // The semaphore was constructed with fewer than `max_slots` permits
+        // (a caller bug) is the only way the acquire below can fail — stop
+        // withholding rather than panicking, but fall the live target back
+        // to the semaphore's true available count so `slot_occupancy`
+        // accounting (which trusts `live_target`) can't silently diverge
+        // from the semaphore's actual, unconstrained capacity.
+        let (withheld, actual_target) = match u32::try_from(to_withhold) {
+            Ok(0) => (Vec::new(), target),
+            Ok(n) => Arc::clone(&semaphore)
+                .try_acquire_many_owned(n)
+                .map_or_else(
+                    |_| (Vec::new(), semaphore.available_permits()),
+                    |permit| (vec![permit], target),
+                ),
+            Err(_) => (Vec::new(), semaphore.available_permits()),
+        };
         Self {
             semaphore,
-            live_target: Arc::new(AtomicUsize::new(target)),
+            live_target: Arc::new(AtomicUsize::new(actual_target)),
             withheld,
             min_slots,
             max_slots,
@@ -917,6 +918,24 @@ mod tests {
         let runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 20, 10, 100);
         assert_eq!(runtime.withheld.len(), 1);
         assert_eq!(runtime.withheld[0].num_permits(), 80);
+    }
+
+    #[tokio::test]
+    async fn tuned_runtime_falls_back_live_target_when_withhold_acquire_fails() {
+        // Regression test (issue #548 review): a semaphore constructed with
+        // fewer than `max_slots` permits (a caller bug) makes the withhold
+        // acquire fail. The live target must then fall back to what the
+        // semaphore actually reports, not the lower intended `target` — a
+        // stale lower target would make `slot_occupancy` silently
+        // under-report `in_use` since more capacity is truly available than
+        // the target claims.
+        let semaphore = Arc::new(Semaphore::new(3));
+        let runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 2, 2, 10);
+        // target = clamp(2, [2, 10]) = 2, to_withhold = 10 - 2 = 8, but only
+        // 3 permits actually exist — the acquire fails.
+        assert!(runtime.withheld.is_empty());
+        assert_eq!(runtime.live_target(), 3);
+        assert_eq!(runtime.live_target(), semaphore.available_permits());
     }
 
     #[tokio::test]

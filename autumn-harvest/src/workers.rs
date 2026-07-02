@@ -7,6 +7,7 @@
 //! The API layer queries this table (per-shard) to surface fleet status to
 //! operators via the management HTTP routes.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1190,9 +1191,9 @@ pub fn spawn_worker_heartbeat(
     pool: DbPool,
     registration: WorkerRegistration,
     wf_semaphore: Arc<Semaphore>,
-    wf_max: usize,
+    wf_max: Arc<AtomicUsize>,
     act_semaphore: Arc<Semaphore>,
-    act_max: usize,
+    act_max: Arc<AtomicUsize>,
     interval: Duration,
     cancel: CancellationToken,
     worker_shutdown: CancellationToken,
@@ -1214,7 +1215,19 @@ pub fn spawn_worker_heartbeat(
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(interval) => {}
             }
-            let in_flight = compute_in_flight(&wf_semaphore, wf_max, &act_semaphore, act_max);
+            // Loaded fresh each tick (issue #548 review): a tuned worker's
+            // dispatch target can change between heartbeats, so a value
+            // captured once at spawn time would drift from reality.
+            //
+            // UFCS is required here: `diesel_async::RunQueryDsl::load` is in
+            // scope in this module and its blanket by-value-receiver impl
+            // wins method resolution over `AtomicUsize::load(&self, ..)`.
+            let in_flight = compute_in_flight(
+                &wf_semaphore,
+                AtomicUsize::load(&wf_max, Ordering::Relaxed),
+                &act_semaphore,
+                AtomicUsize::load(&act_max, Ordering::Relaxed),
+            );
             match pool.get().await {
                 Ok(mut conn) => {
                     let () = do_heartbeat_tick(
