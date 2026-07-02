@@ -535,6 +535,15 @@ impl TunedSlotRuntime {
     /// Called on tuner-loop cancellation so `drain_in_flight`'s
     /// `acquire_many(max_slots)` can complete without waiting on slots the
     /// tuner itself was holding back.
+    ///
+    /// Known limitation (issue #548 review, tracked as follow-up): this
+    /// releases every withheld permit at once as soon as shutdown fires,
+    /// not staged behind drain. A task already claimed from the queue but
+    /// still blocked on a dispatch permit (because the tuner had shrunk
+    /// below what was claimed) can win the race for a just-released permit
+    /// and start running — a brief concurrency spike above the tuner's
+    /// shrunk target during shutdown. See "Known limitation" in
+    /// `docs/operations/adaptive-slot-tuner.md`.
     pub fn release_all_withheld(&mut self) {
         self.withheld.clear();
         self.live_target.store(self.max_slots, Ordering::Relaxed);

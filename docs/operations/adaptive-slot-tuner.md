@@ -128,12 +128,29 @@ When a tuner is configured, a dispatch semaphore is created with
   they are returned, so the in-flight count naturally falls to the new
   target over time rather than being forced down immediately.
 
-This means **graceful shutdown and draining are unaffected**: a shrink
-decision never cancels or reclaims an already-dispatched task. On worker
-shutdown the tuner's control loop releases every withheld permit before
-exiting, so the existing drain path (which waits for all of a semaphore's
-permits to become available again) completes correctly regardless of
-whether the tuner had withheld capacity at the time.
+This means **graceful shutdown and draining are unaffected for already-running
+work**: a shrink decision never cancels or reclaims an already-dispatched
+task. On worker shutdown the tuner's control loop releases every withheld
+permit before exiting, so the existing drain path (which waits for all of a
+semaphore's permits to become available again) completes correctly
+regardless of whether the tuner had withheld capacity at the time.
+
+**Known limitation — shutdown-time concurrency spike.** The withheld-permit
+release above happens all at once, as soon as the worker's shutdown signal
+fires, rather than being staged behind the drain. If tasks were already
+claimed from the queue but are still blocked waiting for a dispatch permit
+(because the tuner had shrunk below what was claimed), releasing the
+withheld permits lets those queued dispatches start running immediately —
+a brief burst of concurrency above the tuner's shrunk target, right as the
+worker is trying to wind down and exactly when the tuner may have shrunk
+*because* a downstream resource (typically the DB pool) was under
+pressure. In practice the window is narrow (bounded by how many tasks were
+claimed beyond the current live target at the moment of shutdown) and every
+started task still completes normally — this does not corrupt state, only
+temporarily exceeds the tuned band during shutdown. A future fix would have
+`drain_in_flight` wait for the tuner's live target directly instead of the
+full `max_slots`, removing the need to force-release withheld permits at
+all; tracked as follow-up work under issue #548.
 
 ## Telemetry
 
