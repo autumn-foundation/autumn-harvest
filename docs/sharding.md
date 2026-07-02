@@ -80,6 +80,63 @@ The `pending` field shows how many tasks are currently deferred because the key 
 
 The `harvest.concurrency.in_flight` metric (tagged by concurrency key) is emitted by the concurrency sampler at regular intervals. **Note**: the raw key value is tagged on the metric — ensure your key cardinality is bounded (e.g., use `tenant_id`, not `execution_id`) to avoid metric cardinality explosion. See ADR-0001 §7.
 
+### Historical per-tenant usage report (issue #596)
+
+`GET /admin/concurrency` above is strictly **point-in-time**: it answers "how many tasks are in flight for this key right now?" It cannot answer the question every multi-tenant embedder eventually asks finance: "how much did tenant `acme` actually consume last month?" ADR-0001's cardinality rule deliberately keeps `MetricsRecorder` low-cardinality, so that answer cannot come from Prometheus either.
+
+`GET /admin/usage` is the **historical companion** to `/admin/concurrency` — and the supported alternative to querying `harvest_workflow_executions` / `harvest_events` directly, which is an internal schema this project does not guarantee stability for. It aggregates already-durable data over a caller-supplied time window, computed read-only, with no new `WorkflowEvent` variant and no migration.
+
+```
+GET /admin/usage?from=2026-06-01T00:00:00Z&to=2026-07-01T00:00:00Z&group_by=search_attr:tenant_id
+```
+
+`from` and `to` are required (RFC 3339 timestamp or a relative duration like `24h`, measured back from now). `group_by` defaults to `workflow_name`; pass `search_attr:<key>` to bucket by a tenant key already carried in `search_attrs` (e.g. `search_attr:tenant_id`).
+
+Response:
+```json
+{
+  "status": "complete",
+  "from": "2026-06-01T00:00:00Z",
+  "to": "2026-07-01T00:00:00Z",
+  "group_by": "search_attr:tenant_id",
+  "groups": [
+    {
+      "group": "acme",
+      "workflow_starts": 4210,
+      "completed": 4102,
+      "failed": 58,
+      "cancelled": 12,
+      "timed_out": 3,
+      "activity_executions": 51820,
+      "activity_executions_failed": 340,
+      "activity_compute_seconds": 918422.7
+    }
+  ],
+  "unavailable_shards": []
+}
+```
+
+Executions that lack the requested `search_attrs` key are grouped under the literal group `"(unattributed)"` rather than silently dropped.
+
+**Metric semantics** (each unit is counted exactly once, in the window it actually occurred — the chargeback-consistent choice):
+
+- `workflow_starts`: executions whose `started_at` falls in `[from, to]`.
+- `completed` / `failed` / `cancelled` / `timed_out`: derived from the durable terminal events (`WorkflowCompleted`/`WorkflowFailed`/`WorkflowCancelled`/`WorkflowExecutionTimedOut`) whose timestamp falls in `[from, to]`, not the mutable execution row — so a DLQ redrive that clears a `FAILED` row's state never erases a historical failure. `cancelled` additionally excludes a `WorkflowCancelled` event whose execution ended up sealed `TERMINATED` by a genuine `terminate` (which reuses the same event type as a real cancel) — but *not* one sealed `TERMINATED` by a later reset/DAG-retry, which always appends its own `WorkflowResetTerminated` marker, so a reforked-for-retry run doesn't lose its historical cancellation either. `TERMINATED` and `CONTINUED_AS_NEW` are not broken out separately.
+- `activity_executions`: count of dispatch attempts (`ActivityStarted` events) in the window — retries reuse the same activity id but each attempt appends a fresh event, so a 3-attempt activity contributes 3.
+- `activity_executions_failed`: count of terminal `ActivityFailed`/`ActivityTimedOut` events in the window that have a matching `ActivityStarted` (non-final retry attempts emit no event, so this counts exhausted-retry-or-timeout only). The start-match requirement excludes external activities, whose `ActivityTimedOut` can be appended with no `ActivityStarted` at all.
+- `activity_compute_seconds`: for each activity whose terminal event falls in the window, the wall-clock span from that activity's most recent (final-attempt) start to its terminal event, summed. Retry backoff wall time is excluded by construction.
+- Local activities and externally-completed activities are excluded from the activity counters — they never emit `ActivityStarted`, so they're not worker compute.
+
+**Window ceiling**: a `from`/`to` window wider than a configurable ceiling (default 90 days, `HarvestApiState::set_usage_window_ceiling`) is rejected with `400`, naming the ceiling, so an operator cannot accidentally trigger a full-table scan across every shard.
+
+**Shard-aware, no rollup**: like `/admin/concurrency`, `/admin/usage` fans out across every shard and merges. Unlike `GET /workflows/count`, it does **not** roll a long tail into an `other` bucket — a chargeback report that silently drops low-volume tenants would be actively wrong. Choose a bounded-cardinality `group_by` key (a tenant id, not an execution id).
+
+CLI:
+```
+harvest usage --from 2026-06-01T00:00:00Z --to 2026-07-01T00:00:00Z --group-by search_attr:tenant_id
+```
+Renders a table by default; pass `--json` for piping.
+
 ### Adding a shard to a deployment that uses per-key concurrency
 
 Follow the standard add-a-shard procedure in `CLAUDE.md`. The new shard starts with no task queue rows, so the cap is independent from day one. If you need to migrate in-flight workflows to the new shard, that is out of scope (cross-shard rebalancing is not supported).

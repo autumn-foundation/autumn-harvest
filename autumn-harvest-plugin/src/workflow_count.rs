@@ -63,15 +63,6 @@ pub const MAX_LIMIT_GROUPS: u32 = 500;
 /// place, alongside `workflow_reachability`'s and `schedule_runs`' reports.
 pub type WorkflowCountReportStatus = FanoutStatus;
 
-/// A shard that could not be queried for this snapshot.
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkflowCountUnavailableShard {
-    /// Shard identifier.
-    pub shard_id: i32,
-    /// Reason the shard could not be queried.
-    pub reason: String,
-}
-
 // serde's `skip_serializing_if` calls this with `&bool` (a reference to the
 // field) — the reference signature is required by serde, not optional.
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -112,7 +103,7 @@ pub struct WorkflowCountResponse {
     pub truncated: bool,
     /// Shards that could not be queried, named with a reason. Never silently
     /// dropped.
-    pub unavailable_shards: Vec<WorkflowCountUnavailableShard>,
+    pub unavailable_shards: Vec<shard_fanout::UnavailableShard>,
 }
 
 /// Parsed, validated query parameters for `GET /workflows/count` (issue #544).
@@ -277,19 +268,7 @@ pub fn build_count_response(
     limit_groups: usize,
     observations: Vec<ShardObservation<WorkflowCountRow>>,
 ) -> WorkflowCountResponse {
-    let inspected = observations.iter().filter(|o| o.error.is_none()).count();
-    let mut unavailable_shards: Vec<WorkflowCountUnavailableShard> = observations
-        .iter()
-        .filter_map(|o| {
-            o.error
-                .as_ref()
-                .map(|reason| WorkflowCountUnavailableShard {
-                    shard_id: o.shard_id,
-                    reason: reason.clone(),
-                })
-        })
-        .collect();
-    unavailable_shards.sort_by_key(|s| s.shard_id);
+    let (inspected, unavailable_shards) = shard_fanout::summarize_shard_errors(&observations);
 
     let mut merged: HashMap<CountKey, i64> = HashMap::new();
     for observation in &observations {

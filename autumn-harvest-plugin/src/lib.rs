@@ -13,6 +13,7 @@ pub mod shard_fanout;
 pub mod shard_health;
 pub mod state;
 pub mod ui;
+pub mod usage;
 pub mod version_gate_retirement;
 pub mod version_usage;
 pub mod workflow_count;

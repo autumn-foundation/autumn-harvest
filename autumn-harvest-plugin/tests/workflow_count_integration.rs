@@ -434,8 +434,8 @@ async fn started_after_and_before_bound_the_window() {
         &app,
         &format!(
             "/workflows/count?started_after={}&started_before={}",
-            after.to_rfc3339(),
-            before.to_rfc3339()
+            after.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            before.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         ),
     )
     .await;

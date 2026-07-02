@@ -3373,6 +3373,59 @@
     },
     {
       "method": "GET",
+      "path": "/admin/usage",
+      "category": "admin",
+      "read_only": true,
+      "description": "Historical per-tenant/per-workflow usage report (issue #596): the historical companion to the point-in-time GET /admin/concurrency endpoint. Aggregates already-durable data (harvest_workflow_executions + harvest_events) over a required [from, to] window, grouped by workflow_name (default) or a search_attr:<key> tenant key, fanned out and summed across every shard. workflow_starts counts by started_at in the window; completed/failed/cancelled/timed_out count by completed_at in the window and matching terminal state; activity_executions counts ActivityStarted events (one per dispatch attempt) in the window; activity_executions_failed counts terminal ActivityFailed/ActivityTimedOut events in the window; activity_compute_seconds sums each activity's final-attempt start-to-terminal wall-clock span for terminal events in the window. Local and externally-completed activities are excluded (no ActivityStarted event). Executions lacking the requested search_attr key are grouped under the literal group \"(unattributed)\" rather than dropped. An unreachable shard is named in unavailable_shards rather than failing the call wholesale.",
+      "params": [
+        {
+          "name": "from",
+          "in": "query",
+          "required": true,
+          "description": "Inclusive lower bound of the aggregation window: RFC 3339 timestamp or relative duration like 24h."
+        },
+        {
+          "name": "to",
+          "in": "query",
+          "required": true,
+          "description": "Inclusive upper bound of the aggregation window: RFC 3339 timestamp or relative duration like 24h."
+        },
+        {
+          "name": "group_by",
+          "in": "query",
+          "required": false,
+          "description": "workflow_name (default) or search_attr:<key> (e.g. search_attr:tenant_id) to bucket by a tenant key carried on executions."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "from",
+          "to",
+          "group_by",
+          "groups",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Missing from/to, malformed timestamp, from after to, window wider than the configurable ceiling (default 90 days, names the ceiling), or an unrecognized group_by dimension."
+        },
+        {
+          "status": 413,
+          "description": "The merged group count exceeds the configurable cap (default 10,000, names the cap and the actual count); narrow the window or choose a lower-cardinality group_by key. A hard failure rather than a silent rollup, since a chargeback report must never drop a low-volume tenant's data."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/admin/debounce",
       "category": "admin",
       "read_only": true,
