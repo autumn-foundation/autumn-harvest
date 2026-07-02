@@ -585,20 +585,26 @@ fn tick_one(
     };
 
     let action = tuner.decide(&observations);
-    // Base the next target on the *desired* target, not the achieved
-    // `current_target` (issue #548 review): if an earlier shrink couldn't
-    // fully land because every slot was occupied at the time, the unmet
-    // portion must not be dropped just because this tick's fresh
-    // observation no longer looks saturated. Building on `desired_target`
-    // means `resize_toward` keeps retrying the same standing intent (a
-    // fresh `Hold` re-requests the same value; a fresh `Shrink` compounds
-    // on top of it) until it is actually reached.
-    let (new_target, decision) = apply_action(
-        slot.runtime.desired_target(),
-        action,
-        slot.runtime.min_slots,
-        slot.runtime.max_slots,
-    );
+    // Base the next target on the *desired* target for Shrink/Hold, but
+    // always on the achieved `current_target` for Grow (issue #548 review,
+    // round 2). An unmet shrink (every slot occupied when it was requested)
+    // must keep being retried by a later Hold/Shrink rather than silently
+    // dropped — that's what `desired_target` is for. But a *Grow* means the
+    // controller has just observed the live semaphore itself saturated and
+    // backlogged (occupancy is computed from `current_target`, i.e.
+    // `live_target`, not `desired_target`); basing that grow on a stale,
+    // lower `desired_target` would compute a target *below* the current
+    // live one, which `resize_toward` would read as a shrink — throttling a
+    // worker the controller just said needs more capacity. Growing from
+    // `current_target` also naturally clears any outstanding unmet shrink,
+    // since `resize_toward` always overwrites `desired_target` with
+    // whatever is passed in.
+    let base = match action {
+        SlotTunerAction::Grow(_) => current_target,
+        SlotTunerAction::Shrink(_) | SlotTunerAction::Hold => slot.runtime.desired_target(),
+    };
+    let (new_target, decision) =
+        apply_action(base, action, slot.runtime.min_slots, slot.runtime.max_slots);
     slot.runtime.resize_toward(new_target);
     decision
 }
@@ -1099,6 +1105,61 @@ mod tests {
         assert_eq!(slot.runtime.live_target(), 6);
 
         drop(held_6);
+    }
+
+    #[tokio::test]
+    async fn tick_one_grow_after_unmet_shrink_rebases_on_live_not_stale_desired() {
+        // Regression test (issue #548 review, round 2): once a shrink is
+        // stuck unmet (desired_target below live_target), a later Grow
+        // decision must expand from the achieved live_target, not resume
+        // from the stale, lower desired_target — otherwise a controller
+        // that just observed saturation-and-backlog would get a target
+        // *below* the current live one, which reads as a further shrink
+        // instead of the requested grow.
+        struct ScriptedTuner {
+            calls: AtomicUsize,
+        }
+        impl SlotTuner for ScriptedTuner {
+            fn decide(&self, _observations: &SlotObservations) -> SlotTunerAction {
+                if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    SlotTunerAction::Shrink(10)
+                } else {
+                    SlotTunerAction::Grow(2)
+                }
+            }
+        }
+
+        let semaphore = Arc::new(Semaphore::new(30));
+        // configured_max=20, band [2, 30]: target=20, 10 permits withheld
+        // internally by the runtime, leaving exactly 20 available.
+        let runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 20, 2, 30);
+        assert_eq!(runtime.live_target(), 20);
+
+        // Simulate every live slot occupied by in-flight work.
+        let held = Arc::clone(&semaphore).try_acquire_many_owned(20).unwrap();
+
+        let tuner = ScriptedTuner {
+            calls: AtomicUsize::new(0),
+        };
+        let mut slot = TunedSlot::new_for_test(runtime, SlotType::Workflow);
+
+        // Tick 1: Shrink(10) requested, but no permit is free — it can't
+        // land. desired_target drops to 10 while live_target stays at 20.
+        let decision1 = tick_one(&mut slot, &tuner, None);
+        assert_eq!(decision1, TunerDecision::Shrink);
+        assert_eq!(slot.runtime.live_target(), 20);
+        assert_eq!(slot.runtime.desired_target(), 10);
+
+        // Tick 2: pressure eased, permit wait is high — the controller asks
+        // to Grow(2). This must expand from live_target (20 -> 22), not
+        // from the stale desired_target (10 -> 12, which would be read as
+        // a further shrink from 20).
+        let decision2 = tick_one(&mut slot, &tuner, None);
+        assert_eq!(decision2, TunerDecision::Grow);
+        assert_eq!(slot.runtime.live_target(), 22);
+        assert_eq!(slot.runtime.desired_target(), 22);
+
+        drop(held);
     }
 
     #[tokio::test]
