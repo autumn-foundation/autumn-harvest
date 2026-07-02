@@ -1020,3 +1020,33 @@ async fn group_count_over_cap_is_413_naming_the_cap() {
         "error should name the group count: {detail}"
     );
 }
+
+#[tokio::test]
+async fn group_count_far_over_cap_is_still_413_via_bounded_shard_query() {
+    // PR #895 review (chatgpt-codex-connector): the 413 cap must bound the
+    // shard query itself (a LIMIT), not just the merged response -- a
+    // single shard with far more distinct groups than the cap must not
+    // materialize them all before the check runs. Seeds well more than
+    // cap+1 groups on one shard and confirms the report still fails loudly
+    // rather than silently succeeding or hanging.
+    let (url, _c) = setup_single_shard().await;
+    let now = Utc::now();
+
+    for i in 0..10 {
+        seed_execution(&url, 0, &format!("wf_{i}"), "RUNNING", now, None, None).await;
+    }
+
+    let app = build_app_with_max_groups(HarvestDbPool::from(build_pool(&url)), 2);
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/admin/usage?from={}&to={}",
+            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let detail = body.get("detail").and_then(Value::as_str).unwrap_or("");
+    assert!(detail.contains('2'), "error should name the cap: {detail}");
+}

@@ -110,7 +110,13 @@ pub const fn default_usage_window_ceiling() -> std::time::Duration {
 /// Unlike `GET /workflows/count`'s top-N + `other` rollup, a chargeback
 /// report must never silently drop a low-volume tenant's data — so
 /// exceeding this cap is a hard error naming the ceiling rather than a
-/// silent rollup.
+/// silent rollup. The cap is enforced at two layers: [`usage_sql`] binds it
+/// (plus one) as a `LIMIT` so a single high-cardinality shard can't
+/// materialize an unbounded result set, and the plugin's
+/// `build_usage_response` checks the merged cross-shard count before
+/// constructing the response — the DB-side `LIMIT` bounds the expensive
+/// part (the query and its memory), the merge-side check produces the
+/// accurate 413.
 #[must_use]
 pub const fn default_usage_max_groups() -> usize {
     10_000
@@ -346,11 +352,18 @@ FROM execution_starts es
 FULL OUTER JOIN terminal_counts tc ON tc.grp = es.grp
 FULL OUTER JOIN activity_metrics am ON am.grp = COALESCE(es.grp, tc.grp)
 ORDER BY 1
+LIMIT $5
 "
     )
 }
 
 /// Load grouped usage rows from a single shard without mutating state.
+///
+/// `row_limit` bounds the number of grouped rows this single shard's query
+/// can return (a `LIMIT` clause in [`usage_sql`]) — callers should pass the
+/// configured group cap plus one, so the plugin can still detect and report
+/// an over-cap condition without ever materializing an unbounded result set
+/// for a single high-cardinality shard.
 ///
 /// # Errors
 ///
@@ -360,6 +373,7 @@ pub async fn load_usage_grouped(
     conn: &mut AsyncPgConnection,
     shard_id: i32,
     query: &UsageQuery,
+    row_limit: i64,
 ) -> HarvestResult<Vec<UsageShardRow>> {
     let attr_key = query.group_by.search_attr_key();
     let rows = diesel::sql_query(usage_sql())
@@ -367,6 +381,7 @@ pub async fn load_usage_grouped(
         .bind::<Nullable<Text>, _>(attr_key)
         .bind::<Timestamptz, _>(query.from)
         .bind::<Timestamptz, _>(query.to)
+        .bind::<BigInt, _>(row_limit)
         .load::<UsageSqlRow>(conn)
         .await
         .map_err(database_error)?;
@@ -544,6 +559,19 @@ mod tests {
             sql.contains("s.last_started_at IS NOT NULL"),
             "activity_executions_failed must require a matching ActivityStarted, \
              excluding external activities whose ActivityTimedOut has none"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn usage_sql_has_a_limit_clause_bound_to_a_parameter() {
+        let sql = usage_sql();
+        assert!(
+            sql.trim_end().ends_with("LIMIT $5"),
+            "the shard query must cap its own row count via a bound LIMIT \
+             parameter, not rely solely on the plugin's post-merge cap \
+             check, so a single high-cardinality shard can't materialize an \
+             unbounded result set before the cap is ever consulted"
         );
     }
 }

@@ -259,10 +259,17 @@ pub fn build_usage_response(
 /// Returns a [`ShardObservation`] rather than propagating errors so a single
 /// unreachable shard never fails the whole fan-out — the caller folds it into
 /// `unavailable_shards` and a `partial`/`unavailable` status instead.
+///
+/// `row_limit` bounds the shard query's `LIMIT` (issue #596 PR review: the
+/// group cap must bound the DB round-trip and memory, not just the response
+/// — passing this straight through to
+/// [`autumn_harvest::usage::load_usage_grouped`] instead of letting it fetch
+/// every row before `build_usage_response` checks the merged count).
 async fn observe_shard(
     shard_id: i32,
     pool: Option<DbPool>,
     query: &UsageQuery,
+    row_limit: i64,
 ) -> ShardObservation<UsageShardRow> {
     let Some(pool) = pool else {
         return ShardObservation {
@@ -280,7 +287,7 @@ async fn observe_shard(
             )),
         };
     };
-    match autumn_harvest::usage::load_usage_grouped(&mut conn, shard_id, query).await {
+    match autumn_harvest::usage::load_usage_grouped(&mut conn, shard_id, query, row_limit).await {
         Ok(rows) => ShardObservation {
             shard_id,
             rows,
@@ -318,6 +325,12 @@ pub async fn build_usage_report(
     let pools = shard_fanout::pools_by_shard(api_state);
     let expected = shard_fanout::expected_shards(api_state, &pools);
     let max_groups = api_state.usage_max_groups();
+    // Bound each shard's own result set at the cap, not just the merged
+    // response: a `+1` (not the cap itself) so a shard sitting exactly at
+    // the cap still cleanly merges under it, while any shard that would
+    // exceed the cap on its own is truncated rather than materializing an
+    // unbounded row set (issue #596 PR review).
+    let row_limit = i64::try_from(max_groups.saturating_add(1)).unwrap_or(i64::MAX);
 
     let query = UsageQuery {
         group_by: params.group_by.clone(),
@@ -329,7 +342,7 @@ pub async fn build_usage_report(
         .iter()
         .map(|shard_id| {
             let pool = pools.get(shard_id).cloned();
-            observe_shard(*shard_id, pool, &query)
+            observe_shard(*shard_id, pool, &query, row_limit)
         })
         .collect::<Vec<_>>();
     let observations = join_all(observations).await;
