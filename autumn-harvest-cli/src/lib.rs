@@ -403,6 +403,27 @@ enum Commands {
         #[command(subcommand)]
         command: GateCommand,
     },
+    /// Report per-tenant/per-workflow usage for chargeback and capacity
+    /// planning (issue #596): the historical companion to `harvest
+    /// concurrency status`. Renders a table by default; pass --json for
+    /// piping.
+    Usage {
+        /// Inclusive lower bound of the aggregation window: RFC 3339 or a
+        /// relative duration like 24h.
+        #[arg(long)]
+        from: String,
+        /// Inclusive upper bound of the aggregation window: RFC 3339 or a
+        /// relative duration like 24h.
+        #[arg(long)]
+        to: String,
+        /// Grouping dimension: workflow_name (default) or
+        /// search_attr:<key> (e.g. search_attr:tenant_id).
+        #[arg(long = "group-by")]
+        group_by: Option<String>,
+        /// Emit raw JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Report recorded workflow version-gate usage.
     VersionUsage {
         /// Filter by registered workflow name.
@@ -1484,6 +1505,12 @@ impl Cli {
             Commands::Audit { command } => Ok(audit_request(command)),
             Commands::Gate { command } => gate_request(command),
             Commands::Worker { command } => Ok(worker_request(command)),
+            Commands::Usage {
+                from,
+                to,
+                group_by,
+                json: _,
+            } => Ok(usage_request(from, to, group_by.as_deref())),
             Commands::VersionUsage {
                 workflow_name,
                 change_id,
@@ -1945,18 +1972,108 @@ fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
     if rate_limit_wants_table(cli) {
         return Ok(format_rate_limit_table(value));
     }
+    if usage_wants_table(cli) {
+        return Ok(format_usage_table(value));
+    }
 
     let output = if workflow_children_wants_raw_json(cli)
         || handoff_wants_raw_json(cli)
         || dlq_aggregate_wants_raw_json(cli)
         || canary_wants_raw_json(cli)
         || workflow_reachability_wants_raw_json(cli)
+        || usage_wants_raw_json(cli)
     {
         OutputFormat::Json
     } else {
         cli.output
     };
     format_output(value, output)
+}
+
+fn usage_wants_table(cli: &Cli) -> bool {
+    matches!(&cli.command, Commands::Usage { json: false, .. })
+        && cli.output == OutputFormat::PrettyJson
+}
+
+const fn usage_wants_raw_json(cli: &Cli) -> bool {
+    matches!(&cli.command, Commands::Usage { json: true, .. })
+}
+
+/// Render the `GET /admin/usage` response as a human-readable table
+/// (issue #596). One row per group, plus a header line naming the window,
+/// grouping dimension, and status.
+fn format_usage_table(value: &Value) -> String {
+    let status = cell_str(value.get("status"));
+    let from = cell_str(value.get("from"));
+    let to = cell_str(value.get("to"));
+    let group_by = cell_str(value.get("group_by"));
+    let mut summary = format!("status: {status}  window: {from} .. {to}  group_by: {group_by}");
+
+    if let Some(unavailable) = value.get("unavailable_shards").and_then(Value::as_array)
+        && !unavailable.is_empty()
+    {
+        let shard_ids: Vec<String> = unavailable
+            .iter()
+            .map(|s| cell_number(s.get("shard_id")))
+            .collect();
+        summary.push_str(&format!("  (unavailable shards: {})", shard_ids.join(",")));
+    }
+
+    let Some(groups) = value.get("groups").and_then(Value::as_array) else {
+        return format!("{summary}\nNo usage groups found.");
+    };
+    if groups.is_empty() {
+        return format!("{summary}\nNo usage groups found.");
+    }
+
+    let header: Vec<String> = [
+        "GROUP",
+        "STARTS",
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "TIMED_OUT",
+        "ACT_EXEC",
+        "ACT_FAILED",
+        "COMPUTE_S",
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+
+    let mut rows = vec![header];
+    for group in groups {
+        rows.push(vec![
+            cell_str(group.get("group")),
+            cell_number(group.get("workflow_starts")),
+            cell_number(group.get("completed")),
+            cell_number(group.get("failed")),
+            cell_number(group.get("cancelled")),
+            cell_number(group.get("timed_out")),
+            cell_number(group.get("activity_executions")),
+            cell_number(group.get("activity_executions_failed")),
+            cell_f64(group.get("activity_compute_seconds")),
+        ]);
+    }
+
+    let widths = (0..rows[0].len())
+        .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+        .collect::<Vec<_>>();
+    let table = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(col, cell)| format!("{cell:<width$}", width = widths[col]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("{summary}\n\n{table}")
 }
 
 fn dlq_aggregate_wants_table(cli: &Cli) -> bool {
@@ -3116,6 +3233,14 @@ fn cell_number(value: Option<&Value>) -> String {
         .map_or_else(String::new, |number| number.to_string())
 }
 
+/// Render a JSON number cell with two decimal places (used for
+/// `activity_compute_seconds`, which is a `f64`).
+fn cell_f64(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_f64)
+        .map_or_else(String::new, |number| format!("{number:.2}"))
+}
+
 fn cell_optional_number(value: Option<&Value>) -> String {
     value
         .and_then(Value::as_i64)
@@ -3269,6 +3394,20 @@ fn canary_request(
             "queue_name": queue,
         })),
     )
+}
+
+fn usage_request(from: &str, to: &str, group_by: Option<&str>) -> ApiRequest {
+    let mut params: Vec<(&'static str, String)> =
+        vec![("from", from.to_string()), ("to", to.to_string())];
+    if let Some(value) = group_by {
+        params.push(("group_by", value.to_string()));
+    }
+    let encoded = params
+        .iter()
+        .map(|(key, value)| format!("{key}={}", query_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    ApiRequest::get(format!("/admin/usage?{encoded}"))
 }
 
 fn version_usage_request(
@@ -6096,5 +6235,144 @@ mod retry_activity_cli_tests {
             req.body.is_none(),
             "retry-activity must send no request body"
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn usage_maps_to_get_admin_usage_with_from_and_to() {
+        let req = request(&[
+            "usage",
+            "--from",
+            "2026-01-01T00:00:00Z",
+            "--to",
+            "2026-02-01T00:00:00Z",
+        ]);
+        assert_eq!(req.method, ApiMethod::Get);
+        assert!(req.path.starts_with("/admin/usage?"), "path: {}", req.path);
+        assert!(
+            req.path.contains("from=2026-01-01T00%3A00%3A00Z")
+                || req.path.contains("from=2026-01-01T00:00:00Z"),
+            "path: {}",
+            req.path
+        );
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn usage_threads_group_by_into_query() {
+        let req = request(&[
+            "usage",
+            "--from",
+            "24h",
+            "--to",
+            "1h",
+            "--group-by",
+            "search_attr:tenant_id",
+        ]);
+        assert!(
+            req.path.contains("group_by=search_attr%3Atenant_id")
+                || req.path.contains("group_by=search_attr:tenant_id"),
+            "path: {}",
+            req.path
+        );
+        assert!(req.path.contains("from=24h"), "path: {}", req.path);
+        assert!(req.path.contains("to=1h"), "path: {}", req.path);
+    }
+
+    #[test]
+    fn usage_omits_group_by_when_not_supplied() {
+        let req = request(&["usage", "--from", "24h", "--to", "1h"]);
+        assert!(!req.path.contains("group_by"), "path: {}", req.path);
+    }
+
+    #[test]
+    fn usage_requires_from_and_to() {
+        assert!(Cli::try_parse_from(["harvest", "usage"]).is_err());
+        assert!(Cli::try_parse_from(["harvest", "usage", "--from", "24h"]).is_err());
+        assert!(Cli::try_parse_from(["harvest", "usage", "--to", "1h"]).is_err());
+    }
+
+    #[test]
+    fn usage_wants_table_is_default_and_json_flag_switches_to_raw_json() {
+        let table_cli = parse(&["usage", "--from", "24h", "--to", "1h"]);
+        assert!(usage_wants_table(&table_cli));
+        assert!(!usage_wants_raw_json(&table_cli));
+
+        let json_cli = parse(&["usage", "--from", "24h", "--to", "1h", "--json"]);
+        assert!(!usage_wants_table(&json_cli));
+        assert!(usage_wants_raw_json(&json_cli));
+    }
+
+    #[test]
+    fn format_usage_table_renders_header_and_rows() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "workflow_name",
+            "groups": [
+                {
+                    "group": "onboarding",
+                    "workflow_starts": 10,
+                    "completed": 8,
+                    "failed": 1,
+                    "cancelled": 0,
+                    "timed_out": 1,
+                    "activity_executions": 25,
+                    "activity_executions_failed": 2,
+                    "activity_compute_seconds": 123.456
+                }
+            ],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        assert!(rendered.contains("status: complete"));
+        assert!(rendered.contains("2026-01-01T00:00:00Z"));
+        assert!(rendered.contains("group_by: workflow_name"));
+        assert!(rendered.contains("onboarding"));
+        assert!(rendered.contains("123.46"));
+    }
+
+    #[test]
+    fn format_usage_table_notes_unavailable_shards() {
+        let value = serde_json::json!({
+            "status": "partial",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "workflow_name",
+            "groups": [],
+            "unavailable_shards": [{"shard_id": 1, "reason": "connection refused"}]
+        });
+        let rendered = format_usage_table(&value);
+        assert!(rendered.contains("unavailable shards: 1"), "{rendered}");
+    }
+
+    #[test]
+    fn format_usage_table_handles_empty_groups() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "workflow_name",
+            "groups": [],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        assert!(rendered.contains("No usage groups found."));
     }
 }

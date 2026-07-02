@@ -269,6 +269,9 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     ("GET /admin/retention", RouteClass::ReadOnly),
     ("GET /admin/concurrency", RouteClass::ReadOnly),
+    // Historical per-tenant/per-workflow usage report (issue #596): read-only
+    // aggregation over already-durable data, companion to /admin/concurrency.
+    ("GET /admin/usage", RouteClass::ReadOnly),
     ("GET /admin/debounce", RouteClass::ReadOnly),
     // Workflow-type handler reachability (issue #520): read-only, no state mutation.
     (
@@ -463,6 +466,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/version-gates/retirement-check",
     "GET /admin/retention",
     "GET /admin/concurrency",
+    "GET /admin/usage",
     "GET /admin/debounce",
     "GET /admin/history/exports",
     "GET /admin/external-handoffs",
@@ -553,6 +557,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /admin/retention", None),
     ("POST /admin/retention/run-now", Some(OP_RETENTION_RUN_NOW)),
     ("GET /admin/concurrency", None),
+    ("GET /admin/usage", None),
     ("GET /admin/debounce", None),
     // Workflow-type handler reachability (issue #520): read-only.
     ("GET /admin/workflow-types/reachability", None),
@@ -929,6 +934,36 @@ mod tests {
                 .any(|(r, op)| *r == "GET /workflows/count" && op.is_none()),
             "GET /workflows/count must appear in ALL_MUTATION_ROUTES with no audit \
              operation (issue #544)"
+        );
+    }
+
+    #[test]
+    fn usage_report_route_is_classified_read_only() {
+        // The historical per-tenant usage report (issue #596) is a read-only
+        // fan-out aggregation, no different from workflow_count / debounce /
+        // concurrency. This test — not just the general exhaustiveness guards
+        // below, which only cross-check CLASSIFIED_ROUTES and
+        // ALL_MUTATION_ROUTES against each other rather than against the live
+        // router — is what actually catches a new route shipping with no
+        // classification at all.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /admin/usage" && *c == RouteClass::ReadOnly),
+            "GET /admin/usage must be classified RouteClass::ReadOnly in \
+             CLASSIFIED_ROUTES (issue #596)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "GET /admin/usage" && op.is_none()),
+            "GET /admin/usage must appear in ALL_MUTATION_ROUTES with no audit \
+             operation (issue #596)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&"GET /admin/usage"),
+            "GET /admin/usage must appear in EXCLUDED_ROUTES (read-only, no audit trail \
+             entry expected, issue #596)"
         );
     }
 
