@@ -2468,4 +2468,49 @@ mod tests {
         assert_eq!(back.queue_name, "billing");
         assert_eq!(back.attempts, 5);
     }
+
+    // ── Enums Parsing & Serialization ──────────────────────────────────────────
+
+    #[test]
+    fn time_bucket_granularity_parsing() {
+        let now = Utc::now();
+        let hour_params = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "time_bucket"), ("time_bucket", "hour")]),
+            now,
+        )
+        .unwrap();
+        assert_eq!(hour_params.time_bucket, TimeBucketGranularity::Hour);
+
+        let day_params = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "time_bucket"), ("time_bucket", "day")]),
+            now,
+        )
+        .unwrap();
+        assert_eq!(day_params.time_bucket, TimeBucketGranularity::Day);
+
+        let err = DlqAggregateParams::from_query_pairs(
+            &pairs(&[("group_by", "time_bucket"), ("time_bucket", "minute")]),
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid time_bucket"));
+    }
+
+    #[test]
+    fn dlq_group_dimension_wire_roundtrips() {
+        for dim in [
+            DlqGroupDimension::WorkflowName,
+            DlqGroupDimension::ActivityName,
+            DlqGroupDimension::QueueName,
+            DlqGroupDimension::TaskType,
+            DlqGroupDimension::TimeBucket,
+            DlqGroupDimension::FailureSignature,
+        ] {
+            let wire = dim.as_wire();
+            let parsed = DlqGroupDimension::from_wire(wire).unwrap();
+            assert_eq!(parsed, dim);
+        }
+
+        assert_eq!(DlqGroupDimension::from_wire("unknown_dim"), None);
+    }
 }

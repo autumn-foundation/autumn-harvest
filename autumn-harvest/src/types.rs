@@ -1188,6 +1188,21 @@ mod tests {
         let ext_id_str = ext_uuid.to_string();
         let parsed_ext_id: ExternalActivityToken = ext_id_str.parse().unwrap();
         assert_eq!(parsed_ext_id.as_uuid(), ext_uuid);
+
+        let update_uuid = uuid::Uuid::new_v4();
+        let update_id_str = update_uuid.to_string();
+        let parsed_update_id: UpdateId = update_id_str.parse().unwrap();
+        assert_eq!(parsed_update_id.as_uuid(), update_uuid);
+
+        let ext_signal_uuid = uuid::Uuid::new_v4();
+        let ext_signal_str = ext_signal_uuid.to_string();
+        let parsed_ext_signal: ExternalSignalId = ext_signal_str.parse().unwrap();
+        assert_eq!(parsed_ext_signal.as_uuid(), ext_signal_uuid);
+
+        let ext_cancel_uuid = uuid::Uuid::new_v4();
+        let ext_cancel_str = ext_cancel_uuid.to_string();
+        let parsed_ext_cancel: ExternalCancelId = ext_cancel_str.parse().unwrap();
+        assert_eq!(parsed_ext_cancel.as_uuid(), ext_cancel_uuid);
     }
 
     #[test]
@@ -1196,6 +1211,9 @@ mod tests {
         assert!(invalid_uuid.parse::<ExecutionId>().is_err());
         assert!(invalid_uuid.parse::<ActivityExecId>().is_err());
         assert!(invalid_uuid.parse::<ExternalActivityToken>().is_err());
+        assert!(invalid_uuid.parse::<UpdateId>().is_err());
+        assert!(invalid_uuid.parse::<ExternalSignalId>().is_err());
+        assert!(invalid_uuid.parse::<ExternalCancelId>().is_err());
     }
 
     #[test]
