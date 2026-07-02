@@ -3769,6 +3769,304 @@ pub async fn non_terminal_counts_by_workflow_name(
         .collect())
 }
 
+// ---------------------------------------------------------------------------
+// Grouped workflow-count snapshot (issue #544)
+// ---------------------------------------------------------------------------
+//
+// Answers "how many RUNNING/FAILED/... per workflow type, right now, across
+// every shard?" in one request instead of paginating `GET /workflows` or
+// hand-querying every shard database. The count is computed with a real SQL
+// `GROUP BY … COUNT(*)` so the response stays cheap even at millions of live
+// executions — never by loading per-execution rows into the app layer.
+
+/// Dimension to group `GET /workflows/count` results by (issue #544).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkflowCountDimension {
+    /// Group by `state`.
+    State,
+    /// Group by `workflow_name`.
+    WorkflowName,
+}
+
+impl WorkflowCountDimension {
+    /// Wire name used in the `group_by` query parameter and response keys.
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::WorkflowName => "workflow_name",
+        }
+    }
+
+    /// Parse a dimension from its wire name, or `None` if unknown.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "state" => Some(Self::State),
+            "workflow_name" => Some(Self::WorkflowName),
+            _ => None,
+        }
+    }
+}
+
+/// Filters + grouping dimensions for the grouped workflow-count snapshot (issue #544).
+///
+/// Shard-local: the plugin layer fans this out across `iter_shards()` and
+/// sums per-group counts across shards.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowCountQuery {
+    /// Ordered, de-duplicated grouping dimensions. Empty means "no grouping"
+    /// (a single total row).
+    pub group_by: Vec<WorkflowCountDimension>,
+    /// Filter: exact workflow name.
+    pub workflow_name: Option<String>,
+    /// Filter: restrict to these states (empty = all states).
+    pub states: Vec<String>,
+    /// Filter: inclusive lower bound on `started_at`.
+    pub started_after: Option<chrono::DateTime<Utc>>,
+    /// Filter: inclusive upper bound on `started_at` (mirrors the `/workflows`
+    /// list endpoint's `started_before`, which is also inclusive).
+    pub started_before: Option<chrono::DateTime<Utc>>,
+}
+
+/// One grouped count row, either raw from a single shard or already summed across shards (issue #544).
+///
+/// `state`/`workflow_name` are `None` exactly when that dimension was not
+/// part of the query's `group_by`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowCountRow {
+    /// Grouped state value, or `None` when not grouping by state.
+    pub state: Option<String>,
+    /// Grouped workflow name value, or `None` when not grouping by workflow name.
+    pub workflow_name: Option<String>,
+    /// Number of executions in this group on the queried shard.
+    pub count: i64,
+}
+
+/// `WHERE` clause shared by all four `COUNT_*_SQL` shapes below (issue #544).
+///
+/// Factored into one constant so a future filter addition (e.g. `queue_name`)
+/// is edited in exactly one place instead of four SQL strings kept in lockstep
+/// by hand — a mismatch between them would silently produce a filter that
+/// works for some `group_by` combinations but not others, with no compiler
+/// check to catch the omission.
+const COUNT_WHERE_CLAUSE: &str = r"
+WHERE shard_id = $1::INT4
+  AND ($2::TEXT IS NULL OR workflow_name = $2::TEXT)
+  AND ($3::TEXT[] IS NULL OR state = ANY($3::TEXT[]))
+  AND ($4::TIMESTAMPTZ IS NULL OR started_at >= $4::TIMESTAMPTZ)
+  AND ($5::TIMESTAMPTZ IS NULL OR started_at <= $5::TIMESTAMPTZ)
+";
+
+fn count_total_sql() -> String {
+    format!(
+        "SELECT COUNT(*)::BIGINT AS count\nFROM harvest_workflow_executions\n{COUNT_WHERE_CLAUSE}"
+    )
+}
+
+fn count_by_state_sql() -> String {
+    format!(
+        "SELECT state::TEXT AS state, COUNT(*)::BIGINT AS count\n\
+         FROM harvest_workflow_executions\n\
+         {COUNT_WHERE_CLAUSE}GROUP BY state"
+    )
+}
+
+fn count_by_workflow_name_sql() -> String {
+    format!(
+        "SELECT workflow_name::TEXT AS workflow_name, COUNT(*)::BIGINT AS count\n\
+         FROM harvest_workflow_executions\n\
+         {COUNT_WHERE_CLAUSE}GROUP BY workflow_name"
+    )
+}
+
+fn count_by_state_and_workflow_name_sql() -> String {
+    format!(
+        "SELECT state::TEXT AS state, workflow_name::TEXT AS workflow_name, COUNT(*)::BIGINT AS count\n\
+         FROM harvest_workflow_executions\n\
+         {COUNT_WHERE_CLAUSE}GROUP BY state, workflow_name"
+    )
+}
+
+#[derive(Debug, diesel::QueryableByName)]
+struct CountTotalSqlRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+#[derive(Debug, diesel::QueryableByName)]
+struct CountByStateSqlRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+#[derive(Debug, diesel::QueryableByName)]
+struct CountByWorkflowNameSqlRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_name: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+#[derive(Debug, diesel::QueryableByName)]
+struct CountByStateAndWorkflowNameSqlRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    workflow_name: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+/// Count workflow executions grouped by the requested dimensions on one shard
+/// (issue #544).
+///
+/// Uses a real SQL `GROUP BY … COUNT(*)` (one of four static queries, selected
+/// by which dimensions are requested) so the response stays cheap at any
+/// execution volume — this function never loads per-execution rows into the
+/// app layer. `shard_id` scopes the query to a single logical shard so two
+/// logical shards sharing one physical database are never double-counted
+/// (mirrors [`non_terminal_counts_by_workflow_name`] and
+/// [`schedule_run_state_summary`]).
+///
+/// This is a read-only, eventually-consistent point-in-time snapshot: it
+/// reflects committed `harvest_workflow_executions.state` at query time and
+/// carries no replay or ordering guarantee under concurrent writes.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the query fails.
+pub async fn count_workflow_executions_grouped(
+    conn: &mut AsyncPgConnection,
+    shard_id: i32,
+    query: &WorkflowCountQuery,
+) -> HarvestResult<Vec<WorkflowCountRow>> {
+    use diesel::sql_types::{Array, Integer, Nullable, Text, Timestamptz};
+
+    let workflow_name = query.workflow_name.clone();
+    let states: Option<Vec<String>> = if query.states.is_empty() {
+        None
+    } else {
+        Some(query.states.clone())
+    };
+    let started_after = query.started_after;
+    let started_before = query.started_before;
+
+    let group_state = query.group_by.contains(&WorkflowCountDimension::State);
+    let group_workflow_name = query
+        .group_by
+        .contains(&WorkflowCountDimension::WorkflowName);
+
+    match (group_state, group_workflow_name) {
+        (true, true) => {
+            let rows = diesel::sql_query(count_by_state_and_workflow_name_sql())
+                .bind::<Integer, _>(shard_id)
+                .bind::<Nullable<Text>, _>(workflow_name)
+                .bind::<Nullable<Array<Text>>, _>(states)
+                .bind::<Nullable<Timestamptz>, _>(started_after)
+                .bind::<Nullable<Timestamptz>, _>(started_before)
+                .load::<CountByStateAndWorkflowNameSqlRow>(conn)
+                .await
+                .map_err(database_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|r| WorkflowCountRow {
+                    state: Some(r.state),
+                    workflow_name: Some(r.workflow_name),
+                    count: r.count,
+                })
+                .collect())
+        }
+        (true, false) => {
+            let rows = diesel::sql_query(count_by_state_sql())
+                .bind::<Integer, _>(shard_id)
+                .bind::<Nullable<Text>, _>(workflow_name)
+                .bind::<Nullable<Array<Text>>, _>(states)
+                .bind::<Nullable<Timestamptz>, _>(started_after)
+                .bind::<Nullable<Timestamptz>, _>(started_before)
+                .load::<CountByStateSqlRow>(conn)
+                .await
+                .map_err(database_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|r| WorkflowCountRow {
+                    state: Some(r.state),
+                    workflow_name: None,
+                    count: r.count,
+                })
+                .collect())
+        }
+        (false, true) => {
+            let rows = diesel::sql_query(count_by_workflow_name_sql())
+                .bind::<Integer, _>(shard_id)
+                .bind::<Nullable<Text>, _>(workflow_name)
+                .bind::<Nullable<Array<Text>>, _>(states)
+                .bind::<Nullable<Timestamptz>, _>(started_after)
+                .bind::<Nullable<Timestamptz>, _>(started_before)
+                .load::<CountByWorkflowNameSqlRow>(conn)
+                .await
+                .map_err(database_error)?;
+            Ok(rows
+                .into_iter()
+                .map(|r| WorkflowCountRow {
+                    state: None,
+                    workflow_name: Some(r.workflow_name),
+                    count: r.count,
+                })
+                .collect())
+        }
+        (false, false) => {
+            let row = diesel::sql_query(count_total_sql())
+                .bind::<Integer, _>(shard_id)
+                .bind::<Nullable<Text>, _>(workflow_name)
+                .bind::<Nullable<Array<Text>>, _>(states)
+                .bind::<Nullable<Timestamptz>, _>(started_after)
+                .bind::<Nullable<Timestamptz>, _>(started_before)
+                .get_result::<CountTotalSqlRow>(conn)
+                .await
+                .map_err(database_error)?;
+            Ok(vec![WorkflowCountRow {
+                state: None,
+                workflow_name: None,
+                count: row.count,
+            }])
+        }
+    }
+}
+
+#[cfg(test)]
+mod workflow_count_tests {
+    use super::WorkflowCountDimension;
+
+    #[test]
+    fn dimension_wire_round_trips() {
+        for dim in [
+            WorkflowCountDimension::State,
+            WorkflowCountDimension::WorkflowName,
+        ] {
+            assert_eq!(WorkflowCountDimension::from_wire(dim.as_wire()), Some(dim));
+        }
+    }
+
+    #[test]
+    fn dimension_from_wire_rejects_unknown() {
+        assert_eq!(WorkflowCountDimension::from_wire("queue_name"), None);
+        assert_eq!(WorkflowCountDimension::from_wire(""), None);
+    }
+
+    #[test]
+    fn dimension_as_wire_matches_query_param_vocabulary() {
+        // AC2: group_by accepts 'state', 'workflow_name', or 'state,workflow_name'.
+        assert_eq!(WorkflowCountDimension::State.as_wire(), "state");
+        assert_eq!(
+            WorkflowCountDimension::WorkflowName.as_wire(),
+            "workflow_name"
+        );
+    }
+}
+
 /// Load a workflow execution row by execution ID without locking.
 pub async fn load_execution(
     conn: &mut AsyncPgConnection,

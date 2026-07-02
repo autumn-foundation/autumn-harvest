@@ -122,6 +122,7 @@ use crate::shard_health::{ShardHealthReport, ShardReadiness, build_shard_health_
 use crate::state::HarvestDbPool;
 use crate::version_gate_retirement::{RetirementCheckQuery, build_retirement_check_report};
 use crate::version_usage::{VersionUsageQuery, build_version_usage_report};
+use crate::workflow_count::{self, WorkflowCountParams, WorkflowCountResponse};
 use crate::workflow_reachability::{WorkflowReachabilityQuery, build_workflow_reachability_report};
 
 #[derive(Clone)]
@@ -2509,6 +2510,9 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/workflows/registered/{name}/schema",
             get(get_registered_workflow_schema),
         )
+        // issue #544: static /workflows/count must be registered before any
+        // /workflows/{param} routes so axum does not capture "count" as a path param.
+        .route("/workflows/count", get(count_workflows))
         .route(
             "/workflows/{id}/history/export",
             get(export_workflow_history),
@@ -2891,6 +2895,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
     &[
         // ── workflows ────────────────────────────────────────────────────────
         ("GET", "/workflows"),
+        ("GET", "/workflows/count"),
         ("GET", "/workflows/registered"),
         ("GET", "/workflows/registered/{name}/schema"),
         ("GET", "/workflows/{id}"),
@@ -3339,6 +3344,18 @@ pub const fn management_api_response_fields()
     &[
         // ── workflows ────────────────────────────────────────────────────────
         ("GET", "/workflows", None), // Vec<WorkflowExecution>
+        (
+            "GET",
+            "/workflows/count",
+            Some(&[
+                "status",
+                "as_of",
+                "groups",
+                "total",
+                "truncated",
+                "unavailable_shards",
+            ]),
+        ),
         (
             "GET",
             "/workflows/{id}",
@@ -4497,6 +4514,28 @@ async fn list_workflows(
         // Legacy bare-array response for callers using only limit/state/search_attr.
         Ok(Json(rows).into_response())
     }
+}
+
+/// `GET /workflows/count` — grouped execution-count fleet snapshot (issue #544).
+///
+/// Groups `harvest_workflow_executions` rows by `state` and/or `workflow_name`
+/// (default: `state`) with a real per-shard SQL `GROUP BY … COUNT(*)`, summed
+/// across shards in-process. Optional filters (`workflow_name`, `state`,
+/// `started_after`, `started_before`) mirror `GET /workflows` where cheap.
+///
+/// This is an eventually-consistent point-in-time snapshot: it reflects
+/// committed `harvest_workflow_executions.state` at query time and carries no
+/// replay or ordering guarantee under concurrent writes. An unreachable shard
+/// is named in `unavailable_shards` rather than failing the call wholesale.
+async fn count_workflows(
+    Extension(api_state): Extension<HarvestApiState>,
+    Query(pairs): Query<Vec<(String, String)>>,
+) -> Result<Json<WorkflowCountResponse>, AutumnError> {
+    let params = WorkflowCountParams::from_query_pairs(&pairs, KNOWN_WORKFLOW_STATES)
+        .map_err(AutumnError::bad_request_msg)?;
+    Ok(Json(
+        workflow_count::build_workflow_count_report(&api_state, params).await,
+    ))
 }
 
 /// `GET /workflows/registered` — list all registered workflow types with

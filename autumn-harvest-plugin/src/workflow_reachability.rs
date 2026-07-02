@@ -46,7 +46,7 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{HarvestApiState, map_error};
-use crate::shard_fanout::{self, ShardObservation};
+use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
 
 /// Query string accepted by `GET /admin/workflow-types/reachability`.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -73,17 +73,12 @@ pub enum ReachabilityVerdict {
 }
 
 /// Overall cross-shard completeness of the report.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReachabilityReportStatus {
-    /// Every expected shard was inspected — verdicts are authoritative.
-    Complete,
-    /// At least one shard was inspected and at least one was unavailable —
-    /// `safe_to_remove` verdicts are provisional.
-    Partial,
-    /// No shard could be inspected — no verdict is authoritative.
-    Unavailable,
-}
+///
+/// A type alias onto the shared [`FanoutStatus`] (rather than its own enum)
+/// so the complete/partial/unavailable derivation rule lives in exactly one
+/// place, alongside `schedule_runs`' and `workflow_count`'s reports.
+/// `safe_to_remove` verdicts are authoritative only when this is `complete`.
+pub type ReachabilityReportStatus = FanoutStatus;
 
 /// Per-shard inspection outcome.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -220,21 +215,16 @@ pub async fn build_workflow_reachability_report(
         .chain(runtime.registered_dag_names().iter().cloned())
         .collect();
 
-    // Build the full expected shard set from both the storage pool AND the
-    // router's readable_shards / default_shard. A shard the router knows about
-    // but for which this process has no pool (e.g. during a mixed-rollout or
+    // The expected shard set is both the storage pool AND the router's
+    // readable_shards/default_shard: a shard the router knows about but for
+    // which this process has no pool (e.g. during a mixed-rollout or
     // shard-add before the pool is wired up) must appear as "unavailable" in
     // the report rather than being silently dropped — the report status then
     // becomes "partial" and the CLI fails closed (exit 2), preventing a false
-    // "safe_to_remove" verdict from a shard that was never inspected.
+    // "safe_to_remove" verdict from a shard that was never inspected. See
+    // [`shard_fanout::expected_shards`] for the shared derivation.
     let pools = shard_fanout::pools_by_shard(api_state);
-    let mut expected_shards: BTreeSet<i32> = pools.keys().copied().collect();
-    let router = runtime.router();
-    expected_shards.extend(router.readable_shards().iter().map(|s| s.as_i32()));
-    expected_shards.insert(router.default_shard().as_i32());
-    if expected_shards.is_empty() {
-        expected_shards.insert(0);
-    }
+    let expected_shards = shard_fanout::expected_shards(api_state, &pools);
 
     let filter = query.workflow_type.clone();
 
@@ -378,7 +368,7 @@ fn build_report_from_observations(
     shards.sort_by_key(|shard| shard.shard_id);
 
     WorkflowReachabilityReport {
-        status: report_status(inspected_shards == 0, unavailable_shards > 0),
+        status: FanoutStatus::from_counts(inspected_shards, unavailable_shards),
         observed_at,
         filter,
         items,
@@ -393,16 +383,6 @@ const fn compute_verdict(non_terminal_count: i64, registered: bool) -> Reachabil
         ReachabilityVerdict::InUse
     } else {
         ReachabilityVerdict::Orphaned
-    }
-}
-
-const fn report_status(no_inspected: bool, has_unavailable: bool) -> ReachabilityReportStatus {
-    if no_inspected {
-        ReachabilityReportStatus::Unavailable
-    } else if has_unavailable {
-        ReachabilityReportStatus::Partial
-    } else {
-        ReachabilityReportStatus::Complete
     }
 }
 
