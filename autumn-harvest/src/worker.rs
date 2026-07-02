@@ -8461,8 +8461,15 @@ impl Worker {
 
         // Monitoring tasks use the default pool for non-shard-specific monitors;
         // the stranded-work sampler (added in spawn_monitoring_tasks) uses the
-        // full ShardedDbPool so it observes every shard.
-        let monitors = self.spawn_monitoring_tasks(default_pool);
+        // full ShardedDbPool so it observes every shard. The slot tuner's
+        // pool-pressure signal is likewise given every shard's own pool
+        // (issue #548 review) so pressure on a non-default shard — the pools
+        // tasks are actually dispatched against in this multi-shard path —
+        // can still trigger a shrink, instead of only ever observing
+        // `default_pool`.
+        let shard_pools_for_pressure: Vec<DbPool> =
+            shard_targets.iter().map(|(_, p)| p.clone()).collect();
+        let monitors = self.spawn_monitoring_tasks(default_pool, &shard_pools_for_pressure);
         let heartbeat_cancel = CancellationToken::new();
 
         // Spawn one heartbeat task per shard pool so every shard's harvest_workers
@@ -8721,7 +8728,7 @@ impl Worker {
         // Auto-register rate limit buckets for the activities configured on this worker.
         self.register_rate_limit_buckets(pool).await;
 
-        let monitors = self.spawn_monitoring_tasks(pool);
+        let monitors = self.spawn_monitoring_tasks(pool, std::slice::from_ref(pool));
         let heartbeat_cancel = CancellationToken::new();
         let heartbeat_handle = self.spawn_heartbeat_task(
             pool,
@@ -8760,8 +8767,21 @@ impl Worker {
     // withheld permits back into the semaphore) immediately, which is
     // exactly the bug this withholding scheme exists to prevent. The lint
     // is a false positive here: both bindings genuinely have two uses.
+    // `pressure_pools` (issue #548 review): the slot tuner's pool-pressure
+    // signal must observe every pool this worker actually dispatches tasks
+    // against, not just `pool`. For the single-shard path `pool` is the
+    // only pool, so callers pass a one-element slice containing it; for
+    // `run_multi_shard`, callers pass every shard's own pool so pressure on
+    // any shard (not only the "default" one) can trigger a shrink. Every
+    // other sampler in this function is unaffected and keeps using `pool`
+    // alone, matching the pre-existing single-default-pool pattern
+    // documented below.
     #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-    fn spawn_monitoring_tasks(&self, pool: &DbPool) -> WorkerMonitoringHandles {
+    fn spawn_monitoring_tasks(
+        &self,
+        pool: &DbPool,
+        pressure_pools: &[DbPool],
+    ) -> WorkerMonitoringHandles {
         // Pools the queue-depth/age, concurrency, rate-limit, and history-
         // oversized samplers aggregate over (issue #522 review). When a
         // ShardedDbPool is configured, sample every shard so these fleet-wide
@@ -9000,7 +9020,15 @@ impl Worker {
                     .activity_permit_wait_micros
                     .clone()
                     .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-                let pool_for_pressure = pool.clone();
+                // Owned so the closure can move it: sample every pool this
+                // worker actually dispatches against (issue #548 review), not
+                // just `pool`, so pressure on any one shard's pool can still
+                // trigger a shrink for a multi-shard worker.
+                let pools_for_pressure: Vec<DbPool> = if pressure_pools.is_empty() {
+                    vec![pool.clone()]
+                } else {
+                    pressure_pools.to_vec()
+                };
                 slot_tuners.push(crate::slot_tuner::spawn_slot_tuner_loop(
                     crate::slot_tuner::TunedSlot {
                         runtime: workflow_runtime,
@@ -9014,13 +9042,19 @@ impl Worker {
                     },
                     Arc::clone(&tuner_cfg.tuner),
                     move || {
-                        let status = pool_for_pressure.status();
-                        Some(crate::slot_tuner::PoolPressure {
-                            max_size: status.max_size,
-                            size: status.size,
-                            available: status.available,
-                            waiting: status.waiting,
-                        })
+                        let readings: Vec<crate::slot_tuner::PoolPressure> = pools_for_pressure
+                            .iter()
+                            .map(|p| {
+                                let status = p.status();
+                                crate::slot_tuner::PoolPressure {
+                                    max_size: status.max_size,
+                                    size: status.size,
+                                    available: status.available,
+                                    waiting: status.waiting,
+                                }
+                            })
+                            .collect();
+                        crate::slot_tuner::worst_pool_pressure(&readings)
                     },
                     self.shutdown.clone(),
                     self.config.poll_interval,

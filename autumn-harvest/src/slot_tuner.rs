@@ -68,6 +68,23 @@ impl PoolPressure {
     }
 }
 
+/// Pick the most-saturated reading from a set of per-pool pressure samples
+/// (issue #548 review).
+///
+/// A multi-shard worker dispatches against several independent DB pools; the
+/// tuner must shrink if *any* of them is under pressure, not merely whichever
+/// pool happens to be sampled. Readings are ordered by
+/// `(is_saturated, waiting)`, so a saturated reading always outranks a
+/// non-saturated one, and among saturated readings the one with the most
+/// waiters wins. Returns `None` for an empty slice.
+#[must_use]
+pub fn worst_pool_pressure(readings: &[PoolPressure]) -> Option<PoolPressure> {
+    readings
+        .iter()
+        .copied()
+        .max_by_key(|p| (p.is_saturated(), p.waiting))
+}
+
 /// The observations a [`SlotTuner`] decides from on each control-loop tick.
 ///
 /// Every field is a signal harvest already owns in-process. Deliberately
@@ -862,6 +879,60 @@ mod tests {
     fn slot_tuner_config_new_uses_default_controller() {
         let cfg = SlotTunerConfig::new(2, 8);
         assert_eq!(cfg.tuner.name(), "harvest-default");
+    }
+
+    // -----------------------------------------------------------------------
+    // worst_pool_pressure (issue #548 review: multi-shard aggregation)
+    // -----------------------------------------------------------------------
+
+    fn idle_pressure() -> PoolPressure {
+        PoolPressure {
+            max_size: 10,
+            size: 5,
+            available: 5,
+            waiting: 0,
+        }
+    }
+
+    fn saturated_pressure(waiting: usize) -> PoolPressure {
+        PoolPressure {
+            max_size: 10,
+            size: 10,
+            available: 0,
+            waiting,
+        }
+    }
+
+    #[test]
+    fn worst_pool_pressure_empty_slice_is_none() {
+        assert_eq!(worst_pool_pressure(&[]), None);
+    }
+
+    #[test]
+    fn worst_pool_pressure_all_idle_returns_idle() {
+        let readings = [idle_pressure(), idle_pressure()];
+        let worst = worst_pool_pressure(&readings).unwrap();
+        assert!(!worst.is_saturated());
+    }
+
+    #[test]
+    fn worst_pool_pressure_picks_the_saturated_shard_among_idle_ones() {
+        // Simulates a 3-shard worker where only shard 2 is under pressure —
+        // the tuner must still see it, not whichever pool sorts first.
+        let readings = [idle_pressure(), saturated_pressure(1), idle_pressure()];
+        let worst = worst_pool_pressure(&readings).unwrap();
+        assert!(worst.is_saturated());
+    }
+
+    #[test]
+    fn worst_pool_pressure_breaks_ties_toward_more_waiters() {
+        let readings = [
+            saturated_pressure(2),
+            saturated_pressure(9),
+            saturated_pressure(4),
+        ];
+        let worst = worst_pool_pressure(&readings).unwrap();
+        assert_eq!(worst.waiting, 9);
     }
 
     // -----------------------------------------------------------------------
