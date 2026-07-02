@@ -92,7 +92,7 @@ pub struct UsageResponse {
 }
 
 /// Parsed, validated query parameters for `GET /admin/usage` (issue #596).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageParams {
     pub group_by: UsageGroupBy,
     pub from: DateTime<Utc>,
@@ -160,6 +160,7 @@ impl UsageParams {
 /// for a stable, deterministic response. `status` is `complete` only when
 /// every shard was inspected.
 #[must_use]
+#[allow(clippy::needless_pass_by_value)]
 pub fn build_usage_response(
     from: DateTime<Utc>,
     to: DateTime<Utc>,

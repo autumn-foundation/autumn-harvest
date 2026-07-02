@@ -4599,7 +4599,7 @@ async fn count_workflows(
 ///
 /// The historical companion to the point-in-time `GET /admin/concurrency`
 /// endpoint. Aggregates already-durable data (`harvest_workflow_executions`
-/// + `harvest_events`) over a required `[from, to]` window, grouped by
+/// and `harvest_events`) over a required `[from, to]` window, grouped by
 /// `workflow_name` (default) or by a `search_attr:<key>` tenant key, fanned
 /// out across every shard. An unreachable shard is named in
 /// `unavailable_shards` rather than failing the call wholesale.

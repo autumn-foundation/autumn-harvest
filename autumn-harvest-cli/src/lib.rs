@@ -416,8 +416,8 @@ enum Commands {
         /// relative duration like 24h.
         #[arg(long)]
         to: String,
-        /// Grouping dimension: workflow_name (default) or
-        /// search_attr:<key> (e.g. search_attr:tenant_id).
+        /// Grouping dimension: `workflow_name` (default) or
+        /// `search_attr:<key>` (e.g. `search_attr:tenant_id`).
         #[arg(long = "group-by")]
         group_by: Option<String>,
         /// Emit raw JSON instead of a table.
@@ -2016,7 +2016,7 @@ fn format_usage_table(value: &Value) -> String {
             .iter()
             .map(|s| cell_number(s.get("shard_id")))
             .collect();
-        summary.push_str(&format!("  (unavailable shards: {})", shard_ids.join(",")));
+        let _ = write!(summary, "  (unavailable shards: {})", shard_ids.join(","));
     }
 
     let Some(groups) = value.get("groups").and_then(Value::as_array) else {
