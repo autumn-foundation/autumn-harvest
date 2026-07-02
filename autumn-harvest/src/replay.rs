@@ -396,18 +396,21 @@ impl HistoryMatcher {
                         .entry(signal_name.clone())
                         .or_default()
                         .push(idx);
-                    if open_race_timers
-                        .get(signal_name.as_str())
-                        .is_some_and(|timers| !timers.is_empty())
+                    if let Some(timers) = open_race_timers.get_mut(signal_name.as_str())
+                        && !timers.is_empty()
                     {
                         race_reserved_signal_events.insert(idx);
-                        // This is the FIRST matching signal since the race(s)
-                        // opened: `match_signal_or_timer`'s own scan resolves
-                        // at the first occurrence and never looks past it, so
-                        // every open race for this name is now settled. Close
-                        // them here so a later, unrelated same-name delivery
-                        // is not incorrectly reserved too (PR #890 review).
-                        open_race_timers.remove(signal_name.as_str());
+                        // This signal resolves the OLDEST still-open race for
+                        // this name (its `match_signal_or_timer` scan started
+                        // first in code-execution order, so it's the first to
+                        // consume an available occurrence -- `open_race_timers`
+                        // is in TimerStarted encounter order). Remove only
+                        // that ONE race: with concurrent same-name races (two
+                        // overlapping `receive_signal_timeout` calls), a later
+                        // race still needs its OWN future occurrence, so
+                        // closing every open race here would let a push
+                        // handler steal it (PR #890 review follow-up).
+                        timers.remove(0);
                     }
                 }
                 WorkflowEvent::TimerStarted { timer_id, .. } => {
@@ -4947,6 +4950,45 @@ mod tests {
                 payload: serde_json::json!({"seq": 1})
             },
             "the race must still resolve correctly with its own (first) signal"
+        );
+    }
+
+    #[test]
+    fn drain_signal_events_reserves_one_occurrence_per_concurrent_race() {
+        // Regression (PR #890 review follow-up): two CONCURRENT
+        // signal-or-deadline races for the same name each need their OWN
+        // signal occurrence, in start order (match_signal_or_timer's scan for
+        // the race started first runs first during replay and so consumes
+        // the first available occurrence, leaving the second for the race
+        // started second). Closing every open race for the name on the
+        // first resolving signal (rather than just the oldest) let a push
+        // handler steal the second race's own signal.
+        let timer_a = "__signal_timeout:1:approval";
+        let timer_b = "__signal_timeout:2:approval";
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(timer_a),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(timer_b),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"seq": 2}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let drained = matcher.drain_signal_events("approval");
+        assert!(
+            drained.is_empty(),
+            "both signals are reserved -- one per concurrent race, neither available to a push handler: {drained:?}"
         );
     }
 
