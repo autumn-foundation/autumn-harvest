@@ -118,6 +118,13 @@ pub struct HarvestBuilder {
     /// Server-side ceiling on `workflow_attempt` (issue #523).
     /// When set, `retry_policy.max_attempts` is clamped to `min(max_attempts, ceiling)`.
     max_workflow_attempts: Option<u32>,
+    /// Ceiling on the `[from, to]` window accepted by `GET /admin/usage`
+    /// (issue #596). `None` uses `crate::usage::default_usage_window_ceiling()`.
+    usage_window_ceiling: Option<Duration>,
+    /// Cap on distinct groups `GET /admin/usage` will return before failing
+    /// loudly with `413` (issue #596). `None` uses
+    /// `crate::usage::default_usage_max_groups()`.
+    usage_max_groups: Option<usize>,
 }
 
 impl Default for HarvestBuilder {
@@ -151,6 +158,8 @@ impl Default for HarvestBuilder {
             batch_start_config: BatchStartConfig::default(),
             completion_triggers: Vec::new(),
             max_workflow_attempts: None,
+            usage_window_ceiling: None,
+            usage_max_groups: None,
         }
     }
 }
@@ -193,6 +202,8 @@ impl std::fmt::Debug for HarvestBuilder {
             )
             .field("batch_start_config", &self.batch_start_config)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
+            .field("usage_window_ceiling", &self.usage_window_ceiling)
+            .field("usage_max_groups", &self.usage_max_groups)
             .finish_non_exhaustive()
     }
 }
@@ -246,6 +257,12 @@ pub struct BuiltHarvest {
     completion_triggers: Vec<crate::completion_trigger::CompletionTrigger>,
     /// Server-side ceiling on workflow retry attempts (issue #523). `None` = no ceiling.
     pub max_workflow_attempts: Option<u32>,
+    /// Ceiling on the `[from, to]` window accepted by `GET /admin/usage`
+    /// (issue #596). Defaults to 90 days.
+    pub usage_window_ceiling: Duration,
+    /// Cap on distinct groups `GET /admin/usage` will return before failing
+    /// loudly with `413` (issue #596). Defaults to 10,000.
+    pub usage_max_groups: usize,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -283,6 +300,8 @@ impl std::fmt::Debug for BuiltHarvest {
             )
             .field("batch_start_config", &self.batch_start_config)
             .field("max_workflow_attempts", &self.max_workflow_attempts)
+            .field("usage_window_ceiling", &self.usage_window_ceiling)
+            .field("usage_max_groups", &self.usage_max_groups)
             .finish_non_exhaustive()
     }
 }
@@ -1022,6 +1041,29 @@ impl HarvestBuilder {
         self
     }
 
+    /// Override the ceiling on the `[from, to]` window accepted by
+    /// `GET /admin/usage` (issue #596).
+    ///
+    /// Defaults to 90 days (`crate::usage::default_usage_window_ceiling()`).
+    #[must_use]
+    pub const fn usage_window_ceiling(mut self, ceiling: Duration) -> Self {
+        self.usage_window_ceiling = Some(ceiling);
+        self
+    }
+
+    /// Override the cap on distinct groups `GET /admin/usage` will return
+    /// before failing loudly with `413` (issue #596).
+    ///
+    /// Defaults to 10,000 (`crate::usage::default_usage_max_groups()`). A
+    /// chargeback report must never silently drop a low-volume tenant's
+    /// data, so exceeding this cap is a hard error naming the ceiling
+    /// rather than a silent top-N rollup.
+    #[must_use]
+    pub const fn usage_max_groups(mut self, cap: usize) -> Self {
+        self.usage_max_groups = Some(cap);
+        self
+    }
+
     /// Set the global maximum byte length for activity input payloads (issue #252).
     ///
     /// Default: 2 MiB. Per-activity overrides declared via
@@ -1211,6 +1253,13 @@ impl HarvestBuilder {
             .unwrap_or(worker_config.unknown_target_grace_window);
         worker_config.unknown_target_grace_window = unknown_target_grace_window;
 
+        let usage_window_ceiling = self
+            .usage_window_ceiling
+            .unwrap_or_else(crate::usage::default_usage_window_ceiling);
+        let usage_max_groups = self
+            .usage_max_groups
+            .unwrap_or_else(crate::usage::default_usage_max_groups);
+
         let telemetry_arc = Arc::new(self.telemetry.unwrap_or_default());
         let payload_offloader = self.payload_store.clone().map(|store| {
             Arc::new(crate::payload_store::PayloadOffloader::new(
@@ -1246,6 +1295,8 @@ impl HarvestBuilder {
             batch_start_config: self.batch_start_config,
             completion_triggers: self.completion_triggers,
             max_workflow_attempts: self.max_workflow_attempts,
+            usage_window_ceiling,
+            usage_max_groups,
         })
     }
 }
@@ -2936,6 +2987,42 @@ mod tests {
             built.max_workflow_execution_timeout_ceiling(),
             Some(ceiling)
         );
+    }
+
+    // ── usage_window_ceiling tests (issue #596) ────────────────────────────────
+
+    #[test]
+    fn builder_usage_window_ceiling_defaults_to_ninety_days() {
+        let built = HarvestBuilder::new().build();
+        assert_eq!(
+            built.usage_window_ceiling,
+            crate::usage::default_usage_window_ceiling()
+        );
+    }
+
+    #[test]
+    fn builder_usage_window_ceiling_is_carried_through_build() {
+        let ceiling = Duration::from_secs(3600);
+        let built = HarvestBuilder::new().usage_window_ceiling(ceiling).build();
+        assert_eq!(
+            built.usage_window_ceiling, ceiling,
+            "ceiling must survive build()"
+        );
+    }
+
+    #[test]
+    fn builder_usage_max_groups_defaults_to_ten_thousand() {
+        let built = HarvestBuilder::new().build();
+        assert_eq!(
+            built.usage_max_groups,
+            crate::usage::default_usage_max_groups()
+        );
+    }
+
+    #[test]
+    fn builder_usage_max_groups_is_carried_through_build() {
+        let built = HarvestBuilder::new().usage_max_groups(42).build();
+        assert_eq!(built.usage_max_groups, 42, "cap must survive build()");
     }
 
     // ── CronInTimezone builder validation ────────────────────────────────────

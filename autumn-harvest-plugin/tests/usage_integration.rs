@@ -159,6 +159,10 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260626000001_harvest_workflow_retry/up.sql"),
     "\n",
     include_str!("../../autumn-harvest/migrations/20260628000001_harvest_execution_origin/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260702000000_harvest_usage_report_indexes/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -225,6 +229,14 @@ fn build_app(storage: HarvestDbPool) -> HarvestApiApp {
     let api_state = HarvestApiState::new();
     api_state.set_admin_auth_boundary(true);
     api_state.install_storage_pool(storage);
+    harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
+}
+
+fn build_app_with_max_groups(storage: HarvestDbPool, max_groups: usize) -> HarvestApiApp {
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(storage);
+    api_state.set_usage_max_groups(max_groups);
     harvest_api_router(api_state).with_state(AppState::for_test().with_profile("test"))
 }
 
@@ -693,4 +705,79 @@ async fn one_shard_down_is_partial_not_500() {
     assert_eq!(unavailable.len(), 1);
     assert_eq!(unavailable[0]["shard_id"], 1);
     assert!(!unavailable[0]["reason"].as_str().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn search_attr_value_literally_unattributed_merges_with_missing_key() {
+    // Locks in the documented limitation (issue #596 F1): an execution whose
+    // search_attrs value for the requested key literally equals the
+    // "(unattributed)" sentinel is indistinguishable from an execution that
+    // lacks the key entirely — both merge into the same group. This is an
+    // accepted, documented limitation, not a defect (see the module doc in
+    // autumn-harvest/src/usage.rs).
+    let (url, _c) = setup_single_shard().await;
+    let app = single_app(&url);
+    let now = Utc::now();
+
+    seed_execution(&url, 0, "onboarding", "RUNNING", now, None, None).await;
+    seed_execution(
+        &url,
+        0,
+        "onboarding",
+        "RUNNING",
+        now,
+        None,
+        Some(serde_json::json!({"tenant_id": "(unattributed)"})),
+    )
+    .await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/admin/usage?from={}&to={}&group_by=search_attr:tenant_id",
+            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = body["groups"].as_array().unwrap();
+    assert_eq!(
+        groups.len(),
+        1,
+        "the missing-key execution and the literal-'(unattributed)'-value execution merge into one group"
+    );
+    let unattributed = groups
+        .iter()
+        .find(|g| g["group"] == "(unattributed)")
+        .unwrap();
+    assert_eq!(unattributed["workflow_starts"], 2);
+}
+
+#[tokio::test]
+async fn group_count_over_cap_is_413_naming_the_cap() {
+    let (url, _c) = setup_single_shard().await;
+    let now = Utc::now();
+
+    for i in 0..3 {
+        seed_execution(&url, 0, &format!("wf_{i}"), "RUNNING", now, None, None).await;
+    }
+
+    let app = build_app_with_max_groups(HarvestDbPool::from(build_pool(&url)), 2);
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/admin/usage?from={}&to={}",
+            (now - Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            (now + Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let detail = body.get("detail").and_then(Value::as_str).unwrap_or("");
+    assert!(detail.contains('2'), "error should name the cap: {detail}");
+    assert!(
+        detail.contains('3'),
+        "error should name the group count: {detail}"
+    );
 }

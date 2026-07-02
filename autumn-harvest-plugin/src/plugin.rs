@@ -332,6 +332,10 @@ async fn start_harvest_runtime(
     api_state.set_default_debounce_max_wait(built.worker_config().default_debounce_max_wait);
     // Propagate the server-side workflow retry attempt ceiling (issue #523).
     api_state.set_max_workflow_attempts(built.max_workflow_attempts);
+    // Propagate the GET /admin/usage window ceiling (issue #596).
+    api_state.set_usage_window_ceiling(built.usage_window_ceiling);
+    // Propagate the GET /admin/usage group-count cap (issue #596).
+    api_state.set_usage_max_groups(built.usage_max_groups);
     // Propagate batch start caps from builder config (issue #357).
     api_state.set_batch_start_config(&built.batch_start_config);
 

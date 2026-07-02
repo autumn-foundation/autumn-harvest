@@ -327,6 +327,9 @@ pub struct HarvestApiState {
     /// Defaults to 90 days; guards against an accidental full-table scan
     /// across every shard.
     usage_window_ceiling: Arc<Mutex<std::time::Duration>>,
+    /// Cap on distinct groups `GET /admin/usage` will return before failing
+    /// loudly with `413` (issue #596). Defaults to 10,000.
+    usage_max_groups: Arc<Mutex<usize>>,
 }
 
 impl Default for HarvestApiState {
@@ -359,6 +362,9 @@ impl Default for HarvestApiState {
             max_workflow_attempts: Arc::new(Mutex::new(None)),
             usage_window_ceiling: Arc::new(Mutex::new(
                 autumn_harvest::usage::default_usage_window_ceiling(),
+            )),
+            usage_max_groups: Arc::new(Mutex::new(
+                autumn_harvest::usage::default_usage_max_groups(),
             )),
         }
     }
@@ -627,6 +633,32 @@ impl HarvestApiState {
             .usage_window_ceiling
             .lock()
             .expect("harvest api state lock poisoned") = ceiling;
+    }
+
+    /// Returns the cap on distinct groups `GET /admin/usage` will return
+    /// before failing loudly with `413` (issue #596). Defaults to 10,000.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    #[must_use]
+    pub fn usage_max_groups(&self) -> usize {
+        *self
+            .usage_max_groups
+            .lock()
+            .expect("harvest api state lock poisoned")
+    }
+
+    /// Override the `GET /admin/usage` group-count cap (issue #596).
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal mutex is poisoned.
+    pub fn set_usage_max_groups(&self, cap: usize) {
+        *self
+            .usage_max_groups
+            .lock()
+            .expect("harvest api state lock poisoned") = cap;
     }
 
     /// Set the hard caps for `POST /workflows/batch_start` (issue #357).
@@ -4610,7 +4642,12 @@ async fn usage_report(
     let ceiling = api_state.usage_window_ceiling();
     let params = UsageParams::from_query_pairs(&pairs, chrono::Utc::now(), ceiling)
         .map_err(AutumnError::bad_request_msg)?;
-    Ok(Json(usage::build_usage_report(&api_state, params).await))
+    let response = usage::build_usage_report(&api_state, params)
+        .await
+        .map_err(|e| {
+            AutumnError::bad_request_msg(e.to_string()).with_status(StatusCode::PAYLOAD_TOO_LARGE)
+        })?;
+    Ok(Json(response))
 }
 
 /// `GET /workflows/registered` — list all registered workflow types with

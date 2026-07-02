@@ -50,19 +50,14 @@ use crate::shard_fanout::{self, FanoutStatus, ShardObservation};
 /// place, alongside `workflow_count`'s and `workflow_reachability`'s reports.
 pub type UsageReportStatus = FanoutStatus;
 
-/// A shard that could not be queried for this report.
-#[derive(Debug, Clone, Serialize)]
-pub struct UsageUnavailableShard {
-    /// Shard identifier.
-    pub shard_id: i32,
-    /// Reason the shard could not be queried.
-    pub reason: String,
-}
-
 /// One merged usage record — exactly the fields named in issue #596's AC.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct UsageGroupRecord {
     pub group: String,
+    /// Count of `harvest_workflow_executions` rows whose `started_at` falls
+    /// in the window — including continue-as-new and auto-retry (issue
+    /// #523) successor rows, each counted as a separate, billable start.
+    /// See `autumn_harvest::usage`'s module doc for full metric semantics.
     pub workflow_starts: i64,
     pub completed: i64,
     pub failed: i64,
@@ -88,7 +83,48 @@ pub struct UsageResponse {
     pub groups: Vec<UsageGroupRecord>,
     /// Shards that could not be queried, named with a reason. Never silently
     /// dropped.
-    pub unavailable_shards: Vec<UsageUnavailableShard>,
+    pub unavailable_shards: Vec<shard_fanout::UnavailableShard>,
+}
+
+/// Returned by [`build_usage_response`]/[`build_usage_report`] when the
+/// merged group count would exceed the configured cap (issue #596).
+///
+/// A hard, loud failure rather than a silent top-N rollup — see the module
+/// doc's "No bounded-cardinality rollup" section for why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageGroupCapExceeded {
+    pub group_count: usize,
+    pub cap: usize,
+}
+
+impl std::fmt::Display for UsageGroupCapExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "usage report would return {} distinct groups, exceeding the \
+             configured cap of {}; narrow the [from, to] window or choose a \
+             lower-cardinality group_by key",
+            self.group_count, self.cap
+        )
+    }
+}
+
+impl std::error::Error for UsageGroupCapExceeded {}
+
+/// Format a ceiling `Duration` for the window-exceeded error message
+/// (issue #596). Expresses `d` in the largest whole unit that evenly
+/// divides it — days, else hours, else seconds — so a 30-hour ceiling
+/// reports "30-hour" instead of being truncated to "1-day". Not a
+/// general-purpose duration formatter; kept local to this one use case.
+fn format_ceiling(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs != 0 && secs.is_multiple_of(24 * 60 * 60) {
+        format!("{}-day", secs / (24 * 60 * 60))
+    } else if secs != 0 && secs.is_multiple_of(60 * 60) {
+        format!("{}-hour", secs / (60 * 60))
+    } else {
+        format!("{secs}-second")
+    }
 }
 
 /// Parsed, validated query parameters for `GET /admin/usage` (issue #596).
@@ -143,9 +179,9 @@ impl UsageParams {
         let window = to.signed_duration_since(from);
         let ceiling_chrono = chrono::Duration::from_std(ceiling).unwrap_or(chrono::Duration::MAX);
         if window > ceiling_chrono {
-            let ceiling_days = ceiling.as_secs() / (24 * 60 * 60);
+            let ceiling_label = format_ceiling(ceiling);
             return Err(format!(
-                "invalid window: 'to' - 'from' exceeds the {ceiling_days}-day usage window \
+                "invalid window: 'to' - 'from' exceeds the {ceiling_label} usage window \
                  ceiling; narrow the window or use a smaller range"
             ));
         }
@@ -159,25 +195,21 @@ impl UsageParams {
 /// Counts sum across shards; groups are ordered lexicographically by `group`
 /// for a stable, deterministic response. `status` is `complete` only when
 /// every shard was inspected.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`UsageGroupCapExceeded`] when the merged group count exceeds
+/// `max_groups`, checked after the cross-shard merge but before the
+/// response is constructed (no extra DB round-trip).
 #[allow(clippy::needless_pass_by_value)]
 pub fn build_usage_response(
     from: DateTime<Utc>,
     to: DateTime<Utc>,
     group_by: &UsageGroupBy,
     observations: Vec<ShardObservation<UsageShardRow>>,
-) -> UsageResponse {
-    let inspected = observations.iter().filter(|o| o.error.is_none()).count();
-    let mut unavailable_shards: Vec<UsageUnavailableShard> = observations
-        .iter()
-        .filter_map(|o| {
-            o.error.as_ref().map(|reason| UsageUnavailableShard {
-                shard_id: o.shard_id,
-                reason: reason.clone(),
-            })
-        })
-        .collect();
-    unavailable_shards.sort_by_key(|s| s.shard_id);
+    max_groups: usize,
+) -> Result<UsageResponse, UsageGroupCapExceeded> {
+    let (inspected, unavailable_shards) = shard_fanout::summarize_shard_errors(&observations);
 
     let mut merged: BTreeMap<String, UsageGroupRecord> = BTreeMap::new();
     for observation in &observations {
@@ -206,14 +238,21 @@ pub fn build_usage_response(
         }
     }
 
-    UsageResponse {
+    if merged.len() > max_groups {
+        return Err(UsageGroupCapExceeded {
+            group_count: merged.len(),
+            cap: max_groups,
+        });
+    }
+
+    Ok(UsageResponse {
         status: FanoutStatus::from_counts(inspected, unavailable_shards.len()),
         from,
         to,
         group_by: group_by.as_wire(),
         groups: merged.into_values().collect(),
         unavailable_shards,
-    }
+    })
 }
 
 /// Query one shard for its grouped usage rows (issue #596).
@@ -264,11 +303,22 @@ async fn observe_shard(
 /// silently skipped, then queries all of them concurrently (`join_all`)
 /// rather than one at a time.
 ///
-/// Never fails outright: a missing storage pool (or an unreachable shard)
-/// surfaces as `status: unavailable`/`partial` in the response.
-pub async fn build_usage_report(api_state: &HarvestApiState, params: UsageParams) -> UsageResponse {
+/// Never fails outright for a partial/unreachable shard: that surfaces as
+/// `status: unavailable`/`partial` in the response. Does fail loudly (see
+/// [`UsageGroupCapExceeded`]) when the merged group count exceeds the
+/// configured cap.
+///
+/// # Errors
+///
+/// Returns [`UsageGroupCapExceeded`] when the merged group count exceeds
+/// `api_state`'s configured `usage_max_groups`.
+pub async fn build_usage_report(
+    api_state: &HarvestApiState,
+    params: UsageParams,
+) -> Result<UsageResponse, UsageGroupCapExceeded> {
     let pools = shard_fanout::pools_by_shard(api_state);
     let expected = shard_fanout::expected_shards(api_state, &pools);
+    let max_groups = api_state.usage_max_groups();
 
     let query = UsageQuery {
         group_by: params.group_by.clone(),
@@ -285,7 +335,13 @@ pub async fn build_usage_report(api_state: &HarvestApiState, params: UsageParams
         .collect::<Vec<_>>();
     let observations = join_all(observations).await;
 
-    build_usage_response(params.from, params.to, &params.group_by, observations)
+    build_usage_response(
+        params.from,
+        params.to,
+        &params.group_by,
+        observations,
+        max_groups,
+    )
 }
 
 #[cfg(test)]
@@ -330,6 +386,7 @@ mod tests {
     }
 
     const CEILING: std::time::Duration = std::time::Duration::from_secs(90 * 24 * 60 * 60);
+    const TEST_MAX_GROUPS: usize = 1000;
 
     // ── UsageParams::from_query_pairs ──────────────────────────────────────
 
@@ -484,6 +541,52 @@ mod tests {
         assert_eq!(params.group_by, UsageGroupBy::WorkflowName);
     }
 
+    // ── format_ceiling (issue #596 F5) ───────────────────────────────────────
+
+    #[test]
+    fn format_ceiling_prefers_whole_days() {
+        assert_eq!(
+            format_ceiling(std::time::Duration::from_secs(2 * 86_400)),
+            "2-day"
+        );
+    }
+
+    #[test]
+    fn format_ceiling_falls_back_to_whole_hours() {
+        assert_eq!(
+            format_ceiling(std::time::Duration::from_secs(30 * 3600)),
+            "30-hour"
+        );
+    }
+
+    #[test]
+    fn format_ceiling_falls_back_to_seconds() {
+        assert_eq!(
+            format_ceiling(std::time::Duration::from_secs(90)),
+            "90-second"
+        );
+    }
+
+    #[test]
+    fn params_rejects_window_wider_than_non_whole_day_ceiling_and_names_hours_not_misrounded_days()
+    {
+        let ceiling = std::time::Duration::from_secs(30 * 3600); // 30h — not a whole day
+        let err = UsageParams::from_query_pairs(
+            &pairs(&[
+                ("from", "2026-01-01T00:00:00Z"),
+                ("to", "2026-01-05T00:00:00Z"),
+            ]),
+            at(0),
+            ceiling,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("30-hour"),
+            "expected 30-hour named, got: {err}"
+        );
+        assert!(!err.contains("1-day"), "must not mis-round to 1-day: {err}");
+    }
+
     // ── build_usage_response ───────────────────────────────────────────────
 
     #[test]
@@ -496,7 +599,9 @@ mod tests {
                 obs(0, vec![row("onboarding", 5, 3, 1)], None),
                 obs(1, vec![row("onboarding", 2, 2, 0)], None),
             ],
-        );
+            TEST_MAX_GROUPS,
+        )
+        .unwrap();
 
         assert_eq!(resp.status, UsageReportStatus::Complete);
         assert_eq!(resp.groups.len(), 1);
@@ -518,7 +623,9 @@ mod tests {
             at(1000),
             &UsageGroupBy::WorkflowName,
             vec![obs(0, vec![a], None), obs(1, vec![b], None)],
-        );
+            TEST_MAX_GROUPS,
+        )
+        .unwrap();
         assert!((resp.groups[0].activity_compute_seconds - 20.0).abs() < f64::EPSILON);
     }
 
@@ -537,7 +644,9 @@ mod tests {
                 ],
                 None,
             )],
-        );
+            TEST_MAX_GROUPS,
+        )
+        .unwrap();
         let names: Vec<&str> = resp.groups.iter().map(|g| g.group.as_str()).collect();
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
     }
@@ -553,7 +662,9 @@ mod tests {
                 vec![row(autumn_harvest::usage::UNATTRIBUTED_GROUP, 3, 1, 0)],
                 None,
             )],
-        );
+            TEST_MAX_GROUPS,
+        )
+        .unwrap();
         assert_eq!(resp.groups.len(), 1);
         assert_eq!(resp.groups[0].group, "(unattributed)");
     }
@@ -568,7 +679,9 @@ mod tests {
                 obs(0, vec![row("onboarding", 4, 0, 0)], None),
                 obs(1, vec![], Some("connection refused")),
             ],
-        );
+            TEST_MAX_GROUPS,
+        )
+        .unwrap();
 
         assert_eq!(resp.status, UsageReportStatus::Partial);
         assert_eq!(resp.unavailable_shards.len(), 1);
@@ -585,11 +698,55 @@ mod tests {
             at(1000),
             &UsageGroupBy::WorkflowName,
             vec![obs(0, vec![], Some("pool missing"))],
-        );
+            TEST_MAX_GROUPS,
+        )
+        .unwrap();
 
         assert_eq!(resp.status, UsageReportStatus::Unavailable);
         assert!(resp.groups.is_empty());
         assert_eq!(resp.unavailable_shards.len(), 1);
+    }
+
+    // ── usage_max_groups cap (issue #596) ────────────────────────────────────
+
+    #[test]
+    fn cap_exceeded_at_cap_plus_one_groups() {
+        let rows: Vec<UsageShardRow> = (0..11).map(|i| row(&format!("wf_{i}"), 1, 0, 0)).collect();
+        let err = build_usage_response(
+            at(0),
+            at(1000),
+            &UsageGroupBy::WorkflowName,
+            vec![obs(0, rows, None)],
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(err.group_count, 11);
+        assert_eq!(err.cap, 10);
+    }
+
+    #[test]
+    fn succeeds_at_exactly_cap_groups() {
+        let rows: Vec<UsageShardRow> = (0..10).map(|i| row(&format!("wf_{i}"), 1, 0, 0)).collect();
+        let resp = build_usage_response(
+            at(0),
+            at(1000),
+            &UsageGroupBy::WorkflowName,
+            vec![obs(0, rows, None)],
+            10,
+        )
+        .expect("exactly at cap must succeed");
+        assert_eq!(resp.groups.len(), 10);
+    }
+
+    #[test]
+    fn cap_exceeded_display_names_the_cap() {
+        let err = UsageGroupCapExceeded {
+            group_count: 12_345,
+            cap: 10_000,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("12345"), "{msg}");
+        assert!(msg.contains("10000"), "{msg}");
     }
 
     #[test]
