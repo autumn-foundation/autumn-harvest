@@ -881,8 +881,69 @@ impl WorkflowContext {
     where
         F: FnOnce(&mut HistoryMatcher) -> R,
     {
-        let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
-        f(&mut matcher)
+        let result = {
+            let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
+            f(&mut matcher)
+        };
+        self.pump_signal_handlers();
+        result
+    }
+
+    /// Dispatches every push-based signal handler whose target signal has
+    /// newly become claimable (issue #546 post-ship hardening).
+    ///
+    /// Runs after every [`match_history`](Self::match_history) call so a
+    /// handler fires exactly when the workflow's own code-driven cursor
+    /// progression passes its recorded position -- never ahead of it. This
+    /// closes a real ordering bug in the original implementation: an eager,
+    /// cursor-independent full-history scan (the original
+    /// `drain_signal_events`) could dispatch a handler for a signal recorded
+    /// *after* an activity or timer the workflow hadn't reached yet in this
+    /// replay cycle, silently reordering observable side effects relative to
+    /// history. [`HistoryMatcher::claim_pending_signal`] only inspects
+    /// signals already drained into `pending_signals` by the same
+    /// cursor-bound sweep every other `match_*` call opens with
+    /// (`prepare_match`), so it can never reach ahead of wherever the
+    /// workflow's code has actually driven the matcher so far.
+    ///
+    /// Claims across all registered handler names are collected and sorted
+    /// by event index *before* any dispatch, so two differently-named
+    /// handlers fire in true historical order relative to each other, not
+    /// just self-consistently within one name.
+    fn pump_signal_handlers(&self) {
+        let names = self
+            .signal_registry
+            .lock()
+            .expect("signal_registry lock poisoned")
+            .list_names();
+        if names.is_empty() {
+            return;
+        }
+
+        let mut claims: Vec<(usize, String, Value)> = Vec::new();
+        {
+            let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
+            for name in &names {
+                for (idx, payload) in matcher.claim_pending_signal(name) {
+                    claims.push((idx, name.clone(), payload));
+                }
+            }
+        }
+        if claims.is_empty() {
+            return;
+        }
+        claims.sort_by_key(|(idx, ..)| *idx);
+
+        for (_, name, payload) in claims {
+            let handler = self
+                .signal_registry
+                .lock()
+                .expect("signal_registry lock poisoned")
+                .get(&name);
+            if let Some(handler) = handler {
+                invoke_signal_handler(&handler, &name, payload);
+            }
+        }
     }
 
     pub(crate) fn is_timer_started_next(&self, timer_id: &str) -> bool {
@@ -5078,19 +5139,34 @@ impl WorkflowContext {
     /// registers for is delivered without a second call the author must
     /// remember to make.
     fn register_and_dispatch_signal_handler(&self, name: &str, handler: BoxSignalHandler) {
-        // `register` returns the handler that actually won registration
-        // (itself on a fresh name, or the earlier-registered one on a
-        // redundant call) so dispatch below never needs a second lock/lookup.
-        let resolved = self
-            .signal_registry
+        self.signal_registry
             .lock()
             .expect("signal_registry lock poisoned")
             .register(name, handler);
 
-        let payloads = self.match_history(|m| m.drain_signal_events(name));
-        for payload in payloads {
-            invoke_signal_handler(&resolved, name, payload);
-        }
+        // Registering alone stores the handler; `match_history`'s post-hook
+        // (`pump_signal_handlers`) does the actual cursor-bound sweep and
+        // dispatch (see its doc comment). Trigger it immediately with a
+        // no-op closure so a signal already recorded before wherever the
+        // cursor currently sits is delivered as soon as its handler exists,
+        // matching the documented "visible within the same cycle" contract.
+        //
+        // Residual limitation (PR #890 review, "preserve signal history
+        // order across handlers"): if two handlers for DIFFERENT names are
+        // registered on consecutive lines with no other command in between,
+        // and BOTH names already have a recorded signal at that point, each
+        // registration's own eager pump can only sort claims among handlers
+        // that already exist -- so the second handler's earlier-recorded
+        // signal cannot retroactively be reordered ahead of the first
+        // handler's already-dispatched one. This is unavoidable without
+        // giving up same-cycle dispatch visibility entirely (there is no
+        // signal that "no more handlers are about to register" short of the
+        // workflow body actually reaching a real command). Once any real
+        // command (activity/timer/child workflow/etc.) separates
+        // registration from the signals, a single pump call considers every
+        // handler registered so far together and sorts by event index, so
+        // cross-name ordering is correct in that -- far more common -- case.
+        self.match_history(|_| ());
     }
 
     // ── Command drain ─────────────────────────────────────────────────
@@ -6341,6 +6417,133 @@ mod tests {
         // (i.e. suspend for a future occurrence), not replay/return it again.
         let history_match = ctx.match_history(|m| m.match_signal("cancel"));
         assert_eq!(history_match, HistoryMatch::NoMatch);
+    }
+
+    #[tokio::test]
+    async fn register_signal_handler_does_not_fire_before_an_unconsumed_activity_is_matched() {
+        // Regression (PR #890 review, "preserve history order when
+        // dispatching handlers", context.rs:5090): with WorkflowStarted,
+        // ActivityScheduled, ActivityCompleted, SignalReceived("cancel"), a
+        // handler registered at the top of the workflow body (the idiomatic
+        // placement) must NOT fire before the workflow has actually replayed
+        // the recorded activity. The original implementation eagerly drained
+        // every recorded "cancel" event at registration time regardless of
+        // the activity sitting in between, so a workflow gating the activity
+        // call on the handler-mutated state could skip the recorded
+        // `execute_activity` call entirely, diverging from history.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            started_event(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "handler must not fire before the workflow has matched the preceding activity"
+        );
+
+        // The workflow body now actually replays the activity.
+        let result = ctx
+            .execute_activity_raw("send_email", Value::Null, "default")
+            .await;
+        assert_eq!(result.unwrap(), serde_json::json!("sent"));
+
+        // Only now -- after the cursor has passed the activity -- is the
+        // trailing signal visible to the handler.
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![serde_json::json!({"reason": "manual"})]
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_handlers_dispatch_in_history_order_across_names_not_registration_order() {
+        // Regression (PR #890 review, "preserve signal history order across
+        // handlers", replay.rs:2745): history records "pause" before
+        // "cancel", but the workflow body registers the "cancel" handler
+        // first. Once a real command (here, an activity) separates
+        // registration from both signals, a single pump call considers every
+        // handler registered so far together and sorts by event index --
+        // dispatch follows SignalReceived history order (pause, then
+        // cancel), not the order the two `register_*` calls happened to run
+        // in. (A handler registered eagerly with no intervening command at
+        // all still dispatches at registration time for same-cycle
+        // visibility -- see `register_and_dispatch_signal_handler`'s doc
+        // comment for that narrower residual case.)
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            started_event(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "pause".into(),
+                payload: serde_json::json!("pause-payload"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!("cancel-payload"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let order: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+
+        let order_for_cancel = order.clone();
+        ctx.register_signal_handler_raw("cancel", move |_payload: Value| {
+            order_for_cancel.lock().unwrap().push("cancel");
+        });
+        let order_for_pause = order.clone();
+        ctx.register_signal_handler_raw("pause", move |_payload: Value| {
+            order_for_pause.lock().unwrap().push("pause");
+        });
+
+        // Both registrations' own eager pumps find nothing yet -- the
+        // ActivityScheduled event blocks the cursor-bound sweep.
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "neither handler may fire before the preceding activity is matched"
+        );
+
+        // The workflow body now actually replays the activity, advancing the
+        // cursor past both trailing signals in one go.
+        let result = ctx
+            .execute_activity_raw("send_email", Value::Null, "default")
+            .await;
+        assert_eq!(result.unwrap(), serde_json::json!("sent"));
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["pause", "cancel"],
+            "dispatch must follow SignalReceived history order, not registration order"
+        );
     }
 
     #[test]
