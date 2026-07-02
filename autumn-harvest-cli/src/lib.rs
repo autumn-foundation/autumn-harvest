@@ -2052,7 +2052,7 @@ fn format_usage_table(value: &Value) -> String {
             cell_number(group.get("timed_out")),
             cell_number(group.get("activity_executions")),
             cell_number(group.get("activity_executions_failed")),
-            cell_f64(group.get("activity_compute_seconds")),
+            format_f64(group.get("activity_compute_seconds")),
         ]);
     }
 
@@ -3231,14 +3231,6 @@ fn cell_number(value: Option<&Value>) -> String {
     value
         .and_then(Value::as_i64)
         .map_or_else(String::new, |number| number.to_string())
-}
-
-/// Render a JSON number cell with two decimal places (used for
-/// `activity_compute_seconds`, which is a `f64`).
-fn cell_f64(value: Option<&Value>) -> String {
-    value
-        .and_then(Value::as_f64)
-        .map_or_else(String::new, |number| format!("{number:.2}"))
 }
 
 fn cell_optional_number(value: Option<&Value>) -> String {
