@@ -121,7 +121,7 @@ Executions that lack the requested `search_attrs` key are grouped under the lite
 **Metric semantics** (each unit is counted exactly once, in the window it actually occurred — the chargeback-consistent choice):
 
 - `workflow_starts`: executions whose `started_at` falls in `[from, to]`.
-- `completed` / `failed` / `cancelled` / `timed_out`: executions whose `completed_at` falls in `[from, to]` and whose terminal state matches. `TERMINATED` and `CONTINUED_AS_NEW` are not broken out separately.
+- `completed` / `failed` / `cancelled` / `timed_out`: derived from the durable terminal events (`WorkflowCompleted`/`WorkflowFailed`/`WorkflowCancelled`/`WorkflowExecutionTimedOut`) whose timestamp falls in `[from, to]`, not the mutable execution row — so a DLQ redrive that clears a `FAILED` row's state never erases a historical failure. `cancelled` additionally checks the row's current state is `CANCELLED` (not `TERMINATED`), since `terminate` reuses the same event type as a genuine cancel. `TERMINATED` and `CONTINUED_AS_NEW` are not broken out separately.
 - `activity_executions`: count of dispatch attempts (`ActivityStarted` events) in the window — retries reuse the same activity id but each attempt appends a fresh event, so a 3-attempt activity contributes 3.
 - `activity_executions_failed`: count of terminal `ActivityFailed`/`ActivityTimedOut` events in the window (non-final retry attempts emit no event, so this counts exhausted-retry-or-timeout only).
 - `activity_compute_seconds`: for each activity whose terminal event falls in the window, the wall-clock span from that activity's most recent (final-attempt) start to its terminal event, summed. Retry backoff wall time is excluded by construction.

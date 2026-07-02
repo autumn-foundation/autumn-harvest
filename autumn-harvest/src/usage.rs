@@ -16,12 +16,27 @@
 //!   row represents separately-billable compute, so this is a deliberate
 //!   consumption-accuracy choice, not an oversight (consistent with how
 //!   `activity_executions` below already counts every retry attempt).
-//! - `completed`/`failed`/`cancelled`/`timed_out`: executions whose
-//!   `completed_at` falls in `[from, to]` and whose terminal `state` matches.
-//!   Each terminal transition is counted exactly once, in the window it
-//!   actually occurred — the chargeback-consistent choice. `TERMINATED` and
-//!   `CONTINUED_AS_NEW` are intentionally not broken out (the issue's AC
-//!   lists exactly these four terminal buckets).
+//! - `completed`/`failed`/`cancelled`/`timed_out`: derived from the durable
+//!   terminal events (`WorkflowCompleted`/`WorkflowFailed`/`WorkflowCancelled`/
+//!   `WorkflowExecutionTimedOut`) whose `harvest_events.timestamp` falls in
+//!   `[from, to]` — **not** from the mutable `harvest_workflow_executions`
+//!   row. This makes the counters immutable historical facts: an operator
+//!   redriving a `FAILED` execution back to `RUNNING` via
+//!   `reactivate_failed_execution` clears the row's `state`/`completed_at`
+//!   but never rewrites or removes the original `WorkflowFailed` event, so a
+//!   usage report re-run for the same window still reports the failure that
+//!   actually happened in it. If the redriven run later succeeds, its
+//!   `WorkflowCompleted` event is counted separately in whichever window
+//!   *that* event falls in — each terminal event is one billable/reportable
+//!   occurrence, not a mutually-exclusive final-state bucket. `cancelled` is
+//!   the one exception that still consults the current row state: `terminate`
+//!   (issue #504) reuses the same `WorkflowCancelled` event type as a genuine
+//!   cancel (no new event variant), so a `WorkflowCancelled` event only counts
+//!   toward `cancelled` when the execution's current `state` is `CANCELLED`
+//!   (not `TERMINATED`) — safe because nothing un-cancels or un-terminates a
+//!   row (only `FAILED` has a redrive path), so this join is immutable in
+//!   practice. `TERMINATED` and `CONTINUED_AS_NEW` are intentionally not
+//!   broken out (the issue's AC lists exactly these four terminal buckets).
 //! - `activity_executions`: count of `ActivityStarted` events in the window
 //!   (one per dispatch attempt — retries reuse the same `activity_id` but
 //!   each attempt appends a fresh `ActivityStarted`).
@@ -211,28 +226,31 @@ fn usage_sql() -> String {
     let group_key_expr = group_key_expr();
     format!(
         r"
-WITH execution_counts AS (
+WITH execution_starts AS (
     SELECT
         {group_key_expr} AS grp,
-        COUNT(*) FILTER (WHERE w.started_at BETWEEN $3 AND $4)::BIGINT AS workflow_starts,
-        COUNT(*) FILTER (
-            WHERE w.state = 'COMPLETED' AND w.completed_at BETWEEN $3 AND $4
-        )::BIGINT AS completed,
-        COUNT(*) FILTER (
-            WHERE w.state = 'FAILED' AND w.completed_at BETWEEN $3 AND $4
-        )::BIGINT AS failed,
-        COUNT(*) FILTER (
-            WHERE w.state = 'CANCELLED' AND w.completed_at BETWEEN $3 AND $4
-        )::BIGINT AS cancelled,
-        COUNT(*) FILTER (
-            WHERE w.state = 'TIMED_OUT' AND w.completed_at BETWEEN $3 AND $4
-        )::BIGINT AS timed_out
+        COUNT(*)::BIGINT AS workflow_starts
     FROM harvest_workflow_executions w
     WHERE w.shard_id = $1::INT4
-      AND (
-          w.started_at BETWEEN $3 AND $4
-          OR w.completed_at BETWEEN $3 AND $4
-      )
+      AND w.started_at BETWEEN $3 AND $4
+    GROUP BY 1
+),
+terminal_counts AS (
+    SELECT
+        {group_key_expr} AS grp,
+        COUNT(*) FILTER (WHERE e.event_type = 'WorkflowCompleted')::BIGINT AS completed,
+        COUNT(*) FILTER (WHERE e.event_type = 'WorkflowFailed')::BIGINT AS failed,
+        COUNT(*) FILTER (
+            WHERE e.event_type = 'WorkflowCancelled' AND w.state = 'CANCELLED'
+        )::BIGINT AS cancelled,
+        COUNT(*) FILTER (WHERE e.event_type = 'WorkflowExecutionTimedOut')::BIGINT AS timed_out
+    FROM harvest_events e
+    INNER JOIN harvest_workflow_executions w ON w.id = e.workflow_exec_id
+    WHERE w.shard_id = $1::INT4
+      AND e.event_type IN (
+        'WorkflowCompleted', 'WorkflowFailed', 'WorkflowCancelled', 'WorkflowExecutionTimedOut'
+    )
+      AND e.timestamp BETWEEN $3 AND $4
     GROUP BY 1
 ),
 activity_events AS (
@@ -240,34 +258,34 @@ activity_events AS (
         e.workflow_exec_id,
         e.event_type,
         e.event_data #>> '{{data,activity_id}}' AS activity_id,
-        e.timestamp
+        e.timestamp,
+        {group_key_expr} AS grp
     FROM harvest_events e
-    WHERE e.event_type IN (
+    INNER JOIN harvest_workflow_executions w ON w.id = e.workflow_exec_id
+    WHERE w.shard_id = $1::INT4
+      AND e.event_type IN (
         'ActivityStarted', 'ActivityCompleted', 'ActivityFailed', 'ActivityTimedOut'
     )
       AND e.timestamp BETWEEN $3 AND $4
 ),
 activity_counts AS (
     SELECT
-        {group_key_expr} AS grp,
+        ae.grp,
         COUNT(*) FILTER (WHERE ae.event_type = 'ActivityStarted')::BIGINT AS activity_executions,
         COUNT(*) FILTER (
             WHERE ae.event_type IN ('ActivityFailed', 'ActivityTimedOut')
         )::BIGINT AS activity_executions_failed
     FROM activity_events ae
-    INNER JOIN harvest_workflow_executions w ON w.id = ae.workflow_exec_id
-    WHERE w.shard_id = $1::INT4
     GROUP BY 1
 ),
 activity_compute AS (
     SELECT
-        {group_key_expr} AS grp,
+        t.grp,
         COALESCE(
             SUM(EXTRACT(EPOCH FROM (t.timestamp - s.last_started_at))),
             0
         )::DOUBLE PRECISION AS activity_compute_seconds
     FROM activity_events t
-    INNER JOIN harvest_workflow_executions w ON w.id = t.workflow_exec_id
     INNER JOIN LATERAL (
         SELECT MAX(e2.timestamp) AS last_started_at
         FROM harvest_events e2
@@ -277,22 +295,22 @@ activity_compute AS (
           AND e2.timestamp <= t.timestamp
     ) s ON s.last_started_at IS NOT NULL
     WHERE t.event_type IN ('ActivityCompleted', 'ActivityFailed', 'ActivityTimedOut')
-      AND w.shard_id = $1::INT4
     GROUP BY 1
 )
 SELECT
-    COALESCE(ec.grp, ac.grp, cp.grp)::TEXT AS grp,
-    COALESCE(ec.workflow_starts, 0)::BIGINT AS workflow_starts,
-    COALESCE(ec.completed, 0)::BIGINT AS completed,
-    COALESCE(ec.failed, 0)::BIGINT AS failed,
-    COALESCE(ec.cancelled, 0)::BIGINT AS cancelled,
-    COALESCE(ec.timed_out, 0)::BIGINT AS timed_out,
+    COALESCE(es.grp, tc.grp, ac.grp, cp.grp)::TEXT AS grp,
+    COALESCE(es.workflow_starts, 0)::BIGINT AS workflow_starts,
+    COALESCE(tc.completed, 0)::BIGINT AS completed,
+    COALESCE(tc.failed, 0)::BIGINT AS failed,
+    COALESCE(tc.cancelled, 0)::BIGINT AS cancelled,
+    COALESCE(tc.timed_out, 0)::BIGINT AS timed_out,
     COALESCE(ac.activity_executions, 0)::BIGINT AS activity_executions,
     COALESCE(ac.activity_executions_failed, 0)::BIGINT AS activity_executions_failed,
     COALESCE(cp.activity_compute_seconds, 0)::DOUBLE PRECISION AS activity_compute_seconds
-FROM execution_counts ec
-FULL OUTER JOIN activity_counts ac ON ac.grp = ec.grp
-FULL OUTER JOIN activity_compute cp ON cp.grp = COALESCE(ec.grp, ac.grp)
+FROM execution_starts es
+FULL OUTER JOIN terminal_counts tc ON tc.grp = es.grp
+FULL OUTER JOIN activity_counts ac ON ac.grp = COALESCE(es.grp, tc.grp)
+FULL OUTER JOIN activity_compute cp ON cp.grp = COALESCE(es.grp, tc.grp, ac.grp)
 ORDER BY 1
 "
     )
@@ -441,6 +459,25 @@ mod tests {
         assert!(
             !sql.contains("activity_terminal"),
             "activity_terminal CTE must be gone after the F10 merge"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn usage_sql_derives_terminal_outcomes_from_durable_events_not_row_state() {
+        let sql = usage_sql();
+        assert!(
+            sql.contains("'WorkflowCompleted'")
+                && sql.contains("'WorkflowFailed'")
+                && sql.contains("'WorkflowCancelled'")
+                && sql.contains("'WorkflowExecutionTimedOut'"),
+            "terminal_counts must scan the four durable terminal event types"
+        );
+        assert!(
+            !sql.contains("w.completed_at BETWEEN"),
+            "terminal outcomes must no longer be windowed by the mutable \
+             completed_at column, so a redrive that clears it cannot erase \
+             a historical failure"
         );
     }
 }

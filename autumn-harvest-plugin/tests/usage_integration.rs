@@ -420,6 +420,49 @@ async fn window_wider_than_ceiling_is_bad_request_naming_ceiling() {
     assert!(msg.contains("90"), "error should name the ceiling: {msg}");
 }
 
+/// Insert a `WorkflowCompleted`/`WorkflowFailed`/`WorkflowCancelled`/
+/// `WorkflowExecutionTimedOut` event on `exec_id` at an explicit
+/// `timestamp`, mirroring the adjacently-tagged `WorkflowEvent` JSON shape.
+/// The usage query only inspects `event_type`, so a minimal empty `data`
+/// object is sufficient.
+async fn seed_terminal_event(
+    url: &str,
+    exec_id: Uuid,
+    event_id: i32,
+    event_type: &str,
+    timestamp: DateTime<Utc>,
+) {
+    use autumn_harvest::schema::harvest_events::dsl;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(url)
+        .await
+        .expect("connect");
+    let event_data = serde_json::json!({
+        "type": event_type,
+        "data": {}
+    });
+    let row = NewHarvestEvent {
+        workflow_exec_id: exec_id,
+        event_id,
+        event_type,
+        event_data,
+    };
+    diesel::insert_into(autumn_harvest::schema::harvest_events::table)
+        .values(&row)
+        .execute(&mut conn)
+        .await
+        .expect("insert event");
+    diesel::update(
+        dsl::harvest_events
+            .filter(dsl::workflow_exec_id.eq(exec_id))
+            .filter(dsl::event_id.eq(event_id)),
+    )
+    .set(dsl::timestamp.eq(timestamp))
+    .execute(&mut conn)
+    .await
+    .expect("force event timestamp");
+}
+
 #[tokio::test]
 async fn default_group_by_is_workflow_name_and_counts_starts() {
     let (url, _c) = setup_single_shard().await;
@@ -447,16 +490,26 @@ async fn default_group_by_is_workflow_name_and_counts_starts() {
 }
 
 #[tokio::test]
-async fn terminal_outcomes_counted_by_completed_at_and_state() {
+async fn terminal_outcomes_counted_by_durable_terminal_events() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
     let now = Utc::now();
     let started = now - Duration::hours(2);
 
-    seed_execution(&url, 0, "onboarding", "COMPLETED", started, Some(now), None).await;
-    seed_execution(&url, 0, "onboarding", "FAILED", started, Some(now), None).await;
-    seed_execution(&url, 0, "onboarding", "CANCELLED", started, Some(now), None).await;
-    seed_execution(&url, 0, "onboarding", "TIMED_OUT", started, Some(now), None).await;
+    let completed_id =
+        seed_execution(&url, 0, "onboarding", "COMPLETED", started, Some(now), None).await;
+    seed_terminal_event(&url, completed_id, 1, "WorkflowCompleted", now).await;
+
+    let failed_id = seed_execution(&url, 0, "onboarding", "FAILED", started, Some(now), None).await;
+    seed_terminal_event(&url, failed_id, 1, "WorkflowFailed", now).await;
+
+    let cancelled_id =
+        seed_execution(&url, 0, "onboarding", "CANCELLED", started, Some(now), None).await;
+    seed_terminal_event(&url, cancelled_id, 1, "WorkflowCancelled", now).await;
+
+    let timed_out_id =
+        seed_execution(&url, 0, "onboarding", "TIMED_OUT", started, Some(now), None).await;
+    seed_terminal_event(&url, timed_out_id, 1, "WorkflowExecutionTimedOut", now).await;
 
     let (status, body) = get_json(
         &app,
@@ -477,6 +530,97 @@ async fn terminal_outcomes_counted_by_completed_at_and_state() {
     // These executions started outside the query window, so they must not
     // be double-counted as workflow_starts.
     assert_eq!(onboarding["workflow_starts"], 0);
+}
+
+#[tokio::test]
+async fn redriven_failure_still_counted_in_the_window_it_occurred() {
+    // Locks in the PR #895 review fix: usage-report terminal outcomes are
+    // immutable historical facts derived from durable events, not mutable
+    // row-state snapshots. A DLQ redrive (reactivate_failed_execution)
+    // clears a FAILED row's state/completed_at but never rewrites or
+    // removes the original WorkflowFailed event, so a report re-run for
+    // the window the failure actually occurred in must still show it.
+    let (url, _c) = setup_single_shard().await;
+    let app = single_app(&url);
+    let now = Utc::now();
+    let started = now - Duration::hours(2);
+
+    let exec_id = seed_execution(&url, 0, "onboarding", "FAILED", started, Some(now), None).await;
+    seed_terminal_event(&url, exec_id, 1, "WorkflowFailed", now).await;
+
+    // Simulate a redrive: the row flips back to RUNNING and completed_at is
+    // cleared, mirroring exactly what reactivate_failed_execution does to
+    // the row, without touching the already-recorded WorkflowFailed event.
+    {
+        use autumn_harvest::schema::harvest_workflow_executions::dsl;
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+            .await
+            .expect("connect");
+        diesel::update(dsl::harvest_workflow_executions.filter(dsl::id.eq(exec_id)))
+            .set((
+                dsl::state.eq("RUNNING"),
+                dsl::completed_at.eq(None::<DateTime<Utc>>),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("simulate redrive");
+    }
+
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/admin/usage?from={}&to={}",
+            (now - Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            (now + Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = body["groups"].as_array().unwrap();
+    let onboarding = groups.iter().find(|g| g["group"] == "onboarding").unwrap();
+    assert_eq!(
+        onboarding["failed"], 1,
+        "the historical WorkflowFailed event must still be counted after redrive clears the row"
+    );
+}
+
+#[tokio::test]
+async fn terminated_execution_reusing_workflow_cancelled_event_is_not_counted_as_cancelled() {
+    // terminate_workflow_execution (issue #504) reuses the same
+    // WorkflowCancelled event type as a genuine cancel (no new event
+    // variant) but seals the row to TERMINATED, not CANCELLED. The
+    // `cancelled` counter must not conflate the two.
+    let (url, _c) = setup_single_shard().await;
+    let app = single_app(&url);
+    let now = Utc::now();
+    let started = now - Duration::hours(2);
+
+    let exec_id = seed_execution(
+        &url,
+        0,
+        "onboarding",
+        "TERMINATED",
+        started,
+        Some(now),
+        None,
+    )
+    .await;
+    seed_terminal_event(&url, exec_id, 1, "WorkflowCancelled", now).await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/admin/usage?from={}&to={}",
+            (now - Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            (now + Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = body["groups"].as_array().unwrap();
+    if let Some(onboarding) = groups.iter().find(|g| g["group"] == "onboarding") {
+        assert_eq!(onboarding["cancelled"], 0);
+    }
 }
 
 #[tokio::test]
