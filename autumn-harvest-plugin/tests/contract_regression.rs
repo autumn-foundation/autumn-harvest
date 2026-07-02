@@ -98,6 +98,32 @@ fn workflow_count_route_is_classified() {
     );
 }
 
+/// `GET /admin/usage` (issue #596) must have an entry in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// Mirrors `workflow_count_route_is_classified`: the corresponding
+/// `usage_report_route_is_classified_read_only` test in `audit.rs` only
+/// cross-checks `CLASSIFIED_ROUTES` against `ALL_MUTATION_ROUTES`/
+/// `EXCLUDED_ROUTES` internally, never against the live router, so it stays
+/// green even if `/admin/usage` were removed from `harvest_api_router`
+/// entirely. This test closes that gap.
+#[test]
+fn usage_route_is_classified() {
+    use autumn_harvest::audit::CLASSIFIED_ROUTES;
+
+    let route = "GET /admin/usage";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES.iter().any(|(r, _)| *r == route),
+        "{route} must have an entry in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
 /// Every route in the contract must carry all required metadata fields.
 #[test]
 fn contract_routes_have_required_fields() {
