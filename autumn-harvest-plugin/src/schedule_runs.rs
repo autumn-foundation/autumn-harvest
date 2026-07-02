@@ -29,17 +29,14 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::shard_fanout::FanoutStatus;
+
 /// Cross-shard completeness of a run-history response.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunsReportStatus {
-    /// Every expected shard was inspected.
-    Complete,
-    /// At least one shard was inspected and at least one was unavailable.
-    Partial,
-    /// No shard could be inspected.
-    Unavailable,
-}
+///
+/// A type alias onto the shared [`FanoutStatus`] (rather than its own enum)
+/// so the complete/partial/unavailable derivation rule lives in exactly one
+/// place, alongside `workflow_reachability`'s and `workflow_count`'s reports.
+pub type RunsReportStatus = FanoutStatus;
 
 /// Per-shard run + summary observation fed into [`build_runs_response`].
 #[derive(Debug, Clone)]
@@ -327,13 +324,7 @@ pub fn build_runs_response(
         .collect();
     shards.sort_by_key(|s| s.shard_id);
 
-    let status = if inspected == 0 {
-        RunsReportStatus::Unavailable
-    } else if unavailable > 0 {
-        RunsReportStatus::Partial
-    } else {
-        RunsReportStatus::Complete
-    };
+    let status = RunsReportStatus::from_counts(inspected, unavailable);
 
     // Sum each shard's scheduled-origin per-state counts into the cadence summary.
     let mut summary = ScheduleRunSummary::default();

@@ -1464,6 +1464,48 @@ fn render_group_key(params: &DlqAggregateParams, key: &[Option<String>]) -> serd
     serde_json::Value::Object(obj)
 }
 
+/// Bounded-cardinality "top-N + other" rollup shared by every grouped
+/// aggregation read model in this codebase (DLQ aggregation here, and the
+/// workflow-count fleet snapshot in `autumn-harvest-plugin`).
+///
+/// `groups` is sorted descending by `count_of` (ties broken by `key`,
+/// ascending) and truncated to `limit`. When the dropped tail's summed count
+/// is positive, it is folded into one rollup entry appended via `make_other`
+/// and the returned `bool` is `true`; a truncation that only drops zero-count
+/// entries reports `false` and appends no rollup row (this never happens for
+/// real `COUNT(*)` rows, which are always `>= 1`, but keeps the helper exact
+/// for any future caller with synthetic zero-count groups). Per-group counts
+/// always reconcile to the pre-rollup total either way.
+#[must_use]
+pub fn rollup_top_n<K: Ord, A, T>(
+    mut groups: Vec<(K, A)>,
+    limit: usize,
+    count_of: impl Fn(&A) -> i64,
+    to_entry: impl Fn(K, A) -> T,
+    make_other: impl FnOnce(i64) -> T,
+) -> (Vec<T>, bool) {
+    groups.sort_by(|a, b| {
+        count_of(&b.1)
+            .cmp(&count_of(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    if groups.len() <= limit {
+        return (
+            groups.into_iter().map(|(k, a)| to_entry(k, a)).collect(),
+            false,
+        );
+    }
+
+    let other_count: i64 = groups[limit..].iter().map(|(_, a)| count_of(a)).sum();
+    let mut out: Vec<T> = groups.drain(..limit).map(|(k, a)| to_entry(k, a)).collect();
+    let truncated = other_count > 0;
+    if truncated {
+        out.push(make_other(other_count));
+    }
+    (out, truncated)
+}
+
 /// Merge per-shard partial aggregates into a single response.
 ///
 /// Counts sum across shards; `first_seen`/`last_seen` take the global min/max;
@@ -1505,50 +1547,36 @@ pub fn merge_dlq_aggregates(
         }
     }
 
-    let mut groups: Vec<DlqRawGroup> = merged.into_values().collect();
-    groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
-
+    let groups: Vec<(Vec<Option<String>>, DlqRawGroup)> = merged
+        .into_values()
+        .map(|group| (group.key.clone(), group))
+        .collect();
     let limit = params.limit_groups as usize;
-    let mut out = Vec::new();
-    let mut truncated = false;
 
-    if groups.len() > limit {
-        let other_count: i64 = groups[limit..].iter().map(|g| g.count).sum();
-        for group in &groups[..limit] {
-            out.push(DlqGroup {
-                key: render_group_key(params, &group.key),
-                count: group.count,
-                first_seen: group.first_seen,
-                last_seen: group.last_seen,
-                sample_dead_letter_ids: group.sample_ids.clone(),
-            });
-        }
-        if other_count > 0 {
-            out.push(DlqGroup {
-                key: serde_json::json!({ "_other": true }),
-                count: other_count,
-                first_seen: None,
-                last_seen: None,
-                sample_dead_letter_ids: Vec::new(),
-            });
-            truncated = true;
-        }
-    } else {
-        for group in &groups {
-            out.push(DlqGroup {
-                key: render_group_key(params, &group.key),
-                count: group.count,
-                first_seen: group.first_seen,
-                last_seen: group.last_seen,
-                sample_dead_letter_ids: group.sample_ids.clone(),
-            });
-        }
-    }
+    let (groups, truncated) = rollup_top_n(
+        groups,
+        limit,
+        |group| group.count,
+        |key, group| DlqGroup {
+            key: render_group_key(params, &key),
+            count: group.count,
+            first_seen: group.first_seen,
+            last_seen: group.last_seen,
+            sample_dead_letter_ids: group.sample_ids,
+        },
+        |other_count| DlqGroup {
+            key: serde_json::json!({ "_other": true }),
+            count: other_count,
+            first_seen: None,
+            last_seen: None,
+            sample_dead_letter_ids: Vec::new(),
+        },
+    );
 
     DlqAggregateResponse {
         total,
         filtered_total,
-        groups: out,
+        groups,
         truncated,
     }
 }
