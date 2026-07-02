@@ -28,6 +28,14 @@ CREATE INDEX IF NOT EXISTS idx_harvest_events_workflow_terminal_type_ts
         'WorkflowExecutionTimedOut'
     );
 
+-- reset_terminated_execs CTE (PR #895 review, cancelled/terminated
+-- disambiguation fix): `event_type = 'WorkflowResetTerminated'`, looked up
+-- by workflow_exec_id (window-independent — a reset can happen long after
+-- the original terminal event's window).
+CREATE INDEX IF NOT EXISTS idx_harvest_events_reset_terminated
+    ON harvest_events (event_type, workflow_exec_id)
+    WHERE event_type = 'WorkflowResetTerminated';
+
 -- activity_events CTE (merged by issue #596's F10 fix): `event_type IN
 -- ('ActivityStarted','ActivityCompleted','ActivityFailed','ActivityTimedOut')
 -- AND timestamp BETWEEN $3 AND $4`. Keep the event_type list in sync with

@@ -29,20 +29,34 @@
 //!   `WorkflowCompleted` event is counted separately in whichever window
 //!   *that* event falls in — each terminal event is one billable/reportable
 //!   occurrence, not a mutually-exclusive final-state bucket. `cancelled` is
-//!   the one exception that still consults the current row state: `terminate`
-//!   (issue #504) reuses the same `WorkflowCancelled` event type as a genuine
-//!   cancel (no new event variant), so a `WorkflowCancelled` event only counts
-//!   toward `cancelled` when the execution's current `state` is `CANCELLED`
-//!   (not `TERMINATED`) — safe because nothing un-cancels or un-terminates a
-//!   row (only `FAILED` has a redrive path), so this join is immutable in
-//!   practice. `TERMINATED` and `CONTINUED_AS_NEW` are intentionally not
-//!   broken out (the issue's AC lists exactly these four terminal buckets).
+//!   the one bucket that still consults the row: `terminate` (issue #504)
+//!   reuses the same `WorkflowCancelled` event type as a genuine cancel (no
+//!   new event variant), so a `WorkflowCancelled` event only counts toward
+//!   `cancelled` when the execution did *not* end up sealed `TERMINATED` by
+//!   a genuine terminate. Reaching `TERMINATED` by a *reset* instead (issue
+//!   #366's DAG retry / #148's reset-from-failed, `allow_terminal_source`)
+//!   does **not** disqualify it: a reset seal always appends a
+//!   `WorkflowResetTerminated` event on the source execution (unlike
+//!   `terminate_workflow_execution`, which never does), so the query can
+//!   tell "genuinely terminated" apart from "this old cancelled run was
+//!   later reforked for retry" and keep counting the latter — otherwise a
+//!   reset would retroactively erase a historical cancellation from past
+//!   report windows, the same immutability bug as the `failed` fix above.
+//!   `TERMINATED` and `CONTINUED_AS_NEW` are intentionally not broken out
+//!   (the issue's AC lists exactly these four terminal buckets).
 //! - `activity_executions`: count of `ActivityStarted` events in the window
 //!   (one per dispatch attempt — retries reuse the same `activity_id` but
 //!   each attempt appends a fresh `ActivityStarted`).
 //! - `activity_executions_failed`: count of terminal `ActivityFailed` +
-//!   `ActivityTimedOut` events in the window (non-final retry attempts do
-//!   not append an event, so this is exhausted-retry-or-timeout only).
+//!   `ActivityTimedOut` events in the window that have a matching
+//!   `ActivityStarted` (non-final retry attempts do not append an event, so
+//!   this is exhausted-retry-or-timeout only). The start-match requirement
+//!   excludes external activities whose `ActivityTimedOut` is appended by
+//!   `enforce_external_task_timeouts` with no `ActivityStarted` at all
+//!   (external activities are dispatched via `ActivityAwaitingExternal`,
+//!   never claimed/started by a worker) — otherwise they would be charged
+//!   as a failure despite `activity_executions`/`activity_compute_seconds`
+//!   correctly excluding them below.
 //! - `activity_compute_seconds`: for each activity whose terminal event
 //!   (`ActivityCompleted`/`ActivityFailed`/`ActivityTimedOut`) falls in the
 //!   window, the wall-clock span from that activity's most recent
@@ -222,6 +236,7 @@ fn group_key_expr() -> String {
 }
 
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_lines)]
 fn usage_sql() -> String {
     let group_key_expr = group_key_expr();
     format!(
@@ -235,17 +250,34 @@ WITH execution_starts AS (
       AND w.started_at BETWEEN $3 AND $4
     GROUP BY 1
 ),
+reset_terminated_execs AS (
+    -- Executions later sealed TERMINATED by a workflow reset (issue #366's
+    -- DAG retry / #148's reset-from-failed, `allow_terminal_source`), which
+    -- is distinct from a genuine `terminate` (issue #504): a reset seal
+    -- always appends `WorkflowResetTerminated` on the source execution,
+    -- while `terminate_workflow_execution` never does. Used below so a
+    -- WorkflowCancelled event's `cancelled` classification survives the
+    -- source row being later reforked, instead of silently flipping to
+    -- uncounted once the row's state moves from CANCELLED to TERMINATED.
+    SELECT DISTINCT e.workflow_exec_id
+    FROM harvest_events e
+    INNER JOIN harvest_workflow_executions w ON w.id = e.workflow_exec_id
+    WHERE w.shard_id = $1::INT4
+      AND e.event_type = 'WorkflowResetTerminated'
+),
 terminal_counts AS (
     SELECT
         {group_key_expr} AS grp,
         COUNT(*) FILTER (WHERE e.event_type = 'WorkflowCompleted')::BIGINT AS completed,
         COUNT(*) FILTER (WHERE e.event_type = 'WorkflowFailed')::BIGINT AS failed,
         COUNT(*) FILTER (
-            WHERE e.event_type = 'WorkflowCancelled' AND w.state = 'CANCELLED'
+            WHERE e.event_type = 'WorkflowCancelled'
+              AND NOT (w.state = 'TERMINATED' AND rt.workflow_exec_id IS NULL)
         )::BIGINT AS cancelled,
         COUNT(*) FILTER (WHERE e.event_type = 'WorkflowExecutionTimedOut')::BIGINT AS timed_out
     FROM harvest_events e
     INNER JOIN harvest_workflow_executions w ON w.id = e.workflow_exec_id
+    LEFT JOIN reset_terminated_execs rt ON rt.workflow_exec_id = e.workflow_exec_id
     WHERE w.shard_id = $1::INT4
       AND e.event_type IN (
         'WorkflowCompleted', 'WorkflowFailed', 'WorkflowCancelled', 'WorkflowExecutionTimedOut'
@@ -268,49 +300,51 @@ activity_events AS (
     )
       AND e.timestamp BETWEEN $3 AND $4
 ),
-activity_counts AS (
+activity_metrics AS (
     SELECT
         ae.grp,
         COUNT(*) FILTER (WHERE ae.event_type = 'ActivityStarted')::BIGINT AS activity_executions,
+        -- Requires a matching ActivityStarted (via the same unwindowed
+        -- lookback used by activity_compute_seconds below), so an external
+        -- activity's ActivityTimedOut (enforce_external_task_timeouts
+        -- appends it with no ActivityStarted — external activities are
+        -- dispatched via ActivityAwaitingExternal, never claimed/started by
+        -- a worker) is excluded, matching the module doc's stated exclusion
+        -- of externally-completed/no-worker-compute activities.
         COUNT(*) FILTER (
             WHERE ae.event_type IN ('ActivityFailed', 'ActivityTimedOut')
-        )::BIGINT AS activity_executions_failed
-    FROM activity_events ae
-    GROUP BY 1
-),
-activity_compute AS (
-    SELECT
-        t.grp,
+              AND s.last_started_at IS NOT NULL
+        )::BIGINT AS activity_executions_failed,
         COALESCE(
-            SUM(EXTRACT(EPOCH FROM (t.timestamp - s.last_started_at))),
+            SUM(EXTRACT(EPOCH FROM (ae.timestamp - s.last_started_at))) FILTER (
+                WHERE ae.event_type IN ('ActivityCompleted', 'ActivityFailed', 'ActivityTimedOut')
+            ),
             0
         )::DOUBLE PRECISION AS activity_compute_seconds
-    FROM activity_events t
-    INNER JOIN LATERAL (
+    FROM activity_events ae
+    LEFT JOIN LATERAL (
         SELECT MAX(e2.timestamp) AS last_started_at
         FROM harvest_events e2
-        WHERE e2.workflow_exec_id = t.workflow_exec_id
+        WHERE e2.workflow_exec_id = ae.workflow_exec_id
           AND e2.event_type = 'ActivityStarted'
-          AND e2.event_data #>> '{{data,activity_id}}' = t.activity_id
-          AND e2.timestamp <= t.timestamp
-    ) s ON s.last_started_at IS NOT NULL
-    WHERE t.event_type IN ('ActivityCompleted', 'ActivityFailed', 'ActivityTimedOut')
+          AND e2.event_data #>> '{{data,activity_id}}' = ae.activity_id
+          AND e2.timestamp <= ae.timestamp
+    ) s ON true
     GROUP BY 1
 )
 SELECT
-    COALESCE(es.grp, tc.grp, ac.grp, cp.grp)::TEXT AS grp,
+    COALESCE(es.grp, tc.grp, am.grp)::TEXT AS grp,
     COALESCE(es.workflow_starts, 0)::BIGINT AS workflow_starts,
     COALESCE(tc.completed, 0)::BIGINT AS completed,
     COALESCE(tc.failed, 0)::BIGINT AS failed,
     COALESCE(tc.cancelled, 0)::BIGINT AS cancelled,
     COALESCE(tc.timed_out, 0)::BIGINT AS timed_out,
-    COALESCE(ac.activity_executions, 0)::BIGINT AS activity_executions,
-    COALESCE(ac.activity_executions_failed, 0)::BIGINT AS activity_executions_failed,
-    COALESCE(cp.activity_compute_seconds, 0)::DOUBLE PRECISION AS activity_compute_seconds
+    COALESCE(am.activity_executions, 0)::BIGINT AS activity_executions,
+    COALESCE(am.activity_executions_failed, 0)::BIGINT AS activity_executions_failed,
+    COALESCE(am.activity_compute_seconds, 0)::DOUBLE PRECISION AS activity_compute_seconds
 FROM execution_starts es
 FULL OUTER JOIN terminal_counts tc ON tc.grp = es.grp
-FULL OUTER JOIN activity_counts ac ON ac.grp = COALESCE(es.grp, tc.grp)
-FULL OUTER JOIN activity_compute cp ON cp.grp = COALESCE(es.grp, tc.grp, ac.grp)
+FULL OUTER JOIN activity_metrics am ON am.grp = COALESCE(es.grp, tc.grp)
 ORDER BY 1
 "
     )
@@ -478,6 +512,38 @@ mod tests {
             "terminal outcomes must no longer be windowed by the mutable \
              completed_at column, so a redrive that clears it cannot erase \
              a historical failure"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn usage_sql_reset_terminated_execs_disambiguates_cancel_from_terminate() {
+        let sql = usage_sql();
+        assert!(
+            sql.contains("reset_terminated_execs") && sql.contains("'WorkflowResetTerminated'"),
+            "cancelled must not be disqualified just because a later reset \
+             sealed the row to TERMINATED"
+        );
+        assert!(
+            !sql.contains("w.state = 'CANCELLED'"),
+            "the cancelled filter must no longer hinge on the row still \
+             being CANCELLED, since a reset can move it to TERMINATED"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn usage_sql_activity_failed_count_requires_a_matching_start() {
+        let sql = usage_sql();
+        assert!(
+            sql.contains("activity_metrics") && !sql.contains("activity_counts"),
+            "activity_counts must be merged into activity_metrics so the \
+             failed count can share the started-lookback LATERAL join"
+        );
+        assert!(
+            sql.contains("s.last_started_at IS NOT NULL"),
+            "activity_executions_failed must require a matching ActivityStarted, \
+             excluding external activities whose ActivityTimedOut has none"
         );
     }
 }

@@ -624,6 +624,101 @@ async fn terminated_execution_reusing_workflow_cancelled_event_is_not_counted_as
 }
 
 #[tokio::test]
+async fn reset_terminated_cancelled_execution_still_counted_as_cancelled() {
+    // PR #895 review (chatgpt-codex-connector): a DAG retry/reset with
+    // allow_terminal_source can seal a CANCELLED source execution to
+    // TERMINATED (reset.rs's sealable_states). Because that reset also
+    // appends WorkflowResetTerminated on the source execution -- unlike a
+    // genuine terminate, which never does -- the cancelled counter must
+    // keep counting the original WorkflowCancelled event instead of losing
+    // it once the row moves off CANCELLED.
+    let (url, _c) = setup_single_shard().await;
+    let app = single_app(&url);
+    let now = Utc::now();
+    let started = now - Duration::hours(2);
+
+    let exec_id = seed_execution(
+        &url,
+        0,
+        "onboarding",
+        "TERMINATED",
+        started,
+        Some(now),
+        None,
+    )
+    .await;
+    seed_terminal_event(&url, exec_id, 1, "WorkflowCancelled", now).await;
+    seed_terminal_event(
+        &url,
+        exec_id,
+        2,
+        "WorkflowResetTerminated",
+        now + Duration::minutes(5),
+    )
+    .await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/admin/usage?from={}&to={}",
+            (now - Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            (now + Duration::minutes(30)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = body["groups"].as_array().unwrap();
+    let onboarding = groups.iter().find(|g| g["group"] == "onboarding").unwrap();
+    assert_eq!(
+        onboarding["cancelled"], 1,
+        "the historical cancellation must survive the later reset seal"
+    );
+}
+
+#[tokio::test]
+async fn external_activity_timeout_without_a_start_is_not_counted_as_failed() {
+    // PR #895 review (chatgpt-codex-connector): enforce_external_task_timeouts
+    // appends ActivityTimedOut for external activities that never emit
+    // ActivityStarted (they're dispatched via ActivityAwaitingExternal, never
+    // claimed by a worker). activity_executions_failed must require a
+    // matching start, same as activity_compute_seconds already does.
+    let (url, _c) = setup_single_shard().await;
+    let app = single_app(&url);
+    let now = Utc::now();
+    let started = now - Duration::hours(1);
+
+    let exec_id = seed_execution(&url, 0, "onboarding", "RUNNING", started, None, None).await;
+    let activity_id = Uuid::new_v4();
+    seed_activity_event(
+        &url,
+        exec_id,
+        1,
+        "ActivityTimedOut",
+        activity_id,
+        started + Duration::minutes(10),
+    )
+    .await;
+
+    let (status, body) = get_json(
+        &app,
+        &format!(
+            "/admin/usage?from={}&to={}",
+            (started - Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            (now + Duration::minutes(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = body["groups"].as_array().unwrap();
+    let onboarding = groups.iter().find(|g| g["group"] == "onboarding").unwrap();
+    assert_eq!(
+        onboarding["activity_executions_failed"], 0,
+        "an ActivityTimedOut with no matching ActivityStarted must not be counted as a failure"
+    );
+    assert_eq!(onboarding["activity_compute_seconds"], 0.0);
+}
+
+#[tokio::test]
 async fn search_attr_group_by_buckets_missing_key_as_unattributed() {
     let (url, _c) = setup_single_shard().await;
     let app = single_app(&url);
