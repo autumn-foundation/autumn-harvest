@@ -394,6 +394,17 @@ pub struct TunedSlotRuntime {
     /// shrink) — `resize_toward`'s grow path is permit-count-aware and
     /// correctly releases only part of an entry when needed.
     withheld: Vec<OwnedSemaphorePermit>,
+    /// The most recently requested target, independent of how much of it
+    /// has actually been achieved (issue #548 review). A shrink that can't
+    /// fully land in one call — every slot at the current target is
+    /// occupied by in-flight work, so no permit is free to withhold — must
+    /// not be silently forgotten just because a *later* tick's fresh
+    /// observation no longer looks saturated: `tick_one` derives each new
+    /// tick's target from this field (not from `live_target`), so
+    /// `resize_toward` keeps retrying the same standing intent on every
+    /// call until it is actually reached, rather than only on calls that
+    /// happen to repeat an unchanged `desired` argument.
+    desired_target: usize,
     min_slots: usize,
     max_slots: usize,
 }
@@ -438,6 +449,7 @@ impl TunedSlotRuntime {
             semaphore,
             live_target: Arc::new(AtomicUsize::new(actual_target)),
             withheld,
+            desired_target: actual_target,
             min_slots,
             max_slots,
         }
@@ -455,14 +467,26 @@ impl TunedSlotRuntime {
         self.live_target.load(Ordering::Relaxed)
     }
 
+    /// The most recently requested target (issue #548 review), regardless of
+    /// how much of it has actually been achieved. Callers computing the next
+    /// tick's target should build on this value rather than [`Self::live_target`]
+    /// so an unmet shrink or grow keeps being retried instead of being
+    /// silently dropped once a later observation stops requesting it.
+    #[must_use]
+    pub const fn desired_target(&self) -> usize {
+        self.desired_target
+    }
+
     /// Move the live target toward `desired` (already band-clamped by the
     /// caller), growing by releasing withheld permits or shrinking by
     /// opportunistically re-acquiring free ones. Never blocks and never
     /// revokes a permit held by an in-flight task — a shrink that cannot
     /// fully reach `desired` this tick will keep trying on subsequent calls
-    /// as permits are returned.
+    /// as permits are returned, since `desired` is remembered in
+    /// [`Self::desired_target`] independent of what this call achieves.
     pub fn resize_toward(&mut self, desired: usize) -> usize {
         let desired = desired.clamp(self.min_slots, self.max_slots);
+        self.desired_target = desired;
         let current = self.live_target();
 
         if desired > current {
@@ -514,6 +538,7 @@ impl TunedSlotRuntime {
     pub fn release_all_withheld(&mut self) {
         self.withheld.clear();
         self.live_target.store(self.max_slots, Ordering::Relaxed);
+        self.desired_target = self.max_slots;
     }
 }
 
@@ -560,8 +585,16 @@ fn tick_one(
     };
 
     let action = tuner.decide(&observations);
+    // Base the next target on the *desired* target, not the achieved
+    // `current_target` (issue #548 review): if an earlier shrink couldn't
+    // fully land because every slot was occupied at the time, the unmet
+    // portion must not be dropped just because this tick's fresh
+    // observation no longer looks saturated. Building on `desired_target`
+    // means `resize_toward` keeps retrying the same standing intent (a
+    // fresh `Hold` re-requests the same value; a fresh `Shrink` compounds
+    // on top of it) until it is actually reached.
     let (new_target, decision) = apply_action(
-        current_target,
+        slot.runtime.desired_target(),
         action,
         slot.runtime.min_slots,
         slot.runtime.max_slots,
@@ -1007,6 +1040,65 @@ mod tests {
         assert!(runtime.withheld.is_empty());
         assert_eq!(runtime.live_target(), 3);
         assert_eq!(runtime.live_target(), semaphore.available_permits());
+    }
+
+    #[tokio::test]
+    async fn tick_one_retries_an_unmet_shrink_after_a_later_hold_decision() {
+        // Regression test (issue #548 review): a shrink that can't fully
+        // land in one tick (every slot at the current target is occupied)
+        // must not be forgotten just because a later tick's fresh
+        // observation no longer looks saturated and reports Hold.
+        struct ScriptedTuner {
+            calls: AtomicUsize,
+        }
+        impl SlotTuner for ScriptedTuner {
+            fn decide(&self, _observations: &SlotObservations) -> SlotTunerAction {
+                if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    SlotTunerAction::Shrink(4)
+                } else {
+                    SlotTunerAction::Hold
+                }
+            }
+        }
+
+        let semaphore = Arc::new(Semaphore::new(10));
+        let runtime = TunedSlotRuntime::new(Arc::clone(&semaphore), 10, 2, 10);
+        assert_eq!(runtime.live_target(), 10);
+
+        // Simulate every slot occupied by in-flight work, held in two
+        // chunks so 4 of the 10 can be released independently later.
+        let held_6 = Arc::clone(&semaphore).try_acquire_many_owned(6).unwrap();
+        let held_4 = Arc::clone(&semaphore).try_acquire_many_owned(4).unwrap();
+
+        let tuner = ScriptedTuner {
+            calls: AtomicUsize::new(0),
+        };
+        let mut slot = TunedSlot::new_for_test(runtime, SlotType::Workflow);
+
+        // Tick 1: tuner requests Shrink(4), but no permit is free — the
+        // shrink can't land this tick.
+        let decision1 = tick_one(&mut slot, &tuner, None);
+        assert_eq!(decision1, TunerDecision::Shrink);
+        assert_eq!(slot.runtime.live_target(), 10);
+        assert_eq!(slot.runtime.desired_target(), 6);
+
+        // Tick 2: tuner now reports Hold, but permits are still all held.
+        // The unmet shrink must still be remembered.
+        let decision2 = tick_one(&mut slot, &tuner, None);
+        assert_eq!(decision2, TunerDecision::Hold);
+        assert_eq!(slot.runtime.live_target(), 10);
+        assert_eq!(slot.runtime.desired_target(), 6);
+
+        // Simulate 4 in-flight tasks completing.
+        drop(held_4);
+
+        // Tick 3: tuner still reports Hold, but the earlier shrink intent
+        // must still be honored now that permits are free to withhold.
+        let decision3 = tick_one(&mut slot, &tuner, None);
+        assert_eq!(decision3, TunerDecision::Hold);
+        assert_eq!(slot.runtime.live_target(), 6);
+
+        drop(held_6);
     }
 
     #[tokio::test]

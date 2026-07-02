@@ -9156,10 +9156,12 @@ impl Worker {
             .iter()
             .map(|s| s.as_i32())
             .collect();
-        let max_concurrency = i32::try_from(
-            self.config.max_concurrent_workflows + self.config.max_concurrent_activities,
-        )
-        .unwrap_or(i32::MAX);
+        // See the matching comment in `register_in_fleet`: advertises the
+        // tuned ceiling so it can never diverge from the tuned
+        // in_flight_count this heartbeat reports.
+        let max_concurrency =
+            i32::try_from(self.workflow_permit_total + self.activity_permit_total)
+                .unwrap_or(i32::MAX);
         crate::workers::spawn_worker_heartbeat(
             pool.clone(),
             crate::workers::WorkerRegistration {
@@ -9334,10 +9336,14 @@ impl Worker {
             .iter()
             .map(|s| s.as_i32())
             .collect();
-        let max_concurrency = i32::try_from(
-            self.config.max_concurrent_workflows + self.config.max_concurrent_activities,
-        )
-        .unwrap_or(i32::MAX);
+        // Advertises the tuned ceiling (max_slots), not the static config
+        // value, so it never diverges from the tuned in_flight_count the
+        // heartbeat reports (issue #548 review) — byte-identical to before
+        // when no tuner is configured, since these fields equal the static
+        // config values in that case.
+        let max_concurrency =
+            i32::try_from(self.workflow_permit_total + self.activity_permit_total)
+                .unwrap_or(i32::MAX);
         let host = crate::workers::local_hostname();
         let version = env!("CARGO_PKG_VERSION");
 
