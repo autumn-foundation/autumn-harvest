@@ -833,7 +833,7 @@ pub struct HistoryPage {
 
 /// Returns `true` when a workflow execution with `exec_id` exists in the database.
 ///
-/// Cheaper than [`load_execution`] when only presence needs to be confirmed
+/// Cheaper than `load_execution` when only presence needs to be confirmed
 /// because it projects only the primary key column.
 #[cfg(feature = "db")]
 pub async fn check_execution_exists(
