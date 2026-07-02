@@ -24,6 +24,7 @@ use crate::error::{HarvestError, HarvestResult, NonDeterministicDetails, Payload
 use crate::event::WorkflowEvent;
 use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
+use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
     IdempotencyKey, TimerId, UpdateId,
@@ -742,6 +743,10 @@ pub struct WorkflowContext {
     update_registry: Mutex<UpdateRegistry>,
     /// Declarative update handlers registered via `register_declarative_update_handler`.
     declarative_updates: Mutex<std::collections::HashMap<String, crate::info::UpdateHandlerFn>>,
+    /// In-memory push-based signal handlers (issue #546), not persisted to
+    /// history. Registration is idempotent -- the first registration wins on
+    /// each replay, mirroring `update_registry`.
+    signal_registry: Mutex<SignalHandlerRegistry>,
     /// Cancellation reason captured from a `WorkflowCancelled` event in history,
     /// if any. When set, `is_cancelled()` returns true and `check_cancellation()`
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
@@ -876,8 +881,91 @@ impl WorkflowContext {
     where
         F: FnOnce(&mut HistoryMatcher) -> R,
     {
-        let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
-        f(&mut matcher)
+        let result = {
+            let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
+            f(&mut matcher)
+        };
+        self.pump_signal_handlers();
+        result
+    }
+
+    /// Dispatches every push-based signal handler whose target signal has
+    /// newly become claimable (issue #546 post-ship hardening).
+    ///
+    /// Runs after every [`match_history`](Self::match_history) call so a
+    /// handler fires exactly when the workflow's own code-driven cursor
+    /// progression passes its recorded position -- never ahead of it. An
+    /// eager, cursor-independent full-history scan (the original
+    /// `drain_signal_events`) could otherwise dispatch a handler for a
+    /// signal recorded *after* an activity or timer the workflow hadn't
+    /// reached yet in this replay cycle, silently reordering observable side
+    /// effects relative to history. [`HistoryMatcher::claim_pending_signal`]
+    /// only inspects signals already drained into `pending_signals` by the
+    /// same cursor-bound sweep every other `match_*` call opens with
+    /// (`prepare_match`), so it can never reach ahead of wherever the
+    /// workflow's code has actually driven the matcher so far.
+    ///
+    /// Claims across all registered handler names are collected and sorted
+    /// by event index *before* any dispatch, so two differently-named
+    /// handlers fire in true historical order relative to each other, not
+    /// just self-consistently within one name -- this is why registration
+    /// itself does not dispatch inline (see
+    /// [`register_and_dispatch_signal_handler`](Self::register_and_dispatch_signal_handler)):
+    /// a pump triggered from a single registration call could only ever see
+    /// the handlers registered so far, not ones about to register on the
+    /// next line.
+    fn pump_signal_handlers(&self) {
+        let names = self
+            .signal_registry
+            .lock()
+            .expect("signal_registry lock poisoned")
+            .list_names();
+        if names.is_empty() {
+            return;
+        }
+
+        let mut claims: Vec<(usize, String, Value)> = Vec::new();
+        {
+            let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
+            for name in &names {
+                for (idx, payload) in matcher.claim_pending_signal(name) {
+                    claims.push((idx, name.clone(), payload));
+                }
+            }
+        }
+        if claims.is_empty() {
+            return;
+        }
+        claims.sort_by_key(|(idx, ..)| *idx);
+
+        for (_, name, payload) in claims {
+            let handler = self
+                .signal_registry
+                .lock()
+                .expect("signal_registry lock poisoned")
+                .get(&name);
+            if let Some(handler) = handler {
+                invoke_signal_handler(&handler, &name, payload);
+            }
+        }
+    }
+
+    /// Forces one [`pump_signal_handlers`](Self::pump_signal_handlers) sweep
+    /// via [`match_history`](Self::match_history)'s post-hook.
+    ///
+    /// Every other trigger for the pump is a byproduct of some other
+    /// cursor-advancing call (an activity/timer/signal match). A workflow
+    /// cycle that registers a handler and then does nothing else that
+    /// touches history before completing would otherwise never flush a
+    /// signal already recorded and claimable at that point. The executor
+    /// calls this once per cycle, right after the handler function returns
+    /// -- and, on the strict/canary replay paths, *before* the subsequent
+    /// `history_has_unconsumed_events()` check, so a signal a registered
+    /// handler was going to claim is never mistaken for genuinely unconsumed
+    /// history (issue #546 post-ship hardening). A no-op when no handlers
+    /// are registered (the overwhelmingly common case).
+    pub(crate) fn flush_pending_signal_handlers(&self) {
+        self.match_history(|_| ());
     }
 
     pub(crate) fn is_timer_started_next(&self, timer_id: &str) -> bool {
@@ -973,6 +1061,7 @@ impl WorkflowContext {
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
+            signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
@@ -1082,6 +1171,7 @@ impl WorkflowContext {
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
+            signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
@@ -1128,6 +1218,7 @@ impl WorkflowContext {
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
             update_registry: Mutex::new(UpdateRegistry::new()),
             declarative_updates: Mutex::new(std::collections::HashMap::new()),
+            signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             cancellation_reason: None,
             strict_replay: false,
             canary_mode: false,
@@ -4539,14 +4630,7 @@ impl WorkflowContext {
         if let Some(h) = decl_handler {
             // Pass self so the handler can access ctx.state::<T>().
             return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(self, args)))
-                .map_err(|e| {
-                    let msg = e
-                        .downcast_ref::<&str>()
-                        .map(|s| (*s).to_string())
-                        .or_else(|| e.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".to_string());
-                    HarvestError::QueryHandlerPanicked(msg)
-                })?
+                .map_err(|e| HarvestError::QueryHandlerPanicked(crate::error::panic_message(e)))?
                 .map_err(HarvestError::QueryHandlerFailed);
         }
 
@@ -4905,6 +4989,206 @@ impl WorkflowContext {
         });
 
         result
+    }
+
+    // ── Signal handlers (issue #546) ────────────────────────────────────
+
+    /// Register a push-based signal handler with an untyped JSON payload.
+    ///
+    /// Unlike [`wait_for_signal`](Self::wait_for_signal), which blocks a single
+    /// specific point in the workflow body waiting for the next matching
+    /// signal, a signal handler is dispatched automatically for **every**
+    /// matching `SignalReceived` event already recorded in history at the
+    /// point of registration -- including ones delivered before the handler
+    /// existed (e.g. a signal that arrived on an earlier workflow-task cycle,
+    /// before this cycle's code reached the registration call). No signal is
+    /// silently dropped.
+    ///
+    /// Handlers are **fire-and-forget**: they run synchronously and return
+    /// nothing. There is no validator and no completion event -- that is the
+    /// `update` primitive's job (issue #140). A handler is expected to mutate
+    /// author-captured state (e.g. an `Arc<Mutex<T>>` declared at the top of
+    /// the workflow body).
+    ///
+    /// **Dispatch timing.** Registration itself only stores the handler --
+    /// it does not fire inline. Dispatch happens the next time the workflow
+    /// body makes any other history-consulting call (an activity, timer,
+    /// child workflow, another signal wait, a deterministic primitive like
+    /// `system_now`/`new_uuid`/`side_effect`, etc.), and at the latest once
+    /// more when the workflow-task cycle finishes, so a handler is always
+    /// guaranteed to have run by the time this cycle's outcome is decided.
+    /// This is deliberate, not a limitation of "immediate" dispatch: an
+    /// eager per-registration pump cannot know about a *different* handler
+    /// about to register on the next line, so it can't order the two
+    /// correctly against interleaved history for different signal names --
+    /// see [`register_and_dispatch_signal_handler`](Self::register_and_dispatch_signal_handler)'s
+    /// doc comment for the full rationale. A workflow that reads
+    /// handler-mutated state should do so after at least one such call (a
+    /// loop with an activity/timer between registration and the read is the
+    /// idiomatic shape); reading it on the literal next line with nothing
+    /// else in between is not supported.
+    ///
+    /// Registration is **idempotent** -- calling this with the same `name`
+    /// multiple times (e.g. on every replay cycle at the top of the workflow
+    /// function, as is idiomatic) is a no-op after the first call within a
+    /// cycle for storage purposes.
+    ///
+    /// **Dispatch is per-cycle, not once-ever.** Unlike the `update`
+    /// primitive (whose handler is guarded by a persisted `UpdateCompleted`/
+    /// `UpdateFailed` event and is therefore skipped on replay),  a signal
+    /// handler has no persisted "already delivered" marker. Every recorded
+    /// `SignalReceived` event for `name` is drained and dispatched exactly
+    /// once **per [`HistoryMatcher`](crate::replay::HistoryMatcher) instance**
+    /// -- i.e. once per registration call within a single workflow-task
+    /// cycle -- but a *new* cycle (the next activity/timer/signal
+    /// completion, a worker restart, a warm-cache eviction) rebuilds the
+    /// matcher from the full recorded history and redelivers the *same*
+    /// historical signals again. That is safe and correct for reconstructing
+    /// in-memory state, because the captured `Arc<Mutex<T>>` is itself
+    /// rebuilt from scratch at the top of the same cycle -- replaying the
+    /// same signals into it always reconstructs the same final value,
+    /// exactly like the rest of the workflow body's plain Rust logic. It is
+    /// **not** safe for a non-idempotent side effect (an external call, a
+    /// log line meant to fire once): that side effect repeats on every
+    /// subsequent replay of the same history. Keep handlers limited to
+    /// mutating captured state; route side effects through a regular
+    /// activity instead.
+    ///
+    /// A signal name that is never registered with a handler, or is only ever
+    /// consumed by [`wait_for_signal`](Self::wait_for_signal), is completely
+    /// unaffected by this method -- the existing pull-based buffered behavior
+    /// is preserved exactly. The two consumption styles for the *same* name
+    /// coexist without double-delivering a single `SignalReceived` event:
+    /// whichever style claims an event first (in code-execution order) is the
+    /// one that receives it. This also holds against a `receive_signal_timeout`
+    /// / `wait_for_signal_timeout` race (issue #476) for the same name: a
+    /// signal that is the resolution of a still-open race is reserved for
+    /// that race and is never claimed by a push handler, so mixing both
+    /// styles for one signal name cannot silently flip a race outcome.
+    ///
+    /// Must be called from the main workflow body, not from inside an
+    /// `#[update]`/`register_update_handler` closure or a query handler: those
+    /// run against a separate, throwaway [`WorkflowContext`] created fresh per
+    /// invocation (see [`new_for_handler`](Self::new_for_handler)), so a
+    /// registration made there is discarded the instant the handler returns
+    /// and will never fire.
+    ///
+    /// For a typed payload, use
+    /// [`register_signal_handler`](Self::register_signal_handler) instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal signal registry mutex is poisoned. If the
+    /// handler closure itself panics, [`invoke_signal_handler`] catches it at
+    /// the dispatch boundary and logs it rather than propagating -- but note
+    /// that if the handler panics *while holding a lock* on its own captured
+    /// `Mutex`, that mutex is poisoned by ordinary Rust semantics regardless
+    /// of this catch, and a later `.lock().unwrap()` on the very same mutex
+    /// elsewhere in the same cycle will still panic. Prefer
+    /// `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)` (or keep
+    /// critical sections trivially short and infallible) if a handler shares
+    /// a mutex with other code in the workflow body.
+    pub fn register_signal_handler_raw<H>(&self, name: &str, handler: H)
+    where
+        H: Fn(Value) + Send + Sync + 'static,
+    {
+        let boxed: BoxSignalHandler = Arc::new(handler);
+        self.register_and_dispatch_signal_handler(name, boxed);
+    }
+
+    /// Register a **typed** push-based signal handler.
+    ///
+    /// The engine deserializes each matching `SignalReceived` payload as `Req`
+    /// before calling `handler`. A payload that fails to deserialize is
+    /// logged and dropped (the handler is never invoked for it) rather than
+    /// panicking the workflow task -- signals are fire-and-forget by
+    /// contract, so there is no caller waiting on a rejection.
+    ///
+    /// See [`register_signal_handler_raw`](Self::register_signal_handler_raw)
+    /// for the full dispatch contract (buffering, idempotency, coexistence
+    /// with pull-based `wait_for_signal`).
+    ///
+    /// ```rust
+    /// use std::sync::{Arc, Mutex};
+    /// use autumn_harvest::context::WorkflowContext;
+    ///
+    /// #[derive(serde::Deserialize)]
+    /// struct CancelRequest { reason: String }
+    ///
+    /// # fn example(ctx: &WorkflowContext) {
+    /// let cancelled_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    /// let state = cancelled_reason.clone();
+    /// ctx.register_signal_handler("cancel", move |req: CancelRequest| {
+    ///     *state.lock().unwrap() = Some(req.reason);
+    /// });
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal signal registry mutex is poisoned.
+    pub fn register_signal_handler<Req, H>(&self, name: &str, handler: H)
+    where
+        Req: serde::de::DeserializeOwned + 'static,
+        H: Fn(Req) + Send + Sync + 'static,
+    {
+        let name_for_log = name.to_string();
+        self.register_signal_handler_raw(
+            name,
+            move |payload: Value| match serde_json::from_value::<Req>(payload) {
+                Ok(req) => handler(req),
+                Err(e) => {
+                    tracing::warn!(
+                        signal = %name_for_log,
+                        error = %e,
+                        "signal handler payload deserialization failed; delivery dropped"
+                    );
+                }
+            },
+        );
+    }
+
+    /// Returns the sorted names of all registered push-based signal handlers.
+    ///
+    /// Parity with [`list_query_names`](Self::list_query_names).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal signal registry mutex is poisoned.
+    #[must_use]
+    pub fn list_signal_handler_names(&self) -> Vec<String> {
+        self.signal_registry
+            .lock()
+            .expect("signal_registry lock poisoned")
+            .list_names()
+    }
+
+    /// Registers `handler` under `name` (idempotent, first wins). Storage
+    /// only -- see the module-level dispatch contract below for when the
+    /// handler actually fires.
+    ///
+    /// Deliberately does **not** dispatch inline (PR #890 review, "preserve
+    /// signal history order across handlers"): an earlier version pumped
+    /// eagerly at each registration call so a signal already recorded before
+    /// the cursor's current position would be delivered on the same line.
+    /// That worked for a single handler, but broke ordering across
+    /// *different* handler names registered back-to-back with no
+    /// intervening command -- at the moment the first name registers, the
+    /// second literally hasn't executed its own `register_*` call yet, so
+    /// the first pump can never know to wait for it. Dispatch is instead
+    /// deferred to [`pump_signal_handlers`](Self::pump_signal_handlers),
+    /// triggered by [`match_history`](Self::match_history)'s post-hook: the
+    /// first real cursor-advancing call made *after* every handler this
+    /// cycle has registered (an activity/timer/signal wait, or -- if the
+    /// workflow body does nothing else -- the executor's end-of-cycle flush)
+    /// considers every currently-registered name together and sorts by
+    /// event index, so cross-name ordering always follows history rather
+    /// than registration order.
+    fn register_and_dispatch_signal_handler(&self, name: &str, handler: BoxSignalHandler) {
+        self.signal_registry
+            .lock()
+            .expect("signal_registry lock poisoned")
+            .register(name, handler);
     }
 
     // ── Command drain ─────────────────────────────────────────────────
@@ -5987,6 +6271,399 @@ mod tests {
     use crate::error::TimeoutType;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+
+    // ── Signal handlers (issue #546) ────────────────────────────────────────
+
+    fn started_event() -> WorkflowEvent {
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    #[test]
+    fn register_signal_handler_raw_is_idempotent() {
+        let ctx = WorkflowContext::new_test();
+        // Registering twice must not panic or error.
+        ctx.register_signal_handler_raw("cancel", |_payload: Value| {});
+        ctx.register_signal_handler_raw("cancel", |_payload: Value| {});
+        assert!(
+            ctx.list_signal_handler_names()
+                .contains(&"cancel".to_string())
+        );
+    }
+
+    #[test]
+    fn register_signal_handler_raw_emits_no_commands() {
+        let ctx = WorkflowContext::new_test();
+        ctx.register_signal_handler_raw("cancel", |_payload: Value| {});
+        let cmds = ctx.drain_commands();
+        assert!(cmds.is_empty(), "registration must not emit any commands");
+    }
+
+    #[test]
+    fn register_signal_handler_raw_dispatches_already_buffered_signal_once_flushed() {
+        // Dispatch is deferred: registration only stores the handler.
+        // `flush_pending_signal_handlers` mirrors the trigger every other
+        // history-consulting call (activity/timer/deterministic primitive)
+        // provides naturally, and the executor's own end-of-cycle flush.
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "user_requested"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        ctx.flush_pending_signal_handlers();
+
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![serde_json::json!({"reason": "user_requested"})],
+            "signal delivered before the handler existed must still be dispatched \
+             once the handler is registered and the cycle is flushed"
+        );
+    }
+
+    #[test]
+    fn register_signal_handler_typed_deserializes_payload() {
+        #[derive(serde::Deserialize)]
+        struct CancelRequest {
+            reason: String,
+        }
+
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "budget_exceeded"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let received: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler("cancel", move |req: CancelRequest| {
+            received_clone.lock().unwrap().push(req.reason);
+        });
+        ctx.flush_pending_signal_handlers();
+
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec!["budget_exceeded".to_string()]
+        );
+    }
+
+    #[test]
+    fn register_signal_handler_multiple_events_dispatched_in_order() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!(1),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!(2),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let received: Arc<std::sync::Mutex<Vec<i64>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone
+                .lock()
+                .unwrap()
+                .push(payload.as_i64().unwrap());
+        });
+        ctx.flush_pending_signal_handlers();
+
+        assert_eq!(*received.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn register_signal_handler_does_not_dispatch_when_no_signal_recorded() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started_event()]);
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn register_signal_handler_does_not_fire_for_other_names() {
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn signal_handler_and_wait_for_signal_do_not_double_deliver() {
+        // Two "cancel" signals recorded. The push handler (registered first,
+        // as is idiomatic at the top of a workflow body) claims both; a later
+        // pull-based wait_for_signal for the same name must not also see them.
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!(1),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        ctx.flush_pending_signal_handlers();
+        assert_eq!(*received.lock().unwrap(), vec![serde_json::json!(1)]);
+
+        // A pull-based wait for the same name, later in the same task, must
+        // not see the already-dispatched event -- it should behave as NoMatch
+        // (i.e. suspend for a future occurrence), not replay/return it again.
+        let history_match = ctx.match_history(|m| m.match_signal("cancel"));
+        assert_eq!(history_match, HistoryMatch::NoMatch);
+    }
+
+    #[tokio::test]
+    async fn register_signal_handler_does_not_fire_before_an_unconsumed_activity_is_matched() {
+        // Regression (PR #890 review, "preserve history order when
+        // dispatching handlers", context.rs:5090): with WorkflowStarted,
+        // ActivityScheduled, ActivityCompleted, SignalReceived("cancel"), a
+        // handler registered at the top of the workflow body (the idiomatic
+        // placement) must NOT fire before the workflow has actually replayed
+        // the recorded activity. The original implementation eagerly drained
+        // every recorded "cancel" event at registration time regardless of
+        // the activity sitting in between, so a workflow gating the activity
+        // call on the handler-mutated state could skip the recorded
+        // `execute_activity` call entirely, diverging from history.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            started_event(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let received: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let received_clone = received.clone();
+        ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+            received_clone.lock().unwrap().push(payload);
+        });
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "handler must not fire before the workflow has matched the preceding activity"
+        );
+
+        // The workflow body now actually replays the activity.
+        let result = ctx
+            .execute_activity_raw("send_email", Value::Null, "default")
+            .await;
+        assert_eq!(result.unwrap(), serde_json::json!("sent"));
+
+        // Only now -- after the cursor has passed the activity -- is the
+        // trailing signal visible to the handler.
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![serde_json::json!({"reason": "manual"})]
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_handlers_dispatch_in_history_order_across_names_not_registration_order() {
+        // Regression (PR #890 review, "preserve signal history order across
+        // handlers", replay.rs:2745): history records "pause" before
+        // "cancel", but the workflow body registers the "cancel" handler
+        // first. A real command (here, an activity) separates registration
+        // from both signals; the pump triggered by matching it considers
+        // every handler registered so far together and sorts by event
+        // index -- dispatch follows SignalReceived history order (pause,
+        // then cancel), not the order the two `register_*` calls happened to
+        // run in. See `signal_handlers_dispatch_in_history_order_with_zero_intervening_commands`
+        // for the same guarantee with nothing at all between the two
+        // registrations.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            started_event(),
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "pause".into(),
+                payload: serde_json::json!("pause-payload"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!("cancel-payload"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let order: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+
+        let order_for_cancel = order.clone();
+        ctx.register_signal_handler_raw("cancel", move |_payload: Value| {
+            order_for_cancel.lock().unwrap().push("cancel");
+        });
+        let order_for_pause = order.clone();
+        ctx.register_signal_handler_raw("pause", move |_payload: Value| {
+            order_for_pause.lock().unwrap().push("pause");
+        });
+
+        // Both registrations' own eager pumps find nothing yet -- the
+        // ActivityScheduled event blocks the cursor-bound sweep.
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "neither handler may fire before the preceding activity is matched"
+        );
+
+        // The workflow body now actually replays the activity, advancing the
+        // cursor past both trailing signals in one go.
+        let result = ctx
+            .execute_activity_raw("send_email", Value::Null, "default")
+            .await;
+        assert_eq!(result.unwrap(), serde_json::json!("sent"));
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["pause", "cancel"],
+            "dispatch must follow SignalReceived history order, not registration order"
+        );
+    }
+
+    #[test]
+    fn signal_handlers_dispatch_in_history_order_with_zero_intervening_commands() {
+        // The case an earlier eager-per-registration design could not fix
+        // (PR #890 review follow-up, context.rs:5169): history records
+        // "pause" before "cancel", the workflow body registers "cancel"
+        // then "pause" back-to-back with *nothing* in between, and BOTH
+        // signals are already recorded before either `register_*` call
+        // runs. Because dispatch is deferred (neither registration pumps
+        // inline), a single flush considers both handlers together and
+        // sorts by event index -- "pause" still fires first, matching
+        // history order despite the reversed registration order and the
+        // total absence of any intervening activity/timer/etc.
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "pause".into(),
+                payload: serde_json::json!("pause-payload"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!("cancel-payload"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let order: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+
+        let order_for_cancel = order.clone();
+        ctx.register_signal_handler_raw("cancel", move |_payload: Value| {
+            order_for_cancel.lock().unwrap().push("cancel");
+        });
+        let order_for_pause = order.clone();
+        ctx.register_signal_handler_raw("pause", move |_payload: Value| {
+            order_for_pause.lock().unwrap().push("pause");
+        });
+
+        // Neither registration dispatches inline -- nothing has fired yet.
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "dispatch must be deferred, not fired inline per registration call"
+        );
+
+        // Mirrors the executor's end-of-cycle flush.
+        ctx.flush_pending_signal_handlers();
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["pause", "cancel"],
+            "dispatch must follow SignalReceived history order even with zero \
+             intervening commands between the two registrations"
+        );
+    }
+
+    #[test]
+    fn list_signal_handler_names_returns_sorted_names() {
+        let ctx = WorkflowContext::new_test();
+        ctx.register_signal_handler_raw("zeta", |_: Value| {});
+        ctx.register_signal_handler_raw("alpha", |_: Value| {});
+        ctx.register_signal_handler_raw("mid", |_: Value| {});
+        assert_eq!(
+            ctx.list_signal_handler_names(),
+            vec!["alpha".to_string(), "mid".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn register_signal_handler_typed_deserialization_failure_does_not_panic() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct CancelRequest {
+            reason: String,
+        }
+
+        let events = vec![
+            started_event(),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                // Missing the required "reason" field.
+                payload: serde_json::json!({}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // Must not panic even though the payload cannot deserialize into CancelRequest.
+        ctx.register_signal_handler("cancel", |_req: CancelRequest| {
+            panic!("handler must never run on a deserialization failure");
+        });
+    }
 
     #[test]
     fn workflow_context_history_event_count_reports_loaded_history() {

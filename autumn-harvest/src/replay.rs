@@ -10,7 +10,7 @@
 //! it directly, avoiding duplicate side effects.
 
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::TimeoutType;
 use crate::event::{SideEffectKind, WorkflowEvent};
@@ -286,6 +286,27 @@ pub struct HistoryMatcher {
     /// deliverable to any subsequent signal wait (the exemption only
     /// suppresses the completed-history check, never consumption).
     late_race_signal_events: HashSet<usize>,
+    /// `SignalReceived` event indices that fall inside a still-open
+    /// signal-or-deadline race window (issue #476) for their signal name --
+    /// i.e. a `TimerStarted { timer_id: "__signal_timeout:{seq}:{name}" }`
+    /// precedes the index with no matching `TimerFired` recorded yet at or
+    /// before it. These are reserved for `Self::match_signal_or_timer`'s own
+    /// resolution and must never be claimed by `Self::claim_pending_signal`
+    /// (issue #546): doing so would silently flip the race outcome to
+    /// `TimerWon` even though the signal arrived first. A signal recorded
+    /// *after* its race's `TimerFired` (the race already resolved
+    /// `TimerWon`) is an ordinary "late loser" and is not reserved -- it
+    /// stays fair game for a push handler exactly like it already stays
+    /// fair game for a later plain signal wait.
+    ///
+    /// In practice a push handler can never reach a signal still inside an
+    /// open race window anyway -- the race's own `TimerStarted` is not one
+    /// of the "transparent" events `Self::drain_early_signals` skips over,
+    /// so it hard-blocks the cursor until `Self::match_signal_or_timer`
+    /// itself consumes it. This set is kept as an explicit, independently
+    /// verified guarantee rather than an implicit consequence of that
+    /// scan-ordering detail.
+    race_reserved_signal_events: HashSet<usize>,
 }
 
 impl HistoryMatcher {
@@ -330,6 +351,8 @@ impl HistoryMatcher {
                 }
             }
         }
+        let race_reserved_signal_events = Self::build_race_reserved_signal_events(&events);
+
         Self {
             events,
             cursor: 0,
@@ -340,7 +363,69 @@ impl HistoryMatcher {
             pending_external_cancels: Vec::new(),
             transparent_events,
             late_race_signal_events: HashSet::new(),
+            race_reserved_signal_events,
         }
+    }
+
+    /// Extracts the signal name from a signal-or-deadline race timer ID
+    /// (issue #476's `__signal_timeout:{seq}:{signal_name}` convention), or
+    /// `None` if `timer_id` is not one of these internal race timers.
+    fn signal_timeout_race_name(timer_id: &str) -> Option<&str> {
+        timer_id
+            .strip_prefix("__signal_timeout:")?
+            .split_once(':')
+            .map(|(_seq, name)| name)
+    }
+
+    /// One-time index build (issue #546): marks exactly which `SignalReceived`
+    /// indices are reserved for an open signal-or-deadline race (issue #476)
+    /// for their name -- see [`Self::race_reserved_signal_events`] for the
+    /// full rationale.
+    fn build_race_reserved_signal_events(events: &[WorkflowEvent]) -> HashSet<usize> {
+        let mut race_reserved_signal_events: HashSet<usize> = HashSet::new();
+        // signal_name -> currently-open race timer_ids for that name.
+        let mut open_race_timers: HashMap<&str, Vec<&str>> = HashMap::new();
+
+        for (idx, event) in events.iter().enumerate() {
+            match event {
+                WorkflowEvent::SignalReceived { signal_name, .. } => {
+                    if let Some(timers) = open_race_timers.get_mut(signal_name.as_str())
+                        && !timers.is_empty()
+                    {
+                        race_reserved_signal_events.insert(idx);
+                        // This signal resolves the OLDEST still-open race for
+                        // this name (its `match_signal_or_timer` scan started
+                        // first in code-execution order, so it's the first to
+                        // consume an available occurrence -- `open_race_timers`
+                        // is in TimerStarted encounter order). Remove only
+                        // that ONE race: with concurrent same-name races (two
+                        // overlapping `receive_signal_timeout` calls), a later
+                        // race still needs its OWN future occurrence, so
+                        // closing every open race here would let a push
+                        // handler steal it (PR #890 review follow-up).
+                        timers.remove(0);
+                    }
+                }
+                WorkflowEvent::TimerStarted { timer_id, .. } => {
+                    if let Some(name) = Self::signal_timeout_race_name(timer_id.as_str()) {
+                        open_race_timers
+                            .entry(name)
+                            .or_default()
+                            .push(timer_id.as_str());
+                    }
+                }
+                WorkflowEvent::TimerFired { timer_id } => {
+                    if let Some(name) = Self::signal_timeout_race_name(timer_id.as_str())
+                        && let Some(timers) = open_race_timers.get_mut(name)
+                    {
+                        timers.retain(|id| *id != timer_id.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        race_reserved_signal_events
     }
 
     /// Returns the IDs of all updates that were admitted but have not completed or failed
@@ -973,7 +1058,17 @@ impl HistoryMatcher {
         }
     }
 
-    fn prepare_match(&mut self) -> bool {
+    /// Advances the cursor past already-consumed events, drains any signals
+    /// (and update/external-signal/external-cancel events) sitting at the
+    /// current cursor into their pending stashes, and resolves any external
+    /// signal/cancel terminals visible further ahead. Returns whether the
+    /// matcher is still replaying afterward.
+    ///
+    /// `pub(crate)` so [`WorkflowContext`](crate::context::WorkflowContext)'s
+    /// signal-handler pump (issue #546) can trigger the same cursor-bound
+    /// sweep `Self::claim_pending_signal` relies on, without duplicating this
+    /// logic.
+    pub(crate) fn prepare_match(&mut self) -> bool {
         self.advance_to_next_unconsumed_event();
         self.drain_early_signals();
         self.scan_ahead_for_external_signal_terminals();
@@ -2582,6 +2677,78 @@ impl HistoryMatcher {
         }
 
         HistoryMatch::NoMatch
+    }
+
+    /// Cursor-bound claim for push-based signal handler dispatch (issue #546).
+    ///
+    /// Unlike [`match_signal`](Self::match_signal), which resolves a single
+    /// pull-based wait at the current cursor position, this claims **every**
+    /// currently-stashed `SignalReceived { signal_name }` payload not yet
+    /// claimed by anything else, in ascending event order. "Currently
+    /// stashed" is the key constraint: this method calls
+    /// [`prepare_match`](Self::prepare_match) (the same cursor-advancing,
+    /// signal-draining sweep every other `match_*` method opens with) and
+    /// then only inspects `pending_signals` -- it never reaches ahead of
+    /// wherever the workflow's own code-driven cursor progression has
+    /// carried the matcher so far.
+    ///
+    /// This is deliberate and is the fix for a real production bug (issue
+    /// #546 post-ship hardening): an earlier version of this method also
+    /// indexed and claimed *every* recorded `SignalReceived` for `name`
+    /// regardless of cursor position, so a handler registered at the top of
+    /// a workflow function could fire on a signal recorded *after* an
+    /// activity or timer the workflow hadn't reached yet in this replay
+    /// cycle -- silently reordering observable side effects relative to
+    /// history. Because `prepare_match`'s `drain_early_signals` sweep halts
+    /// at the first non-transparent event (an `ActivityScheduled`,
+    /// `TimerStarted`, etc. not yet consumed), a signal recorded after such
+    /// an event is invisible here until whatever `match_*` call the
+    /// workflow body actually makes for that event advances the cursor past
+    /// it -- exactly mirroring `wait_for_signal`'s own history-order
+    /// contract.
+    ///
+    /// Claiming marks the returned event indices consumed, so a later
+    /// `wait_for_signal`/`receive_signal` call for the same name will not see
+    /// them again, and vice versa — the two consumption styles never
+    /// double-deliver a single `SignalReceived` event. Calling this again
+    /// immediately (with no intervening cursor advancement) for the same
+    /// `signal_name` returns an empty `Vec`.
+    ///
+    /// An event reserved for an open signal-or-deadline race for the same
+    /// name (see [`Self::race_reserved_signal_events`]) is never claimed
+    /// here, regardless of call order: a push handler must not be able to
+    /// silently steal the signal a concurrent `receive_signal_timeout` /
+    /// `wait_for_signal_timeout` race is waiting to resolve on. In practice
+    /// the race's own unconsumed `TimerStarted` already blocks the cursor
+    /// from reaching that signal at all (see the field doc), so this is a
+    /// second, independent layer of protection rather than the only one.
+    ///
+    /// Returns `(event_index, payload)` pairs -- not just payloads -- so a
+    /// caller dispatching to *multiple* differently-named handlers in one
+    /// pump (as [`WorkflowContext`](crate::context::WorkflowContext) does)
+    /// can sort by index to dispatch in true historical order across
+    /// handler names, not just within one name.
+    pub(crate) fn claim_pending_signal(&mut self, signal_name: &str) -> Vec<(usize, Value)> {
+        self.prepare_match();
+
+        let (matched, remaining): (VecDeque<_>, VecDeque<_>) =
+            std::mem::take(&mut self.pending_signals)
+                .into_iter()
+                .partition(|(name, _, idx)| {
+                    name == signal_name && !self.race_reserved_signal_events.contains(idx)
+                });
+        self.pending_signals = remaining;
+        // Every stashed entry already has its index in `consumed_signal_events`
+        // (set by `stash_signal` at stash time), but re-asserting it here makes
+        // the no-double-delivery invariant explicit at the point of use rather
+        // than relying on the reader to trace it back to the stash call site.
+        for (_, _, idx) in &matched {
+            self.consumed_signal_events.insert(*idx);
+        }
+        matched
+            .into_iter()
+            .map(|(_, payload, idx)| (idx, payload))
+            .collect()
     }
 
     /// Settle the bookkeeping for a signal-branch win of a signal-or-deadline
@@ -4504,6 +4671,381 @@ mod tests {
             HistoryMatch::Matched {
                 output: serde_json::json!({"reason": "manual"}),
             }
+        );
+    }
+
+    // ── claim_pending_signal (issue #546: push-based signal handlers) ──────
+
+    /// Strips event indices for assertions that only care about payloads.
+    fn payloads_only(claimed: Vec<(usize, Value)>) -> Vec<Value> {
+        claimed.into_iter().map(|(_, payload)| payload).collect()
+    }
+
+    #[test]
+    fn claim_pending_signal_returns_matching_payloads_in_order() {
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"seq": 2}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let claimed = payloads_only(matcher.claim_pending_signal("cancel"));
+        assert_eq!(
+            claimed,
+            vec![serde_json::json!({"seq": 1}), serde_json::json!({"seq": 2})]
+        );
+    }
+
+    #[test]
+    fn claim_pending_signal_ignores_other_names() {
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let claimed = payloads_only(matcher.claim_pending_signal("cancel"));
+        assert_eq!(claimed, vec![serde_json::json!({"reason": "manual"})]);
+    }
+
+    #[test]
+    fn claim_pending_signal_is_idempotent_within_one_matcher() {
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "cancel".into(),
+            payload: serde_json::json!({"reason": "manual"}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let first = payloads_only(matcher.claim_pending_signal("cancel"));
+        assert_eq!(first, vec![serde_json::json!({"reason": "manual"})]);
+
+        // Calling again must not re-deliver the same event.
+        let second = matcher.claim_pending_signal("cancel");
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn claim_pending_signal_claims_events_already_stashed_by_another_scan() {
+        // An earlier scan for an unrelated activity stashes the "cancel" signal
+        // into `pending_signals` on its way past it. `claim_pending_signal` must
+        // still find it there even though it never appeared at the raw scan
+        // position the claim itself would have looked at.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        // Scanning for the activity stashes the interleaved "cancel" signal.
+        let activity_result = matcher.match_activity("send_email");
+        assert!(matches!(activity_result, HistoryMatch::Matched { .. }));
+
+        let claimed = payloads_only(matcher.claim_pending_signal("cancel"));
+        assert_eq!(claimed, vec![serde_json::json!({"reason": "manual"})]);
+    }
+
+    #[test]
+    fn claim_pending_signal_does_not_advance_past_an_unconsumed_activity() {
+        // The core regression this refactor fixes (PR #890 review, "eager
+        // dispatch ignores history order"): a signal recorded AFTER an
+        // ActivityScheduled/Completed pair the workflow hasn't reached yet
+        // in this replay cycle must NOT be visible to a push handler. Only
+        // once the workflow's own code actually matches that activity (and
+        // the cursor advances past it) does the signal become claimable.
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!("sent"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        // Registering (and pumping) a handler before the workflow body has
+        // matched the activity must see nothing yet.
+        let claimed = matcher.claim_pending_signal("cancel");
+        assert!(
+            claimed.is_empty(),
+            "must not claim a signal recorded after an unconsumed activity: {claimed:?}"
+        );
+
+        // The workflow body now actually reaches the activity call.
+        let activity_result = matcher.match_activity("send_email");
+        assert!(matches!(activity_result, HistoryMatch::Matched { .. }));
+
+        // Only now is the trailing signal visible.
+        let claimed = payloads_only(matcher.claim_pending_signal("cancel"));
+        assert_eq!(claimed, vec![serde_json::json!({"reason": "manual"})]);
+    }
+
+    #[test]
+    fn claim_pending_signal_does_not_steal_from_pull_based_wait() {
+        // A later `wait_for_signal`/`match_signal` call for the same name must
+        // never see an event that a prior `claim_pending_signal` call already
+        // claimed (issue #546 AC: no double-delivery between push and pull).
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "cancel".into(),
+            payload: serde_json::json!({"reason": "manual"}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let claimed = payloads_only(matcher.claim_pending_signal("cancel"));
+        assert_eq!(claimed, vec![serde_json::json!({"reason": "manual"})]);
+
+        let pulled = matcher.match_signal("cancel");
+        assert_eq!(
+            pulled,
+            HistoryMatch::NoMatch,
+            "the signal was already claimed by the push handler"
+        );
+    }
+
+    #[test]
+    fn match_signal_does_not_steal_from_a_prior_claim() {
+        // Symmetric to the above: once `match_signal` (pull) has consumed an
+        // event, a later `claim_pending_signal` call for the same name must not
+        // see it again either.
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"seq": 2}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let pulled = matcher.match_signal("cancel");
+        assert_eq!(
+            pulled,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"seq": 1})
+            }
+        );
+
+        let claimed = payloads_only(matcher.claim_pending_signal("cancel"));
+        assert_eq!(
+            claimed,
+            vec![serde_json::json!({"seq": 2})],
+            "only the not-yet-pulled event should be delivered to the handler"
+        );
+    }
+
+    #[test]
+    fn claim_pending_signal_returns_empty_when_none_recorded() {
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "approved".into(),
+            payload: serde_json::json!({"ok": true}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let claimed = matcher.claim_pending_signal("cancel");
+        assert!(claimed.is_empty());
+    }
+
+    #[test]
+    fn claim_pending_signal_does_not_steal_from_an_open_signal_timeout_race() {
+        // Regression: a push handler registered for the same name as an
+        // in-flight signal-or-deadline race (issue #476) must not claim the
+        // race's own signal -- doing so used to silently flip the race
+        // outcome from SignalWon to TimerWon even though the signal
+        // genuinely arrived before the deadline.
+        let timer_id = "__signal_timeout:1:approval";
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(timer_id),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new(timer_id),
+            },
+        ];
+
+        // A push handler registered first (the idiomatic top-of-function
+        // ordering) must not be able to claim the race's own signal. The
+        // still-open race's own TimerStarted also hard-blocks the cursor
+        // from reaching it at all, so this asserts the belt-and-suspenders
+        // reservation check independently of that blocking behavior.
+        let mut matcher = HistoryMatcher::new(events);
+        let claimed = matcher.claim_pending_signal("approval");
+        assert!(
+            claimed.is_empty(),
+            "the signal is reserved for the open race and must not be claimed: {claimed:?}"
+        );
+
+        // The race must still resolve exactly as it would with no push
+        // handler involved at all.
+        let result = matcher.match_signal_or_timer("approval", timer_id, Some(300));
+        assert_eq!(
+            result,
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"approved": true})
+            },
+            "the race must still see its own signal after a push-handler claim attempt"
+        );
+    }
+
+    #[test]
+    fn claim_pending_signal_reserves_only_the_racing_occurrence_not_other_signals() {
+        // A second, unrelated "approval" delivery (recorded well after the
+        // race already resolved) is a completely separate signal and must
+        // still be freely available to a push handler once the workflow's
+        // own code has driven the cursor past the resolved race.
+        let timer_id = "__signal_timeout:1:approval";
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(timer_id),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new(timer_id),
+            },
+            // Arrives only after the race already resolved (TimerWon) --
+            // an ordinary, unreserved signal for a push handler to claim.
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true, "late": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_signal_or_timer("approval", timer_id, Some(300));
+        assert_eq!(result, SignalOrTimerMatch::TimerWon);
+
+        let claimed = payloads_only(matcher.claim_pending_signal("approval"));
+        assert_eq!(
+            claimed,
+            vec![serde_json::json!({"approved": true, "late": true})],
+            "a signal recorded after the race already resolved is not reserved"
+        );
+    }
+
+    #[test]
+    fn claim_pending_signal_claims_signals_unrelated_to_any_race() {
+        // A push handler for a name that has no signal-or-timer race at all
+        // must be entirely unaffected by the reservation check.
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "cancel".into(),
+            payload: serde_json::json!({"reason": "manual"}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let claimed = payloads_only(matcher.claim_pending_signal("cancel"));
+        assert_eq!(claimed, vec![serde_json::json!({"reason": "manual"})]);
+    }
+
+    #[test]
+    fn claim_pending_signal_only_reserves_the_first_racing_signal_not_a_later_one() {
+        // Regression (PR #890 review): the race resolves at the FIRST matching
+        // signal (match_signal_or_timer never looks past it), so only that
+        // occurrence is reserved. A second same-name delivery recorded before
+        // the timer fires is unrelated to the race and becomes claimable once
+        // the race has resolved and the cursor has moved past it.
+        let timer_id = "__signal_timeout:1:approval";
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(timer_id),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"seq": 2}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new(timer_id),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_signal_or_timer("approval", timer_id, Some(300));
+        assert_eq!(
+            result,
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"seq": 1})
+            },
+            "the race must resolve on its own (first) signal"
+        );
+
+        let claimed = payloads_only(matcher.claim_pending_signal("approval"));
+        assert_eq!(
+            claimed,
+            vec![serde_json::json!({"seq": 2})],
+            "only the first occurrence was reserved for the race; the second is ordinary"
+        );
+    }
+
+    #[test]
+    fn claim_pending_signal_reserves_one_occurrence_per_concurrent_race() {
+        // Regression (PR #890 review follow-up): two CONCURRENT
+        // signal-or-deadline races for the same name each need their OWN
+        // signal occurrence, in start order (match_signal_or_timer's scan for
+        // the race started first runs first during replay and so consumes
+        // the first available occurrence, leaving the second for the race
+        // started second). Closing every open race for the name on the
+        // first resolving signal (rather than just the oldest) let a push
+        // handler steal the second race's own signal.
+        let timer_a = "__signal_timeout:1:approval";
+        let timer_b = "__signal_timeout:2:approval";
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(timer_a),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(timer_b),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"seq": 2}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let claimed = matcher.claim_pending_signal("approval");
+        assert!(
+            claimed.is_empty(),
+            "both signals are reserved -- one per concurrent race, neither available to a push handler: {claimed:?}"
         );
     }
 

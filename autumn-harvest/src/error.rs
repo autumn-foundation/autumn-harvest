@@ -553,6 +553,41 @@ pub fn database_error(e: impl std::fmt::Display) -> HarvestError {
     HarvestError::Database(e.to_string())
 }
 
+/// Extracts a human-readable message from a caught panic payload.
+///
+/// Shared by every `std::panic::catch_unwind` call site that guards a
+/// user-supplied handler closure (query, declarative query, and signal
+/// handlers) so the `&str` / `String` / "unknown panic" fallback chain is
+/// defined exactly once.
+///
+/// Deliberately takes `payload` **by value** rather than by reference
+/// (`#[allow(clippy::needless_pass_by_value)]`): `Box<dyn Any + Send>` itself
+/// satisfies the blanket `impl<T: 'static> Any for T`, so a caller passing
+/// `&e` for `e: Box<dyn Any + Send>` to a by-reference `&(dyn Any + Send)`
+/// parameter can silently coerce by unsizing the *outer* `Box` (which *is*
+/// `Any`) rather than deref-coercing to the *inner* erased payload --
+/// `downcast_ref` then always misses and this always falls through to
+/// `"unknown panic"`. Taking the `Box` by value forces every call site to
+/// pass the exact value `catch_unwind` produced, with no coercion ambiguity.
+///
+/// ## Examples
+///
+/// ```rust
+/// use autumn_harvest::error::panic_message;
+///
+/// let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+/// assert_eq!(panic_message(payload), "boom");
+/// ```
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
+pub fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
 #[cfg(feature = "db")]
 impl From<diesel::result::Error> for HarvestError {
     fn from(value: diesel::result::Error) -> Self {
@@ -563,6 +598,32 @@ impl From<diesel::result::Error> for HarvestError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_message_extracts_str_literal_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(payload), "boom");
+    }
+
+    #[test]
+    fn panic_message_extracts_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("formatted boom"));
+        assert_eq!(panic_message(payload), "formatted boom");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_unknown_payload_type() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(panic_message(payload), "unknown panic");
+    }
+
+    #[test]
+    fn panic_message_matches_a_real_caught_panic() {
+        let payload =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("real panic")))
+                .unwrap_err();
+        assert_eq!(panic_message(payload), "real panic");
+    }
 
     #[test]
     fn activity_cancelled_variant_exists_and_displays_correctly() {

@@ -1989,3 +1989,149 @@ async fn signal_timeout_timeout_branch_with_ignored_late_signal_replays_succeede
         "timeout branch with an ignored late signal must replay:\n{report}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Push-based signal handlers (issue #546)
+// ---------------------------------------------------------------------------
+
+/// A "subscription" style workflow that reacts to `cancel`/`pause` signals via
+/// `register_signal_handler_raw` rather than hand-coded `wait_for_signal`
+/// interleaving. Completes immediately once both handlers are registered and
+/// have drained whatever history is already recorded for their names.
+fn subscription_handler_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let cancelled = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let paused = std::sync::Arc::new(std::sync::Mutex::new(false));
+
+        let c = cancelled.clone();
+        ctx.register_signal_handler_raw("cancel", move |_payload: Value| {
+            *c.lock().unwrap() = true;
+        });
+        let p = paused.clone();
+        ctx.register_signal_handler_raw("pause", move |_payload: Value| {
+            *p.lock().unwrap() = true;
+        });
+
+        Ok(serde_json::json!({
+            "cancelled": *cancelled.lock().unwrap(),
+            "paused": *paused.lock().unwrap(),
+        }))
+    })
+}
+
+#[tokio::test]
+async fn replayer_replays_signal_handler_workflow_successfully() {
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "cancel".to_string(),
+            payload: serde_json::json!({"reason": "user_requested"}),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "pause".to_string(),
+            payload: serde_json::json!({}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"cancelled": true, "paused": true}),
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "subscription_handler_workflow",
+            subscription_handler_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "handler-based workflow must replay successfully: {report}"
+    );
+}
+
+/// Same fixture with the two signals recorded in the opposite order. Handler
+/// dispatch must be replay-deterministic regardless of which signal name was
+/// recorded first (issue #546 Success Metric: 100% replay-success rate across
+/// reordered signal-arrival fixtures).
+#[tokio::test]
+async fn replayer_replays_signal_handler_workflow_with_reordered_signals() {
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "pause".to_string(),
+            payload: serde_json::json!({}),
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "cancel".to_string(),
+            payload: serde_json::json!({"reason": "user_requested"}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"cancelled": true, "paused": true}),
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "subscription_handler_workflow",
+            subscription_handler_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "reordered signal-arrival fixture must still replay successfully: {report}"
+    );
+}
+
+/// A history recording only the `cancel` signal (no `pause`) must also replay
+/// cleanly -- an unregistered-for-this-run signal name is simply never sent,
+/// which is a normal history, not a divergence.
+#[tokio::test]
+async fn replayer_replays_signal_handler_workflow_with_only_one_signal() {
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::SignalReceived {
+            signal_name: "cancel".to_string(),
+            payload: serde_json::json!({"reason": "user_requested"}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"cancelled": true, "paused": false}),
+        },
+    ];
+
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "subscription_handler_workflow",
+            subscription_handler_workflow,
+        )
+        .replay_from_events(events)
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "single-signal fixture must replay successfully: {report}"
+    );
+}
