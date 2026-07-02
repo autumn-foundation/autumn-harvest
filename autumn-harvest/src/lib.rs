@@ -140,9 +140,10 @@ pub mod test_generator;
 pub mod testing;
 pub mod types;
 pub mod update;
-/// Read-only per-tenant/per-workflow usage aggregation for chargeback and
-/// capacity planning (issue #596). Pure wire-format types compile without
-/// the `db` feature; [`usage::load_usage_grouped`] is DB-gated.
+/// Read-only per-tenant/per-workflow usage aggregation (issue #596).
+///
+/// Pure wire-format types compile without the `db` feature;
+/// [`usage::load_usage_grouped`] is DB-gated.
 pub mod usage;
 #[cfg(feature = "db")]
 pub mod version_gate_retirement;

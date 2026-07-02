@@ -322,9 +322,10 @@ pub struct HarvestApiState {
     /// Server-side ceiling on `workflow_retry_policy.max_attempts` (issue #523).
     /// `None` = no ceiling enforced.
     max_workflow_attempts: Arc<Mutex<Option<u32>>>,
-    /// Ceiling on the `[from, to]` window accepted by `GET /admin/usage`
-    /// (issue #596). Defaults to 90 days; guards against an accidental
-    /// full-table scan across every shard.
+    /// Ceiling on the `[from, to]` window accepted by `GET /admin/usage` (issue #596).
+    ///
+    /// Defaults to 90 days; guards against an accidental full-table scan
+    /// across every shard.
     usage_window_ceiling: Arc<Mutex<std::time::Duration>>,
 }
 
@@ -4594,14 +4595,14 @@ async fn count_workflows(
     ))
 }
 
-/// `GET /admin/usage` — historical per-tenant/per-workflow usage report
-/// (issue #596): the historical companion to the point-in-time
-/// `GET /admin/concurrency` endpoint. Aggregates already-durable data
-/// (`harvest_workflow_executions` + `harvest_events`) over a required
-/// `[from, to]` window, grouped by `workflow_name` (default) or by a
-/// `search_attr:<key>` tenant key, fanned out across every shard. An
-/// unreachable shard is named in `unavailable_shards` rather than failing
-/// the call wholesale.
+/// `GET /admin/usage` — historical per-tenant/per-workflow usage report (issue #596).
+///
+/// The historical companion to the point-in-time `GET /admin/concurrency`
+/// endpoint. Aggregates already-durable data (`harvest_workflow_executions`
+/// + `harvest_events`) over a required `[from, to]` window, grouped by
+/// `workflow_name` (default) or by a `search_attr:<key>` tenant key, fanned
+/// out across every shard. An unreachable shard is named in
+/// `unavailable_shards` rather than failing the call wholesale.
 async fn usage_report(
     Extension(api_state): Extension<HarvestApiState>,
     Query(pairs): Query<Vec<(String, String)>>,

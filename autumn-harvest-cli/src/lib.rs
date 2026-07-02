@@ -403,10 +403,10 @@ enum Commands {
         #[command(subcommand)]
         command: GateCommand,
     },
-    /// Report per-tenant/per-workflow usage for chargeback and capacity
-    /// planning (issue #596): the historical companion to `harvest
-    /// concurrency status`. Renders a table by default; pass --json for
-    /// piping.
+    /// Report per-tenant/per-workflow usage for chargeback and capacity planning (issue #596).
+    ///
+    /// The historical companion to `harvest concurrency status`. Renders a
+    /// table by default; pass --json for piping.
     Usage {
         /// Inclusive lower bound of the aggregation window: RFC 3339 or a
         /// relative duration like 24h.

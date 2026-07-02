@@ -64,6 +64,7 @@ pub enum UsageGroupBy {
     /// Group by `harvest_workflow_executions.workflow_name`.
     WorkflowName,
     /// Group by a key inside the `search_attrs` JSONB object (e.g. tenant id).
+    ///
     /// Executions missing the key are bucketed under [`UNATTRIBUTED_GROUP`].
     SearchAttr(String),
 }
