@@ -1,5 +1,4 @@
-//! Read-only per-tenant/per-workflow usage aggregation for chargeback and
-//! capacity planning (issue #596).
+//! Read-only per-tenant/per-workflow usage aggregation (issue #596).
 //!
 //! The *historical* companion to the *point-in-time* `GET /admin/concurrency`
 //! endpoint (issue #247): answers "how much did tenant X actually consume
@@ -112,7 +111,7 @@ impl UsageGroupBy {
 
     /// The `search_attrs` key this dimension extracts, if any.
     #[must_use]
-    pub fn search_attr_key(&self) -> Option<&str> {
+    pub const fn search_attr_key(&self) -> Option<&str> {
         match self {
             Self::WorkflowName => None,
             Self::SearchAttr(key) => Some(key.as_str()),
