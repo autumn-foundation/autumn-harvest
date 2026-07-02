@@ -11,6 +11,11 @@
 //! ## Metric semantics
 //!
 //! - `workflow_starts`: executions whose `started_at` falls in `[from, to]`.
+//!   Counts every `harvest_workflow_executions` row, including
+//!   continue-as-new and issue #523 auto-retry successor rows — each such
+//!   row represents separately-billable compute, so this is a deliberate
+//!   consumption-accuracy choice, not an oversight (consistent with how
+//!   `activity_executions` below already counts every retry attempt).
 //! - `completed`/`failed`/`cancelled`/`timed_out`: executions whose
 //!   `completed_at` falls in `[from, to]` and whose terminal `state` matches.
 //!   Each terminal transition is counted exactly once, in the window it
@@ -36,6 +41,18 @@
 //! externally-completed activities (`ActivityAwaitingExternal` and
 //! siblings) are excluded from the activity counters — they never emit
 //! `ActivityStarted`, so they naturally fall out of every query above.
+//!
+//! ## Known limitation: `search_attr` value collision with the sentinel
+//!
+//! An execution whose `search_attrs` value for the requested key literally
+//! equals [`UNATTRIBUTED_GROUP`] (`"(unattributed)"`) is indistinguishable
+//! from an execution that lacks the key entirely — both merge into the same
+//! `"(unattributed)"` group. This is an accepted, documented limitation, not
+//! a defect: issue #596's AC mandates this exact literal for missing-key
+//! executions, so any internal separation of the two cases would still
+//! collapse to one flat string in the final JSON response. Operators
+//! choosing a `search_attr:<key>` should avoid keys whose legitimate values
+//! could collide with the sentinel string.
 
 use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
@@ -56,6 +73,18 @@ pub const UNATTRIBUTED_GROUP: &str = "(unattributed)";
 #[must_use]
 pub const fn default_usage_window_ceiling() -> std::time::Duration {
     std::time::Duration::from_secs(90 * 24 * 60 * 60)
+}
+
+/// Default cap on the number of distinct groups `GET /admin/usage` will
+/// return before failing loudly with a `413`-mappable error (issue #596).
+///
+/// Unlike `GET /workflows/count`'s top-N + `other` rollup, a chargeback
+/// report must never silently drop a low-volume tenant's data — so
+/// exceeding this cap is a hard error naming the ceiling rather than a
+/// silent rollup.
+#[must_use]
+pub const fn default_usage_max_groups() -> usize {
+    10_000
 }
 
 /// How `GET /admin/usage` groups executions (issue #596).
@@ -166,19 +195,25 @@ struct UsageSqlRow {
 }
 
 // Shared group-key expression: `workflow_name` when `$2` (the search_attr
-// key) is NULL, else `COALESCE(search_attrs ->> $2, '(unattributed)')`.
+// key) is NULL, else `COALESCE(search_attrs ->> $2, UNATTRIBUTED_GROUP)`.
+// Derived from the `UNATTRIBUTED_GROUP` constant via interpolation (rather
+// than duplicating the literal) so the two can never drift out of sync.
 #[cfg(feature = "db")]
-const GROUP_KEY_EXPR: &str = "\
-    CASE WHEN $2::TEXT IS NULL THEN w.workflow_name \
-    ELSE COALESCE(w.search_attrs ->> $2::TEXT, '(unattributed)') END";
+fn group_key_expr() -> String {
+    format!(
+        "CASE WHEN $2::TEXT IS NULL THEN w.workflow_name \
+         ELSE COALESCE(w.search_attrs ->> $2::TEXT, '{UNATTRIBUTED_GROUP}') END"
+    )
+}
 
 #[cfg(feature = "db")]
 fn usage_sql() -> String {
+    let group_key_expr = group_key_expr();
     format!(
         r"
 WITH execution_counts AS (
     SELECT
-        {GROUP_KEY_EXPR} AS grp,
+        {group_key_expr} AS grp,
         COUNT(*) FILTER (WHERE w.started_at BETWEEN $3 AND $4)::BIGINT AS workflow_starts,
         COUNT(*) FILTER (
             WHERE w.state = 'COMPLETED' AND w.completed_at BETWEEN $3 AND $4
@@ -200,37 +235,38 @@ WITH execution_counts AS (
       )
     GROUP BY 1
 ),
-activity_counts AS (
-    SELECT
-        {GROUP_KEY_EXPR} AS grp,
-        COUNT(*) FILTER (WHERE e.event_type = 'ActivityStarted')::BIGINT AS activity_executions,
-        COUNT(*) FILTER (
-            WHERE e.event_type IN ('ActivityFailed', 'ActivityTimedOut')
-        )::BIGINT AS activity_executions_failed
-    FROM harvest_events e
-    INNER JOIN harvest_workflow_executions w ON w.id = e.workflow_exec_id
-    WHERE w.shard_id = $1::INT4
-      AND e.event_type IN ('ActivityStarted', 'ActivityFailed', 'ActivityTimedOut')
-      AND e.timestamp BETWEEN $3 AND $4
-    GROUP BY 1
-),
-activity_terminal AS (
+activity_events AS (
     SELECT
         e.workflow_exec_id,
+        e.event_type,
         e.event_data #>> '{{data,activity_id}}' AS activity_id,
-        e.timestamp AS terminal_at
+        e.timestamp
     FROM harvest_events e
-    WHERE e.event_type IN ('ActivityCompleted', 'ActivityFailed', 'ActivityTimedOut')
+    WHERE e.event_type IN (
+        'ActivityStarted', 'ActivityCompleted', 'ActivityFailed', 'ActivityTimedOut'
+    )
       AND e.timestamp BETWEEN $3 AND $4
+),
+activity_counts AS (
+    SELECT
+        {group_key_expr} AS grp,
+        COUNT(*) FILTER (WHERE ae.event_type = 'ActivityStarted')::BIGINT AS activity_executions,
+        COUNT(*) FILTER (
+            WHERE ae.event_type IN ('ActivityFailed', 'ActivityTimedOut')
+        )::BIGINT AS activity_executions_failed
+    FROM activity_events ae
+    INNER JOIN harvest_workflow_executions w ON w.id = ae.workflow_exec_id
+    WHERE w.shard_id = $1::INT4
+    GROUP BY 1
 ),
 activity_compute AS (
     SELECT
-        {GROUP_KEY_EXPR} AS grp,
+        {group_key_expr} AS grp,
         COALESCE(
-            SUM(EXTRACT(EPOCH FROM (t.terminal_at - s.last_started_at))),
+            SUM(EXTRACT(EPOCH FROM (t.timestamp - s.last_started_at))),
             0
         )::DOUBLE PRECISION AS activity_compute_seconds
-    FROM activity_terminal t
+    FROM activity_events t
     INNER JOIN harvest_workflow_executions w ON w.id = t.workflow_exec_id
     INNER JOIN LATERAL (
         SELECT MAX(e2.timestamp) AS last_started_at
@@ -238,9 +274,10 @@ activity_compute AS (
         WHERE e2.workflow_exec_id = t.workflow_exec_id
           AND e2.event_type = 'ActivityStarted'
           AND e2.event_data #>> '{{data,activity_id}}' = t.activity_id
-          AND e2.timestamp <= t.terminal_at
+          AND e2.timestamp <= t.timestamp
     ) s ON s.last_started_at IS NOT NULL
-    WHERE w.shard_id = $1::INT4
+    WHERE t.event_type IN ('ActivityCompleted', 'ActivityFailed', 'ActivityTimedOut')
+      AND w.shard_id = $1::INT4
     GROUP BY 1
 )
 SELECT
@@ -384,6 +421,26 @@ mod tests {
         assert_eq!(
             default_usage_window_ceiling(),
             std::time::Duration::from_secs(90 * 24 * 60 * 60)
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn group_key_expr_sql_derives_from_unattributed_group_constant() {
+        assert!(group_key_expr().contains(&format!("'{UNATTRIBUTED_GROUP}'")));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn usage_sql_merges_activity_scans_into_one_cte() {
+        let sql = usage_sql();
+        assert!(
+            sql.contains("activity_events"),
+            "merged activity CTE must exist"
+        );
+        assert!(
+            !sql.contains("activity_terminal"),
+            "activity_terminal CTE must be gone after the F10 merge"
         );
     }
 }
