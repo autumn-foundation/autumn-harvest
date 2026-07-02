@@ -24,6 +24,16 @@
 //! coordination -- and even for the *same* name, at most one style receives
 //! any given recorded `SignalReceived` event (no double delivery).
 //!
+//! **Dispatch timing.** `register_signal_handler*` only stores the handler --
+//! it does not fire inline. Dispatch happens on the *next* history-consulting
+//! call the workflow body makes (an activity, timer, another signal wait, or
+//! a deterministic primitive like `system_now()`), and at the latest once
+//! more when the cycle ends. A workflow that reads handler-mutated state
+//! should do so only after at least one such call; reading it on the literal
+//! next line with nothing in between sees pre-dispatch state. See the
+//! `system_now()` call below for the minimal way to force this when nothing
+//! else in the workflow body would trigger it naturally.
+//!
 //! ## Handlers must be idempotent, replay-safe state mutation only
 //!
 //! There is no persisted "already delivered" marker for a signal handler
@@ -126,6 +136,16 @@ async fn subscription(
         lock_state(&upgrade_state).tier = req.tier;
     });
 
+    // Registration only stores a handler -- it does not dispatch inline.
+    // Dispatch happens on the next history-consulting call the workflow body
+    // makes (an activity, timer, or a cheap deterministic primitive like
+    // `system_now()` below), so a signal already recorded at the start of
+    // this cycle is only visible to the reads further down *after* such a
+    // call. Any real activity/timer/loop later in the workflow provides this
+    // for free; `system_now()` is the minimal way to force it here since
+    // this example checks the flags before doing anything else.
+    let _ = ctx.system_now();
+
     // The rest of the workflow body is free to run its own logic --
     // deterministic replay of the handlers above happens transparently at
     // the top of every cycle, regardless of where this code has gotten to.
@@ -159,4 +179,77 @@ fn main() {
     println!("Register on a HarvestBuilder:");
     println!("  .workflows(workflows![subscription])");
     println!("  .activities(activities![charge_billing_cycle])");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autumn_harvest::context::WorkflowCommand;
+    use autumn_harvest::types::ExecutionId;
+
+    fn started_event(input: &str) -> WorkflowEvent {
+        WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!(input),
+            timestamp: chrono::Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_signal_recorded_before_start_skips_billing_charge() {
+        // Regression (PR #890 review): a signal already recorded before this
+        // cycle even starts must still be observed by the billing decision
+        // below, despite there being zero commands between the three
+        // `register_signal_handler*` calls and this cancellation check other
+        // than the `system_now()` flush point.
+        let events = vec![
+            started_event("gold"),
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "customer_requested"}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let result = subscription(&ctx, "gold".to_string()).await;
+        let state = result.expect("workflow should complete without charging");
+        assert!(
+            state.cancelled,
+            "a cancellation recorded before the cycle started must be observed"
+        );
+        assert_eq!(state.cancel_reason.as_deref(), Some("customer_requested"));
+
+        let commands = ctx.drain_commands();
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::ScheduleActivity { name, .. } if name == "charge_billing_cycle")),
+            "must not charge the billing cycle after observing a pre-recorded \
+             cancellation: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_signals_recorded_charges_billing_cycle() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started_event("gold")]);
+
+        // The activity never completes in this test, so race the workflow
+        // future against a short sleep and inspect what it queued.
+        let fut = subscription(&ctx, "gold".to_string());
+        tokio::pin!(fut);
+        tokio::select! {
+            _ = &mut fut => panic!("workflow must suspend waiting on the activity"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+
+        let commands = ctx.drain_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::ScheduleActivity { name, .. } if name == "charge_billing_cycle")),
+            "must charge the billing cycle when no cancellation/pause was recorded: {commands:?}"
+        );
+    }
 }
