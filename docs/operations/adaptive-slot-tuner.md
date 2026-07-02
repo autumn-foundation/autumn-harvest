@@ -128,6 +128,25 @@ When a tuner is configured, a dispatch semaphore is created with
   they are returned, so the in-flight count naturally falls to the new
   target over time rather than being forced down immediately.
 
+**Known limitation — shrink can be starved by a dispatch backlog.**
+`dispatch_task` spawns every claimed task as a queueing `semaphore.acquire()`,
+and claiming is not throttled against the live target: under a real backlog
+(claims outrunning dispatch capacity), the semaphore's wait queue is
+continuously non-empty. `tokio::sync::Semaphore` always assigns a released
+permit directly to the oldest queued waiter before it is ever visible to a
+concurrent `try_acquire()` — the mechanism shrink uses — so a shrink
+decision can lose that race indefinitely for as long as the backlog
+persists. This is exactly the scenario a pool-protecting shrink is meant to
+help with, so it is a real gap, not a cosmetic one: under sustained
+over-claim, live concurrency may not come down until the backlog itself
+drains by other means (e.g. the DB pool recovering enough for claimed tasks
+to complete). A correct fix requires either making shrink a queued acquire
+that competes fairly in the same FIFO, or throttling `dispatch_task`/the
+poll loop so claims never outrun the live target (keeping the wait queue
+empty). Both are redesigns of the shared dispatch path used by every
+worker, tuned or not, and are tracked as follow-up work under issue #548
+rather than included in the initial implementation.
+
 This means **graceful shutdown and draining are unaffected for already-running
 work**: a shrink decision never cancels or reclaims an already-dispatched
 task. On worker shutdown the tuner's control loop releases every withheld

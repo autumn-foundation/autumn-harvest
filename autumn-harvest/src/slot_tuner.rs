@@ -520,9 +520,19 @@ impl TunedSlotRuntime {
                         self.withheld.push(permit);
                         self.live_target.fetch_sub(1, Ordering::Relaxed);
                     }
-                    // No free permit right now — every remaining slot at
-                    // the current target is occupied by in-flight work.
-                    // Stop; a later tick will retry as permits return.
+                    // No free permit right now — either every remaining
+                    // slot at the current target is occupied by in-flight
+                    // work, or (issue #548 review, known limitation) the
+                    // semaphore has a queued dispatch backlog: tokio always
+                    // hands a released permit straight to the oldest queued
+                    // `.acquire()` waiter before this `try_acquire_owned`
+                    // can ever see it, so a shrink can lose this race
+                    // indefinitely under sustained over-claim. See
+                    // "Known limitation — shrink can be starved by a
+                    // dispatch backlog" in
+                    // docs/operations/adaptive-slot-tuner.md. Stop for this
+                    // tick either way; desired_target still remembers the
+                    // unmet request for `tick_one` to retry.
                     Err(_) => break,
                 }
             }
