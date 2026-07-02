@@ -401,6 +401,13 @@ impl HistoryMatcher {
                         .is_some_and(|timers| !timers.is_empty())
                     {
                         race_reserved_signal_events.insert(idx);
+                        // This is the FIRST matching signal since the race(s)
+                        // opened: `match_signal_or_timer`'s own scan resolves
+                        // at the first occurrence and never looks past it, so
+                        // every open race for this name is now settled. Close
+                        // them here so a later, unrelated same-name delivery
+                        // is not incorrectly reserved too (PR #890 review).
+                        open_race_timers.remove(signal_name.as_str());
                     }
                 }
                 WorkflowEvent::TimerStarted { timer_id, .. } => {
@@ -412,7 +419,9 @@ impl HistoryMatcher {
                     }
                 }
                 WorkflowEvent::TimerFired { timer_id } => {
-                    for timers in open_race_timers.values_mut() {
+                    if let Some(name) = Self::signal_timeout_race_name(timer_id.as_str())
+                        && let Some(timers) = open_race_timers.get_mut(name)
+                    {
                         timers.retain(|id| *id != timer_id.as_str());
                     }
                 }
@@ -2708,6 +2717,13 @@ impl HistoryMatcher {
                     name == signal_name && !self.race_reserved_signal_events.contains(idx)
                 });
         self.pending_signals = remaining;
+        // Every stashed entry already has its index in `consumed_signal_events`
+        // (set by `stash_signal` at stash time), but re-asserting it here makes
+        // the no-double-delivery invariant explicit at the point of use rather
+        // than relying on the reader to trace it back to the stash call site.
+        for (_, _, idx) in &matched {
+            self.consumed_signal_events.insert(*idx);
+        }
         results.extend(matched.into_iter().map(|(_, payload, _)| payload));
 
         // 2. Claim any further matching events nobody has scanned yet at all
@@ -4828,7 +4844,7 @@ mod tests {
 
         // A push handler registered first (the idiomatic top-of-function
         // ordering) must not be able to claim the race's own signal.
-        let mut matcher = HistoryMatcher::new(events.clone());
+        let mut matcher = HistoryMatcher::new(events);
         let drained = matcher.drain_signal_events("approval");
         assert!(
             drained.is_empty(),
@@ -4888,6 +4904,50 @@ mod tests {
         let mut matcher = HistoryMatcher::new(events);
         let drained = matcher.drain_signal_events("cancel");
         assert_eq!(drained, vec![serde_json::json!({"reason": "manual"})]);
+    }
+
+    #[test]
+    fn drain_signal_events_only_reserves_the_first_racing_signal_not_a_later_one() {
+        // Regression (PR #890 review): the race resolves at the FIRST matching
+        // signal (match_signal_or_timer never looks past it), so only that
+        // occurrence is reserved. A second same-name delivery recorded before
+        // the timer fires is unrelated to the race and must remain available
+        // to a push handler.
+        let timer_id = "__signal_timeout:1:approval";
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(timer_id),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"seq": 1}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"seq": 2}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new(timer_id),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let drained = matcher.drain_signal_events("approval");
+        assert_eq!(
+            drained,
+            vec![serde_json::json!({"seq": 2})],
+            "only the first occurrence is reserved for the race; the second is ordinary"
+        );
+
+        let result = matcher.match_signal_or_timer("approval", timer_id, Some(300));
+        assert_eq!(
+            result,
+            SignalOrTimerMatch::SignalWon {
+                payload: serde_json::json!({"seq": 1})
+            },
+            "the race must still resolve correctly with its own (first) signal"
+        );
     }
 
     #[test]
