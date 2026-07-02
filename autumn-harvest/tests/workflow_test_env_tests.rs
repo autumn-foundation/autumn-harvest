@@ -61,6 +61,30 @@ fn retry_workflow<'a>(
     })
 }
 
+/// Publishes an operator status breadcrumb at each phase via
+/// `ctx.set_current_details`, overwriting it between activities and clearing
+/// it (empty string) before completing (issue #593).
+fn current_details_status_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.set_current_details("step 1/2: charging card");
+        let charge = ctx
+            .execute_activity_raw("charge_card", json!({"amount": 100}), "payments")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.set_current_details("step 2/2: sending receipt");
+        let receipt = ctx
+            .execute_activity_raw("send_email", json!({"to": "user@example.com"}), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        // Clear the breadcrumb on completion.
+        ctx.set_current_details("");
+        Ok(json!({"charge": charge, "receipt": receipt}))
+    })
+}
+
 /// (c) Races a timer against a signal; returns which path fired first.
 fn race_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -735,6 +759,47 @@ async fn test_replay_self_check_succeeds_for_deterministic_workflow() {
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "replay self-check failed:\n{report}"
+    );
+}
+
+// ──────────────── set_current_details status breadcrumb (issue #593) ─────────
+
+#[tokio::test]
+async fn test_current_details_set_overwrite_clear_leaves_no_event_footprint() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("charge_card", |_| Ok(json!({"status": "charged"})))
+        .mock_activity("send_email", |_| Ok(json!("delivered")))
+        .run(current_details_status_workflow, json!(null))
+        .await;
+
+    assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
+
+    // set_current_details (initial set, overwrite, and a trailing empty-string
+    // clear) must leave zero footprint in harvest_events -- only the two
+    // activities' events are recorded, exactly as if the calls were never made.
+    let events = outcome.events();
+    let scheduled = events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityScheduled { .. }))
+        .count();
+    let completed = events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
+        .count();
+    assert_eq!(
+        scheduled, 2,
+        "expected exactly two ActivityScheduled events"
+    );
+    assert_eq!(
+        completed, 2,
+        "expected exactly two ActivityCompleted events"
+    );
+
+    let report = outcome.replay_check(current_details_status_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "set_current_details calls (set, overwrite, and empty-string clear) \
+         must replay deterministically:\n{report}"
     );
 }
 

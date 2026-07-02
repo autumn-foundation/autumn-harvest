@@ -342,10 +342,13 @@ pub enum WorkflowCommand {
     /// Emitted by [`WorkflowContext::set_current_details`] during live execution.
     /// Suppressed during replay so the DB write is idempotent across worker
     /// restarts. Last-write-wins: the worker takes the **last** `SetCurrentDetails`
-    /// command from the drained list and persists only that value.
+    /// command from the drained list and persists only that value. An empty
+    /// `value` clears the column to `NULL` (issue #593) rather than storing an
+    /// empty string.
     /// No `WorkflowEvent` is appended — zero footprint in `harvest_events`.
     SetCurrentDetails {
         /// The human-readable status string, already capped by the context.
+        /// An empty string is the clear sentinel.
         value: String,
     },
     /// Spawn a child workflow in detached mode and return its `ExecutionId`
@@ -5197,6 +5200,8 @@ impl WorkflowContext {
     ///
     /// Calls are **last-write-wins**: the worker takes the most recently emitted
     /// value and overwrites `harvest_workflow_executions.current_details`.
+    /// Passing an empty string **clears** the breadcrumb (persists `NULL`
+    /// rather than an empty string) — issue #593.
     ///
     /// The value is **suppressed during replay** (zero new `harvest_events` rows,
     /// zero replay-determinism impact), mirroring the zero-footprint contract of
@@ -10223,6 +10228,26 @@ mod tests {
             stored.len() <= 5,
             "stored length {} exceeds cap 5",
             stored.len()
+        );
+    }
+
+    #[test]
+    fn set_current_details_empty_string_pushes_empty_command() {
+        // The context's job is only to forward the raw value (capped, replay-
+        // gated); interpreting an empty string as "clear to NULL" is the
+        // worker's responsibility (`worker::latest_current_details_update`,
+        // issue #593). This test locks in that the empty string reaches the
+        // drained command list unfiltered, so the worker-side clear signal is
+        // never silently dropped at the context layer.
+        let ctx = WorkflowContext::new_test();
+        ctx.set_current_details("in progress");
+        ctx.set_current_details("");
+        let cmds = ctx.drain_commands();
+        assert_eq!(
+            last_set_current_details(&cmds),
+            Some(""),
+            "an empty-string call must still push a SetCurrentDetails command \
+             carrying an empty value, so the worker can resolve it to a clear"
         );
     }
 

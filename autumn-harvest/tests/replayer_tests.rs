@@ -116,6 +116,32 @@ fn versioned_workflow_unfenced<'a>(
     })
 }
 
+/// Workflow that calls `set_current_details` before, between, and after
+/// activities, including a trailing clear via an empty string (issue #593).
+/// It must replay against a history containing **only** the activity events
+/// -- `set_current_details` leaves zero footprint in `harvest_events`, so no
+/// history event corresponds to any of these calls.
+fn current_details_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.set_current_details("step 1/2: running step_one");
+        let r1 = ctx
+            .execute_activity_raw("step_one", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.set_current_details("step 2/2: running step_two");
+        let r2 = ctx
+            .execute_activity_raw("step_two", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        // Clear the breadcrumb on completion.
+        ctx.set_current_details("");
+        Ok(serde_json::json!({"first": r1, "second": r2}))
+    })
+}
+
 /// Workflow that starts a timer before any activities.
 fn timer_first_workflow<'a>(
     ctx: &'a WorkflowContext,
@@ -195,6 +221,45 @@ fn canonical_history() -> (ExecutionId, Vec<WorkflowEvent>) {
     (exec_id, events)
 }
 
+/// History for `current_details_workflow`: two activities, no timer, and
+/// deliberately **no** event corresponding to any `set_current_details` call
+/// -- proving the call is zero-footprint by construction (issue #593).
+fn current_details_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let id1 = ActivityExecId::new();
+    let id2 = ActivityExecId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id1,
+            name: "step_one".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id1,
+            output: serde_json::json!("result_one"),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: id2,
+            name: "step_two".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: id2,
+            output: serde_json::json!("result_two"),
+        },
+    ];
+    (exec_id, events)
+}
+
 fn build_replayer() -> WorkflowReplayer {
     WorkflowReplayer::new()
         .register_fn("canonical_workflow", canonical_workflow)
@@ -203,6 +268,7 @@ fn build_replayer() -> WorkflowReplayer {
         .register_fn("versioned_workflow_unfenced", versioned_workflow_unfenced)
         .register_fn("timer_first_workflow", timer_first_workflow)
         .register_fn("jitter_timer_workflow", jitter_timer_workflow)
+        .register_fn("current_details_workflow", current_details_workflow)
 }
 
 /// Build a snapshot from a `(exec_id, events)` pair with a given workflow name.
@@ -231,6 +297,32 @@ async fn replay_unchanged_workflow_succeeds() {
     assert!(
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "unchanged workflow must succeed replay, got: {report}"
+    );
+    assert!(
+        report.events_replayed > 0,
+        "events_replayed must be positive"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (a2) set_current_details calls replay safely with zero event footprint
+//      (issue #593 falsifiable correctness bar).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn replay_workflow_with_current_details_calls_succeeds() {
+    let (exec_id, events) = current_details_history();
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot("current_details_workflow", exec_id, events))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a workflow calling set_current_details (including an empty-string \
+         clear) must replay against a history with zero corresponding events, \
+         got: {report}"
     );
     assert!(
         report.events_replayed > 0,

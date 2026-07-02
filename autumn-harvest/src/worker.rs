@@ -2790,28 +2790,62 @@ async fn persist_search_attrs_from_commands(
     store::update_search_attrs(conn, exec_id, &merged).await
 }
 
+/// The effective DB write resolved from the last `SetCurrentDetails` command
+/// in a cycle, if any (issue #593). A 3-way enum rather than
+/// `Option<Option<&str>>` (`clippy::option_option`) -- all three states are
+/// meaningfully distinct outcomes, not a nested-optionality artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentDetailsUpdate<'a> {
+    /// No `SetCurrentDetails` command was present this cycle -- skip the write.
+    NoOp,
+    /// The last command carried an empty string -- clear the column to `NULL`.
+    Clear,
+    /// The last command sets the column to this value.
+    Set(&'a str),
+}
+
+/// Determines the last `SetCurrentDetails` command's effective DB write, if
+/// any (issue #593). Pure, no-DB decision function factored out of
+/// [`persist_current_details_from_commands`] so the last-write-wins /
+/// empty-clears contract is directly unit-testable.
+fn latest_current_details_update(commands: &[WorkflowCommand]) -> CurrentDetailsUpdate<'_> {
+    commands
+        .iter()
+        .rev()
+        .find_map(|cmd| {
+            if let WorkflowCommand::SetCurrentDetails { value } = cmd {
+                Some(if value.is_empty() {
+                    CurrentDetailsUpdate::Clear
+                } else {
+                    CurrentDetailsUpdate::Set(value.as_str())
+                })
+            } else {
+                None
+            }
+        })
+        .unwrap_or(CurrentDetailsUpdate::NoOp)
+}
+
 /// Persist the last `SetCurrentDetails` command to the execution row (issue #473).
 ///
 /// Scans `commands` for [`WorkflowCommand::SetCurrentDetails`] variants and
 /// writes the **last** value (last-write-wins) to
-/// `harvest_workflow_executions.current_details` in a single `UPDATE`.
-/// Does nothing when no `SetCurrentDetails` command is present.
+/// `harvest_workflow_executions.current_details` in a single `UPDATE`. An
+/// empty-string value clears the column to `NULL` (issue #593). Does nothing
+/// when no `SetCurrentDetails` command is present.
 async fn persist_current_details_from_commands(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<()> {
-    // Last-write-wins: take the last SetCurrentDetails value in the command list.
-    let last = commands.iter().rev().find_map(|cmd| {
-        if let WorkflowCommand::SetCurrentDetails { value } = cmd {
-            Some(value.as_str())
-        } else {
-            None
+    match latest_current_details_update(commands) {
+        CurrentDetailsUpdate::NoOp => {}
+        CurrentDetailsUpdate::Clear => {
+            store::update_current_details(conn, exec_id, None).await?;
         }
-    });
-
-    if let Some(details) = last {
-        store::update_current_details(conn, exec_id, details).await?;
+        CurrentDetailsUpdate::Set(details) => {
+            store::update_current_details(conn, exec_id, Some(details)).await?;
+        }
     }
     Ok(())
 }
@@ -10501,6 +10535,121 @@ mod tests {
         let mut cfg = default_runtime_config();
         cfg.workflow_task_timeout = Duration::ZERO;
         assert!(cfg.workflow_task_timeout.is_zero());
+    }
+
+    // ── current_details empty-string-clears tests (issue #593) ────────────
+    //
+    // `latest_current_details_update` is the pure decision function behind
+    // `persist_current_details_from_commands`: it scans a command list for
+    // the last `SetCurrentDetails` and reports what the DB write should be.
+    // `CurrentDetailsUpdate::NoOp` = no command present this cycle (skip the
+    // write entirely). `Clear` = the last command carried an empty string,
+    // which must clear `current_details` to SQL NULL rather than persisting
+    // `""`. `Set(s)` = set `current_details` to `s`.
+
+    #[test]
+    fn latest_current_details_update_none_when_no_command() {
+        let cmds: Vec<WorkflowCommand> = Vec::new();
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::NoOp
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_returns_set_value() {
+        let cmds = vec![WorkflowCommand::SetCurrentDetails {
+            value: "step 2/4: processing payment".to_string(),
+        }];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Set("step 2/4: processing payment")
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_last_write_wins() {
+        let cmds = vec![
+            WorkflowCommand::SetCurrentDetails {
+                value: "first".to_string(),
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: "second".to_string(),
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: "third".to_string(),
+            },
+        ];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Set("third")
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_empty_string_clears() {
+        let cmds = vec![WorkflowCommand::SetCurrentDetails {
+            value: String::new(),
+        }];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Clear,
+            "an empty-string SetCurrentDetails must resolve to a clear (NULL), not a stored empty string"
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_set_then_empty_clears() {
+        let cmds = vec![
+            WorkflowCommand::SetCurrentDetails {
+                value: "in progress".to_string(),
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: String::new(),
+            },
+        ];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Clear,
+            "last-write-wins applies to clears too: a trailing empty string clears"
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_empty_then_set_overwrites_clear() {
+        let cmds = vec![
+            WorkflowCommand::SetCurrentDetails {
+                value: String::new(),
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: "now running".to_string(),
+            },
+        ];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Set("now running")
+        );
+    }
+
+    #[test]
+    fn latest_current_details_update_ignores_other_command_types() {
+        let cmds = vec![
+            WorkflowCommand::RecordMarker {
+                name: "unrelated".to_string(),
+                details: Value::Null,
+            },
+            WorkflowCommand::SetCurrentDetails {
+                value: "the real status".to_string(),
+            },
+            WorkflowCommand::RecordMarker {
+                name: "also-unrelated".to_string(),
+                details: Value::Null,
+            },
+        ];
+        assert_eq!(
+            latest_current_details_update(&cmds),
+            CurrentDetailsUpdate::Set("the real status")
+        );
     }
 
     #[test]
