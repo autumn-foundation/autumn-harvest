@@ -129,6 +129,8 @@ pub mod shard;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
 pub mod simulator;
+/// Adaptive worker dispatch-slot tuner (issue #548).
+pub mod slot_tuner;
 /// OpenTelemetry integration: trace-context propagation and metrics.
 pub mod telemetry;
 #[cfg(any(test, feature = "testing"))]
@@ -234,7 +236,8 @@ pub use execution::{
     PausedWorkflowExecution, ResumedWorkflowExecution, ScheduleRunQuery, ScheduleRunRow,
     ScheduleRunStateCount, SignalWithStartOutcome, SignalWithStartParams, StartWorkflowParams,
     StartedWorkflowExecution, UpdateWithStartOutcome, UpdateWithStartParams,
-    WorkflowTypeNonTerminalCount, auto_resume_expired_pauses, cancel_workflow_execution,
+    WorkflowCountDimension, WorkflowCountQuery, WorkflowCountRow, WorkflowTypeNonTerminalCount,
+    auto_resume_expired_pauses, cancel_workflow_execution, count_workflow_executions_grouped,
     list_schedule_runs, non_terminal_counts_by_workflow_name, pause_workflow_execution,
     resume_workflow_execution, schedule_run_state_summary, signal_with_start_workflow_execution,
     signal_with_start_workflow_execution_with_metrics, start_or_load_workflow_execution,

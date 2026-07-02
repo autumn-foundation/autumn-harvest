@@ -67,6 +67,37 @@ fn management_routes_match_contract() {
     );
 }
 
+/// `GET /workflows/count` (issue #544) must have an entry in
+/// `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// `audit.rs`'s own exhaustiveness tests only check `CLASSIFIED_ROUTES` and
+/// `ALL_MUTATION_ROUTES` against each other, which stays green even if a route
+/// is added to `harvest_api_router` and never classified at all — as happened
+/// here. This test walks the live router for this one route so the specific
+/// regression this diff fixed can't silently reappear.
+///
+/// A broader "every route in `harvest_api_router` must be classified" sweep
+/// was tried here and found 27 pre-existing, unrelated routes with the same
+/// gap; fixing those is out of scope for this change and risks misclassifying
+/// a route's mutation semantics without a dedicated per-route review, so this
+/// test stays scoped to the route this diff actually introduces.
+#[test]
+fn workflow_count_route_is_classified() {
+    use autumn_harvest::audit::CLASSIFIED_ROUTES;
+
+    let route = "GET /workflows/count";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == route),
+        "{route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES.iter().any(|(r, _)| *r == route),
+        "{route} must have an entry in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
 /// Every route in the contract must carry all required metadata fields.
 #[test]
 fn contract_routes_have_required_fields() {

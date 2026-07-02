@@ -233,6 +233,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // require /health to be reachable without credentials.
     ("GET /health", RouteClass::PublicSafe),
     // ── ReadOnly ── reads state, does not modify workflow execution ───────────
+    ("GET /workflows/count", RouteClass::ReadOnly),
     ("GET /workflows", RouteClass::ReadOnly),
     ("GET /workflows/{id}", RouteClass::ReadOnly),
     ("GET /workflows/{id}/children", RouteClass::ReadOnly),
@@ -438,6 +439,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
 /// coverage guard test to ensure no route is accidentally omitted from either
 /// [`ALL_MUTATION_ROUTES`] or this exclusion list.
 pub const EXCLUDED_ROUTES: &[&str] = &[
+    "GET /workflows/count",
     "GET /workflows",
     "GET /workflows/{id}",
     "GET /workflows/{id}/children",
@@ -498,6 +500,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
 /// will fail if any expected mutation route is missing or declared as excluded.
 pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     // Workflow management
+    ("GET /workflows/count", None),
     ("GET /workflows", None),
     ("GET /workflows/{id}", None),
     ("GET /workflows/{id}/children", None),
@@ -901,6 +904,31 @@ mod tests {
                 .any(|(r, c)| *r == "GET /workflows/{id}/result" && *c == RouteClass::ReadOnly),
             "GET /workflows/{{id}}/result must be classified RouteClass::ReadOnly in \
              CLASSIFIED_ROUTES (issue #527)"
+        );
+    }
+
+    #[test]
+    fn workflow_count_route_is_classified_read_only() {
+        // The grouped workflow-count fleet snapshot (issue #544) is a
+        // read-only fan-out projection, no different from the other cross-shard
+        // read models it's modeled after. This test — not just the general
+        // exhaustiveness guards below, which only cross-check CLASSIFIED_ROUTES
+        // and ALL_MUTATION_ROUTES against each other rather than against the
+        // live router — is what actually catches a new route shipping with no
+        // classification at all.
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == "GET /workflows/count" && *c == RouteClass::ReadOnly),
+            "GET /workflows/count must be classified RouteClass::ReadOnly in \
+             CLASSIFIED_ROUTES (issue #544)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == "GET /workflows/count" && op.is_none()),
+            "GET /workflows/count must appear in ALL_MUTATION_ROUTES with no audit \
+             operation (issue #544)"
         );
     }
 

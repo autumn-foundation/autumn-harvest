@@ -421,6 +421,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )
@@ -2377,6 +2378,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         max_workflow_history_events: None,
         shard_notification_database_urls: Vec::new(),
         sharded_pool: None,
+        slot_tuner: None,
     };
     let worker = Arc::new(Worker::new(config, registry).expect("worker should build"));
     let pool = build_test_pool(&database_url);

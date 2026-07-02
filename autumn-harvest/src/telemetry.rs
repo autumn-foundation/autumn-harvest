@@ -212,6 +212,29 @@ pub const METRIC_WORKER_SLOTS_IN_USE: &str = "harvest.worker.slots_in_use";
 /// invariant.
 pub const METRIC_WORKER_SLOTS_AVAILABLE: &str = "harvest.worker.slots_available";
 
+/// Gauge: the adaptive slot tuner's current resize target for one slot type
+/// (issue #548).
+///
+/// Emitted in-process by the worker's slot-tuner control loop on the same
+/// cadence as the other monitoring tasks. Labelled `{slot_type}` only, same
+/// bounded values as [`METRIC_WORKER_SLOTS_IN_USE`]. Composes with the #531
+/// occupancy gauges on the same dashboard: `slot_target` is the band-clamped
+/// value the controller is steering toward; `slots_in_use` /
+/// `slots_available` (issue #531) sum to it. Only emitted when a
+/// `SlotTuner` is configured. Per ADR-0001 §7, `execution.id` MUST NOT appear
+/// as a label.
+pub const METRIC_WORKER_SLOT_TARGET: &str = "harvest.worker.slot_target";
+
+/// Counter: incremented once per adaptive slot-tuner control-loop tick with
+/// the decision that took effect (issue #548).
+///
+/// Labelled `{slot_type, decision}` where `decision` is one of `grow` /
+/// `shrink` / `hold` ([`TunerDecision::as_str`]). A decision that was clamped
+/// away by the `[min_slots, max_slots]` band (e.g. a `Grow` request at
+/// `max_slots`) is recorded as `hold`, reflecting what actually happened to
+/// the live target rather than what the controller requested.
+pub const METRIC_WORKER_TUNER_DECISIONS: &str = "harvest.worker.tuner_decisions";
+
 /// Gauge: current number of entries in the dead letter queue.
 pub const METRIC_DLQ_ENTRIES: &str = "harvest.dlq.entries";
 
@@ -538,6 +561,9 @@ pub const METRIC_LABEL_SCOPE: &str = "scope";
 pub const METRIC_LABEL_BUILD_ID: &str = "build_id";
 /// Metric label: worker dispatch-slot type (`"workflow"` or `"activity"`).
 pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
+/// Metric label: adaptive slot-tuner decision (`"grow"` / `"shrink"` / `"hold"`,
+/// issue #548).
+pub const METRIC_LABEL_DECISION: &str = "decision";
 
 // ---------------------------------------------------------------------------
 // Custom (user) metric constants and validation (issue #532)
@@ -922,6 +948,32 @@ impl SlotType {
     }
 }
 
+/// The decision an adaptive slot tuner made on one control-loop tick (issue
+/// #548), used as the bounded `decision` label on
+/// [`METRIC_WORKER_TUNER_DECISIONS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunerDecision {
+    /// The live target was increased.
+    Grow,
+    /// The live target was decreased.
+    Shrink,
+    /// The live target was left unchanged (including a grow/shrink request
+    /// fully absorbed by the `[min_slots, max_slots]` band clamp).
+    Hold,
+}
+
+impl TunerDecision {
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Grow => "grow",
+            Self::Shrink => "shrink",
+            Self::Hold => "hold",
+        }
+    }
+}
+
 /// Sink for the harvest engine's standard metrics.
 ///
 /// Implementations fan these calls into an OpenTelemetry meter (or whatever
@@ -1218,6 +1270,28 @@ pub trait MetricsRecorder: Send + Sync {
     /// `harvest_worker_slots_available{slot_type}`.
     fn record_worker_slots(&self, slot_type: SlotType, in_use: u64, available: u64) {
         let _ = (slot_type, in_use, available);
+    }
+
+    /// The adaptive slot tuner's current resize target for one slot type
+    /// (issue #548).
+    ///
+    /// Emitted in-process by the worker's slot-tuner control loop on the same
+    /// cadence as [`record_worker_slots`](Self::record_worker_slots). Only
+    /// emitted when a `SlotTuner` is configured.
+    ///
+    /// Maps to the gauge `harvest_worker_slot_target{slot_type}`.
+    fn record_worker_slot_target(&self, slot_type: SlotType, target: u64) {
+        let _ = (slot_type, target);
+    }
+
+    /// A tuner-decision counter tick for one slot type (issue #548).
+    ///
+    /// Emitted once per control-loop tick with the decision that actually
+    /// took effect after band clamping.
+    ///
+    /// Maps to the counter `harvest_worker_tuner_decisions{slot_type, decision}`.
+    fn record_tuner_decision(&self, slot_type: SlotType, decision: TunerDecision) {
+        let _ = (slot_type, decision);
     }
 
     /// Current number of claimable pending tasks on a shard that has no
@@ -2259,6 +2333,30 @@ mod tests {
     fn slot_type_stringify_is_bounded() {
         assert_eq!(SlotType::Workflow.as_str(), "workflow");
         assert_eq!(SlotType::Activity.as_str(), "activity");
+    }
+
+    #[test]
+    fn slot_target_gauge_and_tuner_decision_counter_have_default_noop_impls() {
+        // record_worker_slot_target / record_tuner_decision must exist on
+        // MetricsRecorder with a no-op default (issue #548).
+        let rec = NoOpMetrics;
+        rec.record_worker_slot_target(SlotType::Workflow, 20);
+        rec.record_worker_slot_target(SlotType::Activity, 40);
+        rec.record_tuner_decision(SlotType::Workflow, TunerDecision::Grow);
+        rec.record_tuner_decision(SlotType::Activity, TunerDecision::Shrink);
+        assert_eq!(METRIC_WORKER_SLOT_TARGET, "harvest.worker.slot_target");
+        assert_eq!(
+            METRIC_WORKER_TUNER_DECISIONS,
+            "harvest.worker.tuner_decisions"
+        );
+        assert_eq!(METRIC_LABEL_DECISION, "decision");
+    }
+
+    #[test]
+    fn tuner_decision_stringify_is_bounded() {
+        assert_eq!(TunerDecision::Grow.as_str(), "grow");
+        assert_eq!(TunerDecision::Shrink.as_str(), "shrink");
+        assert_eq!(TunerDecision::Hold.as_str(), "hold");
     }
 
     #[test]

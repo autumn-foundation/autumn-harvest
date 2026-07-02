@@ -776,6 +776,7 @@ fn build_runtime_worker(
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )
@@ -1417,6 +1418,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )
@@ -1545,6 +1547,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )
@@ -1706,6 +1709,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )
@@ -1932,6 +1936,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -2186,6 +2191,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -2348,6 +2354,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -4996,6 +5003,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             Arc::clone(&registry),
         )
@@ -5119,6 +5127,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             Arc::clone(&registry),
         )
@@ -5231,6 +5240,7 @@ async fn workflow_schedule_pause_and_resume() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             Arc::clone(&registry),
         )

@@ -337,6 +337,7 @@ async fn test_delayed_start_no_premature_dispatch() {
                 max_workflow_history_events: None,
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
+                slot_tuner: None,
             },
             registry,
         )

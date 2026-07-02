@@ -127,6 +127,74 @@
     },
     {
       "method": "GET",
+      "path": "/workflows/count",
+      "category": "workflow",
+      "read_only": true,
+      "description": "Grouped execution-count fleet snapshot (issue #544): counts harvest_workflow_executions rows grouped by state and/or workflow_name across all shards, computed with a per-shard SQL GROUP BY and summed in-process. Eventually-consistent point-in-time snapshot; no replay or ordering guarantee under concurrent writes. An unreachable shard is named in unavailable_shards rather than failing the call wholesale.",
+      "params": [
+        {
+          "name": "group_by",
+          "in": "query",
+          "required": false,
+          "description": "Comma-separated grouping dimensions: state, workflow_name, or state,workflow_name. Defaults to state."
+        },
+        {
+          "name": "workflow_name",
+          "in": "query",
+          "required": false,
+          "description": "Filter by registered workflow name (applied before grouping)."
+        },
+        {
+          "name": "state",
+          "in": "query",
+          "required": false,
+          "repeated": true,
+          "description": "Comma-separated or repeated execution states (e.g. RUNNING,FAILED) to include (applied before grouping)."
+        },
+        {
+          "name": "started_after",
+          "in": "query",
+          "required": false,
+          "description": "Filter to executions whose started_at is on or after this RFC 3339 timestamp."
+        },
+        {
+          "name": "started_before",
+          "in": "query",
+          "required": false,
+          "description": "Filter to executions whose started_at is on or before this RFC 3339 timestamp."
+        },
+        {
+          "name": "limit_groups",
+          "in": "query",
+          "required": false,
+          "description": "Cap on returned (state, workflow_name) groups (default 50, max 500); long tail rolls into a single group with other:true."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "status",
+          "as_of",
+          "groups",
+          "total",
+          "truncated",
+          "unavailable_shards"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "Invalid parameter value (unknown group_by dimension, unknown state, malformed timestamp, or out-of-range limit_groups)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/workflows/{id}",
       "category": "workflow",
       "read_only": true,

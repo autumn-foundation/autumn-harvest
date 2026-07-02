@@ -312,6 +312,7 @@ fn make_worker(
             labels: std::collections::HashMap::new(),
             sharded_pool: None,
             max_workflow_history_events: None,
+            slot_tuner: None,
         },
         registry,
     )
