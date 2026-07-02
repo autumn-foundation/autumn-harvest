@@ -4294,6 +4294,220 @@ impl WorkflowContext {
         Ok(typed)
     }
 
+    // ── Fan-out / parallel child workflows (issue #601) ──────────────────
+
+    /// Spawn N child workflows **in parallel** (fail-fast variant).
+    ///
+    /// Dispatches every `(workflow_name, input)` pair concurrently — all N
+    /// children are scheduled (each gets its own `ExecutionId` on the
+    /// parent's shard) before any is awaited — and returns a `Vec` of
+    /// outputs in the **same order as the input slice**, regardless of
+    /// completion order. Returns on the **first** child failure — sibling
+    /// children still complete and are recorded in history, but the
+    /// workflow function receives only the first error.
+    ///
+    /// # Replay safety
+    ///
+    /// A `MarkerRecorded { name: "fan_out:{n}", details: <count> }` event is
+    /// appended immediately before the child events on the first live run —
+    /// the identical marker mechanism used by
+    /// [`execute_activity_fan_out_raw`](Self::execute_activity_fan_out_raw).
+    /// Both share one sequence counter, so `fan_out:{n}` numbering stays
+    /// deterministic when activity and child fan-outs are mixed in one
+    /// workflow. On replay the count is verified; if the input collection
+    /// has grown or shrunk since the original run,
+    /// [`HarvestError::NonDeterministic`] is returned before any child is
+    /// spawned.
+    ///
+    /// The input collection **must** be derived from already-recorded state
+    /// (workflow input, prior activity outputs, signals) — never from
+    /// non-deterministic sources such as the system clock or a random number.
+    ///
+    /// # Cancellation
+    ///
+    /// Checks `is_cancelled()` before dispatching. Returns
+    /// [`HarvestError::Cancelled`] immediately when the workflow has been
+    /// cancelled. Cancellation after dispatch propagates to in-flight
+    /// children per the existing `ParentClosePolicy` semantics (issue #347).
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if `children.len()` differs
+    ///   from the count recorded in history.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    /// - [`HarvestError::ActivityFailed`] (child failures surface with a
+    ///   `child-workflow:{name}` activity name) on the first failure in the
+    ///   group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn spawn_child_workflow_fan_out_raw(
+        &self,
+        children: Vec<(String, Value)>,
+    ) -> HarvestResult<Vec<Value>> {
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = children.len();
+        self.check_fan_out_count(seq, count)?;
+
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let futures: Vec<_> = children
+            .into_iter()
+            .map(|(workflow_name, input)| async move {
+                self.spawn_child_workflow_raw(&workflow_name, input).await
+            })
+            .collect();
+
+        futures::future::try_join_all(futures).await
+    }
+
+    /// Spawn N child workflows **in parallel** (collect-all variant).
+    ///
+    /// Dispatches every `(workflow_name, input)` pair concurrently and
+    /// returns a `Vec<Result<Value, String>>` in the **same order as the
+    /// input slice**. Unlike
+    /// [`spawn_child_workflow_fan_out_raw`](Self::spawn_child_workflow_fan_out_raw),
+    /// **all** children run to completion regardless of failures — per-slot
+    /// errors are captured in the returned `Err` variants rather than
+    /// aborting the fan-out early.
+    ///
+    /// # Replay safety
+    ///
+    /// Same count-marker semantics as the fail-fast variant.
+    ///
+    /// # Cancellation
+    ///
+    /// Checks `is_cancelled()` before dispatching. Returns
+    /// `Err(HarvestError::Cancelled)` immediately when the workflow has been
+    /// cancelled.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if `children.len()` differs
+    ///   from the count recorded in history.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    ///
+    /// Individual per-slot child failures are returned as `Err(String)`
+    /// inside the `Vec`; the outer `Result` only fails for engine-level
+    /// errors (non-determinism, cancellation).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn spawn_child_workflow_fan_out_collect_raw(
+        &self,
+        children: Vec<(String, Value)>,
+    ) -> HarvestResult<Vec<Result<Value, String>>> {
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = children.len();
+        self.check_fan_out_count(seq, count)?;
+
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let futures: Vec<_> = children
+            .into_iter()
+            .map(|(workflow_name, input)| async move {
+                match self.spawn_child_workflow_raw(&workflow_name, input).await {
+                    Ok(v) => Ok(Ok(v)),
+                    Err(e @ HarvestError::ActivityFailed { .. }) => Ok(Err(e.to_string())),
+                    Err(e) => Err(e),
+                }
+            })
+            .collect();
+
+        futures::future::try_join_all(futures).await
+    }
+
+    /// Typed fail-fast fan-out: spawn the same child workflow type for every
+    /// input in `inputs` in parallel and return the outputs in input order.
+    ///
+    /// All slots share the same `WorkflowInfo` (workflow name). Use
+    /// [`spawn_child_workflow_fan_out_raw`](Self::spawn_child_workflow_fan_out_raw)
+    /// for heterogeneous child workflow types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if any input cannot be
+    /// serialized. Propagates all errors from
+    /// [`spawn_child_workflow_fan_out_raw`](Self::spawn_child_workflow_fan_out_raw).
+    pub async fn spawn_child_workflow_fan_out<I, O>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        inputs: Vec<I>,
+    ) -> HarvestResult<Vec<O>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        let children = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let raw_results = self.spawn_child_workflow_fan_out_raw(children).await?;
+        raw_results
+            .into_iter()
+            .map(|v| serde_json::from_value(v).map_err(HarvestError::Serialization))
+            .collect()
+    }
+
+    /// Typed collect-all fan-out: spawn the same child workflow type for
+    /// every input in `inputs` in parallel and return per-slot
+    /// `Result<O, String>` in input order.
+    ///
+    /// All slots share the same `WorkflowInfo`. Use
+    /// [`spawn_child_workflow_fan_out_collect_raw`](Self::spawn_child_workflow_fan_out_collect_raw)
+    /// for heterogeneous child workflow types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if any input cannot be
+    /// serialized. Propagates engine-level errors from
+    /// [`spawn_child_workflow_fan_out_collect_raw`](Self::spawn_child_workflow_fan_out_collect_raw).
+    pub async fn spawn_child_workflow_fan_out_collect<I, O>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        inputs: Vec<I>,
+    ) -> HarvestResult<Vec<Result<O, String>>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        let children = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let raw_results = self
+            .spawn_child_workflow_fan_out_collect_raw(children)
+            .await?;
+        let typed: Vec<Result<O, String>> = raw_results
+            .into_iter()
+            .map(|slot| match slot {
+                Ok(v) => serde_json::from_value::<O>(v)
+                    .map(Ok)
+                    .map_err(HarvestError::Serialization),
+                Err(e) => Ok(Err(e)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(typed)
+    }
+
     // ── External activity completion ───────────────────────────────────
 
     /// Schedule an activity that completes when an *external* system delivers

@@ -2768,6 +2768,307 @@ async fn worker_completes_parent_workflow_with_parallel_child_workflows() {
     }
 }
 
+// ── Child workflow fan-out (issue #601) ──────────────────────────────────────
+
+/// Parent that fans out three children via `spawn_child_workflow_fan_out_raw`
+/// and returns their outputs in input order.
+fn parent_workflow_child_fan_out<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children = vec![
+            ("fan_child".to_string(), serde_json::json!({"item": "one"})),
+            ("fan_child".to_string(), serde_json::json!({"item": "two"})),
+            (
+                "fan_child".to_string(),
+                serde_json::json!({"item": "three"}),
+            ),
+        ];
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "results": results }))
+    })
+}
+
+fn fan_child_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        Ok(serde_json::json!({"result": input.get("item").and_then(|v| v.as_str()).unwrap_or("?")}))
+    })
+}
+
+fn child_fan_out_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: parent_workflow_child_fan_out,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+            WorkflowInfo {
+                name: "fan_child",
+                module: "integration_e2e",
+                handler: fan_child_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+        ],
+        vec![],
+    ))
+}
+
+/// End-to-end proof that the worker persists a `spawn_child_workflow_fan_out_raw`
+/// suspension batch (the `fan_out:{n}` marker + N `StartChildWorkflow` commands)
+/// exactly like the pre-existing hand-rolled `tokio::join!` parallel-children
+/// path, and that all three children complete and merge in input order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_completes_parent_workflow_with_child_fan_out() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({})).await;
+
+    let worker = build_runtime_worker("worker-e2e-child-fan-out", 6, 2, child_fan_out_registry());
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent_execution =
+        wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        parent_execution.output,
+        Some(serde_json::json!({
+            "results": [
+                {"result": "one"},
+                {"result": "two"},
+                {"result": "three"},
+            ],
+        })),
+        "parent output must contain merged child results in input order"
+    );
+
+    let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    let has_fan_out_marker = parent_history.events.iter().any(
+        |e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("fan_out:")),
+    );
+    assert!(
+        has_fan_out_marker,
+        "parent history must record a fan_out:{{n}} marker"
+    );
+
+    let child_started_count = parent_history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowStarted { .. }))
+        .count();
+    let child_completed_count = parent_history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowCompleted { .. }))
+        .count();
+    assert_eq!(
+        child_started_count, 3,
+        "parent history must record all 3 child starts"
+    );
+    assert_eq!(
+        child_completed_count, 3,
+        "parent history must record all 3 child completions"
+    );
+
+    let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(
+        child_execs.len(),
+        3,
+        "exactly three child executions must be stored with parent_id set"
+    );
+    for child_exec in &child_execs {
+        assert_eq!(
+            child_exec.state, "COMPLETED",
+            "each child execution must be COMPLETED"
+        );
+    }
+}
+
+/// Slow child used by the wall-clock success-metric test: sleeps for real
+/// wall-clock time before returning, so N of these running in parallel proves
+/// genuine concurrent dispatch rather than sequential replay-cycle scheduling.
+fn slow_fan_child_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Ok(serde_json::json!({"result": input.get("item").and_then(|v| v.as_str()).unwrap_or("?")}))
+    })
+}
+
+/// Parent that fans out ten slow children.
+fn parent_workflow_ten_slow_children<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children: Vec<_> = (0..10)
+            .map(|i| {
+                (
+                    "slow_fan_child".to_string(),
+                    serde_json::json!({"item": format!("item_{i}")}),
+                )
+            })
+            .collect();
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "results": results }))
+    })
+}
+
+fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: parent_workflow_ten_slow_children,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+            WorkflowInfo {
+                name: "slow_fan_child",
+                module: "integration_e2e",
+                handler: slow_fan_child_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+        ],
+        vec![],
+    ))
+}
+
+/// Success-metric test (issue #601): 10 children that each sleep ~1s must
+/// complete in wall-clock time far below the ~10s a sequential
+/// `spawn_child_workflow` loop would take -- proving the fan-out genuinely
+/// dispatches all N children concurrently rather than one at a time.
+///
+/// The bound is deliberately generous (5s, not the AC's illustrative "< 2s")
+/// to avoid CI flake from container/scheduler jitter; the point demonstrated
+/// is sub-linear wall-clock, not a tight latency SLA.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({})).await;
+
+    // Concurrency must comfortably exceed 1 parent + 10 children so every
+    // child dispatches in the same wave instead of queueing behind a
+    // saturated semaphore.
+    let worker = build_runtime_worker(
+        "worker-e2e-ten-slow-children",
+        16,
+        2,
+        ten_slow_children_registry(),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let start = std::time::Instant::now();
+    let parent_execution =
+        wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+    let elapsed = start.elapsed();
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let results = parent_execution
+        .output
+        .as_ref()
+        .and_then(|o| o.get("results"))
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(results.len(), 10, "all 10 children must complete");
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "10 children sleeping ~1s each should complete in well under the ~10s \
+         a sequential spawn_child_workflow loop would take; got {elapsed:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn worker_builder_state_is_visible_to_workflow_and_activity() {

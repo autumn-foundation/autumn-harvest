@@ -1,0 +1,704 @@
+//! Child-workflow fan-out primitive tests -- parallel child-workflow dispatch,
+//! replay determinism, non-determinism detection, and cancellation propagation
+//! (issue #601).
+//!
+//! Mirrors `tests/fanout_tests.rs` (issue #359, activity fan-out) test-for-test,
+//! substituting `ChildWorkflowStarted`/`ChildWorkflowCompleted`/`ChildWorkflowFailed`
+//! events for `ActivityScheduled`/`ActivityCompleted`/`ActivityFailed`.
+//!
+//! All tests are pure unit tests; no database required.
+
+use std::future::Future;
+use std::pin::Pin;
+
+use autumn_harvest::context::WorkflowContext;
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
+use autumn_harvest::types::ExecutionId;
+use chrono::Utc;
+use serde_json::{Value, json};
+
+// ---------------------------------------------------------------------------
+// Test workflow handlers
+// ---------------------------------------------------------------------------
+
+fn child_fan_out_three_parallel<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children = vec![
+            ("child_a".to_string(), json!("input_a")),
+            ("child_b".to_string(), json!("input_b")),
+            ("child_c".to_string(), json!("input_c")),
+        ];
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "results": results }))
+    })
+}
+
+fn child_fan_out_fail_fast<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children = vec![
+            ("child_ok".to_string(), Value::Null),
+            ("child_fail".to_string(), Value::Null),
+            ("child_ok2".to_string(), Value::Null),
+        ];
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "results": results }))
+    })
+}
+
+fn child_fan_out_collect_all<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children = vec![
+            ("child_ok".to_string(), Value::Null),
+            ("child_fail".to_string(), Value::Null),
+            ("child_ok2".to_string(), Value::Null),
+        ];
+        let results = ctx
+            .spawn_child_workflow_fan_out_collect_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        let serialized: Vec<Value> = results
+            .into_iter()
+            .map(|r| match r {
+                Ok(v) => json!({ "ok": v }),
+                Err(e) => json!({ "err": e }),
+            })
+            .collect();
+        Ok(json!({ "results": serialized }))
+    })
+}
+
+fn child_fan_out_empty<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(vec![])
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "count": results.len() }))
+    })
+}
+
+// Fan out with N derived from a prior activity result.
+fn child_fan_out_dynamic_from_prior<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let items_json = ctx
+            .execute_activity_raw("list_items", json!(null), "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let items = items_json.as_array().cloned().unwrap_or_default();
+
+        let children: Vec<_> = items
+            .into_iter()
+            .map(|item| ("process_item_workflow".to_string(), item))
+            .collect();
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "processed": results }))
+    })
+}
+
+// Workflow for non-determinism (count mismatch) detection test.
+fn child_fan_out_count_changed<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let n = usize::try_from(input.as_u64().unwrap_or(2)).unwrap_or(2);
+        let children: Vec<_> = (0..n).map(|i| (format!("child_{i}"), json!(i))).collect();
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "count": results.len() }))
+    })
+}
+
+// Two independent fan-out groups (one activity, one child) in the same workflow,
+// verifying the shared `fan_out_seq` counter assigns distinct sequence numbers.
+fn mixed_activity_then_child_fan_out<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activity_results = ctx
+            .execute_activity_fan_out_raw(vec![
+                ("a1".to_string(), json!(null), "default".to_string()),
+                ("a2".to_string(), json!(null), "default".to_string()),
+            ])
+            .await
+            .map_err(|e| e.to_string())?;
+        let child_results = ctx
+            .spawn_child_workflow_fan_out_raw(vec![("b1_child".to_string(), json!(null))])
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "activities": activity_results, "children": child_results }))
+    })
+}
+
+fn started() -> WorkflowEvent {
+    WorkflowEvent::WorkflowStarted {
+        input: Value::Null,
+        timestamp: Utc::now(),
+        last_completion_result: None,
+        last_error: None,
+        scheduled_time: None,
+    }
+}
+
+fn child_started(child_id: ExecutionId, workflow_name: &str, input: Value) -> WorkflowEvent {
+    WorkflowEvent::ChildWorkflowStarted {
+        child_id,
+        workflow_name: workflow_name.to_string(),
+        input,
+    }
+}
+
+const fn child_completed(child_id: ExecutionId, output: Value) -> WorkflowEvent {
+    WorkflowEvent::ChildWorkflowCompleted { child_id, output }
+}
+
+fn child_failed(child_id: ExecutionId, error: &str) -> WorkflowEvent {
+    WorkflowEvent::ChildWorkflowFailed {
+        child_id,
+        error: error.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Basic fan-out: 3 children in parallel, all complete successfully.
+/// The workflow should return results in input order (not completion order).
+#[tokio::test]
+async fn child_fan_out_raw_three_parallel_all_succeed() {
+    let exec_id = ExecutionId::new();
+    let id_a = ExecutionId::new();
+    let id_b = ExecutionId::new();
+    let id_c = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(3u64),
+        },
+        child_started(id_a, "child_a", json!("input_a")),
+        child_started(id_b, "child_b", json!("input_b")),
+        child_started(id_c, "child_c", json!("input_c")),
+        // Completions out-of-order: C finishes first, then A, then B.
+        child_completed(id_c, json!("result_c")),
+        child_completed(id_a, json!("result_a")),
+        child_completed(id_b, json!("result_b")),
+    ];
+
+    let outcome = run_workflow(exec_id, history, child_fan_out_three_parallel, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            let results = output["results"].as_array().unwrap();
+            assert_eq!(results.len(), 3, "should have 3 results");
+            assert_eq!(results[0], json!("result_a"), "slot 0 should be result_a");
+            assert_eq!(results[1], json!("result_b"), "slot 1 should be result_b");
+            assert_eq!(results[2], json!("result_c"), "slot 2 should be result_c");
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// Fan-out fail-fast: one child fails, the whole fan-out fails.
+#[tokio::test]
+async fn child_fan_out_raw_fail_fast_on_first_failure() {
+    let exec_id = ExecutionId::new();
+    let id_ok = ExecutionId::new();
+    let id_fail = ExecutionId::new();
+    let id_ok2 = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(3u64),
+        },
+        child_started(id_ok, "child_ok", Value::Null),
+        child_started(id_fail, "child_fail", Value::Null),
+        child_started(id_ok2, "child_ok2", Value::Null),
+        child_completed(id_ok, json!("success")),
+        child_failed(id_fail, "boom"),
+        child_completed(id_ok2, json!("also_success")),
+    ];
+
+    let outcome = run_workflow(exec_id, history, child_fan_out_fail_fast, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Failed { error, .. } => {
+            assert!(
+                error.contains("boom"),
+                "error should mention 'boom', got: {error}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+/// Fan-out collect-all: one child fails, others succeed.
+/// All per-slot results are returned (not fail-fast).
+#[tokio::test]
+async fn child_fan_out_collect_all_returns_per_slot_results() {
+    let exec_id = ExecutionId::new();
+    let id_ok = ExecutionId::new();
+    let id_fail = ExecutionId::new();
+    let id_ok2 = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(3u64),
+        },
+        child_started(id_ok, "child_ok", Value::Null),
+        child_started(id_fail, "child_fail", Value::Null),
+        child_started(id_ok2, "child_ok2", Value::Null),
+        child_completed(id_ok, json!("success")),
+        child_failed(id_fail, "slot_1_failed"),
+        child_completed(id_ok2, json!("also_success")),
+    ];
+
+    let outcome = run_workflow(exec_id, history, child_fan_out_collect_all, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            let results = output["results"].as_array().unwrap();
+            assert_eq!(results.len(), 3, "collect-all should return all 3 slots");
+            assert!(results[0].get("ok").is_some(), "slot 0 should be ok");
+            assert_eq!(results[0]["ok"], json!("success"));
+            assert!(results[1].get("err").is_some(), "slot 1 should be err");
+            let err_msg = results[1]["err"].as_str().unwrap();
+            assert!(
+                err_msg.contains("slot_1_failed"),
+                "slot 1 error message mismatch"
+            );
+            assert!(results[2].get("ok").is_some(), "slot 2 should be ok");
+            assert_eq!(results[2]["ok"], json!("also_success"));
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// Empty fan-out: zero children should return immediately with empty Vec.
+#[tokio::test]
+async fn child_fan_out_empty_returns_empty_vec() {
+    let exec_id = ExecutionId::new();
+    let history = vec![started()];
+
+    let outcome = run_workflow(exec_id, history, child_fan_out_empty, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            assert_eq!(
+                output["count"],
+                json!(0),
+                "empty fan-out should return 0 results"
+            );
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// First-time live execution: no history → fan-out suspends emitting commands.
+/// Verifies all N children are scheduled *before* any is awaited (a single
+/// suspension batch carries the marker + all `StartChildWorkflow` commands).
+#[tokio::test]
+async fn child_fan_out_live_execution_emits_marker_and_start_commands() {
+    let exec_id = ExecutionId::new();
+    let history = vec![started()];
+
+    let outcome = run_workflow(exec_id, history, child_fan_out_three_parallel, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Suspended { commands } => {
+            let has_marker = commands.iter().any(|c| {
+                matches!(c, autumn_harvest::context::WorkflowCommand::RecordMarker {
+                    name, ..
+                } if name.starts_with("fan_out:"))
+            });
+            assert!(
+                has_marker,
+                "should emit a fan_out marker command; got: {commands:?}"
+            );
+
+            let start_count = commands
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c,
+                        autumn_harvest::context::WorkflowCommand::StartChildWorkflow { .. }
+                    )
+                })
+                .count();
+            assert_eq!(
+                start_count, 3,
+                "should emit 3 StartChildWorkflow commands; got {commands:?}"
+            );
+        }
+        other => panic!("expected Suspended, got {other:?}"),
+    }
+}
+
+/// Non-determinism detection: fan-out called with different count than recorded.
+#[tokio::test]
+async fn child_fan_out_count_mismatch_returns_non_deterministic_error() {
+    let exec_id = ExecutionId::new();
+    let id_a = ExecutionId::new();
+    let id_b = ExecutionId::new();
+    let id_c = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(3u64), // recorded 3
+        },
+        child_started(id_a, "child_0", json!(0u64)),
+        child_started(id_b, "child_1", json!(1u64)),
+        child_started(id_c, "child_2", json!(2u64)),
+        child_completed(id_a, json!("r0")),
+        child_completed(id_b, json!("r1")),
+        child_completed(id_c, json!("r2")),
+    ];
+
+    // New code passes input=2 which creates only 2 children (changed from 3).
+    let outcome = run_workflow(exec_id, history, child_fan_out_count_changed, json!(2u64)).await;
+
+    match outcome {
+        WorkflowOutcome::Failed { error, .. } => {
+            assert!(
+                error.to_lowercase().contains("non-deterministic")
+                    || error.to_lowercase().contains("fan_out")
+                    || error.to_lowercase().contains("count"),
+                "error should mention non-determinism or fan_out count; got: {error}"
+            );
+        }
+        other => panic!("expected Failed (non-determinism), got {other:?}"),
+    }
+}
+
+/// Fan-out with dynamic N derived from a prior activity output.
+#[tokio::test]
+async fn child_fan_out_dynamic_from_prior_activity_replays_correctly() {
+    use autumn_harvest::types::ActivityExecId;
+
+    let exec_id = ExecutionId::new();
+    let list_id = ActivityExecId::new();
+    let item_ids: Vec<ExecutionId> = (0..3).map(|_| ExecutionId::new()).collect();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::ActivityScheduled {
+            activity_id: list_id,
+            name: "list_items".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: list_id,
+            output: json!([1, 2, 3]),
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(3u64),
+        },
+        child_started(item_ids[0], "process_item_workflow", json!(1)),
+        child_started(item_ids[1], "process_item_workflow", json!(2)),
+        child_started(item_ids[2], "process_item_workflow", json!(3)),
+        child_completed(item_ids[0], json!("done_1")),
+        child_completed(item_ids[1], json!("done_2")),
+        child_completed(item_ids[2], json!("done_3")),
+    ];
+
+    let outcome = run_workflow(
+        exec_id,
+        history,
+        child_fan_out_dynamic_from_prior,
+        Value::Null,
+    )
+    .await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            let processed = output["processed"].as_array().unwrap();
+            assert_eq!(processed.len(), 3, "should process 3 items");
+            assert_eq!(processed[0], json!("done_1"));
+            assert_eq!(processed[1], json!("done_2"));
+            assert_eq!(processed[2], json!("done_3"));
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+/// Cancellation test: workflow cancelled → fan-out returns Cancelled.
+#[tokio::test]
+async fn child_fan_out_cancelled_workflow_returns_cancelled_error() {
+    let exec_id = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::WorkflowCancelled {
+            reason: "user_requested".into(),
+        },
+    ];
+
+    let outcome = run_workflow(exec_id, history, child_fan_out_three_parallel, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Failed { error, .. } => {
+            assert!(
+                error.contains("cancelled") || error.contains("cancel"),
+                "cancelled workflow fan-out should report cancellation; got: {error}"
+            );
+        }
+        other => panic!("expected Failed (Cancelled), got {other:?}"),
+    }
+}
+
+/// Partial history: all children started, only some terminals recorded.
+/// The parent should re-park, re-emitting `StartChildWorkflow` for the
+/// still-pending child carrying its *existing* `child_id` (no duplicate spawn).
+#[tokio::test]
+async fn child_fan_out_partial_history_re_parks_pending_children() {
+    let exec_id = ExecutionId::new();
+    let id_a = ExecutionId::new();
+    let id_b = ExecutionId::new();
+    let id_c = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(3u64),
+        },
+        child_started(id_a, "child_a", json!("input_a")),
+        child_started(id_b, "child_b", json!("input_b")),
+        child_started(id_c, "child_c", json!("input_c")),
+        // Only child_a has completed; b and c are still in flight.
+        child_completed(id_a, json!("result_a")),
+    ];
+
+    let outcome = run_workflow(exec_id, history, child_fan_out_three_parallel, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Suspended { commands } => {
+            let reparked: Vec<_> = commands
+                .iter()
+                .filter_map(|c| match c {
+                    autumn_harvest::context::WorkflowCommand::StartChildWorkflow {
+                        child_id,
+                        ..
+                    } => Some(*child_id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                reparked.len(),
+                2,
+                "should re-park exactly the 2 still-pending children; got: {commands:?}"
+            );
+            assert!(
+                reparked.contains(&id_b),
+                "should re-park child_b's existing id"
+            );
+            assert!(
+                reparked.contains(&id_c),
+                "should re-park child_c's existing id"
+            );
+        }
+        other => panic!("expected Suspended (re-park), got {other:?}"),
+    }
+}
+
+/// Shared sequence counter: an activity fan-out followed by a child fan-out
+/// in the same workflow gets `fan_out:1` then `fan_out:2` -- not two `fan_out:1`s.
+#[tokio::test]
+async fn child_fan_out_shares_seq_counter_with_activity_fan_out() {
+    use autumn_harvest::types::ActivityExecId;
+
+    let exec_id = ExecutionId::new();
+    let a1 = ActivityExecId::new();
+    let a2 = ActivityExecId::new();
+    let b1 = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        // First fan-out group (activities, seq=1, count=2)
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(2u64),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: a1,
+            name: "a1".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityScheduled {
+            activity_id: a2,
+            name: "a2".into(),
+            input: Value::Null,
+            queue: "default".into(),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: a1,
+            output: json!("ra1"),
+        },
+        WorkflowEvent::ActivityCompleted {
+            activity_id: a2,
+            output: json!("ra2"),
+        },
+        // Second fan-out group (children, seq=2, count=1)
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:2".into(),
+            details: json!(1u64),
+        },
+        child_started(b1, "b1_child", Value::Null),
+        child_completed(b1, json!("rb1")),
+    ];
+
+    let outcome = run_workflow(
+        exec_id,
+        history,
+        mixed_activity_then_child_fan_out,
+        Value::Null,
+    )
+    .await;
+
+    match outcome {
+        WorkflowOutcome::Completed { output } => {
+            let activities = output["activities"].as_array().unwrap();
+            let children = output["children"].as_array().unwrap();
+            assert_eq!(activities.len(), 2);
+            assert_eq!(children.len(), 1);
+            assert_eq!(activities[0], json!("ra1"));
+            assert_eq!(activities[1], json!("ra2"));
+            assert_eq!(children[0], json!("rb1"));
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkflowContext unit tests (typed API, no executor needed)
+// ---------------------------------------------------------------------------
+
+fn make_workflow_info(name: &'static str) -> autumn_harvest::info::WorkflowInfo {
+    autumn_harvest::info::WorkflowInfo {
+        name,
+        module: "test",
+        handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    }
+}
+
+/// Typed fan-out: `spawn_child_workflow_fan_out` accepts `(&WorkflowInfo, I)` pairs.
+#[tokio::test]
+async fn child_fan_out_typed_replays_completed_output() {
+    let info = make_workflow_info("echo_child");
+
+    let exec_id = ExecutionId::new();
+    let id_1 = ExecutionId::new();
+    let id_2 = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(2u64),
+        },
+        child_started(id_1, "echo_child", json!("hello")),
+        child_started(id_2, "echo_child", json!("world")),
+        child_completed(id_1, json!("hello")),
+        child_completed(id_2, json!("world")),
+    ];
+
+    let ctx = WorkflowContext::for_replay(exec_id, history);
+    let results: Vec<String> = ctx
+        .spawn_child_workflow_fan_out(&info, vec!["hello".to_string(), "world".to_string()])
+        .await
+        .expect("fan-out should succeed");
+
+    assert_eq!(results, vec!["hello".to_string(), "world".to_string()]);
+}
+
+/// Typed collect-all fan-out: mixed results returned as `Vec<Result<O, String>>`.
+#[tokio::test]
+async fn child_fan_out_typed_collect_all_returns_per_slot_results() {
+    let info = make_workflow_info("maybe_fail_child");
+
+    let exec_id = ExecutionId::new();
+    let id_1 = ExecutionId::new();
+    let id_2 = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(2u64),
+        },
+        child_started(id_1, "maybe_fail_child", json!("ok_input")),
+        child_started(id_2, "maybe_fail_child", json!("fail_input")),
+        child_completed(id_1, json!("ok_output")),
+        child_failed(id_2, "deliberate_failure"),
+    ];
+
+    let ctx = WorkflowContext::for_replay(exec_id, history);
+    let results: Vec<Result<Value, String>> = ctx
+        .spawn_child_workflow_fan_out_collect(&info, vec![json!("ok_input"), json!("fail_input")])
+        .await
+        .expect("collect should not fail at the workflow level");
+
+    assert_eq!(results.len(), 2);
+    assert!(results[0].is_ok(), "slot 0 should be ok");
+    assert_eq!(results[0].as_ref().unwrap(), &json!("ok_output"));
+    assert!(results[1].is_err(), "slot 1 should be err");
+    assert!(
+        results[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("deliberate_failure")
+    );
+}

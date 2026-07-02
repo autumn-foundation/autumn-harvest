@@ -1252,6 +1252,133 @@ async fn replayer_detects_changed_child_workflow_input() {
 }
 
 // ---------------------------------------------------------------------------
+// Child workflow fan-out replay tests (issue #601)
+// ---------------------------------------------------------------------------
+
+/// Workflow that fans out two children via `spawn_child_workflow_fan_out_raw`.
+fn child_fan_out_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(vec![
+                (
+                    "fan_out_child".to_string(),
+                    serde_json::json!({"item": "A"}),
+                ),
+                (
+                    "fan_out_child".to_string(),
+                    serde_json::json!({"item": "B"}),
+                ),
+            ])
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"processed": results}))
+    })
+}
+
+/// Same shape but fans out only ONE child — triggers a `fan_out:{n}` count
+/// mismatch against a two-child recorded history.
+fn child_fan_out_count_changed_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(vec![(
+                "fan_out_child".to_string(),
+                serde_json::json!({"item": "A"}),
+            )])
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"processed": results}))
+    })
+}
+
+fn child_fan_out_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let child_a = ExecutionId::new();
+    let child_b = ExecutionId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: serde_json::json!(2u64),
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: child_a,
+            workflow_name: "fan_out_child".into(),
+            input: serde_json::json!({"item": "A"}),
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: child_b,
+            workflow_name: "fan_out_child".into(),
+            input: serde_json::json!({"item": "B"}),
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id: child_a,
+            output: serde_json::json!({"done": "A"}),
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id: child_b,
+            output: serde_json::json!({"done": "B"}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"processed": [{"done": "A"}, {"done": "B"}]}),
+        },
+    ];
+    (exec_id, events)
+}
+
+/// Falsifiable success-bar coverage for issue #601: replaying a recorded
+/// history whose workflow calls `spawn_child_workflow_fan_out_raw` must
+/// report `ReplaySucceeded` — mirroring the `set_current_details` precedent
+/// (issue #593) of locking the ACs' "replays deterministically" claim behind
+/// an actual `WorkflowReplayer` fixture rather than only unit tests.
+#[tokio::test]
+async fn replayer_succeeds_for_workflow_spawning_a_child_fan_out() {
+    let (exec_id, events) = child_fan_out_history();
+    let report = WorkflowReplayer::new()
+        .register_fn("child_fan_out_workflow", child_fan_out_workflow)
+        .replay_from_snapshot(make_snapshot("child_fan_out_workflow", exec_id, events))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "child fan-out workflow must replay successfully: {report}"
+    );
+}
+
+/// The recorded history fanned out 2 children; the (simulated) redeployed
+/// code now fans out only 1 -- the `fan_out:{n}` count marker must catch the
+/// divergence before any child is (re)spawned.
+#[tokio::test]
+async fn replayer_detects_child_fan_out_count_mismatch() {
+    let (exec_id, events) = child_fan_out_history();
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "child_fan_out_count_changed_workflow",
+            child_fan_out_count_changed_workflow,
+        )
+        .replay_from_snapshot(make_snapshot(
+            "child_fan_out_count_changed_workflow",
+            exec_id,
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "child fan-out count mismatch must trigger non-determinism: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // External signal replay tests (issue #330)
 // ---------------------------------------------------------------------------
 
