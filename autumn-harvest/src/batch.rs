@@ -650,29 +650,25 @@ mod db {
         job: BatchJob,
         config: &BatchExecutorConfig,
     ) -> HarvestResult<()> {
-        let action: BatchAction = match job.action.parse() {
-            Ok(a) => a,
-            Err(reason) => {
-                tracing::warn!(job_id = %job.id, reason, "batch job has unknown action; failing");
-                let mut conn = owning_shard_pool
-                    .get()
-                    .await
-                    .map_err(|e| HarvestError::Database(e.to_string()))?;
-                let _ = mark_failed(&mut conn, job.id, &reason).await;
-                return Ok(());
-            }
+        let Ok(action) = job.action.parse::<BatchAction>() else {
+            let reason = format!("unknown action '{}'", job.action);
+            tracing::warn!(job_id = %job.id, reason, "batch job has unknown action; failing");
+            let mut conn = owning_shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let _ = mark_failed(&mut conn, job.id, &reason).await;
+            return Ok(());
         };
-        let filter: BatchFilter = match serde_json::from_value(job.filter.clone()) {
-            Ok(f) => f,
-            Err(error) => {
-                tracing::warn!(job_id = %job.id, %error, "batch job filter is malformed");
-                let mut conn = owning_shard_pool
-                    .get()
-                    .await
-                    .map_err(|e| HarvestError::Database(e.to_string()))?;
-                let _ = mark_failed(&mut conn, job.id, &error.to_string()).await;
-                return Ok(());
-            }
+        let Ok(filter) = serde_json::from_value::<BatchFilter>(job.filter.clone()) else {
+            let error = "batch job filter is malformed";
+            tracing::warn!(job_id = %job.id, %error, "batch job filter is malformed");
+            let mut conn = owning_shard_pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string()))?;
+            let _ = mark_failed(&mut conn, job.id, error).await;
+            return Ok(());
         };
 
         // Walk every shard, collect targets, dispatch with bounded fan-out.

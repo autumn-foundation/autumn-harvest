@@ -5899,14 +5899,14 @@ impl WorkflowContext {
             .get(name)
             .copied();
 
-        if let Some(h) = decl_handler {
-            // Pass self so the handler can access ctx.state::<T>().
-            return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(self, args)))
-                .map_err(|e| HarvestError::QueryHandlerPanicked(crate::error::panic_message(e)))?
-                .map_err(HarvestError::QueryHandlerFailed);
-        }
+        let Some(h) = decl_handler else {
+            return Err(HarvestError::QueryHandlerNotFound(name.to_string()));
+        };
 
-        Err(HarvestError::QueryHandlerNotFound(name.to_string()))
+        // Pass self so the handler can access ctx.state::<T>().
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h(self, args)))
+            .map_err(|e| HarvestError::QueryHandlerPanicked(crate::error::panic_message(e)))?
+            .map_err(HarvestError::QueryHandlerFailed)
     }
 
     /// Execute a registered query handler with no arguments.
@@ -6248,10 +6248,10 @@ impl WorkflowContext {
             registry.get_handler(name)
         };
 
-        let result = match handler_opt {
-            Some(handler) => handler(input).await,
-            None => Err(format!("update handler '{name}' not found")),
+        let Some(handler) = handler_opt else {
+            return Err(format!("update handler '{name}' not found"));
         };
+        let result = handler(input).await;
 
         // Durably record the terminal result so the worker can append
         // UpdateCompleted/UpdateFailed before persisting other side effects.
