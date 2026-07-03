@@ -59,6 +59,29 @@ fn child_fan_out_fail_fast<'a>(
     })
 }
 
+// Two failing children among three slots -- used to demonstrate the known,
+// pre-existing (shared with activity fan-out) limitation that a fail-fast
+// replay selects the failure at the lowest input-slot index, not necessarily
+// the one whose terminal event was recorded earliest in history. See
+// `child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_recorded_order`.
+fn child_fan_out_two_failures<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children = vec![
+            ("child_ok".to_string(), Value::Null),
+            ("child_fail_low_slot".to_string(), Value::Null),
+            ("child_fail_high_slot".to_string(), Value::Null),
+        ];
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "results": results }))
+    })
+}
+
 fn child_fan_out_collect_all<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -259,6 +282,85 @@ async fn child_fan_out_raw_fail_fast_on_first_failure() {
             assert!(
                 error.contains("boom"),
                 "error should mention 'boom', got: {error}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+/// **Known limitation** (PR #901 review, shared with the pre-existing activity
+/// fan-out from issue #359 -- not introduced by child fan-out): when two or
+/// more children fail and their terminals are all already recorded (a full
+/// replay, e.g. crash recovery or `WorkflowReplayer`), the fail-fast fan-out
+/// selects the failure at the **lowest input-slot index**, not necessarily the
+/// one whose `ChildWorkflowFailed` event was recorded earliest in history.
+///
+/// `try_join_all` resolves every slot's future synchronously on its first poll
+/// once a terminal is already in history (`match_child_workflow` is a pure,
+/// synchronous history scan with no actual suspension for an already-recorded
+/// `Matched`/`Failed` result), so a single poll pass finds whichever slot's
+/// future is ready-with-`Err` first while iterating in **slot order** --
+/// this is *usually* the same as recorded order (each terminal typically
+/// arrives in its own wake/replay cycle), but diverges when two terminals
+/// land in history before the same decision cycle observes either of them.
+///
+/// This test locks in the *current* behavior for two reasons: (1) it proves
+/// the divergence is real, and (2) it guards against a silent, undetected
+/// behavior change (e.g. from a future refactor of the fan-out or the
+/// underlying `try_join_all` usage) going unnoticed. A workflow that branches
+/// on the *content* of the returned fail-fast error (rather than treating any
+/// fan-out failure identically) should be aware this selection is
+/// **not** guaranteed to reproduce the live run's chronological "first
+/// failure" on replay.
+///
+/// Fixing this properly requires threading the recorded terminal event's
+/// index through `HistoryMatch::Failed` and selecting by that index rather
+/// than by `try_join_all`'s poll order -- a change that would need to apply
+/// equally to `execute_activity_fan_out_raw` to stay consistent between the
+/// two fan-out primitives, and is out of scope for issue #601 (which mirrors
+/// the pre-existing activity fan-out mechanism deliberately, defects
+/// included).
+#[tokio::test]
+async fn child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_recorded_order() {
+    let exec_id = ExecutionId::new();
+    let id_ok = ExecutionId::new();
+    let id_fail_low_slot = ExecutionId::new();
+    let id_fail_high_slot = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(3u64),
+        },
+        // Started events must appear in slot order (0, 1, 2) -- match_child_workflow
+        // matches each slot's own child by cursor position.
+        child_started(id_ok, "child_ok", Value::Null),
+        child_started(id_fail_low_slot, "child_fail_low_slot", Value::Null),
+        child_started(id_fail_high_slot, "child_fail_high_slot", Value::Null),
+        child_completed(id_ok, json!("success")),
+        // The HIGH-slot child (index 2) is recorded as having failed FIRST --
+        // i.e. on the original live run, this is the failure that actually
+        // won the real chronological race and was surfaced to the workflow.
+        child_failed(id_fail_high_slot, "high_slot_failed_first_chronologically"),
+        // The LOW-slot child (index 1) failed second, chronologically.
+        child_failed(id_fail_low_slot, "low_slot_failed_second_chronologically"),
+    ];
+
+    let outcome = run_workflow(exec_id, history, child_fan_out_two_failures, Value::Null).await;
+
+    match outcome {
+        WorkflowOutcome::Failed { error, .. } => {
+            // Known-limitation assertion: replay returns the LOW-slot error
+            // (index order) even though the HIGH-slot error was recorded
+            // first (and is what the live run actually returned). If this
+            // assertion ever starts failing, the underlying selection
+            // mechanism has changed -- update this test and the doc comment
+            // above rather than treating it as a regression.
+            assert!(
+                error.contains("low_slot_failed_second_chronologically"),
+                "replay is expected to select the lowest-slot-index failure \
+                 regardless of recorded order (known limitation) -- got: {error}"
             );
         }
         other => panic!("expected Failed, got {other:?}"),
