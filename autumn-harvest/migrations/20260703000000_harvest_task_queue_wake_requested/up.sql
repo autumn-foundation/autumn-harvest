@@ -1,0 +1,25 @@
+-- issue #601 CI hardening: durable wake-request flag to close a dropped-wake race.
+--
+-- wake_workflow_task's primary re-pend UPDATE only matches a workflow task row
+-- that is parked (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL)
+-- or a still-eligible mixed-signal PENDING row. When a child-completion (or
+-- signal/timer) wake arrives while the parent's workflow task is *currently
+-- claimed and executing* (state = 'RUNNING', worker_id IS NOT NULL), the UPDATE's
+-- WHERE clause matches zero rows and the wake is silently dropped -- there is no
+-- durable trace of it. If the in-flight execution then parks (suspending on a
+-- still-outstanding sibling) without re-checking history for the event the dropped
+-- wake was for, the parked task waits for a wake that already happened and is
+-- gone, until the next unrelated wake or poll-interval sweep recovers it. Under
+-- tight, correlated completion windows (e.g. N children finishing within
+-- milliseconds of each other) this manifests as a cascade of extra claim/replay
+-- cycles rather than one clean wake per completion.
+--
+-- wake_requested makes the "please wake this task" signal durable: when the
+-- primary re-pend UPDATE affects zero rows, wake_workflow_task falls back to
+-- setting wake_requested = TRUE on the currently-claimed RUNNING row. When that
+-- in-flight cycle later parks, park_workflow_task atomically reads and clears
+-- wake_requested in the same UPDATE; if it was TRUE, the park is skipped and the
+-- row is immediately re-pended instead, so a wake that raced the park is never
+-- lost. claim_task resets it to FALSE on every fresh claim.
+ALTER TABLE harvest_task_queue
+    ADD COLUMN IF NOT EXISTS wake_requested BOOLEAN NOT NULL DEFAULT FALSE;

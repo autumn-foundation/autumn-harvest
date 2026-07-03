@@ -326,6 +326,10 @@ pub struct TaskQueueItem {
     /// and falls back to `scheduled_at` when this is `None`.
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
+    /// Durable "please wake this task" flag (dropped-wake fix, issue #601 CI
+    /// hardening). See `wake_workflow_task`/`park_workflow_task` in `queue.rs`.
+    #[serde(default)]
+    pub wake_requested: bool,
 }
 
 /// Insert struct for enqueuing a new task.

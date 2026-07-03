@@ -2888,7 +2888,8 @@ async fn persist_signal_wait_park(
         async move {
             store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
             detached_spawns.persist(conn, commands).await?;
-            queue::park_workflow_task(conn, task_id, sticky).await
+            queue::park_workflow_task(conn, task_id, sticky).await?;
+            Ok(())
         }
         .scope_boxed()
     })
@@ -3652,9 +3653,15 @@ async fn persist_all_started_child_workflows(
                 false
             };
 
-            queue::park_workflow_task(conn, task_id, sticky).await?;
+            // `had_wake_requested` closes the residual race window the
+            // `any_terminal` check above cannot cover: a child transitioning
+            // to terminal (and calling `wake_workflow_task`) between that
+            // check and this park's own atomic UPDATE would otherwise have
+            // its wake silently dropped, since `wake_workflow_task` no-ops
+            // against a still-claimed (`worker_id IS NOT NULL`) row.
+            let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
 
-            if any_terminal {
+            if any_terminal || had_wake_requested {
                 queue::wake_workflow_task(conn, parent_exec_id).await?;
             }
 
@@ -4937,15 +4944,18 @@ async fn persist_scheduled_external_activity(
                 }
                 detached_spawns.persist(conn, commands).await?;
 
+                // Park first to clear worker ownership; wake_workflow_task only
+                // ever moves parked rows.
+                queue::park_workflow_task(conn, task_id, sticky).await?;
+
                 if locked.is_some_and(|t| t.state != "PENDING") {
-                    // The task is still RUNNING (owned by this worker), so
-                    // wake_workflow_task (which only moves parked rows) is a
-                    // no-op.  Park first to clear worker ownership, then wake
-                    // so the next available worker picks up the terminal event.
-                    queue::park_workflow_task(conn, task_id, sticky).await?;
+                    // The task is still RUNNING (owned by this worker), so a
+                    // wake fired while it was terminal-ineligible would have been
+                    // a no-op. Wake now so the next available worker picks up the
+                    // terminal event.
                     queue::wake_workflow_task(conn, exec_id).await
                 } else {
-                    queue::park_workflow_task(conn, task_id, sticky).await
+                    Ok(())
                 }
             }
             .scope_boxed()
