@@ -3126,8 +3126,17 @@ async fn wait_for_completion_with_diagnostics(
                 .map(|t| {
                     format!(
                         "    task={} state={} worker_id={:?} started_at={:?} \
-                         scheduled_at={} wake_requested={}",
-                        t.id, t.state, t.worker_id, t.started_at, t.scheduled_at, t.wake_requested
+                         scheduled_at={} wake_requested={} attempt={} \
+                         crash_strikes={} error={:?}",
+                        t.id,
+                        t.state,
+                        t.worker_id,
+                        t.started_at,
+                        t.scheduled_at,
+                        t.wake_requested,
+                        t.attempt,
+                        t.crash_strikes,
+                        t.error
                     )
                 })
                 .collect::<Vec<_>>()
@@ -3140,19 +3149,23 @@ async fn wait_for_completion_with_diagnostics(
                     let child_tasks =
                         load_tasks_for_execution_from_url(database_url, child_exec_id).await;
                     lines.push(format!(
-                        "  child={} name={} state={}",
-                        child.id, child.workflow_name, child.state
+                        "  child={} name={} state={} error={:?}",
+                        child.id, child.workflow_name, child.state, child.error
                     ));
                     for t in &child_tasks {
                         lines.push(format!(
                             "    task={} state={} worker_id={:?} started_at={:?} \
-                             scheduled_at={} wake_requested={}",
+                             scheduled_at={} wake_requested={} attempt={} \
+                             crash_strikes={} error={:?}",
                             t.id,
                             t.state,
                             t.worker_id,
                             t.started_at,
                             t.scheduled_at,
-                            t.wake_requested
+                            t.wake_requested,
+                            t.attempt,
+                            t.crash_strikes,
+                            t.error
                         ));
                     }
                 }
@@ -3160,10 +3173,11 @@ async fn wait_for_completion_with_diagnostics(
             };
             panic!(
                 "execution {parent_exec_id} did not reach COMPLETED within {timeout:?} \
-                 (currently: {}).\n\
+                 (currently: {} error={:?}).\n\
                  parent task queue rows:\n{parent_tasks}\n\
                  children ({} of expected 10 recorded):\n{child_report}",
                 execution.state,
+                execution.error,
                 children.len(),
             );
         }

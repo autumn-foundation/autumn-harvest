@@ -3171,20 +3171,35 @@ async fn persist_scheduled_activities(
     });
 
     let offloader = registry.payload_offloader();
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
-                .await?;
-            detached_spawns.persist(conn, commands).await?;
-            for params in &enqueued {
-                queue::enqueue(conn, params).await?;
+    // `had_wake_requested` closes a race no other check in this function
+    // covers (PR #901 review): a signal or admitted update landing while this
+    // transaction is still appending events / enqueueing the scheduled
+    // activities -- before this park's own atomic UPDATE -- would otherwise
+    // only be captured as `wake_requested = TRUE` on the still-claimed row
+    // and then silently discarded. Unlike the child-completion or
+    // activity-completion races, this is a *fresh* dispatch (the activities
+    // being scheduled here cannot have completed yet), so no other in-band
+    // check exists to catch it.
+    let had_wake_requested = conn
+        .transaction::<bool, HarvestError, _>(|conn| {
+            async move {
+                store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
+                    .await?;
+                detached_spawns.persist(conn, commands).await?;
+                for params in &enqueued {
+                    queue::enqueue(conn, params).await?;
+                }
+                queue::park_workflow_task(conn, task_id, sticky).await
             }
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await
+            .scope_boxed()
+        })
+        .await?;
+
+    if had_wake_requested {
+        queue::wake_workflow_task(conn, exec_id).await?;
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5013,26 +5028,40 @@ async fn persist_scheduled_external_activity(
         }
     });
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            store::append_events(conn, exec_id, &events, next_event_id).await?;
-            detached_spawns.persist(conn, commands).await?;
-            external_task::record_external_task(
-                conn,
-                exec_id,
-                scheduled.token,
-                scheduled.activity_id,
-                &scheduled.name,
-                &scheduled.queue,
-                scheduled.schedule_to_close_secs,
-            )
-            .await?;
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await
+    // `had_wake_requested` closes a race no other check in this (new-token)
+    // branch covers (PR #901 review): a signal or admitted update landing
+    // while this transaction is still recording the external task -- before
+    // this park's own atomic UPDATE -- would otherwise only be captured as
+    // `wake_requested = TRUE` on the still-claimed row and then silently
+    // discarded, with no later recheck in this branch (unlike the
+    // existing-token branch above, which re-checks the external task's own
+    // state via `find_by_token_locked`).
+    let had_wake_requested = conn
+        .transaction::<bool, HarvestError, _>(|conn| {
+            async move {
+                store::append_events(conn, exec_id, &events, next_event_id).await?;
+                detached_spawns.persist(conn, commands).await?;
+                external_task::record_external_task(
+                    conn,
+                    exec_id,
+                    scheduled.token,
+                    scheduled.activity_id,
+                    &scheduled.name,
+                    &scheduled.queue,
+                    scheduled.schedule_to_close_secs,
+                )
+                .await?;
+                queue::park_workflow_task(conn, task_id, sticky).await
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    if had_wake_requested {
+        queue::wake_workflow_task(conn, exec_id).await?;
+    }
+
+    Ok(())
 }
 
 async fn persist_bookkeeping_and_requeue_workflow(
