@@ -23,6 +23,7 @@
 //! | HVG007 | ProcessGlobal | HardBlocker  | Process-global state mutation        |
 //! | HVG008 | NonDeterministicPredicate| HardBlocker | Non-deterministic predicate closures|
 //! | HVG009 | UnsafeLogging | Warning      | Bare tracing calls amplified by replay |
+//! | HVG010 | SelectMacro   | HardBlocker  | `tokio::select!` / `futures::select!` over ctx awaitables |
 
 /// Severity of a guardrail rule violation.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -55,6 +56,9 @@ pub enum RuleCategory {
     /// Bare `tracing::{info,warn,error}!` calls inside a `#[workflow]` body that
     /// fire on every replay cycle, amplifying log volume.
     UnsafeLogging,
+    /// `tokio::select!` / `futures::select!` / `futures::select_biased!` used to
+    /// race concurrent operations inside a `#[workflow]` body (issue #600).
+    SelectMacro,
 }
 
 /// A single entry in the guardrail rule catalog.
@@ -206,6 +210,25 @@ static CATALOG: &[RuleEntry] = &[
             ctx.log_warn(message), ctx.log_error(message). These are suppressed automatically \
             during replay (is_replaying() == true) and auto-tag every event with workflow_id, \
             execution_id, workflow_type, and replay = false for log correlation.",
+    },
+    RuleEntry {
+        id: "HVG010",
+        severity: Severity::HardBlocker,
+        category: RuleCategory::SelectMacro,
+        explanation: "Using tokio::select!, futures::select!, or futures::select_biased! to race \
+            concurrent ctx-managed operations (activities, timers, signals, child workflows) \
+            inside a workflow body is a double footgun: (1) the winning branch depends on \
+            non-deterministic poll/arrival order, so a replay can pick a different branch than \
+            the original run and diverge; (2) the dropped loser branches do not durably cancel \
+            the underlying work -- a scheduled activity keeps running on a worker and a durable \
+            timer row stays live, leaking state that is never cleaned up.",
+        alternative: "Use ctx.race() (WorkflowContext), the deterministic race/select primitive \
+            (issue #600). It records the winning branch durably via a MarkerRecorded event so \
+            replay always resolves the same winner, and durably cancels every losing branch \
+            (activity task rows, child-workflow executions, or a losing durable timer) so no \
+            leaked in-flight work remains. For a single signal bounded by a deadline, \
+            ctx.receive_signal_timeout()/wait_for_signal_timeout() is the direct primitive \
+            ctx.race()'s timer-plus-signal shape wraps.",
     },
 ];
 

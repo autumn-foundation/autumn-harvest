@@ -717,3 +717,69 @@ fn metrics_recorder_has_payload_methods() {
     );
     recorder.record_payload_rejected(&PayloadKind::ActivityInput, "onboarding");
 }
+
+// ---------------------------------------------------------------------------
+// AC (issue #600): ctx.race() enforces the same payload caps a plain
+// execute_activity/spawn_child_workflow dispatch would, instead of letting a
+// race branch bypass them.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn race_rejects_oversized_activity_input_at_schedule_time() {
+    let ctx = WorkflowContext::new_test().with_payload_caps(
+        1024 * 1024,
+        2 * 1024 * 1024,
+        256 * 1024,
+        2 * 1024 * 1024,
+    );
+
+    let oversized = make_large_json(2 * 1024 * 1024); // ~2 MiB, above the 1 MiB cap
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        ctx.race()
+            .activity_raw("send_email", oversized, "default")
+            .run(),
+    )
+    .await;
+
+    match result {
+        Ok(Err(HarvestError::PayloadTooLarge { kind, .. })) => {
+            assert_eq!(kind, PayloadKind::ActivityInput);
+        }
+        Ok(Ok(_)) => panic!("Should have rejected oversized race activity input"),
+        Ok(Err(e)) => panic!("Wrong error: {e}"),
+        Err(timeout) => {
+            panic!("Timed out ({timeout}) — the cap check should be synchronous before the suspend")
+        }
+    }
+}
+
+#[tokio::test]
+async fn race_rejects_oversized_child_workflow_input_at_schedule_time() {
+    let ctx = WorkflowContext::new_test().with_payload_caps(
+        1024 * 1024,
+        2 * 1024 * 1024,
+        256 * 1024,
+        1024 * 1024,
+    );
+
+    let oversized = make_large_json(2 * 1024 * 1024); // ~2 MiB, above the 1 MiB cap
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        ctx.race().child_workflow_raw("child_wf", oversized).run(),
+    )
+    .await;
+
+    match result {
+        Ok(Err(HarvestError::PayloadTooLarge { kind, .. })) => {
+            assert_eq!(kind, PayloadKind::ChildWorkflowInput);
+        }
+        Ok(Ok(_)) => panic!("Should have rejected oversized race child-workflow input"),
+        Ok(Err(e)) => panic!("Wrong error: {e}"),
+        Err(timeout) => {
+            panic!("Timed out ({timeout}) — the cap check should be synchronous before the suspend")
+        }
+    }
+}

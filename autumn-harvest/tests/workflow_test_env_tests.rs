@@ -1528,3 +1528,145 @@ async fn test_365_days_under_50ms() {
         "outcome.final_now() must be start + 365 days"
     );
 }
+
+// ──────────────────────── ctx.race() tests (issue #600) ────────────────────────
+
+/// Hedge two providers, cancel the loser, take the winner — the AC4 ≤5-line
+/// DX example, exercised end-to-end through the no-DB test harness.
+fn race_two_providers_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_primary", input.clone(), "default")
+            .activity_raw("fetch_fallback", input, "default")
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({"winner_index": winner.index, "value": winner.value}))
+    })
+}
+
+#[tokio::test]
+async fn test_race_two_activities_discards_loser_and_replays_deterministically() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("fetch_primary", |_input| Ok(json!({"provider": "primary"})))
+        .mock_activity("fetch_fallback", |_input| {
+            Ok(json!({"provider": "fallback"}))
+        })
+        .run(race_two_providers_workflow, json!({"query": "widgets"}))
+        .await;
+
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"winner_index": 0, "value": {"provider": "primary"}}))
+    );
+
+    // The winner is durably recorded via the existing MarkerRecorded event
+    // (issue #600 AC2 — no new WorkflowEvent variant).
+    assert!(
+        outcome.events().iter().any(
+            |e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name == "race_winner:1")
+        ),
+        "expected a race_winner marker in history: {:?}",
+        outcome.events()
+    );
+    // WorkflowTestEnv resolves every mocked ScheduleActivity synchronously
+    // within the same iteration, so by the time the race is evaluated *both*
+    // branches already have a real terminal in history — there is nothing
+    // durably "open" left to cancel, and no synthetic "lost race" terminal is
+    // (or should be) recorded. Both activities' real completions are visible
+    // in history; only the non-winning one's value is discarded. The
+    // still-open-loser-gets-cancelled path (a genuinely durable resource) is
+    // covered by the `race_activity_replays_winner_and_records_marker_plus_cancel_losers`
+    // and `race_activity_winner_is_stable_across_randomized_completion_positions`
+    // unit tests in `context.rs`, which construct that history state directly.
+    assert!(
+        !outcome
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. })),
+        "no branch should be force-failed when both already completed: {:?}",
+        outcome.events()
+    );
+    let fallback_completed = outcome.events().iter().any(|e| matches!(
+        e,
+        WorkflowEvent::ActivityCompleted { output, .. } if output == &json!({"provider": "fallback"})
+    ));
+    assert!(
+        fallback_completed,
+        "the losing branch's own real completion is still recorded in history: {:?}",
+        outcome.events()
+    );
+
+    let report = outcome.replay_check(race_two_providers_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "race must replay deterministically:\n{report}"
+    );
+}
+
+/// Approval-signal-or-timeout expressed via `ctx.race()` (issue #600's other
+/// headline example from the User Story) — a thin wrapper over the
+/// already-shipped `receive_signal_timeout` (issue #476). `winner.index` for
+/// this shape is a fixed role-based value (timer = 0, signal = 1),
+/// independent of the `.signal()`/`.timer()` call order below.
+fn race_approval_or_timeout_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let winner = ctx
+            .race()
+            .signal("approval")
+            .timer(std::time::Duration::from_secs(3600))
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({"winner_index": winner.index, "value": winner.value}))
+    })
+}
+
+#[tokio::test]
+async fn test_race_approval_or_timeout_signal_branch() {
+    let outcome = WorkflowTestEnv::new()
+        .queue_signal("approval", json!({"approved": true}))
+        .run(race_approval_or_timeout_workflow, json!(null))
+        .await;
+
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"winner_index": 1, "value": {"approved": true}}))
+    );
+
+    let report = outcome
+        .replay_check(race_approval_or_timeout_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "signal-branch race must replay deterministically:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn test_race_approval_or_timeout_timer_branch() {
+    // No signal queued — the stubbed timer fires immediately.
+    let outcome = WorkflowTestEnv::new()
+        .run(race_approval_or_timeout_workflow, json!(null))
+        .await;
+
+    assert_eq!(
+        outcome.result,
+        Ok(json!({"winner_index": 0, "value": null}))
+    );
+
+    let report = outcome
+        .replay_check(race_approval_or_timeout_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "timer-branch race must replay deterministically:\n{report}"
+    );
+}
