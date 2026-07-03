@@ -3137,6 +3137,14 @@ async fn wait_for_completion_with_diagnostics(
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            let parent_history = load_history_from_url(database_url, parent_exec_id).await;
+            let parent_event_summary = parent_history
+                .events
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("    [{i}] {}", e.type_name()))
+                .collect::<Vec<_>>()
+                .join("\n");
             let children = load_child_executions_from_url(database_url, parent_exec_id).await;
             let child_report = {
                 let mut lines = Vec::new();
@@ -3171,9 +3179,11 @@ async fn wait_for_completion_with_diagnostics(
                 "execution {parent_exec_id} did not reach COMPLETED within {timeout:?} \
                  (currently: {} error={:?}).\n\
                  parent task queue rows:\n{parent_tasks}\n\
+                 parent history ({} events):\n{parent_event_summary}\n\
                  children ({} of expected 10 recorded):\n{child_report}",
                 execution.state,
                 execution.error,
+                parent_history.events.len(),
                 children.len(),
             );
         }
