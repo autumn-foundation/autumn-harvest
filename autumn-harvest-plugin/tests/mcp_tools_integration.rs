@@ -78,6 +78,32 @@ async fn agent_relay_flow(ctx: &WorkflowContext, hop: u32) -> Result<String, Str
     Ok(format!("relay complete at hop {hop}"))
 }
 
+/// Continues itself once, then parks on a signal — used to prove
+/// `signal_{wf}`/`{wf}_update_{name}` resolve the `ContinuedAsNew` chain to
+/// the live successor instead of delegating with the sealed predecessor's
+/// id (code-review fix, PR #908).
+#[workflow(mcp, description = "Continues itself once, then waits for a signal")]
+async fn agent_relay_signal_flow(ctx: &WorkflowContext, hop: u32) -> Result<String, String> {
+    if hop == 0 {
+        ctx.continue_as_new(serde_json::json!(1))
+            .await
+            .map_err(|e| e.to_string())?;
+        unreachable!("continue_as_new does not resolve while the execution is active");
+    }
+    let payload = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+    let value = payload
+        .get("value")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+        .to_string();
+    Ok(format!("relay signalled with {value}"))
+}
+
+#[update(workflow = "agent_relay_signal_flow", mcp)]
+async fn ping_relay(_ctx: &WorkflowContext, _req: Value) -> Result<String, String> {
+    Ok("pong".to_string())
+}
+
 // ── Harness ───────────────────────────────────────────────────────────────────
 
 fn harvest_plugin() -> HarvestPlugin {
@@ -87,8 +113,9 @@ fn harvest_plugin() -> HarvestPlugin {
                 .with_input_schema_fn(approval_input_schema),
             __autumn_workflow_info_agent_other_flow(),
             __autumn_workflow_info_agent_relay_flow(),
+            __autumn_workflow_info_agent_relay_signal_flow(),
         ])
-        .updates(updates![set_priority])
+        .updates(updates![set_priority, ping_relay])
         .worker(WorkerConfig::default())
         .api("/api/harvest")
         .mcp_tools()
@@ -446,4 +473,68 @@ async fn status_and_watch_follow_the_continue_as_new_chain_to_the_real_result() 
     );
     assert_eq!(result["output"], json!("relay complete at hop 1"));
     assert!(result["error"].is_null());
+}
+
+/// Code-review regression test (issue #597, PR #908): `signal_{wf}` and
+/// `{wf}_update_{name}` must resolve a `ContinuedAsNew` chain to the live
+/// successor and delegate with *its* execution id — before the fix, both
+/// delegated with the caller's original (now-sealed) predecessor id, which
+/// the underlying signal/update admission paths reject as terminal, even
+/// though the workflow is still running under its successor.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn signal_and_update_follow_the_continue_as_new_chain_to_the_live_successor() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(db).await;
+
+    let (is_error, started) =
+        call_tool(&client, "start_agent_relay_signal_flow", json!({"body": 0})).await;
+    assert!(!is_error, "start must succeed, got: {started}");
+    let handle = started["execution_id"]
+        .as_str()
+        .expect("start returns the execution_id handle")
+        .to_string();
+
+    // Wait for the chain to settle: the predecessor continues-as-new almost
+    // immediately, and the successor parks on wait_for_signal("go").
+    wait_for_status(&client, "agent_relay_signal_flow_status", &handle, |s| {
+        s["state"] == "RUNNING"
+    })
+    .await;
+
+    // The update tool, called with the ORIGINAL (predecessor) handle, must
+    // reach the live successor rather than failing against the sealed
+    // predecessor id.
+    let (is_error, update_result) = call_tool(
+        &client,
+        "agent_relay_signal_flow_update_ping_relay",
+        json!({"handle": handle, "body": {}}),
+    )
+    .await;
+    assert!(
+        !is_error,
+        "update against the original handle must reach the live successor, got: {update_result}"
+    );
+    assert_eq!(update_result["output"], json!("pong"));
+
+    // The signal tool, also called with the ORIGINAL handle, must unblock
+    // the live successor's wait_for_signal.
+    let (is_error, signal_result) = call_tool(
+        &client,
+        "signal_agent_relay_signal_flow",
+        json!({"handle": handle, "signal_name": "go", "body": {"value": "hello"}}),
+    )
+    .await;
+    assert!(
+        !is_error,
+        "signal against the original handle must reach the live successor, got: {signal_result}"
+    );
+
+    let status = wait_for_status(&client, "agent_relay_signal_flow_status", &handle, |s| {
+        s["is_terminal"] == json!(true)
+    })
+    .await;
+    assert_eq!(status["state"], "COMPLETED");
+    assert_eq!(status["output"], json!("relay signalled with hello"));
 }

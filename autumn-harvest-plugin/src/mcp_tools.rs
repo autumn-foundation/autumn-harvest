@@ -158,6 +158,23 @@ pub fn collect_descriptors(
             );
             continue;
         }
+        // A debounced or batched start defers admission (the scanner fires
+        // it later) and returns 202 Accepted with no execution_id yet -- but
+        // every generated tool (start_{wf} included) promises a durable
+        // handle immediately, and status_{wf}/signal_{wf}/{wf}_watch/updates
+        // all require one. Excluding the workflow here (rather than
+        // surfacing a broken start_{wf} tool that sometimes has no handle to
+        // give back) keeps the "the handle is the correlation token"
+        // contract true for every exposed workflow.
+        if info.debounce.is_some() || info.batch.is_some() {
+            tracing::warn!(
+                workflow = info.name,
+                "workflow has a debounce or batch policy configured; excluding it from \
+                 mcp_tools() exposure, since a deferred start cannot return the durable \
+                 handle every generated tool promises immediately"
+            );
+            continue;
+        }
         let mut wf_updates: Vec<McpUpdateDescriptor> = Vec::new();
         for u in updates.iter().filter(|u| u.mcp && u.workflow == info.name) {
             if wf_updates.iter().any(|existing| existing.name == u.name) {
@@ -790,12 +807,22 @@ async fn signal_tool(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    if let Err(response) = load_owned_execution(&api_state, workflow, &handle).await {
-        return response;
-    }
+    let execution = match load_owned_execution(&api_state, workflow, &handle).await {
+        Ok(execution) => execution,
+        Err(response) => return response,
+    };
+    // Resolve to the live successor if the caller's durable handle names a
+    // predecessor that has since continued-as-new: the underlying signal
+    // path rejects a terminal execution, so signalling with the stale
+    // predecessor id would fail even though status_/watch_ already follow
+    // the chain and report the run as live.
+    let execution = match resolve_if_chained(&api_state, execution).await {
+        Ok(execution) => execution,
+        Err(response) => return response,
+    };
     crate::api::signal_workflow(
         Extension(api_state),
-        Path((handle, signal_name)),
+        Path((execution.id.to_string(), signal_name)),
         Query(crate::api::SignalQuery::default()),
         headers,
         Json(payload),
@@ -813,12 +840,20 @@ async fn update_tool(
     handle: String,
     body: serde_json::Value,
 ) -> axum::response::Response {
-    if let Err(response) = load_owned_execution(&api_state, workflow, &handle).await {
-        return response;
-    }
+    let execution = match load_owned_execution(&api_state, workflow, &handle).await {
+        Ok(execution) => execution,
+        Err(response) => return response,
+    };
+    // Same continue-as-new chain resolution as signal_tool: admitting an
+    // update against a sealed predecessor id would fail even though the
+    // workflow is still live under its successor.
+    let execution = match resolve_if_chained(&api_state, execution).await {
+        Ok(execution) => execution,
+        Err(response) => return response,
+    };
     crate::api::admit_update(
         Extension(api_state),
-        Path((handle, update.to_string())),
+        Path((execution.id.to_string(), update.to_string())),
         Query(crate::api::AdmitUpdateQuery::default()),
         Json(crate::api::AdmitUpdateRequest::new(body)),
     )
@@ -1067,6 +1102,36 @@ mod tests {
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0].name, "exposed");
         assert!(descriptors[0].updates.is_empty());
+    }
+
+    /// Code-review regression test (issue #597, PR #908): a debounced or
+    /// batched start defers admission and can return 202 Accepted with no
+    /// `execution_id`, breaking every generated tool's "durable handle
+    /// immediately" contract. Such workflows must never be exposed.
+    #[test]
+    fn collect_descriptors_excludes_debounced_and_batched_workflows() {
+        let debounced =
+            wf("debounced_flow", true).with_debounce(autumn_harvest::debounce::DebouncePolicy {
+                key_expr: "tenant_id",
+                window: std::time::Duration::from_secs(30),
+                max_wait: None,
+            });
+        let batched =
+            wf("batched_flow", true).with_batch(autumn_harvest::event_batch::BatchPolicy {
+                key_expr: "tenant_id".to_string(),
+                max_size: 10,
+                max_wait: std::time::Duration::from_secs(10),
+            });
+        let plain = wf("plain_flow", true);
+
+        let descriptors = collect_descriptors(&[debounced, batched, plain], &[]);
+
+        let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["plain_flow"],
+            "debounced/batched workflows must be excluded, plain ones kept"
+        );
     }
 
     #[test]

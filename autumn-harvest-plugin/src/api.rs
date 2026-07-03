@@ -1666,6 +1666,12 @@ pub(crate) struct StartWorkflowRequest {
 impl StartWorkflowRequest {
     /// Minimal request carrying only the workflow input — used by the MCP
     /// start tool (issue #597), which exposes no other start options.
+    ///
+    /// Only called from `mcp_tools.rs`, which is entirely excluded from the
+    /// build without the `mcp` cargo feature; without this, a default
+    /// (no-`mcp`) build sees zero callers and clippy's `-D warnings` treats
+    /// that as a hard error.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub(crate) const fn from_input(input: Value) -> Self {
         Self {
             workflow_id: None,
@@ -20929,6 +20935,12 @@ pub(crate) struct AdmitUpdateRequest {
 impl AdmitUpdateRequest {
     /// Request carrying the update input — used by the MCP update tools
     /// (issue #597).
+    ///
+    /// Only called from `mcp_tools.rs`, which is entirely excluded from the
+    /// build without the `mcp` cargo feature; without this, a default
+    /// (no-`mcp`) build sees zero callers and clippy's `-D warnings` treats
+    /// that as a hard error.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
     pub(crate) const fn new(input: Value) -> Self {
         Self { input }
     }

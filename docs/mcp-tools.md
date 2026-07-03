@@ -44,6 +44,11 @@ autumn_web::app()
 
 For `WorkflowInfo` values built outside the macro, use `.with_mcp()`.
 
+A workflow with a `debounce` or `batch` policy is **excluded** from MCP
+exposure (with a `tracing::warn!`), even when `mcp` is set: a deferred start
+can return `202 Accepted` with no `execution_id` yet, which every generated
+tool's "durable handle immediately" contract depends on.
+
 ## Generated tool set (per workflow `foo`, mcp update `bar`)
 
 | Tool (operation id) | Verb + route | Arguments | Semantics |
@@ -110,11 +115,15 @@ An already-terminal run yields the result frame immediately.
   consulted by core execution: no new `WorkflowEvent` variant, no migration,
   no replay surface. Nothing about MCP runs inside the deterministic workflow
   body.
-- `foo_status` and `foo_watch` transparently follow a `ContinuedAsNew`
+- All four handle-taking tools transparently follow a `ContinuedAsNew`
   successor chain (the same chain-following `GET /workflows/{id}/result`
-  uses, issue #527) — a handle for a run that continued itself reports the
-  eventual successor's real state/output/error, never the sealed
-  predecessor's dead-end `CONTINUED_AS_NEW` sentinel.
+  uses, issue #527) — a handle for a run that continued itself keeps
+  working. `foo_status`/`foo_watch` report the eventual successor's real
+  state/output/error, never the sealed predecessor's dead-end
+  `CONTINUED_AS_NEW` sentinel; `signal_foo`/`foo_update_bar` resolve to the
+  live successor's execution id before delegating, so a signal or update
+  sent against the original handle still reaches the running workflow
+  instead of failing against a terminal predecessor.
 
 ## Safety posture
 
