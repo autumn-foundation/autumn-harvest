@@ -73,7 +73,12 @@ fn build_client() -> TestClient {
     ];
     let descriptors = collect_descriptors(&workflows, &updates);
     record_schemas(&descriptors);
-    let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &HarvestApiState::new());
+    let routes = build_mcp_tool_routes(
+        "/api/harvest/mcp",
+        &descriptors,
+        &HarvestApiState::new(),
+        None,
+    );
     TestApp::new().routes(routes).mount_mcp("/mcp").build()
 }
 
@@ -262,7 +267,7 @@ async fn tool_routes_coexist_with_the_nested_management_router() {
     let descriptors = collect_descriptors(&workflows, &[]);
     record_schemas(&descriptors);
     let api_state = HarvestApiState::new();
-    let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &api_state);
+    let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &api_state, None);
 
     let client = TestApp::new()
         .routes(routes)

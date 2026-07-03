@@ -269,12 +269,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             result.batch = Some(BatchArgs { key_expr, max_size, max_wait });
             Ok(())
         } else if meta.path.is_ident("allow_nondeterministic_apis") {
-            if meta.input.peek(syn::Token![=]) {
-                let value: syn::LitBool = meta.value()?.parse()?;
-                result.allow_nondeterministic_apis = value.value;
-            } else {
-                result.allow_nondeterministic_apis = true;
-            }
+            result.allow_nondeterministic_apis = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
         } else if meta.path.is_ident("max_input_bytes") {
             let value: LitStr = meta.value()?.parse()?;
@@ -313,12 +308,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             result.retry = Some(value);
             Ok(())
         } else if meta.path.is_ident("mcp") {
-            if meta.input.peek(syn::Token![=]) {
-                let value: syn::LitBool = meta.value()?.parse()?;
-                result.mcp = value.value;
-            } else {
-                result.mcp = true;
-            }
+            result.mcp = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
         } else {
             Err(meta.error(

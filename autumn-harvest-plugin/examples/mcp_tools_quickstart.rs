@@ -93,6 +93,7 @@ struct DeadlineRequest {
 /// Synchronous steering: an agent calls this as its own MCP tool and gets the
 /// result back in the same call (validated, durably admitted, executed).
 #[update(workflow = "document_review", mcp)]
+#[allow(clippy::unused_async)] // #[update] handlers must be async fn
 async fn set_deadline(_ctx: &WorkflowContext, req: DeadlineRequest) -> Result<String, String> {
     Ok(format!("deadline set to {}", req.deadline))
 }

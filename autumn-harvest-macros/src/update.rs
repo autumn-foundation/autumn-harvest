@@ -43,12 +43,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<UpdateAttrs> {
             result.validator = Some(value);
             Ok(())
         } else if meta.path.is_ident("mcp") {
-            if meta.input.peek(syn::Token![=]) {
-                let value: syn::LitBool = meta.value()?.parse()?;
-                result.mcp = value.value;
-            } else {
-                result.mcp = true;
-            }
+            result.mcp = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
         } else {
             Err(meta.error(

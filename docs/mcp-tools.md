@@ -110,6 +110,11 @@ An already-terminal run yields the result frame immediately.
   consulted by core execution: no new `WorkflowEvent` variant, no migration,
   no replay surface. Nothing about MCP runs inside the deterministic workflow
   body.
+- `foo_status` and `foo_watch` transparently follow a `ContinuedAsNew`
+  successor chain (the same chain-following `GET /workflows/{id}/result`
+  uses, issue #527) — a handle for a run that continued itself reports the
+  eventual successor's real state/output/error, never the sealed
+  predecessor's dead-end `CONTINUED_AS_NEW` sentinel.
 
 ## Safety posture
 
@@ -126,9 +131,19 @@ An already-terminal run yields the result frame immediately.
 - **Auth principal.** `tools/call` forwards the caller's credentials
   (authorization/cookie headers, resolved client identity) into the replayed
   in-process request, so the tools run under the same authenticated principal
-  as any HTTP call. Gate the endpoint with `secure_mcp(...)`; the generated
-  tool routes mirror the management API's posture and fail closed (storage
-  not configured) before the runtime starts.
+  as any HTTP call. The generated tool routes fail closed (runtime not
+  started) before startup completes, regardless of auth configuration.
+  **Two auth layers, both worth configuring:** `secure_mcp(...)` gates the
+  `/mcp` JSON-RPC envelope itself (`initialize`/`tools/list`/`tools/call`
+  dispatch); `HarvestPlugin::api_with_auth(path, middleware)` additionally
+  applies the *same* middleware directly to every generated tool route's own
+  HTTP path (issue #597 code-review hardening — the tool routes are
+  registered via `AppBuilder::routes(...)`, not `nest()`, so without this a
+  caller could bypass `secure_mcp` entirely by hitting a tool's route path
+  directly instead of going through `/mcp`). Configure `api_with_auth`
+  wherever the management API needs a credential and MCP tools are also
+  enabled; `.api(path)` (no auth) leaves both surfaces open, matching today's
+  unauthenticated-by-default posture for that configuration.
 
 ## Testing
 

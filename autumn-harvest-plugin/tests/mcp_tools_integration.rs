@@ -63,6 +63,21 @@ async fn set_priority(_ctx: &WorkflowContext, req: PriorityRequest) -> Result<St
     Ok(format!("priority set to {}", req.level))
 }
 
+/// Continues itself exactly once, then completes — used to prove
+/// `{wf}_status`/`{wf}_watch` resolve the `ContinuedAsNew` chain to the
+/// successor's real outcome instead of surfacing the sealed predecessor's
+/// dead-end sentinel (code-review fix for issue #597).
+#[workflow(mcp, description = "Continues itself once, then completes")]
+async fn agent_relay_flow(ctx: &WorkflowContext, hop: u32) -> Result<String, String> {
+    if hop == 0 {
+        ctx.continue_as_new(serde_json::json!(1))
+            .await
+            .map_err(|e| e.to_string())?;
+        unreachable!("continue_as_new does not resolve while the execution is active");
+    }
+    Ok(format!("relay complete at hop {hop}"))
+}
+
 // ── Harness ───────────────────────────────────────────────────────────────────
 
 fn harvest_plugin() -> HarvestPlugin {
@@ -71,6 +86,7 @@ fn harvest_plugin() -> HarvestPlugin {
             __autumn_workflow_info_agent_approval_flow()
                 .with_input_schema_fn(approval_input_schema),
             __autumn_workflow_info_agent_other_flow(),
+            __autumn_workflow_info_agent_relay_flow(),
         ])
         .updates(updates![set_priority])
         .worker(WorkerConfig::default())
@@ -366,4 +382,68 @@ async fn handles_cannot_cross_workflow_tool_boundaries() {
     )
     .await;
     assert!(is_error, "cross-workflow signal must fail, got: {body}");
+}
+
+/// Code-review regression test (issue #597): `{wf}_status` and `{wf}_watch`
+/// must resolve a `ContinuedAsNew` chain to the successor's real outcome —
+/// before the fix, both surfaced the sealed predecessor's dead-end sentinel
+/// (`state: CONTINUED_AS_NEW`, `output: null`, `error: null`) for any run
+/// that continued itself, exactly like `agent_relay_flow` does once.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn status_and_watch_follow_the_continue_as_new_chain_to_the_real_result() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(db).await;
+
+    let (is_error, started) =
+        call_tool(&client, "start_agent_relay_flow", json!({"body": 0})).await;
+    assert!(!is_error, "start must succeed, got: {started}");
+    let handle = started["execution_id"]
+        .as_str()
+        .expect("start returns the execution_id handle")
+        .to_string();
+
+    // status_ queried on the ORIGINAL (predecessor) handle must resolve
+    // through the successor to the real terminal outcome, not the sealed
+    // predecessor's null output/error.
+    let status = wait_for_status(&client, "agent_relay_flow_status", &handle, |s| {
+        s["is_terminal"] == json!(true)
+    })
+    .await;
+    assert_eq!(
+        status["state"], "COMPLETED",
+        "status must report the successor's real state, not CONTINUED_AS_NEW; got: {status}"
+    );
+    assert_eq!(status["output"], json!("relay complete at hop 1"));
+    assert!(status["error"].is_null());
+
+    // watch_ on the same (now-terminal-by-chain) handle must also resolve
+    // through the chain rather than emitting a dead-end CONTINUED_AS_NEW
+    // result frame.
+    let resp = post_sse(
+        &client,
+        json!({
+            "jsonrpc": "2.0", "id": 88, "method": "tools/call",
+            "params": {
+                "name": "agent_relay_flow_watch",
+                "arguments": {"handle": handle}
+            }
+        }),
+    )
+    .await;
+    resp.assert_ok();
+    let messages = sse_messages(&resp.text());
+    let result = messages
+        .iter()
+        .rev()
+        .find(|m| m.get("state").is_some())
+        .unwrap_or_else(|| panic!("a terminal result frame must be emitted; got: {messages:?}"));
+    assert_eq!(
+        result["state"], "COMPLETED",
+        "watch's terminal frame must report the successor's real state, not \
+         CONTINUED_AS_NEW; got: {result}"
+    );
+    assert_eq!(result["output"], json!("relay complete at hop 1"));
+    assert!(result["error"].is_null());
 }

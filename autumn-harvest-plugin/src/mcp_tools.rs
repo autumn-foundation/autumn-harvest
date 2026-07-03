@@ -347,9 +347,17 @@ fn register_harvest_mcp_schemas(registry: &mut autumn_web::openapi::SchemaRegist
     }
 }
 
-/// Permissive object schema used when a workflow publishes no `input_schema`.
+/// Permissive schema used when a workflow (or update) publishes no
+/// `input_schema`. Deliberately carries **no** `"type"` constraint: per
+/// CLAUDE.md's "Multi-param dispatch packs into JSON array" convention, an
+/// unpublished workflow's actual expected input can be a JSON object
+/// (single struct param), an array (multi-param, positional), or a bare
+/// scalar (single non-object param) — asserting `"type": "object"` here
+/// would make a validating MCP client reject perfectly valid array/scalar
+/// input before it ever reaches `start_tool`'s own schema check. Mirrors
+/// [`SIGNAL_PAYLOAD_SCHEMA`], the existing "arbitrary JSON" fallback.
 fn permissive_object_schema(description: &str) -> serde_json::Value {
-    serde_json::json!({ "type": "object", "description": description })
+    serde_json::json!({ "description": description })
 }
 
 /// Record the descriptors' schemas into the process-global schema map.
@@ -438,7 +446,8 @@ pub fn record_schemas(descriptors: &[McpWorkflowDescriptor]) {
     );
 
     for d in descriptors {
-        map.insert(
+        insert_schema_warn_on_divergence(
+            &mut map,
             input_schema_component(&d.name),
             d.input_schema.clone().unwrap_or_else(|| {
                 permissive_object_schema(&format!(
@@ -449,7 +458,8 @@ pub fn record_schemas(descriptors: &[McpWorkflowDescriptor]) {
             }),
         );
         for u in &d.updates {
-            map.insert(
+            insert_schema_warn_on_divergence(
+                &mut map,
                 update_input_schema_component(&d.name, &u.name),
                 permissive_object_schema(&format!(
                     "Input for the '{}' update (Rust type: {})",
@@ -459,6 +469,37 @@ pub fn record_schemas(descriptors: &[McpWorkflowDescriptor]) {
         }
     }
     drop(map);
+}
+
+/// Insert into the process-global schema map, logging a loud warning first
+/// when an existing entry with the same name carries genuinely different
+/// content.
+///
+/// `MCP_SCHEMAS` has no per-`HarvestPlugin`-instance scoping — it can't,
+/// since autumn-web's `ApiDoc::register_schemas` hook is a bare fn pointer
+/// with no captured state (see the module doc above `MCP_SCHEMAS`). Two
+/// `HarvestPlugin::mcp_tools()` builds in one process (parallel tests, or a
+/// multi-tenant embedder) that register a same-named workflow with
+/// different schemas will still have the later build's schema win — this
+/// cannot be fixed without an upstream autumn-web change — but the collision
+/// is no longer silent.
+fn insert_schema_warn_on_divergence(
+    map: &mut HashMap<String, serde_json::Value>,
+    name: String,
+    schema: serde_json::Value,
+) {
+    if let Some(existing) = map.get(&name)
+        && *existing != schema
+    {
+        tracing::warn!(
+            schema_name = %name,
+            "mcp tool schema '{name}' was already registered with different content by \
+             another HarvestPlugin build in this process; the two builds' advertised \
+             inputSchema will clobber each other (process-global schema map, no \
+             per-instance scoping — see MCP_SCHEMAS doc comment)"
+        );
+    }
+    map.insert(name, schema);
 }
 
 // ── Route/handler layer (layer 3) ────────────────────────────────────────────
@@ -481,11 +522,12 @@ pub fn build_mcp_tool_routes(
     prefix: &str,
     descriptors: &[McpWorkflowDescriptor],
     api_state: &crate::api::HarvestApiState,
+    tool_middleware: Option<&crate::plugin::McpToolMiddlewareFn>,
 ) -> Vec<autumn_web::Route> {
     let mut routes = Vec::new();
     for descriptor in descriptors {
         for spec in tool_route_specs(prefix, descriptor) {
-            routes.push(build_tool_route(&spec, descriptor, api_state.clone()));
+            routes.push(build_tool_route(&spec, api_state.clone(), tool_middleware));
         }
     }
     routes
@@ -493,8 +535,8 @@ pub fn build_mcp_tool_routes(
 
 fn build_tool_route(
     spec: &ToolRouteSpec,
-    descriptor: &McpWorkflowDescriptor,
     api_state: crate::api::HarvestApiState,
+    tool_middleware: Option<&crate::plugin::McpToolMiddlewareFn>,
 ) -> autumn_web::Route {
     use axum::routing::MethodRouter;
 
@@ -503,20 +545,14 @@ fn build_tool_route(
     let workflow: &'static str = leak(spec.workflow.clone());
 
     let handler: MethodRouter<autumn_web::AppState> = match spec.kind {
-        ToolKind::Start => {
-            let input_schema = descriptor.input_schema.clone();
-            axum::routing::post(
-                move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
-                    let api_state = api_state.clone();
-                    let input_schema = input_schema.clone();
-                    // Boxed: the delegated start handler's future is large
-                    // (clippy::large_futures) and this is a cold edge path.
-                    async move {
-                        Box::pin(start_tool(api_state, workflow, input_schema, headers, body)).await
-                    }
-                },
-            )
-        }
+        ToolKind::Start => axum::routing::post(
+            move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                let api_state = api_state.clone();
+                // Boxed: the delegated start handler's future is large
+                // (clippy::large_futures) and this is a cold edge path.
+                async move { Box::pin(start_tool(api_state, workflow, headers, body)).await }
+            },
+        ),
         ToolKind::Status => axum::routing::get(move |Path(handle): Path<String>| {
             let api_state = api_state.clone();
             async move { status_tool(api_state, workflow, &handle).await }
@@ -548,6 +584,17 @@ fn build_tool_route(
             let api_state = api_state.clone();
             async move { watch_tool(api_state, workflow, &handle).await }
         }),
+    };
+    // Issue #597 hardening: these routes are registered via
+    // `AppBuilder::routes(...)`, not `nest()`, so they never pass through
+    // the harvest management API's own auth layer (which only wraps the
+    // nested router) or autumn-web's `secure_mcp` (which only gates the
+    // `/mcp` envelope, not a typed route's own HTTP path). Apply the same
+    // layer `HarvestPlugin::api_with_auth` configured directly to this
+    // route's handler so it requires the same credential either way.
+    let handler = match tool_middleware {
+        Some(mw) => mw(handler),
+        None => handler,
     };
 
     let api_doc = autumn_web::openapi::ApiDoc {
@@ -627,31 +674,25 @@ async fn load_owned_execution(
     Ok(execution)
 }
 
-/// `start_{wf}` — validate the input against the workflow's published schema
-/// (pure, before any storage access), then delegate to the management API's
-/// start handler with only the input set (server-generated `workflow_id`).
+/// `start_{wf}` — delegate straight to the management API's start handler
+/// with only the input set (server-generated `workflow_id`).
+///
+/// Input-schema validation is intentionally *not* duplicated here: the
+/// delegated `start_workflow` already validates against the workflow's
+/// published `WorkflowInfo::input_schema` (issue #373), sourced from the
+/// live runtime registry rather than a schema snapshot closure-captured at
+/// `Plugin::build()` time, and — unlike an earlier version of this
+/// function — writes the audit record for a rejected request. Duplicating
+/// the check here bought no earlier failure (the validation itself is
+/// pure/in-memory either way) at the cost of two independent sources of
+/// truth for the same schema and a rejected MCP-originated attempt leaving
+/// no audit trail.
 async fn start_tool(
     api_state: crate::api::HarvestApiState,
     workflow: &'static str,
-    input_schema: Option<serde_json::Value>,
     headers: axum::http::HeaderMap,
     body: serde_json::Value,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse as _;
-
-    if let Some(schema) = input_schema
-        && let Err(violations) = autumn_harvest::info::validate_against_schema(&schema, &body)
-    {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "input validation failed",
-                "violations": violations,
-            })),
-        )
-            .into_response();
-    }
-
     Box::pin(crate::api::start_workflow(
         Extension(api_state),
         Path(workflow.to_string()),
@@ -696,6 +737,12 @@ impl McpStatusResponse {
 }
 
 /// `{wf}_status` — read the durable execution row.
+///
+/// A `FAILED` or `CONTINUED_AS_NEW` row is resolved through the same
+/// retry/continue-as-new chain-following the `/result` HTTP endpoint uses
+/// (issue #527), so a continued-as-new run's status reflects its eventual
+/// successor's real state/output/error instead of a dead-end sentinel with
+/// null output. Other states need no extra lookup.
 async fn status_tool(
     api_state: crate::api::HarvestApiState,
     workflow: &'static str,
@@ -703,10 +750,32 @@ async fn status_tool(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
-    match load_owned_execution(&api_state, workflow, handle).await {
-        Ok(execution) => Json(McpStatusResponse::from_execution(execution)).into_response(),
-        Err(response) => response,
+    let execution = match load_owned_execution(&api_state, workflow, handle).await {
+        Ok(execution) => execution,
+        Err(response) => return response,
+    };
+    let execution = match resolve_if_chained(&api_state, execution).await {
+        Ok(execution) => execution,
+        Err(response) => return response,
+    };
+    Json(McpStatusResponse::from_execution(execution)).into_response()
+}
+
+/// Follow the retry/continue-as-new chain when `execution` is a dead-end
+/// (`FAILED` or `CONTINUED_AS_NEW`) row; returns `execution` unchanged
+/// otherwise, avoiding a redundant reload for the common terminal/running
+/// case (`load_owned_execution` already loaded it once).
+async fn resolve_if_chained(
+    api_state: &crate::api::HarvestApiState,
+    execution: autumn_harvest::models::WorkflowExecution,
+) -> Result<autumn_harvest::models::WorkflowExecution, axum::response::Response> {
+    if !matches!(execution.state.as_str(), "FAILED" | "CONTINUED_AS_NEW") {
+        return Ok(execution);
     }
+    let exec_id = autumn_harvest::ExecutionId::from_uuid(execution.id);
+    crate::api::resolve_terminal_workflow_execution(api_state, exec_id)
+        .await
+        .map_err(autumn_web::prelude::IntoResponse::into_response)
 }
 
 /// `signal_{wf}` — ownership check, then delegate to the standalone signal
@@ -764,11 +833,19 @@ async fn update_tool(
 /// Frame contract:
 /// - progress frames: `{"progress": <n>, "message": <current_details|state>}`
 ///   (numeric `progress` opts into structured MCP progress forwarding);
-/// - terminal frame: `event: result`, data `{"state", "output", "error"}`.
+/// - terminal frame: `event: result`, data `{"state", "output", "error"}`;
+/// - lost-listener frame: `event: error`, data `{"error": <message>}`, sent
+///   only if the stream's underlying LISTEN/NOTIFY connection is lost before
+///   a terminal state is observed (see below).
 ///
 /// Modeled on the management API's `stream_execution_events` (listener
 /// connected *before* the snapshot read so no event is missed; bounded
-/// channel; pooled connection released while idle).
+/// channel; pooled connection released while idle). A `FAILED`-with-retry or
+/// `CONTINUED_AS_NEW` row is resolved through the same chain-following
+/// `{wf}_status` uses (issue #527), both at subscribe time and whenever a
+/// continue-as-new happens mid-watch, so the terminal frame always reflects
+/// the eventual successor's real outcome instead of a dead-end sentinel.
+#[allow(clippy::too_many_lines)]
 async fn watch_tool(
     api_state: crate::api::HarvestApiState,
     workflow: &'static str,
@@ -785,7 +862,9 @@ async fn watch_tool(
     };
 
     // LISTEN before the snapshot read: an event committed between the two is
-    // caught by the first notification instead of being lost.
+    // caught by the first notification instead of being lost. Continue-as-new
+    // successors always live on the same shard, so one listener connection
+    // covers the whole chain even if we later jump to a successor's exec_id.
     let notification_url = match api_state.sse_notification_url(exec_id.shard()) {
         Ok(url) => url,
         Err(e) => return crate::api::map_error(e).into_response(),
@@ -799,6 +878,13 @@ async fn watch_tool(
         Ok(execution) => execution,
         Err(response) => return response,
     };
+    // Jump straight to the active successor if the handle already names a
+    // dead-end row (matches `{wf}_status`'s chain-following).
+    let execution = match resolve_if_chained(&api_state, execution).await {
+        Ok(execution) => execution,
+        Err(response) => return response,
+    };
+    let exec_id = autumn_harvest::ExecutionId::from_uuid(execution.id);
 
     let keepalive_interval = api_state.sse_keepalive_interval();
     let buffer_depth = api_state.sse_buffer_depth();
@@ -844,6 +930,7 @@ async fn watch_tool(
         }
 
         let mut listener = listener;
+        let mut exec_id = exec_id;
         loop {
             // 2x keepalive so the KeepAlive wrapper pings between wakeups; a
             // TimedOut wakeup re-checks terminal state as a missed-NOTIFY
@@ -857,8 +944,31 @@ async fn watch_tool(
                     true
                 }
                 Ok(WorkflowEventWaitOutcome::TimedOut) => false,
-                Ok(WorkflowEventWaitOutcome::ChannelClosed) | Err(_) => break,
+                Ok(WorkflowEventWaitOutcome::ChannelClosed) | Err(_) => {
+                    // The listener connection is gone: the caller would
+                    // otherwise see the stream end with no terminal signal
+                    // and no error, indistinguishable from "workflow still
+                    // running, nothing to report yet". Say so explicitly.
+                    let _ = tx
+                        .send(Ok(Event::default().event("error").data(
+                            serde_json::json!({
+                                "error": "watch stream lost its event listener connection \
+                                          before the execution reached a terminal state"
+                            })
+                            .to_string(),
+                        )))
+                        .await;
+                    break;
+                }
             };
+            // A client that dropped the SSE connection during a quiet
+            // (TimedOut, no notification) stretch would otherwise never be
+            // detected here — `tx.send` is only reached below when there is
+            // a frame to emit — leaking this task and its DB polling until
+            // the watched execution eventually terminates.
+            if tx.is_closed() {
+                break;
+            }
 
             let refreshed = match crate::api::db_conn_for_execution(&api_clone, exec_id).await {
                 Ok(mut conn) => match crate::api::load_execution(&mut conn, exec_id).await {
@@ -867,6 +977,18 @@ async fn watch_tool(
                 },
                 Err(_) => continue,
             };
+            // Chain resolution hiccup (e.g. a transient DB error): treat as
+            // no update this tick and retry on the next wakeup rather than
+            // tearing down the stream.
+            let Ok(refreshed) = resolve_if_chained(&api_clone, refreshed).await else {
+                continue;
+            };
+            if refreshed.id != exec_id.as_uuid() {
+                // Continue-as-new happened mid-watch: track the successor
+                // going forward so subsequent NOTIFY filtering and polling
+                // target the execution that is actually still active.
+                exec_id = autumn_harvest::ExecutionId::from_uuid(refreshed.id);
+            }
 
             if crate::api::is_terminal_state(&refreshed.state) {
                 let _ = tx.send(Ok(result_frame(&refreshed))).await;
@@ -1127,6 +1249,136 @@ mod tests {
             tools_prefix(None, Some("/tools/")),
             "/tools",
             "override trailing slash trimmed"
+        );
+    }
+
+    /// Code-review regression test (issue #597): the fallback schema must
+    /// not assert `"type": "object"` — a multi-param (array-input) or
+    /// scalar-input workflow with no published schema would otherwise
+    /// advertise an `inputSchema` that rejects its own valid input.
+    #[test]
+    fn permissive_object_schema_carries_no_type_constraint() {
+        let schema = permissive_object_schema("some description");
+        assert!(
+            schema.get("type").is_none(),
+            "fallback schema must not assert a type, got: {schema}"
+        );
+        assert_eq!(schema["description"], "some description");
+    }
+
+    /// Code-review regression test (issue #597): `record_schemas` is called
+    /// repeatedly (once per `Plugin::build()`); re-recording the same
+    /// workflow with identical content must stay a no-op (idempotent), and
+    /// re-recording with *different* content must still resolve to the
+    /// latest call's schema (documented last-write-wins, not a panic or a
+    /// stuck stale entry).
+    ///
+    /// Uses a workflow name not shared with any other test in this module:
+    /// `MCP_SCHEMAS` is a process-global map and `cargo test` runs tests in
+    /// parallel by default, so asserting on a shared name's content (e.g.
+    /// the file's common `"order_flow"` fixture, used by several other
+    /// tests here) would be a genuine cross-test race.
+    #[test]
+    fn record_schemas_is_idempotent_and_last_write_wins_on_divergence() {
+        let first = collect_descriptors(&[wf("review_fix_schema_probe", true)], &[]);
+        record_schemas(&first);
+        record_schemas(&first); // identical re-registration: must not panic
+
+        let diverged = collect_descriptors(
+            &[wf("review_fix_schema_probe", true).with_input_schema_fn(order_input_schema)],
+            &[],
+        );
+        record_schemas(&diverged); // divergent re-registration: must not panic
+
+        let recorded = schema_map()
+            .lock()
+            .unwrap()
+            .get(&input_schema_component("review_fix_schema_probe"))
+            .cloned();
+        assert_eq!(
+            recorded,
+            Some(order_input_schema()),
+            "the latest build's schema must win"
+        );
+    }
+
+    /// Regression test for the auth-bypass finding from the #597 code
+    /// review: MCP tool routes are registered via `AppBuilder::routes(...)`,
+    /// not `nest()`, so without an explicit applier they never pass through
+    /// `HarvestPlugin::api_with_auth`'s middleware. This proves
+    /// `build_mcp_tool_routes`'s `tool_middleware` parameter, when supplied,
+    /// actually wraps every generated route's handler.
+    #[tokio::test]
+    async fn mcp_tool_routes_apply_the_configured_middleware() {
+        use axum::response::IntoResponse as _;
+
+        async fn deny_all(
+            _req: axum::extract::Request,
+            _next: axum::middleware::Next,
+        ) -> axum::response::Response {
+            axum::http::StatusCode::UNAUTHORIZED.into_response()
+        }
+
+        let deny_layer = axum::middleware::from_fn(deny_all);
+        let tool_middleware: crate::plugin::McpToolMiddlewareFn =
+            std::sync::Arc::new(move |mr| mr.layer(deny_layer.clone()));
+
+        let descriptors = collect_descriptors(&[wf("order_flow", true)], &[]);
+        record_schemas(&descriptors);
+        let routes = build_mcp_tool_routes(
+            "/api/harvest/mcp",
+            &descriptors,
+            &crate::api::HarvestApiState::new(),
+            Some(&tool_middleware),
+        );
+
+        let client = autumn_web::test::TestApp::new().routes(routes).build();
+
+        let resp = client
+            .post("/api/harvest/mcp/workflows/order_flow/start")
+            .json(&serde_json::json!({}))
+            .send()
+            .await;
+        resp.assert_status(401);
+
+        let resp = client
+            .get("/api/harvest/mcp/workflows/order_flow/some-handle/status")
+            .send()
+            .await;
+        resp.assert_status(401);
+    }
+
+    /// Without a configured middleware (`None`, matching every existing
+    /// test above), a request must still reach the real handler — i.e. this
+    /// module's hardening does not accidentally start gating requests when
+    /// the embedder never opted into `api_with_auth`.
+    #[tokio::test]
+    async fn mcp_tool_routes_are_unwrapped_when_no_middleware_is_configured() {
+        let descriptors = collect_descriptors(&[wf("order_flow", true)], &[]);
+        record_schemas(&descriptors);
+        let routes = build_mcp_tool_routes(
+            "/api/harvest/mcp",
+            &descriptors,
+            &crate::api::HarvestApiState::new(),
+            None,
+        );
+
+        let client = autumn_web::test::TestApp::new().routes(routes).build();
+
+        let resp = client
+            .post("/api/harvest/mcp/workflows/order_flow/start")
+            .json(&serde_json::json!({}))
+            .send()
+            .await;
+        // No middleware to reject the request with 401; it reaches the real
+        // handler, which fails closed with a "harvest runtime is not
+        // started" 400 (no runtime is installed in this no-DB test) —
+        // proving the request was NOT rejected at the (absent) auth layer.
+        let resp = resp.assert_status(400);
+        assert!(
+            resp.text().contains("harvest runtime is not started"),
+            "expected the real handler's fail-closed error, got: {}",
+            resp.text()
         );
     }
 }

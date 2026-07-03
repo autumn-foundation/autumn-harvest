@@ -5544,54 +5544,68 @@ async fn get_workflow_result(
     workflow_result_pending_response()
 }
 
-/// Snapshot the result of `exec_id` using only DB reads (no LISTEN/NOTIFY),
-/// transparently following:
-/// 1. the workflow-level retry chain so a transient `FAILED` + retry successor
-///    is not surfaced as the final answer;
-/// 2. `ContinuedAsNew` → successor chains so callers get the final logical output.
+/// Resolve `exec_id` to the effective execution row by transparently
+/// following:
+/// 1. the workflow-level retry chain (issue #523) so a transient `FAILED` +
+///    retry successor is not surfaced as the final answer;
+/// 2. `ContinuedAsNew` → successor chains (issue #527) so callers get the
+///    row that actually carries the final logical output/error.
 ///
-/// Only a `NotFound` on a mid-chain successor row is swallowed (returns the last
-/// `ContinuedAsNew` sentinel rather than a confusing 404); all other errors
-/// propagate so callers see the 5xx.
-async fn workflow_result_snapshot_following_can(
+/// Only a `NotFound` on a mid-chain successor row is swallowed (returns the
+/// last-seen `CONTINUED_AS_NEW` row rather than a confusing 404); all other
+/// errors propagate so callers see the 5xx. Shared by the `/result` HTTP
+/// endpoint (issue #527) and the MCP `{wf}_status`/`{wf}_watch` tools (issue
+/// #597) so both surfaces resolve a continued-as-new chain identically.
+pub(crate) async fn resolve_terminal_workflow_execution(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
-) -> Result<WorkflowResult, AutumnError> {
-    use autumn_harvest::WorkflowResultState;
+) -> Result<WorkflowExecution, AutumnError> {
     let mut current_id = exec_id;
-    let mut last_can_snapshot: Option<WorkflowResult> = None;
+    let mut last_continued_as_new: Option<WorkflowExecution> = None;
     // Bound the chain walk so a pathological cycle can't loop forever.
     for _ in 0..128 {
         let execution = match load_execution_following_retries(api_state, current_id).await {
             Ok(e) => e,
             // Only swallow NotFound mid-chain (missing successor row).
-            Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-                return Ok(last_can_snapshot.unwrap());
+            Err(HarvestError::NotFound(_)) if last_continued_as_new.is_some() => {
+                return Ok(last_continued_as_new.unwrap());
             }
             Err(e) => return Err(map_error(e)),
         };
-        let snapshot = WorkflowResult::from_execution(&execution);
-        if snapshot.state != WorkflowResultState::ContinuedAsNew {
-            return Ok(snapshot);
+        if execution.state != "CONTINUED_AS_NEW" {
+            return Ok(execution);
         }
         // load_execution_following_retries may have advanced past current_id via
         // the retry chain; the ContinuedAsNew event lives on the effective
         // (retried) execution, so read history from its id, not current_id.
         let effective_id = ExecutionId::from_uuid(execution.id);
-        last_can_snapshot = Some(snapshot);
         match load_continue_as_new_successor(api_state, effective_id).await? {
-            Some(next_id) => current_id = next_id,
-            None => return Ok(last_can_snapshot.unwrap()),
+            Some(next_id) => {
+                current_id = next_id;
+                last_continued_as_new = Some(execution);
+            }
+            None => return Ok(execution),
         }
     }
     // Exceeded chain depth — return whatever state the current execution has.
     match load_execution_following_retries(api_state, current_id).await {
-        Ok(e) => Ok(WorkflowResult::from_execution(&e)),
-        Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-            Ok(last_can_snapshot.unwrap())
+        Ok(e) => Ok(e),
+        Err(HarvestError::NotFound(_)) if last_continued_as_new.is_some() => {
+            Ok(last_continued_as_new.unwrap())
         }
         Err(e) => Err(map_error(e)),
     }
+}
+
+/// Snapshot the result of `exec_id` using only DB reads (no LISTEN/NOTIFY),
+/// transparently following the retry and `ContinuedAsNew` chains via
+/// [`resolve_terminal_workflow_execution`].
+async fn workflow_result_snapshot_following_can(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<WorkflowResult, AutumnError> {
+    let execution = resolve_terminal_workflow_execution(api_state, exec_id).await?;
+    Ok(WorkflowResult::from_execution(&execution))
 }
 
 /// Load the effective execution for `exec_id` by following the workflow-level
