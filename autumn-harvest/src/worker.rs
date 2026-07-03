@@ -6235,15 +6235,23 @@ fn pre_suspension_event_count(commands: &[WorkflowCommand]) -> u64 {
             )
         })
         .count();
-    // Upper bound on the synthetic ActivityFailed events apply_race_loser_cancellations
-    // may append: at most one per losing activity branch, and only for a branch still
-    // open at cancellation time (an already-completed branch produces none). Counting
-    // every listed activity here can overcount but never undercount, so it only ever
-    // nudges the history hard-cap check earlier -- never masks a real overflow.
+    // Upper bound on the events apply_race_loser_cancellations may append: at most
+    // one synthetic ActivityFailed per losing activity branch still open at
+    // cancellation time (an already-completed branch produces none), plus at most
+    // one ChildWorkflowFailed appended onto *this* execution's own history per
+    // newly-cancelled losing child branch (every race child is an awaited child of
+    // this execution, so a genuine cancellation notifies this parent inline via
+    // notify_awaited_parent_of_child_terminal). Counting every listed activity/child
+    // here can overcount but never undercount, so it only ever nudges the history
+    // hard-cap check earlier -- never masks a real overflow.
     let race_cancel_events: usize = commands
         .iter()
         .filter_map(|cmd| match cmd {
-            WorkflowCommand::CancelRaceLosers { activities, .. } => Some(activities.len()),
+            WorkflowCommand::CancelRaceLosers {
+                activities,
+                children,
+                ..
+            } => Some(activities.len().saturating_add(children.len())),
             _ => None,
         })
         .sum();

@@ -4949,6 +4949,25 @@ impl WorkflowContext {
                     let child_id = dispatch
                         .child_id
                         .expect("child dispatch always carries a child_id");
+                    if dispatch.is_new {
+                        // Enforce the child-workflow input payload cap before
+                        // scheduling, mirroring spawn_child_workflow_raw's NoMatch
+                        // branch. ChildWorkflowStarted is written to the parent's
+                        // history via append_single_event (plain), so the offload
+                        // bypass must NOT apply here either.
+                        let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+                        if self.payload_max_workflow_input > 0
+                            && observed > self.payload_max_workflow_input
+                        {
+                            return Err(HarvestError::PayloadTooLarge {
+                                kind: PayloadKind::ChildWorkflowInput,
+                                observed_bytes: observed,
+                                cap_bytes: self.payload_max_workflow_input,
+                                workflow_type: self.workflow_name.clone(),
+                                activity_name: None,
+                            });
+                        }
+                    }
                     self.push_command(WorkflowCommand::StartChildWorkflow {
                         child_id,
                         workflow_name: workflow_name.clone(),
