@@ -460,7 +460,12 @@ async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
-        .max_size(4)
+        // Must comfortably exceed the largest `max_concurrent_workflows` any
+        // test in this file passes to `build_runtime_worker` (currently 16,
+        // for the 1-parent+10-children wall-clock fan-out test) -- otherwise
+        // genuinely-concurrent workflow tasks contend for pool checkouts
+        // instead of exercising real in-process parallelism.
+        .max_size(20)
         .build()
         .expect("failed to build test pool")
 }

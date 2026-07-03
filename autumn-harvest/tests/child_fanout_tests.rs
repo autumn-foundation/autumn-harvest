@@ -11,7 +11,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use autumn_harvest::context::WorkflowContext;
+use autumn_harvest::context::{WorkflowCommand, WorkflowContext};
+use autumn_harvest::error::{HarvestError, PayloadKind};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
 use autumn_harvest::types::ExecutionId;
@@ -701,4 +702,105 @@ async fn child_fan_out_typed_collect_all_returns_per_slot_results() {
             .unwrap_err()
             .contains("deliberate_failure")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Post-review hardening: all-or-nothing dispatch on payload-cap overflow
+// ---------------------------------------------------------------------------
+
+/// A fresh fan-out where one child's input exceeds the payload cap must fail
+/// with `PayloadTooLarge` *before dispatching any child* -- not leave earlier
+/// siblings' `StartChildWorkflow` commands sitting in the drained command
+/// list while the batch as a whole fails. Proves the dispatch is genuinely
+/// all-or-nothing: zero `StartChildWorkflow` commands are ever pushed, not a
+/// partial N-of-M count that would depend on `try_join_all`'s poll order.
+#[tokio::test]
+async fn child_fan_out_raw_oversized_child_rejects_before_dispatching_any_sibling() {
+    let exec_id = ExecutionId::new();
+    let history = vec![started()];
+
+    // max_workflow_input capped tiny (100 bytes); the small child fits, the
+    // second child's input does not.
+    let ctx = WorkflowContext::for_replay(exec_id, history).with_payload_caps(
+        1024 * 1024,
+        1024 * 1024,
+        1024 * 1024,
+        100,
+    );
+
+    let small = json!("small");
+    let oversized = json!({ "data": "x".repeat(1000) });
+
+    let result = ctx
+        .spawn_child_workflow_fan_out_raw(vec![
+            ("child_small".to_string(), small),
+            ("child_big".to_string(), oversized),
+        ])
+        .await;
+
+    match result {
+        Err(HarvestError::PayloadTooLarge { kind, .. }) => {
+            assert_eq!(kind, PayloadKind::ChildWorkflowInput);
+        }
+        other => panic!("expected PayloadTooLarge, got {other:?}"),
+    }
+
+    let commands = ctx.drain_commands();
+    let start_count = commands
+        .iter()
+        .filter(|c| matches!(c, WorkflowCommand::StartChildWorkflow { .. }))
+        .count();
+    assert_eq!(
+        start_count, 0,
+        "no child should have been dispatched when any sibling exceeds the payload cap; \
+         got: {commands:?}"
+    );
+}
+
+/// A fan-out group already fully recorded in history (both children
+/// `Matched`) must replay successfully even if `payload_max_workflow_input`
+/// has since been lowered below what one child's original input required --
+/// the payload pre-check must never re-run on replay, only on a fresh
+/// (first-time) dispatch, or a config change alone could make an
+/// already-completed execution fail non-deterministically on replay.
+#[tokio::test]
+async fn child_fan_out_raw_replay_ignores_current_payload_cap_for_already_recorded_children() {
+    let exec_id = ExecutionId::new();
+    let id_a = ExecutionId::new();
+    let id_b = ExecutionId::new();
+
+    // child_b's recorded input is 500 bytes -- would exceed a 100-byte cap
+    // if the pre-check ran on replay, but it must not.
+    let large_input = json!({ "data": "x".repeat(500) });
+
+    let history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(2u64),
+        },
+        child_started(id_a, "child_a", json!("small")),
+        child_started(id_b, "child_b", large_input.clone()),
+        child_completed(id_a, json!("result_a")),
+        child_completed(id_b, json!("result_b")),
+    ];
+
+    // Cap lowered to 100 bytes -- below child_b's recorded 500-byte input --
+    // simulating a config change made after the original run.
+    let ctx = WorkflowContext::for_replay(exec_id, history).with_payload_caps(
+        1024 * 1024,
+        1024 * 1024,
+        1024 * 1024,
+        100,
+    );
+
+    let results = ctx
+        .spawn_child_workflow_fan_out_raw(vec![
+            ("child_a".to_string(), json!("small")),
+            ("child_b".to_string(), large_input),
+        ])
+        .await
+        .expect("replay of an already-recorded fan-out must not re-validate the payload cap");
+
+    assert_eq!(results, vec![json!("result_a"), json!("result_b")]);
 }

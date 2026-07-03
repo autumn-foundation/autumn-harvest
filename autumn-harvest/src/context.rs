@@ -3945,12 +3945,15 @@ impl WorkflowContext {
     /// Record or verify the fan-out count in event history.
     ///
     /// On **live execution** (past end of history): pushes a `RecordMarker`
-    /// command so future replays can verify the collection length.
+    /// command so future replays can verify the collection length, and
+    /// returns `Ok(true)` — this is the very first time this fan-out group
+    /// has ever been dispatched, which callers use to gate one-time,
+    /// pre-dispatch validation that must never re-run on replay.
     ///
     /// On **replay**: matches the `MarkerRecorded` event and compares the
-    /// recorded count with the current count. Returns a
-    /// [`HarvestError::NonDeterministic`] when they differ.
-    fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<()> {
+    /// recorded count with the current count, returning `Ok(false)` on a
+    /// match. Returns a [`HarvestError::NonDeterministic`] when they differ.
+    fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
         let marker_result = self.match_history(|m| m.match_fan_out_marker(seq, count));
         match marker_result {
             HistoryMatch::NoMatch => {
@@ -3958,9 +3961,9 @@ impl WorkflowContext {
                     name: format!("fan_out:{seq}"),
                     details: Value::from(count as u64),
                 });
-                Ok(())
+                Ok(true)
             }
-            HistoryMatch::Matched { .. } => Ok(()),
+            HistoryMatch::Matched { .. } => Ok(false),
             HistoryMatch::Diverged {
                 expected,
                 actual,
@@ -4093,7 +4096,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -4161,7 +4164,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -4296,6 +4299,50 @@ impl WorkflowContext {
 
     // ── Fan-out / parallel child workflows (issue #601) ──────────────────
 
+    /// Validate every child's serialized input against the payload cap
+    /// *before any child is dispatched*, on a fresh (first-time) fan-out
+    /// dispatch only.
+    ///
+    /// Without this pre-check, `spawn_child_workflow_raw`'s own per-child
+    /// cap enforcement (checked lazily inside its `NoMatch` branch) could
+    /// let earlier children in the batch push their `StartChildWorkflow`
+    /// command and suspend before a later, oversized child aborts the
+    /// whole `try_join_all` with `PayloadTooLarge` — and the worker's
+    /// terminal-failure persistence path does not replay `StartChildWorkflow`
+    /// commands, so those earlier commands would be silently dropped,
+    /// leaving a persisted `fan_out:{n}` marker whose count doesn't match
+    /// its `ChildWorkflowStarted` count. Checking every input up front make
+    /// the dispatch all-or-nothing: either every child is scheduled, or
+    /// none are.
+    ///
+    /// Only run when `fresh_dispatch` is `true` (i.e. `check_fan_out_count`
+    /// just recorded a new marker) — a replayed fan-out group's children are
+    /// matched against already-recorded history and must never re-derive a
+    /// pass/fail verdict from the *current* `payload_max_workflow_input`,
+    /// which may have changed since the original run.
+    fn validate_child_payload_caps(
+        &self,
+        fresh_dispatch: bool,
+        children: &[(String, Value)],
+    ) -> HarvestResult<()> {
+        if !fresh_dispatch || self.payload_max_workflow_input == 0 {
+            return Ok(());
+        }
+        for (_, input) in children {
+            let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+            if observed > self.payload_max_workflow_input {
+                return Err(HarvestError::PayloadTooLarge {
+                    kind: PayloadKind::ChildWorkflowInput,
+                    observed_bytes: observed,
+                    cap_bytes: self.payload_max_workflow_input,
+                    workflow_type: self.workflow_name.clone(),
+                    activity_name: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Spawn N child workflows **in parallel** (fail-fast variant).
     ///
     /// Dispatches every `(workflow_name, input)` pair concurrently — all N
@@ -4327,8 +4374,15 @@ impl WorkflowContext {
     ///
     /// Checks `is_cancelled()` before dispatching. Returns
     /// [`HarvestError::Cancelled`] immediately when the workflow has been
-    /// cancelled. Cancellation after dispatch propagates to in-flight
-    /// children per the existing `ParentClosePolicy` semantics (issue #347).
+    /// cancelled. Fanned-out children are **awaited** (not detached), so
+    /// cancelling the parent after dispatch does **not** propagate to
+    /// already-in-flight children — `ParentClosePolicy` (issue #347) is a
+    /// detached-child mechanism only; an awaited child (fan-out or a plain
+    /// `spawn_child_workflow_raw` call) can outlive a cancelled or
+    /// terminated parent, exactly like today's single-child spawn. Use
+    /// [`spawn_child_workflow_detached_raw`](Self::spawn_child_workflow_detached_raw)
+    /// with an explicit `ParentClosePolicy` if children must be torn down
+    /// when the parent closes.
     ///
     /// # Errors
     ///
@@ -4350,7 +4404,8 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = children.len();
-        self.check_fan_out_count(seq, count)?;
+        let fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        self.validate_child_payload_caps(fresh_dispatch, &children)?;
 
         if children.is_empty() {
             return Ok(Vec::new());
@@ -4407,7 +4462,8 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = children.len();
-        self.check_fan_out_count(seq, count)?;
+        let fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        self.validate_child_payload_caps(fresh_dispatch, &children)?;
 
         if children.is_empty() {
             return Ok(Vec::new());
@@ -4418,7 +4474,15 @@ impl WorkflowContext {
             .map(|(workflow_name, input)| async move {
                 match self.spawn_child_workflow_raw(&workflow_name, input).await {
                     Ok(v) => Ok(Ok(v)),
-                    Err(e @ HarvestError::ActivityFailed { .. }) => Ok(Err(e.to_string())),
+                    // Mirrors the activity fan-out sibling's `ActivityFailed | Timeout`
+                    // classification for defensive symmetry. `spawn_child_workflow_raw`
+                    // cannot currently produce `Timeout` (its `HistoryMatch::TimedOut`
+                    // arm is `unreachable!()`), but matching it here means a future
+                    // child-level timeout path degrades to a per-slot failure instead
+                    // of silently reverting to aborting the whole collect-all batch.
+                    Err(
+                        e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
+                    ) => Ok(Err(e.to_string())),
                     Err(e) => Err(e),
                 }
             })
