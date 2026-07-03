@@ -22,6 +22,9 @@ pub mod workflow_reachability;
 #[cfg(feature = "webhooks")]
 pub mod webhook;
 
+#[cfg(feature = "mcp")]
+pub mod mcp_tools;
+
 pub use api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
     management_api_request_fields, management_api_response_fields, management_api_routes,

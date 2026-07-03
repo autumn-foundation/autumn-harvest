@@ -125,6 +125,20 @@ impl HarvestPlugin {
         self
     }
 
+    /// Register declarative update handlers produced by `autumn_harvest::updates!`.
+    #[must_use]
+    pub fn updates(mut self, updates: Vec<autumn_harvest::UpdateHandlerInfo>) -> Self {
+        self.builder = self.builder.updates(updates);
+        self
+    }
+
+    /// Register declarative query handlers produced by `autumn_harvest::queries!`.
+    #[must_use]
+    pub fn queries(mut self, queries: Vec<autumn_harvest::QueryHandlerInfo>) -> Self {
+        self.builder = self.builder.queries(queries);
+        self
+    }
+
     /// Register typed shared state visible to workflow and activity handlers.
     #[must_use]
     pub fn state<T: Any + Send + Sync>(mut self, value: T) -> Self {
@@ -1025,5 +1039,44 @@ mod tests {
             .expect("external mode should resolve a dedicated harvest pool");
 
         assert_eq!(harvest_pool.status().max_size, 10);
+    }
+
+    #[test]
+    fn harvest_plugin_forwards_updates_and_queries_to_builder() {
+        // Issue #597 gap-fill: #[update(..., mcp)] handlers must reach the
+        // builder through the plugin's fluent surface.
+        fn fake_update() -> autumn_harvest::UpdateHandlerInfo {
+            autumn_harvest::UpdateHandlerInfo {
+                name: "approve",
+                workflow: "echo",
+                module: "tests",
+                input_type_hint: "ApproveRequest",
+                output_type_hint: "bool",
+                has_validator: false,
+                handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
+                validator: None,
+                mcp: true,
+            }
+        }
+        fn fake_query() -> autumn_harvest::QueryHandlerInfo {
+            autumn_harvest::QueryHandlerInfo {
+                name: "progress",
+                workflow: "echo",
+                module: "tests",
+                input_type_hint: "()",
+                output_type_hint: "u64",
+                handler: |_ctx, _args| Ok(serde_json::Value::Null),
+            }
+        }
+
+        let plugin = HarvestPlugin::new()
+            .workflows(vec![fake_workflow_info()])
+            .updates(vec![fake_update()])
+            .queries(vec![fake_query()]);
+        assert_eq!(plugin.builder.update_handlers().len(), 1);
+        assert_eq!(plugin.builder.update_handlers()[0].name, "approve");
+        assert!(plugin.builder.update_handlers()[0].mcp);
+        assert_eq!(plugin.builder.query_handlers().len(), 1);
+        assert_eq!(plugin.builder.query_handlers()[0].name, "progress");
     }
 }

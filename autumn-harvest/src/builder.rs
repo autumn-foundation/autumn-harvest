@@ -785,6 +785,31 @@ impl HarvestBuilder {
         self
     }
 
+    /// Registered workflow metadata, in registration order.
+    ///
+    /// Used by the plugin's MCP tool generator (issue #597) to select
+    /// `mcp`-flagged workflows before the runtime starts.
+    #[must_use]
+    pub fn workflow_infos(&self) -> &[WorkflowInfo] {
+        &self.workflows
+    }
+
+    /// Registered declarative update handlers, in registration order.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::update_handlers`] (issue #597).
+    #[must_use]
+    pub fn update_handlers(&self) -> &[UpdateHandlerInfo] {
+        &self.update_handlers
+    }
+
+    /// Registered declarative query handlers, in registration order.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::query_handlers`] (issue #597).
+    #[must_use]
+    pub fn query_handlers(&self) -> &[QueryHandlerInfo] {
+        &self.query_handlers
+    }
+
     /// Register activity definitions (output of `activities![]` macro).
     ///
     /// The runtime maps activity tasks to these definitions for execution.
@@ -2307,6 +2332,18 @@ mod tests {
     fn harvest_builder_collects_workflows() {
         let builder = HarvestBuilder::new().workflows(vec![fake_workflow_info()]);
         assert_eq!(builder.workflow_count(), 1);
+    }
+
+    #[test]
+    fn workflow_infos_accessor_exposes_registered_infos_with_mcp_flag() {
+        // Issue #597: the plugin's MCP tool generator reads registered
+        // workflows (incl. the mcp flag) from the builder before startup.
+        let builder = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info(), fake_workflow_info().with_mcp()]);
+        let infos = builder.workflow_infos();
+        assert_eq!(infos.len(), 2);
+        assert!(!infos[0].mcp);
+        assert!(infos[1].mcp);
     }
 
     #[test]
