@@ -3828,6 +3828,21 @@ impl WorkflowContext {
         signal_name: &str,
         timeout: std::time::Duration,
     ) -> HarvestResult<Option<Value>> {
+        self.wait_for_signal_timeout_with_timer_id(signal_name, timeout)
+            .await
+            .map(|(value, _timer_id)| value)
+    }
+
+    /// Same race as [`Self::wait_for_signal_timeout`], but also returns the
+    /// deterministic durable timer ID the race armed. Used internally by
+    /// [`Self::race_timer_signal_impl`] (issue #600) to durably cancel the
+    /// losing timer branch when the signal wins, without re-deriving (and
+    /// thereby double-incrementing) the private `signal_timeout_seq` counter.
+    async fn wait_for_signal_timeout_with_timer_id(
+        &self,
+        signal_name: &str,
+        timeout: std::time::Duration,
+    ) -> HarvestResult<(Option<Value>, String)> {
         use crate::replay::SignalOrTimerMatch;
 
         // Deterministic timer ID: the counter increments on every call (live
@@ -3852,25 +3867,27 @@ impl WorkflowContext {
             m.match_signal_or_timer(signal_name, &timer_id, Some(duration_secs))
         });
 
-        match history_match {
-            SignalOrTimerMatch::SignalWon { payload } => Ok(Some(payload)),
+        let result = match history_match {
+            SignalOrTimerMatch::SignalWon { payload } => Some(payload),
             SignalOrTimerMatch::TimerWon => {
                 // Advance the virtual clock (same coupling as timer() above).
                 // Signal-won path advances nothing — no TimerStarted event recorded.
                 #[cfg(any(test, feature = "testing"))]
                 self.advance_timer_clock(duration_secs);
-                Ok(None)
+                None
             }
             SignalOrTimerMatch::Diverged {
                 expected,
                 actual,
                 event_index,
-            } => Err(self.nd_error(
-                format!("signal-or-timeout mismatch: expected {expected}, got {actual}"),
-                event_index,
-                Some(expected),
-                Some(actual),
-            )),
+            } => {
+                return Err(self.nd_error(
+                    format!("signal-or-timeout mismatch: expected {expected}, got {actual}"),
+                    event_index,
+                    Some(expected),
+                    Some(actual),
+                ));
+            }
             outcome @ (SignalOrTimerMatch::NoMatch | SignalOrTimerMatch::InProgress) => {
                 if matches!(outcome, SignalOrTimerMatch::NoMatch) {
                     self.check_strict_replay_no_match(&format!(
@@ -3911,9 +3928,10 @@ impl WorkflowContext {
                     signal_gone: false,
                     timer_gone: false,
                 }
-                .await
+                .await?
             }
-        }
+        };
+        Ok((result, timer_id))
     }
 
     /// Wait for a signal with a deadline and deserialize its payload into `O`.
@@ -5132,7 +5150,27 @@ impl WorkflowContext {
             .expect("validated by caller: exactly one timer branch");
 
         let timeout = std::time::Duration::from_secs(duration_secs);
-        let payload = self.wait_for_signal_timeout(&signal_name, timeout).await?;
+        let (payload, timer_id) = self
+            .wait_for_signal_timeout_with_timer_id(&signal_name, timeout)
+            .await?;
+        if payload.is_some() {
+            // Signal won: the durable timer row armed above is now a stale
+            // loser that would otherwise sit PENDING until its original
+            // deadline -- blocking retention (`harvest_timers.fired = false`
+            // rows keep an otherwise-terminal execution alive) and risking an
+            // unrelated stray `TimerFired` on a later wake. `CancelRaceLosers`
+            // already knows how to durably delete a losing timer row
+            // (mirroring the activity/child-workflow shapes' loser cleanup);
+            // reuse it here with no activities/children. Unlike those shapes
+            // this never appends an event, so it is safe to push on every
+            // resolution of this race, not just the first (there is no
+            // marker to gate on for this shape).
+            self.push_command(WorkflowCommand::CancelRaceLosers {
+                activities: Vec::new(),
+                children: Vec::new(),
+                timers: vec![TimerId::new(&timer_id)],
+            });
+        }
         Ok(payload.map_or_else(
             || RaceWinner {
                 index: TIMER_INDEX,
@@ -11762,6 +11800,19 @@ mod tests {
             "signal branch has the fixed role-based index 1"
         );
         assert_eq!(winner.value, serde_json::json!({"approved": true}));
+
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, children, timers }
+                    if activities.is_empty()
+                        && children.is_empty()
+                        && timers == &vec![TimerId::new(&timer_id)]
+            )),
+            "the now-stale still-armed timer must be queued for durable \
+             deletion so it doesn't block retention or fire later: {commands:?}"
+        );
         Ok(())
     }
 
@@ -11792,6 +11843,15 @@ mod tests {
             "timer branch has the fixed role-based index 0"
         );
         assert_eq!(winner.value, Value::Null);
+
+        let commands = ctx.drain_commands();
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::CancelRaceLosers { .. })),
+            "the timer already fired to win -- there is nothing to durably \
+             cancel, and the signal branch simply stays observable: {commands:?}"
+        );
         Ok(())
     }
 

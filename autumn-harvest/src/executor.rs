@@ -154,6 +154,7 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
 /// Inner body shared by [`run_workflow_strict`] and
 /// [`run_workflow_strict_advancing_clock`].  The caller builds the context
 /// (including any advancing-clock opt-in) and passes it here.
+#[allow(clippy::too_many_lines)]
 async fn run_strict_with_ctx(
     exec_id: ExecutionId,
     ctx: WorkflowContext,
@@ -202,10 +203,17 @@ async fn run_strict_with_ctx(
                     } else if ctx.drain_commands().into_iter().any(|cmd| {
                         // UpsertSearchAttributes and SetCurrentDetails are pure metadata
                         // and do not affect replay determinism; exclude from this check.
+                        // CancelRaceLosers is also excluded: for the timer+signal race
+                        // shape (issue #600) it is a pure, deterministic function of
+                        // already-resolved history (signal won -> cancel the now-stale
+                        // timer) with no marker to gate re-emission on, so replaying the
+                        // same complete history always reproduces it identically -- it
+                        // never introduces new, unaccounted-for information.
                         !matches!(
                             cmd,
                             WorkflowCommand::UpsertSearchAttributes { .. }
                                 | WorkflowCommand::SetCurrentDetails { .. }
+                                | WorkflowCommand::CancelRaceLosers { .. }
                         )
                     }) {
                         // New commands emitted after history was fully consumed (e.g. a
@@ -342,6 +350,7 @@ pub(crate) async fn run_workflow_canary(
                             cmd,
                             WorkflowCommand::UpsertSearchAttributes { .. }
                                 | WorkflowCommand::SetCurrentDetails { .. }
+                                | WorkflowCommand::CancelRaceLosers { .. }
                         )
                     }) {
                         let nd = ctx.take_nd_details().or_else(|| {
