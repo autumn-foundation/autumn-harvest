@@ -883,6 +883,80 @@ pub async fn cancel_open_tasks_for_execution(
     .map_err(crate::error::database_error)
 }
 
+/// Atomically cancel a single activity task row by its `activity_id`, iff it
+/// is still open (`PENDING`/`RUNNING`) — the loser-cancellation primitive for
+/// `ctx.race()` (issue #600).
+///
+/// Returns `Some((activity_name, queue_name))` if a still-open row was
+/// transitioned to `CANCELLED` (the caller should then record a synthetic
+/// terminal event for it so replay never re-observes it as in-progress, and
+/// can use the returned name/queue to record activity-outcome metrics);
+/// returns `None` if the row was already terminal by the time this ran (a
+/// genuine completion raced the cancellation) — the caller must **not**
+/// record a synthetic terminal in that case, since a real one already exists
+/// (or is about to be appended by the in-flight completion write).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) on
+/// update failure.
+pub async fn cancel_activity_task(
+    conn: &mut AsyncPgConnection,
+    activity_id: crate::types::ActivityExecId,
+) -> HarvestResult<Option<(String, String)>> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let cancelled = diesel::update(
+        dsl::harvest_task_queue
+            .filter(dsl::activity_id.eq(Some(activity_id.as_uuid())))
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    )
+    .set((
+        dsl::state.eq("CANCELLED"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::error.eq(Some("lost race to a sibling branch".to_string())),
+        dsl::heartbeat_details.eq(None::<serde_json::Value>),
+        dsl::completed_at.eq(Some(Utc::now())),
+    ))
+    .returning((dsl::activity_name, dsl::queue_name))
+    .get_result::<(Option<String>, String)>(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?;
+
+    Ok(cancelled.map(|(name, queue_name)| (name.unwrap_or_default(), queue_name)))
+}
+
+/// Delete a single still-pending durable timer row by its `timer_id`.
+///
+/// The loser-cancellation primitive for a losing timer branch of `ctx.race()`
+/// (issue #600). A no-op (returns `Ok(())`) if the timer has already fired
+/// (`fired = true`) or does not exist.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) on
+/// delete failure.
+pub async fn delete_pending_timer(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    timer_id: &crate::types::TimerId,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_timers::dsl;
+
+    diesel::delete(
+        dsl::harvest_timers
+            .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(dsl::timer_id.eq(timer_id.as_str()))
+            .filter(dsl::fired.eq(false)),
+    )
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    Ok(())
+}
+
 /// Count pending tasks per queue for observability / metrics.
 ///
 /// Returns one row per queue name (unseen queues are omitted). Only tasks in

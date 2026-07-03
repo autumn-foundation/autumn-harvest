@@ -36,7 +36,7 @@ let rule = rule_by_id("HVG001").unwrap();
 
 Since version 0.3.0, the `#[workflow]` attribute macro automatically scans the annotated function body at compile-time to enforce these guardrails:
 
-- **Hard Blockers** (`HVG001` through `HVG008`): Trigger compilation errors at the exact site of the violation, preventing the build from succeeding with unsafe code.
+- **Hard Blockers** (`HVG001` through `HVG008`, `HVG010`): Trigger compilation errors at the exact site of the violation, preventing the build from succeeding with unsafe code.
 - **Warnings** (`HVG009`): Emit standard deprecation compiler warnings (`note = "..."`) at the exact log macro site to encourage migration without breaking CI or blocking local development.
 
 ### Suppressing compile-time guardrails
@@ -306,6 +306,56 @@ These match the Temporal / Cadence / DBOS convention so existing log dashboards 
 #### Guardrail severity
 
 HVG009 is a **Warning** (not a HardBlocker): bare tracing calls do not break determinism or corrupt workflow state — they only amplify log volume. The rule is surfaced so authors can fix it without CI being blocked by a false positive.
+
+---
+
+### HVG010 — `tokio::select!` / `futures::select!` over ctx awaitables (HardBlocker)
+
+| | Example |
+|---|---|
+| **Disallowed** | `tokio::select! { r = ctx.timer("t", 60) => {}, s = ctx.wait_for_signal("approve") => {} }` |
+| **Disallowed** | `futures::select! { a = fut_a.fuse() => {}, b = fut_b.fuse() => {} }` |
+| **Allowed** | `ctx.race().timer(Duration::from_secs(60)).signal("approve").run().await?` |
+| **Allowed** | `ctx.race().activity_raw("fetch_a", input, "q").activity_raw("fetch_b", input, "q").run().await?` |
+
+Harvest already sanctions `futures::join!`/`futures::try_join!` for wait-**all** concurrency (see HVG005 above: "Harvest records each branch's result durably and re-joins them correctly on replay"). There is no equivalent sanction for wait-**first** — `select!` is a double footgun in a replay engine:
+
+1. **Non-deterministic winner.** The branch that wins depends on poll/arrival order on whichever worker happens to be replaying. A replayed history can pick a *different* branch than the original live run and diverge, since `select!` has no durable record of which branch actually completed first.
+2. **No durable cancellation of the losers.** Dropping the losing branches' futures does not durably cancel the underlying work: a scheduled activity keeps running to completion on its worker (and its eventual `ActivityCompleted`/`ActivityFailed` event lands in history unconsumed), and a durable timer row in `harvest_timers` stays live indefinitely.
+
+`ctx.race()` (issue #600) is the deterministic alternative: it records the winning branch via the existing `MarkerRecorded` event (no new `WorkflowEvent` variant — the same idiom `execute_activity_fan_out` already uses for its count marker), so replay always resolves the identical winner, and it durably cancels every losing branch — a still-open activity's task row is cancelled and a synthetic terminal is recorded, a losing child workflow is cancelled via the same primitive `ctx.request_cancel_external_workflow` uses, and a losing durable timer row is removed.
+
+**Migration example:**
+
+```rust
+// Before — non-deterministic winner, losers leak
+#[workflow]
+async fn hedge_providers(ctx: &WorkflowContext, req: Value) -> Result<Value, String> {
+    tokio::select! {                                            // ← HVG010
+        a = ctx.execute_activity_raw("fetch_primary", req.clone(), "default") => a.map_err(|e| e.to_string()),
+        b = ctx.execute_activity_raw("fetch_fallback", req, "default") => b.map_err(|e| e.to_string()),
+    }
+}
+
+// After — deterministic winner, loser durably cancelled
+#[workflow]
+async fn hedge_providers(ctx: &WorkflowContext, req: Value) -> Result<Value, String> {
+    let winner = ctx
+        .race()
+        .activity_raw("fetch_primary", req.clone(), "default")
+        .activity_raw("fetch_fallback", req, "default")
+        .run()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(winner.value)
+}
+```
+
+`ctx.race()` currently supports three shapes in one call: a homogeneous race of activity branches, a homogeneous race of child-workflow branches, or exactly one timer branch paired with exactly one signal branch (a thin wrapper over `receive_signal_timeout`/`wait_for_signal_timeout`, issue #476). Mixing branch kinds (e.g. an activity racing a timer in the same call) is out of scope for this slice and returns `HarvestError::Config` — bound an individual activity with its own `start_to_close`/`schedule_to_close` timeout, or compose a separate `receive_signal_timeout`, to express a deadline-bounded branch instead. See the `WorkflowContext::race` rustdoc for the full determinism contract.
+
+#### Guardrail severity
+
+HVG010 is a **HardBlocker**: an unguarded `select!` over ctx-managed awaitables can silently diverge a replay or leak in-flight activities/timers, both of which are worse than a build failure.
 
 ---
 
