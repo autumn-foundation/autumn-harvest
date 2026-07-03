@@ -140,7 +140,10 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #534: origin column + per-schedule run-history index.
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
-    include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql")
+    include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
+    "\n",
+    // issue #604: target_build_id/ramp_percent columns on harvest_build_policies.
+    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -208,6 +211,9 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS retry_policy JSONB NULL;\n",
     // issue #534: the modern start path inserts origin.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS origin TEXT NULL;\n",
+    // issue #604: get_build_policy/set_build_policy always select target_build_id/ramp_percent.
+    "ALTER TABLE harvest_build_policies ADD COLUMN IF NOT EXISTS target_build_id TEXT NULL;\n",
+    "ALTER TABLE harvest_build_policies ADD COLUMN IF NOT EXISTS ramp_percent INTEGER NULL;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return
