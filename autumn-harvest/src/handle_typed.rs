@@ -246,3 +246,20 @@ pub struct TypedSignalWithStartOptions {
     /// without terminating it. Overrides `WorkflowInfo::sla`; clamped to `execution_timeout`.
     pub sla: Option<Duration>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    #[test]
+    fn typed_handle_is_send_sync() {
+        // Assert thread-safety of TypedWorkflowHandle regardless of T.
+        // T=std::rc::Rc<()> is deliberately neither Send nor Sync.
+        fn is_send<T: Send>() {}
+        fn is_sync<T: Sync>() {}
+
+        is_send::<TypedWorkflowHandle<Rc<()>>>();
+        is_sync::<TypedWorkflowHandle<Rc<()>>>();
+    }
+}
