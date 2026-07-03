@@ -759,21 +759,36 @@ impl RaceWinner {
 pub struct RaceBuilder<'a> {
     ctx: &'a WorkflowContext,
     branches: Vec<RaceBranch>,
+    /// First serialization failure encountered while building branches
+    /// (`.activity`/`.child_workflow`), surfaced by [`Self::run`] instead of
+    /// silently degrading the branch's input to `Value::Null`.
+    pending_error: Option<HarvestError>,
 }
 
 impl RaceBuilder<'_> {
+    fn fail(mut self, err: HarvestError) -> Self {
+        if self.pending_error.is_none() {
+            self.pending_error = Some(err);
+        }
+        self
+    }
+
     /// Add a typed activity branch, using `info`'s registered queue/retry/timeout defaults.
     #[must_use]
     pub fn activity<I: serde::Serialize>(self, info: &crate::info::ActivityInfo, input: I) -> Self {
-        let json_input = serde_json::to_value(input).unwrap_or(Value::Null);
-        let queue = info.default_queue.unwrap_or("default").to_string();
-        self.push(RaceBranchKind::Activity {
-            name: info.name.to_string(),
-            input: json_input,
-            queue,
-            retry: info.default_retry_policy.clone(),
-            start_to_close: info.default_start_to_close,
-        })
+        match serde_json::to_value(input) {
+            Ok(json_input) => {
+                let queue = info.default_queue.unwrap_or("default").to_string();
+                self.push(RaceBranchKind::Activity {
+                    name: info.name.to_string(),
+                    input: json_input,
+                    queue,
+                    retry: info.default_retry_policy.clone(),
+                    start_to_close: info.default_start_to_close,
+                })
+            }
+            Err(err) => self.fail(err.into()),
+        }
     }
 
     /// Add an untyped activity branch by name.
@@ -795,10 +810,10 @@ impl RaceBuilder<'_> {
         info: &crate::info::WorkflowInfo,
         input: I,
     ) -> Self {
-        self.child_workflow_raw(
-            info.name,
-            serde_json::to_value(input).unwrap_or(Value::Null),
-        )
+        match serde_json::to_value(input) {
+            Ok(json_input) => self.child_workflow_raw(info.name, json_input),
+            Err(err) => self.fail(err.into()),
+        }
     }
 
     /// Add an untyped child-workflow branch by name.
@@ -849,6 +864,10 @@ impl RaceBuilder<'_> {
     ///
     /// # Errors
     ///
+    /// - [`HarvestError::Serialization`] if a typed [`Self::activity`] or
+    ///   [`Self::child_workflow`] branch's input could not be serialized
+    ///   (surfaced here rather than silently running the branch with a
+    ///   `null` input).
     /// - [`HarvestError::Config`] if zero branches were added, or if the
     ///   branch kinds don't form one of the three supported shapes (see the
     ///   type-level docs).
@@ -857,6 +876,9 @@ impl RaceBuilder<'_> {
     ///   previously recorded winner or branch count.
     /// - Whatever error the winning branch itself failed with.
     pub async fn run(self) -> HarvestResult<RaceWinner> {
+        if let Some(err) = self.pending_error {
+            return Err(err);
+        }
         self.ctx.race_impl(self.branches).await
     }
 }
@@ -4644,6 +4666,7 @@ impl WorkflowContext {
         RaceBuilder {
             ctx: self,
             branches: Vec::new(),
+            pending_error: None,
         }
     }
 
@@ -11294,6 +11317,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HarvestError::Config(_)));
+    }
+
+    struct FailsToSerialize;
+
+    impl serde::Serialize for FailsToSerialize {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "intentional serialization failure",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn race_activity_branch_propagates_serialization_error() {
+        let ctx = WorkflowContext::new_test();
+        let info = make_activity_info("fetch_a", false);
+        let err = ctx
+            .race()
+            .activity(&info, FailsToSerialize)
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HarvestError::Serialization(_)),
+            "expected Serialization error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn race_child_workflow_branch_propagates_serialization_error() {
+        let ctx = WorkflowContext::new_test();
+        let info = make_workflow_info("child_wf");
+        let err = ctx
+            .race()
+            .child_workflow(&info, FailsToSerialize)
+            .run()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HarvestError::Serialization(_)),
+            "expected Serialization error, got {err:?}"
+        );
     }
 
     #[tokio::test]

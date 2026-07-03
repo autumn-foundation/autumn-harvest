@@ -5253,19 +5253,34 @@ async fn apply_race_loser_cancellations(
                             &queue_name,
                             WorkflowStatus::Cancelled,
                         );
+                        // A race child is always an *awaited* child of this very
+                        // execution (parent_id = exec_id, parent_close_policy =
+                        // None), so a genuine (newly-cancelled) cancellation here
+                        // runs `notify_awaited_parent_of_child_terminal` inside the
+                        // same transaction, which appends a `ChildWorkflowFailed`
+                        // event onto *our own* history via a self-computed id.
+                        // Advance the cursor so the winner marker / terminal-
+                        // outcome append that follows doesn't collide with it.
+                        *next_event_id = next_event_id.saturating_add(1);
                     }
                 }
+                Err(HarvestError::NotFound(_) | HarvestError::Config(_)) => {
+                    // Benign no-op: the child is already gone, or already reached
+                    // some other terminal state on its own (it also finished,
+                    // just wasn't the winner) -- nothing to durably cancel, and no
+                    // event was appended to our history.
+                }
                 Err(err) => {
-                    // Best-effort cleanup: a losing child that already reached
-                    // some other terminal state (it also finished, just wasn't
-                    // the winner) must never abort persisting the race's own,
-                    // already-decided outcome.
-                    tracing::warn!(
-                        child_id = %child_id,
-                        exec_id = %exec_id,
-                        err = %err,
-                        "ctx.race(): failed to cancel a losing child-workflow branch"
-                    );
+                    // A real persistence failure must not be swallowed here:
+                    // CancelRaceLosers is pushed exactly once, on the single
+                    // cycle the winner marker is first recorded, and is never
+                    // re-emitted on later replays (settle_race only re-verifies
+                    // an already-recorded winner from then on). Silently
+                    // continuing would leave this losing child running forever
+                    // with no future chance to be cancelled. Propagate so the
+                    // whole transaction rolls back and the next attempt
+                    // re-derives and retries the cancellation.
+                    return Err(err);
                 }
             }
         }
