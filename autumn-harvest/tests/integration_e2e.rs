@@ -3064,6 +3064,82 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
 /// fanned out complete together, not one full round trip at a time" -- does
 /// not depend on the exact numbers; only the "all 10 completed" assertion
 /// is meant to be load-bearing on constrained hardware.
+/// Polls for the given execution to reach `COMPLETED`, exactly like
+/// [`wait_for_execution_state_with_timeout`], but on timeout dumps a full
+/// snapshot of the parent's and every child's execution row plus task queue
+/// row(s) into the panic message instead of the bare `Elapsed(())`.
+///
+/// This test (`worker_completes_ten_child_fan_out_within_wall_clock_bound`)
+/// failed on CI five consecutive times across several confirmed, distinct
+/// dropped-wake fixes (PR #901 review rounds 2-4); if a sixth failure occurs
+/// after all of those fixes, this snapshot is the fastest way to tell a
+/// genuinely-stuck row (`state=RUNNING`, `worker_id=NULL`, i.e. parked
+/// forever) apart from mere CI slowness (`state=PENDING`, still waiting for
+/// a worker slot) without needing an interactive debugger against a
+/// Docker-less sandbox.
+async fn wait_for_completion_with_diagnostics(
+    database_url: &str,
+    parent_exec_id: ExecutionId,
+    timeout: Duration,
+) -> WorkflowExecution {
+    let start = std::time::Instant::now();
+    loop {
+        let execution = load_execution_from_url(database_url, parent_exec_id).await;
+        if execution.state == "COMPLETED" {
+            return execution;
+        }
+        if start.elapsed() >= timeout {
+            let parent_tasks = load_tasks_for_execution_from_url(database_url, parent_exec_id)
+                .await
+                .into_iter()
+                .map(|t| {
+                    format!(
+                        "    task={} state={} worker_id={:?} started_at={:?} \
+                         scheduled_at={} wake_requested={}",
+                        t.id, t.state, t.worker_id, t.started_at, t.scheduled_at, t.wake_requested
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let children = load_child_executions_from_url(database_url, parent_exec_id).await;
+            let child_report = {
+                let mut lines = Vec::new();
+                for child in &children {
+                    let child_exec_id = ExecutionId::from_uuid(child.id);
+                    let child_tasks =
+                        load_tasks_for_execution_from_url(database_url, child_exec_id).await;
+                    lines.push(format!(
+                        "  child={} name={} state={}",
+                        child.id, child.workflow_name, child.state
+                    ));
+                    for t in &child_tasks {
+                        lines.push(format!(
+                            "    task={} state={} worker_id={:?} started_at={:?} \
+                             scheduled_at={} wake_requested={}",
+                            t.id,
+                            t.state,
+                            t.worker_id,
+                            t.started_at,
+                            t.scheduled_at,
+                            t.wake_requested
+                        ));
+                    }
+                }
+                lines.join("\n")
+            };
+            panic!(
+                "execution {parent_exec_id} did not reach COMPLETED within {timeout:?} \
+                 (currently: {}).\n\
+                 parent task queue rows:\n{parent_tasks}\n\
+                 children ({} of expected 10 recorded):\n{child_report}",
+                execution.state,
+                children.len(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -3087,10 +3163,9 @@ async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     let handle = spawn_test_worker(Arc::clone(&worker), pool);
 
     let start = std::time::Instant::now();
-    let parent_execution = wait_for_execution_state_with_timeout(
+    let parent_execution = wait_for_completion_with_diagnostics(
         &database_url,
         parent_exec_id,
-        "COMPLETED",
         Duration::from_secs(90),
     )
     .await;
