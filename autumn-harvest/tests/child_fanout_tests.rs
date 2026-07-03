@@ -810,15 +810,24 @@ async fn child_fan_out_raw_replay_ignores_current_payload_cap_for_already_record
 /// A workflow that catches a fan-out's `PayloadTooLarge` (a normal,
 /// supported "degrade gracefully" pattern -- the caller can `match`/`map_err`
 /// on the returned `HarvestResult` instead of propagating with `?`) and then
-/// runs a *second*, successful fan-out must not have "burned" a `fan_out`
-/// sequence number on the failed attempt. If it did, the second (successful)
-/// fan-out would record `fan_out:2` instead of `fan_out:1` -- and on a
-/// later replay, the *first* call (fresh counter, seq=1 again) would find
-/// `MarkerRecorded(fan_out:2)` sitting at the cursor instead of the
-/// `fan_out:1` marker it expects, diverging as `NonDeterministic` before it
-/// can even reproduce the caught `PayloadTooLarge`.
+/// runs a *second*, successful fan-out must have the second call's marker
+/// number stay one past the first, even though the first call recorded no
+/// marker at all.
+///
+/// This looks unintuitive but is deliberate: an earlier revision tried
+/// *releasing* the failed call's number so the second call could reuse it.
+/// That is a **worse** bug -- it lets an unrelated fan-out call site inherit
+/// another call's number, so a later replay of the *first* call could match
+/// against the *second* call's marker/count (or, in the collect-all-error
+/// case, its recorded children), silently misattributing unrelated data
+/// instead of cleanly diverging. Burning the number instead produces an
+/// honest "expected `fan_out:1`, got `fan_out:2`" divergence on replay -- which
+/// still doesn't gracefully reproduce the caught error (that's the same
+/// broader, pre-existing engine limitation documented on
+/// `known_limitation_early_config_dependent_failure_does_not_replay_cleanly`,
+/// `tests/replayer_tests.rs`), but it is never silently wrong.
 #[tokio::test]
-async fn child_fan_out_raw_releases_seq_on_validation_failure_so_next_fan_out_reuses_it() {
+async fn child_fan_out_raw_burns_seq_on_validation_failure_so_next_fan_out_never_reuses_it() {
     let exec_id = ExecutionId::new();
     let history = vec![started()];
 
@@ -830,8 +839,7 @@ async fn child_fan_out_raw_releases_seq_on_validation_failure_so_next_fan_out_re
     );
 
     // First fan-out: one child exceeds the 100-byte cap -- fails before any
-    // marker is recorded (and, after this fix, before any seq number is
-    // permanently consumed).
+    // marker is recorded, but its sequence number (1) must still be burned.
     let oversized = json!({ "data": "x".repeat(1000) });
     let first = ctx
         .spawn_child_workflow_fan_out_raw(vec![("child_big".to_string(), oversized)])
@@ -845,9 +853,8 @@ async fn child_fan_out_raw_releases_seq_on_validation_failure_so_next_fan_out_re
     // test resolves the child's oneshot, so the call suspends forever
     // waiting on it -- confirmed via a short outer timeout. What matters is
     // the SYNCHRONOUS prefix (peek/validate/record) that runs before that
-    // await point: the marker it records must be "fan_out:1", not
-    // "fan_out:2" -- the failed first attempt must not have consumed a
-    // sequence number.
+    // await point: the marker it records must be "fan_out:2" (seq 1 was
+    // burned by the failed first call, never reused).
     let second = tokio::time::timeout(
         std::time::Duration::from_millis(50),
         ctx.spawn_child_workflow_fan_out_raw(vec![("child_small".to_string(), json!("small"))]),
@@ -871,9 +878,10 @@ async fn child_fan_out_raw_releases_seq_on_validation_failure_so_next_fan_out_re
         .collect();
     assert_eq!(
         marker_names,
-        vec!["fan_out:1".to_string()],
-        "the second (successful) fan-out must reuse seq 1 -- the failed \
-         first attempt released it instead of permanently burning it; got \
-         markers: {marker_names:?}, all commands: {commands:?}"
+        vec!["fan_out:2".to_string()],
+        "the second (successful) fan-out must NOT reuse seq 1 -- the \
+         failed first attempt must permanently burn it so no later fan-out \
+         call site can ever be confused with it; got markers: \
+         {marker_names:?}, all commands: {commands:?}"
     );
 }

@@ -3936,38 +3936,27 @@ impl WorkflowContext {
     // ── Fan-out / parallel activities (issue #359) ───────────────────────────
 
     /// Generate the next fan-out sequence number for marker naming.
+    ///
+    /// **Numbers are never given back, even if the call that allocated one
+    /// goes on to fail before recording a marker** (e.g. a fresh dispatch's
+    /// payload-cap validation fails, or the workflow catches a fan-out
+    /// error and runs another fan-out). An earlier revision tried releasing
+    /// and reusing the number in that case; that let a *different*,
+    /// unrelated fan-out call site inherit the failed call's number, so on
+    /// replay the failed call's `peek_fan_out_count` could match against
+    /// the *other* call's marker/count (or even, in the collect-all-error
+    /// case, its recorded children) — a **silent misattribution**, strictly
+    /// worse than the plain "expected `fan_out:N`, got `fan_out:M`" divergence
+    /// burning the number produces. A caught-and-continued fan-out failure
+    /// simply not replaying cleanly is an accepted instance of the broader,
+    /// pre-existing, engine-wide limitation documented on
+    /// `known_limitation_early_config_dependent_failure_does_not_replay_cleanly`
+    /// (`tests/replayer_tests.rs`) — not something a numbering trick should
+    /// try to paper over.
     fn next_fan_out_seq(&self) -> u32 {
         let mut seq = self.fan_out_seq.lock().expect("fan_out_seq lock poisoned");
         *seq += 1;
         *seq
-    }
-
-    /// Undo a `next_fan_out_seq()` allocation for a fan-out group that will
-    /// never leave a footprint in history (a fresh-dispatch validation
-    /// failure discovered *before* the marker was recorded — see
-    /// `peek_fan_out_count`/`record_fan_out_marker`/
-    /// `validate_child_payload_caps`).
-    ///
-    /// Without this, a workflow that catches a fan-out's validation error
-    /// (e.g. `PayloadTooLarge`) and goes on to run *another* fan-out in the
-    /// same execution would have already consumed a sequence number for the
-    /// failed group with no marker ever recorded for it — the next
-    /// successful fan-out then records a marker one number ahead of what a
-    /// fresh replay derives, and replay diverges hunting for the skipped
-    /// number's marker before it can even reproduce the caught error.
-    ///
-    /// Safe only because nothing yields control between `next_fan_out_seq()`
-    /// and this call within one fan-out method — no sibling fan-out call
-    /// (sequential or concurrently joined) can have advanced the counter
-    /// further in the interim, so `seq` is always still the most recently
-    /// allocated number when this runs. The equality check is a defensive
-    /// no-op guard against that invariant rather than a documented
-    /// possibility of it being violated.
-    fn release_fan_out_seq(&self, seq: u32) {
-        let mut current = self.fan_out_seq.lock().expect("fan_out_seq lock poisoned");
-        if *current == seq {
-            *current -= 1;
-        }
     }
 
     /// Record or verify the fan-out count in event history.
@@ -4469,19 +4458,8 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = children.len();
-        let fresh_dispatch = match self.peek_fan_out_count(seq, count) {
-            Ok(fresh) => fresh,
-            Err(e) => {
-                self.release_fan_out_seq(seq);
-                return Err(e);
-            }
-        };
-        if let Err(e) = self.validate_child_payload_caps(fresh_dispatch, &children) {
-            if fresh_dispatch {
-                self.release_fan_out_seq(seq);
-            }
-            return Err(e);
-        }
+        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
+        self.validate_child_payload_caps(fresh_dispatch, &children)?;
         if fresh_dispatch {
             self.record_fan_out_marker(seq, count);
         }
@@ -4541,19 +4519,8 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = children.len();
-        let fresh_dispatch = match self.peek_fan_out_count(seq, count) {
-            Ok(fresh) => fresh,
-            Err(e) => {
-                self.release_fan_out_seq(seq);
-                return Err(e);
-            }
-        };
-        if let Err(e) = self.validate_child_payload_caps(fresh_dispatch, &children) {
-            if fresh_dispatch {
-                self.release_fan_out_seq(seq);
-            }
-            return Err(e);
-        }
+        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
+        self.validate_child_payload_caps(fresh_dispatch, &children)?;
         if fresh_dispatch {
             self.record_fan_out_marker(seq, count);
         }
