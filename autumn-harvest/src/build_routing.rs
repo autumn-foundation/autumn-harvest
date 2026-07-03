@@ -36,7 +36,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::error::{HarvestResult, database_error};
+use crate::error::{HarvestError, HarvestResult, database_error};
+use crate::types::ExecutionId;
 
 // ── BuildCompatibilitySet ─────────────────────────────────────────────────────
 
@@ -118,6 +119,12 @@ impl BuildCompatibilitySet {
 /// New workflow executions started on `queue_name` receive
 /// `assigned_build_id = build_id`. This does **not** affect existing
 /// in-flight executions; those keep whatever build they were started with.
+///
+/// ## Percentage ramp (issue #604)
+///
+/// `target_build_id` + `ramp_percent` optionally ramp a slice of new starts
+/// to a second build while the rest continue to `build_id`. See
+/// [`BuildPolicy::resolve_assigned_build`] for the decision rule.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BuildPolicy {
     pub id: Uuid,
@@ -126,6 +133,77 @@ pub struct BuildPolicy {
     pub deployment_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Ramp target build. `None` = no ramp configured (100% `build_id`).
+    #[serde(default)]
+    pub target_build_id: Option<String>,
+    /// Ramp percentage in `0..=100`. `0` = no traffic to the target, `100` =
+    /// full cutover. `None` = no ramp configured.
+    #[serde(default)]
+    pub ramp_percent: Option<i32>,
+}
+
+/// Domain separator for the ramp-decision hash, so it is decoupled from the
+/// shard-router rendezvous hash and the scheduler jitter hash even though all
+/// three use `seahash` over a fixed byte layout.
+const RAMP_HASH_DOMAIN_SEP: &[u8] = b"harvest_build_ramp:";
+
+/// Deterministic bucket in `0..100` for `exec_id`, used to decide ramp membership.
+///
+/// Pure function of `exec_id` — the same execution always maps to the same
+/// bucket, on every process and every retry (issue #604 AC3).
+#[must_use]
+pub fn ramp_bucket(exec_id: ExecutionId) -> u8 {
+    let uuid = exec_id.as_uuid();
+    let mut bytes = [0u8; RAMP_HASH_DOMAIN_SEP.len() + 16];
+    bytes[..RAMP_HASH_DOMAIN_SEP.len()].copy_from_slice(RAMP_HASH_DOMAIN_SEP);
+    bytes[RAMP_HASH_DOMAIN_SEP.len()..].copy_from_slice(uuid.as_bytes());
+    let hash = seahash::hash(&bytes);
+    // hash % 100 always fits in u8 (0..=99).
+    u8::try_from(hash % 100).unwrap_or(0)
+}
+
+/// Validate a ramp percentage: must be in `0..=100`.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Config` when `percent` is outside `0..=100`.
+pub fn validate_ramp_percent(percent: i32) -> HarvestResult<()> {
+    if (0..=100).contains(&percent) {
+        Ok(())
+    } else {
+        Err(HarvestError::Config(format!(
+            "ramp_percent must be between 0 and 100, got {percent}"
+        )))
+    }
+}
+
+impl BuildPolicy {
+    /// Resolve the `assigned_build_id` for a fresh workflow start under this
+    /// policy's ramp configuration.
+    ///
+    /// Returns `target_build_id` for approximately `ramp_percent`% of
+    /// `exec_id` values and `build_id` otherwise. The decision is a pure,
+    /// deterministic function of `exec_id` (via [`ramp_bucket`]) so an
+    /// outbox/start retry for the same execution never flips its build
+    /// (issue #604 AC3), and in-flight executions are never re-routed since
+    /// this is only ever called once, at start time.
+    ///
+    /// `ramp_percent = None` or `Some(0)`, or `target_build_id = None`, all
+    /// resolve to `build_id` — clearing either field alone is enough to stop
+    /// new starts from reaching the target (AC6).
+    #[must_use]
+    pub fn resolve_assigned_build(&self, exec_id: ExecutionId) -> String {
+        match (&self.target_build_id, self.ramp_percent) {
+            (Some(target), Some(percent)) if percent > 0 => {
+                let percent = u8::try_from(percent.clamp(0, 100)).unwrap_or(100);
+                if ramp_bucket(exec_id) < percent {
+                    return target.clone();
+                }
+                self.build_id.clone()
+            }
+            _ => self.build_id.clone(),
+        }
+    }
 }
 
 /// A single row in `harvest_build_compat`.
@@ -176,37 +254,72 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 ///
 /// Returns `HarvestError::Database` on failure.
 #[cfg(feature = "db")]
+#[derive(diesel::QueryableByName, Debug)]
+struct BuildPolicyRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    queue_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    build_id: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    deployment_name: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    created_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    updated_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    target_build_id: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    ramp_percent: Option<i32>,
+}
+
+#[cfg(feature = "db")]
+const BUILD_POLICY_COLUMNS: &str = "id, queue_name, build_id, deployment_name, created_at, \
+     updated_at, target_build_id, ramp_percent";
+
+#[cfg(feature = "db")]
+impl From<BuildPolicyRow> for BuildPolicy {
+    fn from(r: BuildPolicyRow) -> Self {
+        Self {
+            id: r.id,
+            queue_name: r.queue_name,
+            build_id: r.build_id,
+            deployment_name: r.deployment_name,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            target_build_id: r.target_build_id,
+            ramp_percent: r.ramp_percent,
+        }
+    }
+}
+
+/// Upsert the active build policy for a queue.
+///
+/// After this call, new workflow executions started on `queue_name` will have
+/// `assigned_build_id = build_id` and task queue entries will carry
+/// `required_build_id = build_id`. Existing in-flight executions are not
+/// affected.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on failure.
+#[cfg(feature = "db")]
 pub async fn set_build_policy(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
     build_id: &str,
     deployment_name: Option<&str>,
 ) -> HarvestResult<BuildPolicy> {
-    #[derive(diesel::QueryableByName, Debug)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        id: Uuid,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        queue_name: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        build_id: String,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        deployment_name: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        created_at: DateTime<Utc>,
-        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        updated_at: DateTime<Utc>,
-    }
-
-    let rows: Vec<Row> = diesel::sql_query(
+    let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
         "INSERT INTO harvest_build_policies (id, queue_name, build_id, deployment_name) \
          VALUES ($1, $2, $3, $4) \
          ON CONFLICT (queue_name) DO UPDATE \
              SET build_id = EXCLUDED.build_id, \
                  deployment_name = EXCLUDED.deployment_name, \
                  updated_at = NOW() \
-         RETURNING id, queue_name, build_id, deployment_name, created_at, updated_at",
-    )
+         RETURNING {BUILD_POLICY_COLUMNS}"
+    ))
     .bind::<diesel::sql_types::Uuid, _>(Uuid::new_v4())
     .bind::<diesel::sql_types::Text, _>(queue_name)
     .bind::<diesel::sql_types::Text, _>(build_id)
@@ -217,14 +330,7 @@ pub async fn set_build_policy(
 
     rows.into_iter()
         .next()
-        .map(|r| BuildPolicy {
-            id: r.id,
-            queue_name: r.queue_name,
-            build_id: r.build_id,
-            deployment_name: r.deployment_name,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-        })
+        .map(BuildPolicy::from)
         .ok_or_else(|| database_error("set_build_policy: no row returned"))
 }
 
@@ -241,40 +347,17 @@ pub async fn get_build_policy(
     conn: &mut AsyncPgConnection,
     queue_name: &str,
 ) -> HarvestResult<Option<BuildPolicy>> {
-    #[derive(diesel::QueryableByName, Debug)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        id: Uuid,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        queue_name: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        build_id: String,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        deployment_name: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        created_at: DateTime<Utc>,
-        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        updated_at: DateTime<Utc>,
-    }
-
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT id, queue_name, build_id, deployment_name, created_at, updated_at \
+    let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
+        "SELECT {BUILD_POLICY_COLUMNS} \
          FROM harvest_build_policies \
-         WHERE queue_name = $1",
-    )
+         WHERE queue_name = $1"
+    ))
     .bind::<diesel::sql_types::Text, _>(queue_name)
     .load(conn)
     .await
     .map_err(database_error)?;
 
-    Ok(rows.into_iter().next().map(|r| BuildPolicy {
-        id: r.id,
-        queue_name: r.queue_name,
-        build_id: r.build_id,
-        deployment_name: r.deployment_name,
-        created_at: r.created_at,
-        updated_at: r.updated_at,
-    }))
+    Ok(rows.into_iter().next().map(BuildPolicy::from))
 }
 
 /// List all registered build policies across all queues.
@@ -284,42 +367,89 @@ pub async fn get_build_policy(
 /// Returns `HarvestError::Database` on failure.
 #[cfg(feature = "db")]
 pub async fn list_build_policies(conn: &mut AsyncPgConnection) -> HarvestResult<Vec<BuildPolicy>> {
-    #[derive(diesel::QueryableByName, Debug)]
-    struct Row {
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        id: Uuid,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        queue_name: String,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        build_id: String,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        deployment_name: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        created_at: DateTime<Utc>,
-        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        updated_at: DateTime<Utc>,
-    }
-
-    let rows: Vec<Row> = diesel::sql_query(
-        "SELECT id, queue_name, build_id, deployment_name, created_at, updated_at \
+    let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
+        "SELECT {BUILD_POLICY_COLUMNS} \
          FROM harvest_build_policies \
-         ORDER BY queue_name",
-    )
+         ORDER BY queue_name"
+    ))
     .load(conn)
     .await
     .map_err(database_error)?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| BuildPolicy {
-            id: r.id,
-            queue_name: r.queue_name,
-            build_id: r.build_id,
-            deployment_name: r.deployment_name,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
+    Ok(rows.into_iter().map(BuildPolicy::from).collect())
+}
+
+/// Set (or update) the percentage ramp for a queue's existing build policy.
+///
+/// The base policy (`build_id`) must already exist for `queue_name` — a ramp
+/// targets a second build *in addition to* the base, so there must be a base
+/// to ramp away from. `percent` is validated via [`validate_ramp_percent`].
+///
+/// # Errors
+///
+/// - `HarvestError::Config` when `percent` is outside `0..=100`, or when no
+///   base build policy has been registered for `queue_name` yet.
+/// - `HarvestError::Database` on failure.
+#[cfg(feature = "db")]
+pub async fn set_build_ramp(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    target_build_id: &str,
+    percent: i32,
+) -> HarvestResult<BuildPolicy> {
+    validate_ramp_percent(percent)?;
+
+    let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = $2, ramp_percent = $3, updated_at = NOW() \
+         WHERE queue_name = $1 \
+         RETURNING {BUILD_POLICY_COLUMNS}"
+    ))
+    .bind::<diesel::sql_types::Text, _>(queue_name)
+    .bind::<diesel::sql_types::Text, _>(target_build_id)
+    .bind::<diesel::sql_types::Integer, _>(percent)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+
+    rows.into_iter()
+        .next()
+        .map(BuildPolicy::from)
+        .ok_or_else(|| {
+            HarvestError::Config(format!(
+                "cannot set a build ramp for queue '{queue_name}': no base build policy is \
+             registered for this queue yet — call set_build_policy first"
+            ))
         })
-        .collect())
+}
+
+/// Clear a queue's percentage ramp, immediately stopping new starts from
+/// reaching the target build (the base `build_id` policy is left untouched).
+///
+/// Returns `None` when no policy row exists for `queue_name` (nothing to
+/// clear). Clearing an already-unramped policy is a no-op that still returns
+/// `Some(policy)`.
+///
+/// # Errors
+///
+/// Returns `HarvestError::Database` on failure.
+#[cfg(feature = "db")]
+pub async fn clear_build_ramp(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+) -> HarvestResult<Option<BuildPolicy>> {
+    let rows: Vec<BuildPolicyRow> = diesel::sql_query(format!(
+        "UPDATE harvest_build_policies \
+         SET target_build_id = NULL, ramp_percent = NULL, updated_at = NOW() \
+         WHERE queue_name = $1 \
+         RETURNING {BUILD_POLICY_COLUMNS}"
+    ))
+    .bind::<diesel::sql_types::Text, _>(queue_name)
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+
+    Ok(rows.into_iter().next().map(BuildPolicy::from))
 }
 
 /// Declare that workers running `build_id` are compatible with executions

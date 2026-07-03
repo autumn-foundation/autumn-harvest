@@ -352,7 +352,7 @@ pub async fn start_or_load_workflow_execution_collect(
     // error returns without leaving a committed pre-check cancellation whose
     // follow-up starts would be lost.
     let policy = build_routing::get_build_policy(conn, request.queue_name).await?;
-    let assigned_build = policy.map(|p| p.build_id);
+    let assigned_build = policy.map(|p| p.resolve_assigned_build(exec_id));
 
     // For TerminateIfRunning: if there is an existing RUNNING execution, cancel
     // it (Transaction 1) before the start transaction below (Transaction 2). A

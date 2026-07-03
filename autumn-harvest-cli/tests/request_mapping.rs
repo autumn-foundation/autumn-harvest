@@ -1434,3 +1434,87 @@ fn workflow_batch_reset_no_point_flag_returns_error() {
         "batch-reset without a reset-point flag should return an error"
     );
 }
+
+// ── Build routing ramp (issue #604) ────────────────────────────────────────
+
+#[test]
+fn build_ramp_set_maps_to_post_request_with_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "build",
+        "ramp",
+        "set",
+        "--queue",
+        "default",
+        "--target-build-id",
+        "canary-v2",
+        "--percent",
+        "25",
+    ])
+    .expect("build ramp set args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("build ramp set request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(request.path, "/admin/build-routing/ramp");
+    let body = request.body.expect("ramp set must send a body");
+    assert_eq!(body["queue_name"], "default");
+    assert_eq!(body["target_build_id"], "canary-v2");
+    assert_eq!(body["ramp_percent"], 25);
+}
+
+#[test]
+fn build_ramp_show_maps_to_get_request() {
+    let cli = Cli::try_parse_from(["harvest", "build", "ramp", "show"])
+        .expect("build ramp show args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("build ramp show request should build");
+
+    assert_eq!(request.method, ApiMethod::Get);
+    assert_eq!(request.path, "/admin/build-routing");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn build_ramp_clear_maps_to_delete_request() {
+    let cli = Cli::try_parse_from(["harvest", "build", "ramp", "clear", "--queue", "default"])
+        .expect("build ramp clear args should parse");
+
+    let request = cli
+        .api_request()
+        .expect("build ramp clear request should build");
+
+    assert_eq!(request.method, ApiMethod::Delete);
+    assert_eq!(request.path, "/admin/build-routing/ramp/default");
+    assert_eq!(request.body, None);
+}
+
+#[test]
+fn build_ramp_set_rejects_percent_out_of_range_at_parse_or_request_time() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "build",
+        "ramp",
+        "set",
+        "--queue",
+        "default",
+        "--target-build-id",
+        "canary-v2",
+        "--percent",
+        "101",
+    ]);
+    match cli {
+        Err(_) => {} // rejected at clap parse time — acceptable
+        Ok(cli) => {
+            let result = cli.api_request();
+            assert!(
+                result.is_err(),
+                "percent=101 must be rejected before an HTTP request is built"
+            );
+        }
+    }
+}

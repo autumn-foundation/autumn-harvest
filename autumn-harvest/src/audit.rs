@@ -119,6 +119,10 @@ pub const OP_WORKFLOW_REPLAY_CANARY: &str = "workflow.replay_canary";
 pub const OP_ACTIVITY_RETRY_NOW: &str = "activity.retry_now";
 /// Audit operation: Batch-reset workflow executions to a semantic point (issue #538).
 pub const OP_BATCH_RESET: &str = "batch.reset";
+/// Audit operation: Set (or updated) a queue's percentage build ramp (issue #604).
+pub const OP_BUILD_RAMP_SET: &str = "build_routing.ramp.set";
+/// Audit operation: Cleared a queue's percentage build ramp (issue #604).
+pub const OP_BUILD_RAMP_CLEAR: &str = "build_routing.ramp.clear";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -369,6 +373,12 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ),
     // Retire is a read-only reachability check; no DB state is written.
     ("POST /admin/build-routing/retire", RouteClass::ReadOnly),
+    // Percentage build ramp (issue #604)
+    ("POST /admin/build-routing/ramp", RouteClass::Mutating),
+    (
+        "DELETE /admin/build-routing/ramp/{queue_name}",
+        RouteClass::Mutating,
+    ),
     // Task queue management (issue #249)
     ("PATCH /tasks/{id}", RouteClass::Mutating),
     // PII erasure (issue #495): admin-only, irreversible, terminal-only.
@@ -434,6 +444,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_ACTIVITY_RETRY_NOW,
     // Batch reset by semantic point (issue #538)
     OP_BATCH_RESET,
+    // Percentage build ramp (issue #604)
+    OP_BUILD_RAMP_SET,
+    OP_BUILD_RAMP_CLEAR,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -629,6 +642,12 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ),
     // retire is a read-only safety check — no state is mutated.
     ("POST /admin/build-routing/retire", None),
+    // Percentage build ramp (issue #604)
+    ("POST /admin/build-routing/ramp", Some(OP_BUILD_RAMP_SET)),
+    (
+        "DELETE /admin/build-routing/ramp/{queue_name}",
+        Some(OP_BUILD_RAMP_CLEAR),
+    ),
     // Admission gates (issue #377)
     ("GET /admin/gates", None),
     ("POST /admin/gates", Some(OP_GATE_CREATE)),

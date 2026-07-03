@@ -839,3 +839,45 @@ fn canary_body_fields_are_documented() {
         "critical",
     ]);
 }
+
+// ── Build routing ramp (issue #604) ────────────────────────────────────────
+
+#[test]
+fn build_ramp_set_is_covered() {
+    assert_covered(&[
+        "build",
+        "ramp",
+        "set",
+        "--queue",
+        "default",
+        "--target-build-id",
+        "canary-v2",
+        "--percent",
+        "25",
+    ]);
+}
+
+#[test]
+fn build_ramp_show_is_covered() {
+    assert_covered(&["build", "ramp", "show"]);
+}
+
+#[test]
+fn build_ramp_clear_is_covered() {
+    assert_covered(&["build", "ramp", "clear", "--queue", "default"]);
+}
+
+#[test]
+fn build_ramp_set_body_fields_are_documented() {
+    assert_body_fields_documented(&[
+        "build",
+        "ramp",
+        "set",
+        "--queue",
+        "default",
+        "--target-build-id",
+        "canary-v2",
+        "--percent",
+        "25",
+    ]);
+}

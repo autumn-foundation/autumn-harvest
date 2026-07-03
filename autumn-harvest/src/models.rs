@@ -795,6 +795,10 @@ pub struct HarvestBuildPolicy {
     pub deployment_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Ramp target build (issue #604). `None` = no ramp configured.
+    pub target_build_id: Option<String>,
+    /// Ramp percentage 0..=100 (issue #604). `None` = no ramp configured.
+    pub ramp_percent: Option<i32>,
 }
 
 /// Insert struct for a new build policy.

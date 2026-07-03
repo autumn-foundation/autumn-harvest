@@ -533,6 +533,51 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Manage build-routing policies and percentage ramps for safe rolling
+    /// deploys (issue #171, issue #604).
+    #[command(alias = "build-routing")]
+    Build {
+        #[command(subcommand)]
+        command: BuildRoutingCommand,
+    },
+}
+
+/// Build-routing subcommands (issue #604).
+#[derive(Debug, Subcommand)]
+enum BuildRoutingCommand {
+    /// Manage a queue's percentage build ramp.
+    Ramp {
+        #[command(subcommand)]
+        command: RampCommand,
+    },
+}
+
+/// Percentage build ramp subcommands (issue #604).
+#[derive(Debug, Subcommand)]
+enum RampCommand {
+    /// Set (or update) a queue's percentage build ramp. Requires a base
+    /// build policy to already exist for the queue.
+    Set {
+        /// Task queue to ramp.
+        #[arg(long)]
+        queue: String,
+        /// Ramp target build ID.
+        #[arg(long)]
+        target_build_id: String,
+        /// Percentage of new starts routed to the target build, 0..=100.
+        #[arg(long, value_parser = clap::value_parser!(i32).range(0..=100))]
+        percent: i32,
+    },
+    /// Show current build policies and ramp state for every queue.
+    #[command(alias = "list", alias = "ls")]
+    Show,
+    /// Clear a queue's percentage build ramp, immediately stopping new
+    /// starts from reaching the target build.
+    Clear {
+        /// Task queue whose ramp should be cleared.
+        #[arg(long)]
+        queue: String,
+    },
 }
 
 /// Workflow-type reachability subcommands (issue #520).
@@ -1558,7 +1603,33 @@ impl Cli {
                 workflow_name.as_deref(),
                 queue.as_deref(),
             )),
+            Commands::Build { command } => Ok(build_routing_request(command)),
         }
+    }
+}
+
+fn build_routing_request(command: &BuildRoutingCommand) -> ApiRequest {
+    match command {
+        BuildRoutingCommand::Ramp { command } => match command {
+            RampCommand::Set {
+                queue,
+                target_build_id,
+                percent,
+            } => ApiRequest::post(
+                "/admin/build-routing/ramp",
+                Some(json!({
+                    "queue_name": queue,
+                    "target_build_id": target_build_id,
+                    "ramp_percent": percent,
+                })),
+            ),
+            RampCommand::Show => ApiRequest::get("/admin/build-routing"),
+            RampCommand::Clear { queue } => ApiRequest {
+                method: ApiMethod::Delete,
+                path: format!("/admin/build-routing/ramp/{}", path_segment(queue)),
+                body: None,
+            },
+        },
     }
 }
 
