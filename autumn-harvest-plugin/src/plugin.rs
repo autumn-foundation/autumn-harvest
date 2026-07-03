@@ -85,6 +85,11 @@ pub struct HarvestPlugin {
     builder: HarvestBuilder,
     api_path: Option<String>,
     api_middleware: Option<ApiMiddlewareFn>,
+    /// Register MCP tool routes for `#[workflow(mcp)]` workflows (issue #597).
+    /// Set via [`Self::mcp_tools`] / [`Self::mcp_tools_at`] (feature `mcp`).
+    mcp_tools_enabled: bool,
+    /// Optional prefix override for the generated MCP tool routes.
+    mcp_tools_prefix: Option<String>,
 }
 
 impl Default for HarvestPlugin {
@@ -101,6 +106,8 @@ impl HarvestPlugin {
             builder: HarvestBuilder::default(),
             api_path: None,
             api_middleware: None,
+            mcp_tools_enabled: false,
+            mcp_tools_prefix: None,
         }
     }
 
@@ -186,6 +193,36 @@ impl HarvestPlugin {
         self.api_middleware = Some(Box::new(move |router| router.layer(middleware)));
         self
     }
+
+    /// Expose every `#[workflow(mcp)]` workflow as MCP tools (issue #597).
+    ///
+    /// Generates typed `start_{wf}` / `{wf}_status` / `signal_{wf}` /
+    /// `{wf}_watch` routes (plus one `{wf}_update_{name}` per
+    /// `#[update(workflow = "…", mcp)]` handler) under `{api_path}/mcp`
+    /// (default `/api/harvest/mcp`) and registers them as app-level routes so
+    /// autumn-web's `AppBuilder::mount_mcp("/mcp")` projects them into the MCP
+    /// tool catalog. The app author still mounts (and secures, via
+    /// `secure_mcp`) the MCP endpoint itself.
+    ///
+    /// Opt-in only: workflows without the `mcp` attribute never surface, and
+    /// the mutating tools are never part of autumn-web's read-only
+    /// `expose_all_as_mcp` hatch.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub const fn mcp_tools(mut self) -> Self {
+        self.mcp_tools_enabled = true;
+        self
+    }
+
+    /// Like [`Self::mcp_tools`], mounting the generated tool routes under an
+    /// explicit prefix instead of `{api_path}/mcp`.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_tools_at(mut self, prefix: impl Into<String>) -> Self {
+        self.mcp_tools_enabled = true;
+        self.mcp_tools_prefix = Some(prefix.into());
+        self
+    }
 }
 
 impl Plugin for HarvestPlugin {
@@ -194,13 +231,41 @@ impl Plugin for HarvestPlugin {
             builder,
             api_path,
             api_middleware,
+            mcp_tools_enabled,
+            mcp_tools_prefix,
         } = self;
+        #[cfg(not(feature = "mcp"))]
+        let _ = (mcp_tools_enabled, mcp_tools_prefix);
+
+        let api_state = HarvestApiState::new();
+
+        // Issue #597: generate the MCP tool routes before the builder is
+        // stashed in the runtime slot. These are app-level typed routes
+        // (registered via `AppBuilder::routes`, not `nest`) so autumn-web's
+        // `mount_mcp` can project them into the tool catalog; handlers fail
+        // closed until `on_startup` installs the runtime.
+        #[cfg(feature = "mcp")]
+        let mcp_routes = if mcp_tools_enabled {
+            let prefix =
+                crate::mcp_tools::tools_prefix(api_path.as_deref(), mcp_tools_prefix.as_deref());
+            let descriptors = crate::mcp_tools::collect_descriptors(
+                builder.workflow_infos(),
+                builder.update_handlers(),
+            );
+            crate::mcp_tools::record_schemas(&descriptors);
+            Some(crate::mcp_tools::build_mcp_tool_routes(
+                &prefix,
+                &descriptors,
+                api_state.clone(),
+            ))
+        } else {
+            None
+        };
 
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
             runtime: None,
         }));
-        let api_state = HarvestApiState::new();
         // issue #377: arm fail-closed so any request in the window between
         // HTTP server bind and the boot-time gate load is safely rejected.
         api_state.arm_gate_cache_fail_closed();
@@ -237,6 +302,12 @@ impl Plugin for HarvestPlugin {
                     stop_harvest_runtime(slot, api_state).await;
                 }
             });
+
+        #[cfg(feature = "mcp")]
+        let app = match mcp_routes {
+            Some(routes) => app.routes(routes),
+            None => app,
+        };
 
         if let Some(path) = api_path {
             let ui_router = harvest_ui_router(api_state.clone());

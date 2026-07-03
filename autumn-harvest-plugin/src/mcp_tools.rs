@@ -27,7 +27,12 @@
 //! variant, no migration, no replay surface — the `mcp` flag is never
 //! consulted by core execution.
 
+use std::collections::HashMap;
+
 use autumn_harvest::{UpdateHandlerInfo, WorkflowInfo};
+use autumn_web::reexports::axum;
+use axum::extract::{Path, Query};
+use axum::{Extension, Json};
 
 /// Default mount prefix for the generated tool routes when the plugin has no
 /// management-API path configured.
@@ -313,6 +318,568 @@ pub fn tools_prefix(api_path: Option<&str>, prefix_override: Option<&str>) -> St
         },
         |p| p.trim_end_matches('/').to_string(),
     )
+}
+
+// ── Global schema map (layer 2) ──────────────────────────────────────────────
+//
+// autumn-web resolves `SchemaEntry::Ref` component names against the schemas
+// registered during spec generation. `ApiDoc.register_schemas` is a plain fn
+// pointer (no closures), so per-workflow schemas — only known at plugin build
+// time — are staged in a process-global map that the static hook drains.
+// Mirrors the `GLOBAL_WORKFLOW_METADATA` precedent in `autumn_harvest::worker`.
+
+static MCP_SCHEMAS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, serde_json::Value>>> =
+    std::sync::OnceLock::new();
+
+fn schema_map() -> &'static std::sync::Mutex<HashMap<String, serde_json::Value>> {
+    MCP_SCHEMAS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The static `ApiDoc::register_schemas` hook attached to every generated
+/// tool route. Inserts everything staged by [`record_schemas`].
+fn register_harvest_mcp_schemas(registry: &mut autumn_web::openapi::SchemaRegistry) {
+    let map = schema_map()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (name, schema) in map.iter() {
+        registry.insert(name.clone(), schema.clone());
+    }
+}
+
+/// Permissive object schema used when a workflow publishes no `input_schema`.
+fn permissive_object_schema(description: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "object", "description": description })
+}
+
+/// Record the descriptors' input schemas (and the fixed response/payload
+/// schemas) into the process-global schema map consumed by
+/// [`register_harvest_mcp_schemas`]. Idempotent, name-keyed: re-recording the
+/// same workflow overwrites with identical content.
+pub fn record_schemas(descriptors: &[McpWorkflowDescriptor]) {
+    let mut map = schema_map()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    map.insert(
+        START_RESULT_SCHEMA.to_string(),
+        serde_json::json!({
+            "type": "object",
+            "description": "Durable workflow handle returned immediately by a start tool.",
+            "properties": {
+                "execution_id": {
+                    "type": "string",
+                    "description": "The workflow handle. Pass it to the status/signal/update/watch tools."
+                },
+                "workflow_name": { "type": "string" },
+                "workflow_id": { "type": "string" },
+                "state": { "type": "string" }
+            },
+            "required": ["execution_id", "workflow_name", "workflow_id", "state"]
+        }),
+    );
+    map.insert(
+        STATUS_RESULT_SCHEMA.to_string(),
+        serde_json::json!({
+            "type": "object",
+            "description": "Durable state snapshot of one workflow execution.",
+            "properties": {
+                "execution_id": { "type": "string" },
+                "workflow_name": { "type": "string" },
+                "workflow_id": { "type": "string" },
+                "state": { "type": "string" },
+                "is_terminal": { "type": "boolean" },
+                "current_details": {
+                    "type": ["string", "null"],
+                    "description": "Author-published progress breadcrumb (ctx.set_current_details)."
+                },
+                "output": { "description": "Workflow output when state = COMPLETED." },
+                "error": { "type": ["string", "null"] },
+                "started_at": { "type": "string", "format": "date-time" },
+                "completed_at": { "type": ["string", "null"], "format": "date-time" }
+            },
+            "required": ["execution_id", "workflow_name", "workflow_id", "state", "is_terminal"]
+        }),
+    );
+    map.insert(
+        SIGNAL_PAYLOAD_SCHEMA.to_string(),
+        serde_json::json!({
+            "description": "Arbitrary JSON signal payload delivered to the workflow."
+        }),
+    );
+    map.insert(
+        SIGNAL_ACK_SCHEMA.to_string(),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ok": { "type": "boolean" },
+                "signal_delivered": {
+                    "type": "boolean",
+                    "description": "false when an idempotency key deduplicated the delivery."
+                }
+            },
+            "required": ["ok"]
+        }),
+    );
+    map.insert(
+        UPDATE_RESULT_SCHEMA.to_string(),
+        serde_json::json!({
+            "type": "object",
+            "description": "Synchronous update outcome.",
+            "properties": {
+                "update_id": { "type": "string" },
+                "output": { "description": "Handler result when the update completed." },
+                "error": { "type": ["string", "null"] }
+            },
+            "required": ["update_id"]
+        }),
+    );
+
+    for d in descriptors {
+        map.insert(
+            input_schema_component(&d.name),
+            d.input_schema.clone().unwrap_or_else(|| {
+                permissive_object_schema(&format!(
+                    "Input for the '{}' workflow (no published schema; see issue #373 \
+                     to publish one)",
+                    d.name
+                ))
+            }),
+        );
+        for u in &d.updates {
+            map.insert(
+                update_input_schema_component(&d.name, &u.name),
+                permissive_object_schema(&format!(
+                    "Input for the '{}' update (Rust type: {})",
+                    u.name, u.input_type_hint
+                )),
+            );
+        }
+    }
+}
+
+// ── Route/handler layer (layer 3) ────────────────────────────────────────────
+
+/// Leak a string into a `&'static str` for `ApiDoc`/`Route` fields. Bounded:
+/// a handful of strings per mcp workflow, once per plugin build.
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// Build the typed autumn-web routes for every descriptor's tool set.
+///
+/// Each route carries an `ApiDoc` with `mcp_tool: true` (and `mcp_stream` for
+/// watch) so autumn-web's `mount_mcp` projects it into the tool catalog; the
+/// handlers delegate to the same primitives the management API uses, reading
+/// runtime state from the given [`HarvestApiState`] (fail-closed 503 before
+/// `on_startup` installs the runtime).
+#[must_use]
+pub fn build_mcp_tool_routes(
+    prefix: &str,
+    descriptors: &[McpWorkflowDescriptor],
+    api_state: crate::api::HarvestApiState,
+) -> Vec<autumn_web::Route> {
+    let mut routes = Vec::new();
+    for descriptor in descriptors {
+        for spec in tool_route_specs(prefix, descriptor) {
+            routes.push(build_tool_route(&spec, descriptor, api_state.clone()));
+        }
+    }
+    routes
+}
+
+fn build_tool_route(
+    spec: &ToolRouteSpec,
+    descriptor: &McpWorkflowDescriptor,
+    api_state: crate::api::HarvestApiState,
+) -> autumn_web::Route {
+    use axum::routing::MethodRouter;
+
+    let path: &'static str = leak(spec.path.clone());
+    let operation_id: &'static str = leak(spec.operation_id.clone());
+    let workflow: &'static str = leak(spec.workflow.clone());
+
+    let handler: MethodRouter<autumn_web::AppState> = match spec.kind {
+        ToolKind::Start => {
+            let input_schema = descriptor.input_schema.clone();
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let api_state = api_state.clone();
+                    let input_schema = input_schema.clone();
+                    async move { start_tool(api_state, workflow, input_schema, headers, body).await }
+                },
+            )
+        }
+        ToolKind::Status => axum::routing::get(move |Path(handle): Path<String>| {
+            let api_state = api_state.clone();
+            async move { status_tool(api_state, workflow, &handle).await }
+        }),
+        ToolKind::Signal => axum::routing::post(
+            move |Path((handle, signal_name)): Path<(String, String)>,
+                  headers: axum::http::HeaderMap,
+                  Json(payload): Json<serde_json::Value>| {
+                let api_state = api_state.clone();
+                async move {
+                    signal_tool(api_state, workflow, handle, signal_name, headers, payload).await
+                }
+            },
+        ),
+        ToolKind::Update => {
+            let update: &'static str = leak(
+                spec.update
+                    .clone()
+                    .expect("Update spec always carries the update name"),
+            );
+            axum::routing::post(
+                move |Path(handle): Path<String>, Json(body): Json<serde_json::Value>| {
+                    let api_state = api_state.clone();
+                    async move { update_tool(api_state, workflow, update, handle, body).await }
+                },
+            )
+        }
+        ToolKind::Watch => axum::routing::get(move |Path(handle): Path<String>| {
+            let api_state = api_state.clone();
+            async move { watch_tool(api_state, workflow, &handle).await }
+        }),
+    };
+
+    let api_doc = autumn_web::openapi::ApiDoc {
+        method: spec.method,
+        path,
+        operation_id,
+        summary: Some(leak(spec.summary.clone())),
+        description: Some(leak(spec.description.clone())),
+        path_params: Box::leak(spec.path_params.clone().into_boxed_slice()),
+        request_body: spec
+            .body_component
+            .clone()
+            .map(|name| autumn_web::openapi::SchemaEntry {
+                name: leak(name),
+                kind: autumn_web::openapi::SchemaKind::Ref,
+            }),
+        response: spec
+            .response_component
+            .map(|name| autumn_web::openapi::SchemaEntry {
+                name,
+                kind: autumn_web::openapi::SchemaKind::Ref,
+            }),
+        success_status: 200,
+        register_schemas: Some(register_harvest_mcp_schemas),
+        mcp_tool: true,
+        mcp_stream: spec.stream,
+        ..Default::default()
+    };
+
+    autumn_web::Route {
+        method: method_for(spec.method),
+        path,
+        handler,
+        name: operation_id,
+        api_doc,
+        api_version: None,
+        sunset_opt_out: false,
+        repository: None,
+        idempotency: autumn_web::RouteIdempotency::Direct,
+    }
+}
+
+fn method_for(method: &str) -> axum::http::Method {
+    match method {
+        "GET" => axum::http::Method::GET,
+        "POST" => axum::http::Method::POST,
+        other => unreachable!("unsupported MCP tool method {other}"),
+    }
+}
+
+// ── Tool handlers ────────────────────────────────────────────────────────────
+
+/// Parse the handle, route to the owning shard, load the execution row, and
+/// verify it belongs to `workflow`. A mismatching handle returns the same 404
+/// an unknown handle does, so one workflow's tools cannot be used as an
+/// existence oracle for another's executions.
+async fn load_owned_execution(
+    api_state: &crate::api::HarvestApiState,
+    workflow: &str,
+    handle: &str,
+) -> Result<autumn_harvest::models::WorkflowExecution, axum::response::Response> {
+    use axum::response::IntoResponse as _;
+
+    let exec_id = crate::api::parse_execution_id(handle).map_err(|e| e.into_response())?;
+    let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
+        .await
+        .map_err(|e| e.into_response())?;
+    let execution = crate::api::load_execution(&mut conn, exec_id)
+        .await
+        .map_err(|e| crate::api::map_error(e).into_response())?;
+    if execution.workflow_name != workflow {
+        return Err(autumn_web::error::AutumnError::not_found_msg(format!(
+            "workflow execution {handle}"
+        ))
+        .into_response());
+    }
+    Ok(execution)
+}
+
+/// `start_{wf}` — validate the input against the workflow's published schema
+/// (pure, before any storage access), then delegate to the management API's
+/// start handler with only the input set (server-generated workflow_id).
+async fn start_tool(
+    api_state: crate::api::HarvestApiState,
+    workflow: &'static str,
+    input_schema: Option<serde_json::Value>,
+    headers: axum::http::HeaderMap,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    if let Some(schema) = input_schema
+        && let Err(violations) = autumn_harvest::info::validate_against_schema(&schema, &body)
+    {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "input validation failed",
+                "violations": violations,
+            })),
+        )
+            .into_response();
+    }
+
+    crate::api::start_workflow(
+        Extension(api_state),
+        Path(workflow.to_string()),
+        None,
+        headers,
+        Json(crate::api::StartWorkflowRequest::from_input(body)),
+    )
+    .await
+}
+
+/// Response body of `{wf}_status` — a compact durable-state snapshot.
+#[derive(Debug, serde::Serialize)]
+struct McpStatusResponse {
+    execution_id: String,
+    workflow_name: String,
+    workflow_id: String,
+    state: String,
+    is_terminal: bool,
+    current_details: Option<String>,
+    output: Option<serde_json::Value>,
+    error: Option<String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl McpStatusResponse {
+    fn from_execution(execution: autumn_harvest::models::WorkflowExecution) -> Self {
+        let is_terminal = crate::api::is_terminal_state(&execution.state);
+        Self {
+            execution_id: execution.id.to_string(),
+            workflow_name: execution.workflow_name,
+            workflow_id: execution.workflow_id,
+            state: execution.state,
+            is_terminal,
+            current_details: execution.current_details,
+            output: execution.output,
+            error: execution.error,
+            started_at: execution.started_at,
+            completed_at: execution.completed_at,
+        }
+    }
+}
+
+/// `{wf}_status` — read the durable execution row.
+async fn status_tool(
+    api_state: crate::api::HarvestApiState,
+    workflow: &'static str,
+    handle: &str,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    match load_owned_execution(&api_state, workflow, handle).await {
+        Ok(execution) => Json(McpStatusResponse::from_execution(execution)).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// `signal_{wf}` — ownership check, then delegate to the standalone signal
+/// handler (inherits Idempotency-Key header support).
+async fn signal_tool(
+    api_state: crate::api::HarvestApiState,
+    workflow: &'static str,
+    handle: String,
+    signal_name: String,
+    headers: axum::http::HeaderMap,
+    payload: serde_json::Value,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    if let Err(response) = load_owned_execution(&api_state, workflow, &handle).await {
+        return response;
+    }
+    crate::api::signal_workflow(
+        Extension(api_state),
+        Path((handle, signal_name)),
+        Query(crate::api::SignalQuery::default()),
+        headers,
+        Json(payload),
+    )
+    .await
+    .into_response()
+}
+
+/// `{wf}_update_{name}` — ownership check, then delegate to the update-admit
+/// handler with its synchronous default (`wait=completed`, 30 s timeout).
+async fn update_tool(
+    api_state: crate::api::HarvestApiState,
+    workflow: &'static str,
+    update: &'static str,
+    handle: String,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    if let Err(response) = load_owned_execution(&api_state, workflow, &handle).await {
+        return response;
+    }
+    crate::api::admit_update(
+        Extension(api_state),
+        Path((handle, update.to_string())),
+        Query(crate::api::AdmitUpdateQuery::default()),
+        Json(crate::api::AdmitUpdateRequest::new(body)),
+    )
+    .await
+}
+
+/// `{wf}_watch` — SSE stream of progress frames driven by the shard's
+/// LISTEN/NOTIFY `harvest_events` channel (no polling). autumn-web's MCP layer
+/// projects each frame as a `notifications/progress` message; the terminal
+/// `event: result` frame becomes the final `tools/call` result.
+///
+/// Frame contract:
+/// - progress frames: `{"progress": <n>, "message": <current_details|state>}`
+///   (numeric `progress` opts into structured MCP progress forwarding);
+/// - terminal frame: `event: result`, data `{"state", "output", "error"}`.
+///
+/// Modeled on the management API's `stream_execution_events` (listener
+/// connected *before* the snapshot read so no event is missed; bounded
+/// channel; pooled connection released while idle).
+async fn watch_tool(
+    api_state: crate::api::HarvestApiState,
+    workflow: &'static str,
+    handle: &str,
+) -> axum::response::Response {
+    use autumn_harvest::notify::{WorkflowEventListener, WorkflowEventWaitOutcome};
+    use axum::response::IntoResponse as _;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::SinkExt as _;
+
+    let exec_id = match crate::api::parse_execution_id(handle) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+
+    // LISTEN before the snapshot read: an event committed between the two is
+    // caught by the first notification instead of being lost.
+    let notification_url = match api_state.sse_notification_url(exec_id.shard()) {
+        Ok(url) => url,
+        Err(e) => return crate::api::map_error(e).into_response(),
+    };
+    let listener = match WorkflowEventListener::connect(&notification_url).await {
+        Ok(l) => l,
+        Err(e) => return crate::api::map_error(e).into_response(),
+    };
+
+    let execution = match load_owned_execution(&api_state, workflow, handle).await {
+        Ok(execution) => execution,
+        Err(response) => return response,
+    };
+
+    let keepalive_interval = api_state.sse_keepalive_interval();
+    let buffer_depth = api_state.sse_buffer_depth();
+    let (mut tx, rx) = futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(
+        buffer_depth.max(1),
+    );
+
+    let api_clone = api_state.clone();
+    tokio::spawn(async move {
+        let result_frame = |execution: &autumn_harvest::models::WorkflowExecution| {
+            Event::default().event("result").data(
+                serde_json::json!({
+                    "state": execution.state,
+                    "output": execution.output,
+                    "error": execution.error,
+                })
+                .to_string(),
+            )
+        };
+        let progress_frame = |n: u64, execution: &autumn_harvest::models::WorkflowExecution| {
+            let message = execution
+                .current_details
+                .clone()
+                .unwrap_or_else(|| execution.state.clone());
+            Event::default()
+                .data(serde_json::json!({ "progress": n, "message": message }).to_string())
+        };
+
+        // Already terminal: emit the result frame and close.
+        if crate::api::is_terminal_state(&execution.state) {
+            let _ = tx.send(Ok(result_frame(&execution))).await;
+            return;
+        }
+
+        // Initial snapshot frame so the subscriber sees progress immediately.
+        let mut progress: u64 = 1;
+        if tx
+            .send(Ok(progress_frame(progress, &execution)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let mut listener = listener;
+        loop {
+            // 2x keepalive so the KeepAlive wrapper pings between wakeups; a
+            // TimedOut wakeup re-checks terminal state as a missed-NOTIFY
+            // safety net without emitting a progress frame.
+            let wait_timeout = keepalive_interval.saturating_mul(2);
+            let emit_progress = match listener.wait_for_notification_timeout(wait_timeout).await {
+                Ok(WorkflowEventWaitOutcome::Notification(payload)) => {
+                    if payload.workflow_exec_id != exec_id.as_uuid() {
+                        continue;
+                    }
+                    true
+                }
+                Ok(WorkflowEventWaitOutcome::TimedOut) => false,
+                Ok(WorkflowEventWaitOutcome::ChannelClosed) | Err(_) => break,
+            };
+
+            let refreshed = match crate::api::db_conn_for_execution(&api_clone, exec_id).await {
+                Ok(mut conn) => match crate::api::load_execution(&mut conn, exec_id).await {
+                    Ok(execution) => execution,
+                    Err(_) => continue,
+                },
+                Err(_) => continue,
+            };
+
+            if crate::api::is_terminal_state(&refreshed.state) {
+                let _ = tx.send(Ok(result_frame(&refreshed))).await;
+                break;
+            }
+            if emit_progress {
+                progress += 1;
+                if tx
+                    .send(Ok(progress_frame(progress, &refreshed)))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive_interval))
+        .into_response()
 }
 
 #[cfg(test)]

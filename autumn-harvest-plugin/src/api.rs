@@ -1455,7 +1455,7 @@ struct BasicAck {
 /// `idempotency_key` is the lower-precedence way to supply the exactly-once
 /// delivery key — the `Idempotency-Key` HTTP header wins when both are present.
 #[derive(Debug, Default, Deserialize)]
-struct SignalQuery {
+pub(crate) struct SignalQuery {
     #[serde(default)]
     idempotency_key: Option<String>,
 }
@@ -1466,7 +1466,7 @@ struct SignalQuery {
 /// `false` when an idempotency-key collision deduplicated the delivery. Unkeyed
 /// deliveries always report `true`, matching the legacy at-least-once behavior.
 #[derive(Debug, Serialize)]
-struct SignalAck {
+pub(crate) struct SignalAck {
     ok: bool,
     signal_delivered: bool,
 }
@@ -1639,7 +1639,7 @@ struct DagRetryResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct StartWorkflowRequest {
+pub(crate) struct StartWorkflowRequest {
     workflow_id: Option<String>,
     input: Option<Value>,
     queue: Option<String>,
@@ -1661,6 +1661,28 @@ struct StartWorkflowRequest {
     batch_key: Option<String>,
     batch_max_size: Option<usize>,
     batch_max_wait: Option<String>,
+}
+
+impl StartWorkflowRequest {
+    /// Minimal request carrying only the workflow input — used by the MCP
+    /// start tool (issue #597), which exposes no other start options.
+    pub(crate) fn from_input(input: Value) -> Self {
+        Self {
+            workflow_id: None,
+            input: Some(input),
+            queue: None,
+            memo: None,
+            search_attrs: None,
+            execution_timeout_secs: None,
+            sla_secs: None,
+            reuse_policy: None,
+            start_at: None,
+            delay: None,
+            batch_key: None,
+            batch_max_size: None,
+            batch_max_wait: None,
+        }
+    }
 }
 
 /// Response body for a 409 Conflict returned by `RejectDuplicate` policy.
@@ -6692,7 +6714,7 @@ fn workflow_has_resolving_debounce(
 }
 
 #[allow(clippy::too_many_lines, clippy::result_large_err)]
-async fn start_workflow(
+pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     maybe_session: Option<Extension<Session>>,
@@ -11420,7 +11442,7 @@ async fn retry_dag_run(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn signal_workflow(
+pub(crate) async fn signal_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, signal_name)): Path<(String, String)>,
     Query(query): Query<SignalQuery>,
@@ -20885,13 +20907,21 @@ async fn drain_preview_handler(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct AdmitUpdateRequest {
+pub(crate) struct AdmitUpdateRequest {
     #[serde(default)]
     input: Value,
 }
 
-#[derive(Debug, Deserialize)]
-struct AdmitUpdateQuery {
+impl AdmitUpdateRequest {
+    /// Request carrying the update input — used by the MCP update tools
+    /// (issue #597).
+    pub(crate) const fn new(input: Value) -> Self {
+        Self { input }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct AdmitUpdateQuery {
     /// Controls how long to wait for a result.
     /// `"admitted"` — return 202 as soon as the event is durably written.
     /// `"completed"` (default) — block until the handler returns or the timeout fires.
@@ -20930,7 +20960,7 @@ struct UpdateOrphanedResponse {
 /// workflow worker, then either returns immediately (`?wait=admitted`) or polls
 /// for the terminal `UpdateCompleted`/`UpdateFailed` event (`?wait=completed`,
 /// the default) until the configurable timeout fires.
-async fn admit_update(
+pub(crate) async fn admit_update(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, update_name)): Path<(String, String)>,
     Query(query): Query<AdmitUpdateQuery>,
