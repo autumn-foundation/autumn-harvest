@@ -82,6 +82,34 @@ fn child_fan_out_two_failures<'a>(
     })
 }
 
+// Two children: slot 0 is still ChildInProgress (no terminal recorded), slot
+// 1 has a recorded failure. Catches the fail-fast error and continues by
+// scheduling an activity -- used to demonstrate the known limitation where
+// try_join_all re-emits slot 0's StartChildWorkflow re-park command before
+// the fail-fast error is even returned, leaving it in the *same* commands
+// batch as whatever the workflow does next. See
+// `child_fan_out_raw_known_limitation_stale_repark_command_leaks_into_next_suspension`.
+fn child_fan_out_catch_and_continue<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children = vec![
+            ("child_pending".to_string(), Value::Null),
+            ("child_fail".to_string(), Value::Null),
+        ];
+        let Err(_) = ctx.spawn_child_workflow_fan_out_raw(children).await else {
+            panic!("expected the fan-out to fail fast");
+        };
+        // Caught the error and continued -- push an unrelated suspending
+        // command (ScheduleActivity).
+        ctx.execute_activity_raw("unrelated_activity", Value::Null, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "continued": true }))
+    })
+}
+
 fn child_fan_out_collect_all<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -364,6 +392,113 @@ async fn child_fan_out_raw_known_limitation_replay_selects_by_slot_order_not_rec
             );
         }
         other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+/// **Known limitation** (PR #901 review, shared with the pre-existing activity
+/// fan-out from issue #359 -- not introduced by child fan-out): when an
+/// earlier-slot child is still `ChildInProgress` (started, no terminal
+/// recorded yet) while a later-slot child has a recorded failure,
+/// `try_join_all` polls the earlier slot first during the same sweep that
+/// discovers the fail-fast error. `spawn_child_workflow_raw`'s
+/// `ChildInProgress` branch synchronously pushes a re-park
+/// `StartChildWorkflow` command (carrying the existing `child_id`) *before*
+/// suspending on its own oneshot -- and that push is not undone when
+/// `try_join_all` subsequently short-circuits on the later slot's `Err` and
+/// drops the still-pending future. If the workflow catches the fail-fast
+/// error and pushes a different command (e.g. schedules an activity), both
+/// commands land in the *same* suspension batch: a stale re-park alongside
+/// an unrelated new command. The worker's dispatch logic (`worker.rs`,
+/// `suspended_workflow_error`) only recognizes single-shape suspension
+/// batches, so this mixed batch hits "workflow task suspended with
+/// unsupported commands ...; this command set is not implemented yet" and
+/// fails the workflow outright -- even though the user only handled the
+/// fan-out error and continued normally.
+///
+/// `execute_activity_fan_out_raw` (issue #359) has the identical structure
+/// (`ActivityInProgress` also pushes `WaitForActivity` then suspends before
+/// returning), so this is a pre-existing, shared limitation, not something
+/// introduced by child fan-out. Properly fixing it needs either abandoning
+/// `try_join_all`'s natural poll-all-every-time semantics for a custom
+/// combinator that never touches a sibling slot once the fail-fast winner is
+/// known, or a side-effect-free way to peek "is this child already failed in
+/// history" against the stateful, cursor-based `HistoryMatcher` without
+/// consuming its cursor -- both are large, cross-cutting changes shared with
+/// the activity fan-out primitive, out of scope for issue #601.
+///
+/// This test proves the defect at the `WorkflowOutcome` level (a full
+/// worker-level reproduction of the resulting `WorkflowFailed` needs a
+/// DB-backed integration test, since the "unsupported commands" check lives
+/// in `worker.rs`, not the pure `executor::run_workflow` used here): the
+/// commands returned alongside the fail-fast error already contain the
+/// stale `StartChildWorkflow` re-park for the still-pending sibling.
+#[tokio::test]
+async fn child_fan_out_raw_known_limitation_stale_repark_command_leaks_into_next_suspension() {
+    let exec_id = ExecutionId::new();
+    let id_pending = ExecutionId::new();
+    let id_fail = ExecutionId::new();
+
+    let history = vec![
+        started(),
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: json!(2u64),
+        },
+        // Slot 0: started, no terminal -- still ChildInProgress.
+        child_started(id_pending, "child_pending", Value::Null),
+        // Slot 1: started and failed.
+        child_started(id_fail, "child_fail", Value::Null),
+        child_failed(id_fail, "boom"),
+    ];
+
+    let outcome = run_workflow(
+        exec_id,
+        history,
+        child_fan_out_catch_and_continue,
+        Value::Null,
+    )
+    .await;
+
+    match outcome {
+        WorkflowOutcome::Suspended { commands } => {
+            let has_stale_repark = commands.iter().any(|c| {
+                matches!(
+                    c,
+                    autumn_harvest::context::WorkflowCommand::StartChildWorkflow {
+                        child_id,
+                        ..
+                    } if *child_id == id_pending
+                )
+            });
+            let has_unrelated_activity = commands.iter().any(|c| {
+                matches!(
+                    c,
+                    autumn_harvest::context::WorkflowCommand::ScheduleActivity { name, .. }
+                        if name == "unrelated_activity"
+                )
+            });
+            assert!(
+                has_stale_repark,
+                "known limitation: the still-pending sibling's re-park command \
+                 should leak into this suspension batch -- got: {commands:?}"
+            );
+            assert!(
+                has_unrelated_activity,
+                "the workflow's post-catch activity should also be in this batch -- \
+                 got: {commands:?}"
+            );
+            assert_eq!(
+                commands.len(),
+                2,
+                "batch should contain exactly the stale re-park plus the new \
+                 activity -- a worker receiving this mixed batch has no single \
+                 recognized shape to persist it as; got: {commands:?}"
+            );
+        }
+        other => panic!(
+            "expected Suspended with a mixed stale-repark + new-command batch \
+             (known limitation), got: {other:?}"
+        ),
     }
 }
 
