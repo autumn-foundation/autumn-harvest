@@ -4741,20 +4741,24 @@ impl WorkflowContext {
         let seq = self.next_race_seq();
         let count = branches.len();
         let open_marker = format!("race:{seq}");
-        match self.match_history(|m| m.match_u64_marker(&open_marker, count as u64)) {
-            HistoryMatch::Matched { .. } => {}
-            HistoryMatch::NoMatch => {
-                self.push_command(WorkflowCommand::RecordMarker {
-                    name: open_marker,
-                    details: Value::from(count as u64),
-                });
-            }
-            HistoryMatch::Diverged {
-                expected,
-                actual,
-                event_index,
-            } => {
-                return Err(self.nd_error(
+        // Deferred rather than pushed immediately: if a branch that is about
+        // to be freshly dispatched fails its payload-cap check below, this
+        // race must leave zero durable trace of the cycle (see the
+        // validation pass after Phase A) -- otherwise a terminal failure
+        // mapped from that error would persist this marker with no
+        // corresponding branch dispatch event, and replay would diverge
+        // expecting ActivityScheduled/ChildWorkflowStarted but finding the
+        // terminal event instead.
+        let needs_open_marker =
+            match self.match_history(|m| m.match_u64_marker(&open_marker, count as u64)) {
+                HistoryMatch::Matched { .. } => false,
+                HistoryMatch::NoMatch => true,
+                HistoryMatch::Diverged {
+                    expected,
+                    actual,
+                    event_index,
+                } => {
+                    return Err(self.nd_error(
                     format!(
                         "race #{seq}: history has {expected} but current code supplies {actual} \
                          — the branch count changed between deploy and replay; use ctx.version() \
@@ -4764,9 +4768,9 @@ impl WorkflowContext {
                     Some(expected),
                     Some(actual),
                 ));
-            }
-            _ => unreachable!("match_u64_marker only returns Matched, NoMatch, or Diverged"),
-        }
+                }
+                _ => unreachable!("match_u64_marker only returns Matched, NoMatch, or Diverged"),
+            };
 
         // Phase A: synchronously check every branch's history state without
         // pushing any command yet, so a branch that already has a terminal
@@ -4904,6 +4908,65 @@ impl WorkflowContext {
             }
         }
 
+        // Validate payload caps for every branch about to be freshly
+        // dispatched *before* pushing any bookkeeping for this cycle (the
+        // open marker below, or a branch's own schedule/start command in
+        // Phase B). An oversized branch must abort this race with zero
+        // durable trace -- see the comment on `needs_open_marker` above.
+        for dispatch in &to_dispatch {
+            if !dispatch.is_new {
+                continue;
+            }
+            match &branches[dispatch.index].kind {
+                RaceBranchKind::Activity { name, input, .. } => {
+                    let effective_cap = {
+                        let global = self.payload_max_activity_input;
+                        self.activity_input_cap_overrides
+                            .get(name)
+                            .copied()
+                            .map_or(global, |ov| global.max(ov))
+                    };
+                    let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+                    if effective_cap > 0
+                        && observed > effective_cap
+                        && !self.offload_will_apply(observed)
+                    {
+                        return Err(HarvestError::PayloadTooLarge {
+                            kind: PayloadKind::ActivityInput,
+                            observed_bytes: observed,
+                            cap_bytes: effective_cap,
+                            workflow_type: self.workflow_name.clone(),
+                            activity_name: Some(name.clone()),
+                        });
+                    }
+                }
+                RaceBranchKind::ChildWorkflow { input, .. } => {
+                    let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+                    if self.payload_max_workflow_input > 0
+                        && observed > self.payload_max_workflow_input
+                    {
+                        return Err(HarvestError::PayloadTooLarge {
+                            kind: PayloadKind::ChildWorkflowInput,
+                            observed_bytes: observed,
+                            cap_bytes: self.payload_max_workflow_input,
+                            workflow_type: self.workflow_name.clone(),
+                            activity_name: None,
+                        });
+                    }
+                }
+                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
+                    unreachable!("timer/signal branches only occur in the paired shape")
+                }
+            }
+        }
+
+        if needs_open_marker {
+            self.push_command(WorkflowCommand::RecordMarker {
+                name: open_marker,
+                details: Value::from(count as u64),
+            });
+        }
+
         if !resolved.is_empty() {
             return self.settle_race(seq, &branches, resolved, &to_dispatch);
         }
@@ -4930,28 +4993,7 @@ impl WorkflowContext {
                         .activity_id
                         .expect("activity dispatch always carries an activity_id");
                     if dispatch.is_new {
-                        // Enforce the activity input payload cap before scheduling,
-                        // mirroring execute_activity_with_opts's NoMatch branch.
-                        let effective_cap = {
-                            let global = self.payload_max_activity_input;
-                            self.activity_input_cap_overrides
-                                .get(name)
-                                .copied()
-                                .map_or(global, |ov| global.max(ov))
-                        };
-                        let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
-                        if effective_cap > 0
-                            && observed > effective_cap
-                            && !self.offload_will_apply(observed)
-                        {
-                            return Err(HarvestError::PayloadTooLarge {
-                                kind: PayloadKind::ActivityInput,
-                                observed_bytes: observed,
-                                cap_bytes: effective_cap,
-                                workflow_type: self.workflow_name.clone(),
-                                activity_name: Some(name.clone()),
-                            });
-                        }
+                        // Payload cap already validated in the pre-dispatch pass above.
                         self.push_command(WorkflowCommand::ScheduleActivity {
                             activity_id,
                             name: name.clone(),
@@ -4975,25 +5017,10 @@ impl WorkflowContext {
                     let child_id = dispatch
                         .child_id
                         .expect("child dispatch always carries a child_id");
-                    if dispatch.is_new {
-                        // Enforce the child-workflow input payload cap before
-                        // scheduling, mirroring spawn_child_workflow_raw's NoMatch
-                        // branch. ChildWorkflowStarted is written to the parent's
-                        // history via append_single_event (plain), so the offload
-                        // bypass must NOT apply here either.
-                        let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
-                        if self.payload_max_workflow_input > 0
-                            && observed > self.payload_max_workflow_input
-                        {
-                            return Err(HarvestError::PayloadTooLarge {
-                                kind: PayloadKind::ChildWorkflowInput,
-                                observed_bytes: observed,
-                                cap_bytes: self.payload_max_workflow_input,
-                                workflow_type: self.workflow_name.clone(),
-                                activity_name: None,
-                            });
-                        }
-                    }
+                    // Payload cap already validated in the pre-dispatch pass above
+                    // when dispatch.is_new (ChildWorkflowStarted is written to the
+                    // parent's history via append_single_event, so the offload
+                    // bypass never applies to this kind).
                     self.push_command(WorkflowCommand::StartChildWorkflow {
                         child_id,
                         workflow_name: workflow_name.clone(),
@@ -11391,6 +11418,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HarvestError::Config(_)));
+    }
+
+    /// Regression test (Codex review, PR #902): a payload-cap failure on a
+    /// fresh branch must leave zero durable trace of the race -- specifically,
+    /// the `race:{seq}` open marker must not have been queued, since nothing
+    /// else in this cycle (no branch's ScheduleActivity/StartChildWorkflow)
+    /// would be recorded to match it on a later replay.
+    #[tokio::test]
+    async fn race_rejects_oversized_second_branch_without_queuing_open_marker() {
+        let ctx = WorkflowContext::new_test().with_payload_caps(
+            1024 * 1024,
+            2 * 1024 * 1024,
+            256 * 1024,
+            2 * 1024 * 1024,
+        );
+        let oversized = serde_json::json!({ "data": "x".repeat(2 * 1024 * 1024) });
+
+        let err = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", oversized, "default")
+            .run()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HarvestError::PayloadTooLarge { .. }),
+            "expected PayloadTooLarge, got {err:?}"
+        );
+
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.is_empty(),
+            "an aborted race must not have queued the open marker (or any \
+             branch dispatch command) -- otherwise replay would find the \
+             marker with no corresponding branch event and diverge: \
+             {commands:?}"
+        );
     }
 
     struct FailsToSerialize;
