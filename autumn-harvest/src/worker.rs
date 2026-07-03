@@ -2985,8 +2985,15 @@ async fn persist_activity_wait_park(
                 .iter()
                 .any(|activity_id| has_activity_terminal_event(&history.events, *activity_id));
 
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-            if has_terminal {
+            // `had_wake_requested` closes the residual race window `has_terminal`
+            // cannot cover (PR #901 review): an already-scheduled activity
+            // completing (and calling `wake_workflow_task`) between the history
+            // load above and this park's own atomic UPDATE would otherwise have
+            // its wake silently dropped, since `wake_workflow_task` no-ops
+            // against a still-claimed (`worker_id IS NOT NULL`) row and the
+            // returned flag was previously discarded here.
+            let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
+            if has_terminal || had_wake_requested {
                 queue::wake_workflow_task(conn, exec_id).await?;
             }
             Ok(())
@@ -4946,9 +4953,17 @@ async fn persist_scheduled_external_activity(
 
                 // Park first to clear worker ownership; wake_workflow_task only
                 // ever moves parked rows.
-                queue::park_workflow_task(conn, task_id, sticky).await?;
+                //
+                // `had_wake_requested` closes the residual race window the
+                // `locked` check above cannot cover (PR #901 review): an
+                // external-task completion/timeout path that does not share
+                // `find_by_token_locked`'s row lock (e.g. a distinct token
+                // whose event still targets this same workflow task) racing
+                // between that check and this park's own atomic UPDATE would
+                // otherwise have its wake silently dropped.
+                let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
 
-                if locked.is_some_and(|t| t.state != "PENDING") {
+                if had_wake_requested || locked.is_some_and(|t| t.state != "PENDING") {
                     // The task is still RUNNING (owned by this worker), so a
                     // wake fired while it was terminal-ineligible would have been
                     // a no-op. Wake now so the next available worker picks up the
