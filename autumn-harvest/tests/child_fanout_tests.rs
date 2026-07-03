@@ -11,7 +11,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use autumn_harvest::context::{WorkflowCommand, WorkflowContext};
+use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::error::{HarvestError, PayloadKind};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::executor::{WorkflowOutcome, run_workflow};
@@ -745,15 +745,17 @@ async fn child_fan_out_raw_oversized_child_rejects_before_dispatching_any_siblin
         other => panic!("expected PayloadTooLarge, got {other:?}"),
     }
 
+    // Zero commands of ANY kind -- not even the `fan_out:{n}` marker --
+    // must be pushed. If the marker were recorded but no children were, a
+    // later replay of this exact terminal history would match the marker
+    // (fresh_dispatch == false), skip the cap re-check, and then diverge
+    // looking for `ChildWorkflowStarted` events that were never recorded
+    // (see `replayer_...` coverage in tests/replayer_tests.rs).
     let commands = ctx.drain_commands();
-    let start_count = commands
-        .iter()
-        .filter(|c| matches!(c, WorkflowCommand::StartChildWorkflow { .. }))
-        .count();
-    assert_eq!(
-        start_count, 0,
-        "no child should have been dispatched when any sibling exceeds the payload cap; \
-         got: {commands:?}"
+    assert!(
+        commands.is_empty(),
+        "no command -- not even the fan_out marker -- should be pushed when any \
+         sibling exceeds the payload cap on a fresh dispatch; got: {commands:?}"
     );
 }
 

@@ -3953,16 +3953,38 @@ impl WorkflowContext {
     /// On **replay**: matches the `MarkerRecorded` event and compares the
     /// recorded count with the current count, returning `Ok(false)` on a
     /// match. Returns a [`HarvestError::NonDeterministic`] when they differ.
+    ///
+    /// Used as-is by the activity fan-out methods, which have no pre-dispatch
+    /// validation step to sequence around the marker. Child fan-out instead
+    /// uses [`peek_fan_out_count`](Self::peek_fan_out_count) +
+    /// [`record_fan_out_marker`](Self::record_fan_out_marker) so the marker
+    /// is recorded only *after* payload validation succeeds — see those
+    /// methods' docs for why.
     fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
+        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
+        if fresh_dispatch {
+            self.record_fan_out_marker(seq, count);
+        }
+        Ok(fresh_dispatch)
+    }
+
+    /// Check the fan-out count against event history **without** pushing the
+    /// `RecordMarker` command on a fresh dispatch.
+    ///
+    /// Splitting this out of [`check_fan_out_count`](Self::check_fan_out_count)
+    /// lets a caller run additional validation (e.g. the child fan-out
+    /// payload-cap pre-check) *between* determining "this is a fresh
+    /// dispatch" and actually committing the `fan_out:{n}` marker to the
+    /// command list — so a validation failure discovered in between never
+    /// leaves a persisted marker with no corresponding dispatch attempt. A
+    /// terminal execution whose history contains a `fan_out:{n}` marker but
+    /// no children would otherwise be replayed by matching the marker
+    /// (`fresh_dispatch == false`) and then diverging when it tries to
+    /// re-derive a `ChildWorkflowStarted` that was never recorded.
+    fn peek_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
         let marker_result = self.match_history(|m| m.match_fan_out_marker(seq, count));
         match marker_result {
-            HistoryMatch::NoMatch => {
-                self.push_command(WorkflowCommand::RecordMarker {
-                    name: format!("fan_out:{seq}"),
-                    details: Value::from(count as u64),
-                });
-                Ok(true)
-            }
+            HistoryMatch::NoMatch => Ok(true),
             HistoryMatch::Matched { .. } => Ok(false),
             HistoryMatch::Diverged {
                 expected,
@@ -3980,6 +4002,17 @@ impl WorkflowContext {
             )),
             _ => unreachable!("match_fan_out_marker only returns Matched, NoMatch, or Diverged"),
         }
+    }
+
+    /// Push the `RecordMarker { name: "fan_out:{n}" }` command. Only called
+    /// on a fresh dispatch (`peek_fan_out_count` returned `true`), and only
+    /// once the caller has confirmed the whole group can actually be
+    /// attempted (see [`peek_fan_out_count`](Self::peek_fan_out_count)).
+    fn record_fan_out_marker(&self, seq: u32, count: usize) {
+        self.push_command(WorkflowCommand::RecordMarker {
+            name: format!("fan_out:{seq}"),
+            details: Value::from(count as u64),
+        });
     }
 
     /// Record or verify a condition-skip decision for a DAG node in event history.
@@ -4307,16 +4340,20 @@ impl WorkflowContext {
     /// cap enforcement (checked lazily inside its `NoMatch` branch) could
     /// let earlier children in the batch push their `StartChildWorkflow`
     /// command and suspend before a later, oversized child aborts the
-    /// whole `try_join_all` with `PayloadTooLarge` — and the worker's
-    /// terminal-failure persistence path does not replay `StartChildWorkflow`
-    /// commands, so those earlier commands would be silently dropped,
-    /// leaving a persisted `fan_out:{n}` marker whose count doesn't match
-    /// its `ChildWorkflowStarted` count. Checking every input up front make
-    /// the dispatch all-or-nothing: either every child is scheduled, or
-    /// none are.
+    /// whole `try_join_all` with `PayloadTooLarge`. Checking every input up
+    /// front makes the dispatch all-or-nothing: either every child is
+    /// scheduled, or none are.
     ///
-    /// Only run when `fresh_dispatch` is `true` (i.e. `check_fan_out_count`
-    /// just recorded a new marker) — a replayed fan-out group's children are
+    /// Called with the result of
+    /// [`peek_fan_out_count`](Self::peek_fan_out_count) — a validation
+    /// failure here means the caller must **not** call
+    /// [`record_fan_out_marker`](Self::record_fan_out_marker), so a fresh
+    /// dispatch that fails the cap check never leaves a persisted
+    /// `fan_out:{n}` marker with no corresponding `ChildWorkflowStarted`
+    /// events; a later replay attempt then simply re-derives the same
+    /// failure from scratch instead of diverging against a marker that
+    /// promised children which were never recorded. Only run when
+    /// `fresh_dispatch` is `true` — a replayed fan-out group's children are
     /// matched against already-recorded history and must never re-derive a
     /// pass/fail verdict from the *current* `payload_max_workflow_input`,
     /// which may have changed since the original run.
@@ -4404,8 +4441,11 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = children.len();
-        let fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
         self.validate_child_payload_caps(fresh_dispatch, &children)?;
+        if fresh_dispatch {
+            self.record_fan_out_marker(seq, count);
+        }
 
         if children.is_empty() {
             return Ok(Vec::new());
@@ -4462,8 +4502,11 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = children.len();
-        let fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
         self.validate_child_payload_caps(fresh_dispatch, &children)?;
+        if fresh_dispatch {
+            self.record_fan_out_marker(seq, count);
+        }
 
         if children.is_empty() {
             return Ok(Vec::new());
