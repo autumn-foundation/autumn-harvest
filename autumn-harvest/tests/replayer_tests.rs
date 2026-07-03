@@ -1252,6 +1252,295 @@ async fn replayer_detects_changed_child_workflow_input() {
 }
 
 // ---------------------------------------------------------------------------
+// Child workflow fan-out replay tests (issue #601)
+// ---------------------------------------------------------------------------
+
+/// Workflow that fans out two children via `spawn_child_workflow_fan_out_raw`.
+fn child_fan_out_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(vec![
+                (
+                    "fan_out_child".to_string(),
+                    serde_json::json!({"item": "A"}),
+                ),
+                (
+                    "fan_out_child".to_string(),
+                    serde_json::json!({"item": "B"}),
+                ),
+            ])
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"processed": results}))
+    })
+}
+
+/// Same shape but fans out only ONE child — triggers a `fan_out:{n}` count
+/// mismatch against a two-child recorded history.
+fn child_fan_out_count_changed_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(vec![(
+                "fan_out_child".to_string(),
+                serde_json::json!({"item": "A"}),
+            )])
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"processed": results}))
+    })
+}
+
+fn child_fan_out_history() -> (ExecutionId, Vec<WorkflowEvent>) {
+    let exec_id = ExecutionId::new();
+    let child_a = ExecutionId::new();
+    let child_b = ExecutionId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::MarkerRecorded {
+            name: "fan_out:1".into(),
+            details: serde_json::json!(2u64),
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: child_a,
+            workflow_name: "fan_out_child".into(),
+            input: serde_json::json!({"item": "A"}),
+        },
+        WorkflowEvent::ChildWorkflowStarted {
+            child_id: child_b,
+            workflow_name: "fan_out_child".into(),
+            input: serde_json::json!({"item": "B"}),
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id: child_a,
+            output: serde_json::json!({"done": "A"}),
+        },
+        WorkflowEvent::ChildWorkflowCompleted {
+            child_id: child_b,
+            output: serde_json::json!({"done": "B"}),
+        },
+        WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"processed": [{"done": "A"}, {"done": "B"}]}),
+        },
+    ];
+    (exec_id, events)
+}
+
+/// Falsifiable success-bar coverage for issue #601: replaying a recorded
+/// history whose workflow calls `spawn_child_workflow_fan_out_raw` must
+/// report `ReplaySucceeded` — mirroring the `set_current_details` precedent
+/// (issue #593) of locking the ACs' "replays deterministically" claim behind
+/// an actual `WorkflowReplayer` fixture rather than only unit tests.
+#[tokio::test]
+async fn replayer_succeeds_for_workflow_spawning_a_child_fan_out() {
+    let (exec_id, events) = child_fan_out_history();
+    let report = WorkflowReplayer::new()
+        .register_fn("child_fan_out_workflow", child_fan_out_workflow)
+        .replay_from_snapshot(make_snapshot("child_fan_out_workflow", exec_id, events))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "child fan-out workflow must replay successfully: {report}"
+    );
+}
+
+/// The recorded history fanned out 2 children; the (simulated) redeployed
+/// code now fans out only 1 -- the `fan_out:{n}` count marker must catch the
+/// divergence before any child is (re)spawned.
+#[tokio::test]
+async fn replayer_detects_child_fan_out_count_mismatch() {
+    let (exec_id, events) = child_fan_out_history();
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "child_fan_out_count_changed_workflow",
+            child_fan_out_count_changed_workflow,
+        )
+        .replay_from_snapshot(make_snapshot(
+            "child_fan_out_count_changed_workflow",
+            exec_id,
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "child fan-out count mismatch must trigger non-determinism: {report}"
+    );
+}
+
+/// Workflow whose second fan-out child exceeds the default 2 MiB payload
+/// cap, so the fan-out fails before *any* child (or the `fan_out:{n}`
+/// marker) is ever recorded -- see `peek_fan_out_count`/
+/// `record_fan_out_marker`/`validate_child_payload_caps` in `context.rs`.
+fn child_fan_out_workflow_with_oversized_child<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let huge = serde_json::json!({ "data": "x".repeat(3 * 1024 * 1024) });
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(vec![
+                (
+                    "fan_out_child".to_string(),
+                    serde_json::json!({"item": "A"}),
+                ),
+                ("fan_out_child".to_string(), huge),
+            ])
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"processed": results}))
+    })
+}
+
+/// Plain (non-fan-out) single-child spawn whose input exceeds the default
+/// 2 MiB payload cap -- used to show the limitation below is general, not
+/// introduced by fan-out.
+fn single_child_spawn_with_oversized_input<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let huge = serde_json::json!({ "data": "x".repeat(3 * 1024 * 1024) });
+        ctx.spawn_child_workflow_raw("some_child", huge)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+/// Post-review hardening for issue #601 (Codex finding, PR #901): a fan-out
+/// that fails on payload-cap overflow before any child is dispatched must
+/// never leave an orphaned `fan_out:{n}` marker in the persisted terminal
+/// history -- confirmed here by feeding the minimal, marker-free
+/// `[WorkflowStarted, WorkflowFailed]` history (what the fixed code
+/// actually persists for this failure -- see the `drain_commands().is_empty()`
+/// assertion in
+/// `child_fan_out_raw_oversized_child_rejects_before_dispatching_any_sibling`,
+/// `tests/child_fanout_tests.rs`) back through the replayer.
+///
+/// This does **not** achieve `ReplaySucceeded`, and that is expected, not a
+/// bug: see [`known_limitation_early_config_dependent_failure_does_not_replay_cleanly`]
+/// below for why a bare trailing `WorkflowFailed` diverges on *any* match
+/// attempt reaching it, fan-out or not. What this test locks in is the
+/// narrower claim the fix actually makes: the divergence is a plain
+/// `MarkerRecorded(fan_out:1)` vs `WorkflowFailed` mismatch (the code
+/// correctly attempting to peek/record the marker and finding the terminal
+/// event instead) -- not the pre-fix `ChildWorkflowStarted(fan_out_child)`
+/// vs `WorkflowFailed` mismatch, which would have meant a marker claiming a
+/// child that was never recorded lied about the group's true size.
+#[tokio::test]
+async fn replayer_diverges_at_marker_not_at_a_phantom_child_for_payload_cap_failure() {
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::WorkflowFailed {
+            error: "payload too large: child input exceeds cap".into(),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "child_fan_out_workflow_with_oversized_child",
+            child_fan_out_workflow_with_oversized_child,
+        )
+        .replay_from_snapshot(make_snapshot(
+            "child_fan_out_workflow_with_oversized_child",
+            exec_id,
+            events,
+        ))
+        .await;
+    match report.status {
+        ReplayStatus::NonDeterminismDetected {
+            ref expected,
+            ref actual,
+            ..
+        } => {
+            assert_eq!(
+                expected, "MarkerRecorded(fan_out:1)",
+                "the fix must move the divergence to the marker check, not \
+                 a phantom child: {report}"
+            );
+            assert_eq!(actual, "WorkflowFailed");
+        }
+        other => panic!(
+            "expected a marker-vs-WorkflowFailed NonDeterminismDetected \
+             (see the known-limitation test for why this doesn't fully \
+             replay), got: {other:?}"
+        ),
+    }
+}
+
+/// Known, **pre-existing** engine limitation (predates issue #601 and is
+/// not specific to fan-out): a workflow whose first live execution fails
+/// due to a config-dependent check -- like the payload-size cap (issue
+/// #252) -- *after* at least one Harvest primitive call has already
+/// touched the matcher does not replay cleanly through `WorkflowReplayer`.
+///
+/// `HistoryMatcher::new` deliberately leaves a bare trailing `WorkflowFailed`
+/// non-transparent unless it is immediately followed by a `WorkflowRedriven`
+/// event (issue #510) -- see the comment there: "a genuinely failed run...
+/// must be unaffected." So any `match_*` call that reaches that cursor
+/// position sees `WorkflowFailed` instead of the event type it expects and
+/// reports a divergence, rather than gracefully recognizing "the workflow
+/// is about to fail anyway." This is demonstrated here with a **plain
+/// single-child** `spawn_child_workflow_raw` call (no fan-out involved at
+/// all) to prove the limitation is general: issue #601's `peek_fan_out_count`
+/// fix (above) narrows *what* diverges for a fan-out's own payload-cap
+/// failure, but closing this gap for good -- making terminal `WorkflowFailed`
+/// events transparent to in-progress match attempts -- is a deliberate,
+/// documented design tradeoff this codebase currently avoids, and is out of
+/// scope for a context.rs-only change.
+#[tokio::test]
+async fn known_limitation_early_config_dependent_failure_does_not_replay_cleanly() {
+    let exec_id = ExecutionId::new();
+    let events = vec![
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        },
+        WorkflowEvent::WorkflowFailed {
+            error: "payload too large".into(),
+        },
+    ];
+    let report = WorkflowReplayer::new()
+        .register_fn(
+            "single_child_spawn_with_oversized_input",
+            single_child_spawn_with_oversized_input,
+        )
+        .replay_from_snapshot(make_snapshot(
+            "single_child_spawn_with_oversized_input",
+            exec_id,
+            events,
+        ))
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+        "documents a known, pre-existing engine limitation (not a fan-out \
+         regression) -- if this ever starts passing, the limitation this \
+         test documents has been fixed and its doc comment should be \
+         updated/removed: {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // External signal replay tests (issue #330)
 // ---------------------------------------------------------------------------
 

@@ -139,7 +139,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql"),
     "\n",
     // issue #534: origin column + per-schedule run-history index.
-    include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql")
+    include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
+    include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -460,7 +461,12 @@ async fn drop_dag_runs_migration_preserves_subsecond_legacy_run_identities() {
 fn build_test_pool(database_url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
     deadpool::managed::Pool::builder(manager)
-        .max_size(4)
+        // Must comfortably exceed the largest `max_concurrent_workflows` any
+        // test in this file passes to `build_runtime_worker` (currently 16,
+        // for the 1-parent+10-children wall-clock fan-out test) -- otherwise
+        // genuinely-concurrent workflow tasks contend for pool checkouts
+        // instead of exercising real in-process parallelism.
+        .max_size(20)
         .build()
         .expect("failed to build test pool")
 }
@@ -747,6 +753,37 @@ fn build_runtime_worker(
     max_concurrent_activities: usize,
     registry: Arc<HandlerRegistry>,
 ) -> Arc<Worker> {
+    build_runtime_worker_with_task_timeout(
+        worker_id,
+        max_concurrent_workflows,
+        max_concurrent_activities,
+        registry,
+        Duration::from_secs(10),
+    )
+}
+
+/// Same as [`build_runtime_worker`], but with a caller-supplied
+/// `workflow_task_timeout` instead of the default 10s.
+///
+/// The default 10s per-decision-cycle budget is tight enough that a
+/// genuinely-high-concurrency, DB-heavy test (many workflow tasks racing for
+/// very few CPUs on a constrained CI runner) can trip the poison-pill
+/// mechanism (`WorkerConfig::poison_pill_threshold`, issue #367) purely from
+/// scheduling delay -- a decision cycle whose actual work (e.g. an in-body
+/// `tokio::time::sleep`) is well under budget can still exceed 10s wall-clock
+/// if the runtime starves it for CPU, and three such strikes quarantines the
+/// execution as FAILED with no relation to the workflow's own logic. Tests
+/// that already carry their own generous outer wall-clock bound (e.g. a
+/// `tokio::time::timeout` around the whole assertion) should use this to set
+/// a `workflow_task_timeout` wide enough that only a genuine stall -- not CI
+/// scheduling noise -- can trip it.
+fn build_runtime_worker_with_task_timeout(
+    worker_id: &str,
+    max_concurrent_workflows: usize,
+    max_concurrent_activities: usize,
+    registry: Arc<HandlerRegistry>,
+    workflow_task_timeout: Duration,
+) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
@@ -769,7 +806,7 @@ fn build_runtime_worker(
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
 
-                workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_task_timeout,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -795,7 +832,26 @@ async fn wait_for_execution_state(
     exec_id: ExecutionId,
     expected_state: &str,
 ) -> WorkflowExecution {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    wait_for_execution_state_with_timeout(
+        database_url,
+        exec_id,
+        expected_state,
+        Duration::from_secs(10),
+    )
+    .await
+}
+
+/// Same as [`wait_for_execution_state`] but with a caller-supplied timeout,
+/// for tests whose expected wall-clock (e.g. many genuinely-concurrent
+/// children each sleeping for real time) can exceed the 10s default under
+/// resource-constrained CI runners.
+async fn wait_for_execution_state_with_timeout(
+    database_url: &str,
+    exec_id: ExecutionId,
+    expected_state: &str,
+    timeout: Duration,
+) -> WorkflowExecution {
+    tokio::time::timeout(timeout, async {
         loop {
             let execution = load_execution_from_url(database_url, exec_id).await;
             if execution.state == expected_state {
@@ -2768,6 +2824,468 @@ async fn worker_completes_parent_workflow_with_parallel_child_workflows() {
     }
 }
 
+// ── Child workflow fan-out (issue #601) ──────────────────────────────────────
+
+/// Parent that fans out three children via `spawn_child_workflow_fan_out_raw`
+/// and returns their outputs in input order.
+fn parent_workflow_child_fan_out<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children = vec![
+            ("fan_child".to_string(), serde_json::json!({"item": "one"})),
+            ("fan_child".to_string(), serde_json::json!({"item": "two"})),
+            (
+                "fan_child".to_string(),
+                serde_json::json!({"item": "three"}),
+            ),
+        ];
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "results": results }))
+    })
+}
+
+fn fan_child_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        Ok(serde_json::json!({"result": input.get("item").and_then(|v| v.as_str()).unwrap_or("?")}))
+    })
+}
+
+fn child_fan_out_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: parent_workflow_child_fan_out,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+            WorkflowInfo {
+                name: "fan_child",
+                module: "integration_e2e",
+                handler: fan_child_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+        ],
+        vec![],
+    ))
+}
+
+/// End-to-end proof that the worker persists a `spawn_child_workflow_fan_out_raw`
+/// suspension batch (the `fan_out:{n}` marker + N `StartChildWorkflow` commands)
+/// exactly like the pre-existing hand-rolled `tokio::join!` parallel-children
+/// path, and that all three children complete and merge in input order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_completes_parent_workflow_with_child_fan_out() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({})).await;
+
+    let worker = build_runtime_worker("worker-e2e-child-fan-out", 6, 2, child_fan_out_registry());
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let parent_execution =
+        wait_for_execution_state(&database_url, parent_exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        parent_execution.output,
+        Some(serde_json::json!({
+            "results": [
+                {"result": "one"},
+                {"result": "two"},
+                {"result": "three"},
+            ],
+        })),
+        "parent output must contain merged child results in input order"
+    );
+
+    let parent_history = load_history_from_url(&database_url, parent_exec_id).await;
+    let has_fan_out_marker = parent_history.events.iter().any(
+        |e| matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name.starts_with("fan_out:")),
+    );
+    assert!(
+        has_fan_out_marker,
+        "parent history must record a fan_out:{{n}} marker"
+    );
+
+    let child_started_count = parent_history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowStarted { .. }))
+        .count();
+    let child_completed_count = parent_history
+        .events
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowCompleted { .. }))
+        .count();
+    assert_eq!(
+        child_started_count, 3,
+        "parent history must record all 3 child starts"
+    );
+    assert_eq!(
+        child_completed_count, 3,
+        "parent history must record all 3 child completions"
+    );
+
+    let child_execs = load_child_executions_from_url(&database_url, parent_exec_id).await;
+    assert_eq!(
+        child_execs.len(),
+        3,
+        "exactly three child executions must be stored with parent_id set"
+    );
+    for child_exec in &child_execs {
+        assert_eq!(
+            child_exec.state, "COMPLETED",
+            "each child execution must be COMPLETED"
+        );
+    }
+}
+
+/// Slow child used by the wall-clock success-metric test: durably waits for
+/// real wall-clock time before returning, so N of these running in parallel
+/// proves genuine concurrent dispatch rather than sequential replay-cycle
+/// scheduling.
+///
+/// **Must use `ctx.timer(...)`, never a raw `tokio::time::sleep` inside the
+/// workflow body.** `drive_workflow`'s live-execution poll wraps the entire
+/// handler call in `tokio::time::timeout(SUSPENSION_TIMEOUT, ...)` with
+/// `SUSPENSION_TIMEOUT = 100ms` (executor.rs) -- a hard, non-configurable
+/// budget for the workflow function to either complete or reach a genuine
+/// command-emitting suspension point (e.g. `rx.await` after pushing
+/// `WorkflowCommand::StartTimer`/`ScheduleActivity`/etc.). A raw
+/// `tokio::time::sleep` participates in neither: it blocks the same poll for
+/// its full duration with zero commands emitted, so any sleep longer than
+/// 100ms deterministically hits `drive_workflow`'s "workflow suspended
+/// without emitted commands; resumption is not implemented yet" fatal error
+/// on every single attempt -- not a CI-speed flake, a 100% reproducible bug
+/// in the test's own workflow code, confirmed via the diagnostic dump added
+/// to this test in an earlier PR #901 review round (every child showed
+/// exactly this error). `ctx.timer` pushes `StartTimer` and suspends via a
+/// real oneshot immediately, so the actual 1s wait happens on a later,
+/// separate decision cycle -- never inside the 100ms window -- exactly like
+/// every other durable-wait primitive in this engine.
+fn slow_fan_child_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.timer("slow_wait", 1).await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"result": input.get("item").and_then(|v| v.as_str()).unwrap_or("?")}))
+    })
+}
+
+/// Parent that fans out ten slow children.
+fn parent_workflow_ten_slow_children<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let children: Vec<_> = (0..10)
+            .map(|i| {
+                (
+                    "slow_fan_child".to_string(),
+                    serde_json::json!({"item": format!("item_{i}")}),
+                )
+            })
+            .collect();
+        let results = ctx
+            .spawn_child_workflow_fan_out_raw(children)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "results": results }))
+    })
+}
+
+fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                name: "e2e_test_workflow",
+                module: "integration_e2e",
+                handler: parent_workflow_ten_slow_children,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+            WorkflowInfo {
+                name: "slow_fan_child",
+                module: "integration_e2e",
+                handler: slow_fan_child_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+
+                debounce: None,
+                batch: None,
+                max_input_bytes: None,
+
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            },
+        ],
+        vec![],
+    ))
+}
+
+/// Polls for the given execution to reach `COMPLETED`, exactly like
+/// [`wait_for_execution_state_with_timeout`], but on timeout dumps a full
+/// snapshot of the parent's and every child's execution row plus task queue
+/// row(s) into the panic message instead of the bare `Elapsed(())`.
+///
+/// This test (`worker_completes_ten_child_fan_out_within_wall_clock_bound`)
+/// failed on CI several consecutive times across a mix of confirmed,
+/// distinct dropped-wake fixes and one actual test-authoring bug (see that
+/// test's own doc comment for the full history); this snapshot is the
+/// fastest way to tell a genuinely-stuck row (`state=RUNNING`,
+/// `worker_id=NULL`, i.e. parked forever) apart from mere CI slowness
+/// (`state=PENDING`, still waiting for a worker slot) without needing an
+/// interactive debugger against a Docker-less sandbox.
+async fn wait_for_completion_with_diagnostics(
+    database_url: &str,
+    parent_exec_id: ExecutionId,
+    timeout: Duration,
+) -> WorkflowExecution {
+    let start = std::time::Instant::now();
+    loop {
+        let execution = load_execution_from_url(database_url, parent_exec_id).await;
+        if execution.state == "COMPLETED" {
+            return execution;
+        }
+        if start.elapsed() >= timeout {
+            let parent_tasks = load_tasks_for_execution_from_url(database_url, parent_exec_id)
+                .await
+                .into_iter()
+                .map(|t| {
+                    format!(
+                        "    task={} state={} worker_id={:?} started_at={:?} \
+                         scheduled_at={} wake_requested={} attempt={} \
+                         crash_strikes={} error={:?}",
+                        t.id,
+                        t.state,
+                        t.worker_id,
+                        t.started_at,
+                        t.scheduled_at,
+                        t.wake_requested,
+                        t.attempt,
+                        t.crash_strikes,
+                        t.error
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let parent_history = load_history_from_url(database_url, parent_exec_id).await;
+            let parent_event_summary = parent_history
+                .events
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("    [{i}] {}", e.type_name()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let children = load_child_executions_from_url(database_url, parent_exec_id).await;
+            let child_report = {
+                let mut lines = Vec::new();
+                for child in &children {
+                    let child_exec_id = ExecutionId::from_uuid(child.id);
+                    let child_tasks =
+                        load_tasks_for_execution_from_url(database_url, child_exec_id).await;
+                    lines.push(format!(
+                        "  child={} name={} state={} error={:?}",
+                        child.id, child.workflow_name, child.state, child.error
+                    ));
+                    for t in &child_tasks {
+                        lines.push(format!(
+                            "    task={} state={} worker_id={:?} started_at={:?} \
+                             scheduled_at={} wake_requested={} attempt={} \
+                             crash_strikes={} error={:?}",
+                            t.id,
+                            t.state,
+                            t.worker_id,
+                            t.started_at,
+                            t.scheduled_at,
+                            t.wake_requested,
+                            t.attempt,
+                            t.crash_strikes,
+                            t.error
+                        ));
+                    }
+                }
+                lines.join("\n")
+            };
+            panic!(
+                "execution {parent_exec_id} did not reach COMPLETED within {timeout:?} \
+                 (currently: {} error={:?}).\n\
+                 parent task queue rows:\n{parent_tasks}\n\
+                 parent history ({} events):\n{parent_event_summary}\n\
+                 children ({} of expected 10 recorded):\n{child_report}",
+                execution.state,
+                execution.error,
+                parent_history.events.len(),
+                children.len(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Success-metric test (issue #601): 10 children fanned out in parallel
+/// must all complete -- proving the fan-out genuinely dispatches all N
+/// children concurrently (one suspension batch, one worker wave) rather
+/// than one at a time.
+///
+/// This is deliberately **not** a tight latency assertion. Two rounds of
+/// `ubuntu-latest` CI failures (a 5s bound against a shared 10s timeout,
+/// then a 20s bound against a 30s timeout) showed that GitHub-hosted
+/// runners (2 vCPUs, and this whole suite runs with `--test-threads=1`) do
+/// not give 11 genuinely-concurrent workflow tasks -- each doing several
+/// real DB round trips -- anywhere close to the throughput available in a
+/// typical dev sandbox. The outer bounds below were widened accordingly.
+/// The qualitative claim this test defends -- "N children fanned out
+/// complete together, not one full round trip at a time" -- does not depend
+/// on the exact numbers; only the "all 10 completed" assertion is meant to
+/// be load-bearing on constrained hardware.
+///
+/// **Root cause of five subsequent CI failures, finally found via the
+/// diagnostic dump in [`wait_for_completion_with_diagnostics`] (PR #901
+/// review rounds 2-8):** the original version of `slow_fan_child_workflow`
+/// used a raw `tokio::time::sleep` inside the workflow body instead of
+/// `ctx.timer(...)`. That is invalid workflow code for this engine --
+/// `drive_workflow`'s live-execution poll wraps the handler call in a hard,
+/// non-configurable 100ms `SUSPENSION_TIMEOUT`, and a raw sleep longer than
+/// that blocks the poll with zero commands emitted, deterministically
+/// hitting "workflow suspended without emitted commands; resumption is not
+/// implemented yet" on every attempt. This was mistaken for a series of
+/// dropped-wake races across several review rounds (each of which found and
+/// fixed a real, independently-confirmed bug in `worker.rs`/`queue.rs` --
+/// none of them were the actual cause of *this test's* failures).
+/// `slow_fan_child_workflow` now uses `ctx.timer("slow_wait", 1)`, the
+/// durable primitive every other wait in this engine uses, which properly
+/// suspends via a real oneshot after pushing `StartTimer` instead of
+/// blocking the poll.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let parent_exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({})).await;
+
+    // Concurrency must comfortably exceed 1 parent + 10 children so every
+    // child dispatches in the same wave instead of queueing behind a
+    // saturated semaphore.
+    //
+    // Uses a wide workflow_task_timeout (not the 10s default) as a safety
+    // margin against pure CI scheduling contention across 11 genuinely-
+    // concurrent, DB-heavy decision cycles -- this was originally suspected
+    // to be the root cause of this test's flakiness, but the actual cause
+    // (see the doc comment above) was unrelated: a raw tokio::time::sleep in
+    // the workflow body, now fixed. The wider timeout is left in place as
+    // cheap, harmless insurance; the test's own 90s outer bound is the real
+    // backstop against a genuine stall.
+    let worker = build_runtime_worker_with_task_timeout(
+        "worker-e2e-ten-slow-children",
+        16,
+        2,
+        ten_slow_children_registry(),
+        Duration::from_secs(60),
+    );
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let start = std::time::Instant::now();
+    let parent_execution = wait_for_completion_with_diagnostics(
+        &database_url,
+        parent_exec_id,
+        Duration::from_secs(90),
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let results = parent_execution
+        .output
+        .as_ref()
+        .and_then(|o| o.get("results"))
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(results.len(), 10, "all 10 children must complete");
+
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "10 fanned-out children should complete in one concurrent wave, \
+         not one at a time; got {elapsed:?} (see the doc comment above for \
+         why this bound is wide)"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn worker_builder_state_is_visible_to_workflow_and_activity() {
@@ -3879,6 +4397,106 @@ async fn wake_workflow_task_refreshes_sticky_until() {
         refreshed_until > parked_until,
         "sticky_until should be pushed forward on wake (parked_until={parked_until}, \
          refreshed_until={refreshed_until})",
+    );
+}
+
+/// Regression test for a PR #901 review finding: `wake_workflow_task`'s
+/// dropped-wake fallback can itself lose the race against `park_workflow_task`.
+///
+/// If `park_workflow_task`'s `candidate SELECT ... FOR UPDATE` has already
+/// locked the row (but not yet committed) when the fallback `UPDATE ... SET
+/// wake_requested = TRUE` runs, the fallback's initial snapshot still shows
+/// the row as owned (`worker_id IS NOT NULL`) so it attempts to lock and
+/// write -- and blocks on park's row lock. Once park commits, Postgres
+/// re-checks the fallback's WHERE clause against the now-committed row
+/// (`worker_id` is NULL after park), which no longer matches, so the
+/// fallback silently updates zero rows and `wake_requested` is never set --
+/// even though a park this wake raced against just committed a parked row
+/// that is this exact wake's target. `wake_workflow_task` must retry its
+/// primary re-pend query in that case rather than relying solely on
+/// `wake_requested`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wake_workflow_task_retries_after_losing_the_park_row_lock_race() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    let mut conn_park =
+        <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect (park conn)");
+    let mut conn_wake =
+        <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect (wake conn)");
+    let mut conn_read =
+        <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect (read conn)");
+
+    let exec_id = insert_workflow_execution(&mut conn_park).await;
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    let task_id = queue::enqueue(&mut conn_park, &params)
+        .await
+        .expect("enqueue should succeed");
+    let queues = vec!["default".to_string()];
+    queue::claim_task(&mut conn_park, &queues, "race-worker", "", None, &[], &[])
+        .await
+        .expect("claim should succeed")
+        .expect("row should be claimable");
+
+    // Manually hold park's row lock open: BEGIN an explicit transaction on
+    // `conn_park`, run the real `park_workflow_task` (which locks and
+    // provisionally updates the row inside this open transaction), but do
+    // NOT commit yet -- reproducing park having locked the row but not yet
+    // released it.
+    conn_park
+        .batch_execute("BEGIN")
+        .await
+        .expect("begin should succeed");
+    queue::park_workflow_task(&mut conn_park, task_id, None)
+        .await
+        .expect("park should succeed inside the open transaction");
+
+    // Wake concurrently on a separate connection while the park above is
+    // still uncommitted. Its primary re-pend UPDATE won't match (the row's
+    // committed snapshot still shows worker_id NOT NULL), so it falls
+    // through to the fallback UPDATE, which blocks on the row lock
+    // `conn_park` is holding.
+    let wake_handle =
+        tokio::spawn(async move { queue::wake_workflow_task(&mut conn_wake, exec_id).await });
+
+    // Give the spawned wake a moment to reach and block on the fallback
+    // UPDATE before releasing the lock -- otherwise this test could pass
+    // trivially because the wake simply ran entirely after the commit.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    conn_park
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit should succeed");
+
+    wake_handle
+        .await
+        .expect("wake task should not panic")
+        .expect("wake_workflow_task should succeed");
+
+    let row = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn_read)
+        .await
+        .expect("row should exist");
+
+    assert_eq!(
+        row.state, "PENDING",
+        "the wake that raced park's row lock must still re-pend the row via \
+         the primary-repend retry, even though wake_requested was silently \
+         lost to the lock-order race",
+    );
+    assert!(
+        row.worker_id.is_none(),
+        "re-pended row must have no worker ownership",
     );
 }
 

@@ -4316,6 +4316,23 @@ impl WorkflowContext {
     // ── Fan-out / parallel activities (issue #359) ───────────────────────────
 
     /// Generate the next fan-out sequence number for marker naming.
+    ///
+    /// **Numbers are never given back, even if the call that allocated one
+    /// goes on to fail before recording a marker** (e.g. a fresh dispatch's
+    /// payload-cap validation fails, or the workflow catches a fan-out
+    /// error and runs another fan-out). An earlier revision tried releasing
+    /// and reusing the number in that case; that let a *different*,
+    /// unrelated fan-out call site inherit the failed call's number, so on
+    /// replay the failed call's `peek_fan_out_count` could match against
+    /// the *other* call's marker/count (or even, in the collect-all-error
+    /// case, its recorded children) — a **silent misattribution**, strictly
+    /// worse than the plain "expected `fan_out:N`, got `fan_out:M`" divergence
+    /// burning the number produces. A caught-and-continued fan-out failure
+    /// simply not replaying cleanly is an accepted instance of the broader,
+    /// pre-existing, engine-wide limitation documented on
+    /// `known_limitation_early_config_dependent_failure_does_not_replay_cleanly`
+    /// (`tests/replayer_tests.rs`) — not something a numbering trick should
+    /// try to paper over.
     fn next_fan_out_seq(&self) -> u32 {
         let mut seq = self.fan_out_seq.lock().expect("fan_out_seq lock poisoned");
         *seq += 1;
@@ -4325,22 +4342,47 @@ impl WorkflowContext {
     /// Record or verify the fan-out count in event history.
     ///
     /// On **live execution** (past end of history): pushes a `RecordMarker`
-    /// command so future replays can verify the collection length.
+    /// command so future replays can verify the collection length, and
+    /// returns `Ok(true)` — this is the very first time this fan-out group
+    /// has ever been dispatched, which callers use to gate one-time,
+    /// pre-dispatch validation that must never re-run on replay.
     ///
     /// On **replay**: matches the `MarkerRecorded` event and compares the
-    /// recorded count with the current count. Returns a
-    /// [`HarvestError::NonDeterministic`] when they differ.
-    fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<()> {
+    /// recorded count with the current count, returning `Ok(false)` on a
+    /// match. Returns a [`HarvestError::NonDeterministic`] when they differ.
+    ///
+    /// Used as-is by the activity fan-out methods, which have no pre-dispatch
+    /// validation step to sequence around the marker. Child fan-out instead
+    /// uses [`peek_fan_out_count`](Self::peek_fan_out_count) +
+    /// [`record_fan_out_marker`](Self::record_fan_out_marker) so the marker
+    /// is recorded only *after* payload validation succeeds — see those
+    /// methods' docs for why.
+    fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
+        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
+        if fresh_dispatch {
+            self.record_fan_out_marker(seq, count);
+        }
+        Ok(fresh_dispatch)
+    }
+
+    /// Check the fan-out count against event history **without** pushing the
+    /// `RecordMarker` command on a fresh dispatch.
+    ///
+    /// Splitting this out of [`check_fan_out_count`](Self::check_fan_out_count)
+    /// lets a caller run additional validation (e.g. the child fan-out
+    /// payload-cap pre-check) *between* determining "this is a fresh
+    /// dispatch" and actually committing the `fan_out:{n}` marker to the
+    /// command list — so a validation failure discovered in between never
+    /// leaves a persisted marker with no corresponding dispatch attempt. A
+    /// terminal execution whose history contains a `fan_out:{n}` marker but
+    /// no children would otherwise be replayed by matching the marker
+    /// (`fresh_dispatch == false`) and then diverging when it tries to
+    /// re-derive a `ChildWorkflowStarted` that was never recorded.
+    fn peek_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
         let marker_result = self.match_history(|m| m.match_fan_out_marker(seq, count));
         match marker_result {
-            HistoryMatch::NoMatch => {
-                self.push_command(WorkflowCommand::RecordMarker {
-                    name: format!("fan_out:{seq}"),
-                    details: Value::from(count as u64),
-                });
-                Ok(())
-            }
-            HistoryMatch::Matched { .. } => Ok(()),
+            HistoryMatch::NoMatch => Ok(true),
+            HistoryMatch::Matched { .. } => Ok(false),
             HistoryMatch::Diverged {
                 expected,
                 actual,
@@ -4357,6 +4399,17 @@ impl WorkflowContext {
             )),
             _ => unreachable!("match_fan_out_marker only returns Matched, NoMatch, or Diverged"),
         }
+    }
+
+    /// Push the `RecordMarker { name: "fan_out:{n}" }` command. Only called
+    /// on a fresh dispatch (`peek_fan_out_count` returned `true`), and only
+    /// once the caller has confirmed the whole group can actually be
+    /// attempted (see [`peek_fan_out_count`](Self::peek_fan_out_count)).
+    fn record_fan_out_marker(&self, seq: u32, count: usize) {
+        self.push_command(WorkflowCommand::RecordMarker {
+            name: format!("fan_out:{seq}"),
+            details: Value::from(count as u64),
+        });
     }
 
     /// Record or verify a condition-skip decision for a DAG node in event history.
@@ -4473,7 +4526,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -4541,7 +4594,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -4661,6 +4714,291 @@ impl WorkflowContext {
                 info.default_retry_policy.clone(),
                 info.default_start_to_close,
             )
+            .await?;
+        let typed: Vec<Result<O, String>> = raw_results
+            .into_iter()
+            .map(|slot| match slot {
+                Ok(v) => serde_json::from_value::<O>(v)
+                    .map(Ok)
+                    .map_err(HarvestError::Serialization),
+                Err(e) => Ok(Err(e)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(typed)
+    }
+
+    // ── Fan-out / parallel child workflows (issue #601) ──────────────────
+
+    /// Validate every child's serialized input against the payload cap
+    /// *before any child is dispatched*, on a fresh (first-time) fan-out
+    /// dispatch only.
+    ///
+    /// Without this pre-check, `spawn_child_workflow_raw`'s own per-child
+    /// cap enforcement (checked lazily inside its `NoMatch` branch) could
+    /// let earlier children in the batch push their `StartChildWorkflow`
+    /// command and suspend before a later, oversized child aborts the
+    /// whole `try_join_all` with `PayloadTooLarge`. Checking every input up
+    /// front makes the dispatch all-or-nothing: either every child is
+    /// scheduled, or none are.
+    ///
+    /// Called with the result of
+    /// [`peek_fan_out_count`](Self::peek_fan_out_count) — a validation
+    /// failure here means the caller must **not** call
+    /// [`record_fan_out_marker`](Self::record_fan_out_marker), so a fresh
+    /// dispatch that fails the cap check never leaves a persisted
+    /// `fan_out:{n}` marker with no corresponding `ChildWorkflowStarted`
+    /// events; a later replay attempt then simply re-derives the same
+    /// failure from scratch instead of diverging against a marker that
+    /// promised children which were never recorded. Only run when
+    /// `fresh_dispatch` is `true` — a replayed fan-out group's children are
+    /// matched against already-recorded history and must never re-derive a
+    /// pass/fail verdict from the *current* `payload_max_workflow_input`,
+    /// which may have changed since the original run.
+    fn validate_child_payload_caps(
+        &self,
+        fresh_dispatch: bool,
+        children: &[(String, Value)],
+    ) -> HarvestResult<()> {
+        if !fresh_dispatch || self.payload_max_workflow_input == 0 {
+            return Ok(());
+        }
+        for (_, input) in children {
+            let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+            if observed > self.payload_max_workflow_input {
+                return Err(HarvestError::PayloadTooLarge {
+                    kind: PayloadKind::ChildWorkflowInput,
+                    observed_bytes: observed,
+                    cap_bytes: self.payload_max_workflow_input,
+                    workflow_type: self.workflow_name.clone(),
+                    activity_name: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn N child workflows **in parallel** (fail-fast variant).
+    ///
+    /// Dispatches every `(workflow_name, input)` pair concurrently — all N
+    /// children are scheduled (each gets its own `ExecutionId` on the
+    /// parent's shard) before any is awaited — and returns a `Vec` of
+    /// outputs in the **same order as the input slice**, regardless of
+    /// completion order. Returns on the **first** child failure — sibling
+    /// children still complete and are recorded in history, but the
+    /// workflow function receives only the first error.
+    ///
+    /// # Replay safety
+    ///
+    /// A `MarkerRecorded { name: "fan_out:{n}", details: <count> }` event is
+    /// appended immediately before the child events on the first live run —
+    /// the identical marker mechanism used by
+    /// [`execute_activity_fan_out_raw`](Self::execute_activity_fan_out_raw).
+    /// Both share one sequence counter, so `fan_out:{n}` numbering stays
+    /// deterministic when activity and child fan-outs are mixed in one
+    /// workflow. On replay the count is verified; if the input collection
+    /// has grown or shrunk since the original run,
+    /// [`HarvestError::NonDeterministic`] is returned before any child is
+    /// spawned.
+    ///
+    /// The input collection **must** be derived from already-recorded state
+    /// (workflow input, prior activity outputs, signals) — never from
+    /// non-deterministic sources such as the system clock or a random number.
+    ///
+    /// # Cancellation
+    ///
+    /// Checks `is_cancelled()` before dispatching. Returns
+    /// [`HarvestError::Cancelled`] immediately when the workflow has been
+    /// cancelled. Fanned-out children are **awaited** (not detached), so
+    /// cancelling the parent after dispatch does **not** propagate to
+    /// already-in-flight children — `ParentClosePolicy` (issue #347) is a
+    /// detached-child mechanism only; an awaited child (fan-out or a plain
+    /// `spawn_child_workflow_raw` call) can outlive a cancelled or
+    /// terminated parent, exactly like today's single-child spawn. Use
+    /// [`spawn_child_workflow_detached_raw`](Self::spawn_child_workflow_detached_raw)
+    /// with an explicit `ParentClosePolicy` if children must be torn down
+    /// when the parent closes.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if `children.len()` differs
+    ///   from the count recorded in history.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    /// - [`HarvestError::ActivityFailed`] (child failures surface with a
+    ///   `child-workflow:{name}` activity name) on the first failure in the
+    ///   group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn spawn_child_workflow_fan_out_raw(
+        &self,
+        children: Vec<(String, Value)>,
+    ) -> HarvestResult<Vec<Value>> {
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = children.len();
+        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
+        self.validate_child_payload_caps(fresh_dispatch, &children)?;
+        if fresh_dispatch {
+            self.record_fan_out_marker(seq, count);
+        }
+
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let futures: Vec<_> = children
+            .into_iter()
+            .map(|(workflow_name, input)| async move {
+                self.spawn_child_workflow_raw(&workflow_name, input).await
+            })
+            .collect();
+
+        futures::future::try_join_all(futures).await
+    }
+
+    /// Spawn N child workflows **in parallel** (collect-all variant).
+    ///
+    /// Dispatches every `(workflow_name, input)` pair concurrently and
+    /// returns a `Vec<Result<Value, String>>` in the **same order as the
+    /// input slice**. Unlike
+    /// [`spawn_child_workflow_fan_out_raw`](Self::spawn_child_workflow_fan_out_raw),
+    /// **all** children run to completion regardless of failures — per-slot
+    /// errors are captured in the returned `Err` variants rather than
+    /// aborting the fan-out early.
+    ///
+    /// # Replay safety
+    ///
+    /// Same count-marker semantics as the fail-fast variant.
+    ///
+    /// # Cancellation
+    ///
+    /// Checks `is_cancelled()` before dispatching. Returns
+    /// `Err(HarvestError::Cancelled)` immediately when the workflow has been
+    /// cancelled.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::NonDeterministic`] if `children.len()` differs
+    ///   from the count recorded in history.
+    /// - [`HarvestError::Cancelled`] if the workflow was cancelled.
+    ///
+    /// Individual per-slot child failures are returned as `Err(String)`
+    /// inside the `Vec`; the outer `Result` only fails for engine-level
+    /// errors (non-determinism, cancellation).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher or commands mutex is poisoned.
+    pub async fn spawn_child_workflow_fan_out_collect_raw(
+        &self,
+        children: Vec<(String, Value)>,
+    ) -> HarvestResult<Vec<Result<Value, String>>> {
+        self.check_cancellation()?;
+
+        let seq = self.next_fan_out_seq();
+        let count = children.len();
+        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
+        self.validate_child_payload_caps(fresh_dispatch, &children)?;
+        if fresh_dispatch {
+            self.record_fan_out_marker(seq, count);
+        }
+
+        if children.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let futures: Vec<_> = children
+            .into_iter()
+            .map(|(workflow_name, input)| async move {
+                match self.spawn_child_workflow_raw(&workflow_name, input).await {
+                    Ok(v) => Ok(Ok(v)),
+                    // Mirrors the activity fan-out sibling's `ActivityFailed | Timeout`
+                    // classification for defensive symmetry. `spawn_child_workflow_raw`
+                    // cannot currently produce `Timeout` (its `HistoryMatch::TimedOut`
+                    // arm is `unreachable!()`), but matching it here means a future
+                    // child-level timeout path degrades to a per-slot failure instead
+                    // of silently reverting to aborting the whole collect-all batch.
+                    Err(
+                        e @ (HarvestError::ActivityFailed { .. } | HarvestError::Timeout { .. }),
+                    ) => Ok(Err(e.to_string())),
+                    Err(e) => Err(e),
+                }
+            })
+            .collect();
+
+        futures::future::try_join_all(futures).await
+    }
+
+    /// Typed fail-fast fan-out: spawn the same child workflow type for every
+    /// input in `inputs` in parallel and return the outputs in input order.
+    ///
+    /// All slots share the same `WorkflowInfo` (workflow name). Use
+    /// [`spawn_child_workflow_fan_out_raw`](Self::spawn_child_workflow_fan_out_raw)
+    /// for heterogeneous child workflow types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if any input cannot be
+    /// serialized. Propagates all errors from
+    /// [`spawn_child_workflow_fan_out_raw`](Self::spawn_child_workflow_fan_out_raw).
+    pub async fn spawn_child_workflow_fan_out<I, O>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        inputs: Vec<I>,
+    ) -> HarvestResult<Vec<O>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        let children = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let raw_results = self.spawn_child_workflow_fan_out_raw(children).await?;
+        raw_results
+            .into_iter()
+            .map(|v| serde_json::from_value(v).map_err(HarvestError::Serialization))
+            .collect()
+    }
+
+    /// Typed collect-all fan-out: spawn the same child workflow type for
+    /// every input in `inputs` in parallel and return per-slot
+    /// `Result<O, String>` in input order.
+    ///
+    /// All slots share the same `WorkflowInfo`. Use
+    /// [`spawn_child_workflow_fan_out_collect_raw`](Self::spawn_child_workflow_fan_out_collect_raw)
+    /// for heterogeneous child workflow types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if any input cannot be
+    /// serialized. Propagates engine-level errors from
+    /// [`spawn_child_workflow_fan_out_collect_raw`](Self::spawn_child_workflow_fan_out_collect_raw).
+    pub async fn spawn_child_workflow_fan_out_collect<I, O>(
+        &self,
+        info: &crate::info::WorkflowInfo,
+        inputs: Vec<I>,
+    ) -> HarvestResult<Vec<Result<O, String>>>
+    where
+        I: serde::Serialize,
+        O: serde::de::DeserializeOwned,
+    {
+        let children = inputs
+            .into_iter()
+            .map(|i| {
+                let json_input = serde_json::to_value(i)?;
+                Ok((info.name.to_string(), json_input))
+            })
+            .collect::<Result<Vec<_>, serde_json::Error>>()?;
+
+        let raw_results = self
+            .spawn_child_workflow_fan_out_collect_raw(children)
             .await?;
         let typed: Vec<Result<O, String>> = raw_results
             .into_iter()

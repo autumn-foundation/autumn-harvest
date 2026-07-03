@@ -149,6 +149,13 @@ diesel::table! {
         /// Row insert time (issue #501 review). Nullable: pre-upgrade rows are NULL
         /// and the schedule-to-start SLI falls back to `scheduled_at` via COALESCE.
         created_at -> Nullable<Timestamptz>,
+        /// Durable "please wake this task" flag (dropped-wake fix, issue #601 CI
+        /// hardening). Set by `wake_workflow_task` when its primary re-pend UPDATE
+        /// matches zero rows because the row is currently claimed and mid-processing
+        /// (`state = 'RUNNING'`, `worker_id IS NOT NULL`) -- the wake would otherwise
+        /// be silently dropped. Read-and-cleared by `park_workflow_task` so a park
+        /// racing a same-cycle wake immediately re-pends instead of parking.
+        wake_requested -> Bool,
     }
 }
 

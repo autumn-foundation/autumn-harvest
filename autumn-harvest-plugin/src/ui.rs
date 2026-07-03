@@ -7856,6 +7856,7 @@ mod tests {
             required_capabilities: None,
             context_headers: None,
             created_at: Some(now),
+            wake_requested: false,
         }
     }
 

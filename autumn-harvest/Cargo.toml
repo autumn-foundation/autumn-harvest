@@ -149,6 +149,9 @@ name = "collect_approvals"
 name = "fanout_batch"
 
 [[example]]
+name = "fanout_child_workflows"
+
+[[example]]
 name = "schema_workflow"
 required-features = ["schema"]
 

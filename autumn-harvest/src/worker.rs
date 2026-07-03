@@ -2894,7 +2894,17 @@ async fn persist_signal_wait_park(
     // `wake_workflow_task` — which only targets RUNNING/parked rows — can
     // reliably distinguish signal waits from timer waits and will not
     // prematurely fire a pending timer when a signal is delivered.
-    let deferred = conn
+    //
+    // `had_wake_requested` closes a race the post-park checks below cannot
+    // cover (PR #901 review): those checks re-load pending signals and
+    // external signal/cancel terminals, but an *update* admitted via
+    // `execute_update_in_process` (which appends `UpdateAdmitted` and calls
+    // `wake_workflow_task` as two separate, non-transactional steps -- no
+    // shared lock with this park) has no equivalent post-park re-check. A
+    // wake landing in the gap between this transaction's park and its commit
+    // would otherwise only be captured as `wake_requested = TRUE` and then
+    // silently discarded here.
+    let (deferred, had_wake_requested) = conn
         .transaction::<_, HarvestError, _>(|conn| {
             async move {
                 store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
@@ -2908,14 +2918,19 @@ async fn persist_signal_wait_park(
                     registry,
                 )
                 .await?;
-                queue::park_workflow_task(conn, task_id, sticky).await?;
-                Ok(deferred)
+                let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
+                Ok((deferred, had_wake_requested))
             }
             .scope_boxed()
         })
         .await?;
     for start in deferred {
         start.spawn();
+    }
+
+    if had_wake_requested {
+        queue::wake_workflow_task(conn, exec_id).await?;
+        return Ok(());
     }
 
     // A signal may have arrived while this task was actively running (before the
@@ -3022,8 +3037,15 @@ async fn persist_activity_wait_park(
                 )
                 .await?;
 
-                queue::park_workflow_task(conn, task_id, sticky).await?;
-                if has_terminal {
+                // `had_wake_requested` closes the residual race window `has_terminal`
+                // cannot cover (PR #901 review): an already-scheduled activity
+                // completing (and calling `wake_workflow_task`) between the history
+                // load above and this park's own atomic UPDATE would otherwise have
+                // its wake silently dropped, since `wake_workflow_task` no-ops
+                // against a still-claimed (`worker_id IS NOT NULL`) row and the
+                // returned flag was previously discarded here.
+                let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
+                if has_terminal || had_wake_requested {
                     queue::wake_workflow_task(conn, exec_id).await?;
                 }
                 Ok(deferred)
@@ -3192,7 +3214,16 @@ async fn persist_scheduled_activities(
 
     let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
     let offloader = registry.payload_offloader();
-    let deferred = conn
+    // `had_wake_requested` closes a race no other check in this function
+    // covers (PR #901 review): a signal or admitted update landing while this
+    // transaction is still appending events / enqueueing the scheduled
+    // activities -- before this park's own atomic UPDATE -- would otherwise
+    // only be captured as `wake_requested = TRUE` on the still-claimed row
+    // and then silently discarded. Unlike the child-completion or
+    // activity-completion races, this is a *fresh* dispatch (the activities
+    // being scheduled here cannot have completed yet), so no other in-band
+    // check exists to catch it.
+    let (deferred, had_wake_requested) = conn
         .transaction::<_, HarvestError, _>(|conn| {
             async move {
                 store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
@@ -3210,8 +3241,8 @@ async fn persist_scheduled_activities(
                     registry,
                 )
                 .await?;
-                queue::park_workflow_task(conn, task_id, sticky).await?;
-                Ok(deferred)
+                let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
+                Ok((deferred, had_wake_requested))
             }
             .scope_boxed()
         })
@@ -3220,6 +3251,11 @@ async fn persist_scheduled_activities(
     for start in deferred {
         start.spawn();
     }
+
+    if had_wake_requested {
+        queue::wake_workflow_task(conn, exec_id).await?;
+    }
+
     Ok(())
 }
 
@@ -3741,9 +3777,15 @@ async fn persist_all_started_child_workflows(
                     false
                 };
 
-                queue::park_workflow_task(conn, task_id, sticky).await?;
+                // `had_wake_requested` closes the residual race window the
+                // `any_terminal` check above cannot cover: a child transitioning
+                // to terminal (and calling `wake_workflow_task`) between that
+                // check and this park's own atomic UPDATE would otherwise have
+                // its wake silently dropped, since `wake_workflow_task` no-ops
+                // against a still-claimed (`worker_id IS NOT NULL`) row.
+                let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
 
-                if any_terminal {
+                if any_terminal || had_wake_requested {
                     queue::wake_workflow_task(conn, parent_exec_id).await?;
                 }
 
@@ -5044,12 +5086,23 @@ async fn persist_scheduled_external_activity(
                     )
                     .await?;
 
-                    // Park first (unconditionally): if the task is still RUNNING
-                    // (owned by this worker), wake_workflow_task on an unparked row
-                    // would be a no-op, so ownership must be cleared before waking
-                    // so the next available worker picks up the terminal event.
-                    queue::park_workflow_task(conn, task_id, sticky).await?;
-                    if locked.is_some_and(|t| t.state != "PENDING") {
+                    // Park first to clear worker ownership; wake_workflow_task only
+                    // ever moves parked rows.
+                    //
+                    // `had_wake_requested` closes the residual race window the
+                    // `locked` check above cannot cover (PR #901 review): an
+                    // external-task completion/timeout path that does not share
+                    // `find_by_token_locked`'s row lock (e.g. a distinct token
+                    // whose event still targets this same workflow task) racing
+                    // between that check and this park's own atomic UPDATE would
+                    // otherwise have its wake silently dropped.
+                    let had_wake_requested =
+                        queue::park_workflow_task(conn, task_id, sticky).await?;
+                    if had_wake_requested || locked.is_some_and(|t| t.state != "PENDING") {
+                        // The task is still RUNNING (owned by this worker), so a
+                        // wake fired while it was terminal-ineligible would have been
+                        // a no-op. Wake now so the next available worker picks up the
+                        // terminal event.
                         queue::wake_workflow_task(conn, exec_id).await?;
                     }
                     Ok(deferred)
@@ -5082,9 +5135,17 @@ async fn persist_scheduled_external_activity(
         }
     });
 
+    // `had_wake_requested` closes a race no other check in this (new-token)
+    // branch covers (PR #901 review): a signal or admitted update landing
+    // while this transaction is still recording the external task -- before
+    // this park's own atomic UPDATE -- would otherwise only be captured as
+    // `wake_requested = TRUE` on the still-claimed row and then silently
+    // discarded, with no later recheck in this branch (unlike the
+    // existing-token branch above, which re-checks the external task's own
+    // state via `find_by_token_locked`).
     let registry = detached_spawns.registry;
     let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
-    let deferred = conn
+    let (deferred, had_wake_requested) = conn
         .transaction::<_, HarvestError, _>(|conn| {
             async move {
                 store::append_events(conn, exec_id, &events, next_event_id).await?;
@@ -5108,14 +5169,18 @@ async fn persist_scheduled_external_activity(
                     registry,
                 )
                 .await?;
-                queue::park_workflow_task(conn, task_id, sticky).await?;
-                Ok(deferred)
+                let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
+                Ok((deferred, had_wake_requested))
             }
             .scope_boxed()
         })
         .await?;
     for start in deferred {
         start.spawn();
+    }
+
+    if had_wake_requested {
+        queue::wake_workflow_task(conn, exec_id).await?;
     }
     Ok(())
 }
@@ -7208,7 +7273,19 @@ async fn process_workflow_task(
             } else {
                 Some(queue::StickyHint::new(worker_id, sticky_timeout))
             };
-            queue::park_workflow_task(conn, task.id, sticky).await?;
+            // Unlike the persist-time PAUSED check further down, this
+            // fast-path read takes no lock, so it has no ordering guarantee
+            // against `resume_workflow_execution` (PR #901 review): if resume
+            // transitions PAUSED -> RUNNING and calls `wake_workflow_task`
+            // between this read and this park's own atomic UPDATE, the wake
+            // is captured as `wake_requested = TRUE` on this still-claimed
+            // row -- and resume's wake is the *only* wake for this event, so
+            // discarding it here (unlike other pause-discard sites) leaves a
+            // resumed execution parked with nothing left to re-wake it.
+            let had_wake_requested = queue::park_workflow_task(conn, task.id, sticky).await?;
+            if had_wake_requested {
+                queue::wake_workflow_task(conn, prepared.exec_id).await?;
+            }
             drop(execute_span);
             return Ok(());
         }
