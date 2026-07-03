@@ -2238,6 +2238,7 @@ mod tests {
 
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
+            mcp: false,
             name: "test",
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -2731,6 +2732,7 @@ mod tests {
         use crate::concurrency::ConcurrencyPolicy;
         let result = HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                mcp: false,
                 name: "report_wf",
                 module: "test",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -2771,6 +2773,7 @@ mod tests {
         use crate::concurrency::ConcurrencyPolicy;
         let result = HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                mcp: false,
                 name: "report_wf",
                 module: "test",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),

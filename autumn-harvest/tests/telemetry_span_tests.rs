@@ -231,6 +231,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "telemetry_master_workflow",
                 module: "telemetry_span_tests",
                 handler: telemetry_master_workflow,
@@ -252,6 +253,7 @@ fn build_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "telem_child_wf",
                 module: "telemetry_span_tests",
                 handler: telem_child_wf,

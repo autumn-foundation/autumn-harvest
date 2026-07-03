@@ -775,6 +775,7 @@ mod tests {
 
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
+            mcp: false,
             name: "echo",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

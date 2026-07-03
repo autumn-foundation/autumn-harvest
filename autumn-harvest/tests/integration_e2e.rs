@@ -869,6 +869,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_with_child,
@@ -890,6 +891,7 @@ fn child_round_trip_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "child_echo_workflow",
                 module: "integration_e2e",
                 handler: child_echo_workflow,
@@ -919,6 +921,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_with_continue_as_new_child,
@@ -940,6 +943,7 @@ fn child_continue_as_new_rejection_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "child_continue_as_new_workflow",
                 module: "integration_e2e",
                 handler: continue_as_new_workflow,
@@ -1423,6 +1427,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: echo_workflow,
@@ -1552,6 +1557,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: failing_workflow,
@@ -1694,6 +1700,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_activity,
@@ -1854,6 +1861,7 @@ async fn activity_retry_resumes_from_persisted_heartbeat_details() {
     let stats = Arc::new(HeartbeatResumeStats::default());
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_checkpointed_activity,
@@ -2251,6 +2259,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
+                    mcp: false,
                     name: "e2e_test_workflow",
                     module: "integration_e2e",
                     handler: workflow_with_slow_activity,
@@ -2414,6 +2423,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
+                    mcp: false,
                     name: "e2e_test_workflow",
                     module: "integration_e2e",
                     handler: workflow_with_timer,
@@ -2683,6 +2693,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_parallel_children,
@@ -2704,6 +2715,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "child_alpha",
                 module: "integration_e2e",
                 handler: child_alpha_workflow,
@@ -2725,6 +2737,7 @@ fn parallel_children_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "child_beta",
                 module: "integration_e2e",
                 handler: child_beta_workflow,
@@ -2862,6 +2875,7 @@ fn child_fan_out_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_child_fan_out,
@@ -2883,6 +2897,7 @@ fn child_fan_out_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "fan_child",
                 module: "integration_e2e",
                 handler: fan_child_workflow,
@@ -3045,6 +3060,7 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "e2e_test_workflow",
                 module: "integration_e2e",
                 handler: parent_workflow_ten_slow_children,
@@ -3066,6 +3082,7 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "slow_fan_child",
                 module: "integration_e2e",
                 handler: slow_fan_child_workflow,
@@ -3322,6 +3339,7 @@ async fn worker_builder_state_is_visible_to_workflow_and_activity() {
 
     let built = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_builder_state,
@@ -3837,6 +3855,7 @@ async fn worker_completes_workflow_after_signal_delivery() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: signal_waiting_workflow,
@@ -3964,6 +3983,7 @@ async fn worker_handles_early_ingested_signal_before_activity() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: activity_then_signal_workflow,
@@ -4513,6 +4533,7 @@ async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: continue_as_new_workflow,
@@ -4626,6 +4647,7 @@ async fn continue_as_new_down_migration_rewrites_historical_runs_for_rollback() 
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: continue_as_new_workflow,
@@ -5551,6 +5573,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
     let wf_name = "scheduled_instant_workflow";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "integration_e2e",
             handler: instant_workflow,
@@ -5676,6 +5699,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
     let wf_name = "scheduled_slow_workflow";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
@@ -5788,6 +5812,7 @@ async fn workflow_schedule_pause_and_resume() {
     let wf_name = "scheduled_pause_resume_workflow";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "integration_e2e",
             handler: instant_workflow,
@@ -6084,6 +6109,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "approval_search_attrs_workflow",
             module: "integration_e2e",
             handler: approval_search_attrs_workflow,
@@ -6252,6 +6278,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
     let make_registry = || {
         Arc::new(HandlerRegistry::new(
             vec![WorkflowInfo {
+                mcp: false,
                 name: "approval_search_attrs_workflow",
                 module: "integration_e2e",
                 handler: approval_search_attrs_workflow,
@@ -6355,6 +6382,7 @@ fn workflow_schedule_builder_rejects_unregistered_workflow() {
 
     let result = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            mcp: false,
             name: "some_other_workflow",
             module: "integration_e2e",
             handler: echo_workflow,
@@ -6717,6 +6745,7 @@ async fn non_retryable_activity_fails_fast_on_attempt_one() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_activity,
@@ -6871,6 +6900,7 @@ async fn circuit_breaker_short_circuits_after_tripping() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_activity,
@@ -7007,6 +7037,7 @@ async fn legacy_string_failure_in_non_retryable_errors_fails_fast() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_with_activity,
@@ -7159,6 +7190,7 @@ async fn overlap_policy_skip_explicitly_drops_new_firings() {
     let wf_name = "overlap_skip_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
@@ -7234,6 +7266,7 @@ async fn overlap_policy_buffer_one_queues_single_slot() {
     let wf_name = "overlap_buffer_one_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
@@ -7318,6 +7351,7 @@ async fn overlap_policy_buffer_all_queues_multiple_slots() {
     let wf_name = "overlap_buffer_all_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
@@ -7406,6 +7440,7 @@ async fn overlap_policy_cancel_other_cancels_inflight_run() {
     let wf_name = "overlap_cancel_other_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
@@ -7489,6 +7524,7 @@ async fn overlap_policy_terminate_other_terminates_inflight_run() {
     let wf_name = "overlap_terminate_other_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
@@ -7576,6 +7612,7 @@ async fn overlap_policy_buffer_one_survives_scheduler_restart() {
     let wf_name = "overlap_restart_wf";
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "integration_e2e",
             handler: slow_workflow,
@@ -8192,6 +8229,7 @@ async fn activity_context_exposes_attempt_and_previous_failure_on_retry() {
 
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "e2e_test_workflow",
             module: "integration_e2e",
             handler: workflow_calling_retry_activity,

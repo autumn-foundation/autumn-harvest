@@ -61,6 +61,7 @@ async fn setup_database_url_with_migrations() -> (String, ContainerAsync<Postgre
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name: "test_workflow",
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),

@@ -21,12 +21,16 @@ use syn::{Expr, ItemFn, LitStr, parse::Parser as _};
 struct UpdateAttrs {
     workflow: Option<String>,
     validator: Option<Expr>,
+    /// Opt-in MCP tool exposure for this update (issue #597). Parsed from
+    /// `#[update(workflow = "…", mcp)]` or `mcp = true`.
+    mcp: bool,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<UpdateAttrs> {
     let mut result = UpdateAttrs {
         workflow: None,
         validator: None,
+        mcp: false,
     };
 
     syn::meta::parser(|meta| {
@@ -38,9 +42,17 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<UpdateAttrs> {
             let value: Expr = meta.value()?.parse()?;
             result.validator = Some(value);
             Ok(())
+        } else if meta.path.is_ident("mcp") {
+            if meta.input.peek(syn::Token![=]) {
+                let value: syn::LitBool = meta.value()?.parse()?;
+                result.mcp = value.value;
+            } else {
+                result.mcp = true;
+            }
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `workflow = \"name\"` or `validator = path::to::fn`",
+                "unsupported attribute: expected `workflow = \"name\"`, `validator = path::to::fn`, or `mcp`",
             ))
         }
     })
@@ -128,6 +140,9 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             )
         },
     );
+
+    let mcp = attrs.mcp;
+    let mcp_expr = quote! { #mcp };
 
     let parsed_path = match crate::parse_and_validate_workflow_path(
         &workflow_name,
@@ -565,6 +580,7 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 has_validator: #has_validator,
                 handler: __dispatch,
                 validator: #validator_expr,
+                mcp: #mcp_expr,
             }
         }
 

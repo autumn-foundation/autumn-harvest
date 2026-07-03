@@ -23031,6 +23031,7 @@ mod tests {
     fn dag_registration_marker_is_separate_from_workflow_registry() {
         let registry = Arc::new(HandlerRegistry::new(
             vec![autumn_harvest::WorkflowInfo {
+                mcp: false,
                 name: "workflow_only",
                 module: "tests",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -24785,6 +24786,7 @@ mod tests {
         Arc::new(HandlerRegistry::new(
             vec![
                 autumn_harvest::WorkflowInfo {
+                    mcp: false,
                     name: "schema_wf",
                     module: "tests",
                     handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -24805,6 +24807,7 @@ mod tests {
                     retry_policy: None,
                 },
                 autumn_harvest::WorkflowInfo {
+                    mcp: false,
                     name: "no_schema_wf",
                     module: "tests",
                     handler: |_ctx, input| Box::pin(async move { Ok(input) }),

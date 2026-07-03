@@ -407,6 +407,7 @@ async fn patch_json(
 fn approval_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "approval_workflow",
             module: "tests",
             handler: approval_workflow,
@@ -435,6 +436,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "approval_workflow",
                 module: "tests",
                 handler: approval_workflow,
@@ -456,6 +458,7 @@ fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "timer_then_signal_workflow",
                 module: "tests",
                 handler: timer_then_signal_workflow,
@@ -1989,6 +1992,7 @@ fn classic_interval_pipeline_info() -> DagInfo {
 
 fn workflow_info_named(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name,
         module: "tests",
         handler: approval_workflow,
@@ -3038,6 +3042,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
     let web_runtime = HarvestRunner::start(
         autumn_harvest::HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                mcp: false,
                 name: "approval_workflow",
                 module: "tests",
                 handler: approval_workflow,
@@ -3078,6 +3083,7 @@ async fn external_runner_processes_workflows_started_via_management_api() {
     let runner = HarvestRunner::start(
         autumn_harvest::HarvestBuilder::new()
             .workflows(vec![WorkflowInfo {
+                mcp: false,
                 name: "approval_workflow",
                 module: "tests",
                 handler: approval_workflow,
@@ -3161,6 +3167,7 @@ async fn worker_enqueues_multiple_activity_commands_from_one_workflow_task() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "parallel_activities_workflow",
             module: "tests",
             handler: parallel_activities_workflow,
@@ -3220,6 +3227,7 @@ async fn worker_does_not_reschedule_inflight_parallel_activity_after_sibling_com
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "staggered_parallel_workflow",
             module: "tests",
             handler: staggered_parallel_workflow,
@@ -3288,6 +3296,7 @@ async fn worker_resolves_parallel_sibling_tasks_that_share_activity_name() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "parallel_same_activity_workflow",
             module: "tests",
             handler: parallel_same_activity_workflow,
@@ -3343,6 +3352,7 @@ async fn worker_serializes_terminal_events_for_parallel_activity_completions() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "barrier_parallel_workflow",
             module: "tests",
             handler: barrier_parallel_workflow,
@@ -3407,6 +3417,7 @@ async fn worker_does_not_append_completion_after_activity_timeout() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "timeout_completion_race_workflow",
             module: "tests",
             handler: timeout_completion_race_workflow,
@@ -4037,6 +4048,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
     let pool = build_test_pool(&database_url);
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "manual_pipeline",
             module: "tests",
             handler: manual_pipeline_workflow,
@@ -4973,6 +4985,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "interval_pipeline",
             module: "tests",
             handler: interval_pipeline_workflow,
@@ -5087,6 +5100,7 @@ async fn concurrent_scheduler_ticks_activate_due_dag_run_once() {
     );
     let registry = Arc::new(HandlerRegistry::with_state(
         vec![WorkflowInfo {
+            mcp: false,
             name: "interval_pipeline",
             module: "tests",
             handler: interval_pipeline_workflow,

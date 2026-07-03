@@ -188,6 +188,7 @@ fn build_pool(url: &str) -> DbPool {
 fn test_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "onboarding",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

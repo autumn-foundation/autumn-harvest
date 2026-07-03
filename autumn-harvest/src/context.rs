@@ -11200,6 +11200,7 @@ mod tests {
 
     fn make_workflow_info(name: &'static str) -> crate::info::WorkflowInfo {
         crate::info::WorkflowInfo {
+            mcp: false,
             name,
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

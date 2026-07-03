@@ -181,6 +181,7 @@ fn make_pool(url: &str) -> DbPool {
 fn make_registry(wf_name: &'static str) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "scheduled_time_tests",
             handler: scheduled_time_recorder,

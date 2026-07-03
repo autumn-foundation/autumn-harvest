@@ -91,3 +91,62 @@ fn workflow_metadata_attributes() {
     assert_eq!(info.runbook_url, Some("https://wiki.acme.com/runbook"));
     assert_eq!(info.severity, Some("sev2"));
 }
+
+// ── MCP tool exposure opt-in (issue #597) ─────────────────────────────────────
+
+#[workflow(mcp)]
+async fn mcp_bare_workflow(_ctx: &WorkflowContext, _input: String) -> Result<String, String> {
+    Ok("done".into())
+}
+
+#[workflow(mcp = true)]
+async fn mcp_eq_true_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
+    Ok(())
+}
+
+#[workflow(mcp = false)]
+async fn mcp_eq_false_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
+    Ok(())
+}
+
+#[workflow(mcp, description = "an MCP-exposed workflow")]
+async fn mcp_with_description_workflow(_ctx: &WorkflowContext) -> Result<(), String> {
+    Ok(())
+}
+
+#[test]
+fn workflow_mcp_bare_flag_sets_true() {
+    let info = __autumn_workflow_info_mcp_bare_workflow();
+    assert!(
+        info.mcp,
+        "#[workflow(mcp)] must set WorkflowInfo.mcp = true"
+    );
+}
+
+#[test]
+fn workflow_mcp_eq_true_sets_true() {
+    let info = __autumn_workflow_info_mcp_eq_true_workflow();
+    assert!(info.mcp, "#[workflow(mcp = true)] must set mcp = true");
+}
+
+#[test]
+fn workflow_mcp_eq_false_sets_false() {
+    let info = __autumn_workflow_info_mcp_eq_false_workflow();
+    assert!(!info.mcp, "#[workflow(mcp = false)] must set mcp = false");
+}
+
+#[test]
+fn workflow_mcp_defaults_to_false() {
+    let info = __autumn_workflow_info_test_workflow();
+    assert!(
+        !info.mcp,
+        "workflows without the mcp attribute must default to mcp = false"
+    );
+}
+
+#[test]
+fn workflow_mcp_composes_with_other_attributes() {
+    let info = __autumn_workflow_info_mcp_with_description_workflow();
+    assert!(info.mcp);
+    assert_eq!(info.description, Some("an MCP-exposed workflow"));
+}
