@@ -1610,7 +1610,9 @@ async fn test_race_two_activities_discards_loser_and_replays_deterministically()
 
 /// Approval-signal-or-timeout expressed via `ctx.race()` (issue #600's other
 /// headline example from the User Story) — a thin wrapper over the
-/// already-shipped `receive_signal_timeout` (issue #476).
+/// already-shipped `receive_signal_timeout` (issue #476). `winner.index` for
+/// this shape is a fixed role-based value (timer = 0, signal = 1),
+/// independent of the `.signal()`/`.timer()` call order below.
 fn race_approval_or_timeout_workflow<'a>(
     ctx: &'a WorkflowContext,
     _input: Value,
@@ -1636,7 +1638,7 @@ async fn test_race_approval_or_timeout_signal_branch() {
 
     assert_eq!(
         outcome.result,
-        Ok(json!({"winner_index": 0, "value": {"approved": true}}))
+        Ok(json!({"winner_index": 1, "value": {"approved": true}}))
     );
 
     let report = outcome
@@ -1657,7 +1659,7 @@ async fn test_race_approval_or_timeout_timer_branch() {
 
     assert_eq!(
         outcome.result,
-        Ok(json!({"winner_index": 1, "value": null}))
+        Ok(json!({"winner_index": 0, "value": null}))
     );
 
     let report = outcome

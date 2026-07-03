@@ -674,7 +674,9 @@ struct RaceDispatch {
 #[derive(Debug, Clone)]
 pub struct RaceWinner {
     /// Index of the winning branch, in the order branches were added to the
-    /// [`RaceBuilder`].
+    /// [`RaceBuilder`] -- **except** for the timer+signal shape, where this
+    /// is a fixed role-based index (timer = `0`, signal = `1`) independent of
+    /// `.timer()`/`.signal()` call order; see [`RaceBuilder`]'s docs.
     pub index: usize,
     /// The label attached via [`RaceBuilder::label`], if any.
     pub label: Option<String>,
@@ -716,7 +718,13 @@ impl RaceWinner {
 ///   primitive (issue #476). A losing signal simply stays observable to a
 ///   later signal wait (nothing to durably cancel); a losing timer's
 ///   still-armed durable timer row is removed by the worker exactly as it is
-///   today.
+///   today. Unlike the two homogeneous shapes above, [`RaceWinner::index`]
+///   for this shape is a **fixed, role-based** value (the timer branch is
+///   always `0`, the signal branch is always `1`) rather than each branch's
+///   position in the builder chain — reordering `.timer()`/`.signal()` calls
+///   between deploys can never flip which index an in-flight execution
+///   observes, because the underlying winner determination is itself decided
+///   purely by recorded history order, independent of call order.
 ///
 /// Mixing branch kinds outside of these three shapes (e.g. racing an activity
 /// against a timer in the same call) returns [`HarvestError::Config`] from
@@ -5093,23 +5101,32 @@ impl WorkflowContext {
     /// losing timer's durable row is removed by the worker exactly as it is
     /// today for `wait_for_signal_timeout`'s signal-won branch.
     async fn race_timer_signal_impl(&self, branches: Vec<RaceBranch>) -> HarvestResult<RaceWinner> {
-        let (signal_index, signal_name, signal_label) = branches
+        // Fixed, role-based indices (NOT each branch's position in the builder
+        // chain): the winner for this shape is decided entirely by
+        // wait_for_signal_timeout's own recorded-history-order determinism
+        // contract, independent of whether `.timer()` or `.signal()` was
+        // called first. Deriving RaceWinner.index from `.position()` in
+        // `branches` instead would let a pure builder-call reorder (same
+        // signal_name/duration_secs, different declaration order) silently
+        // flip the index an in-flight execution observes on replay, with no
+        // NonDeterministic error -- since no marker records the winner for
+        // this shape (unlike the activity/child-workflow shapes above).
+        const TIMER_INDEX: usize = 0;
+        const SIGNAL_INDEX: usize = 1;
+
+        let (signal_name, signal_label) = branches
             .iter()
-            .enumerate()
-            .find_map(|(i, b)| match &b.kind {
+            .find_map(|b| match &b.kind {
                 RaceBranchKind::Signal { signal_name } => {
-                    Some((i, signal_name.clone(), b.label.clone()))
+                    Some((signal_name.clone(), b.label.clone()))
                 }
                 _ => None,
             })
             .expect("validated by caller: exactly one signal branch");
-        let (timer_index, duration_secs, timer_label) = branches
+        let (duration_secs, timer_label) = branches
             .iter()
-            .enumerate()
-            .find_map(|(i, b)| match &b.kind {
-                RaceBranchKind::Timer { duration_secs } => {
-                    Some((i, *duration_secs, b.label.clone()))
-                }
+            .find_map(|b| match &b.kind {
+                RaceBranchKind::Timer { duration_secs } => Some((*duration_secs, b.label.clone())),
                 _ => None,
             })
             .expect("validated by caller: exactly one timer branch");
@@ -5118,12 +5135,12 @@ impl WorkflowContext {
         let payload = self.wait_for_signal_timeout(&signal_name, timeout).await?;
         Ok(payload.map_or_else(
             || RaceWinner {
-                index: timer_index,
+                index: TIMER_INDEX,
                 label: timer_label,
                 value: Value::Null,
             },
             |payload| RaceWinner {
-                index: signal_index,
+                index: SIGNAL_INDEX,
                 label: signal_label,
                 value: payload,
             },
@@ -11740,7 +11757,10 @@ mod tests {
             .run()
             .await?;
 
-        assert_eq!(winner.index, 0, "signal branch was added first");
+        assert_eq!(
+            winner.index, 1,
+            "signal branch has the fixed role-based index 1"
+        );
         assert_eq!(winner.value, serde_json::json!({"approved": true}));
         Ok(())
     }
@@ -11767,8 +11787,54 @@ mod tests {
             .run()
             .await?;
 
-        assert_eq!(winner.index, 1, "timer branch was added second");
+        assert_eq!(
+            winner.index, 0,
+            "timer branch has the fixed role-based index 0"
+        );
         assert_eq!(winner.value, Value::Null);
+        Ok(())
+    }
+
+    /// Regression test (Codex review, PR #902): `RaceWinner.index` for the
+    /// timer+signal shape must be a fixed role-based value, independent of
+    /// whether `.timer()` or `.signal()` was called first in the builder
+    /// chain -- otherwise a pure reorder between deploys (same `signal_name` /
+    /// `duration_secs`) could silently flip the index an in-flight execution
+    /// observes on replay, with no `NonDeterministic` error.
+    #[tokio::test]
+    async fn race_timer_signal_pair_index_is_independent_of_builder_call_order()
+    -> Result<(), HarvestError> {
+        let timer_id = "__signal_timeout:1:approval".to_string();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(&timer_id),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+
+        let ctx_signal_first = WorkflowContext::for_replay(ExecutionId::new(), events.clone());
+        let winner_signal_first = ctx_signal_first
+            .race()
+            .signal("approval")
+            .timer(std::time::Duration::from_secs(300))
+            .run()
+            .await?;
+
+        let ctx_timer_first = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let winner_timer_first = ctx_timer_first
+            .race()
+            .timer(std::time::Duration::from_secs(300))
+            .signal("approval")
+            .run()
+            .await?;
+
+        assert_eq!(winner_signal_first.index, winner_timer_first.index);
+        assert_eq!(winner_signal_first.value, winner_timer_first.value);
         Ok(())
     }
 
