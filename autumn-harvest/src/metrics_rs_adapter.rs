@@ -63,7 +63,7 @@ use crate::telemetry::{
     METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE, METRIC_WORKER_SLOTS_IN_USE,
     METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS,
     METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
-    METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
+    METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED,
     METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
     METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_STARTED,
     METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
@@ -145,6 +145,15 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_WORKFLOW_NON_DETERMINISM,
             METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
             METRIC_LABEL_BUILD_ID => build_id.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
+        counter!(
+            METRIC_WORKFLOW_ND_BLOCKED,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
         )
         .increment(1);
     }
@@ -729,6 +738,7 @@ mod tests {
         rec.record_rate_limit_refill_rate("rl", 2.0);
         rec.record_rate_limit_throttled("rl");
         rec.record_workflow_non_determinism("wf", "build-123");
+        rec.record_workflow_nondeterministic_block("wf", "q");
         rec.record_schedule_to_start("q", 1.5);
         rec.record_queue_oldest_pending_age("q", 30.0);
     }

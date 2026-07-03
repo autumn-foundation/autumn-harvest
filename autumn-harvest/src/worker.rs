@@ -2295,6 +2295,12 @@ async fn update_workflow_execution_completed(
         dsl::error.eq(None::<String>),
         dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
         dsl::completed_at.eq(Some(chrono::Utc::now())),
+        // Belt-and-braces ND-block reset (issue #603): terminal paths that
+        // bypass the pause-guarded persist transaction (and its clear hook)
+        // must not leave a stale block marker on a closed run.
+        dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+        dsl::nd_block_reason.eq(None::<String>),
+        dsl::nd_block_count.eq(0),
     ))
     .execute(conn)
     .await
@@ -2305,6 +2311,87 @@ async fn update_workflow_execution_completed(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Non-terminal replay-non-determinism block (issue #603)
+// ---------------------------------------------------------------------------
+
+/// Base delay before the first blocked re-dispatch (issue #603).
+const ND_BLOCK_BACKOFF_BASE_SECS: u64 = 5;
+
+/// Ceiling on the blocked re-dispatch delay (issue #603). A permanently
+/// diverging history is re-dispatched at most once per this interval, so a
+/// blocked cohort can never hot-loop worker slots. Retries are otherwise
+/// unbounded — the block is rate-limited, not attempt-capped, so a rollback at
+/// any later time still resumes the execution (Temporal workflow-task-retry
+/// semantics; see `docs/runbooks/nondeterminism-block.md`).
+const ND_BLOCK_BACKOFF_CAP_SECS: u64 = 300;
+
+/// Capped exponential backoff for blocked re-dispatches: `5s * 2^count`,
+/// capped at 300s (issue #603).
+///
+/// `block_count` is the execution's `nd_block_count` *before* this block is
+/// recorded, so the first block waits 5s and the seventh-and-later waits the
+/// full 300s cap. Clamping the exponent to 6 keeps the shift trivially
+/// overflow-free (`5 << 6 = 320` already exceeds the cap) and makes negative
+/// counts (impossible via the DB column, but defensive) behave as zero.
+fn nd_block_backoff(block_count: i32) -> Duration {
+    let shift = u32::try_from(block_count.clamp(0, 6)).unwrap_or(0);
+    Duration::from_secs((ND_BLOCK_BACKOFF_BASE_SECS << shift).min(ND_BLOCK_BACKOFF_CAP_SECS))
+}
+
+/// Build the search-attrs diagnostic patch stamped on an execution when the
+/// engine records a replay divergence (issues #480/#603): `failure_cause`
+/// plus whichever of `event_index`/`expected`/`actual`/`workflow_type`/
+/// `build_id` the [`crate::error::NonDeterministicDetails`] carries. Shared by
+/// the terminal failure path (`update_workflow_execution_failed`) and the
+/// non-terminal block path (`block_workflow_for_non_determinism`).
+fn nd_search_attrs_patch(
+    details: &crate::error::NonDeterministicDetails,
+) -> std::collections::HashMap<String, Option<serde_json::Value>> {
+    let mut patch = std::collections::HashMap::new();
+    patch.insert(
+        "failure_cause".to_string(),
+        Some(serde_json::json!("non_determinism")),
+    );
+    if let Some(idx) = details.event_index {
+        patch.insert("event_index".to_string(), Some(serde_json::json!(idx)));
+    }
+    if let Some(ref exp) = details.expected {
+        patch.insert("expected".to_string(), Some(serde_json::json!(exp)));
+    }
+    if let Some(ref act) = details.actual {
+        patch.insert("actual".to_string(), Some(serde_json::json!(act)));
+    }
+    if let Some(ref wf_type) = details.workflow_type {
+        patch.insert(
+            "workflow_type".to_string(),
+            Some(serde_json::json!(wf_type)),
+        );
+    }
+    if let Some(ref bid) = details.build_id {
+        patch.insert("build_id".to_string(), Some(serde_json::json!(bid)));
+    }
+    patch
+}
+
+/// The inverse of [`nd_search_attrs_patch`]: every key that patch can stamp,
+/// mapped to `None` so `store::update_search_attrs` deletes it. Applied when a
+/// previously ND-blocked execution replays cleanly (rollback recovery) so no
+/// stale divergence diagnostic survives on a healthy run.
+fn nd_search_attrs_clear_patch() -> std::collections::HashMap<String, Option<serde_json::Value>> {
+    [
+        "failure_cause",
+        "event_index",
+        "expected",
+        "actual",
+        "workflow_type",
+        "build_id",
+    ]
+    .into_iter()
+    .map(|k| (k.to_string(), None))
+    .collect()
 }
 
 async fn update_workflow_execution_failed(
@@ -2327,6 +2414,12 @@ async fn update_workflow_execution_failed(
         dsl::error.eq(Some(error.to_string())),
         dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
         dsl::completed_at.eq(Some(chrono::Utc::now())),
+        // Belt-and-braces ND-block reset (issue #603): an author failure (or
+        // history-cap/dispatch-error terminal) closes the run — a stale block
+        // marker must not survive on a terminal row.
+        dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+        dsl::nd_block_reason.eq(None::<String>),
+        dsl::nd_block_count.eq(0),
     ))
     .execute(conn)
     .await
@@ -2337,32 +2430,166 @@ async fn update_workflow_execution_failed(
     }
 
     if let Some(details) = nd_details {
-        let mut patch = std::collections::HashMap::new();
-        patch.insert(
-            "failure_cause".to_string(),
-            Some(serde_json::json!("non_determinism")),
-        );
-        if let Some(idx) = details.event_index {
-            patch.insert("event_index".to_string(), Some(serde_json::json!(idx)));
-        }
-        if let Some(ref exp) = details.expected {
-            patch.insert("expected".to_string(), Some(serde_json::json!(exp)));
-        }
-        if let Some(ref act) = details.actual {
-            patch.insert("actual".to_string(), Some(serde_json::json!(act)));
-        }
-        if let Some(ref wf_type) = details.workflow_type {
-            patch.insert(
-                "workflow_type".to_string(),
-                Some(serde_json::json!(wf_type)),
-            );
-        }
-        if let Some(ref bid) = details.build_id {
-            patch.insert("build_id".to_string(), Some(serde_json::json!(bid)));
-        }
-        crate::store::update_search_attrs(conn, exec_id, &patch).await?;
+        crate::store::update_search_attrs(conn, exec_id, &nd_search_attrs_patch(details)).await?;
     }
 
+    Ok(())
+}
+
+/// Block an execution non-terminally on an engine-detected replay divergence
+/// (issue #603).
+///
+/// Runs one row-locked transaction (mirroring the pause-guarded persistence
+/// transaction in [`process_workflow_task`]) that:
+/// 1. stamps `nd_blocked_at` / `nd_block_reason` and increments
+///    `nd_block_count` on the execution row — `state` stays `RUNNING`;
+/// 2. stamps the divergence diagnostic into `search_attrs`
+///    ([`nd_search_attrs_patch`]);
+/// 3. re-pends the workflow task with `scheduled_at = NOW() + backoff`
+///    ([`queue::requeue_workflow_task_nd_blocked`]), unpinning sticky
+///    affinity so a rolled-back worker can claim it.
+///
+/// It deliberately appends **zero** events (the divergent cycle's pending
+/// commands were already discarded by the caller), never calls
+/// `queue::fail_task`, and never runs the parent-close cascade, completion
+/// triggers, or a parent wake — so root and child executions block uniformly
+/// and a blocked child's parent simply stays suspended until the child
+/// completes after the offending build is rolled back.
+///
+/// If an operator pause committed first (observed `PAUSED` under the row
+/// lock), the task is re-parked instead — pause supersedes the block; the
+/// next resume re-derives the same divergence (or replays cleanly under a
+/// fixed build) on a fresh cycle.
+#[allow(clippy::too_many_arguments)]
+async fn block_workflow_for_non_determinism(
+    conn: &mut AsyncPgConnection,
+    telemetry: &crate::telemetry::TelemetryConfig,
+    task: &TaskQueueItem,
+    execution: &WorkflowExecution,
+    exec_id: ExecutionId,
+    worker_id: &str,
+    sticky_timeout: Duration,
+    build_id: &str,
+    error: &str,
+    details: &crate::error::NonDeterministicDetails,
+) -> HarvestResult<()> {
+    let backoff = nd_block_backoff(execution.nd_block_count);
+    let backoff_chrono = chrono::Duration::from_std(backoff).unwrap_or_default();
+    let error_owned = error.to_string();
+    let patch = nd_search_attrs_patch(details);
+    let task_id = task.id;
+    let exec_uuid = exec_id.as_uuid();
+
+    let parked_paused = conn
+        .transaction::<bool, HarvestError, _>(|conn| {
+            let error_owned = error_owned.clone();
+            let patch = patch.clone();
+            async move {
+                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+                let locked_state: Option<String> = exec_dsl::harvest_workflow_executions
+                    .find(exec_uuid)
+                    .select(exec_dsl::state)
+                    .for_update()
+                    .first::<String>(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?;
+                if locked_state.as_deref() == Some("PAUSED") {
+                    let sticky = if sticky_timeout.is_zero() {
+                        None
+                    } else {
+                        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+                    };
+                    // Discarding the wake bool is safe here: this check shares
+                    // `pause_workflow_execution`'s FOR UPDATE row lock, so a
+                    // concurrent resume serializes after this transaction and
+                    // issues its own wake (mirrors the persist-time PAUSED
+                    // re-park in `process_workflow_task`).
+                    let _ = queue::park_workflow_task(conn, task_id, sticky).await?;
+                    return Ok(true);
+                }
+
+                let updated = diesel::update(
+                    exec_dsl::harvest_workflow_executions
+                        .find(exec_uuid)
+                        .filter(exec_dsl::state.eq("RUNNING")),
+                )
+                .set((
+                    exec_dsl::nd_blocked_at.eq(Some(chrono::Utc::now())),
+                    exec_dsl::nd_block_reason.eq(Some(error_owned.clone())),
+                    exec_dsl::nd_block_count.eq(exec_dsl::nd_block_count + 1),
+                ))
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+                if updated == 0 {
+                    return Err(workflow_execution_transition_error(conn, exec_id).await?);
+                }
+
+                crate::store::update_search_attrs(conn, exec_id, &patch).await?;
+                queue::requeue_workflow_task_nd_blocked(
+                    conn,
+                    task_id,
+                    backoff_chrono,
+                    &error_owned,
+                )
+                .await?;
+                Ok(false)
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    if parked_paused {
+        return Ok(());
+    }
+
+    // Post-commit, best-effort telemetry. The #480 detection counter keeps
+    // firing (a divergence WAS detected); the new #603 counter signals the
+    // non-terminal block so a divergent deploy is alertable within one scrape
+    // interval without any execution terminally failing.
+    telemetry
+        .metrics
+        .record_workflow_non_determinism(&execution.workflow_name, build_id);
+    telemetry
+        .metrics
+        .record_workflow_nondeterministic_block(&execution.workflow_name, &task.queue_name);
+    tracing::warn!(
+        execution_id = %exec_id,
+        workflow = %execution.workflow_name,
+        queue = %task.queue_name,
+        build_id,
+        block_count = execution.nd_block_count.saturating_add(1),
+        backoff_secs = backoff.as_secs(),
+        event_index = ?details.event_index,
+        expected = ?details.expected,
+        actual = ?details.actual,
+        "harvest: replay non-determinism detected — execution blocked \
+         non-terminally; roll back or fix the offending build to resume \
+         (see docs/runbooks/nondeterminism-block.md)"
+    );
+
+    Ok(())
+}
+
+/// Clear the ND-block marker columns and search-attrs diagnostic on an
+/// execution whose latest dispatch replayed cleanly (issue #603). Called
+/// inside the same transaction that persists the recovered cycle's outcome so
+/// recovery and marker-clearing are atomic.
+async fn clear_nd_block(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> HarvestResult<()> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+        .set((
+            dsl::nd_blocked_at.eq(None::<chrono::DateTime<chrono::Utc>>),
+            dsl::nd_block_reason.eq(None::<String>),
+            dsl::nd_block_count.eq(0),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    crate::store::update_search_attrs(conn, exec_id, &nd_search_attrs_clear_patch()).await?;
     Ok(())
 }
 
@@ -6142,6 +6369,14 @@ enum WorkflowPersistFlow {
 const fn schedule_counter_action(outcome: &WorkflowOutcome) -> Option<bool> {
     match outcome {
         WorkflowOutcome::Completed { .. } => Some(false),
+        // Defensive (issue #603): an engine-detected replay divergence blocks
+        // the execution non-terminally at the gate in `process_workflow_task`
+        // and never reaches this counter mapping — but if it ever did, a
+        // blocked run is neither a schedule success nor a failure.
+        WorkflowOutcome::Failed {
+            non_deterministic_details: Some(_),
+            ..
+        } => None,
         WorkflowOutcome::Failed { .. } => Some(true),
         _ => None,
     }
@@ -7291,6 +7526,43 @@ async fn process_workflow_task(
         }
     }
 
+    // Issue #603: an engine-detected replay divergence must NOT terminally
+    // fail the workflow — it is a recoverable code-deploy bug, not a workflow
+    // outcome ("a workflow-task failure must never fail the workflow"). Gate
+    // here, before ANY terminal side effect (cascade counting, history-cap
+    // fail, terminal metrics, and — critically — the pre-terminal event
+    // appends in `persist_terminal_outcome_commands`): the divergent cycle's
+    // pending commands are untrustworthy, and persisting even one marker from
+    // the bad build would poison history against the rolled-back code. The
+    // whole decision is discarded exactly like the ParkedPaused path; the
+    // block path appends zero events, stamps the diagnostic columns, and
+    // re-pends the task with a capped-exponential backoff so a rollback at
+    // any later time resumes the execution from where it was.
+    //
+    // The author-Err path is untouched: a workflow body's own `Err(...)`
+    // carries `non_deterministic_details: None` and still fails terminally
+    // below, exactly as before.
+    if let WorkflowOutcome::Failed {
+        error,
+        non_deterministic_details: Some(details),
+    } = &outcome
+    {
+        drop(execute_span);
+        return block_workflow_for_non_determinism(
+            conn,
+            &telemetry,
+            task,
+            &prepared.execution,
+            prepared.exec_id,
+            worker_id,
+            sticky_timeout,
+            build_id,
+            error,
+            details,
+        )
+        .await;
+    }
+
     let terminal_parent_close_cascade_events = if matches!(
         &outcome,
         WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
@@ -7387,6 +7659,9 @@ async fn process_workflow_task(
             non_deterministic_details,
             ..
         } => {
+            // Defensive (issue #603): an ND-carrying Failed outcome is gated
+            // earlier into `block_workflow_for_non_determinism` (which emits
+            // the detection counter itself) and never reaches this arm.
             if non_deterministic_details.is_some() {
                 telemetry
                     .metrics
@@ -7508,6 +7783,16 @@ async fn process_workflow_task(
                     };
                     queue::park_workflow_task(conn, task.id, sticky).await?;
                     return Ok(WorkflowPersistFlow::ParkedPaused);
+                }
+
+                // Issue #603: this cycle replayed cleanly (the ND gate above
+                // did not fire), so if the execution was previously blocked on
+                // replay non-determinism the offending build has been rolled
+                // back or fixed — clear the block marker atomically with the
+                // recovered cycle's persisted outcome. Guarded on the
+                // claim-time snapshot so never-blocked executions pay nothing.
+                if execution_ref.nd_blocked_at.is_some() {
+                    clear_nd_block(conn, persistence.exec_id).await?;
                 }
 
                 let (retry_scheduled, deferred_checks, race_deferred_triggers) =
@@ -11911,5 +12196,106 @@ mod tests {
         };
         let worker = Worker::new(cfg, registry).unwrap();
         assert_eq!(worker.ineligible_activities, vec!["act_cpu".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-terminal replay-non-determinism block (issue #603)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn nd_block_backoff_starts_at_base_and_doubles() {
+        assert_eq!(nd_block_backoff(0), Duration::from_secs(5));
+        assert_eq!(nd_block_backoff(1), Duration::from_secs(10));
+        assert_eq!(nd_block_backoff(2), Duration::from_secs(20));
+        assert_eq!(nd_block_backoff(3), Duration::from_secs(40));
+        assert_eq!(nd_block_backoff(5), Duration::from_secs(160));
+    }
+
+    #[test]
+    fn nd_block_backoff_caps_at_five_minutes() {
+        // 5 * 2^6 = 320 > 300 — first count that hits the cap.
+        assert_eq!(nd_block_backoff(6), Duration::from_secs(300));
+        assert_eq!(nd_block_backoff(20), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn nd_block_backoff_saturates_on_extreme_counts() {
+        // Negative counts (impossible via the DB column but defensive) clamp
+        // to the base; huge counts must not overflow the shift.
+        assert_eq!(nd_block_backoff(-1), Duration::from_secs(5));
+        assert_eq!(nd_block_backoff(i32::MAX), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn nd_search_attrs_patch_full_details_stamps_all_six_keys() {
+        let details = crate::error::NonDeterministicDetails {
+            event_index: Some(7),
+            expected: Some("ActivityScheduled".to_string()),
+            actual: Some("TimerStarted".to_string()),
+            workflow_type: Some("onboarding".to_string()),
+            build_id: Some("v2.0.0".to_string()),
+        };
+        let patch = nd_search_attrs_patch(&details);
+        assert_eq!(
+            patch.get("failure_cause"),
+            Some(&Some(serde_json::json!("non_determinism")))
+        );
+        assert_eq!(patch.get("event_index"), Some(&Some(serde_json::json!(7))));
+        assert_eq!(
+            patch.get("expected"),
+            Some(&Some(serde_json::json!("ActivityScheduled")))
+        );
+        assert_eq!(
+            patch.get("actual"),
+            Some(&Some(serde_json::json!("TimerStarted")))
+        );
+        assert_eq!(
+            patch.get("workflow_type"),
+            Some(&Some(serde_json::json!("onboarding")))
+        );
+        assert_eq!(
+            patch.get("build_id"),
+            Some(&Some(serde_json::json!("v2.0.0")))
+        );
+        assert_eq!(patch.len(), 6);
+    }
+
+    #[test]
+    fn nd_search_attrs_patch_sparse_details_stamps_only_failure_cause() {
+        let details = crate::error::NonDeterministicDetails {
+            event_index: None,
+            expected: None,
+            actual: None,
+            workflow_type: None,
+            build_id: None,
+        };
+        let patch = nd_search_attrs_patch(&details);
+        assert_eq!(
+            patch.get("failure_cause"),
+            Some(&Some(serde_json::json!("non_determinism")))
+        );
+        assert_eq!(patch.len(), 1);
+    }
+
+    #[test]
+    fn nd_search_attrs_clear_patch_removes_every_key_the_stamp_can_set() {
+        // Key symmetry: recovery must delete exactly the key set the block
+        // path can stamp, so a recovered execution carries no stale ND
+        // diagnostic in search_attrs.
+        let clear = nd_search_attrs_clear_patch();
+        let full = nd_search_attrs_patch(&crate::error::NonDeterministicDetails {
+            event_index: Some(1),
+            expected: Some("e".to_string()),
+            actual: Some("a".to_string()),
+            workflow_type: Some("w".to_string()),
+            build_id: Some("b".to_string()),
+        });
+        let mut clear_keys: Vec<&str> = clear.keys().map(String::as_str).collect();
+        let mut stamp_keys: Vec<&str> = full.keys().map(String::as_str).collect();
+        clear_keys.sort_unstable();
+        stamp_keys.sort_unstable();
+        assert_eq!(clear_keys, stamp_keys);
+        // Every value in the clear patch is None (= delete the key).
+        assert!(clear.values().all(Option::is_none));
     }
 }

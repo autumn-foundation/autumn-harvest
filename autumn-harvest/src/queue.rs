@@ -1205,6 +1205,71 @@ pub async fn requeue_for_retry(
     Ok(())
 }
 
+/// Re-pend an ND-blocked workflow task with a future `scheduled_at` (issue
+/// #603).
+///
+/// Mirrors [`requeue_for_retry`] with three deliberate differences for the
+/// replay-non-determinism block path:
+/// - restricted to `task_type = 'workflow'` rows (defensive — the block path
+///   only ever holds a claimed workflow task);
+/// - clears the sticky affinity columns: the pinned worker is running the
+///   divergent build, so the re-dispatch must be claimable by any worker
+///   (e.g. one already running the rolled-back build);
+/// - clears `wake_requested`: a wake captured mid-cycle must not short-circuit
+///   the backoff — the row is durably `PENDING` and deferred purely by
+///   `scheduled_at` (`claim_task` enforces `scheduled_at <= NOW()`), so signals
+///   arriving while blocked are processed on the next backoff dispatch.
+///
+/// No `pg_notify`: the task is deliberately not claimable until `scheduled_at`,
+/// so waking pollers early would be pure noise.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not a
+/// claimed (`RUNNING`) workflow task, and
+/// [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_workflow_task_nd_blocked(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    delay: Duration,
+    reason: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let next_run = Utc::now() + delay;
+
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::crash_strikes.eq(0),
+        dsl::scheduled_at.eq(next_run),
+        dsl::error.eq(Some(reason)),
+        dsl::sticky_worker_id.eq(None::<String>),
+        dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+        dsl::sticky_timeout.eq(None::<chrono::Duration>),
+        dsl::wake_requested.eq(false),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not a running workflow task"
+        )));
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // force_retry_activity_now (issue #516)
 // ---------------------------------------------------------------------------
