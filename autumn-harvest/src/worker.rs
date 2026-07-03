@@ -6956,7 +6956,19 @@ async fn process_workflow_task(
             } else {
                 Some(queue::StickyHint::new(worker_id, sticky_timeout))
             };
-            queue::park_workflow_task(conn, task.id, sticky).await?;
+            // Unlike the persist-time PAUSED check further down, this
+            // fast-path read takes no lock, so it has no ordering guarantee
+            // against `resume_workflow_execution` (PR #901 review): if resume
+            // transitions PAUSED -> RUNNING and calls `wake_workflow_task`
+            // between this read and this park's own atomic UPDATE, the wake
+            // is captured as `wake_requested = TRUE` on this still-claimed
+            // row -- and resume's wake is the *only* wake for this event, so
+            // discarding it here (unlike other pause-discard sites) leaves a
+            // resumed execution parked with nothing left to re-wake it.
+            let had_wake_requested = queue::park_workflow_task(conn, task.id, sticky).await?;
+            if had_wake_requested {
+                queue::wake_workflow_task(conn, prepared.exec_id).await?;
+            }
             drop(execute_span);
             return Ok(());
         }

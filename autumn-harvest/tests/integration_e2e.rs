@@ -2986,22 +2986,35 @@ async fn worker_completes_parent_workflow_with_child_fan_out() {
     }
 }
 
-/// Slow child used by the wall-clock success-metric test: sleeps for real
-/// wall-clock time before returning, so N of these running in parallel proves
-/// genuine concurrent dispatch rather than sequential replay-cycle scheduling.
+/// Slow child used by the wall-clock success-metric test: durably waits for
+/// real wall-clock time before returning, so N of these running in parallel
+/// proves genuine concurrent dispatch rather than sequential replay-cycle
+/// scheduling.
 ///
-/// 200ms (not the AC's illustrative "~1s") to keep the test's absolute floor
-/// latency low on CPU-constrained CI runners (GitHub-hosted `ubuntu-latest`
-/// typically has 2 vCPUs, and this suite runs with `--test-threads=1`, so
-/// this test's 11 genuinely-concurrent workflow tasks -- each doing real DB
-/// round trips -- compete for very little CPU); the concurrency claim being
-/// tested is unaffected by the exact sleep duration.
+/// **Must use `ctx.timer(...)`, never a raw `tokio::time::sleep` inside the
+/// workflow body.** `drive_workflow`'s live-execution poll wraps the entire
+/// handler call in `tokio::time::timeout(SUSPENSION_TIMEOUT, ...)` with
+/// `SUSPENSION_TIMEOUT = 100ms` (executor.rs) -- a hard, non-configurable
+/// budget for the workflow function to either complete or reach a genuine
+/// command-emitting suspension point (e.g. `rx.await` after pushing
+/// `WorkflowCommand::StartTimer`/`ScheduleActivity`/etc.). A raw
+/// `tokio::time::sleep` participates in neither: it blocks the same poll for
+/// its full duration with zero commands emitted, so any sleep longer than
+/// 100ms deterministically hits `drive_workflow`'s "workflow suspended
+/// without emitted commands; resumption is not implemented yet" fatal error
+/// on every single attempt -- not a CI-speed flake, a 100% reproducible bug
+/// in the test's own workflow code, confirmed via the diagnostic dump added
+/// to this test in an earlier PR #901 review round (every child showed
+/// exactly this error). `ctx.timer` pushes `StartTimer` and suspends via a
+/// real oneshot immediately, so the actual 1s wait happens on a later,
+/// separate decision cycle -- never inside the 100ms window -- exactly like
+/// every other durable-wait primitive in this engine.
 fn slow_fan_child_workflow<'a>(
-    _ctx: &'a WorkflowContext,
+    ctx: &'a WorkflowContext,
     input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        ctx.timer("slow_wait", 1).await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"result": input.get("item").and_then(|v| v.as_str()).unwrap_or("?")}))
     })
 }
@@ -3078,36 +3091,19 @@ fn ten_slow_children_registry() -> Arc<HandlerRegistry> {
     ))
 }
 
-/// Success-metric test (issue #601): 10 children fanned out in parallel
-/// must all complete -- proving the fan-out genuinely dispatches all N
-/// children concurrently (one suspension batch, one worker wave) rather
-/// than one at a time.
-///
-/// This is deliberately **not** a tight latency assertion. Two rounds of
-/// `ubuntu-latest` CI failures (a 5s bound against a shared 10s timeout,
-/// then a 20s bound against a 30s timeout) showed that GitHub-hosted
-/// runners (2 vCPUs, and this whole suite runs with `--test-threads=1`) do
-/// not give 11 genuinely-concurrent workflow tasks -- each doing several
-/// real DB round trips -- anywhere close to the throughput available in a
-/// typical dev sandbox. Both the per-child sleep (200ms, not the AC's
-/// illustrative "~1s") and the outer bounds below were reduced/widened
-/// accordingly. The qualitative claim this test defends -- "N children
-/// fanned out complete together, not one full round trip at a time" -- does
-/// not depend on the exact numbers; only the "all 10 completed" assertion
-/// is meant to be load-bearing on constrained hardware.
 /// Polls for the given execution to reach `COMPLETED`, exactly like
 /// [`wait_for_execution_state_with_timeout`], but on timeout dumps a full
 /// snapshot of the parent's and every child's execution row plus task queue
 /// row(s) into the panic message instead of the bare `Elapsed(())`.
 ///
 /// This test (`worker_completes_ten_child_fan_out_within_wall_clock_bound`)
-/// failed on CI five consecutive times across several confirmed, distinct
-/// dropped-wake fixes (PR #901 review rounds 2-4); if a sixth failure occurs
-/// after all of those fixes, this snapshot is the fastest way to tell a
-/// genuinely-stuck row (`state=RUNNING`, `worker_id=NULL`, i.e. parked
-/// forever) apart from mere CI slowness (`state=PENDING`, still waiting for
-/// a worker slot) without needing an interactive debugger against a
-/// Docker-less sandbox.
+/// failed on CI several consecutive times across a mix of confirmed,
+/// distinct dropped-wake fixes and one actual test-authoring bug (see that
+/// test's own doc comment for the full history); this snapshot is the
+/// fastest way to tell a genuinely-stuck row (`state=RUNNING`,
+/// `worker_id=NULL`, i.e. parked forever) apart from mere CI slowness
+/// (`state=PENDING`, still waiting for a worker slot) without needing an
+/// interactive debugger against a Docker-less sandbox.
 async fn wait_for_completion_with_diagnostics(
     database_url: &str,
     parent_exec_id: ExecutionId,
@@ -3185,6 +3181,40 @@ async fn wait_for_completion_with_diagnostics(
     }
 }
 
+/// Success-metric test (issue #601): 10 children fanned out in parallel
+/// must all complete -- proving the fan-out genuinely dispatches all N
+/// children concurrently (one suspension batch, one worker wave) rather
+/// than one at a time.
+///
+/// This is deliberately **not** a tight latency assertion. Two rounds of
+/// `ubuntu-latest` CI failures (a 5s bound against a shared 10s timeout,
+/// then a 20s bound against a 30s timeout) showed that GitHub-hosted
+/// runners (2 vCPUs, and this whole suite runs with `--test-threads=1`) do
+/// not give 11 genuinely-concurrent workflow tasks -- each doing several
+/// real DB round trips -- anywhere close to the throughput available in a
+/// typical dev sandbox. The outer bounds below were widened accordingly.
+/// The qualitative claim this test defends -- "N children fanned out
+/// complete together, not one full round trip at a time" -- does not depend
+/// on the exact numbers; only the "all 10 completed" assertion is meant to
+/// be load-bearing on constrained hardware.
+///
+/// **Root cause of five subsequent CI failures, finally found via the
+/// diagnostic dump in [`wait_for_completion_with_diagnostics`] (PR #901
+/// review rounds 2-8):** the original version of `slow_fan_child_workflow`
+/// used a raw `tokio::time::sleep` inside the workflow body instead of
+/// `ctx.timer(...)`. That is invalid workflow code for this engine --
+/// `drive_workflow`'s live-execution poll wraps the handler call in a hard,
+/// non-configurable 100ms `SUSPENSION_TIMEOUT`, and a raw sleep longer than
+/// that blocks the poll with zero commands emitted, deterministically
+/// hitting "workflow suspended without emitted commands; resumption is not
+/// implemented yet" on every attempt. This was mistaken for a series of
+/// dropped-wake races across several review rounds (each of which found and
+/// fixed a real, independently-confirmed bug in `worker.rs`/`queue.rs` --
+/// none of them were the actual cause of *this test's* failures).
+/// `slow_fan_child_workflow` now uses `ctx.timer("slow_wait", 1)`, the
+/// durable primitive every other wait in this engine uses, which properly
+/// suspends via a real oneshot after pushing `StartTimer` instead of
+/// blocking the poll.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     let (database_url, _container) = setup_test_database_url().await;
@@ -3199,15 +3229,14 @@ async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     // child dispatches in the same wave instead of queueing behind a
     // saturated semaphore.
     //
-    // Uses a wide workflow_task_timeout (not the 10s default) because this
-    // test's 11 genuinely-concurrent, DB-heavy decision cycles can exceed a
-    // 10s per-cycle wall-clock budget purely from CI scheduling contention,
-    // tripping the poison-pill mechanism and FAILing every child with no
-    // relation to the workflow's own logic (root-caused via the diagnostic
-    // dump in wait_for_completion_with_diagnostics on a prior CI failure,
-    // where all 10 children showed state=FAILED almost immediately after
-    // being claimed). The test's own 90s outer bound is the real backstop
-    // against a genuine stall.
+    // Uses a wide workflow_task_timeout (not the 10s default) as a safety
+    // margin against pure CI scheduling contention across 11 genuinely-
+    // concurrent, DB-heavy decision cycles -- this was originally suspected
+    // to be the root cause of this test's flakiness, but the actual cause
+    // (see the doc comment above) was unrelated: a raw tokio::time::sleep in
+    // the workflow body, now fixed. The wider timeout is left in place as
+    // cheap, harmless insurance; the test's own 90s outer bound is the real
+    // backstop against a genuine stall.
     let worker = build_runtime_worker_with_task_timeout(
         "worker-e2e-ten-slow-children",
         16,
