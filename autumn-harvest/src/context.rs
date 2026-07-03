@@ -3942,6 +3942,34 @@ impl WorkflowContext {
         *seq
     }
 
+    /// Undo a `next_fan_out_seq()` allocation for a fan-out group that will
+    /// never leave a footprint in history (a fresh-dispatch validation
+    /// failure discovered *before* the marker was recorded — see
+    /// `peek_fan_out_count`/`record_fan_out_marker`/
+    /// `validate_child_payload_caps`).
+    ///
+    /// Without this, a workflow that catches a fan-out's validation error
+    /// (e.g. `PayloadTooLarge`) and goes on to run *another* fan-out in the
+    /// same execution would have already consumed a sequence number for the
+    /// failed group with no marker ever recorded for it — the next
+    /// successful fan-out then records a marker one number ahead of what a
+    /// fresh replay derives, and replay diverges hunting for the skipped
+    /// number's marker before it can even reproduce the caught error.
+    ///
+    /// Safe only because nothing yields control between `next_fan_out_seq()`
+    /// and this call within one fan-out method — no sibling fan-out call
+    /// (sequential or concurrently joined) can have advanced the counter
+    /// further in the interim, so `seq` is always still the most recently
+    /// allocated number when this runs. The equality check is a defensive
+    /// no-op guard against that invariant rather than a documented
+    /// possibility of it being violated.
+    fn release_fan_out_seq(&self, seq: u32) {
+        let mut current = self.fan_out_seq.lock().expect("fan_out_seq lock poisoned");
+        if *current == seq {
+            *current -= 1;
+        }
+    }
+
     /// Record or verify the fan-out count in event history.
     ///
     /// On **live execution** (past end of history): pushes a `RecordMarker`
@@ -4441,8 +4469,19 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = children.len();
-        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
-        self.validate_child_payload_caps(fresh_dispatch, &children)?;
+        let fresh_dispatch = match self.peek_fan_out_count(seq, count) {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                self.release_fan_out_seq(seq);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.validate_child_payload_caps(fresh_dispatch, &children) {
+            if fresh_dispatch {
+                self.release_fan_out_seq(seq);
+            }
+            return Err(e);
+        }
         if fresh_dispatch {
             self.record_fan_out_marker(seq, count);
         }
@@ -4502,8 +4541,19 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = children.len();
-        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
-        self.validate_child_payload_caps(fresh_dispatch, &children)?;
+        let fresh_dispatch = match self.peek_fan_out_count(seq, count) {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                self.release_fan_out_seq(seq);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.validate_child_payload_caps(fresh_dispatch, &children) {
+            if fresh_dispatch {
+                self.release_fan_out_seq(seq);
+            }
+            return Err(e);
+        }
         if fresh_dispatch {
             self.record_fan_out_marker(seq, count);
         }

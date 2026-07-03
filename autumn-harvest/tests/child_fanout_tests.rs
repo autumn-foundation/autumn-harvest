@@ -806,3 +806,74 @@ async fn child_fan_out_raw_replay_ignores_current_payload_cap_for_already_record
 
     assert_eq!(results, vec![json!("result_a"), json!("result_b")]);
 }
+
+/// A workflow that catches a fan-out's `PayloadTooLarge` (a normal,
+/// supported "degrade gracefully" pattern -- the caller can `match`/`map_err`
+/// on the returned `HarvestResult` instead of propagating with `?`) and then
+/// runs a *second*, successful fan-out must not have "burned" a `fan_out`
+/// sequence number on the failed attempt. If it did, the second (successful)
+/// fan-out would record `fan_out:2` instead of `fan_out:1` -- and on a
+/// later replay, the *first* call (fresh counter, seq=1 again) would find
+/// `MarkerRecorded(fan_out:2)` sitting at the cursor instead of the
+/// `fan_out:1` marker it expects, diverging as `NonDeterministic` before it
+/// can even reproduce the caught `PayloadTooLarge`.
+#[tokio::test]
+async fn child_fan_out_raw_releases_seq_on_validation_failure_so_next_fan_out_reuses_it() {
+    let exec_id = ExecutionId::new();
+    let history = vec![started()];
+
+    let ctx = WorkflowContext::for_replay(exec_id, history).with_payload_caps(
+        1024 * 1024,
+        1024 * 1024,
+        1024 * 1024,
+        100,
+    );
+
+    // First fan-out: one child exceeds the 100-byte cap -- fails before any
+    // marker is recorded (and, after this fix, before any seq number is
+    // permanently consumed).
+    let oversized = json!({ "data": "x".repeat(1000) });
+    let first = ctx
+        .spawn_child_workflow_fan_out_raw(vec![("child_big".to_string(), oversized)])
+        .await;
+    assert!(
+        matches!(first, Err(HarvestError::PayloadTooLarge { .. })),
+        "expected the first fan-out to fail on payload cap: {first:?}"
+    );
+
+    // Second fan-out: a small, valid input. Nothing in this no-worker unit
+    // test resolves the child's oneshot, so the call suspends forever
+    // waiting on it -- confirmed via a short outer timeout. What matters is
+    // the SYNCHRONOUS prefix (peek/validate/record) that runs before that
+    // await point: the marker it records must be "fan_out:1", not
+    // "fan_out:2" -- the failed first attempt must not have consumed a
+    // sequence number.
+    let second = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        ctx.spawn_child_workflow_fan_out_raw(vec![("child_small".to_string(), json!("small"))]),
+    )
+    .await;
+    assert!(
+        second.is_err(),
+        "second fan-out should suspend cleanly waiting on its child's \
+         (never-resolved) oneshot, not fail synchronously: {second:?}"
+    );
+
+    let commands = ctx.drain_commands();
+    let marker_names: Vec<String> = commands
+        .iter()
+        .filter_map(|c| match c {
+            autumn_harvest::context::WorkflowCommand::RecordMarker { name, .. } => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        marker_names,
+        vec!["fan_out:1".to_string()],
+        "the second (successful) fan-out must reuse seq 1 -- the failed \
+         first attempt released it instead of permanently burning it; got \
+         markers: {marker_names:?}, all commands: {commands:?}"
+    );
+}
