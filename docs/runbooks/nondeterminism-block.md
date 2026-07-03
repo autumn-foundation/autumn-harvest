@@ -89,7 +89,12 @@ and continues from exactly where it was — zero data loss, no manual reset.
 - **Cancel / terminate / pause** all work normally (the state is `RUNNING`).
   They are the escape hatches for an execution you decide not to recover.
   Note: cancel/terminate leave the stale `nd_block*` marker on the closed row
-  (the `nd_blocked=true` filter hides non-RUNNING rows).
+  (the `nd_blocked=true` filter hides non-RUNNING rows). Note: a terminate
+  landing in the narrow window between the block transaction's row-lock check
+  and its commit can surface as a transient error on that one dispatch cycle
+  instead of a graceful no-op (the same pre-existing race any ordinary
+  terminal-`Failed` persistence shares) — retried automatically on the next
+  poll, it is not a permanent failure.
 - **Execution timeout** (#243) still applies: a blocked execution whose
   `deadline_at` elapses is timed out terminally by the scanner. If a long
   rollback is expected, consider whether affected runs carry tight execution

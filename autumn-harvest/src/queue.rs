@@ -7,6 +7,7 @@
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
+use diesel::AsChangeset;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -1141,6 +1142,37 @@ pub async fn record_heartbeat(
     Ok(())
 }
 
+/// Shared "reset a claimed task back to `PENDING` with a future
+/// `scheduled_at`" changeset (code-review cleanup, issue #603): the 7 fields
+/// common to both [`requeue_for_retry`] (activity retry) and
+/// [`requeue_workflow_task_nd_blocked`] (ND-block backoff), previously
+/// duplicated verbatim in both functions.
+#[derive(AsChangeset)]
+#[diesel(table_name = crate::schema::harvest_task_queue)]
+struct PendingRequeueChangeset {
+    state: &'static str,
+    worker_id: Option<String>,
+    started_at: Option<chrono::DateTime<Utc>>,
+    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    crash_strikes: i32,
+    scheduled_at: chrono::DateTime<Utc>,
+    error: Option<String>,
+}
+
+impl PendingRequeueChangeset {
+    const fn new(next_run: chrono::DateTime<Utc>, previous_error: String) -> Self {
+        Self {
+            state: "PENDING",
+            worker_id: None,
+            started_at: None,
+            last_heartbeat_at: None,
+            crash_strikes: 0,
+            scheduled_at: next_run,
+            error: Some(previous_error),
+        }
+    }
+}
+
 /// Reset a task to `PENDING` with a future `scheduled_at` for retry.
 ///
 /// # Errors
@@ -1165,21 +1197,14 @@ pub async fn requeue_for_retry(
     use crate::schema::harvest_task_queue::dsl;
 
     let next_run = Utc::now() + delay;
+    let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
 
     let queue_name = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
-    .set((
-        dsl::state.eq("PENDING"),
-        dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::crash_strikes.eq(0),
-        dsl::scheduled_at.eq(next_run),
-        dsl::error.eq(Some(previous_error)),
-    ))
+    .set(&changeset)
     .returning(dsl::queue_name)
     .get_result::<String>(conn)
     .await
@@ -1208,7 +1233,7 @@ pub async fn requeue_for_retry(
 /// Re-pend an ND-blocked workflow task with a future `scheduled_at` (issue
 /// #603).
 ///
-/// Mirrors [`requeue_for_retry`] with three deliberate differences for the
+/// Mirrors [`requeue_for_retry`] with four deliberate differences for the
 /// replay-non-determinism block path:
 /// - restricted to `task_type = 'workflow'` rows (defensive — the block path
 ///   only ever holds a claimed workflow task);
@@ -1218,7 +1243,12 @@ pub async fn requeue_for_retry(
 /// - clears `wake_requested`: a wake captured mid-cycle must not short-circuit
 ///   the backoff — the row is durably `PENDING` and deferred purely by
 ///   `scheduled_at` (`claim_task` enforces `scheduled_at <= NOW()`), so signals
-///   arriving while blocked are processed on the next backoff dispatch.
+///   arriving while blocked are processed on the next backoff dispatch;
+/// - clears `activity_name`: a stale `'mixed_signal_suspension'` sentinel
+///   (issue #476/#600 timer+signal races) left on the row would otherwise let
+///   `primary_repend_workflow_task_query`'s wake fallback match this
+///   `PENDING`/future-`scheduled_at` row and reset `scheduled_at` to now on
+///   any unrelated wake, silently bypassing the backoff (issue #603 fix).
 ///
 /// No `pg_notify`: the task is deliberately not claimable until `scheduled_at`,
 /// so waking pollers early would be pure noise.
@@ -1237,6 +1267,7 @@ pub async fn requeue_workflow_task_nd_blocked(
     use crate::schema::harvest_task_queue::dsl;
 
     let next_run = Utc::now() + delay;
+    let changeset = PendingRequeueChangeset::new(next_run, reason.to_string());
 
     let updated = diesel::update(
         dsl::harvest_task_queue
@@ -1245,17 +1276,12 @@ pub async fn requeue_workflow_task_nd_blocked(
             .filter(dsl::task_type.eq("workflow")),
     )
     .set((
-        dsl::state.eq("PENDING"),
-        dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::crash_strikes.eq(0),
-        dsl::scheduled_at.eq(next_run),
-        dsl::error.eq(Some(reason)),
+        changeset,
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
         dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
     ))
     .execute(conn)
     .await

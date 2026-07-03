@@ -203,6 +203,20 @@ fn divergent_v2_handler(
     })
 }
 
+/// v1 variant used for the continue-as-new regression test: waits on the
+/// same durable timer as `timer_v1_handler`, then requests continue-as-new
+/// instead of completing.
+fn timer_then_continue_as_new_handler(
+    ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move {
+        ctx.timer("nd-gate", 300).await.map_err(|e| e.to_string())?;
+        let _ = ctx.continue_as_new(serde_json::json!("v1-continued")).await;
+        unreachable!("continue_as_new must not resolve");
+    })
+}
+
 /// Author-error control: fails from its own logic (AC3).
 fn author_fail_handler(
     _ctx: &WorkflowContext,
@@ -927,4 +941,166 @@ async fn reblock_increments_count_and_grows_backoff() {
         0,
         "re-blocks must never fail the execution terminally"
     );
+}
+
+/// Regression test (code-review fix): a task row carrying a stale
+/// `activity_name = 'mixed_signal_suspension'` sentinel (left behind by an
+/// earlier `ctx.race()`/`receive_signal_timeout` timer+signal race, issue
+/// #476/#600) must have that sentinel cleared when it is later ND-blocked.
+/// Before the fix, the sentinel survived `requeue_workflow_task_nd_blocked`
+/// and let `primary_repend_workflow_task_query` match the blocked row on any
+/// unrelated wake, resetting `scheduled_at` early and bypassing the
+/// capped-exponential backoff entirely (AC4).
+#[tokio::test]
+async fn nd_block_clears_stale_mixed_signal_suspension_sentinel() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    let exec_id = start_workflow(&mut conn, "nd_wf", "nd-sentinel-001").await;
+
+    let (worker1, handle1) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_wf", timer_v1_handler)],
+            metrics.clone(),
+            "v1",
+        ),
+        build_pool(&url),
+    );
+    wait_for_timer_started(&mut conn, exec_id).await;
+    worker1.shutdown();
+    let _ = handle1.await;
+
+    // Simulate a prior timer+signal race having stamped the sentinel on this
+    // task row (the actual mechanism, `persist_started_timer`, is exercised
+    // elsewhere; this test isolates the requeue-clearing behavior directly).
+    diesel::update(
+        harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(harvest_task_queue::task_type.eq("workflow")),
+    )
+    .set(harvest_task_queue::activity_name.eq(Some("mixed_signal_suspension")))
+    .execute(&mut conn)
+    .await
+    .expect("stamp mixed_signal_suspension sentinel");
+
+    fire_timer_now(&mut conn, exec_id).await;
+    let (worker2, handle2) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_wf", divergent_v2_handler)],
+            metrics.clone(),
+            "v2",
+        ),
+        build_pool(&url),
+    );
+    wait_for_nd_block(&mut conn, exec_id, 1).await;
+    worker2.shutdown();
+    let _ = handle2.await;
+
+    let activity_name: Option<String> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .filter(harvest_task_queue::task_type.eq("workflow"))
+        .select(harvest_task_queue::activity_name)
+        .first(&mut conn)
+        .await
+        .expect("workflow task row must exist");
+    assert_eq!(
+        activity_name, None,
+        "requeue_workflow_task_nd_blocked must clear the stale sentinel so an \
+         unrelated wake_workflow_task call cannot bypass the backoff"
+    );
+}
+
+/// Regression test (code-review fix): when a recovered cycle also produces
+/// `ContinuedAsNew` in the same decision, the successor must NOT inherit the
+/// just-cleared ND diagnostic `search_attrs` from the stale, pre-clear
+/// in-memory snapshot.
+#[tokio::test]
+async fn continue_as_new_successor_does_not_inherit_stale_nd_search_attrs() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    let exec_id = start_workflow(&mut conn, "nd_can_wf", "nd-can-001").await;
+
+    // v1 (rollback build): suspends on the same timer, then continue-as-news.
+    let (worker1, handle1) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_can_wf", timer_then_continue_as_new_handler)],
+            metrics.clone(),
+            "v1",
+        ),
+        build_pool(&url),
+    );
+    wait_for_timer_started(&mut conn, exec_id).await;
+    worker1.shutdown();
+    let _ = handle1.await;
+
+    // Divergent v2 blocks it, stamping the ND diagnostic into search_attrs.
+    fire_timer_now(&mut conn, exec_id).await;
+    let (worker2, handle2) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_can_wf", divergent_v2_handler)],
+            metrics.clone(),
+            "v2",
+        ),
+        build_pool(&url),
+    );
+    wait_for_nd_block(&mut conn, exec_id, 1).await;
+    worker2.shutdown();
+    let _ = handle2.await;
+
+    // Rollback: v1 (timer_then_continue_as_new_handler) redeployed. The
+    // recovered cycle both clears the ND block AND continue-as-news.
+    make_task_claimable_now(&mut conn, exec_id).await;
+    let (worker3, handle3) = spawn_worker(
+        make_worker(
+            vec![wf_info("nd_can_wf", timer_then_continue_as_new_handler)],
+            metrics.clone(),
+            "v1",
+        ),
+        build_pool(&url),
+    );
+    wait_for_state(&mut conn, exec_id, &["CONTINUED_AS_NEW"]).await;
+    worker3.shutdown();
+    let _ = handle3.await;
+
+    // Predecessor's own row: cleared (already covered by the rollback test,
+    // asserted again here for completeness of this specific scenario).
+    let (blocked, reason, count, _) = get_nd_block_row(&mut conn, exec_id).await;
+    assert!(!blocked && reason.is_none() && count == 0);
+
+    // Find the successor via the recorded WorkflowContinuedAsNew event.
+    let history = get_history(&mut conn, exec_id).await;
+    let successor_id = history
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(*new_exec_id),
+            _ => None,
+        })
+        .expect("history must contain WorkflowContinuedAsNew");
+
+    let successor_attrs: Option<Value> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(successor_id.as_uuid()))
+        .select(harvest_workflow_executions::search_attrs)
+        .first(&mut conn)
+        .await
+        .expect("successor execution must exist");
+
+    if let Some(attrs) = successor_attrs {
+        for key in [
+            "failure_cause",
+            "event_index",
+            "expected",
+            "actual",
+            "workflow_type",
+            "build_id",
+        ] {
+            assert!(
+                attrs.get(key).is_none(),
+                "continue-as-new successor must NOT inherit the stale ND \
+                 diagnostic key '{key}' from the pre-clear snapshot: {attrs}"
+            );
+        }
+    }
 }

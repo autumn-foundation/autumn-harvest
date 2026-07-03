@@ -2310,6 +2310,15 @@ async fn update_workflow_execution_completed(
         return Err(workflow_execution_transition_error(conn, exec_id).await?);
     }
 
+    // Code-review fix (issue #603): the column reset above only clears the
+    // marker; the search_attrs diagnostic must be cleared too, or a
+    // previously-blocked execution that completes via a path bypassing the
+    // pause-guarded transaction's `clear_nd_block` hook leaves a phantom
+    // `failure_cause=non_determinism` on a run that actually completed fine.
+    // `nd_search_attrs_clear_patch`/`store::update_search_attrs` are defined
+    // further below in this file; Rust item order doesn't matter here.
+    crate::store::update_search_attrs(conn, exec_id, &nd_search_attrs_clear_patch()).await?;
+
     Ok(())
 }
 
@@ -2333,12 +2342,21 @@ const ND_BLOCK_BACKOFF_CAP_SECS: u64 = 300;
 ///
 /// `block_count` is the execution's `nd_block_count` *before* this block is
 /// recorded, so the first block waits 5s and the seventh-and-later waits the
-/// full 300s cap. Clamping the exponent to 6 keeps the shift trivially
-/// overflow-free (`5 << 6 = 320` already exceeds the cap) and makes negative
-/// counts (impossible via the DB column, but defensive) behave as zero.
+/// full 300s cap. Thin wrapper over the shared, more robust
+/// [`crate::policy::compute_retry_delay`] (reuse per code-review finding) —
+/// `attempt` is 1-based there, so `block_count` (0-based) maps to
+/// `block_count + 1`; negative counts (impossible via the DB column, but
+/// defensive) clamp to attempt 1.
 fn nd_block_backoff(block_count: i32) -> Duration {
-    let shift = u32::try_from(block_count.clamp(0, 6)).unwrap_or(0);
-    Duration::from_secs((ND_BLOCK_BACKOFF_BASE_SECS << shift).min(ND_BLOCK_BACKOFF_CAP_SECS))
+    let attempt = u32::try_from(block_count.max(0))
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    crate::policy::compute_retry_delay(
+        Duration::from_secs(ND_BLOCK_BACKOFF_BASE_SECS),
+        2.0,
+        Duration::from_secs(ND_BLOCK_BACKOFF_CAP_SECS),
+        attempt,
+    )
 }
 
 /// Build the search-attrs diagnostic patch stamped on an execution when the
@@ -2378,9 +2396,13 @@ fn nd_search_attrs_patch(
 
 /// The inverse of [`nd_search_attrs_patch`]: every key that patch can stamp,
 /// mapped to `None` so `store::update_search_attrs` deletes it. Applied when a
-/// previously ND-blocked execution replays cleanly (rollback recovery) so no
-/// stale divergence diagnostic survives on a healthy run.
-fn nd_search_attrs_clear_patch() -> std::collections::HashMap<String, Option<serde_json::Value>> {
+/// previously ND-blocked execution replays cleanly (rollback recovery), when a
+/// terminal transition closes out a previously-blocked execution (belt-and-
+/// braces reset), and when a reset-from-history fork is created from a
+/// currently-blocked source (`reset.rs`, hence `pub(crate)`) — so no stale
+/// divergence diagnostic survives on a healthy, terminal, or forked run.
+pub(crate) fn nd_search_attrs_clear_patch()
+-> std::collections::HashMap<String, Option<serde_json::Value>> {
     [
         "failure_cause",
         "event_index",
@@ -2429,8 +2451,23 @@ async fn update_workflow_execution_failed(
         return Err(workflow_execution_transition_error(conn, exec_id).await?);
     }
 
-    if let Some(details) = nd_details {
-        crate::store::update_search_attrs(conn, exec_id, &nd_search_attrs_patch(details)).await?;
+    match nd_details {
+        Some(details) => {
+            crate::store::update_search_attrs(conn, exec_id, &nd_search_attrs_patch(details))
+                .await?;
+        }
+        // Code-review fix (issue #603): the column reset above only clears
+        // the nd_blocked_at/reason/count marker; when this failure carries
+        // no fresh ND details (the common case post-gate — an author error,
+        // or a history-cap/dispatch-error terminal), a *stale* diagnostic
+        // from an earlier, now-resolved ND-block incident must also be
+        // cleared from search_attrs, or the closed FAILED row keeps
+        // displaying `failure_cause=non_determinism` for an unrelated
+        // failure reason.
+        None => {
+            crate::store::update_search_attrs(conn, exec_id, &nd_search_attrs_clear_patch())
+                .await?;
+        }
     }
 
     Ok(())
@@ -2461,6 +2498,51 @@ async fn update_workflow_execution_failed(
 /// next resume re-derives the same divergence (or replays cleanly under a
 /// fixed build) on a fresh cycle.
 #[allow(clippy::too_many_arguments)]
+/// Check whether `exec_uuid` is currently `PAUSED` under a `FOR UPDATE` row
+/// lock (serialising with `pause_workflow_execution`'s own lock), and if so,
+/// re-park `task_id` under that same lock.
+///
+/// Shared by `process_workflow_task`'s own pause-guarded persistence
+/// transaction and [`block_workflow_for_non_determinism`] (issue #603
+/// code-review fix — both previously duplicated this identical shape).
+///
+/// Must be called from inside an open transaction on `conn`. Returns `true`
+/// when the execution was `PAUSED` (the task has been re-parked and the
+/// caller should discard its pending decision); `false` otherwise.
+///
+/// Discarding [`queue::park_workflow_task`]'s wake-requested return value is
+/// safe at both call sites: each shares `pause_workflow_execution`'s `FOR
+/// UPDATE` row lock, so a concurrent resume serialises after this check
+/// commits and issues its own wake.
+async fn check_paused_and_park(
+    conn: &mut AsyncPgConnection,
+    exec_uuid: uuid::Uuid,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+    sticky_timeout: Duration,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+    let locked_state: Option<String> = exec_dsl::harvest_workflow_executions
+        .find(exec_uuid)
+        .select(exec_dsl::state)
+        .for_update()
+        .first::<String>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    if locked_state.as_deref() != Some("PAUSED") {
+        return Ok(false);
+    }
+    let sticky = if sticky_timeout.is_zero() {
+        None
+    } else {
+        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+    };
+    let _ = queue::park_workflow_task(conn, task_id, sticky).await?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn block_workflow_for_non_determinism(
     conn: &mut AsyncPgConnection,
     telemetry: &crate::telemetry::TelemetryConfig,
@@ -2486,26 +2568,9 @@ async fn block_workflow_for_non_determinism(
             let patch = patch.clone();
             async move {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-                let locked_state: Option<String> = exec_dsl::harvest_workflow_executions
-                    .find(exec_uuid)
-                    .select(exec_dsl::state)
-                    .for_update()
-                    .first::<String>(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                if locked_state.as_deref() == Some("PAUSED") {
-                    let sticky = if sticky_timeout.is_zero() {
-                        None
-                    } else {
-                        Some(queue::StickyHint::new(worker_id, sticky_timeout))
-                    };
-                    // Discarding the wake bool is safe here: this check shares
-                    // `pause_workflow_execution`'s FOR UPDATE row lock, so a
-                    // concurrent resume serializes after this transaction and
-                    // issues its own wake (mirrors the persist-time PAUSED
-                    // re-park in `process_workflow_task`).
-                    let _ = queue::park_workflow_task(conn, task_id, sticky).await?;
+                if check_paused_and_park(conn, exec_uuid, task_id, worker_id, sticky_timeout)
+                    .await?
+                {
                     return Ok(true);
                 }
 
@@ -2540,17 +2605,33 @@ async fn block_workflow_for_non_determinism(
         })
         .await?;
 
-    if parked_paused {
-        return Ok(());
-    }
-
-    // Post-commit, best-effort telemetry. The #480 detection counter keeps
-    // firing (a divergence WAS detected); the new #603 counter signals the
-    // non-terminal block so a divergent deploy is alertable within one scrape
-    // interval without any execution terminally failing.
+    // Post-commit, best-effort telemetry. The #480 detection counter fires
+    // unconditionally — a divergence WAS detected this cycle regardless of
+    // what happened next — mirroring the pre-existing precedent in
+    // `process_workflow_task`'s own terminal-telemetry block, which likewise
+    // fires speculatively before its pause-guarded transaction even opens
+    // (an accepted "best-effort, may over-count in a rare pause race"
+    // pattern already established in this codebase).
     telemetry
         .metrics
         .record_workflow_non_determinism(&execution.workflow_name, build_id);
+
+    if parked_paused {
+        // The nd_blocked_at/reason/count columns were never actually
+        // stamped in this branch (the transaction returned before that
+        // UPDATE ran), so the #603 "entered the blocked state" counter must
+        // NOT fire here — code-review fix: this used to return before any
+        // telemetry at all, silently dropping the detection signal above too.
+        tracing::warn!(
+            execution_id = %exec_id,
+            workflow = %execution.workflow_name,
+            build_id,
+            "harvest: replay non-determinism detected during a pause race; \
+             execution re-parked, will re-evaluate on resume"
+        );
+        return Ok(());
+    }
+
     telemetry
         .metrics
         .record_workflow_nondeterministic_block(&execution.workflow_name, &task.queue_name);
@@ -2993,6 +3074,44 @@ fn apply_search_attrs_patch_in_memory(
     } else {
         Some(serde_json::Value::Object(obj))
     }
+}
+
+/// In-memory equivalent of [`crate::store::update_search_attrs`]'s merge
+/// semantics, for a raw key/value patch (as opposed to
+/// [`apply_search_attrs_patch_in_memory`]'s `WorkflowCommand`-sourced
+/// patches). `Some(v)` merges `v` in; `None` removes the key.
+///
+/// Unlike [`apply_search_attrs_patch_in_memory`], an empty result is **not**
+/// collapsed to `None` — it stays `Some(Value::Object({}))` — matching
+/// `store::update_search_attrs`'s own DB-write behavior exactly (it always
+/// writes `Some(new_attrs)`, never clears the column to SQL `NULL`), so a
+/// caller keeping an in-memory `WorkflowExecution` snapshot consistent with a
+/// same-transaction `store::update_search_attrs` call sees byte-identical
+/// `search_attrs` (issue #603 fix: kept the two callers' snapshots from
+/// silently reintroducing cleared ND diagnostic keys, e.g. into a
+/// continue-as-new successor built from the stale pre-clear reference).
+pub(crate) fn apply_raw_search_attrs_patch_in_memory(
+    base: Option<serde_json::Value>,
+    patch: &std::collections::HashMap<String, Option<serde_json::Value>>,
+) -> Option<serde_json::Value> {
+    if patch.is_empty() {
+        return base;
+    }
+    let mut merged = match base {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    for (key, value) in patch {
+        match value {
+            Some(v) => {
+                merged.insert(key.clone(), v.clone());
+            }
+            None => {
+                merged.remove(key.as_str());
+            }
+        }
+    }
+    Some(serde_json::Value::Object(merged))
 }
 
 /// Apply `UpsertSearchAttributes` commands from a command list to the DB.
@@ -6372,11 +6491,21 @@ const fn schedule_counter_action(outcome: &WorkflowOutcome) -> Option<bool> {
         // Defensive (issue #603): an engine-detected replay divergence blocks
         // the execution non-terminally at the gate in `process_workflow_task`
         // and never reaches this counter mapping — but if it ever did, a
-        // blocked run is neither a schedule success nor a failure.
+        // blocked run is neither a schedule success nor a failure. Asserted
+        // (not just commented) so a future regression that lets this arm
+        // become reachable panics loudly in debug/test builds instead of
+        // silently miscounting.
         WorkflowOutcome::Failed {
             non_deterministic_details: Some(_),
             ..
-        } => None,
+        } => {
+            debug_assert!(
+                false,
+                "ND-carrying Failed outcome must be gated earlier in \
+                 process_workflow_task, before schedule_counter_action is ever called"
+            );
+            None
+        }
         WorkflowOutcome::Failed { .. } => Some(true),
         _ => None,
     }
@@ -7662,6 +7791,14 @@ async fn process_workflow_task(
             // Defensive (issue #603): an ND-carrying Failed outcome is gated
             // earlier into `block_workflow_for_non_determinism` (which emits
             // the detection counter itself) and never reaches this arm.
+            // Asserted so a future regression that lets this happen panics
+            // loudly in debug/test builds instead of silently double-counting
+            // (or, worse, silently NOT counting once the gate is removed).
+            debug_assert!(
+                non_deterministic_details.is_none(),
+                "ND-carrying Failed outcome must be gated earlier in \
+                 process_workflow_task, before terminal metrics are recorded"
+            );
             if non_deterministic_details.is_some() {
                 telemetry
                     .metrics
@@ -7679,6 +7816,28 @@ async fn process_workflow_task(
             WorkflowStatus::ContinuedAsNew,
         ),
         WorkflowOutcome::Suspended { .. } => {} // not terminal — no counter
+    }
+
+    // Issue #603 fix: if this execution was previously ND-blocked, this cycle
+    // replaying cleanly means the offending build was rolled back or fixed —
+    // `clear_nd_block` (called inside the persistence transaction below) will
+    // clear the DB row. Mirror that clear into the in-memory snapshot *before*
+    // `execution_ref` is captured (same pattern as the pending_cmds patch
+    // just below), so a same-cycle `ContinuedAsNew` successor built from
+    // `execution_ref.search_attrs` doesn't silently reintroduce the six
+    // diagnostic keys the transaction is about to delete from the DB.
+    // `was_nd_blocked` is captured before mutating so the transaction's own
+    // guard (which decides whether to call `clear_nd_block` at all) doesn't
+    // read back the now-already-cleared in-memory value and skip the call.
+    let was_nd_blocked = prepared.execution.nd_blocked_at.is_some();
+    if was_nd_blocked {
+        prepared.execution.nd_blocked_at = None;
+        prepared.execution.nd_block_reason = None;
+        prepared.execution.nd_block_count = 0;
+        prepared.execution.search_attrs = apply_raw_search_attrs_patch_in_memory(
+            prepared.execution.search_attrs.take(),
+            &nd_search_attrs_clear_patch(),
+        );
     }
 
     // Keep the in-memory execution snapshot current so that
@@ -7766,22 +7925,9 @@ async fn process_workflow_task(
     let persist_flow = conn
         .transaction::<WorkflowPersistFlow, HarvestError, _>(|conn| {
             async move {
-                use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
-                let locked_state: Option<String> = exec_dsl::harvest_workflow_executions
-                    .find(exec_uuid)
-                    .select(exec_dsl::state)
-                    .for_update()
-                    .first::<String>(conn)
-                    .await
-                    .optional()
-                    .map_err(crate::error::database_error)?;
-                if locked_state.as_deref() == Some("PAUSED") {
-                    let sticky = if sticky_timeout.is_zero() {
-                        None
-                    } else {
-                        Some(queue::StickyHint::new(worker_id, sticky_timeout))
-                    };
-                    queue::park_workflow_task(conn, task.id, sticky).await?;
+                if check_paused_and_park(conn, exec_uuid, task.id, worker_id, sticky_timeout)
+                    .await?
+                {
                     return Ok(WorkflowPersistFlow::ParkedPaused);
                 }
 
@@ -7789,9 +7935,13 @@ async fn process_workflow_task(
                 // did not fire), so if the execution was previously blocked on
                 // replay non-determinism the offending build has been rolled
                 // back or fixed — clear the block marker atomically with the
-                // recovered cycle's persisted outcome. Guarded on the
-                // claim-time snapshot so never-blocked executions pay nothing.
-                if execution_ref.nd_blocked_at.is_some() {
+                // recovered cycle's persisted outcome. Guarded on
+                // `was_nd_blocked` (captured *before* the in-memory mutation
+                // above) rather than re-reading `execution_ref.nd_blocked_at`,
+                // which is already `None` here by the time this runs — so
+                // never-blocked executions still pay nothing, and a
+                // previously-blocked one still gets its DB row cleared.
+                if was_nd_blocked {
                     clear_nd_block(conn, persistence.exec_id).await?;
                 }
 
@@ -12227,6 +12377,48 @@ mod tests {
     }
 
     #[test]
+    fn apply_raw_search_attrs_patch_in_memory_inserts_and_removes() {
+        let base = Some(serde_json::json!({"tenant": "acme", "build_id": "v1"}));
+        let mut patch = std::collections::HashMap::new();
+        patch.insert("build_id".to_string(), Some(serde_json::json!("v2")));
+        patch.insert("failure_cause".to_string(), None);
+        let result = apply_raw_search_attrs_patch_in_memory(base, &patch);
+        assert_eq!(
+            result,
+            Some(serde_json::json!({"tenant": "acme", "build_id": "v2"}))
+        );
+    }
+
+    #[test]
+    fn apply_raw_search_attrs_patch_in_memory_empty_patch_is_noop() {
+        let base = Some(serde_json::json!({"tenant": "acme"}));
+        let result =
+            apply_raw_search_attrs_patch_in_memory(base.clone(), &std::collections::HashMap::new());
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn apply_raw_search_attrs_patch_in_memory_removing_everything_stays_some_empty_object() {
+        // Byte-for-byte parity with `store::update_search_attrs`, which always
+        // writes `Some(new_attrs)` and never collapses to SQL NULL — unlike
+        // the sibling `apply_search_attrs_patch_in_memory` (command-sourced),
+        // which does collapse an empty result to `None`.
+        let base = Some(serde_json::json!({"failure_cause": "non_determinism"}));
+        let mut patch = std::collections::HashMap::new();
+        patch.insert("failure_cause".to_string(), None);
+        let result = apply_raw_search_attrs_patch_in_memory(base, &patch);
+        assert_eq!(result, Some(serde_json::json!({})));
+    }
+
+    #[test]
+    fn apply_raw_search_attrs_patch_in_memory_none_base_with_inserts_builds_object() {
+        let mut patch = std::collections::HashMap::new();
+        patch.insert("build_id".to_string(), Some(serde_json::json!("v1")));
+        let result = apply_raw_search_attrs_patch_in_memory(None, &patch);
+        assert_eq!(result, Some(serde_json::json!({"build_id": "v1"})));
+    }
+
+    #[test]
     fn nd_search_attrs_patch_full_details_stamps_all_six_keys() {
         let details = crate::error::NonDeterministicDetails {
             event_index: Some(7),
@@ -12297,5 +12489,27 @@ mod tests {
         assert_eq!(clear_keys, stamp_keys);
         // Every value in the clear patch is None (= delete the key).
         assert!(clear.values().all(Option::is_none));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be gated earlier in process_workflow_task")]
+    fn schedule_counter_action_asserts_if_nd_carrying_failed_ever_reaches_it() {
+        // Locks in the debug_assert! added as a code-review fix: this arm is
+        // provably unreachable in production today (the early gate in
+        // process_workflow_task always intercepts first), but if a future
+        // regression ever routes an ND-carrying Failed outcome here, this
+        // must panic loudly in debug/test builds rather than silently
+        // returning None.
+        let outcome = WorkflowOutcome::Failed {
+            error: "non-deterministic replay: test".to_string(),
+            non_deterministic_details: Some(crate::error::NonDeterministicDetails {
+                event_index: Some(0),
+                expected: None,
+                actual: None,
+                workflow_type: None,
+                build_id: None,
+            }),
+        };
+        let _ = schedule_counter_action(&outcome);
     }
 }

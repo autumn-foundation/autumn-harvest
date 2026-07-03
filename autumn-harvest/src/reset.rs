@@ -1227,6 +1227,21 @@ async fn insert_fork_execution(
     let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
     // Re-anchor the soft SLA deadline per-fork (issue #487).
     let sla_deadline_at = source.sla.map(|d| chrono::Utc::now() + d);
+    // Strip the six replay-non-determinism diagnostic keys unconditionally
+    // (issue #603 fix): the source can legitimately be a currently-ND-blocked
+    // RUNNING execution (the documented escalation path for a stuck block),
+    // whose search_attrs still carries the diagnostic — the fresh fork itself
+    // has never diverged, so it must not display a phantom "blocked" reason.
+    // Guarded on `Some` so a source with no search_attrs at all doesn't gain
+    // a stray `{}` object (`apply_raw_search_attrs_patch_in_memory` always
+    // returns `Some`, mirroring `store::update_search_attrs`'s DB semantics).
+    let fork_search_attrs = source.search_attrs.as_ref().map(|_| {
+        crate::worker::apply_raw_search_attrs_patch_in_memory(
+            source.search_attrs.clone(),
+            &crate::worker::nd_search_attrs_clear_patch(),
+        )
+        .unwrap_or_default()
+    });
 
     let row = NewWorkflowExecution {
         id: new_exec_id.as_uuid(),
@@ -1242,7 +1257,7 @@ async fn insert_fork_execution(
         sla: source.sla,
         sla_deadline_at,
         memo: source.memo.clone(),
-        search_attrs: source.search_attrs.clone(),
+        search_attrs: fork_search_attrs,
         assigned_build_id: source.assigned_build_id.clone(),
         parent_close_policy: None, // reset fork is a fresh root execution
         owner: source.owner.as_deref(),
