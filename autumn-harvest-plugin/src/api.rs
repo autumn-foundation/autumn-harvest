@@ -21758,7 +21758,6 @@ async fn clear_build_ramp_handler(
     let (actor, source, request_id) = audit_context(&headers, &api_state);
 
     let mut last_policy = None;
-    let mut any_shard_succeeded = false;
     let mut shard_errors: Vec<String> = Vec::new();
     for (shard_id, shard_pool) in pool.iter_shards() {
         let mut conn = match acquire_conn(shard_pool).await {
@@ -21773,7 +21772,6 @@ async fn clear_build_ramp_handler(
             .map_err(map_error)
         {
             Ok(p) => {
-                any_shard_succeeded = true;
                 if p.is_some() {
                     last_policy = p;
                 }
@@ -21784,8 +21782,10 @@ async fn clear_build_ramp_handler(
         }
     }
 
-    // If every shard write failed, return 503 before attempting audit.
-    if !shard_errors.is_empty() && !any_shard_succeeded {
+    // If any shard failed and no reachable shard had a policy to clear, we
+    // can't tell whether the queue truly has no ramp or the ramp lives on an
+    // unreachable shard — surface 503 rather than a misleading 404.
+    if !shard_errors.is_empty() && last_policy.is_none() {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({ "errors": shard_errors })),
