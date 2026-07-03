@@ -4230,6 +4230,106 @@ async fn wake_workflow_task_refreshes_sticky_until() {
     );
 }
 
+/// Regression test for a PR #901 review finding: `wake_workflow_task`'s
+/// dropped-wake fallback can itself lose the race against `park_workflow_task`.
+///
+/// If `park_workflow_task`'s `candidate SELECT ... FOR UPDATE` has already
+/// locked the row (but not yet committed) when the fallback `UPDATE ... SET
+/// wake_requested = TRUE` runs, the fallback's initial snapshot still shows
+/// the row as owned (`worker_id IS NOT NULL`) so it attempts to lock and
+/// write -- and blocks on park's row lock. Once park commits, Postgres
+/// re-checks the fallback's WHERE clause against the now-committed row
+/// (`worker_id` is NULL after park), which no longer matches, so the
+/// fallback silently updates zero rows and `wake_requested` is never set --
+/// even though a park this wake raced against just committed a parked row
+/// that is this exact wake's target. `wake_workflow_task` must retry its
+/// primary re-pend query in that case rather than relying solely on
+/// `wake_requested`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wake_workflow_task_retries_after_losing_the_park_row_lock_race() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    let mut conn_park =
+        <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect (park conn)");
+    let mut conn_wake =
+        <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect (wake conn)");
+    let mut conn_read =
+        <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect (read conn)");
+
+    let exec_id = insert_workflow_execution(&mut conn_park).await;
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    let task_id = queue::enqueue(&mut conn_park, &params)
+        .await
+        .expect("enqueue should succeed");
+    let queues = vec!["default".to_string()];
+    queue::claim_task(&mut conn_park, &queues, "race-worker", "", None, &[], &[])
+        .await
+        .expect("claim should succeed")
+        .expect("row should be claimable");
+
+    // Manually hold park's row lock open: BEGIN an explicit transaction on
+    // `conn_park`, run the real `park_workflow_task` (which locks and
+    // provisionally updates the row inside this open transaction), but do
+    // NOT commit yet -- reproducing park having locked the row but not yet
+    // released it.
+    conn_park
+        .batch_execute("BEGIN")
+        .await
+        .expect("begin should succeed");
+    queue::park_workflow_task(&mut conn_park, task_id, None)
+        .await
+        .expect("park should succeed inside the open transaction");
+
+    // Wake concurrently on a separate connection while the park above is
+    // still uncommitted. Its primary re-pend UPDATE won't match (the row's
+    // committed snapshot still shows worker_id NOT NULL), so it falls
+    // through to the fallback UPDATE, which blocks on the row lock
+    // `conn_park` is holding.
+    let wake_handle =
+        tokio::spawn(async move { queue::wake_workflow_task(&mut conn_wake, exec_id).await });
+
+    // Give the spawned wake a moment to reach and block on the fallback
+    // UPDATE before releasing the lock -- otherwise this test could pass
+    // trivially because the wake simply ran entirely after the commit.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    conn_park
+        .batch_execute("COMMIT")
+        .await
+        .expect("commit should succeed");
+
+    wake_handle
+        .await
+        .expect("wake task should not panic")
+        .expect("wake_workflow_task should succeed");
+
+    let row = harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn_read)
+        .await
+        .expect("row should exist");
+
+    assert_eq!(
+        row.state, "PENDING",
+        "the wake that raced park's row lock must still re-pend the row via \
+         the primary-repend retry, even though wake_requested was silently \
+         lost to the lock-order race",
+    );
+    assert!(
+        row.worker_id.is_none(),
+        "re-pended row must have no worker ownership",
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn worker_continues_as_new_with_fresh_history_and_same_workflow_id() {
     let (database_url, _container) = setup_test_database_url().await;

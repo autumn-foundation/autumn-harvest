@@ -1617,57 +1617,7 @@ pub async fn wake_workflow_task(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<()> {
-    // Use raw SQL so we can refresh `sticky_until` from the row's own
-    // `sticky_timeout` column atomically in a single UPDATE. Doing this in
-    // two trips (SELECT then UPDATE) would race with other wake paths.
-    //
-    // `created_at` is refreshed to `clock_timestamp()` (the wake instant): this
-    // re-pends an *old* parked workflow task with a freshly backdated
-    // `scheduled_at` (= now - skew), so without refreshing `created_at` the
-    // schedule-to-start eligibility floor `GREATEST(scheduled_at, created_at)`
-    // would pick the backdated wake timestamp (the stale insert-time `created_at`
-    // is older) and report ~skew seconds of phantom latency for an immediately
-    // claimed follow-up task (issue #501 review). The wake instant is this cycle's
-    // true eligibility, so an immediately-served wake correctly reports ~0.
-    let queue_names: Vec<String> = {
-        use diesel::deserialize::QueryableByName;
-        use diesel::sql_types::Text;
-
-        #[derive(QueryableByName)]
-        struct QueueNameRow {
-            #[diesel(sql_type = Text)]
-            queue_name: String,
-        }
-
-        let rows: Vec<QueueNameRow> = diesel::sql_query(
-            "UPDATE harvest_task_queue \
-             SET state = 'PENDING', \
-                 worker_id = NULL, \
-                 started_at = NULL, \
-                 scheduled_at = $2, \
-                 created_at = clock_timestamp(), \
-                 activity_name = NULL, \
-                 sticky_until = CASE \
-                     WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
-                     THEN NOW() + sticky_timeout \
-                     ELSE sticky_until \
-                 END \
-             WHERE workflow_exec_id = $1 \
-               AND task_type = 'workflow' \
-               AND ( \
-                   (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
-                   OR (state = 'PENDING' AND scheduled_at > $2 AND activity_name = 'mixed_signal_suspension') \
-               ) \
-             RETURNING queue_name",
-        )
-        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
-
-        rows.into_iter().map(|r| r.queue_name).collect()
-    };
+    let mut queue_names = primary_repend_workflow_task(conn, exec_id).await?;
 
     // Dropped-wake fix: if no row was parked and re-pended above, the target
     // workflow task may currently be claimed and mid-processing (state =
@@ -1684,11 +1634,27 @@ pub async fn wake_workflow_task(
     // immediately instead of actually parking if it was set -- closing the
     // race without this call ever blocking or retrying.
     if queue_names.is_empty() {
-        diesel::sql_query(wake_requested_fallback_query())
+        let fallback_updated = diesel::sql_query(wake_requested_fallback_query())
             .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
             .execute(conn)
             .await
             .map_err(crate::error::database_error)?;
+
+        if fallback_updated == 0 {
+            // Closes a residual race (PR #901 review): if `park_workflow_task`'s
+            // `candidate SELECT ... FOR UPDATE` already locked this row before the
+            // fallback UPDATE above ran, the fallback blocks on that row lock
+            // rather than skipping it outright (its WHERE clause matched the row's
+            // pre-park, still-owned snapshot). Once the park commits, Postgres
+            // re-checks the fallback's WHERE clause against the just-committed row
+            // -- which now has `worker_id = NULL` -- so it no longer matches and
+            // `wake_requested` is silently never set, even though a park the wake
+            // raced against just committed a parked row that is this exact wake's
+            // target. Retry the primary re-pend query once: if the row is now
+            // genuinely parked (the common outcome of that exact race), this
+            // catches it directly instead of depending on `wake_requested`.
+            queue_names = primary_repend_workflow_task(conn, exec_id).await?;
+        }
     }
 
     // A workflow task may already be PENDING with an elapsed `scheduled_at` —
@@ -1723,7 +1689,6 @@ pub async fn wake_workflow_task(
         rows.into_iter().map(|r| r.queue_name).collect()
     };
 
-    let mut queue_names = queue_names;
     queue_names.extend(already_due_queue_names);
     queue_names.sort();
     queue_names.dedup();
@@ -1731,6 +1696,67 @@ pub async fn wake_workflow_task(
     crate::notify::notify_tasks_enqueued(conn, &queue_names, Uuid::nil()).await?;
 
     Ok(())
+}
+
+/// Runs [`wake_workflow_task`]'s primary re-pend `UPDATE`: resets a parked
+/// (or elapsed mixed-signal-suspension) workflow task row for `exec_id` back
+/// to `PENDING` and returns the queue names of any rows it touched. Extracted
+/// so the dropped-wake fallback below can retry it after losing the
+/// `park_workflow_task` row-lock race.
+///
+/// `created_at` is refreshed to `clock_timestamp()` (the wake instant): this
+/// re-pends an *old* parked workflow task with a freshly backdated
+/// `scheduled_at` (= now - skew), so without refreshing `created_at` the
+/// schedule-to-start eligibility floor `GREATEST(scheduled_at, created_at)`
+/// would pick the backdated wake timestamp (the stale insert-time `created_at`
+/// is older) and report ~skew seconds of phantom latency for an immediately
+/// claimed follow-up task (issue #501 review). The wake instant is this cycle's
+/// true eligibility, so an immediately-served wake correctly reports ~0.
+async fn primary_repend_workflow_task(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Vec<String>> {
+    use diesel::deserialize::QueryableByName;
+    use diesel::sql_types::Text;
+
+    #[derive(QueryableByName)]
+    struct QueueNameRow {
+        #[diesel(sql_type = Text)]
+        queue_name: String,
+    }
+
+    let rows: Vec<QueueNameRow> = diesel::sql_query(primary_repend_workflow_task_query())
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Timestamptz, _>(Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().map(|r| r.queue_name).collect())
+}
+
+/// SQL for [`primary_repend_workflow_task`]. Extracted as a `const fn` so its
+/// WHERE clause is unit-testable without a database.
+const fn primary_repend_workflow_task_query() -> &'static str {
+    "UPDATE harvest_task_queue \
+     SET state = 'PENDING', \
+         worker_id = NULL, \
+         started_at = NULL, \
+         scheduled_at = $2, \
+         created_at = clock_timestamp(), \
+         activity_name = NULL, \
+         sticky_until = CASE \
+             WHEN sticky_worker_id IS NOT NULL AND sticky_timeout IS NOT NULL \
+             THEN NOW() + sticky_timeout \
+             ELSE sticky_until \
+         END \
+     WHERE workflow_exec_id = $1 \
+       AND task_type = 'workflow' \
+       AND ( \
+           (state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL) \
+           OR (state = 'PENDING' AND scheduled_at > $2 AND activity_name = 'mixed_signal_suspension') \
+       ) \
+     RETURNING queue_name"
 }
 
 /// SQL for [`wake_workflow_task`]'s dropped-wake fallback: marks a still-claimed
@@ -2117,6 +2143,22 @@ mod tests {
     use super::*;
 
     // ── Dropped-wake fix (issue #601 CI hardening) ──────────────────────────
+
+    #[test]
+    fn primary_repend_workflow_task_query_targets_parked_and_elapsed_mixed_signal_rows() {
+        let sql = primary_repend_workflow_task_query();
+        assert!(sql.contains("SET state = 'PENDING'"));
+        assert!(sql.contains("worker_id = NULL"));
+        assert!(sql.contains("started_at = NULL"));
+        assert!(
+            sql.contains("state = 'RUNNING' AND worker_id IS NULL AND started_at IS NULL"),
+            "must target genuinely parked rows",
+        );
+        assert!(
+            sql.contains("activity_name = 'mixed_signal_suspension'"),
+            "must also target an elapsed mixed-signal PENDING row (issue #383)",
+        );
+    }
 
     #[test]
     fn wake_requested_fallback_query_targets_only_claimed_running_rows() {
