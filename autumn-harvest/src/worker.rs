@@ -2884,16 +2884,31 @@ async fn persist_signal_wait_park(
     // `wake_workflow_task` — which only targets RUNNING/parked rows — can
     // reliably distinguish signal waits from timer waits and will not
     // prematurely fire a pending timer when a signal is delivered.
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
-            detached_spawns.persist(conn, commands).await?;
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await?;
+    //
+    // `had_wake_requested` closes a race the post-park checks below cannot
+    // cover (PR #901 review): those checks re-load pending signals and
+    // external signal/cancel terminals, but an *update* admitted via
+    // `execute_update_in_process` (which appends `UpdateAdmitted` and calls
+    // `wake_workflow_task` as two separate, non-transactional steps -- no
+    // shared lock with this park) has no equivalent post-park re-check. A
+    // wake landing in the gap between this transaction's park and its commit
+    // would otherwise only be captured as `wake_requested = TRUE` and then
+    // silently discarded here.
+    let had_wake_requested = conn
+        .transaction::<bool, HarvestError, _>(|conn| {
+            async move {
+                store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
+                detached_spawns.persist(conn, commands).await?;
+                queue::park_workflow_task(conn, task_id, sticky).await
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    if had_wake_requested {
+        queue::wake_workflow_task(conn, exec_id).await?;
+        return Ok(());
+    }
 
     // A signal may have arrived while this task was actively running (before the
     // park above).  `send_signal` would have called `wake_workflow_task` at that
