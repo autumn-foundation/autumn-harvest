@@ -2284,6 +2284,21 @@ async fn update_workflow_execution_completed(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
+    // Code-review fix (issue #603): read the pre-update block state so the
+    // search_attrs clear below can be gated on it. A best-effort, unlocked
+    // read is fine here -- a race against a concurrent (re-)block is
+    // harmless (the block path stamps its own diagnostic independently, and
+    // a missed belt-and-braces clear here is caught by the next terminal
+    // transition or by `clear_nd_block`'s own guarded path).
+    let was_nd_blocked = dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select(dsl::nd_blocked_at.is_not_null())
+        .first::<bool>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .unwrap_or(false);
+
     let updated = diesel::update(
         dsl::harvest_workflow_executions
             .find(exec_id.as_uuid())
@@ -2315,9 +2330,14 @@ async fn update_workflow_execution_completed(
     // previously-blocked execution that completes via a path bypassing the
     // pause-guarded transaction's `clear_nd_block` hook leaves a phantom
     // `failure_cause=non_determinism` on a run that actually completed fine.
+    // Gated on `was_nd_blocked` (PR review fix): an unconditional clear here
+    // would silently delete pre-existing user search_attrs of the same name
+    // on rows created before these keys became reserved.
     // `nd_search_attrs_clear_patch`/`store::update_search_attrs` are defined
     // further below in this file; Rust item order doesn't matter here.
-    crate::store::update_search_attrs(conn, exec_id, &nd_search_attrs_clear_patch()).await?;
+    if was_nd_blocked {
+        crate::store::update_search_attrs(conn, exec_id, &nd_search_attrs_clear_patch()).await?;
+    }
 
     Ok(())
 }
@@ -2425,6 +2445,19 @@ async fn update_workflow_execution_failed(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
+    // Code-review fix (issue #603): see `update_workflow_execution_completed`
+    // for the rationale -- read the pre-update block state so the stale-
+    // diagnostic clear in the `None` arm below can be gated on it instead of
+    // running unconditionally on every ordinary author-error failure.
+    let was_nd_blocked = dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select(dsl::nd_blocked_at.is_not_null())
+        .first::<bool>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .unwrap_or(false);
+
     let updated = diesel::update(
         dsl::harvest_workflow_executions
             .find(exec_id.as_uuid())
@@ -2463,11 +2496,15 @@ async fn update_workflow_execution_failed(
         // from an earlier, now-resolved ND-block incident must also be
         // cleared from search_attrs, or the closed FAILED row keeps
         // displaying `failure_cause=non_determinism` for an unrelated
-        // failure reason.
-        None => {
+        // failure reason. Gated on `was_nd_blocked` (PR review fix): an
+        // unconditional clear here would silently delete pre-existing user
+        // search_attrs of the same name on rows created before these keys
+        // became reserved.
+        None if was_nd_blocked => {
             crate::store::update_search_attrs(conn, exec_id, &nd_search_attrs_clear_patch())
                 .await?;
         }
+        None => {}
     }
 
     Ok(())

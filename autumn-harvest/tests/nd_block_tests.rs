@@ -225,6 +225,15 @@ fn author_fail_handler(
     Box::pin(async move { Err("author says no".to_string()) })
 }
 
+/// Completes immediately with no suspension — used to exercise the terminal
+/// writers' belt-and-braces ND-block reset on a row that was never blocked.
+fn immediate_complete_handler(
+    _ctx: &WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + '_>> {
+    Box::pin(async move { Ok(serde_json::json!("done")) })
+}
+
 /// Parent: awaits one child workflow and returns its output.
 fn parent_handler(
     ctx: &WorkflowContext,
@@ -1103,4 +1112,66 @@ async fn continue_as_new_successor_does_not_inherit_stale_nd_search_attrs() {
             );
         }
     }
+}
+
+/// Regression test (code-review fix): a normal completion on a row that was
+/// *never* ND-blocked must not touch `search_attrs` at all. Before the fix,
+/// `update_workflow_execution_completed`'s belt-and-braces reset called
+/// `nd_search_attrs_clear_patch()` unconditionally on every completion,
+/// which would silently delete a pre-existing user-authored `build_id`
+/// business attribute written before these six keys became reserved
+/// (issue #603 only reserves them going forward — it does not, and cannot,
+/// revalidate rows already sitting in the database).
+#[tokio::test]
+async fn completion_never_touches_search_attrs_on_a_row_that_was_never_nd_blocked() {
+    let (url, _c) = setup().await;
+    let mut conn = connect(&url).await;
+    let metrics = Arc::new(RecordingMetrics::default());
+
+    let exec_id = start_workflow(&mut conn, "immediate_wf", "nd-legacy-attrs-001").await;
+
+    // Simulate a pre-existing legacy row: a business attribute under a name
+    // that only became reserved in this deploy, written via raw SQL (as a
+    // pre-migration application write would have) rather than through the
+    // now-validating `upsert_search_attrs` path.
+    diesel::update(harvest_workflow_executions::table)
+        .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::search_attrs.eq(Some(
+            serde_json::json!({"build_id": "legacy-user-value", "tenant": "acme"}),
+        )))
+        .execute(&mut conn)
+        .await
+        .expect("seeding legacy search_attrs should succeed");
+
+    let (worker, handle) = spawn_worker(
+        make_worker(
+            vec![wf_info("immediate_wf", immediate_complete_handler)],
+            metrics.clone(),
+            "v1",
+        ),
+        build_pool(&url),
+    );
+    wait_for_state(&mut conn, exec_id, &["COMPLETED"]).await;
+    worker.shutdown();
+    let _ = handle.await;
+
+    let attrs: Option<Value> = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(exec_id.as_uuid()))
+        .select(harvest_workflow_executions::search_attrs)
+        .first(&mut conn)
+        .await
+        .expect("execution must exist");
+
+    let attrs = attrs.expect("search_attrs must survive a completion that was never ND-blocked");
+    assert_eq!(
+        attrs.get("build_id"),
+        Some(&serde_json::json!("legacy-user-value")),
+        "a pre-existing legacy business attribute named 'build_id' must survive an \
+         ordinary completion: {attrs}"
+    );
+    assert_eq!(
+        attrs.get("tenant"),
+        Some(&serde_json::json!("acme")),
+        "unrelated search_attrs keys must be untouched: {attrs}"
+    );
 }

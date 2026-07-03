@@ -209,6 +209,11 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS retry_policy JSONB NULL;\n",
     // issue #534: the modern start path inserts origin.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS origin TEXT NULL;\n",
+    // issue #603: the modern start path's full-row insert touches the
+    // nd_block_* columns even for a fresh (never-blocked) execution.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_blocked_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_reason TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_count INTEGER NOT NULL DEFAULT 0;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return

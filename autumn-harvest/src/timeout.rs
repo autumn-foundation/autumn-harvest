@@ -422,6 +422,19 @@ async fn update_workflow_execution_timed_out(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_workflow_executions::dsl;
 
+    // Code-review fix (issue #603): see
+    // `worker::update_workflow_execution_completed` for the rationale --
+    // read the pre-update block state so the search_attrs clear below can be
+    // gated on it instead of running unconditionally on every timeout.
+    let was_nd_blocked = dsl::harvest_workflow_executions
+        .find(exec_id.as_uuid())
+        .select(dsl::nd_blocked_at.is_not_null())
+        .first::<bool>(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .unwrap_or(false);
+
     let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
         .set((
             dsl::state.eq("TIMED_OUT"),
@@ -447,8 +460,17 @@ async fn update_workflow_execution_timed_out(
         )));
     }
 
-    crate::store::update_search_attrs(conn, exec_id, &crate::worker::nd_search_attrs_clear_patch())
+    // Gated on `was_nd_blocked` (PR review fix): an unconditional clear here
+    // would silently delete pre-existing user search_attrs of the same name
+    // on rows created before these keys became reserved.
+    if was_nd_blocked {
+        crate::store::update_search_attrs(
+            conn,
+            exec_id,
+            &crate::worker::nd_search_attrs_clear_patch(),
+        )
         .await?;
+    }
 
     Ok(())
 }

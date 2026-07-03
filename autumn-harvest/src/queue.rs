@@ -1147,8 +1147,15 @@ pub async fn record_heartbeat(
 /// common to both [`requeue_for_retry`] (activity retry) and
 /// [`requeue_workflow_task_nd_blocked`] (ND-block backoff), previously
 /// duplicated verbatim in both functions.
+///
+/// `treat_none_as_null = true` is required: Diesel's default `AsChangeset`
+/// behavior treats a `None` field as "omit this column from `SET`" rather
+/// than "set it to `NULL`", which would silently stop `worker_id`,
+/// `started_at`, and `last_heartbeat_at` from ever being cleared on requeue
+/// (the pre-refactor code used explicit `.eq(None::<T>)` per column, which
+/// is unaffected by this default and was correct).
 #[derive(AsChangeset)]
-#[diesel(table_name = crate::schema::harvest_task_queue)]
+#[diesel(table_name = crate::schema::harvest_task_queue, treat_none_as_null = true)]
 struct PendingRequeueChangeset {
     state: &'static str,
     worker_id: Option<String>,
@@ -2377,6 +2384,46 @@ mod tests {
         assert!(sql.contains("sticky_worker_id = NULL"));
         assert!(sql.contains("sticky_until = NULL"));
         assert!(sql.contains("sticky_timeout = NULL"));
+    }
+
+    /// PR-review regression test (Gemini finding): `PendingRequeueChangeset`
+    /// must actually null out `worker_id`/`started_at`/`last_heartbeat_at` in
+    /// the generated SQL, not silently omit them from the `SET` clause.
+    /// Diesel's default `AsChangeset` treats a `None` field as "no update";
+    /// without `treat_none_as_null = true` this test fails with the columns
+    /// missing from the query entirely.
+    #[test]
+    fn pending_requeue_changeset_nulls_out_none_fields_in_generated_sql() {
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::debug_query;
+        use diesel::pg::Pg;
+
+        let changeset =
+            PendingRequeueChangeset::new(chrono::Utc::now(), "some retryable error".to_string());
+        let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
+            .set(&changeset);
+        let debug = debug_query::<Pg, _>(&query).to_string();
+
+        // With `treat_none_as_null = true`, a `None` field is bound as a SQL
+        // NULL parameter rather than silently omitted from the `SET` clause
+        // (Diesel's default behavior). Assert both: the column is present in
+        // the generated SQL text, and its bound value is `None` (SQL NULL).
+        for column in ["worker_id", "started_at", "last_heartbeat_at"] {
+            assert!(
+                debug.contains(&format!("\"{column}\" = $")),
+                "{column} must appear as a bound column in the SET clause \
+                 (not omitted): {debug}"
+            );
+        }
+        assert!(
+            debug.matches("None").count() >= 3,
+            "worker_id/started_at/last_heartbeat_at must all bind to None (SQL NULL), \
+             not be silently dropped from the query: {debug}"
+        );
+        assert!(debug.contains("\"state\" = "));
+        assert!(debug.contains("\"crash_strikes\" = "));
+        assert!(debug.contains("\"scheduled_at\" = "));
+        assert!(debug.contains("\"error\" = "));
     }
 
     #[test]
