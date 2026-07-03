@@ -3590,26 +3590,82 @@ impl HistoryMatcher {
     }
 
     /// Non-destructively check whether a `u64`-valued `MarkerRecorded` event
-    /// named `marker_name` sits at the current cursor position, returning its
-    /// value and consuming it if so.
+    /// named `marker_name` exists ahead in history, returning its value and
+    /// consuming it if so.
     ///
     /// Unlike [`Self::match_u64_marker`] this takes no expected value, so it
     /// can be used to *discover* a previously recorded decision (e.g.
     /// `WorkflowContext::race`'s winner marker) rather than verify one already
-    /// known to the caller. On a miss (wrong event, wrong name, or past end of
-    /// history) the cursor is left completely unchanged, so it is always safe
-    /// to call speculatively.
+    /// known to the caller.
+    ///
+    /// **Interleave-tolerant** (mirrors [`Self::scan_activity_terminal`]'s
+    /// forward scan): when two `ctx.race()` calls (or a race alongside a
+    /// fan-out / side-effect / child-workflow race) are driven concurrently
+    /// via `futures::join!`, a sibling primitive's own marker or branch
+    /// events can legitimately sit between the cursor and this marker's true
+    /// recorded position — e.g. race #2's `race:2` open marker and branch
+    /// schedules landing between race #1's own branch schedules and its
+    /// `race_winner:1` marker. Those tolerated event kinds are scanned past
+    /// (tracked, not consumed) rather than treated as an immediate miss; on
+    /// a match, the cursor rewinds to the first such tolerated event (like
+    /// [`Self::settle_terminal`]) so a sibling's own later scan still finds
+    /// it. On a genuine miss (scan exhausted, or an event outside the
+    /// tolerated set is encountered) the cursor is left unchanged if nothing
+    /// was skipped, or parked at the first tolerated event otherwise — in
+    /// both cases safe to call speculatively.
     pub fn peek_u64_marker(&mut self, marker_name: &str) -> Option<u64> {
         if !self.prepare_match() {
             return None;
         }
-        if let WorkflowEvent::MarkerRecorded { name, details } = &self.events[self.cursor]
-            && name == marker_name
-        {
-            let value = details.as_u64();
-            self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_command = None;
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+            match &self.events[scan_cursor] {
+                WorkflowEvent::MarkerRecorded { name, details } if name == marker_name => {
+                    let value = details.as_u64();
+                    if let Some(command_cursor) = first_interleaved_command {
+                        self.consumed_out_of_order_events.insert(scan_cursor);
+                        self.cursor = command_cursor;
+                    } else {
+                        self.cursor = scan_cursor + 1;
+                    }
+                    self.advance_to_next_unconsumed_event();
+                    return value;
+                }
+                // Events a sibling ctx.race()/fan-out/side-effect/child-race
+                // branch, driven concurrently via futures::join!, can
+                // legitimately interleave with this marker's true position.
+                WorkflowEvent::MarkerRecorded { .. }
+                | WorkflowEvent::SideEffectRecorded { .. }
+                | WorkflowEvent::ActivityScheduled { .. }
+                | WorkflowEvent::ActivityStarted { .. }
+                | WorkflowEvent::ActivityHeartbeat { .. }
+                | WorkflowEvent::ActivityCompleted { .. }
+                | WorkflowEvent::ActivityFailed { .. }
+                | WorkflowEvent::ActivityTimedOut { .. }
+                | WorkflowEvent::ChildWorkflowStarted { .. }
+                | WorkflowEvent::ChildWorkflowSpawnedDetached { .. }
+                | WorkflowEvent::ChildWorkflowCompleted { .. }
+                | WorkflowEvent::ChildWorkflowFailed { .. }
+                | WorkflowEvent::TimerStarted { .. }
+                | WorkflowEvent::TimerFired { .. } => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // Anything else (signals, external-signal/cancel triplets,
+                // update events, terminal lifecycle events, ...) is outside
+                // the tolerated set for this scan -- stop rather than
+                // silently skipping past something that might matter.
+                _ => break,
+            }
+        }
+        if let Some(command_cursor) = first_interleaved_command {
+            self.cursor = command_cursor;
             self.advance_to_next_unconsumed_event();
-            return value;
         }
         None
     }

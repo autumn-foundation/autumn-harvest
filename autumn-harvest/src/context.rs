@@ -11602,6 +11602,101 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test (Codex review, PR #902): two `ctx.race()` calls driven
+    /// concurrently (e.g. via `futures::join!`) interleave their histories --
+    /// a sibling race's own open marker and branch schedules land, in
+    /// recorded event order, between this race's own branch schedules and
+    /// its already-recorded winner marker (since the sibling was dispatched
+    /// on an earlier cycle and hasn't resolved yet). `peek_u64_marker` must
+    /// scan past that interleaved sibling data to find `race_winner:1`
+    /// rather than treating the sibling's `race:2` marker sitting at the
+    /// (rewound) cursor as a miss and re-emitting a duplicate winner marker.
+    #[tokio::test]
+    async fn race_verifies_previously_recorded_winner_across_an_interleaved_sibling_race()
+    -> Result<(), HarvestError> {
+        let a1 = ActivityExecId::new();
+        let a2 = ActivityExecId::new();
+        let b1 = ActivityExecId::new();
+        let b2 = ActivityExecId::new();
+        let winner_output = serde_json::json!({"provider": "a1"});
+
+        let events = vec![
+            race_started_event(),
+            // Race #1's own open marker + branch schedules.
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: a1,
+                name: "a1".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: a2,
+                name: "a2".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            // Race #2 (a sibling driven concurrently via futures::join!) is
+            // dispatched but never resolves in this history snapshot.
+            WorkflowEvent::MarkerRecorded {
+                name: "race:2".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: b1,
+                name: "b1".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: b2,
+                name: "b2".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            // Race #1 resolves and is fully recorded, all positioned *after*
+            // race #2's still-open branch schedules above.
+            WorkflowEvent::ActivityCompleted {
+                activity_id: a1,
+                output: winner_output.clone(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "race_winner:1".to_string(),
+                details: Value::from(0u64),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: a2,
+                error: "lost race to a sibling branch".to_string(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: true,
+                details: None,
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .activity_raw("a1", Value::Null, "default")
+            .activity_raw("a2", Value::Null, "default")
+            .run()
+            .await?;
+
+        assert_eq!(winner.index, 0, "a1 completed and must win");
+        assert_eq!(winner.value, winner_output);
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.is_empty(),
+            "the already-recorded race_winner:1 marker must be found past the \
+             interleaved sibling race's events, not re-emitted as a duplicate: \
+             {commands:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn race_activity_diverges_when_recorded_winner_disagrees_with_replay() {
         let branch_a = ActivityExecId::new();
