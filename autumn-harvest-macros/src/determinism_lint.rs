@@ -388,6 +388,34 @@ impl<'ast> Visit<'ast> for DeterminismVisitor {
         syn::visit::visit_expr_macro(self, i);
     }
 
+    fn visit_macro(&mut self, i: &'ast syn::Macro) {
+        // HVG010: SelectMacro (issue #600) -- tokio::select!/futures::select!/
+        // futures::select_biased! racing ctx-managed awaitables is a double
+        // footgun (non-deterministic winner on replay, no durable loser
+        // cancellation). Checked at the generic `visit_macro` level (rather
+        // than `visit_expr_macro`) because `select! { .. }` used bare at
+        // statement position -- the idiomatic form, with no trailing `;` --
+        // parses as `syn::StmtMacro`, not `syn::ExprMacro`; `visit_macro` is
+        // called from both. Detected by macro path only, mirroring HVG009 --
+        // the macro body's tokens are not parsed as exprs by syn, so this
+        // cannot distinguish a `select!` over ctx awaitables from one over
+        // plain futures, but a workflow body has no legitimate reason to
+        // `select!` over anything else (ctx.race() and futures::join! cover
+        // every wait-first/wait-all shape blessed for workflow code).
+        let path_str = path_to_string(&i.path);
+        if path_str == "select"
+            || path_str == "select_biased"
+            || path_str == "tokio::select"
+            || path_str == "futures::select"
+            || path_str == "futures::select_biased"
+        {
+            self.add_finding("HVG010", i.path.segments.last().unwrap().ident.span());
+        }
+
+        // Delegate to nested traversal
+        syn::visit::visit_macro(self, i);
+    }
+
     fn visit_path(&mut self, i: &'ast syn::Path) {
         let path_str = path_to_string(i);
         if path_str == "rand::rngs::OsRng" || path_str == "OsRng" {
@@ -456,6 +484,12 @@ pub fn load_catalog_metadata() -> HashMap<String, RuleInfo> {
             severity: "Warning".to_string(),
             explanation: "Calling tracing::info!(), tracing::warn!(), tracing::error!(), or any other bare tracing macro directly inside a #[workflow] body emits one log event per replay cycle. Because the workflow executor re-runs the function from the top on every suspension/resume, a single log statement fires N times for a workflow that suspends N times. This amplifies log volume in proportion to replay depth and fills Loki/Elastic with duplicate lines that lack correlation keys, making incident triage harder.".to_string(),
             alternative: "Use ctx.logger().info(message), ctx.logger().warn(message), ctx.logger().error(message), or the convenience wrappers ctx.log_info(message), ctx.log_warn(message), ctx.log_error(message). These are suppressed automatically during replay (is_replaying() == true) and auto-tag every event with workflow_id, execution_id, workflow_type, and replay = false for log correlation.".to_string(),
+        },
+        RuleInfo {
+            id: "HVG010".to_string(),
+            severity: "HardBlocker".to_string(),
+            explanation: "Using tokio::select!, futures::select!, or futures::select_biased! to race concurrent ctx-managed operations (activities, timers, signals, child workflows) inside a workflow body is a double footgun: (1) the winning branch depends on non-deterministic poll/arrival order, so a replay can pick a different branch than the original run and diverge; (2) the dropped loser branches do not durably cancel the underlying work -- a scheduled activity keeps running on a worker and a durable timer row stays live, leaking state that is never cleaned up.".to_string(),
+            alternative: "Use ctx.race() (WorkflowContext), the deterministic race/select primitive (issue #600). It records the winning branch durably via a MarkerRecorded event so replay always resolves the same winner, and durably cancels every losing branch (activity task rows, child-workflow executions, or a losing durable timer) so no leaked in-flight work remains. For a single signal bounded by a deadline, ctx.receive_signal_timeout()/wait_for_signal_timeout() is the direct primitive ctx.race()'s timer-plus-signal shape wraps.".to_string(),
         },
     ];
 

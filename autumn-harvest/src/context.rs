@@ -424,6 +424,37 @@ pub enum WorkflowCommand {
         /// not be appended again (crash-recovery path).
         already_requested: bool,
     },
+    /// Durably cancel the losing branches of a resolved `ctx.race()` (issue #600).
+    ///
+    /// Pushed once per race, in the same drained batch as the race's winner
+    /// marker (`RecordMarker { name: "race_winner:{seq}", .. }"`). Bookkeeping:
+    /// carries no result channel and never drives a suspension shape by
+    /// itself — every suspension/terminal persist path treats it as
+    /// bookkeeping alongside `RecordMarker`/`RecordSideEffect`/etc.
+    ///
+    /// The worker resolves it (in the *same* transaction that persists the
+    /// winner marker, so a crash between the two can never leak a row) by:
+    /// - `activities`: atomically transitioning each still-open task row to
+    ///   `CANCELLED` and appending a synthetic `ActivityFailed { error: "lost
+    ///   race to a sibling branch", .. }` for it (reusing the existing event
+    ///   variant — no new `WorkflowEvent`), so every future replay resolves
+    ///   that branch to a terminal instead of looping forever on
+    ///   `ActivityInProgress`. Already-terminal activities (a genuine
+    ///   completion raced the cancellation) are left untouched.
+    /// - `children`: cancelling via the existing `cancel_workflow_execution_collect`
+    ///   primitive (issue #492's machinery), which already appends the
+    ///   necessary terminal event to the parent's history and is idempotent
+    ///   against an already-terminal child.
+    /// - `timers`: deleting the still-pending `harvest_timers` row.
+    CancelRaceLosers {
+        /// Activity execution IDs of losing activity branches still open
+        /// (`PENDING`/`RUNNING`) at race-resolution time.
+        activities: Vec<ActivityExecId>,
+        /// Execution IDs of losing child-workflow branches to cancel.
+        children: Vec<ExecutionId>,
+        /// Timer IDs of losing timer branches to remove from `harvest_timers`.
+        timers: Vec<TimerId>,
+    },
 }
 
 // Manual Debug because oneshot::Sender is not Debug.
@@ -557,6 +588,16 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("target", target)
                 .field("already_requested", already_requested)
                 .finish_non_exhaustive(),
+            Self::CancelRaceLosers {
+                activities,
+                children,
+                timers,
+            } => f
+                .debug_struct("CancelRaceLosers")
+                .field("activities", activities)
+                .field("children", children)
+                .field("timers", timers)
+                .finish(),
             Self::SpawnDetachedChildWorkflow {
                 child_id,
                 workflow_name,
@@ -579,6 +620,289 @@ impl std::fmt::Debug for WorkflowCommand {
 async fn park_until_dropped() -> HarvestResult<()> {
     std::future::pending::<()>().await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ctx.race() — deterministic race/select primitive (issue #600)
+// ---------------------------------------------------------------------------
+
+/// One branch of a [`RaceBuilder`] (issue #600).
+enum RaceBranchKind {
+    Activity {
+        name: String,
+        input: Value,
+        queue: String,
+        retry: Option<crate::policy::RetryPolicy>,
+        start_to_close: Option<std::time::Duration>,
+    },
+    ChildWorkflow {
+        workflow_name: String,
+        input: Value,
+    },
+    /// Paired with exactly one [`RaceBranchKind::Signal`] branch and no other
+    /// branches — see [`RaceBuilder::run`] for the supported-shape rules.
+    Timer {
+        duration_secs: u64,
+    },
+    /// Paired with exactly one [`RaceBranchKind::Timer`] branch and no other
+    /// branches — see [`RaceBuilder::run`] for the supported-shape rules.
+    Signal {
+        signal_name: String,
+    },
+}
+
+struct RaceBranch {
+    kind: RaceBranchKind,
+    label: Option<String>,
+}
+
+/// A still-open race branch discovered during `WorkflowContext::race_impl`'s
+/// history check, carrying whatever durable resource id it will need if it
+/// loses the race and must be cancelled.
+struct RaceDispatch {
+    /// Index into the original branch list.
+    index: usize,
+    activity_id: Option<ActivityExecId>,
+    child_id: Option<ExecutionId>,
+    /// `true` when this branch has never been dispatched before (its command
+    /// must carry full scheduling parameters); `false` when it is already in
+    /// history and only needs a `WaitForActivity` re-park.
+    is_new: bool,
+}
+
+/// The winning branch of a resolved [`WorkflowContext::race`] (issue #600).
+#[derive(Debug, Clone)]
+pub struct RaceWinner {
+    /// Index of the winning branch, in the order branches were added to the
+    /// [`RaceBuilder`].
+    pub index: usize,
+    /// The label attached via [`RaceBuilder::label`], if any.
+    pub label: Option<String>,
+    /// The winning branch's value: the activity/child-workflow output, the
+    /// signal payload, or `Value::Null` for a timer branch.
+    pub value: Value,
+}
+
+impl RaceWinner {
+    /// Deserialize the winning branch's value into `O`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Serialization`] if `O` cannot be deserialized
+    /// from the winning branch's JSON value.
+    pub fn decode<O: serde::de::DeserializeOwned>(&self) -> HarvestResult<O> {
+        serde_json::from_value(self.value.clone()).map_err(HarvestError::Serialization)
+    }
+}
+
+/// Builder for [`WorkflowContext::race`] (issue #600): await the first of
+/// several concurrent ctx-managed awaitables and durably cancel the losers.
+///
+/// # Supported shapes
+///
+/// - **N activity branches** (`N >= 1`, via [`Self::activity`]/[`Self::activity_raw`]):
+///   races activities; every losing activity is durably cancelled — its task
+///   row is transitioned out of `PENDING`/`RUNNING` and a synthetic
+///   `ActivityFailed { error: "lost race to a sibling branch" }` terminal is
+///   recorded (reusing the existing event variant) so replay always resolves
+///   that branch to a terminal instead of looping on `ActivityInProgress`.
+/// - **N child-workflow branches** (`N >= 1`, via [`Self::child_workflow`]):
+///   races child workflows; every losing child is durably cancelled via the
+///   same `cancel_workflow_execution_collect` primitive the external-cancel
+///   feature uses (issue #492).
+/// - **Exactly one [`Self::timer`] + exactly one [`Self::signal`]**: a thin
+///   wrapper around the fully-tested
+///   [`WorkflowContext::receive_signal_timeout`]/`wait_for_signal_timeout`
+///   primitive (issue #476). A losing signal simply stays observable to a
+///   later signal wait (nothing to durably cancel); a losing timer's
+///   still-armed durable timer row is removed by the worker exactly as it is
+///   today.
+///
+/// Mixing branch kinds outside of these three shapes (e.g. racing an activity
+/// against a timer in the same call) returns [`HarvestError::Config`] from
+/// [`Self::run`] — the worker's suspension-persistence layer does not yet
+/// support a fully heterogeneous mixed-command batch (see the crate-level
+/// determinism guide, HVG010, for the rationale). Bound an individual
+/// activity with its own `start_to_close`/`schedule_to_close` timeout, or use
+/// `receive_signal_timeout` directly, to express a deadline-bounded branch
+/// instead.
+///
+/// # Determinism contract
+///
+/// The winning branch is recorded via the existing `MarkerRecorded` event
+/// (mirroring `execute_activity_fan_out`'s marker — no new `WorkflowEvent`
+/// variant): an "open" marker (`race:{seq}`) fixes the branch count on first
+/// dispatch, and a "winner" marker (`race_winner:{seq}`) fixes the winning
+/// index once decided. Every subsequent replay of the same history *verifies*
+/// — rather than re-derives — the previously recorded winner, so a code
+/// change that would flip the outcome is rejected as
+/// [`HarvestError::NonDeterministic`] instead of silently diverging.
+///
+/// If multiple branches already have a terminal result recorded in history by
+/// the time the race is (re-)evaluated (e.g. two activities both finished
+/// before the workflow task got a chance to notice), the **lowest-indexed**
+/// resolved branch wins — a documented, deterministic tie-break, mirroring
+/// `receive_signal_timeout`'s signal-first tie-break for its own in-cycle
+/// case.
+///
+/// # Example
+///
+/// Racing two activities and durably cancelling the loser, in five lines:
+///
+/// ```rust,ignore
+/// let winner = ctx.race()
+///     .activity(&fetch_primary_info(), input.clone())
+///     .activity(&fetch_fallback_info(), input)
+///     .run().await?;
+/// let quote: Quote = winner.decode()?;
+/// ```
+pub struct RaceBuilder<'a> {
+    ctx: &'a WorkflowContext,
+    branches: Vec<RaceBranch>,
+}
+
+impl RaceBuilder<'_> {
+    /// Add a typed activity branch, using `info`'s registered queue/retry/timeout defaults.
+    #[must_use]
+    pub fn activity<I: serde::Serialize>(self, info: &crate::info::ActivityInfo, input: I) -> Self {
+        let json_input = serde_json::to_value(input).unwrap_or(Value::Null);
+        let queue = info.default_queue.unwrap_or("default").to_string();
+        self.push(RaceBranchKind::Activity {
+            name: info.name.to_string(),
+            input: json_input,
+            queue,
+            retry: info.default_retry_policy.clone(),
+            start_to_close: info.default_start_to_close,
+        })
+    }
+
+    /// Add an untyped activity branch by name.
+    #[must_use]
+    pub fn activity_raw(self, name: &str, input: Value, queue: &str) -> Self {
+        self.push(RaceBranchKind::Activity {
+            name: name.to_string(),
+            input,
+            queue: queue.to_string(),
+            retry: None,
+            start_to_close: None,
+        })
+    }
+
+    /// Add a child-workflow branch.
+    #[must_use]
+    pub fn child_workflow<I: serde::Serialize>(
+        self,
+        info: &crate::info::WorkflowInfo,
+        input: I,
+    ) -> Self {
+        self.child_workflow_raw(
+            info.name,
+            serde_json::to_value(input).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Add an untyped child-workflow branch by name.
+    #[must_use]
+    pub fn child_workflow_raw(self, workflow_name: &str, input: Value) -> Self {
+        self.push(RaceBranchKind::ChildWorkflow {
+            workflow_name: workflow_name.to_string(),
+            input,
+        })
+    }
+
+    /// Add a durable-timer branch. Must be paired with exactly one
+    /// [`Self::signal`] branch and no other branches — see [`Self::run`].
+    /// `timeout` is rounded **up** to whole seconds.
+    #[must_use]
+    pub fn timer(self, timeout: std::time::Duration) -> Self {
+        let duration_secs = timeout
+            .as_secs()
+            .saturating_add(u64::from(timeout.subsec_nanos() > 0));
+        self.push(RaceBranchKind::Timer { duration_secs })
+    }
+
+    /// Add a signal branch. Must be paired with exactly one [`Self::timer`]
+    /// branch and no other branches — see [`Self::run`].
+    #[must_use]
+    pub fn signal(self, signal_name: &str) -> Self {
+        self.push(RaceBranchKind::Signal {
+            signal_name: signal_name.to_string(),
+        })
+    }
+
+    /// Label the most recently added branch (surfaced on [`RaceWinner::label`]).
+    #[must_use]
+    pub fn label(mut self, label: &str) -> Self {
+        if let Some(last) = self.branches.last_mut() {
+            last.label = Some(label.to_string());
+        }
+        self
+    }
+
+    fn push(mut self, kind: RaceBranchKind) -> Self {
+        self.branches.push(RaceBranch { kind, label: None });
+        self
+    }
+
+    /// Resolve the race: await the first branch to complete and durably
+    /// cancel the losers.
+    ///
+    /// # Errors
+    ///
+    /// - [`HarvestError::Config`] if zero branches were added, or if the
+    ///   branch kinds don't form one of the three supported shapes (see the
+    ///   type-level docs).
+    /// - [`HarvestError::Cancelled`] if the workflow has been cancelled.
+    /// - [`HarvestError::NonDeterministic`] if replay disagrees with a
+    ///   previously recorded winner or branch count.
+    /// - Whatever error the winning branch itself failed with.
+    pub async fn run(self) -> HarvestResult<RaceWinner> {
+        self.ctx.race_impl(self.branches).await
+    }
+}
+
+/// Live-mode future for `ctx.race()` (issue #600): polls every still-pending
+/// branch receiver in ascending index order on each poll, so a live in-cycle
+/// tie (multiple receivers ready in the same poll) always resolves to the
+/// lowest-indexed branch — the same deterministic tie-break `settle_race`
+/// documents for the history-derived case. A dropped channel is removed and
+/// treated as "will never resolve"; only when every receiver is gone does the
+/// future resolve to [`HarvestError::Cancelled`].
+struct RaceFirstFut {
+    receivers: Vec<(usize, oneshot::Receiver<Result<Value, String>>)>,
+}
+
+impl std::future::Future for RaceFirstFut {
+    type Output = HarvestResult<(usize, Result<Value, String>)>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut i = 0;
+        while i < this.receivers.len() {
+            match std::pin::Pin::new(&mut this.receivers[i].1).poll(cx) {
+                std::task::Poll::Ready(Ok(result)) => {
+                    let (index, _) = this.receivers.remove(i);
+                    return std::task::Poll::Ready(Ok((index, result)));
+                }
+                std::task::Poll::Ready(Err(_)) => {
+                    this.receivers.remove(i);
+                }
+                std::task::Poll::Pending => {
+                    i += 1;
+                }
+            }
+        }
+        if this.receivers.is_empty() {
+            std::task::Poll::Ready(Err(HarvestError::Cancelled(
+                "race: all branch channels dropped".to_string(),
+            )))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +1071,11 @@ pub struct WorkflowContext {
     /// (issue #476). Each `wait_for_signal_timeout` call increments this once
     /// so each race has a stable, unique timer ID across replays.
     signal_timeout_seq: Mutex<u32>,
+    /// Monotonically increasing counter for naming `ctx.race()` markers
+    /// (issue #600). Each `race()` call increments this once so each race has
+    /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
+    /// replays, mirroring `fan_out_seq`.
+    race_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
@@ -1072,6 +1401,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
+            race_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -1182,6 +1512,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
+            race_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -1229,6 +1560,7 @@ impl WorkflowContext {
             activity_seq: Mutex::new(0),
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
+            race_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -4292,6 +4624,442 @@ impl WorkflowContext {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(typed)
+    }
+
+    // ── Race / select (issue #600) ───────────────────────────────────────────
+
+    /// Generate the next race sequence number for marker naming (mirrors
+    /// `next_fan_out_seq`).
+    fn next_race_seq(&self) -> u32 {
+        let mut seq = self.race_seq.lock().expect("race_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Start building a deterministic race between several ctx-managed
+    /// awaitables (issue #600) — see [`RaceBuilder`] for the supported shapes,
+    /// determinism contract, and cancellation semantics.
+    #[must_use]
+    pub const fn race(&self) -> RaceBuilder<'_> {
+        RaceBuilder {
+            ctx: self,
+            branches: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn race_impl(&self, branches: Vec<RaceBranch>) -> HarvestResult<RaceWinner> {
+        self.check_cancellation()?;
+
+        if branches.is_empty() {
+            return Err(HarvestError::Config(
+                "ctx.race() requires at least one branch".to_string(),
+            ));
+        }
+
+        let all_activity = branches
+            .iter()
+            .all(|b| matches!(b.kind, RaceBranchKind::Activity { .. }));
+        let all_child = branches
+            .iter()
+            .all(|b| matches!(b.kind, RaceBranchKind::ChildWorkflow { .. }));
+        let is_timer_signal_pair = branches.len() == 2
+            && branches
+                .iter()
+                .any(|b| matches!(b.kind, RaceBranchKind::Timer { .. }))
+            && branches
+                .iter()
+                .any(|b| matches!(b.kind, RaceBranchKind::Signal { .. }));
+
+        if is_timer_signal_pair {
+            return self.race_timer_signal_impl(branches).await;
+        }
+
+        if !all_activity && !all_child {
+            return Err(HarvestError::Config(
+                "ctx.race() only supports a homogeneous race of activity branches, a \
+                 homogeneous race of child-workflow branches, or exactly one timer branch \
+                 paired with exactly one signal branch in this release — mixing branch kinds \
+                 (e.g. an activity racing a timer) is out of scope for issue #600's initial \
+                 slice because the worker's suspension-persistence layer does not yet support \
+                 a fully heterogeneous mixed-command batch. Bound an individual activity with \
+                 its own start_to_close/schedule_to_close timeout, or use \
+                 receive_signal_timeout for a signal-or-deadline race, instead."
+                    .to_string(),
+            ));
+        }
+
+        let seq = self.next_race_seq();
+        let count = branches.len();
+        let open_marker = format!("race:{seq}");
+        match self.match_history(|m| m.match_u64_marker(&open_marker, count as u64)) {
+            HistoryMatch::Matched { .. } => {}
+            HistoryMatch::NoMatch => {
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: open_marker,
+                    details: Value::from(count as u64),
+                });
+            }
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => {
+                return Err(self.nd_error(
+                    format!(
+                        "race #{seq}: history has {expected} but current code supplies {actual} \
+                         — the branch count changed between deploy and replay; use ctx.version() \
+                         to guard this race if the change is intentional"
+                    ),
+                    event_index,
+                    Some(expected),
+                    Some(actual),
+                ));
+            }
+            _ => unreachable!("match_u64_marker only returns Matched, NoMatch, or Diverged"),
+        }
+
+        // Phase A: synchronously check every branch's history state without
+        // pushing any command yet, so a branch that already has a terminal
+        // recorded (the common case on any replay after the race resolves)
+        // never re-emits a stray dispatch/wait command for a cancelled sibling.
+        let mut resolved: Vec<(usize, HarvestResult<Value>)> = Vec::new();
+        let mut to_dispatch: Vec<RaceDispatch> = Vec::new();
+
+        for (index, branch) in branches.iter().enumerate() {
+            match &branch.kind {
+                RaceBranchKind::Activity { name, .. } => {
+                    let history_match = self.match_history(|m| m.match_activity(name));
+                    match history_match {
+                        HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
+                        HistoryMatch::Failed {
+                            error,
+                            attempt,
+                            error_type,
+                            details,
+                        } => resolved.push((
+                            index,
+                            Err(HarvestError::ActivityFailed {
+                                name: name.clone(),
+                                attempt,
+                                error_type,
+                                details,
+                                source: error.into(),
+                            }),
+                        )),
+                        HistoryMatch::TimedOut { timeout_type } => resolved.push((
+                            index,
+                            Err(HarvestError::Timeout {
+                                timeout_type,
+                                task_name: name.clone(),
+                            }),
+                        )),
+                        HistoryMatch::Diverged {
+                            expected,
+                            actual,
+                            event_index,
+                        } => {
+                            return Err(self.nd_error(
+                                format!(
+                                    "race #{seq} branch {index} ({name}): activity mismatch: \
+                                     expected {expected}, got {actual}"
+                                ),
+                                event_index,
+                                Some(expected),
+                                Some(actual),
+                            ));
+                        }
+                        HistoryMatch::ActivityInProgress { activity_id } => {
+                            to_dispatch.push(RaceDispatch {
+                                index,
+                                activity_id: Some(activity_id),
+                                child_id: None,
+                                is_new: false,
+                            });
+                        }
+                        HistoryMatch::NoMatch => {
+                            to_dispatch.push(RaceDispatch {
+                                index,
+                                activity_id: Some(self.next_activity_id()),
+                                child_id: None,
+                                is_new: true,
+                            });
+                        }
+                        _ => unreachable!("match_activity never returns this variant"),
+                    }
+                }
+                RaceBranchKind::ChildWorkflow {
+                    workflow_name,
+                    input,
+                } => {
+                    let history_match =
+                        self.match_history(|m| m.match_child_workflow(workflow_name, input));
+                    match history_match {
+                        HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
+                        HistoryMatch::Failed {
+                            error,
+                            attempt,
+                            error_type,
+                            details,
+                        } => resolved.push((
+                            index,
+                            Err(HarvestError::ActivityFailed {
+                                name: format!("child-workflow:{workflow_name}"),
+                                attempt,
+                                error_type,
+                                details,
+                                source: error.into(),
+                            }),
+                        )),
+                        HistoryMatch::Diverged {
+                            expected,
+                            actual,
+                            event_index,
+                        } => {
+                            return Err(self.nd_error(
+                                format!(
+                                    "race #{seq} branch {index} ({workflow_name}): child \
+                                     workflow mismatch: expected {expected}, got {actual}"
+                                ),
+                                event_index,
+                                Some(expected),
+                                Some(actual),
+                            ));
+                        }
+                        HistoryMatch::ChildInProgress { child_id } => {
+                            to_dispatch.push(RaceDispatch {
+                                index,
+                                activity_id: None,
+                                child_id: Some(child_id),
+                                is_new: false,
+                            });
+                        }
+                        HistoryMatch::NoMatch => {
+                            to_dispatch.push(RaceDispatch {
+                                index,
+                                activity_id: None,
+                                child_id: Some(ExecutionId::new()),
+                                is_new: true,
+                            });
+                        }
+                        _ => unreachable!("match_child_workflow never returns this variant"),
+                    }
+                }
+                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
+                    unreachable!("timer/signal branches only occur in the paired shape")
+                }
+            }
+        }
+
+        if !resolved.is_empty() {
+            return self.settle_race(seq, &branches, resolved, &to_dispatch);
+        }
+
+        // Nothing resolved yet — dispatch every branch and await the first
+        // live resolution. Branches are pushed in ascending index order, so
+        // the race future's poll-order tie-break (lowest index first)
+        // matches the documented tie-break used when multiple branches are
+        // already resolved by the time a later replay cycle checks them.
+        let mut receivers: Vec<(usize, oneshot::Receiver<Result<Value, String>>)> =
+            Vec::with_capacity(to_dispatch.len());
+        for dispatch in &to_dispatch {
+            let branch = &branches[dispatch.index];
+            let (tx, rx) = oneshot::channel();
+            match &branch.kind {
+                RaceBranchKind::Activity {
+                    name,
+                    input,
+                    queue,
+                    retry,
+                    start_to_close,
+                } => {
+                    let activity_id = dispatch
+                        .activity_id
+                        .expect("activity dispatch always carries an activity_id");
+                    if dispatch.is_new {
+                        self.push_command(WorkflowCommand::ScheduleActivity {
+                            activity_id,
+                            name: name.clone(),
+                            input: input.clone(),
+                            queue: queue.clone(),
+                            retry_policy_override: retry.clone(),
+                            start_to_close_override: *start_to_close,
+                            result_tx: tx,
+                        });
+                    } else {
+                        self.push_command(WorkflowCommand::WaitForActivity {
+                            activity_id,
+                            result_tx: tx,
+                        });
+                    }
+                }
+                RaceBranchKind::ChildWorkflow {
+                    workflow_name,
+                    input,
+                } => {
+                    let child_id = dispatch
+                        .child_id
+                        .expect("child dispatch always carries a child_id");
+                    self.push_command(WorkflowCommand::StartChildWorkflow {
+                        child_id,
+                        workflow_name: workflow_name.clone(),
+                        input: input.clone(),
+                        result_tx: tx,
+                    });
+                }
+                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
+                    unreachable!("timer/signal branches only occur in the paired shape")
+                }
+            }
+            receivers.push((dispatch.index, rx));
+        }
+
+        let (winner_index, winner_raw) = RaceFirstFut { receivers }.await?;
+        let winner_result = match winner_raw {
+            Ok(value) => Ok(value),
+            Err(error) => match &branches[winner_index].kind {
+                RaceBranchKind::Activity { name, .. } => {
+                    Err(HarvestError::activity_failed(name, 1, &error))
+                }
+                RaceBranchKind::ChildWorkflow { workflow_name, .. } => {
+                    Err(HarvestError::activity_failed(
+                        format!("child-workflow:{workflow_name}"),
+                        1,
+                        &error,
+                    ))
+                }
+                RaceBranchKind::Timer { .. } | RaceBranchKind::Signal { .. } => {
+                    unreachable!("timer/signal branches only occur in the paired shape")
+                }
+            },
+        };
+
+        self.settle_race(
+            seq,
+            &branches,
+            vec![(winner_index, winner_result)],
+            &to_dispatch,
+        )
+    }
+
+    /// Decide (and, on the first cycle a winner is known, durably record) the
+    /// winning branch of a race whose branch-level history states are already
+    /// known (`resolved`), given the set of still-open branches (`to_dispatch`)
+    /// that must be durably cancelled if they are not the winner.
+    fn settle_race(
+        &self,
+        seq: u32,
+        branches: &[RaceBranch],
+        mut resolved: Vec<(usize, HarvestResult<Value>)>,
+        to_dispatch: &[RaceDispatch],
+    ) -> HarvestResult<RaceWinner> {
+        let winner_marker_name = format!("race_winner:{seq}");
+        let winner_index = if let Some(recorded) =
+            self.match_history(|m| m.peek_u64_marker(&winner_marker_name))
+        {
+            let recorded_index = usize::try_from(recorded).unwrap_or(usize::MAX);
+            if !resolved.iter().any(|(i, _)| *i == recorded_index) {
+                return Err(self.nd_error(
+                    format!(
+                        "race #{seq}: previously recorded winner (branch {recorded_index}) has \
+                         no resolved terminal on this replay"
+                    ),
+                    None,
+                    Some(format!("winner={recorded_index}")),
+                    Some("no matching resolved branch".to_string()),
+                ));
+            }
+            recorded_index
+        } else {
+            // First cycle a winner is known: lowest-indexed resolved branch
+            // wins (documented tie-break), the marker is recorded, and every
+            // still-open sibling branch is durably cancelled.
+            let winner_index = resolved
+                .iter()
+                .map(|(i, _)| *i)
+                .min()
+                .expect("resolved is non-empty (checked by callers)");
+            self.push_command(WorkflowCommand::RecordMarker {
+                name: winner_marker_name,
+                details: Value::from(winner_index as u64),
+            });
+
+            let mut activities = Vec::new();
+            let mut children = Vec::new();
+            for dispatch in to_dispatch {
+                if dispatch.index == winner_index {
+                    continue;
+                }
+                if let Some(id) = dispatch.activity_id {
+                    activities.push(id);
+                }
+                if let Some(id) = dispatch.child_id {
+                    children.push(id);
+                }
+            }
+            if !activities.is_empty() || !children.is_empty() {
+                self.push_command(WorkflowCommand::CancelRaceLosers {
+                    activities,
+                    children,
+                    timers: Vec::new(),
+                });
+            }
+            winner_index
+        };
+
+        let pos = resolved
+            .iter()
+            .position(|(i, _)| *i == winner_index)
+            .expect("winner_index is always present in resolved (checked above)");
+        let (_, winner_result) = resolved.remove(pos);
+        winner_result.map(|value| RaceWinner {
+            index: winner_index,
+            label: branches[winner_index].label.clone(),
+            value,
+        })
+    }
+
+    /// Thin wrapper around [`wait_for_signal_timeout`](Self::wait_for_signal_timeout)
+    /// (issue #476) for the exactly-one-timer + exactly-one-signal race shape.
+    /// A losing signal simply stays observable (nothing to durably cancel); a
+    /// losing timer's durable row is removed by the worker exactly as it is
+    /// today for `wait_for_signal_timeout`'s signal-won branch.
+    async fn race_timer_signal_impl(&self, branches: Vec<RaceBranch>) -> HarvestResult<RaceWinner> {
+        let (signal_index, signal_name, signal_label) = branches
+            .iter()
+            .enumerate()
+            .find_map(|(i, b)| match &b.kind {
+                RaceBranchKind::Signal { signal_name } => {
+                    Some((i, signal_name.clone(), b.label.clone()))
+                }
+                _ => None,
+            })
+            .expect("validated by caller: exactly one signal branch");
+        let (timer_index, duration_secs, timer_label) = branches
+            .iter()
+            .enumerate()
+            .find_map(|(i, b)| match &b.kind {
+                RaceBranchKind::Timer { duration_secs } => {
+                    Some((i, *duration_secs, b.label.clone()))
+                }
+                _ => None,
+            })
+            .expect("validated by caller: exactly one timer branch");
+
+        let timeout = std::time::Duration::from_secs(duration_secs);
+        let payload = self.wait_for_signal_timeout(&signal_name, timeout).await?;
+        Ok(payload.map_or_else(
+            || RaceWinner {
+                index: timer_index,
+                label: timer_label,
+                value: Value::Null,
+            },
+            |payload| RaceWinner {
+                index: signal_index,
+                label: signal_label,
+                value: payload,
+            },
+        ))
     }
 
     // ── External activity completion ───────────────────────────────────
@@ -10468,5 +11236,512 @@ mod tests {
         ctx.await_condition(|| ctx.all_handlers_finished())
             .await
             .unwrap();
+    }
+
+    // ── ctx.race() tests (issue #600) ───────────────────────────────────────
+
+    fn race_started_event() -> WorkflowEvent {
+        WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn race_rejects_zero_branches() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx.race().run().await.unwrap_err();
+        assert!(matches!(err, HarvestError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn race_rejects_mixed_activity_and_timer_shape() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HarvestError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn race_live_dispatch_emits_open_marker_and_schedules_all_branches() {
+        let ctx = std::sync::Arc::new(WorkflowContext::new_test());
+        let race_ctx = ctx.clone();
+        let handle = tokio::spawn(async move {
+            race_ctx
+                .race()
+                .activity_raw("fetch_a", Value::Null, "default")
+                .activity_raw("fetch_b", Value::Null, "default")
+                .run()
+                .await
+        });
+
+        // The race never resolves live in this test (no worker completes the
+        // activities), so it suspends -- give it a moment to push commands.
+        let timeout_result =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle).await;
+        assert!(
+            timeout_result.is_err(),
+            "race with no resolution should suspend"
+        );
+
+        let commands = ctx.drain_commands();
+        assert!(matches!(
+            commands.first(),
+            Some(WorkflowCommand::RecordMarker { name, .. }) if name == "race:1"
+        ));
+        let scheduled = commands
+            .iter()
+            .filter(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+            .count();
+        assert_eq!(
+            scheduled, 2,
+            "both branches must be dispatched: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn race_activity_replays_winner_and_records_marker_plus_cancel_losers()
+    -> Result<(), HarvestError> {
+        let loser_id = ActivityExecId::new();
+        let winner_id = ActivityExecId::new();
+        let winner_output = serde_json::json!({"provider": "b"});
+
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: loser_id,
+                name: "fetch_a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: winner_id,
+                name: "fetch_b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: winner_id,
+                output: winner_output.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await?;
+
+        assert_eq!(
+            winner.index, 1,
+            "branch b resolved first in history and must win"
+        );
+        assert_eq!(winner.value, winner_output);
+
+        let commands = ctx.drain_commands();
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::RecordMarker { name, details }
+                    if name == "race_winner:1" && details.as_u64() == Some(1)
+            )),
+            "winner marker must be recorded: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                WorkflowCommand::CancelRaceLosers { activities, .. } if activities == &vec![loser_id]
+            )),
+            "the still-open loser must be queued for cancellation: {commands:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn race_activity_verifies_previously_recorded_winner_without_new_commands()
+    -> Result<(), HarvestError> {
+        let loser_id = ActivityExecId::new();
+        let winner_id = ActivityExecId::new();
+        let winner_output = serde_json::json!({"provider": "b"});
+
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: loser_id,
+                name: "fetch_a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: winner_id,
+                name: "fetch_b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: winner_id,
+                output: winner_output.clone(),
+            },
+            // Cancellation of the loser already committed on an earlier cycle,
+            // synthesizing its terminal exactly as `apply_race_loser_cancellations` does.
+            WorkflowEvent::ActivityFailed {
+                activity_id: loser_id,
+                error: "lost race to a sibling branch".to_string(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: true,
+                details: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "race_winner:1".to_string(),
+                details: Value::from(1u64),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await?;
+
+        assert_eq!(winner.index, 1);
+        assert_eq!(winner.value, winner_output);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "a fully-resolved race must not re-emit any command on replay"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn race_activity_diverges_when_recorded_winner_disagrees_with_replay() {
+        let branch_a = ActivityExecId::new();
+        let branch_b = ActivityExecId::new();
+
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: branch_a,
+                name: "fetch_a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            // branch_a never resolves in this history (still in progress).
+            WorkflowEvent::ActivityScheduled {
+                activity_id: branch_b,
+                name: "fetch_b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: branch_b,
+                output: Value::Null,
+            },
+            // Recorded winner (branch 0) disagrees with what this replay can
+            // actually observe as resolved (only branch 1 has a terminal).
+            WorkflowEvent::MarkerRecorded {
+                name: "race_winner:1".to_string(),
+                details: Value::from(0u64),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let err = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HarvestError::NonDeterministic { .. }));
+    }
+
+    #[tokio::test]
+    async fn race_activity_fingerprint_mismatch_diverges() {
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(3u64), // recorded 3 branches
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        // Current code only supplies 2 branches -- a resize since the recorded run.
+        let err = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HarvestError::NonDeterministic { .. }));
+    }
+
+    #[tokio::test]
+    async fn race_activity_failed_winner_propagates_error_after_recording_marker()
+    -> Result<(), HarvestError> {
+        let winner_id = ActivityExecId::new();
+        let loser_id = ActivityExecId::new();
+
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: winner_id,
+                name: "fetch_a".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: winner_id,
+                error: "upstream 500".to_string(),
+                attempt: 1,
+                error_type: "Error".to_string(),
+                non_retryable: false,
+                details: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: loser_id,
+                name: "fetch_b".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let err = ctx
+            .race()
+            .activity_raw("fetch_a", Value::Null, "default")
+            .activity_raw("fetch_b", Value::Null, "default")
+            .run()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HarvestError::ActivityFailed { .. }));
+        assert!(err.to_string().contains("upstream 500"));
+
+        // The failed branch still legitimately "won" the race (first terminal
+        // in history) -- the still-open sibling must be queued for cancellation.
+        let commands = ctx.drain_commands();
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            WorkflowCommand::CancelRaceLosers { activities, .. } if activities == &vec![loser_id]
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn race_child_workflow_replays_winner() -> Result<(), HarvestError> {
+        let loser_id = ExecutionId::new();
+        let winner_id = ExecutionId::new();
+        let winner_output = serde_json::json!({"report": "done"});
+
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".to_string(),
+                details: Value::from(2u64),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: loser_id,
+                workflow_name: "provider_a".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: winner_id,
+                workflow_name: "provider_b".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: winner_id,
+                output: winner_output.clone(),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .child_workflow_raw("provider_a", Value::Null)
+            .child_workflow_raw("provider_b", Value::Null)
+            .run()
+            .await?;
+
+        assert_eq!(winner.index, 1);
+        assert_eq!(winner.value, winner_output);
+        let commands = ctx.drain_commands();
+        assert!(commands.iter().any(|c| matches!(
+            c,
+            WorkflowCommand::CancelRaceLosers { children, .. } if children == &vec![loser_id]
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn race_timer_signal_pair_signal_branch_wins() -> Result<(), HarvestError> {
+        let timer_id = "__signal_timeout:1:approval".to_string();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(&timer_id),
+                duration_secs: 300,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approval".into(),
+                payload: serde_json::json!({"approved": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .signal("approval")
+            .timer(std::time::Duration::from_secs(300))
+            .run()
+            .await?;
+
+        assert_eq!(winner.index, 0, "signal branch was added first");
+        assert_eq!(winner.value, serde_json::json!({"approved": true}));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn race_timer_signal_pair_timer_branch_wins() -> Result<(), HarvestError> {
+        let timer_id = "__signal_timeout:1:approval".to_string();
+        let events = vec![
+            race_started_event(),
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new(&timer_id),
+                duration_secs: 300,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new(&timer_id),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let winner = ctx
+            .race()
+            .signal("approval")
+            .timer(std::time::Duration::from_secs(300))
+            .run()
+            .await?;
+
+        assert_eq!(winner.index, 1, "timer branch was added second");
+        assert_eq!(winner.value, Value::Null);
+        Ok(())
+    }
+
+    /// Property test (issue #600 success metric): across M synthetic histories
+    /// with the winning branch at a different position each time, replaying
+    /// the *same* history repeatedly always resolves to the *same* winner and
+    /// the *same* commands (zero divergences), and `CancelRaceLosers` is
+    /// always keyed to exactly the non-winning branches -- never the winner.
+    #[tokio::test]
+    async fn race_activity_winner_is_stable_across_randomized_completion_positions()
+    -> Result<(), HarvestError> {
+        const BRANCH_COUNT: usize = 5;
+        const ITERATIONS: usize = 20;
+
+        for iteration in 0..ITERATIONS {
+            let winner_position = iteration % BRANCH_COUNT;
+            let ids: Vec<ActivityExecId> =
+                (0..BRANCH_COUNT).map(|_| ActivityExecId::new()).collect();
+
+            let mut events = vec![
+                race_started_event(),
+                WorkflowEvent::MarkerRecorded {
+                    name: "race:1".to_string(),
+                    details: Value::from(BRANCH_COUNT as u64),
+                },
+            ];
+            for (i, id) in ids.iter().enumerate() {
+                events.push(WorkflowEvent::ActivityScheduled {
+                    activity_id: *id,
+                    name: format!("provider_{i}"),
+                    input: Value::Null,
+                    queue: "default".into(),
+                });
+            }
+            // Only the designated winner has a terminal in this history; every
+            // other branch is still legitimately in progress.
+            events.push(WorkflowEvent::ActivityCompleted {
+                activity_id: ids[winner_position],
+                output: serde_json::json!({"winner_position": winner_position}),
+            });
+
+            let expected_losers: Vec<ActivityExecId> = ids
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != winner_position)
+                .map(|(_, id)| *id)
+                .collect();
+
+            // Replay the identical history three times -- every run must agree.
+            for _ in 0..3 {
+                let ctx = WorkflowContext::for_replay(ExecutionId::new(), events.clone());
+                let mut builder = ctx.race();
+                for i in 0..BRANCH_COUNT {
+                    builder =
+                        builder.activity_raw(&format!("provider_{i}"), Value::Null, "default");
+                }
+                let winner = builder.run().await?;
+
+                assert_eq!(
+                    winner.index, winner_position,
+                    "iteration {iteration}: winner must match the branch with the recorded terminal"
+                );
+
+                let commands = ctx.drain_commands();
+                let cancelled: Vec<ActivityExecId> = commands
+                    .iter()
+                    .find_map(|c| match c {
+                        WorkflowCommand::CancelRaceLosers { activities, .. } => {
+                            Some(activities.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let mut cancelled_sorted = cancelled;
+                cancelled_sorted.sort_by_key(ActivityExecId::as_uuid);
+                let mut expected_sorted = expected_losers.clone();
+                expected_sorted.sort_by_key(ActivityExecId::as_uuid);
+                assert_eq!(
+                    cancelled_sorted, expected_sorted,
+                    "iteration {iteration}: exactly the non-winning branches must be queued for cancellation"
+                );
+                assert!(
+                    !cancelled_sorted.contains(&ids[winner_position]),
+                    "iteration {iteration}: the winner must never be cancelled"
+                );
+            }
+        }
+        Ok(())
     }
 }

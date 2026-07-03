@@ -3543,6 +3543,77 @@ impl HistoryMatcher {
         }
     }
 
+    /// Match a `MarkerRecorded` event carrying a single `u64` payload at the
+    /// current cursor position, keyed by an arbitrary caller-supplied name.
+    ///
+    /// Generalizes [`Self::match_fan_out_marker`]'s count-verification shape
+    /// for any `u64`-valued marker. Used by `WorkflowContext::race` (issue
+    /// #600) to record and verify both the race's branch count (the "open"
+    /// marker) and its winning branch index (the "winner" marker) — mirroring
+    /// the fan-out marker idiom without introducing a new event variant.
+    ///
+    /// Returns:
+    /// - [`HistoryMatch::Matched`] — marker found and recorded value equals `expected`.
+    /// - [`HistoryMatch::Diverged`] — recorded value differs from `expected`,
+    ///   or a different event type was at this cursor position.
+    /// - [`HistoryMatch::NoMatch`] — past end of history (live execution).
+    pub fn match_u64_marker(&mut self, marker_name: &str, expected: u64) -> HistoryMatch {
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        match &self.events[self.cursor] {
+            WorkflowEvent::MarkerRecorded { name, details } if name == marker_name => {
+                let recorded = details.as_u64();
+                if recorded == Some(expected) {
+                    self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
+                    HistoryMatch::Matched {
+                        output: serde_json::json!(expected),
+                    }
+                } else {
+                    HistoryMatch::Diverged {
+                        expected: format!("MarkerRecorded({marker_name}, {expected})"),
+                        actual: format!("MarkerRecorded({marker_name}, {recorded:?})"),
+
+                        event_index: i32::try_from(self.cursor).ok(),
+                    }
+                }
+            }
+            other => HistoryMatch::Diverged {
+                expected: format!("MarkerRecorded({marker_name})"),
+                actual: Self::actual_event_name(other),
+
+                event_index: i32::try_from(self.cursor).ok(),
+            },
+        }
+    }
+
+    /// Non-destructively check whether a `u64`-valued `MarkerRecorded` event
+    /// named `marker_name` sits at the current cursor position, returning its
+    /// value and consuming it if so.
+    ///
+    /// Unlike [`Self::match_u64_marker`] this takes no expected value, so it
+    /// can be used to *discover* a previously recorded decision (e.g.
+    /// `WorkflowContext::race`'s winner marker) rather than verify one already
+    /// known to the caller. On a miss (wrong event, wrong name, or past end of
+    /// history) the cursor is left completely unchanged, so it is always safe
+    /// to call speculatively.
+    pub fn peek_u64_marker(&mut self, marker_name: &str) -> Option<u64> {
+        if !self.prepare_match() {
+            return None;
+        }
+        if let WorkflowEvent::MarkerRecorded { name, details } = &self.events[self.cursor]
+            && name == marker_name
+        {
+            let value = details.as_u64();
+            self.cursor += 1;
+            self.advance_to_next_unconsumed_event();
+            return value;
+        }
+        None
+    }
+
     /// Match a named `MarkerRecorded` event at the current cursor position.
     ///
     /// Used by `WorkflowContext::dag_skip_marker` to record the condition-skip
@@ -6629,5 +6700,82 @@ mod tests {
                 }
             );
         }
+    }
+
+    // ── ctx.race() marker matcher (issue #600) ──────────────────────────────
+
+    #[test]
+    fn match_u64_marker_no_match_on_empty_history() {
+        let mut matcher = HistoryMatcher::new(vec![]);
+        assert_eq!(matcher.match_u64_marker("race:1", 2), HistoryMatch::NoMatch);
+    }
+
+    #[test]
+    fn match_u64_marker_matches_recorded_value() {
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "race:1".into(),
+            details: serde_json::json!(2),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_u64_marker("race:1", 2),
+            HistoryMatch::Matched {
+                output: serde_json::json!(2)
+            }
+        );
+    }
+
+    #[test]
+    fn match_u64_marker_diverges_on_value_mismatch() {
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "race:1".into(),
+            details: serde_json::json!(2),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_u64_marker("race:1", 3);
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn match_u64_marker_diverges_on_name_mismatch() {
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "race:1".into(),
+            details: serde_json::json!(2),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_u64_marker("race:2", 2);
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn match_u64_marker_diverges_on_unexpected_event() {
+        let events = vec![WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("t1"),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_u64_marker("race:1", 2);
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn match_u64_marker_advances_cursor_past_marker() {
+        let events = vec![
+            WorkflowEvent::MarkerRecorded {
+                name: "race:1".into(),
+                details: serde_json::json!(2),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("t1"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_u64_marker("race:1", 2),
+            HistoryMatch::Matched {
+                output: serde_json::json!(2)
+            }
+        );
+        // Cursor should now sit at the TimerFired event, ready for the next matcher.
+        assert_eq!(matcher.cursor, 1);
     }
 }

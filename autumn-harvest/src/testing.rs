@@ -2979,6 +2979,36 @@ impl WorkflowTestEnv {
                 Ok(false)
             }
 
+            // Durably cancel the losing branches of a resolved ctx.race()
+            // (issue #600). Mirrors the real worker's `apply_race_loser_cancellations`:
+            // append a synthetic terminal for each still-open loser so the next
+            // replay iteration resolves it to a terminal instead of looping on
+            // `ActivityInProgress`/`ChildInProgress`. Timers carry no history
+            // footprint in the harness (no `harvest_timers` table to clean up).
+            WorkflowCommand::CancelRaceLosers {
+                activities,
+                children,
+                timers: _,
+            } => {
+                for activity_id in activities {
+                    deferred_events.push(WorkflowEvent::ActivityFailed {
+                        activity_id,
+                        error: "lost race to a sibling branch".to_string(),
+                        attempt: 1,
+                        error_type: "Error".to_string(),
+                        non_retryable: true,
+                        details: None,
+                    });
+                }
+                for child_id in children {
+                    deferred_events.push(WorkflowEvent::ChildWorkflowFailed {
+                        child_id,
+                        error: "lost race to a sibling branch".to_string(),
+                    });
+                }
+                Ok(true)
+            }
+
             // WaitForActivity: activity was scheduled in a previous iteration;
             // its terminal event is already in history and will be matched on replay.
             WorkflowCommand::WaitForActivity { .. }

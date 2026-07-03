@@ -13,6 +13,11 @@ async fn bypass_workflow(ctx: &WorkflowContext) -> Result<(), String> {
     let _ = std::fs::read_to_string("config.json");
     let _guard = GLOBAL_MUTEX.lock().unwrap();
     tracing::info!("this is bare log which is a warning but allowed or warning only");
+    drop(_guard);
+    tokio::select! {
+        _ = ctx.timer("t1", 60) => {}
+        _ = ctx.wait_for_signal("approve") => {}
+    }
     Ok(())
 }
 

@@ -655,6 +655,7 @@ const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::SignalExternalWorkflow { .. } => "SignalExternalWorkflow",
         WorkflowCommand::RequestCancelExternalWorkflow { .. } => "RequestCancelExternalWorkflow",
         WorkflowCommand::SpawnDetachedChildWorkflow { .. } => "SpawnDetachedChildWorkflow",
+        WorkflowCommand::CancelRaceLosers { .. } => "CancelRaceLosers",
     }
 }
 
@@ -708,6 +709,7 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+                | WorkflowCommand::CancelRaceLosers { .. }
         )
     });
 
@@ -725,6 +727,7 @@ fn only_bookkeeping_commands(commands: &[WorkflowCommand]) -> bool {
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+                    | WorkflowCommand::CancelRaceLosers { .. }
             )
         })
 }
@@ -925,6 +928,7 @@ fn extract_single_command<T>(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+                | WorkflowCommand::CancelRaceLosers { .. }
         )
     });
 
@@ -951,7 +955,8 @@ fn extract_all_scheduled_activities(
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
-            | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
+            | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+            | WorkflowCommand::CancelRaceLosers { .. } => {}
             WorkflowCommand::ScheduleActivity {
                 activity_id,
                 name,
@@ -991,7 +996,8 @@ fn extract_all_activity_waits(commands: &[WorkflowCommand]) -> Option<Vec<Activi
             | WorkflowCommand::RecordUpdateResult { .. }
             | WorkflowCommand::UpsertSearchAttributes { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
-            | WorkflowCommand::SpawnDetachedChildWorkflow { .. } => {}
+            | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+            | WorkflowCommand::CancelRaceLosers { .. } => {}
             WorkflowCommand::WaitForActivity { activity_id, .. } => activity_ids.push(*activity_id),
             _ => return None,
         }
@@ -1045,6 +1051,7 @@ fn extract_started_timer_for_suspension(
                 | WorkflowCommand::UpsertSearchAttributes { .. }
                 | WorkflowCommand::SetCurrentDetails { .. }
                 | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+                | WorkflowCommand::CancelRaceLosers { .. }
         )
     });
 
@@ -1069,6 +1076,7 @@ fn extract_all_started_child_workflows(
                     | WorkflowCommand::UpsertSearchAttributes { .. }
                     | WorkflowCommand::SetCurrentDetails { .. }
                     | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+                    | WorkflowCommand::CancelRaceLosers { .. }
             )
         })
         .collect();
@@ -3147,21 +3155,36 @@ async fn persist_scheduled_activities(
         }
     });
 
+    let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
     let offloader = registry.payload_offloader();
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
+    let deferred = conn
+        .transaction::<_, HarvestError, _>(|conn| {
+            async move {
+                store::append_events_offloaded(conn, exec_id, &events, next_event_id, offloader)
+                    .await?;
+                detached_spawns.persist(conn, commands).await?;
+                for params in &enqueued {
+                    queue::enqueue(conn, params).await?;
+                }
+                let mut race_next_event_id = next_event_id.saturating_add(events_len);
+                let deferred = apply_race_loser_cancellations(
+                    conn,
+                    exec_id,
+                    commands,
+                    &mut race_next_event_id,
+                )
                 .await?;
-            detached_spawns.persist(conn, commands).await?;
-            for params in &enqueued {
-                queue::enqueue(conn, params).await?;
+                queue::park_workflow_task(conn, task_id, sticky).await?;
+                Ok(deferred)
             }
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await
+            .scope_boxed()
+        })
+        .await?;
+
+    for start in deferred {
+        start.spawn();
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5005,19 +5028,119 @@ async fn persist_bookkeeping_and_requeue_workflow(
     sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
     let events = pre_suspension_events_from_commands(commands);
+    let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            if !events.is_empty() {
-                store::append_events(conn, exec_id, &events, next_event_id).await?;
+    let deferred = conn
+        .transaction::<_, HarvestError, _>(|conn| {
+            async move {
+                if !events.is_empty() {
+                    store::append_events(conn, exec_id, &events, next_event_id).await?;
+                }
+                detached_spawns.persist(conn, commands).await?;
+                let mut race_next_event_id = next_event_id.saturating_add(events_len);
+                let deferred = apply_race_loser_cancellations(
+                    conn,
+                    exec_id,
+                    commands,
+                    &mut race_next_event_id,
+                )
+                .await?;
+                queue::park_workflow_task(conn, task_id, sticky).await?;
+                queue::wake_workflow_task(conn, exec_id).await?;
+                Ok(deferred)
             }
-            detached_spawns.persist(conn, commands).await?;
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-            queue::wake_workflow_task(conn, exec_id).await
+            .scope_boxed()
+        })
+        .await?;
+
+    for start in deferred {
+        start.spawn();
+    }
+    Ok(())
+}
+
+/// Resolve the `WorkflowCommand::CancelRaceLosers` bookkeeping command(s) in
+/// `commands` (issue #600): durably cancel every losing activity/child/timer
+/// branch of a resolved `ctx.race()`, in the **same transaction** that
+/// persists the race's winner marker (the caller runs this inside its own
+/// `conn.transaction`), so a crash between the two can never leak a row.
+///
+/// Returns the child-cancellation `DeferredTriggerStart`s that the caller
+/// must spawn **after** its outer transaction commits (mirrors the existing
+/// external-cancel delivery pattern, issue #492) — never before, so a rolled
+/// back cancellation cannot have already started trigger workflows.
+async fn apply_race_loser_cancellations(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    commands: &[WorkflowCommand],
+    next_event_id: &mut i32,
+) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
+    let mut deferred = Vec::new();
+    let mut synthetic_events = Vec::new();
+
+    for cmd in commands {
+        let WorkflowCommand::CancelRaceLosers {
+            activities,
+            children,
+            timers,
+        } = cmd
+        else {
+            continue;
+        };
+
+        for activity_id in activities {
+            // Only a still-open row gets a synthetic terminal: if the activity
+            // genuinely completed first (raced the cancellation), a real
+            // terminal event already exists (or is about to be appended by
+            // that in-flight completion write) and must not be duplicated.
+            if queue::cancel_activity_task(conn, *activity_id).await? {
+                synthetic_events.push(WorkflowEvent::ActivityFailed {
+                    activity_id: *activity_id,
+                    error: "lost race to a sibling branch".to_string(),
+                    attempt: 1,
+                    error_type: "Error".to_string(),
+                    non_retryable: true,
+                    details: None,
+                });
+            }
         }
-        .scope_boxed()
-    })
-    .await
+
+        for timer_id in timers {
+            queue::delete_pending_timer(conn, exec_id, timer_id).await?;
+        }
+
+        for child_id in children {
+            match crate::execution::cancel_workflow_execution_collect(
+                conn,
+                *child_id,
+                "lost race to a sibling branch",
+            )
+            .await
+            {
+                Ok((_, mut starts, _closed_children, _)) => deferred.append(&mut starts),
+                Err(err) => {
+                    // Best-effort cleanup: a losing child that already reached
+                    // some other terminal state (it also finished, just wasn't
+                    // the winner) must never abort persisting the race's own,
+                    // already-decided outcome.
+                    tracing::warn!(
+                        child_id = %child_id,
+                        exec_id = %exec_id,
+                        err = %err,
+                        "ctx.race(): failed to cancel a losing child-workflow branch"
+                    );
+                }
+            }
+        }
+    }
+
+    if !synthetic_events.is_empty() {
+        let inserted =
+            store::append_events(conn, exec_id, &synthetic_events, *next_event_id).await?;
+        *next_event_id = next_event_id.saturating_add(i32::try_from(inserted).unwrap_or(0));
+    }
+
+    Ok(deferred)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5866,6 +5989,19 @@ async fn persist_terminal_outcome_commands(
         next_event_id = next_event_id
             .checked_add(i32::try_from(pre_terminal.len()).unwrap_or(i32::MAX))
             .ok_or_else(|| crate::error::HarvestError::Database("Event ID overflow".to_string()))?;
+    }
+
+    // A ctx.race() resolving in the same workflow-task cycle as its terminal
+    // Complete/Fail (the ≤5-line "race, then return" DX) durably cancels its
+    // losers here. Spawned inline rather than deferred past an outer
+    // transaction commit: this function is already a sequence of independent
+    // statements (not one atomic transaction), so this carries the same
+    // pre-existing best-effort risk profile as its neighbors.
+    for start in
+        apply_race_loser_cancellations(conn, persistence.exec_id, pending_cmds, &mut next_event_id)
+            .await?
+    {
+        start.spawn();
     }
 
     create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span).await?;
@@ -11250,6 +11386,78 @@ mod tests {
             details: serde_json::json!(2),
         }];
         assert!(!should_requeue_signal_wait(&commands));
+    }
+
+    // ── ctx.race() bookkeeping ignore-lists (issue #600) ────────────────────
+
+    #[test]
+    fn only_bookkeeping_commands_accepts_race_winner_plus_cancel_losers() {
+        let commands = vec![
+            WorkflowCommand::RecordMarker {
+                name: "race_winner:1".to_string(),
+                details: serde_json::json!(0),
+            },
+            WorkflowCommand::CancelRaceLosers {
+                activities: vec![crate::types::ActivityExecId::new()],
+                children: vec![],
+                timers: vec![],
+            },
+        ];
+        assert!(only_bookkeeping_commands(&commands));
+    }
+
+    #[test]
+    fn extract_all_scheduled_activities_tolerates_cancel_race_losers() {
+        let (tx, _rx) = oneshot::channel::<Result<serde_json::Value, String>>();
+        let commands = vec![
+            WorkflowCommand::RecordMarker {
+                name: "race:1".to_string(),
+                details: serde_json::json!(2),
+            },
+            WorkflowCommand::CancelRaceLosers {
+                activities: vec![crate::types::ActivityExecId::new()],
+                children: vec![],
+                timers: vec![],
+            },
+            WorkflowCommand::ScheduleActivity {
+                activity_id: crate::types::ActivityExecId::new(),
+                name: "fetch_primary".to_string(),
+                input: serde_json::Value::Null,
+                queue: "default".to_string(),
+                retry_policy_override: None,
+                start_to_close_override: None,
+                result_tx: tx,
+            },
+        ];
+        let scheduled = extract_all_scheduled_activities(&commands);
+        assert!(scheduled.is_some());
+        assert_eq!(scheduled.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn extract_all_activity_waits_tolerates_cancel_race_losers() {
+        let commands = vec![
+            WorkflowCommand::CancelRaceLosers {
+                activities: vec![crate::types::ActivityExecId::new()],
+                children: vec![],
+                timers: vec![],
+            },
+            WorkflowCommand::WaitForActivity {
+                activity_id: crate::types::ActivityExecId::new(),
+                result_tx: oneshot::channel::<Result<serde_json::Value, String>>().0,
+            },
+        ];
+        assert!(extract_all_activity_waits(&commands).is_some());
+    }
+
+    #[test]
+    fn workflow_command_name_covers_cancel_race_losers() {
+        let cmd = WorkflowCommand::CancelRaceLosers {
+            activities: vec![],
+            children: vec![],
+            timers: vec![],
+        };
+        assert_eq!(workflow_command_name(&cmd), "CancelRaceLosers");
     }
 
     #[test]
