@@ -753,6 +753,37 @@ fn build_runtime_worker(
     max_concurrent_activities: usize,
     registry: Arc<HandlerRegistry>,
 ) -> Arc<Worker> {
+    build_runtime_worker_with_task_timeout(
+        worker_id,
+        max_concurrent_workflows,
+        max_concurrent_activities,
+        registry,
+        Duration::from_secs(10),
+    )
+}
+
+/// Same as [`build_runtime_worker`], but with a caller-supplied
+/// `workflow_task_timeout` instead of the default 10s.
+///
+/// The default 10s per-decision-cycle budget is tight enough that a
+/// genuinely-high-concurrency, DB-heavy test (many workflow tasks racing for
+/// very few CPUs on a constrained CI runner) can trip the poison-pill
+/// mechanism (`WorkerConfig::poison_pill_threshold`, issue #367) purely from
+/// scheduling delay -- a decision cycle whose actual work (e.g. an in-body
+/// `tokio::time::sleep`) is well under budget can still exceed 10s wall-clock
+/// if the runtime starves it for CPU, and three such strikes quarantines the
+/// execution as FAILED with no relation to the workflow's own logic. Tests
+/// that already carry their own generous outer wall-clock bound (e.g. a
+/// `tokio::time::timeout` around the whole assertion) should use this to set
+/// a `workflow_task_timeout` wide enough that only a genuine stall -- not CI
+/// scheduling noise -- can trip it.
+fn build_runtime_worker_with_task_timeout(
+    worker_id: &str,
+    max_concurrent_workflows: usize,
+    max_concurrent_activities: usize,
+    registry: Arc<HandlerRegistry>,
+    workflow_task_timeout: Duration,
+) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
@@ -775,7 +806,7 @@ fn build_runtime_worker(
                 unknown_target_grace_window: Duration::from_secs(5),
                 poison_pill_threshold: 3,
 
-                workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_task_timeout,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
                 max_workflow_pause_duration: std::time::Duration::from_secs(24 * 3600),
@@ -3153,11 +3184,22 @@ async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     // Concurrency must comfortably exceed 1 parent + 10 children so every
     // child dispatches in the same wave instead of queueing behind a
     // saturated semaphore.
-    let worker = build_runtime_worker(
+    //
+    // Uses a wide workflow_task_timeout (not the 10s default) because this
+    // test's 11 genuinely-concurrent, DB-heavy decision cycles can exceed a
+    // 10s per-cycle wall-clock budget purely from CI scheduling contention,
+    // tripping the poison-pill mechanism and FAILing every child with no
+    // relation to the workflow's own logic (root-caused via the diagnostic
+    // dump in wait_for_completion_with_diagnostics on a prior CI failure,
+    // where all 10 children showed state=FAILED almost immediately after
+    // being claimed). The test's own 90s outer bound is the real backstop
+    // against a genuine stall.
+    let worker = build_runtime_worker_with_task_timeout(
         "worker-e2e-ten-slow-children",
         16,
         2,
         ten_slow_children_registry(),
+        Duration::from_secs(60),
     );
     let pool = build_test_pool(&database_url);
     let handle = spawn_test_worker(Arc::clone(&worker), pool);
