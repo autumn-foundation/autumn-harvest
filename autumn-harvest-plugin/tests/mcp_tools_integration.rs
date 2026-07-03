@@ -12,6 +12,7 @@
 //! compile-checked with `cargo test --no-run` (repo precedent: #543/#544).
 
 #![cfg(feature = "mcp")]
+#![allow(clippy::unused_async, clippy::used_underscore_binding)]
 
 use std::time::Duration;
 
@@ -170,7 +171,7 @@ async fn post_sse(client: &TestClient, body: Value) -> TestResponse {
 async fn agent_drives_a_durable_workflow_via_mcp_tools() {
     let _ = tracing_subscriber::fmt::try_init();
     let db = setup_db().await;
-    let client = build_app(&db).await;
+    let client = build_app(db).await;
 
     // start_ returns the durable handle immediately, without blocking to
     // completion (the workflow is parked on a signal).
@@ -285,7 +286,7 @@ async fn workflow_started_via_mcp_survives_daemon_restart() {
     let db = setup_db().await;
 
     let handle = {
-        let client = build_app(&db).await;
+        let client = build_app(db).await;
         let (is_error, started) = call_tool(
             &client,
             "start_agent_approval_flow",
@@ -306,7 +307,7 @@ async fn workflow_started_via_mcp_survives_daemon_restart() {
     };
 
     // "Daemon restart": a brand new app against the same database.
-    let client = build_app(&db).await;
+    let client = build_app(db).await;
 
     // The run is still there, still parked — recovered purely from Postgres.
     let status = wait_for_status(&client, "agent_approval_flow_status", &handle, |s| {
@@ -339,7 +340,7 @@ async fn workflow_started_via_mcp_survives_daemon_restart() {
 async fn handles_cannot_cross_workflow_tool_boundaries() {
     let _ = tracing_subscriber::fmt::try_init();
     let db = setup_db().await;
-    let client = build_app(&db).await;
+    let client = build_app(db).await;
 
     let (is_error, started) = call_tool(
         &client,

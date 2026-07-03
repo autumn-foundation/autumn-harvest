@@ -256,7 +256,7 @@ impl Plugin for HarvestPlugin {
             Some(crate::mcp_tools::build_mcp_tool_routes(
                 &prefix,
                 &descriptors,
-                api_state.clone(),
+                &api_state,
             ))
         } else {
             None

@@ -189,6 +189,7 @@ pub fn collect_descriptors(
 /// Expand one workflow descriptor into its full tool-route spec set:
 /// start, status, signal, one update spec per attached update, and watch.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn tool_route_specs(prefix: &str, descriptor: &McpWorkflowDescriptor) -> Vec<ToolRouteSpec> {
     let wf = &descriptor.name;
     let about = descriptor
@@ -351,10 +352,12 @@ fn permissive_object_schema(description: &str) -> serde_json::Value {
     serde_json::json!({ "type": "object", "description": description })
 }
 
-/// Record the descriptors' input schemas (and the fixed response/payload
-/// schemas) into the process-global schema map consumed by
-/// [`register_harvest_mcp_schemas`]. Idempotent, name-keyed: re-recording the
-/// same workflow overwrites with identical content.
+/// Record the descriptors' schemas into the process-global schema map.
+///
+/// Covers each workflow's input schema plus the fixed response/payload
+/// schemas, consumed by [`register_harvest_mcp_schemas`]. Idempotent,
+/// name-keyed: re-recording the same workflow overwrites with identical
+/// content.
 pub fn record_schemas(descriptors: &[McpWorkflowDescriptor]) {
     let mut map = schema_map()
         .lock()
@@ -455,6 +458,7 @@ pub fn record_schemas(descriptors: &[McpWorkflowDescriptor]) {
             );
         }
     }
+    drop(map);
 }
 
 // ── Route/handler layer (layer 3) ────────────────────────────────────────────
@@ -476,7 +480,7 @@ fn leak(s: String) -> &'static str {
 pub fn build_mcp_tool_routes(
     prefix: &str,
     descriptors: &[McpWorkflowDescriptor],
-    api_state: crate::api::HarvestApiState,
+    api_state: &crate::api::HarvestApiState,
 ) -> Vec<autumn_web::Route> {
     let mut routes = Vec::new();
     for descriptor in descriptors {
@@ -505,7 +509,11 @@ fn build_tool_route(
                 move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
                     let api_state = api_state.clone();
                     let input_schema = input_schema.clone();
-                    async move { start_tool(api_state, workflow, input_schema, headers, body).await }
+                    // Boxed: the delegated start handler's future is large
+                    // (clippy::large_futures) and this is a cold edge path.
+                    async move {
+                        Box::pin(start_tool(api_state, workflow, input_schema, headers, body)).await
+                    }
                 },
             )
         }
@@ -601,12 +609,12 @@ async fn load_owned_execution(
     workflow: &str,
     handle: &str,
 ) -> Result<autumn_harvest::models::WorkflowExecution, axum::response::Response> {
-    use axum::response::IntoResponse as _;
+    use axum::response::IntoResponse;
 
-    let exec_id = crate::api::parse_execution_id(handle).map_err(|e| e.into_response())?;
+    let exec_id = crate::api::parse_execution_id(handle).map_err(IntoResponse::into_response)?;
     let mut conn = crate::api::db_conn_for_execution(api_state, exec_id)
         .await
-        .map_err(|e| e.into_response())?;
+        .map_err(IntoResponse::into_response)?;
     let execution = crate::api::load_execution(&mut conn, exec_id)
         .await
         .map_err(|e| crate::api::map_error(e).into_response())?;
@@ -621,7 +629,7 @@ async fn load_owned_execution(
 
 /// `start_{wf}` — validate the input against the workflow's published schema
 /// (pure, before any storage access), then delegate to the management API's
-/// start handler with only the input set (server-generated workflow_id).
+/// start handler with only the input set (server-generated `workflow_id`).
 async fn start_tool(
     api_state: crate::api::HarvestApiState,
     workflow: &'static str,
@@ -644,13 +652,13 @@ async fn start_tool(
             .into_response();
     }
 
-    crate::api::start_workflow(
+    Box::pin(crate::api::start_workflow(
         Extension(api_state),
         Path(workflow.to_string()),
         None,
         headers,
         Json(crate::api::StartWorkflowRequest::from_input(body)),
-    )
+    ))
     .await
 }
 

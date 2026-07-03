@@ -6,13 +6,14 @@
 //! contract that proves dispatch flows through the real handler pipeline
 //! (the runtime is not installed, so handle-taking calls fail closed).
 //!
-//! NOTE: `TestApp::plugin(HarvestPlugin)` cannot be used here — TestApp
+//! NOTE: `TestApp::plugin(HarvestPlugin)` cannot be used here — `TestApp`
 //! replays plugin startup hooks and `start_harvest_runtime` requires a live
 //! Postgres. The full plugin-wired flow is covered by the testcontainers
 //! integration test (`mcp_tools_integration.rs`, compile-checked in this
 //! sandbox per the #543/#544 precedent).
 
 #![cfg(feature = "mcp")]
+#![allow(clippy::unused_async, clippy::used_underscore_binding)]
 
 use autumn_harvest::prelude::*;
 use autumn_harvest_plugin::HarvestApiState;
@@ -59,7 +60,7 @@ fn order_input_schema() -> Value {
 }
 
 /// Assemble a no-DB test app: descriptor plan -> schema map -> routes ->
-/// mount_mcp. Mirrors what `HarvestPlugin::mcp_tools()` does inside
+/// `mount_mcp`. Mirrors what `HarvestPlugin::mcp_tools()` does inside
 /// `Plugin::build`, minus the runtime startup.
 fn build_client() -> TestClient {
     let workflows = vec![
@@ -72,7 +73,7 @@ fn build_client() -> TestClient {
     ];
     let descriptors = collect_descriptors(&workflows, &updates);
     record_schemas(&descriptors);
-    let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, HarvestApiState::new());
+    let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &HarvestApiState::new());
     TestApp::new().routes(routes).mount_mcp("/mcp").build()
 }
 
@@ -261,7 +262,7 @@ async fn tool_routes_coexist_with_the_nested_management_router() {
     let descriptors = collect_descriptors(&workflows, &[]);
     record_schemas(&descriptors);
     let api_state = HarvestApiState::new();
-    let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, api_state.clone());
+    let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &api_state);
 
     let client = TestApp::new()
         .routes(routes)

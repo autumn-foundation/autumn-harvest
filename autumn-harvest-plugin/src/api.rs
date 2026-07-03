@@ -1666,7 +1666,7 @@ pub(crate) struct StartWorkflowRequest {
 impl StartWorkflowRequest {
     /// Minimal request carrying only the workflow input — used by the MCP
     /// start tool (issue #597), which exposes no other start options.
-    pub(crate) fn from_input(input: Value) -> Self {
+    pub(crate) const fn from_input(input: Value) -> Self {
         Self {
             workflow_id: None,
             input: Some(input),
