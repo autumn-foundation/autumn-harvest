@@ -206,8 +206,8 @@ pub use calendar::{
 };
 pub use completion_trigger::{CompletionTrigger, InputMapping, TerminalState};
 pub use context::{
-    ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, WorkflowCommand, WorkflowContext,
-    WorkflowHistoryPolicy,
+    ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD, RaceBuilder, RaceWinner,
+    WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{

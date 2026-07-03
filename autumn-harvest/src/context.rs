@@ -4728,8 +4728,12 @@ impl WorkflowContext {
 
         for (index, branch) in branches.iter().enumerate() {
             match &branch.kind {
-                RaceBranchKind::Activity { name, .. } => {
-                    let history_match = self.match_history(|m| m.match_activity(name));
+                RaceBranchKind::Activity { name, input, .. } => {
+                    let history_match = if self.strict_replay {
+                        self.match_history(|m| m.match_activity_strict(name, input))
+                    } else {
+                        self.match_history(|m| m.match_activity(name))
+                    };
                     match history_match {
                         HistoryMatch::Matched { output } => resolved.push((index, Ok(output))),
                         HistoryMatch::Failed {
@@ -4877,6 +4881,28 @@ impl WorkflowContext {
                         .activity_id
                         .expect("activity dispatch always carries an activity_id");
                     if dispatch.is_new {
+                        // Enforce the activity input payload cap before scheduling,
+                        // mirroring execute_activity_with_opts's NoMatch branch.
+                        let effective_cap = {
+                            let global = self.payload_max_activity_input;
+                            self.activity_input_cap_overrides
+                                .get(name)
+                                .copied()
+                                .map_or(global, |ov| global.max(ov))
+                        };
+                        let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+                        if effective_cap > 0
+                            && observed > effective_cap
+                            && !self.offload_will_apply(observed)
+                        {
+                            return Err(HarvestError::PayloadTooLarge {
+                                kind: PayloadKind::ActivityInput,
+                                observed_bytes: observed,
+                                cap_bytes: effective_cap,
+                                workflow_type: self.workflow_name.clone(),
+                                activity_name: Some(name.clone()),
+                            });
+                        }
                         self.push_command(WorkflowCommand::ScheduleActivity {
                             activity_id,
                             name: name.clone(),

@@ -2887,20 +2887,36 @@ async fn persist_signal_wait_park(
     sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
     let marker_events = pre_suspension_events_from_commands(commands);
+    let events_len = i32::try_from(marker_events.len()).unwrap_or(i32::MAX);
+    let registry = detached_spawns.registry;
     // Park the workflow task (state=RUNNING, worker cleared) so it is not
     // confused with a timer-waiting task (state=PENDING). This ensures that
     // `wake_workflow_task` — which only targets RUNNING/parked rows — can
     // reliably distinguish signal waits from timer waits and will not
     // prematurely fire a pending timer when a signal is delivered.
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
-            detached_spawns.persist(conn, commands).await?;
-            queue::park_workflow_task(conn, task_id, sticky).await
-        }
-        .scope_boxed()
-    })
-    .await?;
+    let deferred = conn
+        .transaction::<_, HarvestError, _>(|conn| {
+            async move {
+                store::append_events(conn, exec_id, &marker_events, next_event_id).await?;
+                detached_spawns.persist(conn, commands).await?;
+                let mut race_next_event_id = next_event_id.saturating_add(events_len);
+                let deferred = apply_race_loser_cancellations(
+                    conn,
+                    exec_id,
+                    commands,
+                    &mut race_next_event_id,
+                    registry,
+                )
+                .await?;
+                queue::park_workflow_task(conn, task_id, sticky).await?;
+                Ok(deferred)
+            }
+            .scope_boxed()
+        })
+        .await?;
+    for start in deferred {
+        start.spawn();
+    }
 
     // A signal may have arrived while this task was actively running (before the
     // park above).  `send_signal` would have called `wake_workflow_task` at that
@@ -2969,38 +2985,57 @@ async fn persist_activity_wait_park(
     sticky: Option<queue::StickyHint<'_>>,
 ) -> HarvestResult<()> {
     let marker_events = pre_suspension_events_from_commands(commands);
+    let registry = detached_spawns.registry;
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            harvest_workflow_executions::table
-                .find(exec_id.as_uuid())
-                .for_update()
-                .select(WorkflowExecution::as_select())
-                .first(conn)
-                .await
-                .optional()
-                .map_err(crate::error::database_error)?
-                .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))?;
+    let deferred = conn
+        .transaction::<_, HarvestError, _>(|conn| {
+            async move {
+                harvest_workflow_executions::table
+                    .find(exec_id.as_uuid())
+                    .for_update()
+                    .select(WorkflowExecution::as_select())
+                    .first(conn)
+                    .await
+                    .optional()
+                    .map_err(crate::error::database_error)?
+                    .ok_or_else(|| {
+                        HarvestError::NotFound(format!("workflow execution {exec_id}"))
+                    })?;
 
-            for event in marker_events {
-                store::append_single_event(conn, exec_id, event).await?;
+                for event in marker_events {
+                    store::append_single_event(conn, exec_id, event).await?;
+                }
+                detached_spawns.persist(conn, commands).await?;
+
+                let history = store::load_history(conn, exec_id).await?;
+                let has_terminal = activity_ids
+                    .iter()
+                    .any(|activity_id| has_activity_terminal_event(&history.events, *activity_id));
+
+                let mut next_event_id = history.next_event_id;
+                let deferred = apply_race_loser_cancellations(
+                    conn,
+                    exec_id,
+                    commands,
+                    &mut next_event_id,
+                    registry,
+                )
+                .await?;
+
+                queue::park_workflow_task(conn, task_id, sticky).await?;
+                if has_terminal {
+                    queue::wake_workflow_task(conn, exec_id).await?;
+                }
+                Ok(deferred)
             }
-            detached_spawns.persist(conn, commands).await?;
+            .scope_boxed()
+        })
+        .await?;
 
-            let history = store::load_history(conn, exec_id).await?;
-            let has_terminal = activity_ids
-                .iter()
-                .any(|activity_id| has_activity_terminal_event(&history.events, *activity_id));
-
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-            if has_terminal {
-                queue::wake_workflow_task(conn, exec_id).await?;
-            }
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await
+    for start in deferred {
+        start.spawn();
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3172,6 +3207,7 @@ async fn persist_scheduled_activities(
                     exec_id,
                     commands,
                     &mut race_next_event_id,
+                    registry,
                 )
                 .await?;
                 queue::park_workflow_task(conn, task_id, sticky).await?;
@@ -3249,8 +3285,11 @@ async fn persist_started_timer(
     );
 
     let has_events = !events.is_empty();
+    let registry = detached_spawns.registry;
+    let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
+    let deferred = conn
+        .transaction::<_, HarvestError, _>(|conn| {
         async move {
             use crate::schema::harvest_task_queue::dsl as queue_dsl;
 
@@ -3258,6 +3297,16 @@ async fn persist_started_timer(
                 store::append_events(conn, exec_id, &events, next_event_id).await?;
             }
             detached_spawns.persist(conn, commands).await?;
+
+            let mut race_next_event_id = next_event_id.saturating_add(events_len);
+            let deferred = apply_race_loser_cancellations(
+                conn,
+                exec_id,
+                commands,
+                &mut race_next_event_id,
+                registry,
+            )
+            .await?;
 
             if is_new {
                 let new_timer = NewHarvestTimer {
@@ -3332,12 +3381,16 @@ async fn persist_started_timer(
             if sticky.is_some() {
                 queue::set_task_sticky_affinity(conn, task_id, sticky).await?;
             }
-            Ok(())
+            Ok(deferred)
         }
         .scope_boxed()
     })
-    .instrument(span)
-    .await?;
+        .instrument(span)
+        .await?;
+
+    for start in deferred {
+        start.spawn();
+    }
 
     // A signal may have arrived while this task was actively running (before
     // the park above). `send_signal` would have called `wake_workflow_task` at
@@ -3453,239 +3506,257 @@ async fn persist_all_started_child_workflows(
     let telemetry = registry.telemetry().clone();
     let execute_span = execute_span.clone();
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        let children = children.clone();
-        let pre_events_by_pos = pre_events_by_pos.clone();
-        let start_child_cmd_indices = start_child_cmd_indices.clone();
-        let queue_name = queue_name.clone();
-        let telemetry = telemetry.clone();
-        let execute_span = execute_span.clone();
-        async move {
-            // Determine which children are genuinely new vs. already running.
-            let requested_ids: Vec<uuid::Uuid> =
-                children.iter().map(|c| c.child_id.as_uuid()).collect();
-            let existing_ids: HashSet<uuid::Uuid> = harvest_workflow_executions::table
-                .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
-                .select(harvest_workflow_executions::id)
-                .load::<uuid::Uuid>(conn)
-                .await
-                .map_err(crate::error::database_error)?
-                .into_iter()
-                .collect();
-
-            let new_children: Vec<&StartedChildWorkflowCommand> = children
-                .iter()
-                .filter(|c| !existing_ids.contains(&c.child_id.as_uuid()))
-                .collect();
-
-            // ADR-0001 §2.8: emit harvest.child_workflow.start PRODUCER spans only
-            // for genuinely new children (after the existing_ids filter).
-            // `parent: &execute_span` makes each span a child of this executor
-            // cycle's harvest.workflow.execute span even though that span's
-            // instrumented future has already returned (the handle is still open).
-            // EnteredSpan is !Send so each span must be fully dropped (via
-            // .in_scope) before the next .await.
-            let child_trace_ctxs: std::collections::HashMap<
-                uuid::Uuid,
-                Option<TraceContextCarrier>,
-            > = new_children
-                .iter()
-                .map(|child| {
-                    let ctx = tracing::info_span!(
-                        parent: &execute_span,
-                        "harvest.child_workflow.start",
-                        "otel.kind" = "producer",
-                        { ATTR_WORKFLOW_ID } = %child.workflow_name,
-                        { ATTR_EXECUTION_ID } = %child.child_id,
-                        { ATTR_SHARD_ID } = shard_id,
-                    )
-                    .in_scope(|| telemetry.capture_trace_context());
-                    (child.child_id.as_uuid(), ctx)
-                })
-                .collect();
-
-            // Build the parent event list in command emission order.
-            // Markers, detached-spawn events, and ChildWorkflowStarted events are
-            // interleaved at their actual command positions so the replay engine's
-            // sequential cursor sees the same order as command emission.
-            // append_single_event (not append_events) is used so each insert
-            // re-reads MAX(event_id) under the parent-row FOR UPDATE lock, serialising
-            // against concurrent ChildWorkflowCompleted/Failed appends from sibling
-            // children that complete while this parent task is still RUNNING.
-            let new_child_id_set: HashSet<uuid::Uuid> =
-                new_children.iter().map(|c| c.child_id.as_uuid()).collect();
-            let mut child_events_by_pos: Vec<(usize, WorkflowEvent)> = start_child_cmd_indices
-                .iter()
-                .zip(children.iter())
-                .filter_map(|(pos, child)| {
-                    if new_child_id_set.contains(&child.child_id.as_uuid()) {
-                        Some((
-                            *pos,
-                            WorkflowEvent::ChildWorkflowStarted {
-                                child_id: child.child_id,
-                                workflow_name: child.workflow_name.clone(),
-                                input: child.input.clone(),
-                            },
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let mut all_events_by_pos = pre_events_by_pos;
-            all_events_by_pos.append(&mut child_events_by_pos);
-            all_events_by_pos.sort_unstable_by_key(|(i, _)| *i);
-            let parent_events: Vec<WorkflowEvent> =
-                all_events_by_pos.into_iter().map(|(_, e)| e).collect();
-            for event in parent_events {
-                store::append_single_event(conn, parent_exec_id, event).await?;
-            }
-            create_detached_child_executions(
-                conn,
-                registry,
-                parent_execution,
-                commands,
-                &execute_span,
-            )
-            .await?;
-
-            // Insert rows and enqueue tasks for new children.
-            for child in &new_children {
-                let child_workflow_id = child.child_id.to_string();
-                let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
-                let (
-                    owner,
-                    runbook_url,
-                    severity,
-                    child_sla,
-                    child_execution_timeout,
-                    child_retry_policy,
-                ) = child_wf_info.map_or((None, None, None, None, None, None), |w| {
-                    (
-                        w.owner,
-                        w.runbook_url,
-                        w.severity,
-                        w.sla,
-                        w.execution_timeout,
-                        w.retry_policy.clone(),
-                    )
-                });
-                let child_execution_timeout =
-                    child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
-                let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
-                let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
-                let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
-                let child_row = NewWorkflowExecution {
-                    id: child.child_id.as_uuid(),
-                    workflow_name: &child.workflow_name,
-                    workflow_id: &child_workflow_id,
-                    run_id: uuid::Uuid::new_v4(),
-                    shard_id,
-                    input: child.input.clone(),
-                    parent_id: Some(parent_exec_id.as_uuid()),
-                    queue_name: &queue_name,
-                    execution_timeout: child_execution_timeout,
-                    deadline_at: child_deadline_at,
-                    sla: child_sla,
-                    sla_deadline_at: child_sla_deadline_at,
-                    memo: None,
-                    search_attrs: None,
-                    assigned_build_id: parent_execution.assigned_build_id.clone(),
-                    parent_close_policy: None, // awaited child
-                    owner,
-                    runbook_url,
-                    severity,
-                    context_headers: parent_execution.context_headers.clone(),
-                    schedule_id: None, // child workflows are not scheduled fires
-                    scheduled_for: None,
-                    workflow_attempt: 1,
-                    workflow_retry_policy: child_retry_policy
-                        .and_then(|p| serde_json::to_value(&p).ok()),
-                    retry_of_exec_id: None,
-                    origin: None, // child workflow, not a schedule fire (issue #534)
-                };
-                let child_started_event = WorkflowEvent::WorkflowStarted {
-                    input: child.input.clone(),
-                    timestamp: chrono::Utc::now(),
-                    last_completion_result: None,
-                    last_error: None,
-                    scheduled_time: None, // child workflows are not scheduler-fired
-                };
-                let mut params = queue::EnqueueParams::new(
-                    queue_name.clone(),
-                    TaskType::Workflow,
-                    child.input.clone(),
-                );
-                params.workflow_exec_id = Some(child.child_id.as_uuid());
-                params.required_build_id = parent_execution.assigned_build_id.clone();
-                (params.concurrency_key, params.max_concurrent) =
-                    resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
-                params.trace_context = child_trace_ctxs
-                    .get(&child.child_id.as_uuid())
-                    .cloned()
-                    .flatten();
-
-                diesel::insert_into(harvest_workflow_executions::table)
-                    .values(&child_row)
-                    .execute(conn)
+    let deferred = conn
+        .transaction::<_, HarvestError, _>(|conn| {
+            let children = children.clone();
+            let pre_events_by_pos = pre_events_by_pos.clone();
+            let start_child_cmd_indices = start_child_cmd_indices.clone();
+            let queue_name = queue_name.clone();
+            let telemetry = telemetry.clone();
+            let execute_span = execute_span.clone();
+            async move {
+                // Determine which children are genuinely new vs. already running.
+                let requested_ids: Vec<uuid::Uuid> =
+                    children.iter().map(|c| c.child_id.as_uuid()).collect();
+                let existing_ids: HashSet<uuid::Uuid> = harvest_workflow_executions::table
+                    .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
+                    .select(harvest_workflow_executions::id)
+                    .load::<uuid::Uuid>(conn)
                     .await
-                    .map_err(crate::error::database_error)?;
-                store::append_events_offloaded(
+                    .map_err(crate::error::database_error)?
+                    .into_iter()
+                    .collect();
+
+                let new_children: Vec<&StartedChildWorkflowCommand> = children
+                    .iter()
+                    .filter(|c| !existing_ids.contains(&c.child_id.as_uuid()))
+                    .collect();
+
+                // ADR-0001 §2.8: emit harvest.child_workflow.start PRODUCER spans only
+                // for genuinely new children (after the existing_ids filter).
+                // `parent: &execute_span` makes each span a child of this executor
+                // cycle's harvest.workflow.execute span even though that span's
+                // instrumented future has already returned (the handle is still open).
+                // EnteredSpan is !Send so each span must be fully dropped (via
+                // .in_scope) before the next .await.
+                let child_trace_ctxs: std::collections::HashMap<
+                    uuid::Uuid,
+                    Option<TraceContextCarrier>,
+                > = new_children
+                    .iter()
+                    .map(|child| {
+                        let ctx = tracing::info_span!(
+                            parent: &execute_span,
+                            "harvest.child_workflow.start",
+                            "otel.kind" = "producer",
+                            { ATTR_WORKFLOW_ID } = %child.workflow_name,
+                            { ATTR_EXECUTION_ID } = %child.child_id,
+                            { ATTR_SHARD_ID } = shard_id,
+                        )
+                        .in_scope(|| telemetry.capture_trace_context());
+                        (child.child_id.as_uuid(), ctx)
+                    })
+                    .collect();
+
+                // Build the parent event list in command emission order.
+                // Markers, detached-spawn events, and ChildWorkflowStarted events are
+                // interleaved at their actual command positions so the replay engine's
+                // sequential cursor sees the same order as command emission.
+                // append_single_event (not append_events) is used so each insert
+                // re-reads MAX(event_id) under the parent-row FOR UPDATE lock, serialising
+                // against concurrent ChildWorkflowCompleted/Failed appends from sibling
+                // children that complete while this parent task is still RUNNING.
+                let new_child_id_set: HashSet<uuid::Uuid> =
+                    new_children.iter().map(|c| c.child_id.as_uuid()).collect();
+                let mut child_events_by_pos: Vec<(usize, WorkflowEvent)> = start_child_cmd_indices
+                    .iter()
+                    .zip(children.iter())
+                    .filter_map(|(pos, child)| {
+                        if new_child_id_set.contains(&child.child_id.as_uuid()) {
+                            Some((
+                                *pos,
+                                WorkflowEvent::ChildWorkflowStarted {
+                                    child_id: child.child_id,
+                                    workflow_name: child.workflow_name.clone(),
+                                    input: child.input.clone(),
+                                },
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let mut all_events_by_pos = pre_events_by_pos;
+                all_events_by_pos.append(&mut child_events_by_pos);
+                all_events_by_pos.sort_unstable_by_key(|(i, _)| *i);
+                let parent_events: Vec<WorkflowEvent> =
+                    all_events_by_pos.into_iter().map(|(_, e)| e).collect();
+                for event in parent_events {
+                    store::append_single_event(conn, parent_exec_id, event).await?;
+                }
+                create_detached_child_executions(
                     conn,
-                    child.child_id,
-                    &[child_started_event],
-                    0,
-                    registry.payload_offloader(),
+                    registry,
+                    parent_execution,
+                    commands,
+                    &execute_span,
                 )
                 .await?;
-                queue::enqueue(conn, &params).await?;
-            }
 
-            // Check for already-terminal children only in the re-park path
-            // (new_children is empty).  In the initial park path all children
-            // were just created inside this transaction and are invisible to
-            // other transactions until commit, so they cannot be terminal and
-            // the check would always return false.  Skipping it also avoids a
-            // lock-order inversion: append_single_event (for new ChildWorkflowStarted
-            // events) holds the parent execution row lock, and then acquiring
-            // child execution row locks via FOR UPDATE would be the inverse of
-            // the child-completion order (child exec row → parent exec row via
-            // wake_parent append_single_event).
-            //
-            // In the re-park path there are no append_single_event calls, so
-            // lock order is child exec rows → parent task queue row, which
-            // matches the child-completion path.  A terminal child here means
-            // wake_workflow_task was a no-op while the parent was RUNNING, so
-            // we re-wake after parking.
-            let any_terminal = if new_children.is_empty() {
-                let child_states: Vec<String> = harvest_workflow_executions::table
-                    .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
-                    .for_update()
-                    .select(harvest_workflow_executions::state)
-                    .load::<String>(conn)
-                    .await
-                    .map_err(crate::error::database_error)?;
-                child_states.iter().any(|s| {
-                    matches!(
-                        s.as_str(),
-                        "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED" | "TERMINATED"
+                let mut race_next_event_id = store::load_history(conn, parent_exec_id)
+                    .await?
+                    .next_event_id;
+                let race_deferred = apply_race_loser_cancellations(
+                    conn,
+                    parent_exec_id,
+                    commands,
+                    &mut race_next_event_id,
+                    registry,
+                )
+                .await?;
+
+                // Insert rows and enqueue tasks for new children.
+                for child in &new_children {
+                    let child_workflow_id = child.child_id.to_string();
+                    let child_wf_info = registry.workflows.get(child.workflow_name.as_str());
+                    let (
+                        owner,
+                        runbook_url,
+                        severity,
+                        child_sla,
+                        child_execution_timeout,
+                        child_retry_policy,
+                    ) = child_wf_info.map_or((None, None, None, None, None, None), |w| {
+                        (
+                            w.owner,
+                            w.runbook_url,
+                            w.severity,
+                            w.sla,
+                            w.execution_timeout,
+                            w.retry_policy.clone(),
+                        )
+                    });
+                    let child_execution_timeout =
+                        child_execution_timeout.and_then(|d| chrono::Duration::from_std(d).ok());
+                    let child_sla = child_sla.and_then(|d| chrono::Duration::from_std(d).ok());
+                    let child_deadline_at = child_execution_timeout.map(|d| chrono::Utc::now() + d);
+                    let child_sla_deadline_at = child_sla.map(|d| chrono::Utc::now() + d);
+                    let child_row = NewWorkflowExecution {
+                        id: child.child_id.as_uuid(),
+                        workflow_name: &child.workflow_name,
+                        workflow_id: &child_workflow_id,
+                        run_id: uuid::Uuid::new_v4(),
+                        shard_id,
+                        input: child.input.clone(),
+                        parent_id: Some(parent_exec_id.as_uuid()),
+                        queue_name: &queue_name,
+                        execution_timeout: child_execution_timeout,
+                        deadline_at: child_deadline_at,
+                        sla: child_sla,
+                        sla_deadline_at: child_sla_deadline_at,
+                        memo: None,
+                        search_attrs: None,
+                        assigned_build_id: parent_execution.assigned_build_id.clone(),
+                        parent_close_policy: None, // awaited child
+                        owner,
+                        runbook_url,
+                        severity,
+                        context_headers: parent_execution.context_headers.clone(),
+                        schedule_id: None, // child workflows are not scheduled fires
+                        scheduled_for: None,
+                        workflow_attempt: 1,
+                        workflow_retry_policy: child_retry_policy
+                            .and_then(|p| serde_json::to_value(&p).ok()),
+                        retry_of_exec_id: None,
+                        origin: None, // child workflow, not a schedule fire (issue #534)
+                    };
+                    let child_started_event = WorkflowEvent::WorkflowStarted {
+                        input: child.input.clone(),
+                        timestamp: chrono::Utc::now(),
+                        last_completion_result: None,
+                        last_error: None,
+                        scheduled_time: None, // child workflows are not scheduler-fired
+                    };
+                    let mut params = queue::EnqueueParams::new(
+                        queue_name.clone(),
+                        TaskType::Workflow,
+                        child.input.clone(),
+                    );
+                    params.workflow_exec_id = Some(child.child_id.as_uuid());
+                    params.required_build_id = parent_execution.assigned_build_id.clone();
+                    (params.concurrency_key, params.max_concurrent) =
+                        resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+                    params.trace_context = child_trace_ctxs
+                        .get(&child.child_id.as_uuid())
+                        .cloned()
+                        .flatten();
+
+                    diesel::insert_into(harvest_workflow_executions::table)
+                        .values(&child_row)
+                        .execute(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                    store::append_events_offloaded(
+                        conn,
+                        child.child_id,
+                        &[child_started_event],
+                        0,
+                        registry.payload_offloader(),
                     )
-                })
-            } else {
-                false
-            };
+                    .await?;
+                    queue::enqueue(conn, &params).await?;
+                }
 
-            queue::park_workflow_task(conn, task_id, sticky).await?;
+                // Check for already-terminal children only in the re-park path
+                // (new_children is empty).  In the initial park path all children
+                // were just created inside this transaction and are invisible to
+                // other transactions until commit, so they cannot be terminal and
+                // the check would always return false.  Skipping it also avoids a
+                // lock-order inversion: append_single_event (for new ChildWorkflowStarted
+                // events) holds the parent execution row lock, and then acquiring
+                // child execution row locks via FOR UPDATE would be the inverse of
+                // the child-completion order (child exec row → parent exec row via
+                // wake_parent append_single_event).
+                //
+                // In the re-park path there are no append_single_event calls, so
+                // lock order is child exec rows → parent task queue row, which
+                // matches the child-completion path.  A terminal child here means
+                // wake_workflow_task was a no-op while the parent was RUNNING, so
+                // we re-wake after parking.
+                let any_terminal = if new_children.is_empty() {
+                    let child_states: Vec<String> = harvest_workflow_executions::table
+                        .filter(harvest_workflow_executions::id.eq_any(&requested_ids))
+                        .for_update()
+                        .select(harvest_workflow_executions::state)
+                        .load::<String>(conn)
+                        .await
+                        .map_err(crate::error::database_error)?;
+                    child_states.iter().any(|s| {
+                        matches!(
+                            s.as_str(),
+                            "COMPLETED" | "FAILED" | "TIMED_OUT" | "CANCELLED" | "TERMINATED"
+                        )
+                    })
+                } else {
+                    false
+                };
 
-            if any_terminal {
-                queue::wake_workflow_task(conn, parent_exec_id).await?;
+                queue::park_workflow_task(conn, task_id, sticky).await?;
+
+                if any_terminal {
+                    queue::wake_workflow_task(conn, parent_exec_id).await?;
+                }
+
+                Ok(race_deferred)
             }
+            .scope_boxed()
+        })
+        .await?;
 
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await
+    for start in deferred {
+        start.spawn();
+    }
+    Ok(())
 }
 
 /// Chronologically interleave due timer fires and pending signals for a
@@ -4945,35 +5016,50 @@ async fn persist_scheduled_external_activity(
         .is_some()
     {
         let token = scheduled.token;
-        conn.transaction::<(), HarvestError, _>(|conn| {
-            async move {
-                let locked = external_task::find_by_token_locked(conn, token).await?;
+        let registry = detached_spawns.registry;
+        let deferred = conn
+            .transaction::<_, HarvestError, _>(|conn| {
+                async move {
+                    let locked = external_task::find_by_token_locked(conn, token).await?;
 
-                // Recompute the event offset inside the transaction: external
-                // completion may have appended a terminal event between replay
-                // start (when next_event_id was sampled) and here.  Using
-                // append_single_event serialises each append against concurrent
-                // writers via the per-execution FOR UPDATE it acquires.
-                let marker_events = pre_suspension_events_from_commands(commands);
-                for event in marker_events {
-                    store::append_single_event(conn, exec_id, event).await?;
-                }
-                detached_spawns.persist(conn, commands).await?;
+                    // Recompute the event offset inside the transaction: external
+                    // completion may have appended a terminal event between replay
+                    // start (when next_event_id was sampled) and here.  Using
+                    // append_single_event serialises each append against concurrent
+                    // writers via the per-execution FOR UPDATE it acquires.
+                    let marker_events = pre_suspension_events_from_commands(commands);
+                    for event in marker_events {
+                        store::append_single_event(conn, exec_id, event).await?;
+                    }
+                    detached_spawns.persist(conn, commands).await?;
 
-                if locked.is_some_and(|t| t.state != "PENDING") {
-                    // The task is still RUNNING (owned by this worker), so
-                    // wake_workflow_task (which only moves parked rows) is a
-                    // no-op.  Park first to clear worker ownership, then wake
+                    let mut race_next_event_id =
+                        store::load_history(conn, exec_id).await?.next_event_id;
+                    let deferred = apply_race_loser_cancellations(
+                        conn,
+                        exec_id,
+                        commands,
+                        &mut race_next_event_id,
+                        registry,
+                    )
+                    .await?;
+
+                    // Park first (unconditionally): if the task is still RUNNING
+                    // (owned by this worker), wake_workflow_task on an unparked row
+                    // would be a no-op, so ownership must be cleared before waking
                     // so the next available worker picks up the terminal event.
                     queue::park_workflow_task(conn, task_id, sticky).await?;
-                    queue::wake_workflow_task(conn, exec_id).await
-                } else {
-                    queue::park_workflow_task(conn, task_id, sticky).await
+                    if locked.is_some_and(|t| t.state != "PENDING") {
+                        queue::wake_workflow_task(conn, exec_id).await?;
+                    }
+                    Ok(deferred)
                 }
-            }
-            .scope_boxed()
-        })
-        .await?;
+                .scope_boxed()
+            })
+            .await?;
+        for start in deferred {
+            start.spawn();
+        }
         return Ok(());
     }
 
@@ -4996,26 +5082,42 @@ async fn persist_scheduled_external_activity(
         }
     });
 
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        async move {
-            store::append_events(conn, exec_id, &events, next_event_id).await?;
-            detached_spawns.persist(conn, commands).await?;
-            external_task::record_external_task(
-                conn,
-                exec_id,
-                scheduled.token,
-                scheduled.activity_id,
-                &scheduled.name,
-                &scheduled.queue,
-                scheduled.schedule_to_close_secs,
-            )
-            .await?;
-            queue::park_workflow_task(conn, task_id, sticky).await?;
-            Ok(())
-        }
-        .scope_boxed()
-    })
-    .await
+    let registry = detached_spawns.registry;
+    let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
+    let deferred = conn
+        .transaction::<_, HarvestError, _>(|conn| {
+            async move {
+                store::append_events(conn, exec_id, &events, next_event_id).await?;
+                detached_spawns.persist(conn, commands).await?;
+                external_task::record_external_task(
+                    conn,
+                    exec_id,
+                    scheduled.token,
+                    scheduled.activity_id,
+                    &scheduled.name,
+                    &scheduled.queue,
+                    scheduled.schedule_to_close_secs,
+                )
+                .await?;
+                let mut race_next_event_id = next_event_id.saturating_add(events_len);
+                let deferred = apply_race_loser_cancellations(
+                    conn,
+                    exec_id,
+                    commands,
+                    &mut race_next_event_id,
+                    registry,
+                )
+                .await?;
+                queue::park_workflow_task(conn, task_id, sticky).await?;
+                Ok(deferred)
+            }
+            .scope_boxed()
+        })
+        .await?;
+    for start in deferred {
+        start.spawn();
+    }
+    Ok(())
 }
 
 async fn persist_bookkeeping_and_requeue_workflow(
@@ -5029,6 +5131,7 @@ async fn persist_bookkeeping_and_requeue_workflow(
 ) -> HarvestResult<()> {
     let events = pre_suspension_events_from_commands(commands);
     let events_len = i32::try_from(events.len()).unwrap_or(i32::MAX);
+    let registry = detached_spawns.registry;
 
     let deferred = conn
         .transaction::<_, HarvestError, _>(|conn| {
@@ -5043,6 +5146,7 @@ async fn persist_bookkeeping_and_requeue_workflow(
                     exec_id,
                     commands,
                     &mut race_next_event_id,
+                    registry,
                 )
                 .await?;
                 queue::park_workflow_task(conn, task_id, sticky).await?;
@@ -5065,6 +5169,13 @@ async fn persist_bookkeeping_and_requeue_workflow(
 /// persists the race's winner marker (the caller runs this inside its own
 /// `conn.transaction`), so a crash between the two can never leak a row.
 ///
+/// Records the same telemetry a normal terminal outcome would: the
+/// `harvest.activity.*` trio for a cancelled loser activity (mirroring the
+/// circuit-breaker short-circuit convention of `duration_secs = 0.0` and
+/// `workflow_type = ""` when the activity never actually ran) and
+/// `harvest.workflow.terminal{outcome="cancelled"}` for a cancelled loser
+/// child workflow.
+///
 /// Returns the child-cancellation `DeferredTriggerStart`s that the caller
 /// must spawn **after** its outer transaction commits (mirrors the existing
 /// external-cancel delivery pattern, issue #492) — never before, so a rolled
@@ -5074,9 +5185,11 @@ async fn apply_race_loser_cancellations(
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
     next_event_id: &mut i32,
+    registry: &HandlerRegistry,
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
     let mut deferred = Vec::new();
     let mut synthetic_events = Vec::new();
+    let metrics = &registry.telemetry().metrics;
 
     for cmd in commands {
         let WorkflowCommand::CancelRaceLosers {
@@ -5093,7 +5206,9 @@ async fn apply_race_loser_cancellations(
             // genuinely completed first (raced the cancellation), a real
             // terminal event already exists (or is about to be appended by
             // that in-flight completion write) and must not be duplicated.
-            if queue::cancel_activity_task(conn, *activity_id).await? {
+            if let Some((activity_name, queue_name)) =
+                queue::cancel_activity_task(conn, *activity_id).await?
+            {
                 synthetic_events.push(WorkflowEvent::ActivityFailed {
                     activity_id: *activity_id,
                     error: "lost race to a sibling branch".to_string(),
@@ -5102,6 +5217,19 @@ async fn apply_race_loser_cancellations(
                     non_retryable: true,
                     details: None,
                 });
+                metrics.record_activity_completed_with_error_type(
+                    &activity_name,
+                    &queue_name,
+                    0.0,
+                    ActivityStatus::Failed,
+                    Some("Error"),
+                );
+                metrics.record_activity_failed(&activity_name, "", "Error", true);
+                metrics.record_activity_attempt(
+                    &activity_name,
+                    &queue_name,
+                    ActivityStatus::Failed,
+                );
             }
         }
 
@@ -5117,7 +5245,16 @@ async fn apply_race_loser_cancellations(
             )
             .await
             {
-                Ok((_, mut starts, _closed_children, _)) => deferred.append(&mut starts),
+                Ok((_, mut starts, _closed_children, terminal_metric)) => {
+                    deferred.append(&mut starts);
+                    if let Some((child_workflow_name, queue_name)) = terminal_metric {
+                        metrics.record_workflow_terminal(
+                            &child_workflow_name,
+                            &queue_name,
+                            WorkflowStatus::Cancelled,
+                        );
+                    }
+                }
                 Err(err) => {
                     // Best-effort cleanup: a losing child that already reached
                     // some other terminal state (it also finished, just wasn't
@@ -5907,6 +6044,14 @@ enum WorkflowPersistFlow {
     Persisted {
         retry_scheduled: bool,
         deferred_checks: Vec<(ExecutionId, Option<String>)>,
+        /// `ctx.race()` loser-cancellation completion-trigger starts (issue
+        /// #600), gathered from `persist_terminal_outcome_commands` — empty
+        /// when the outcome path didn't run `apply_race_loser_cancellations`.
+        /// Must only be spawned **after** this transaction commits (see
+        /// `apply_race_loser_cancellations`'s doc comment): a start spawned
+        /// before commit could run against a cancellation that later rolls
+        /// back if this transaction fails.
+        race_deferred_triggers: Vec<crate::completion_trigger::DeferredTriggerStart>,
     },
 }
 
@@ -5976,7 +6121,11 @@ async fn persist_terminal_outcome_commands(
     outcome: WorkflowOutcome,
     pending_cmds: &[WorkflowCommand],
     execute_span: &tracing::Span,
-) -> HarvestResult<(bool, Vec<(ExecutionId, Option<String>)>)> {
+) -> HarvestResult<(
+    bool,
+    Vec<(ExecutionId, Option<String>)>,
+    Vec<crate::completion_trigger::DeferredTriggerStart>,
+)> {
     let mut next_event_id = persistence.next_event_id;
     persist_update_result_commands(conn, persistence.exec_id, pending_cmds, &mut next_event_id)
         .await?;
@@ -5993,16 +6142,18 @@ async fn persist_terminal_outcome_commands(
 
     // A ctx.race() resolving in the same workflow-task cycle as its terminal
     // Complete/Fail (the ≤5-line "race, then return" DX) durably cancels its
-    // losers here. Spawned inline rather than deferred past an outer
-    // transaction commit: this function is already a sequence of independent
-    // statements (not one atomic transaction), so this carries the same
-    // pre-existing best-effort risk profile as its neighbors.
-    for start in
-        apply_race_loser_cancellations(conn, persistence.exec_id, pending_cmds, &mut next_event_id)
-            .await?
-    {
-        start.spawn();
-    }
+    // losers here, in the same transaction the caller wraps this whole
+    // function in. The returned starts are NOT spawned here — the caller
+    // must only spawn them after that outer transaction commits (see
+    // `apply_race_loser_cancellations`'s doc comment).
+    let race_deferred_triggers = apply_race_loser_cancellations(
+        conn,
+        persistence.exec_id,
+        pending_cmds,
+        &mut next_event_id,
+        registry,
+    )
+    .await?;
 
     create_detached_child_executions(conn, registry, execution, pending_cmds, execute_span).await?;
 
@@ -6024,7 +6175,7 @@ async fn persist_terminal_outcome_commands(
 
     // `update_schedule_counter: false` — the caller runs counters after commit.
     // Returns true if a workflow retry was scheduled (root/detached failure path).
-    persist_workflow_outcome(
+    let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
         conn,
         registry,
         effective_execution,
@@ -6036,7 +6187,8 @@ async fn persist_terminal_outcome_commands(
         execute_span,
         false,
     )
-    .await
+    .await?;
+    Ok((retry_scheduled, deferred_checks, race_deferred_triggers))
 }
 
 fn pending_update_result_event_count(commands: &[WorkflowCommand]) -> u64 {
@@ -6057,20 +6209,30 @@ fn terminal_history_event_count(next_event_id: i32, pending_cmds: &[WorkflowComm
 }
 
 fn pre_suspension_event_count(commands: &[WorkflowCommand]) -> u64 {
-    u64::try_from(
-        commands
-            .iter()
-            .filter(|cmd| {
-                matches!(
-                    cmd,
-                    WorkflowCommand::RecordMarker { .. }
-                        | WorkflowCommand::RecordSideEffect { .. }
-                        | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
-                )
-            })
-            .count(),
-    )
-    .unwrap_or(u64::MAX)
+    let simple_events = commands
+        .iter()
+        .filter(|cmd| {
+            matches!(
+                cmd,
+                WorkflowCommand::RecordMarker { .. }
+                    | WorkflowCommand::RecordSideEffect { .. }
+                    | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+            )
+        })
+        .count();
+    // Upper bound on the synthetic ActivityFailed events apply_race_loser_cancellations
+    // may append: at most one per losing activity branch, and only for a branch still
+    // open at cancellation time (an already-completed branch produces none). Counting
+    // every listed activity here can overcount but never undercount, so it only ever
+    // nudges the history hard-cap check earlier -- never masks a real overflow.
+    let race_cancel_events: usize = commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::CancelRaceLosers { activities, .. } => Some(activities.len()),
+            _ => None,
+        })
+        .sum();
+    u64::try_from(simple_events.saturating_add(race_cancel_events)).unwrap_or(u64::MAX)
 }
 
 fn pending_detached_parent_close_cascade_event_count(commands: &[WorkflowCommand]) -> u64 {
@@ -7248,32 +7410,35 @@ async fn process_workflow_task(
                     return Ok(WorkflowPersistFlow::ParkedPaused);
                 }
 
-                let (retry_scheduled, deferred_checks) = if is_terminal_with_commands {
-                    persist_terminal_outcome_commands(
-                        conn,
-                        registry,
-                        execution_ref,
-                        persistence,
-                        outcome,
-                        &pending_cmds,
-                        &execute_span,
-                    )
-                    .await?
-                } else {
-                    persist_workflow_outcome(
-                        conn,
-                        registry,
-                        execution_ref,
-                        persistence,
-                        outcome,
-                        &execute_span,
-                        false,
-                    )
-                    .await?
-                };
+                let (retry_scheduled, deferred_checks, race_deferred_triggers) =
+                    if is_terminal_with_commands {
+                        persist_terminal_outcome_commands(
+                            conn,
+                            registry,
+                            execution_ref,
+                            persistence,
+                            outcome,
+                            &pending_cmds,
+                            &execute_span,
+                        )
+                        .await?
+                    } else {
+                        let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
+                            conn,
+                            registry,
+                            execution_ref,
+                            persistence,
+                            outcome,
+                            &execute_span,
+                            false,
+                        )
+                        .await?;
+                        (retry_scheduled, deferred_checks, Vec::new())
+                    };
                 Ok(WorkflowPersistFlow::Persisted {
                     retry_scheduled,
                     deferred_checks,
+                    race_deferred_triggers,
                 })
             }
             .scope_boxed()
@@ -7288,7 +7453,16 @@ async fn process_workflow_task(
         Ok(WorkflowPersistFlow::Persisted {
             retry_scheduled,
             deferred_checks,
+            race_deferred_triggers,
         }) => {
+            // Only spawned now that the transaction above has committed (see
+            // apply_race_loser_cancellations's doc comment) — spawning inside
+            // the transaction closure could start a trigger workflow for a
+            // cancellation that a later error in that same transaction rolls back.
+            for start in race_deferred_triggers {
+                start.spawn();
+            }
+
             // Deferred best-effort schedule counters, in autocommit post-commit.
             // When a retry was scheduled the failure-counter increment is
             // suppressed: one failure chain counts as one failure (issue #523).

@@ -436,6 +436,33 @@ impl WorkflowSimulator {
                     history.push(WorkflowEvent::SideEffectRecorded { kind, name, value });
                     advanced = true;
                 }
+                WorkflowCommand::CancelRaceLosers {
+                    activities,
+                    children,
+                    timers: _,
+                } => {
+                    // Mirrors WorkflowTestEnv's handling (testing.rs): a still-open
+                    // losing branch gets a synthetic terminal so no future iteration
+                    // loops on an in-progress match; timers carry no history footprint
+                    // in the simulator (no `harvest_timers` table to clean up).
+                    for activity_id in activities {
+                        history.push(WorkflowEvent::ActivityFailed {
+                            activity_id,
+                            error: "lost race to a sibling branch".to_string(),
+                            attempt: 1,
+                            error_type: "Error".to_string(),
+                            non_retryable: true,
+                            details: None,
+                        });
+                    }
+                    for child_id in children {
+                        history.push(WorkflowEvent::ChildWorkflowFailed {
+                            child_id,
+                            error: "lost race to a sibling branch".to_string(),
+                        });
+                    }
+                    advanced = true;
+                }
                 _ => {
                     // Commands like WaitForSignal, StartChildWorkflow are not yet fully supported.
                     // Complete and Fail are handled on the next loop iteration.
