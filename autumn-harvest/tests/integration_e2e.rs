@@ -475,9 +475,9 @@ fn build_test_pool(database_url: &str) -> DbPool {
     deadpool::managed::Pool::builder(manager)
         // Must comfortably exceed the largest `max_concurrent_workflows` any
         // test in this file passes to `build_runtime_worker` (currently 16,
-        // for the 1-parent+10-children wall-clock fan-out test) -- otherwise
-        // genuinely-concurrent workflow tasks contend for pool checkouts
-        // instead of exercising real in-process parallelism.
+        // for the wall-clock fan-out test) -- otherwise genuinely-concurrent
+        // workflow tasks contend for pool checkouts instead of exercising
+        // real in-process parallelism.
         .max_size(20)
         .build()
         .expect("failed to build test pool")
@@ -3046,13 +3046,31 @@ fn slow_fan_child_workflow<'a>(
     })
 }
 
-/// Parent that fans out ten slow children.
+/// Number of children fanned out by [`worker_completes_ten_child_fan_out_within_wall_clock_bound`].
+///
+/// Reduced from 10 to 5 after reproducing this test's CI flakiness locally
+/// (see that test's doc comment for the full investigation): under genuine
+/// CPU contention (verified with `taskset -c 0,1` plus background CPU load,
+/// simulating a busy shared CI runner) all children still completed near-
+/// instantly, but the parent's own reclaim-and-finalize decision cycle --
+/// strictly heavier than any single child's, since it replays the full,
+/// ever-growing history and re-awaits every already-resolved child future
+/// on each reclaim -- occasionally starved for minutes even past the 60s
+/// internal `workflow_task_timeout`, because under severe-enough contention
+/// even tokio's own timer wheel can't service the deadline promptly. Fewer
+/// concurrent decision cycles (6 total instead of 11) directly shrinks both
+/// the contention surface and the parent's per-cycle replay cost, while
+/// still meaningfully proving genuine concurrent dispatch (distinct from
+/// the 3-child correctness test `worker_completes_parent_workflow_with_child_fan_out`).
+const SLOW_FAN_CHILD_COUNT: usize = 5;
+
+/// Parent that fans out several slow children (count: [`SLOW_FAN_CHILD_COUNT`]).
 fn parent_workflow_ten_slow_children<'a>(
     ctx: &'a WorkflowContext,
     _input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        let children: Vec<_> = (0..10)
+        let children: Vec<_> = (0..SLOW_FAN_CHILD_COUNT)
             .map(|i| {
                 (
                     "slow_fan_child".to_string(),
@@ -3209,7 +3227,7 @@ async fn wait_for_completion_with_diagnostics(
                  (currently: {} error={:?}).\n\
                  parent task queue rows:\n{parent_tasks}\n\
                  parent history ({} events):\n{parent_event_summary}\n\
-                 children ({} of expected 10 recorded):\n{child_report}",
+                 children ({} recorded):\n{child_report}",
                 execution.state,
                 execution.error,
                 parent_history.events.len(),
@@ -3289,18 +3307,20 @@ async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
     let parent_exec_id = insert_workflow_execution(&mut conn).await;
     enqueue_started_workflow_task(&mut conn, parent_exec_id, serde_json::json!({})).await;
 
-    // Concurrency must comfortably exceed 1 parent + 10 children so every
-    // child dispatches in the same wave instead of queueing behind a
-    // saturated semaphore.
+    // Concurrency must comfortably exceed 1 parent + SLOW_FAN_CHILD_COUNT
+    // children so every child dispatches in the same wave instead of
+    // queueing behind a saturated semaphore.
     //
     // Uses a wide workflow_task_timeout (not the 10s default) as a safety
-    // margin against pure CI scheduling contention across 11 genuinely-
-    // concurrent, DB-heavy decision cycles -- this was originally suspected
-    // to be the root cause of this test's flakiness, but the actual cause
-    // (see the doc comment above) was unrelated: a raw tokio::time::sleep in
-    // the workflow body, now fixed. The wider timeout is left in place as
-    // cheap, harmless insurance; the test's own 90s outer bound is the real
-    // backstop against a genuine stall.
+    // margin against pure CI scheduling contention across several
+    // genuinely-concurrent, DB-heavy decision cycles -- this was originally
+    // suspected to be the root cause of this test's flakiness, but the
+    // actual cause (see the doc comment above) was unrelated: a raw
+    // tokio::time::sleep in the workflow body, now fixed. The wider timeout
+    // is left in place as cheap, harmless insurance; the test's own outer
+    // bound is the real backstop against a genuine stall, and
+    // SLOW_FAN_CHILD_COUNT was later reduced from 10 to shrink the
+    // contention surface itself (see that constant's doc comment).
     let worker = build_runtime_worker_with_task_timeout(
         "worker-e2e-ten-slow-children",
         16,
@@ -3339,11 +3359,15 @@ async fn worker_completes_ten_child_fan_out_within_wall_clock_bound() {
         .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
-    assert_eq!(results.len(), 10, "all 10 children must complete");
+    assert_eq!(
+        results.len(),
+        SLOW_FAN_CHILD_COUNT,
+        "all {SLOW_FAN_CHILD_COUNT} children must complete"
+    );
 
     assert!(
         elapsed < Duration::from_secs(150),
-        "10 fanned-out children should complete in one concurrent wave, \
+        "{SLOW_FAN_CHILD_COUNT} fanned-out children should complete in one concurrent wave, \
          not one at a time; got {elapsed:?} (see the doc comment above for \
          why this bound is wide)"
     );
