@@ -32,14 +32,20 @@ HarvestPlugin::new()
     .workflows(vec![__autumn_workflow_info_document_review()
         .with_input_schema_fn(review_input_schema)])   // issue #373 schema => typed tool input
     .updates(updates![set_deadline])
-    .api("/api/harvest")
+    // api_with_auth (not plain `.api(...)`) is required in production: it
+    // protects both the management API and every generated MCP tool
+    // route's own HTTP path -- secure_mcp below only gates the /mcp
+    // JSON-RPC envelope (see "Safety posture" below).
+    .api_with_auth("/api/harvest", RequireApiToken::new(…))
     .mcp_tools()                                        // or .mcp_tools_at("/custom/prefix")
 
 // 3. App-side MCP endpoint (autumn-web):
 autumn_web::app()
     .plugin(…)
+    // Also secure the /mcp JSON-RPC envelope itself (initialize/tools/list/
+    // tools/call dispatch) -- both layers are needed.
+    .secure_mcp(RequireApiToken::new(…))
     .mount_mcp("/mcp")
-    .secure_mcp(RequireApiToken::new(…))                // gate agent access in production
 ```
 
 For `WorkflowInfo` values built outside the macro, use `.with_mcp()`.
