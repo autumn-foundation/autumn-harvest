@@ -167,11 +167,16 @@ pub fn collect_descriptors(
 ) -> Vec<McpWorkflowDescriptor> {
     let mut name_counts: HashMap<&str, u32> = HashMap::new();
     let mut effective: HashMap<&str, &WorkflowInfo> = HashMap::new();
-    for w in workflows {
+    // Index of the registration `effective` currently points to for this
+    // name -- i.e. the LAST occurrence seen so far, kept in lockstep with
+    // `effective` (same insert-per-iteration, same last-wins overwrite).
+    let mut effective_index: HashMap<&str, usize> = HashMap::new();
+    for (idx, w) in workflows.iter().enumerate() {
         *name_counts.entry(w.name).or_insert(0) += 1;
         // Last-wins, mirroring `workflows.into_iter().map(|w| (w.name,
         // w)).collect::<HashMap<_, _>>()` in `HandlerRegistry`.
         effective.insert(w.name, w);
+        effective_index.insert(w.name, idx);
     }
     for (name, count) in &name_counts {
         if *count > 1 {
@@ -184,22 +189,29 @@ pub fn collect_descriptors(
             );
         }
     }
-    // Process unique names in *first-registration* order, not alphabetical
-    // order (code review, PR #908): the operation-id collision check below
-    // is documented and tested as "first-registered wins" -- registering
-    // `start_invoice` before `invoice_status` must keep `start_invoice` even
-    // though "invoice_status" sorts first alphabetically. Sorting `names`
-    // here (an earlier revision of this fix) silently flipped that tie-break
-    // to alphabetical order for any collision pair whose registration order
-    // disagreed with lexicographic order. The final returned `Vec` is still
-    // sorted by name below, independent of processing order.
-    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut names: Vec<&str> = Vec::new();
-    for w in workflows {
-        if seen_names.insert(w.name) {
-            names.push(w.name);
-        }
-    }
+    // Process unique names in *effective-registration* order -- the index of
+    // the occurrence `effective` actually resolved to (its last occurrence),
+    // not the index of the name's first mention (code review, PR #908,
+    // round 2 of this fix). The operation-id collision check below is
+    // documented and tested as "first-registered wins," but when a name is
+    // registered more than once, the registration that matters is the one
+    // `effective` (and thus the runtime) actually uses -- an earlier,
+    // superseded registration of that same name is irrelevant history, not a
+    // real claim on "registered first." Example: `[invoice_status(non-mcp),
+    // start_invoice(mcp), invoice_status(mcp)]` -- `invoice_status`'s
+    // *effective* registration is the third entry, which comes after
+    // `start_invoice`'s only (and thus effective) registration; ordering by
+    // first-mention would have processed `invoice_status` first anyway
+    // (since its first, now-superseded mention was earliest), incorrectly
+    // letting it win the `start_invoice_status` collision over
+    // `start_invoice`, which is the one actually "first" among registrations
+    // that matter. Sorting by `effective_index` (populated in lockstep with
+    // `effective` above) fixes this while leaving the earlier, no-duplicates
+    // regression fix (registration order beats alphabetical order) intact --
+    // the two coincide whenever no name repeats. The final returned `Vec` is
+    // still sorted by name below, independent of processing order.
+    let mut names: Vec<&str> = effective.keys().copied().collect();
+    names.sort_by_key(|name| effective_index[name]);
 
     // Duplicate `(workflow, update_name)` resolution matches the runtime
     // exactly, mirroring the workflow-name fix above: `admit_update` /
@@ -1305,6 +1317,37 @@ mod tests {
             vec!["start_invoice"],
             "start_invoice was registered first and must win the collision, regardless of \
              alphabetical order"
+        );
+    }
+
+    /// Code-review regression test (issue #597, PR #908, round 2 of the
+    /// collision-order fix): when a name is registered more than once, the
+    /// registration that determines "registered first" for collision
+    /// purposes must be the *effective* (last, runtime-executed)
+    /// registration, not the name's first, possibly-superseded mention.
+    /// `invoice_status`'s effective registration (the third entry) comes
+    /// after `start_invoice`'s only registration (the second entry), so
+    /// `start_invoice` must win the `start_invoice_status` collision even
+    /// though `invoice_status` was *mentioned* first (as a since-superseded,
+    /// non-mcp registration).
+    #[test]
+    fn collect_descriptors_collision_order_uses_effective_registration_not_first_mention() {
+        let descriptors = collect_descriptors(
+            &[
+                wf("invoice_status", false), // superseded, non-mcp
+                wf("start_invoice", true),
+                wf("invoice_status", true), // effective registration
+            ],
+            &[],
+        );
+
+        let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["start_invoice"],
+            "start_invoice's only (and thus effective) registration precedes \
+             invoice_status's effective (third-entry) registration, so start_invoice must win \
+             the collision, got: {names:?}"
         );
     }
 
