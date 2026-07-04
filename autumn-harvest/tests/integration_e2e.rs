@@ -143,7 +143,7 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
     "\n",
     // issue #604: target_build_id/ramp_percent columns on harvest_build_policies.
-    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
     include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
