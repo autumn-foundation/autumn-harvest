@@ -36,7 +36,7 @@ pub enum HistoryMatch {
         /// Stable, low-cardinality error-type class recorded with the failure
         /// (issue #227 / #369), e.g. `"CircuitOpen"`. `"Error"` for legacy
         /// `Err(String)` failures. Carried so the consumer can build a typed
-        /// [`HarvestError::ActivityFailed`] without parsing the message.
+        /// [`HarvestError::ActivityFailed`](crate::error::HarvestError::ActivityFailed) without parsing the message.
         error_type: String,
         /// Optional structured details recorded with a typed failure (e.g.
         /// `retry_after_secs` / `forced` for `CircuitOpen`). `None` otherwise.
@@ -3598,7 +3598,7 @@ impl HistoryMatcher {
     /// `WorkflowContext::race`'s winner marker) rather than verify one already
     /// known to the caller.
     ///
-    /// **Interleave-tolerant** (mirrors [`Self::scan_activity_terminal`]'s
+    /// **Interleave-tolerant** (mirrors `Self::scan_activity_terminal`'s
     /// forward scan): when two `ctx.race()` calls (or a race alongside a
     /// fan-out / side-effect / child-workflow race) are driven concurrently
     /// via `futures::join!`, a sibling primitive's own marker or branch
@@ -3608,7 +3608,7 @@ impl HistoryMatcher {
     /// `race_winner:1` marker. Those tolerated event kinds are scanned past
     /// (tracked, not consumed) rather than treated as an immediate miss; on
     /// a match, the cursor rewinds to the first such tolerated event (like
-    /// [`Self::settle_terminal`]) so a sibling's own later scan still finds
+    /// `Self::settle_terminal`) so a sibling's own later scan still finds
     /// it. On a genuine miss (scan exhausted, or an event outside the
     /// tolerated set is encountered) the cursor is left unchanged if nothing
     /// was skipped, or parked at the first tolerated event otherwise — in

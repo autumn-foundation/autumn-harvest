@@ -6326,7 +6326,7 @@ impl WorkflowContext {
     /// `UpdateFailed` event and is therefore skipped on replay),  a signal
     /// handler has no persisted "already delivered" marker. Every recorded
     /// `SignalReceived` event for `name` is drained and dispatched exactly
-    /// once **per [`HistoryMatcher`](crate::replay::HistoryMatcher) instance**
+    /// once **per [`HistoryMatcher`] instance**
     /// -- i.e. once per registration call within a single workflow-task
     /// cycle -- but a *new* cycle (the next activity/timer/signal
     /// completion, a worker restart, a warm-cache eviction) rebuilds the

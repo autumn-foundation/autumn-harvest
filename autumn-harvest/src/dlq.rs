@@ -794,7 +794,7 @@ async fn query_dead_letters_for_redrive(
 /// Re-enqueues the dead-lettered task onto its original queue with a fresh
 /// retry budget. Unlike [`replay_dead_letter`], a redrive **reactivates** an
 /// owning execution that was sealed `FAILED` at quarantine time (`FAILED →
-/// RUNNING`, appending a [`WorkflowEvent::WorkflowRedriven`] event so replay
+/// RUNNING`, appending a [`WorkflowEvent::WorkflowRedriven`](crate::event::WorkflowEvent::WorkflowRedriven) event so replay
 /// resumes from existing history append-only). The whole operation is one
 /// transaction.
 ///

@@ -8,15 +8,15 @@
 //! climbs.
 //!
 //! This module is the opt-in *act* half of issue #531 (slot-utilization
-//! gauges, the *observe* half): a [`SlotTuner`] resizes a worker's live
+//! gauges, the *observe* half): a [`SlotTuner`](crate::slot_tuner::SlotTuner) resizes a worker's live
 //! dispatch semaphore within an operator-configured `[min_slots, max_slots]`
 //! band, driven only by in-process signals the worker already owns — slot
 //! utilization, worker DB-pool acquisition pressure, and recent
 //! claim-to-dispatch permit-wait latency. No new external dependency, no
 //! `execution.id` sampling.
 //!
-//! This module is pure / no-DB except for [`TunedSlotRuntime`] and
-//! [`spawn_slot_tuner_loop`], which operate on an in-memory `Semaphore` and a
+//! This module is pure / no-DB except for [`TunedSlotRuntime`](crate::slot_tuner::TunedSlotRuntime) and
+//! [`spawn_slot_tuner_loop`](crate::slot_tuner::spawn_slot_tuner_loop), which operate on an in-memory `Semaphore` and a
 //! caller-supplied pool-pressure closure — there is still no direct database
 //! dependency here (the closure and the DB connection live in `worker.rs`).
 //!
@@ -505,9 +505,9 @@ impl TunedSlotRuntime {
     /// [`Self::desired_target`] independent of what this call achieves.
     ///
     /// Async (issue #548 review, round 4) only to reap an already-finished
-    /// background shrink-acquire (see [`Self::pending_shrink`]) — that
+    /// background shrink-acquire (see `Self::pending_shrink`) — that
     /// `.await` never actually suspends, since it is only reached after
-    /// confirming the task [`JoinHandle::is_finished`]. This does not make
+    /// confirming the task [`JoinHandle::is_finished`](tokio::task::JoinHandle::is_finished). This does not make
     /// `resize_toward` itself block on the semaphore.
     pub async fn resize_toward(&mut self, desired: usize) -> usize {
         let desired = desired.clamp(self.min_slots, self.max_slots);
