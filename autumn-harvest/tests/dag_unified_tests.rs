@@ -622,6 +622,7 @@ fn builder_rejects_workflow_name_collision_with_auto_registered_dag() {
     use autumn_harvest::info::WorkflowInfo;
 
     let colliding_workflow = WorkflowInfo {
+        mcp: false,
         name: "linear_dag",
         module: "tests",
         handler: __autumn_workflow_info_scheduled_dag().handler,

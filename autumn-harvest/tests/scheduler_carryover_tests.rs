@@ -226,6 +226,7 @@ fn make_registry_for(
 ) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "scheduler_carryover_tests",
             handler,

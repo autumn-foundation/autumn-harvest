@@ -535,6 +535,7 @@ async fn reset_fork_completes_with_current_code_and_observes_buffered_signal() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "resettable",
             module: "workflow_reset_integration",
             handler: replay_checkpoints_then_signal,

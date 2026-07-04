@@ -198,6 +198,7 @@ fn test_app_state() -> AppState {
 fn minimal_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "deploy_workflow",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

@@ -268,6 +268,7 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
 
     Arc::new(HandlerRegistry::with_state(
         vec![autumn_harvest::info::WorkflowInfo {
+            mcp: false,
             name: "heartbeat_workflow",
             module: "cancellation_tests",
             handler: heartbeat_workflow,
@@ -683,6 +684,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
 
     Arc::new(HandlerRegistry::with_state(
         vec![autumn_harvest::info::WorkflowInfo {
+            mcp: false,
             name: "uncooperative_workflow",
             module: "cancellation_tests",
             handler: uncooperative_workflow,

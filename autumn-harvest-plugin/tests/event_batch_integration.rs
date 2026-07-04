@@ -194,6 +194,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
     let registry = HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "test_batch_request",
                 module: "tests",
                 handler: dummy_workflow,
@@ -213,6 +214,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "test_batch_macro",
                 module: "tests",
                 handler: dummy_workflow,
@@ -236,6 +238,7 @@ fn build_app(pool: &DbPool) -> HarvestApiApp {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "test_batch_and_debounce",
                 module: "tests",
                 handler: dummy_workflow,

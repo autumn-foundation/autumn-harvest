@@ -153,6 +153,7 @@ fn build_pool(url: &str) -> DbPool {
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name,
         module: "pause_tests",
         handler,

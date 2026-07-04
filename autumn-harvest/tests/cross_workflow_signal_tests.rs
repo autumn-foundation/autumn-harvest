@@ -247,6 +247,7 @@ async fn test_same_shard_not_found_retry() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                mcp: false,
                 name: "caller_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: caller_workflow,
@@ -268,6 +269,7 @@ async fn test_same_shard_not_found_retry() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "target_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: target_workflow,
@@ -436,6 +438,7 @@ async fn test_cross_shard_outbox_delivery() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                mcp: false,
                 name: "caller_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: caller_workflow,
@@ -457,6 +460,7 @@ async fn test_cross_shard_outbox_delivery() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "target_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: target_workflow,
@@ -615,6 +619,7 @@ async fn test_grace_window_expiration() {
 
     let built = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            mcp: false,
             name: "caller_workflow",
             module: "cross_workflow_signal_tests",
             handler: caller_workflow,
@@ -748,6 +753,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                mcp: false,
                 name: "mixed_suspension_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: mixed_suspension_workflow,
@@ -769,6 +775,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "target_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: target_workflow,

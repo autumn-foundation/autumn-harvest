@@ -737,6 +737,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            mcp: false,
             name: "metrics_test_workflow",
             module: "metrics_integration",
             handler: metrics_test_workflow,
@@ -960,6 +961,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
     );
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            mcp: false,
             name: "continue_metric_workflow",
             module: "metrics_integration",
             handler: continue_metric_workflow,
@@ -1103,6 +1105,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
     let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(2);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
+            mcp: false,
             name: "history_cap_violator",
             module: "metrics_integration",
             handler: history_cap_violator,
@@ -1253,6 +1256,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
     let registry = Arc::new(
         HandlerRegistry::new(
             vec![WorkflowInfo {
+                mcp: false,
                 name: "history_cap_violator",
                 module: "metrics_integration",
                 handler: history_cap_violator,
@@ -1404,6 +1408,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "suspended_command_reaches_history_cap",
                 module: "metrics_integration",
                 handler: suspended_command_reaches_history_cap,
@@ -1425,6 +1430,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "history_cap_never_finishing_child",
                 module: "metrics_integration",
                 handler: history_cap_never_finishing_child,
@@ -1625,6 +1631,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
     let policy = WorkflowHistoryPolicy::default().with_event_hard_cap(4);
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![WorkflowInfo {
+            mcp: false,
             name: "local_activity_retry_reaches_history_cap",
             module: "metrics_integration",
             handler: local_activity_retry_reaches_history_cap,
@@ -1803,6 +1810,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "detached_cascade_reaches_history_cap",
                 module: "metrics_integration",
                 handler: detached_cascade_reaches_history_cap,
@@ -1824,6 +1832,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "history_cap_never_finishing_child",
                 module: "metrics_integration",
                 handler: history_cap_never_finishing_child,
@@ -1994,6 +2003,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
     let registry = Arc::new(HandlerRegistry::with_state_telemetry_and_history_policy(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "parent_with_history_capped_child",
                 module: "metrics_integration",
                 handler: parent_with_history_capped_child,
@@ -2015,6 +2025,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "child_breaches_history_cap_inline",
                 module: "metrics_integration",
                 handler: child_breaches_history_cap_inline,
@@ -2327,6 +2338,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            mcp: false,
             name: "non_deterministic_test_workflow",
             module: "metrics_integration",
             handler: non_deterministic_test_workflow,
@@ -2542,6 +2554,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            mcp: false,
             name: "sts_test_workflow",
             module: "metrics_integration",
             handler: sts_test_workflow,
@@ -3160,6 +3173,7 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            mcp: false,
             name: "unfinished_updates_test_workflow",
             module: "metrics_integration",
             handler: unfinished_updates_test_workflow,

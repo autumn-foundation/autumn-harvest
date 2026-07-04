@@ -261,6 +261,7 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            mcp: false,
             name: "echo_workflow",
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -364,6 +365,7 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
     // Default registry uses NoOpPropagator → capture() returns None.
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "echo_workflow",
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

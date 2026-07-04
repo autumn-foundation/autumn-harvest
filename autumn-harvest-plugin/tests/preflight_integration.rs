@@ -209,6 +209,7 @@ fn two_shard_router() -> ShardRouter {
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name: "echo_workflow",
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),

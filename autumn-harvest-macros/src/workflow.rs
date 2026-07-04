@@ -101,6 +101,10 @@ struct WorkflowAttrs {
     /// Workflow-level retry policy (issue #523).
     /// Parsed from `#[workflow(retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]`.
     retry: Option<syn::Expr>,
+    /// Opt-in MCP tool exposure (issue #597). Parsed from `#[workflow(mcp)]`
+    /// or `#[workflow(mcp = true)]`. Only sets `WorkflowInfo::mcp` — the
+    /// macro never emits `::autumn_web::` paths.
+    mcp: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -118,6 +122,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
         description: None,
         allow_nondeterministic_apis: false,
         retry: None,
+        mcp: false,
     };
 
     syn::meta::parser(|meta| {
@@ -264,12 +269,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             result.batch = Some(BatchArgs { key_expr, max_size, max_wait });
             Ok(())
         } else if meta.path.is_ident("allow_nondeterministic_apis") {
-            if meta.input.peek(syn::Token![=]) {
-                let value: syn::LitBool = meta.value()?.parse()?;
-                result.allow_nondeterministic_apis = value.value;
-            } else {
-                result.allow_nondeterministic_apis = true;
-            }
+            result.allow_nondeterministic_apis = crate::attr_util::parse_bool_flag(&meta)?;
             Ok(())
         } else if meta.path.is_ident("max_input_bytes") {
             let value: LitStr = meta.value()?.parse()?;
@@ -307,9 +307,12 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             let value: syn::Expr = meta.value()?.parse()?;
             result.retry = Some(value);
             Ok(())
+        } else if meta.path.is_ident("mcp") {
+            result.mcp = crate::attr_util::parse_bool_flag(&meta)?;
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, or `allow_nondeterministic_apis`",
+                "unsupported attribute: expected `execution_timeout`, `sla`, `concurrency`, `debounce`, `batch`, `max_input_bytes`, `owner`, `runbook`, `severity`, `description`, `retry`, `mcp`, or `allow_nondeterministic_apis`",
             ))
         }
     })
@@ -581,6 +584,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .as_deref()
         .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
 
+    let mcp = attrs.mcp;
+    let mcp_expr = quote! { #mcp };
+
     quote! {
         #warnings_tokens
         #input_fn
@@ -609,6 +615,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 output_schema: ::std::option::Option::None,
                 error_schema: ::std::option::Option::None,
                 retry_policy: #retry_policy_expr,
+                mcp: #mcp_expr,
             }
         }
 

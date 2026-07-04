@@ -11905,6 +11905,7 @@ mod tests {
     #[test]
     fn handler_registry_indexes_by_name() {
         let wf = WorkflowInfo {
+            mcp: false,
             name: "onboarding",
             module: "app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

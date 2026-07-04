@@ -300,6 +300,7 @@ fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn)
         output_schema: None,
         error_schema: None,
         retry_policy: None,
+        mcp: false,
     }
 }
 

@@ -7,6 +7,7 @@
 use proc_macro::TokenStream;
 
 mod activity;
+mod attr_util;
 mod collect;
 mod dag;
 pub(crate) mod determinism_lint;

@@ -255,6 +255,7 @@ fn wf_info(
     retry_policy: Option<RetryPolicy>,
 ) -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name,
         module: "workflow_retry_tests",
         handler,
