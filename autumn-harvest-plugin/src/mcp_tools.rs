@@ -140,26 +140,61 @@ pub fn update_input_schema_component(workflow: &str, update: &str) -> String {
 
 /// Select the mcp-flagged workflows and attach their mcp-flagged updates.
 ///
-/// Pure: no I/O, no state. Workflows are returned sorted by name; duplicate
-/// workflow registrations keep the first and log a warning; updates whose
-/// `workflow` does not match any mcp-enabled workflow are ignored (they may
-/// belong to a non-exposed workflow, which is not an error).
+/// Pure: no I/O, no state. Workflows are returned sorted by name; updates
+/// whose `workflow` does not match any mcp-enabled workflow are ignored
+/// (they may belong to a non-exposed workflow, which is not an error).
+///
+/// **Duplicate workflow-name resolution matches the runtime exactly.**
+/// `HandlerRegistry::with_state_and_telemetry` collapses the builder's
+/// `Vec<WorkflowInfo>` into a `HashMap<String, WorkflowInfo>` via
+/// `.collect()`, so when the same workflow name is registered more than
+/// once, the *last* registration in the vec is the one `start_workflow`
+/// actually executes against. An earlier version of this function filtered
+/// to `mcp`-flagged entries and kept the *first* same-named descriptor
+/// (first-wins) -- so `.workflows([foo.with_mcp(), foo])` (a second,
+/// non-`mcp` `foo` registered afterward) would still expose MCP tools for
+/// `foo` using the *first* entry's schema/description, even though the
+/// runtime's last-wins `HashMap` resolves `foo` to the second, non-`mcp`
+/// `WorkflowInfo` -- a tool surface advertising a workflow the runtime would
+/// not actually execute that way. Fixed by resolving the same last-wins
+/// `HashMap` collapse *before* filtering by `mcp`, so tool exposure and
+/// schema derivation always read the exact `WorkflowInfo` the runtime will
+/// execute.
 #[must_use]
 pub fn collect_descriptors(
     workflows: &[WorkflowInfo],
     updates: &[UpdateHandlerInfo],
 ) -> Vec<McpWorkflowDescriptor> {
+    let mut name_counts: HashMap<&str, u32> = HashMap::new();
+    let mut effective: HashMap<&str, &WorkflowInfo> = HashMap::new();
+    for w in workflows {
+        *name_counts.entry(w.name).or_insert(0) += 1;
+        // Last-wins, mirroring `workflows.into_iter().map(|w| (w.name,
+        // w)).collect::<HashMap<_, _>>()` in `HandlerRegistry`.
+        effective.insert(w.name, w);
+    }
+    for (name, count) in &name_counts {
+        if *count > 1 {
+            tracing::warn!(
+                workflow = %name,
+                registrations = count,
+                "workflow name registered more than once; the runtime executes the LAST \
+                 registration (HashMap last-wins) and mcp tool exposure resolves to that \
+                 same effective WorkflowInfo"
+            );
+        }
+    }
+    let mut names: Vec<&str> = effective.keys().copied().collect();
+    names.sort_unstable();
+
     let mut descriptors: Vec<McpWorkflowDescriptor> = Vec::new();
     let mut seen_operation_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    for info in workflows.iter().filter(|w| w.mcp) {
-        if descriptors.iter().any(|d| d.name == info.name) {
-            tracing::warn!(
-                workflow = info.name,
-                "duplicate mcp workflow registration; keeping the first"
-            );
-            continue;
-        }
+    for info in names
+        .into_iter()
+        .map(|name| effective[name])
+        .filter(|w| w.mcp)
+    {
         // A debounced or batched start defers admission (the scanner fires
         // it later) and returns 202 Accepted with no execution_id yet -- but
         // every generated tool (start_{wf} included) promises a durable
@@ -1231,6 +1266,47 @@ mod tests {
             "the first-registered workflow (with its update) must be kept; the colliding \
              sibling excluded entirely"
         );
+    }
+
+    /// Code-review regression test (issue #597, PR #908): duplicate
+    /// workflow-name resolution must match `HandlerRegistry`'s runtime
+    /// `HashMap<String, WorkflowInfo>` last-wins collapse. A workflow
+    /// registered first with `mcp` and again afterward *without* `mcp` must
+    /// NOT be exposed -- the runtime executes the later, non-mcp
+    /// registration, so exposing tools derived from the first would
+    /// advertise a workflow the runtime does not actually run that way.
+    #[test]
+    fn collect_descriptors_resolves_duplicate_names_last_wins_like_the_runtime_hashmap() {
+        let descriptors = collect_descriptors(&[wf("foo", true), wf("foo", false)], &[]);
+        assert!(
+            descriptors.is_empty(),
+            "the runtime's last-wins HashMap resolves 'foo' to the non-mcp registration; \
+             mcp tools must not be exposed for it, got: {descriptors:?}"
+        );
+    }
+
+    /// The reverse direction: a workflow registered first without `mcp`,
+    /// then again with `mcp` (and a schema) -- the last registration wins at
+    /// runtime, so tools must be exposed using its schema/description.
+    #[test]
+    fn collect_descriptors_duplicate_last_registration_with_mcp_and_schema_is_exposed() {
+        let descriptors = collect_descriptors(
+            &[
+                wf("foo", false),
+                wf("foo", true)
+                    .with_description("second registration")
+                    .with_input_schema_fn(order_input_schema),
+            ],
+            &[],
+        );
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].name, "foo");
+        assert_eq!(
+            descriptors[0].description.as_deref(),
+            Some("second registration"),
+            "must reflect the LAST registration's WorkflowInfo, matching runtime resolution"
+        );
+        assert_eq!(descriptors[0].input_schema, Some(order_input_schema()));
     }
 
     #[test]
