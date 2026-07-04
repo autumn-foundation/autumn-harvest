@@ -150,6 +150,8 @@ pub fn collect_descriptors(
     updates: &[UpdateHandlerInfo],
 ) -> Vec<McpWorkflowDescriptor> {
     let mut descriptors: Vec<McpWorkflowDescriptor> = Vec::new();
+    let mut seen_operation_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for info in workflows.iter().filter(|w| w.mcp) {
         if descriptors.iter().any(|d| d.name == info.name) {
             tracing::warn!(
@@ -192,15 +194,66 @@ pub fn collect_descriptors(
             });
         }
         wf_updates.sort_by(|a, b| a.name.cmp(&b.name));
-        descriptors.push(McpWorkflowDescriptor {
+        let candidate = McpWorkflowDescriptor {
             name: info.name.to_string(),
             description: info.description.map(ToString::to_string),
             input_schema: info.input_schema.map(|f| f()),
             updates: wf_updates,
-        });
+        };
+        // Two differently-named workflows (or a workflow and a sibling's
+        // update) can still generate the SAME operation id -- e.g. workflow
+        // "invoice_status" -> start_invoice_status (its start tool) collides
+        // with workflow "start_invoice" -> start_invoice_status (its status
+        // tool). autumn-web's tool derivation keeps only the first
+        // registration and silently drops later duplicates, so an unchecked
+        // collision would make one flagged workflow quietly lose a tool from
+        // tools/list/tools/call while its direct HTTP route still exists.
+        // Exclude the colliding workflow entirely (first-seen wins, matching
+        // the duplicate-registration precedent above) rather than ship a
+        // partial tool set.
+        if let Some(colliding_id) = tool_operation_ids(&candidate)
+            .into_iter()
+            .find(|id| seen_operation_ids.contains(id))
+        {
+            tracing::warn!(
+                workflow = info.name,
+                operation_id = %colliding_id,
+                "generated mcp tool name collides with an already-registered tool; excluding \
+                 this workflow from mcp_tools() exposure (rename the workflow or update to \
+                 avoid the naming collision)"
+            );
+            continue;
+        }
+        seen_operation_ids.extend(tool_operation_ids(&candidate));
+        descriptors.push(candidate);
     }
     descriptors.sort_by(|a, b| a.name.cmp(&b.name));
     descriptors
+}
+
+/// The full set of MCP operation ids one workflow descriptor's tool set
+/// (start/status/signal/watch plus one per attached update) would register.
+/// Operation ids are independent of the mount prefix, so this can be
+/// computed directly from a [`McpWorkflowDescriptor`] without building the
+/// full [`ToolRouteSpec`] list. Kept in sync by hand with the `operation_id`
+/// fields [`tool_route_specs`] assigns below — used by
+/// [`collect_descriptors`]'s cross-workflow name-collision check, which runs
+/// before a descriptor's specs ever get built.
+fn tool_operation_ids(descriptor: &McpWorkflowDescriptor) -> Vec<String> {
+    let wf = &descriptor.name;
+    let mut ids = vec![
+        format!("start_{wf}"),
+        format!("{wf}_status"),
+        format!("signal_{wf}"),
+    ];
+    ids.extend(
+        descriptor
+            .updates
+            .iter()
+            .map(|u| format!("{wf}_update_{}", u.name)),
+    );
+    ids.push(format!("{wf}_watch"));
+    ids
 }
 
 /// Expand one workflow descriptor into its full tool-route spec set:
@@ -1131,6 +1184,52 @@ mod tests {
             names,
             vec!["plain_flow"],
             "debounced/batched workflows must be excluded, plain ones kept"
+        );
+    }
+
+    /// Code-review regression test (issue #597, PR #908): two differently
+    /// named workflows can still generate the same MCP operation id --
+    /// `invoice_status`'s start tool (`start_invoice_status`) collides with
+    /// `start_invoice`'s status tool (also `start_invoice_status`).
+    /// autumn-web's tool derivation keeps only the first registration and
+    /// silently drops the rest, so an unchecked collision would make one
+    /// exposed workflow quietly lose a tool. The first-seen workflow must be
+    /// kept in full; the colliding one must be excluded entirely (not
+    /// partially exposed with a missing tool).
+    #[test]
+    fn collect_descriptors_excludes_workflows_with_colliding_generated_tool_names() {
+        let descriptors = collect_descriptors(
+            &[wf("invoice_status", true), wf("start_invoice", true)],
+            &[],
+        );
+
+        let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["invoice_status"],
+            "the first-registered workflow must be kept; the colliding one excluded entirely"
+        );
+    }
+
+    /// A workflow whose own update-derived operation id collides with
+    /// another workflow's core tool name must also be excluded, not just
+    /// workflow-vs-workflow collisions.
+    #[test]
+    fn collect_descriptors_excludes_workflows_whose_update_id_collides() {
+        // Workflow "a" with an update named "watch" generates the operation
+        // id "a_update_watch"; workflow "a_update" generates the same id for
+        // its own watch tool ("{wf}_watch" = "a_update_watch").
+        let descriptors = collect_descriptors(
+            &[wf("a", true), wf("a_update", true)],
+            &[upd("watch", "a", true)],
+        );
+
+        let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a"],
+            "the first-registered workflow (with its update) must be kept; the colliding \
+             sibling excluded entirely"
         );
     }
 

@@ -49,6 +49,14 @@ exposure (with a `tracing::warn!`), even when `mcp` is set: a deferred start
 can return `202 Accepted` with no `execution_id` yet, which every generated
 tool's "durable handle immediately" contract depends on.
 
+Generated tool names can collide across two differently-named workflows
+(e.g. workflow `invoice_status`'s start tool, `start_invoice_status`, is the
+same string as workflow `start_invoice`'s status tool, `start_invoice_status`).
+autumn-web's tool derivation silently keeps only the first registration on a
+name collision, so a colliding workflow (whichever loses the tiebreak) is
+**excluded** from MCP exposure entirely (`tracing::warn!`), rather than
+shipped with a tool quietly missing from `tools/list`.
+
 ## Generated tool set (per workflow `foo`, mcp update `bar`)
 
 | Tool (operation id) | Verb + route | Arguments | Semantics |
