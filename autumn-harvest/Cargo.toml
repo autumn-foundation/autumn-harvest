@@ -12,6 +12,7 @@ keywords = ["workflow", "durable", "postgres", "orchestration", "autumn"]
 categories = ["asynchronous", "database"]
 
 [features]
+visualizer = []
 default = ["db", "unified-dag-execution"]
 unified-dag-execution = ["autumn-harvest-macros/unified-dag-execution"]
 db = [
