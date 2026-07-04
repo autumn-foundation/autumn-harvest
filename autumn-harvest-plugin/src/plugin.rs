@@ -261,6 +261,14 @@ impl HarvestPlugin {
     }
 }
 
+/// Whether the generated MCP tool routes are about to be registered with no
+/// route-level auth applied (issue #597, PR #908 hardening). Pure so the
+/// decision is unit-testable without capturing `tracing` output.
+#[cfg(feature = "mcp")]
+const fn mcp_tools_unprotected(mcp_tools_enabled: bool, has_tool_middleware: bool) -> bool {
+    mcp_tools_enabled && !has_tool_middleware
+}
+
 impl Plugin for HarvestPlugin {
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
@@ -283,6 +291,25 @@ impl Plugin for HarvestPlugin {
         // closed until `on_startup` installs the runtime.
         #[cfg(feature = "mcp")]
         let mcp_routes = if mcp_tools_enabled {
+            // Codex review (PR #908, P1): `HarvestPlugin` cannot detect or
+            // intercept `AppBuilder::secure_mcp(...)` -- that's configured on
+            // the outer app builder, after this `Plugin::build` call returns
+            // -- so there is no way to *guarantee* these routes are
+            // protected. `secure_mcp` only gates the `/mcp` JSON-RPC
+            // envelope, not a generated tool route's own direct HTTP path
+            // (these are registered via `AppBuilder::routes`, not `nest`).
+            // Surface the gap loudly at startup instead of leaving it silent.
+            if mcp_tools_unprotected(mcp_tools_enabled, mcp_tool_middleware.is_some()) {
+                tracing::warn!(
+                    "HarvestPlugin::mcp_tools() is enabled with no HarvestPlugin::api_with_auth(..) \
+                     configured -- the generated start_/signal_/update_ tool routes are reachable \
+                     UNAUTHENTICATED at their own HTTP path, even if the app also configures \
+                     autumn-web's secure_mcp(...) (which only gates the /mcp JSON-RPC envelope, not \
+                     these routes' direct paths). Configure HarvestPlugin::api_with_auth(path, mw) \
+                     to protect the generated tool routes, or disregard this warning if \
+                     unauthenticated access is intentional (e.g. local development)."
+                );
+            }
             let prefix =
                 crate::mcp_tools::tools_prefix(api_path.as_deref(), mcp_tools_prefix.as_deref());
             let descriptors = crate::mcp_tools::collect_descriptors(
@@ -1005,6 +1032,30 @@ mod tests {
 
         assert_eq!(plugin.api_path.as_deref(), Some("/api"));
         assert!(plugin.api_middleware.is_some());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn harvest_plugin_api_with_auth_also_sets_mcp_tool_middleware() {
+        let plugin =
+            HarvestPlugin::new().api_with_auth("/api", autumn_web::auth::RequireAuth::new("test"));
+
+        assert!(
+            plugin.mcp_tool_middleware.is_some(),
+            "api_with_auth must configure the same layer for generated MCP tool routes"
+        );
+    }
+
+    /// Regression test (issue #597, PR #908 review): `mcp_tools()` combined
+    /// with no `api_with_auth(..)` must be flagged so the generated tool
+    /// routes' unauthenticated-at-their-own-path gap is never silent.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_tools_unprotected_flags_enabled_without_middleware_only() {
+        assert!(mcp_tools_unprotected(true, false));
+        assert!(!mcp_tools_unprotected(true, true));
+        assert!(!mcp_tools_unprotected(false, false));
+        assert!(!mcp_tools_unprotected(false, true));
     }
 
     #[test]
