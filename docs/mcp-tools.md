@@ -58,10 +58,26 @@ tool's "durable handle immediately" contract depends on.
 Generated tool names can collide across two differently-named workflows
 (e.g. workflow `invoice_status`'s start tool, `start_invoice_status`, is the
 same string as workflow `start_invoice`'s status tool, `start_invoice_status`).
-autumn-web's tool derivation silently keeps only the first registration on a
-name collision, so a colliding workflow (whichever loses the tiebreak) is
-**excluded** from MCP exposure entirely (`tracing::warn!`), rather than
-shipped with a tool quietly missing from `tools/list`.
+autumn-web's tool derivation keeps only the first registration on a name
+collision and logs a `tracing::warn!` (never silent, but it *is* a partial
+tool set — the losing registration's other, non-colliding tools would still
+ship). Harvest's own collision check runs one step earlier and is stricter:
+a colliding workflow (whichever loses the tiebreak, by registration order) is
+**excluded** from MCP exposure entirely (its own `tracing::warn!`), rather
+than partially shipped with one tool quietly missing from `tools/list`.
+
+This Harvest-side check only compares Harvest-generated operation ids
+against each other — it has no visibility into MCP tool names the host app
+registers itself (via its own `AppBuilder::routes(...)` calls, before or
+after `HarvestPlugin::build()` runs), since `AppBuilder` exposes no accessor
+to introspect already- or later-registered routes. If a generated Harvest
+tool name collides with an unrelated app-registered tool name, that
+collision falls through to autumn-web's own `derive_tools` fallback above
+(first-registered-in-the-final-route-list wins, warned, not silent) instead
+of Harvest's whole-workflow exclusion. Avoid this by choosing workflow/update
+names that don't collide with your app's other MCP tool names, or by
+checking your app's full route list for `start_*`/`*_status`/`signal_*`/
+`*_watch`/`*_update_*` name clashes before enabling `mcp_tools()`.
 
 ## Generated tool set (per workflow `foo`, mcp update `bar`)
 
