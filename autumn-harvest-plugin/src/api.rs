@@ -21028,6 +21028,20 @@ pub(crate) async fn admit_update(
         Err(e) => return e.into_response(),
     };
 
+    // Fail closed if the runtime isn't installed yet, rather than silently
+    // skipping the validator check below. `install_storage_pool` runs before
+    // `install(runtime)` during plugin startup (with a genuine `.await` --
+    // the boot-time admission-gate load -- in between), so a request can
+    // reach this handler with a working storage pool while `runtime()` still
+    // errors. Without this check, that narrow startup window would let a
+    // validator-bearing update slip through unvalidated into durable history
+    // instead of being rejected at the edge (code-review finding, PR #908).
+    // Mirrors `update_with_start_workflow`'s identical hard requirement.
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
     // Run the registered update handler's validator (if any) before
     // admitting -- mirrors the validator check `update_with_start_workflow_execution`
     // already runs, so an invalid payload is rejected at the edge instead of
@@ -21036,7 +21050,6 @@ pub(crate) async fn admit_update(
     // different workflows may register update handlers with the same name.
     let execution_for_validation = load_execution(&mut conn, exec_id).await;
     if let Ok(execution) = &execution_for_validation
-        && let Ok(runtime) = api_state.runtime()
         && let Some(update_info) = runtime
             .registry
             .update_handlers
@@ -24002,6 +24015,118 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Code-review regression test (issue #597, PR #908): `Plugin::build`'s
+    /// `start_harvest_runtime` calls `install_storage_pool` before an
+    /// `.await` (the boot-time admission-gate load) that yields control,
+    /// then calls `install(runtime)` only afterward -- so a request can
+    /// reach `admit_update` with a working storage pool while
+    /// `api_state.runtime()` still errors. Reproduce that exact state
+    /// directly (storage pool installed, runtime never installed) and
+    /// assert `admit_update` fails closed instead of silently skipping the
+    /// validator check and admitting the update anyway.
+    #[tokio::test]
+    async fn admit_update_fails_closed_when_storage_pool_ready_but_runtime_not_installed() {
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let exec_id = ExecutionId::new();
+        let mut conn =
+            <diesel_async::AsyncPgConnection as diesel_async::AsyncConnection>::establish(
+                &database_url,
+            )
+            .await
+            .expect("failed to connect to admit_update test database");
+        autumn_harvest::start_or_load_workflow_execution_with_metrics(
+            &mut conn,
+            autumn_harvest::StartWorkflowParams {
+                workflow_name: "admit_update_no_runtime",
+                workflow_id: "admit-update-no-runtime-1",
+                exec_id,
+                input: serde_json::json!({ "ok": true }),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+            },
+            None,
+        )
+        .await
+        .expect("workflow execution should be seeded");
+
+        // Deliberately install ONLY the storage pool -- never call
+        // `state.install(runtime)` -- to reproduce the plugin-startup
+        // window described above.
+        let state = HarvestApiState::new();
+        state.install_storage_pool(crate::state::HarvestDbPool::single(
+            workflow_result_test_pool(&database_url),
+        ));
+
+        let response = admit_update(
+            Extension(state),
+            Path((exec_id.to_string(), "some_update".to_string())),
+            Query(AdmitUpdateQuery {
+                wait: None,
+                timeout_secs: None,
+            }),
+            Json(AdmitUpdateRequest {
+                input: serde_json::json!({}),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "admit_update must fail closed when the runtime isn't installed yet, not silently \
+             admit"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            body_text.contains("harvest runtime is not started"),
+            "expected the runtime-not-started error, got: {body_text}"
+        );
+
+        // And the update must NOT have been durably admitted -- no
+        // UpdateAdmitted event should exist for this execution.
+        let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+            .await
+            .expect("history should load");
+        assert!(
+            !history.events.iter().any(|e| matches!(
+                e,
+                autumn_harvest::event::WorkflowEvent::UpdateAdmitted { .. }
+            )),
+            "the update must not have been durably admitted while the runtime was unavailable"
+        );
     }
 
     fn workflow_result_test_pool(database_url: &str) -> autumn_harvest::worker::DbPool {
