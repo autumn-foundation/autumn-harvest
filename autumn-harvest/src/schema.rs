@@ -82,6 +82,14 @@ diesel::table! {
         /// (manual start, signal-with-start, child workflows, etc.). Metadata only —
         /// never affects replay or carryover.
         origin -> Nullable<Text>,
+        /// Wall-clock of the most recent replay-non-determinism block observation
+        /// (issue #603). NULL = not blocked. State stays RUNNING while blocked.
+        nd_blocked_at -> Nullable<Timestamptz>,
+        /// Divergence error string from the most recent blocked cycle (issue #603).
+        nd_block_reason -> Nullable<Text>,
+        /// Consecutive block entries for the current divergence incident (issue
+        /// #603). Drives the re-dispatch backoff; reset to 0 on a clean cycle.
+        nd_block_count -> Int4,
     }
 }
 

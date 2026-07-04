@@ -158,7 +158,8 @@ const INIT_SQL: &str = concat!(
     include_str!("../../autumn-harvest/migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
-    )
+    ),
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -669,4 +670,96 @@ async fn reset_on_terminal_source_returns_conflict() {
 
     assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
     assert!(body["message"].as_str().unwrap().contains("terminal"));
+}
+
+/// Regression test (code-review fix, issue #603): resetting a currently
+/// ND-blocked execution (the documented escalation path) must strip the six
+/// replay-non-determinism diagnostic keys from the fork's `search_attrs`
+/// while preserving unrelated business attributes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_strips_stale_nd_diagnostic_search_attrs_from_fork() {
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&url)
+        .await
+        .expect("connect");
+    let (exec_id, _) = seed_execution(&mut conn, "wf-reset-nd-blocked").await;
+    append_marker_events(&mut conn, exec_id, 5).await;
+
+    // Simulate the source being currently ND-blocked: RUNNING, with the block
+    // columns and search_attrs diagnostic stamped, plus one unrelated
+    // business attribute the fork must keep.
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set((
+            harvest_workflow_executions::nd_blocked_at.eq(Some(Utc::now())),
+            harvest_workflow_executions::nd_block_reason.eq(Some(
+                "non-deterministic replay: activity mismatch".to_string(),
+            )),
+            harvest_workflow_executions::nd_block_count.eq(1),
+            harvest_workflow_executions::search_attrs.eq(Some(json!({
+                "failure_cause": "non_determinism",
+                "event_index": 3,
+                "expected": "ActivityScheduled",
+                "actual": "TimerStarted",
+                "workflow_type": "wf-reset-nd-blocked",
+                "build_id": "v2.0.0",
+                "tenant": "acme",
+            }))),
+        ))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/reset"),
+        json!({
+            "reset_to_event_id": 1,
+            "reason": "escalate stuck ND block",
+            "operator_id": "oncall",
+            "signal_reapply": "drop"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "reset response: {body}");
+    let new_exec_id: ExecutionId = body["new_exec_id"]
+        .as_str()
+        .expect("new_exec_id")
+        .parse()
+        .expect("valid new exec id");
+
+    let fork: WorkflowExecution = harvest_workflow_executions::table
+        .find(new_exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .unwrap();
+
+    assert!(
+        fork.nd_blocked_at.is_none(),
+        "fork must not carry the source's nd_blocked_at column"
+    );
+    assert_eq!(fork.nd_block_count, 0);
+
+    let attrs = fork.search_attrs.expect("fork must keep the business attr");
+    assert_eq!(
+        attrs.get("tenant"),
+        Some(&json!("acme")),
+        "unrelated business search attr must survive: {attrs}"
+    );
+    for key in [
+        "failure_cause",
+        "event_index",
+        "expected",
+        "actual",
+        "workflow_type",
+        "build_id",
+    ] {
+        assert!(
+            attrs.get(key).is_none(),
+            "fork must not inherit the stale ND diagnostic key '{key}': {attrs}"
+        );
+    }
 }

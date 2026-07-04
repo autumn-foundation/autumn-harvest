@@ -2141,6 +2141,10 @@ pub struct WorkflowListPage {
     pub next_cursor: Option<String>,
 }
 
+// A parsed query-param bag: each bool is an independent opt-in filter flag
+// (`?sla_breached=true`, `?nd_blocked=true`, ...), not encodable state — a
+// state machine or enums would obscure the 1:1 query-param mapping.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WorkflowFilters {
     pub(crate) limit: i64,
@@ -2165,6 +2169,9 @@ pub(crate) struct WorkflowFilters {
     pub(crate) include_sleeping: bool,
     /// When true, return only executions whose soft SLA has been breached (#487).
     pub(crate) sla_breached: bool,
+    /// When true, return only RUNNING executions currently blocked on replay
+    /// non-determinism (issue #603).
+    pub(crate) nd_blocked: bool,
     /// Only return executions with at least this many recorded events (issue #493).
     pub(crate) min_history_events: Option<u64>,
     /// Sort direction (issue #498). Default: `Desc`.
@@ -4975,6 +4982,9 @@ pub(crate) fn parse_workflow_filters(
             }
             "sla_breached" => {
                 filters.sla_breached = value.trim().eq_ignore_ascii_case("true");
+            }
+            "nd_blocked" => {
+                filters.nd_blocked = value.trim().eq_ignore_ascii_case("true");
             }
             "min_history_events" => {
                 let parsed = value.trim().parse::<u64>().map_err(|_| {
@@ -17776,6 +17786,14 @@ pub(crate) async fn load_workflows(
     if filters.sla_breached {
         query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
     }
+    if filters.nd_blocked {
+        // Only RUNNING rows: operator cancel/terminate escape hatches
+        // intentionally leave the marker in place, and a closed run is no
+        // longer "blocked" (issue #603).
+        query = query
+            .filter(harvest_workflow_executions::nd_blocked_at.is_not_null())
+            .filter(harvest_workflow_executions::state.eq("RUNNING"));
+    }
     if let Some(min_events) = filters.min_history_events {
         // Correlated subquery: filter to executions with at least `min_events`
         // recorded events. No schema migration is required — the count is
@@ -17937,6 +17955,13 @@ pub(crate) async fn load_stalled_workflows(
     // stalled rows because this loader bypasses `load_workflows`.
     if filters.sla_breached {
         query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+    }
+    // Honor the ND-block filter on the stalled path too (issue #603), for the
+    // same bypass reason as sla_breached above.
+    if filters.nd_blocked {
+        query = query
+            .filter(harvest_workflow_executions::nd_blocked_at.is_not_null())
+            .filter(harvest_workflow_executions::state.eq("RUNNING"));
     }
     // Honor the time-range and exec-id-prefix filters (issue #498) on the
     // stalled path too: without these, `?no_progress_minutes=N&started_after=…`
@@ -23557,6 +23582,28 @@ mod tests {
         let other = parse_workflow_filters(&pairs(&[("sla_breached", "1")]))
             .expect("sla_breached=1 parses without error");
         assert!(!other.sla_breached);
+    }
+
+    #[test]
+    fn parse_workflow_filters_parses_nd_blocked_flag() {
+        // Absent → false (issue #603).
+        let absent = parse_workflow_filters(&pairs(&[])).expect("empty filters parse");
+        assert!(!absent.nd_blocked);
+
+        // Explicit true (case-insensitive).
+        let on = parse_workflow_filters(&pairs(&[("nd_blocked", "TRUE")]))
+            .expect("nd_blocked=true parses");
+        assert!(on.nd_blocked);
+
+        // Explicit false.
+        let off = parse_workflow_filters(&pairs(&[("nd_blocked", "false")]))
+            .expect("nd_blocked=false parses");
+        assert!(!off.nd_blocked);
+
+        // Any non-"true" value is treated as false, never an error.
+        let other = parse_workflow_filters(&pairs(&[("nd_blocked", "1")]))
+            .expect("nd_blocked=1 parses without error");
+        assert!(!other.nd_blocked);
     }
 
     #[test]

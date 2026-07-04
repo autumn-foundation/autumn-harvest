@@ -874,6 +874,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn author_error_produces_failed_without_nd_details() {
+        // AC3 pin (issue #603): a workflow body's own Err(...) must carry NO
+        // NonDeterministicDetails — it is the worker's signal that the failure
+        // is a legitimate author decision and must stay terminal.
+        let exec_id = ExecutionId::new();
+        let history = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+
+        let outcome = run_workflow(exec_id, history, failing_workflow, Value::Null).await;
+
+        match outcome {
+            WorkflowOutcome::Failed {
+                non_deterministic_details,
+                ..
+            } => {
+                assert!(
+                    non_deterministic_details.is_none(),
+                    "an author Err must not be classified as engine non-determinism"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_divergence_produces_failed_with_nd_details() {
+        // AC3 pin (issue #603): an engine-detected replay divergence must carry
+        // structured NonDeterministicDetails so the worker can block the
+        // execution non-terminally instead of failing it.
+        let exec_id = ExecutionId::new();
+        // History recorded a timer, but the workflow schedules an activity —
+        // a genuine divergence surfaced by the fallible match path.
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: crate::types::TimerId::new("t1"),
+                duration_secs: 60,
+            },
+        ];
+
+        let outcome = run_workflow(exec_id, history, activity_workflow, Value::Null).await;
+
+        match outcome {
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details,
+            } => {
+                assert!(
+                    error.contains("non-deterministic replay"),
+                    "unexpected error: {error}"
+                );
+                let details = non_deterministic_details
+                    .expect("engine divergence must carry NonDeterministicDetails");
+                // `expected` carries what the code requested this cycle;
+                // `actual` carries what the recorded history holds.
+                assert_eq!(
+                    details.expected.as_deref(),
+                    Some("ActivityScheduled(send_email)")
+                );
+                assert_eq!(details.actual.as_deref(), Some("TimerStarted"));
+                assert!(details.event_index.is_some());
+            }
+            other => panic!("expected Failed(non-determinism), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn executor_suspends_on_new_activity() {
         let exec_id = ExecutionId::new();
         let input = serde_json::json!({"to": "alice@example.com"});

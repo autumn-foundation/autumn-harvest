@@ -295,7 +295,9 @@ pub enum HarvestError {
     /// - The key is empty or longer than 64 characters.
     /// - The key contains characters outside `[a-zA-Z0-9_-]`.
     /// - The key is engine-reserved (`exec_id`, `workflow_name`, `shard_id`,
-    ///   `status`, `run_id`) or starts with the `_harvest` prefix.
+    ///   `status`, `run_id`, or the six replay-non-determinism diagnostic keys
+    ///   `failure_cause`/`event_index`/`expected`/`actual`/`workflow_type`/
+    ///   `build_id`, issue #603) or starts with the `_harvest` prefix.
     /// - The value is a JSON object or array (only primitives and null allowed).
     #[error("invalid search attribute: {reason}")]
     InvalidSearchAttribute {

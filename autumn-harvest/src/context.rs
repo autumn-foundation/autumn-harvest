@@ -941,8 +941,22 @@ impl std::future::Future for RaceFirstFut {
 
 const SEARCH_ATTR_KEY_MAX_LEN: usize = 64;
 
-const RESERVED_SEARCH_ATTR_KEYS: &[&str] =
-    &["exec_id", "workflow_name", "shard_id", "status", "run_id"];
+const RESERVED_SEARCH_ATTR_KEYS: &[&str] = &[
+    "exec_id",
+    "workflow_name",
+    "shard_id",
+    "status",
+    "run_id",
+    // The six replay-non-determinism diagnostic keys (issue #603): reserved so
+    // a workflow author's own business attribute can never collide with, and
+    // be silently deleted by, `nd_search_attrs_clear_patch`'s recovery clear.
+    "failure_cause",
+    "event_index",
+    "expected",
+    "actual",
+    "workflow_type",
+    "build_id",
+];
 
 const RESERVED_SEARCH_ATTR_PREFIX: &str = "_harvest";
 
@@ -2193,7 +2207,9 @@ impl WorkflowContext {
     ///
     /// - Non-empty, ≤ 64 characters, matching `[a-zA-Z0-9_-]+`.
     /// - Not one of the reserved engine keys: `exec_id`, `workflow_name`,
-    ///   `shard_id`, `status`, `run_id`.
+    ///   `shard_id`, `status`, `run_id`, `failure_cause`, `event_index`,
+    ///   `expected`, `actual`, `workflow_type`, `build_id` (the last six are
+    ///   the replay-non-determinism diagnostic keys, issue #603).
     /// - Must not start with the `_harvest` prefix.
     ///
     /// # Value constraints
@@ -10446,6 +10462,31 @@ mod tests {
             let err = ctx
                 .upsert_search_attrs([(key.to_string(), Some(Value::String("x".to_string())))])
                 .expect_err(&format!("reserved key '{key}' must be rejected"));
+            assert!(
+                matches!(err, HarvestError::InvalidSearchAttribute { .. }),
+                "key '{key}': expected InvalidSearchAttribute"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_search_attrs_rejects_nd_diagnostic_keys() {
+        // Issue #603 fix: a workflow author must never be able to write one of
+        // the six replay-non-determinism diagnostic key names — doing so would
+        // let `nd_search_attrs_clear_patch`'s recovery clear silently delete
+        // the author's own business data on an unrelated ND-block recovery.
+        let ctx = WorkflowContext::new_test();
+        for key in &[
+            "failure_cause",
+            "event_index",
+            "expected",
+            "actual",
+            "workflow_type",
+            "build_id",
+        ] {
+            let err = ctx
+                .upsert_search_attrs([(key.to_string(), Some(Value::String("x".to_string())))])
+                .expect_err(&format!("ND diagnostic key '{key}' must be rejected"));
             assert!(
                 matches!(err, HarvestError::InvalidSearchAttribute { .. }),
                 "key '{key}': expected InvalidSearchAttribute"

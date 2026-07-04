@@ -357,6 +357,18 @@ pub const METRIC_WORKFLOW_RETRIES: &str = "harvest.workflow.retries";
 /// Labeled by `workflow` (workflow name) and `build_id`.
 pub const METRIC_WORKFLOW_NON_DETERMINISM: &str = "harvest.workflow.non_determinism";
 
+/// Counter: incremented each time an execution enters (or re-enters) the
+/// non-terminal replay-non-determinism blocked state (issue #603).
+///
+/// A single incident emits once per blocked dispatch attempt, so the rate
+/// reflects how hard the divergent cohort is re-hitting the divergence; the
+/// execution row's `nd_block_count` column disambiguates re-blocks from fresh
+/// incidents.
+///
+/// Labeled by `workflow` (workflow name) and `queue` (task queue name).
+/// `execution.id` stays span-only per the cardinality rule (ADR-0001 §7).
+pub const METRIC_WORKFLOW_ND_BLOCKED: &str = "harvest.workflow.nondeterministic_block";
+
 /// Counter: incremented each time a workflow execution is paused by an operator
 /// or the bounded-pause auto-resume scanner (issue #383).
 ///
@@ -1059,6 +1071,17 @@ pub trait MetricsRecorder: Send + Sync {
     /// A workflow replay non-determinism (divergence) failure was detected.
     fn record_workflow_non_determinism(&self, workflow_name: &str, build_id: &str) {
         let _ = (workflow_name, build_id);
+    }
+
+    /// An execution entered (or re-entered) the non-terminal
+    /// replay-non-determinism blocked state (issue #603).
+    ///
+    /// Emitted once per blocked dispatch attempt — never on the terminal
+    /// failure path, which a blocked execution deliberately does not take.
+    /// Maps to [`METRIC_WORKFLOW_ND_BLOCKED`].
+    /// Per ADR-0001 §7, `execution.id` must never be a label here.
+    fn record_workflow_nondeterministic_block(&self, workflow_name: &str, queue: &str) {
+        let _ = (workflow_name, queue);
     }
 
     /// Gauge snapshot: `count` in-flight executions for `workflow_name` whose
@@ -1918,6 +1941,10 @@ mod tests {
             "harvest.workflow.non_determinism"
         );
         assert_eq!(
+            METRIC_WORKFLOW_ND_BLOCKED,
+            "harvest.workflow.nondeterministic_block"
+        );
+        assert_eq!(
             METRIC_WORKFLOW_TASK_TIMEOUT,
             "harvest.workflow.task_timeout"
         );
@@ -2423,6 +2450,7 @@ mod tests {
         rec.record_schedule_skipped("workflow", "daily_digest", "paused");
         rec.record_retention_tick(0, 100, 50, 0.02);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
+        rec.record_workflow_nondeterministic_block("onboarding", "default");
         rec.record_schedule_to_start("default", 1.5);
         rec.record_queue_oldest_pending_age("default", 30.0);
         rec.record_worker_slots(SlotType::Workflow, 3, 5);

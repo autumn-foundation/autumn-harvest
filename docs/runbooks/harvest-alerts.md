@@ -563,17 +563,29 @@ Escalate to the platform owner if:
 
 ## harvest_workflow_non_determinism
 
+Since issue #603 an engine-detected replay divergence **blocks the affected
+execution non-terminally** instead of failing it: the run stays `RUNNING`, no
+`WorkflowFailed` event is written, and the workflow task is re-dispatched with
+a capped-exponential backoff (5s doubling to a 300s ceiling, indefinitely).
+Rolling back or fixing the offending build resumes the whole cohort with **no
+per-execution operator action**. Full playbook:
+`docs/runbooks/nondeterminism-block.md`.
+
 ### Triage steps
 
-1. Locate failed executions by querying the management API:
+1. Locate blocked executions by querying the management API:
    ```bash
-   GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism
+   GET /api/harvest/workflows?nd_blocked=true
    ```
-2. Fetch the detailed search attributes of the failed execution to identify:
-   - `expected` (expected event/command generated during execution)
-   - `actual` (actual event/command recorded in the history)
+   (Executions that terminally failed under the pre-#603 behavior remain
+   discoverable via `GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism`.)
+2. Read each row's divergence diagnostic: `nd_block_reason`, `nd_block_count`,
+   `nd_blocked_at` on the execution, plus the structured fields in
+   `search_attrs`:
+   - `expected` (the event/command the current code generated)
+   - `actual` (the event recorded in the history)
    - `event_index` (index where the divergence occurred)
-   - `build_id` (the build ID of the running worker when it failed)
+   - `build_id` (the build ID of the worker that observed the divergence)
 3. Check recent deployment history to see if a new release was shipped without proper version gating or routing protection.
 4. Run replay tests on the workflow using the exported history to reproduce the non-determinism error.
 
@@ -585,13 +597,13 @@ Escalate to the platform owner if:
 
 ### False positives
 
-None. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible.
+None. A non-determinism mismatch means the workflow code generated a different sequence of commands/actions than what was recorded in history, making replay safety impossible. Author `Err(...)` returns are never classified as divergence — they still fail terminally.
 
 ### Safe actions
 
-1. Roll back the offending deployment immediately to the last known-good version.
+1. Roll back the offending deployment immediately to the last known-good version. Blocked executions resume automatically on their next backoff re-dispatch (within ≤300s) — confirm `nd_blocked_at` clears and the cohort progresses.
 2. If the deployment must stay, declare build compatibility appropriately or use version gates.
-3. For individual executions blocked in `FAILED` state due to non-determinism, once the code is fixed or rolled back, they can be reset to the pre-divergence event index using the reset API:
+3. Escalation only — for a history that stays blocked even under the rolled-back build (e.g. the divergent build appended inline events before diverging), reset to the pre-divergence event index:
    ```bash
    POST /api/harvest/workflows/{execution_id}/reset
    ```
@@ -599,7 +611,7 @@ None. A non-determinism mismatch means the workflow code generated a different s
 
 ### Escalation criteria
 
-Escalate immediately to the release owner and the team who shipped the latest version. Replay divergence blocks execution progress for all active workflows of that type, risking data inconsistency.
+Escalate immediately to the release owner and the team who shipped the latest version. Replay divergence blocks execution progress for all active workflows of that type; while no work is destroyed (the block is recoverable), the cohort makes no forward progress until the build is rolled back or fixed.
 
 ## harvest_activity_success_ratio
 

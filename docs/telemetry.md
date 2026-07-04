@@ -245,6 +245,7 @@ metric is emitted in the source code.
 | `harvest.schedule.runs` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, on successful dispatch |
 | `harvest.schedule.skipped` | Counter | `scheduler.rs` — `tick_one_workflow_schedule` / DAG tick, when a run is skipped |
 | `harvest.retention.deleted` | Counter | `retention.rs` — `run_shard_tick`, per tick per shard |
+| `harvest.workflow.nondeterministic_block` | Counter | `worker.rs` — `block_workflow_for_non_determinism`, once per non-terminal replay-divergence block entry (incl. re-blocks); the runtime companion to the `harvest.workflow.non_determinism` detection counter (issue #603) |
 
 ### Label sets
 
@@ -268,6 +269,7 @@ metric is emitted in the source code.
 | `harvest.schedule.runs` | `kind` (`workflow\|dag`), `name` |
 | `harvest.schedule.skipped` | `kind`, `name`, `reason` (`paused\|max_active_runs_reached\|catchup_disabled`) |
 | `harvest.retention.deleted` | `shard` |
+| `harvest.workflow.nondeterministic_block` | `workflow`, `queue` |
 
 **Cardinality rule:** `execution.id` is **never** a metric label. It is
 span-only (see ADR-0001 §4). The `MetricsRecorder` API enforces this by
