@@ -14,6 +14,10 @@ categories = ["asynchronous", "database"]
 [features]
 unified-dag-execution = ["autumn-harvest/unified-dag-execution"]
 webhooks = ["autumn-harvest/db"]
+# MCP tool exposure for #[workflow(mcp)] workflows (issue #597). Enables
+# autumn-web's MCP layer so HarvestPlugin::mcp_tools() can project workflows
+# as start/status/signal/update/watch tools via AppBuilder::mount_mcp.
+mcp = ["autumn-web/mcp"]
 
 
 [dependencies]
@@ -38,7 +42,7 @@ tower = "0.5"
 maud = { version = "0.27", features = ["axum"] }
 
 [dev-dependencies]
-autumn-web = { version = "0.5", features = ["test-support"] }
+autumn-web = { version = "0.5", features = ["test-support", "mcp"] }
 autumn-harvest = { version = "0.4.0", path = "../autumn-harvest", features = ["db", "testing"] }
 tower = "0.5"
 testcontainers = { workspace = true }
@@ -47,3 +51,7 @@ tracing-subscriber = "0.3"
 
 [lints]
 workspace = true
+
+[[example]]
+name = "mcp_tools_quickstart"
+required-features = ["mcp"]

@@ -7,6 +7,7 @@
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
+use diesel::AsChangeset;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -1141,6 +1142,44 @@ pub async fn record_heartbeat(
     Ok(())
 }
 
+/// Shared "reset a claimed task back to `PENDING` with a future
+/// `scheduled_at`" changeset (code-review cleanup, issue #603): the 7 fields
+/// common to both [`requeue_for_retry`] (activity retry) and
+/// [`requeue_workflow_task_nd_blocked`] (ND-block backoff), previously
+/// duplicated verbatim in both functions.
+///
+/// `treat_none_as_null = true` is required: Diesel's default `AsChangeset`
+/// behavior treats a `None` field as "omit this column from `SET`" rather
+/// than "set it to `NULL`", which would silently stop `worker_id`,
+/// `started_at`, and `last_heartbeat_at` from ever being cleared on requeue
+/// (the pre-refactor code used explicit `.eq(None::<T>)` per column, which
+/// is unaffected by this default and was correct).
+#[derive(AsChangeset)]
+#[diesel(table_name = crate::schema::harvest_task_queue, treat_none_as_null = true)]
+struct PendingRequeueChangeset {
+    state: &'static str,
+    worker_id: Option<String>,
+    started_at: Option<chrono::DateTime<Utc>>,
+    last_heartbeat_at: Option<chrono::DateTime<Utc>>,
+    crash_strikes: i32,
+    scheduled_at: chrono::DateTime<Utc>,
+    error: Option<String>,
+}
+
+impl PendingRequeueChangeset {
+    const fn new(next_run: chrono::DateTime<Utc>, previous_error: String) -> Self {
+        Self {
+            state: "PENDING",
+            worker_id: None,
+            started_at: None,
+            last_heartbeat_at: None,
+            crash_strikes: 0,
+            scheduled_at: next_run,
+            error: Some(previous_error),
+        }
+    }
+}
+
 /// Reset a task to `PENDING` with a future `scheduled_at` for retry.
 ///
 /// # Errors
@@ -1165,21 +1204,14 @@ pub async fn requeue_for_retry(
     use crate::schema::harvest_task_queue::dsl;
 
     let next_run = Utc::now() + delay;
+    let changeset = PendingRequeueChangeset::new(next_run, previous_error.to_string());
 
     let queue_name = diesel::update(
         dsl::harvest_task_queue
             .find(task_id)
             .filter(dsl::state.eq("RUNNING")),
     )
-    .set((
-        dsl::state.eq("PENDING"),
-        dsl::worker_id.eq(None::<String>),
-        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
-        dsl::crash_strikes.eq(0),
-        dsl::scheduled_at.eq(next_run),
-        dsl::error.eq(Some(previous_error)),
-    ))
+    .set(&changeset)
     .returning(dsl::queue_name)
     .get_result::<String>(conn)
     .await
@@ -1200,6 +1232,72 @@ pub async fn requeue_for_retry(
             error = %e,
             "pg_notify failed after retry requeue; task is PENDING and will be claimed on next poll"
         );
+    }
+
+    Ok(())
+}
+
+/// Re-pend an ND-blocked workflow task with a future `scheduled_at` (issue
+/// #603).
+///
+/// Mirrors [`requeue_for_retry`] with four deliberate differences for the
+/// replay-non-determinism block path:
+/// - restricted to `task_type = 'workflow'` rows (defensive — the block path
+///   only ever holds a claimed workflow task);
+/// - clears the sticky affinity columns: the pinned worker is running the
+///   divergent build, so the re-dispatch must be claimable by any worker
+///   (e.g. one already running the rolled-back build);
+/// - clears `wake_requested`: a wake captured mid-cycle must not short-circuit
+///   the backoff — the row is durably `PENDING` and deferred purely by
+///   `scheduled_at` (`claim_task` enforces `scheduled_at <= NOW()`), so signals
+///   arriving while blocked are processed on the next backoff dispatch;
+/// - clears `activity_name`: a stale `'mixed_signal_suspension'` sentinel
+///   (issue #476/#600 timer+signal races) left on the row would otherwise let
+///   `primary_repend_workflow_task_query`'s wake fallback match this
+///   `PENDING`/future-`scheduled_at` row and reset `scheduled_at` to now on
+///   any unrelated wake, silently bypassing the backoff (issue #603 fix).
+///
+/// No `pg_notify`: the task is deliberately not claimable until `scheduled_at`,
+/// so waking pollers early would be pure noise.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::NotFound`] when the task is not a
+/// claimed (`RUNNING`) workflow task, and
+/// [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_workflow_task_nd_blocked(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    delay: Duration,
+    reason: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let next_run = Utc::now() + delay;
+    let changeset = PendingRequeueChangeset::new(next_run, reason.to_string());
+
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING"))
+            .filter(dsl::task_type.eq("workflow")),
+    )
+    .set((
+        changeset,
+        dsl::sticky_worker_id.eq(None::<String>),
+        dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
+        dsl::sticky_timeout.eq(None::<chrono::Duration>),
+        dsl::wake_requested.eq(false),
+        dsl::activity_name.eq(None::<String>),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not a running workflow task"
+        )));
     }
 
     Ok(())
@@ -2286,6 +2384,46 @@ mod tests {
         assert!(sql.contains("sticky_worker_id = NULL"));
         assert!(sql.contains("sticky_until = NULL"));
         assert!(sql.contains("sticky_timeout = NULL"));
+    }
+
+    /// PR-review regression test (Gemini finding): `PendingRequeueChangeset`
+    /// must actually null out `worker_id`/`started_at`/`last_heartbeat_at` in
+    /// the generated SQL, not silently omit them from the `SET` clause.
+    /// Diesel's default `AsChangeset` treats a `None` field as "no update";
+    /// without `treat_none_as_null = true` this test fails with the columns
+    /// missing from the query entirely.
+    #[test]
+    fn pending_requeue_changeset_nulls_out_none_fields_in_generated_sql() {
+        use crate::schema::harvest_task_queue::dsl;
+        use diesel::debug_query;
+        use diesel::pg::Pg;
+
+        let changeset =
+            PendingRequeueChangeset::new(chrono::Utc::now(), "some retryable error".to_string());
+        let query = diesel::update(dsl::harvest_task_queue.filter(dsl::state.eq("RUNNING")))
+            .set(&changeset);
+        let debug = debug_query::<Pg, _>(&query).to_string();
+
+        // With `treat_none_as_null = true`, a `None` field is bound as a SQL
+        // NULL parameter rather than silently omitted from the `SET` clause
+        // (Diesel's default behavior). Assert both: the column is present in
+        // the generated SQL text, and its bound value is `None` (SQL NULL).
+        for column in ["worker_id", "started_at", "last_heartbeat_at"] {
+            assert!(
+                debug.contains(&format!("\"{column}\" = $")),
+                "{column} must appear as a bound column in the SET clause \
+                 (not omitted): {debug}"
+            );
+        }
+        assert!(
+            debug.matches("None").count() >= 3,
+            "worker_id/started_at/last_heartbeat_at must all bind to None (SQL NULL), \
+             not be silently dropped from the query: {debug}"
+        );
+        assert!(debug.contains("\"state\" = "));
+        assert!(debug.contains("\"crash_strikes\" = "));
+        assert!(debug.contains("\"scheduled_at\" = "));
+        assert!(debug.contains("\"error\" = "));
     }
 
     #[test]

@@ -140,7 +140,8 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
     ),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -679,6 +680,98 @@ async fn workflow_list_filter_failure_cause() {
     assert_eq!(status, StatusCode::OK);
     let ids = workflow_ids(&json);
     assert_eq!(ids, vec!["wf-failed-nd".to_string()]);
+}
+
+/// Issue #603: `?nd_blocked=true` returns only RUNNING executions currently
+/// blocked on replay non-determinism. Terminal rows carrying a stale marker
+/// (operator cancel/terminate escape hatches leave it in place) are excluded,
+/// as are healthy RUNNING rows. The block columns surface in the row JSON.
+#[tokio::test]
+async fn workflow_list_filter_nd_blocked() {
+    let (database_url, _container) = setup_single_database().await;
+    let pool = build_pool(&database_url);
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    // A RUNNING execution blocked on divergence.
+    let blocked = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "onboarding",
+        "wf-nd-blocked",
+        None,
+    )
+    .await;
+    // A healthy RUNNING execution.
+    let _healthy = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "onboarding",
+        "wf-nd-healthy",
+        None,
+    )
+    .await;
+    // A CANCELLED execution with a stale marker (operator escape hatch does
+    // not clear the marker; the state filter must hide it).
+    let stale = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "onboarding",
+        "wf-nd-stale",
+        None,
+    )
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to stamp nd-block columns");
+    let now = chrono::Utc::now();
+    diesel::update(harvest_workflow_executions::table.find(blocked.as_uuid()))
+        .set((
+            harvest_workflow_executions::nd_blocked_at.eq(Some(now)),
+            harvest_workflow_executions::nd_block_reason.eq(Some(
+                "non-deterministic replay: activity mismatch".to_string(),
+            )),
+            harvest_workflow_executions::nd_block_count.eq(2),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("stamp blocked row");
+    diesel::update(harvest_workflow_executions::table.find(stale.as_uuid()))
+        .set((
+            harvest_workflow_executions::state.eq("CANCELLED"),
+            harvest_workflow_executions::nd_blocked_at.eq(Some(now)),
+            harvest_workflow_executions::nd_block_reason
+                .eq(Some("non-deterministic replay: timer mismatch".to_string())),
+            harvest_workflow_executions::nd_block_count.eq(1),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("stamp stale row");
+
+    let (status, json) = get_json(&app, "/workflows?nd_blocked=true").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids = workflow_ids(&json);
+    assert_eq!(
+        ids,
+        vec!["wf-nd-blocked".to_string()],
+        "only the RUNNING blocked row matches; healthy and stale-terminal rows are excluded"
+    );
+
+    // The block columns surface on the row for operator triage (AC5).
+    let row = &json.as_array().expect("array response")[0];
+    assert!(row["nd_blocked_at"].is_string());
+    assert_eq!(
+        row["nd_block_reason"],
+        "non-deterministic replay: activity mismatch"
+    );
+    assert_eq!(row["nd_block_count"], 2);
+
+    // Unfiltered list still returns all three rows.
+    let (status, json) = get_json(&app, "/workflows?limit=10").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json.as_array().map(Vec::len), Some(3));
 }
 
 // ── Issue #498: cursor pagination + time-range filters ───────────────────────

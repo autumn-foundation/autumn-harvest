@@ -426,6 +426,7 @@ pub mod flows {
         #[must_use]
         pub fn info() -> ::autumn_harvest::WorkflowInfo {
             ::autumn_harvest::WorkflowInfo {
+                mcp: false,
                 name: "my_absolute_wf",
                 module: "flows",
                 handler: |_, _| Box::pin(async { Ok(::autumn_harvest::serde_json::Value::Null) }),
@@ -481,6 +482,7 @@ pub mod relative_test_self {
             #[must_use]
             pub fn info() -> ::autumn_harvest::WorkflowInfo {
                 ::autumn_harvest::WorkflowInfo {
+                    mcp: false,
                     name: "my_relative_wf",
                     module: "relative_test_self::flows",
                     handler: |_, _| {
@@ -526,6 +528,7 @@ pub mod relative_test_super {
             #[must_use]
             pub fn info() -> ::autumn_harvest::WorkflowInfo {
                 ::autumn_harvest::WorkflowInfo {
+                    mcp: false,
                     name: "my_relative_wf",
                     module: "relative_test_super::flows",
                     handler: |_, _| {
@@ -575,6 +578,7 @@ pub mod relative_test_plain {
             #[must_use]
             pub fn info() -> ::autumn_harvest::WorkflowInfo {
                 ::autumn_harvest::WorkflowInfo {
+                    mcp: false,
                     name: "my_relative_wf",
                     module: "relative_test_plain::flows",
                     handler: |_, _| {
@@ -638,4 +642,58 @@ fn relative_workflow_paths_compile_and_resolve_successfully() {
     let u_plain = relative_test_plain::__autumn_update_handler_info_update_relative_plain();
     assert_eq!(u_plain.name, "update_relative_plain");
     assert_eq!(u_plain.workflow, "my_relative_wf");
+}
+
+// ── MCP tool exposure opt-in for updates (issue #597) ─────────────────────────
+
+#[update(workflow = "my_workflow", mcp)]
+async fn mcp_bare_update(_ctx: &WorkflowContext, req: ApproveRequest) -> Result<bool, String> {
+    Ok(req.approved)
+}
+
+#[update(workflow = "my_workflow", mcp = true)]
+async fn mcp_eq_true_update(_ctx: &WorkflowContext, req: ApproveRequest) -> Result<bool, String> {
+    Ok(req.approved)
+}
+
+#[update(workflow = "my_workflow", mcp = false)]
+async fn mcp_eq_false_update(_ctx: &WorkflowContext, req: ApproveRequest) -> Result<bool, String> {
+    Ok(req.approved)
+}
+
+#[test]
+fn update_mcp_bare_flag_sets_true() {
+    let info = __autumn_update_handler_info_mcp_bare_update();
+    assert!(
+        info.mcp,
+        "#[update(..., mcp)] must set UpdateHandlerInfo.mcp = true"
+    );
+}
+
+#[test]
+fn update_mcp_eq_true_sets_true() {
+    let info = __autumn_update_handler_info_mcp_eq_true_update();
+    assert!(info.mcp);
+}
+
+#[test]
+fn update_mcp_eq_false_sets_false() {
+    let info = __autumn_update_handler_info_mcp_eq_false_update();
+    assert!(!info.mcp);
+}
+
+#[test]
+fn update_mcp_defaults_to_false() {
+    let info = __autumn_update_handler_info_approve();
+    assert!(
+        !info.mcp,
+        "updates without the mcp attribute must default to mcp = false"
+    );
+}
+
+#[test]
+fn update_mcp_composes_with_validator() {
+    let info = __autumn_update_handler_info_approve_with_validator();
+    assert!(!info.mcp);
+    assert!(info.has_validator);
 }

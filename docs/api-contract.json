@@ -106,6 +106,12 @@
           "in": "query",
           "required": false,
           "description": "When 'true', return only executions whose soft SLA has been breached (issue #487)."
+        },
+        {
+          "name": "nd_blocked",
+          "in": "query",
+          "required": false,
+          "description": "When 'true', return only RUNNING executions currently blocked on replay non-determinism (issue #603). Each row carries nd_blocked_at / nd_block_reason / nd_block_count plus the structured divergence diagnostic (failure_cause, expected, actual, event_index, workflow_type, build_id) in search_attrs."
         }
       ],
       "request_body": null,

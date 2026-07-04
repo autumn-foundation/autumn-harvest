@@ -180,7 +180,8 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
     ),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -261,6 +262,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![
             WorkflowInfo {
+                mcp: false,
                 name: "source_wf",
                 module: "tests",
                 handler: test_workflow,
@@ -281,6 +283,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 severity: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "target_wf",
                 module: "tests",
                 handler: test_workflow,
@@ -301,6 +304,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 severity: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "target_with_schema_wf",
                 module: "tests",
                 handler: test_workflow,
@@ -324,6 +328,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
             // a source whose force-terminate fires `Terminated` triggers, plus the
             // two distinct targets the test registers triggers against.
             WorkflowInfo {
+                mcp: false,
                 name: "term_source_wf",
                 module: "tests",
                 handler: test_workflow,
@@ -344,6 +349,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 severity: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "on_terminate_wf",
                 module: "tests",
                 handler: test_workflow,
@@ -364,6 +370,7 @@ fn test_registry() -> Arc<HandlerRegistry> {
                 severity: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "on_cancel_wf",
                 module: "tests",
                 handler: test_workflow,
@@ -2137,6 +2144,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
     let built = autumn_harvest::HarvestBuilder::new()
         .workflows(vec![
             autumn_harvest::info::WorkflowInfo {
+                mcp: false,
                 name: "source",
                 module: "tests",
                 handler: test_workflow,
@@ -2156,6 +2164,7 @@ async fn test_runner_startup_fails_on_sync_failure() {
                 severity: None,
             },
             autumn_harvest::info::WorkflowInfo {
+                mcp: false,
                 name: "target",
                 module: "tests",
                 handler: test_workflow,

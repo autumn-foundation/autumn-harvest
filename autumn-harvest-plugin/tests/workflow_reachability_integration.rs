@@ -47,6 +47,7 @@ fn noop_workflow<'a>(
 
 fn workflow_info_named(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name,
         module: "tests",
         handler: noop_workflow,

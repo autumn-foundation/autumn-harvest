@@ -160,7 +160,8 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
     ),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 type HarvestApiApp = axum::Router;
@@ -189,6 +190,7 @@ fn build_pool(url: &str) -> DbPool {
 fn test_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "onboarding",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

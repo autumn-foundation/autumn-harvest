@@ -61,6 +61,24 @@ type ApiMiddlewareFn = Box<
         + Sync,
 >;
 
+/// Applies the same auth layer configured via [`HarvestPlugin::api_with_auth`]
+/// to one generated MCP tool route's `MethodRouter` (issue #597 hardening).
+///
+/// The MCP tool routes are registered via `AppBuilder::routes(...)`, not
+/// `nest()`, so they never pass through the `ApiMiddlewareFn` above (which
+/// only wraps the nested management-API router). Without this, a caller
+/// could hit a mutating tool route's own HTTP path directly and bypass both
+/// the configured admin auth and autumn-web's `secure_mcp` (which only gates
+/// the `/mcp` JSON-RPC envelope, not a typed route's direct path). `Fn` (not
+/// `FnOnce`) so it can be cloned onto every generated route.
+pub(crate) type McpToolMiddlewareFn = std::sync::Arc<
+    dyn Fn(
+            autumn_web::reexports::axum::routing::MethodRouter<autumn_web::AppState>,
+        ) -> autumn_web::reexports::axum::routing::MethodRouter<autumn_web::AppState>
+        + Send
+        + Sync,
+>;
+
 /// Autumn plugin that embeds the Harvest workflow engine in an application.
 ///
 /// # Example
@@ -85,6 +103,16 @@ pub struct HarvestPlugin {
     builder: HarvestBuilder,
     api_path: Option<String>,
     api_middleware: Option<ApiMiddlewareFn>,
+    /// Same auth layer as `api_middleware`, applicable to a `MethodRouter` so
+    /// it can also wrap the generated MCP tool routes (issue #597
+    /// hardening). Populated alongside `api_middleware` by
+    /// [`Self::api_with_auth`].
+    mcp_tool_middleware: Option<McpToolMiddlewareFn>,
+    /// Register MCP tool routes for `#[workflow(mcp)]` workflows (issue #597).
+    /// Set via [`Self::mcp_tools`] / [`Self::mcp_tools_at`] (feature `mcp`).
+    mcp_tools_enabled: bool,
+    /// Optional prefix override for the generated MCP tool routes.
+    mcp_tools_prefix: Option<String>,
 }
 
 impl Default for HarvestPlugin {
@@ -101,6 +129,9 @@ impl HarvestPlugin {
             builder: HarvestBuilder::default(),
             api_path: None,
             api_middleware: None,
+            mcp_tool_middleware: None,
+            mcp_tools_enabled: false,
+            mcp_tools_prefix: None,
         }
     }
 
@@ -122,6 +153,20 @@ impl HarvestPlugin {
     #[must_use]
     pub fn dags(mut self, dags: Vec<DagInfo>) -> Self {
         self.builder = self.builder.dags(dags);
+        self
+    }
+
+    /// Register declarative update handlers produced by `autumn_harvest::updates!`.
+    #[must_use]
+    pub fn updates(mut self, updates: Vec<autumn_harvest::UpdateHandlerInfo>) -> Self {
+        self.builder = self.builder.updates(updates);
+        self
+    }
+
+    /// Register declarative query handlers produced by `autumn_harvest::queries!`.
+    #[must_use]
+    pub fn queries(mut self, queries: Vec<autumn_harvest::QueryHandlerInfo>) -> Self {
+        self.builder = self.builder.queries(queries);
         self
     }
 
@@ -148,6 +193,14 @@ impl HarvestPlugin {
 
     /// Mount the Harvest management API under `path`, protected by the given
     /// tower middleware layer.
+    ///
+    /// The same layer is also applied to every generated MCP tool route
+    /// (issue #597 hardening) when [`Self::mcp_tools`] /
+    /// [`Self::mcp_tools_at`] is used — those routes are registered via
+    /// `AppBuilder::routes(...)`, not `nest()`, so without this they would
+    /// never pass through this middleware and would be reachable
+    /// unauthenticated at their own HTTP path even when the rest of the
+    /// Harvest API requires a credential.
     #[must_use]
     pub fn api_with_auth<M>(mut self, path: impl Into<String>, middleware: M) -> Self
     where
@@ -169,9 +222,51 @@ impl HarvestPlugin {
             Send + 'static,
     {
         self.api_path = Some(path.into());
+        let mcp_middleware = middleware.clone();
+        self.mcp_tool_middleware = Some(std::sync::Arc::new(move |method_router| {
+            method_router.layer(mcp_middleware.clone())
+        }));
         self.api_middleware = Some(Box::new(move |router| router.layer(middleware)));
         self
     }
+
+    /// Expose every `#[workflow(mcp)]` workflow as MCP tools (issue #597).
+    ///
+    /// Generates typed `start_{wf}` / `{wf}_status` / `signal_{wf}` /
+    /// `{wf}_watch` routes (plus one `{wf}_update_{name}` per
+    /// `#[update(workflow = "…", mcp)]` handler) under `{api_path}/mcp`
+    /// (default `/api/harvest/mcp`) and registers them as app-level routes so
+    /// autumn-web's `AppBuilder::mount_mcp("/mcp")` projects them into the MCP
+    /// tool catalog. The app author still mounts (and secures, via
+    /// `secure_mcp`) the MCP endpoint itself.
+    ///
+    /// Opt-in only: workflows without the `mcp` attribute never surface, and
+    /// the mutating tools are never part of autumn-web's read-only
+    /// `expose_all_as_mcp` hatch.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub const fn mcp_tools(mut self) -> Self {
+        self.mcp_tools_enabled = true;
+        self
+    }
+
+    /// Like [`Self::mcp_tools`], mounting the generated tool routes under an
+    /// explicit prefix instead of `{api_path}/mcp`.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_tools_at(mut self, prefix: impl Into<String>) -> Self {
+        self.mcp_tools_enabled = true;
+        self.mcp_tools_prefix = Some(prefix.into());
+        self
+    }
+}
+
+/// Whether the generated MCP tool routes are about to be registered with no
+/// route-level auth applied (issue #597, PR #908 hardening). Pure so the
+/// decision is unit-testable without capturing `tracing` output.
+#[cfg(feature = "mcp")]
+const fn mcp_tools_unprotected(mcp_tools_enabled: bool, has_tool_middleware: bool) -> bool {
+    mcp_tools_enabled && !has_tool_middleware
 }
 
 impl Plugin for HarvestPlugin {
@@ -180,13 +275,62 @@ impl Plugin for HarvestPlugin {
             builder,
             api_path,
             api_middleware,
+            mcp_tool_middleware,
+            mcp_tools_enabled,
+            mcp_tools_prefix,
         } = self;
+        #[cfg(not(feature = "mcp"))]
+        let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
+
+        let api_state = HarvestApiState::new();
+
+        // Issue #597: generate the MCP tool routes before the builder is
+        // stashed in the runtime slot. These are app-level typed routes
+        // (registered via `AppBuilder::routes`, not `nest`) so autumn-web's
+        // `mount_mcp` can project them into the tool catalog; handlers fail
+        // closed until `on_startup` installs the runtime.
+        #[cfg(feature = "mcp")]
+        let mcp_routes = if mcp_tools_enabled {
+            // Codex review (PR #908, P1): `HarvestPlugin` cannot detect or
+            // intercept `AppBuilder::secure_mcp(...)` -- that's configured on
+            // the outer app builder, after this `Plugin::build` call returns
+            // -- so there is no way to *guarantee* these routes are
+            // protected. `secure_mcp` only gates the `/mcp` JSON-RPC
+            // envelope, not a generated tool route's own direct HTTP path
+            // (these are registered via `AppBuilder::routes`, not `nest`).
+            // Surface the gap loudly at startup instead of leaving it silent.
+            if mcp_tools_unprotected(mcp_tools_enabled, mcp_tool_middleware.is_some()) {
+                tracing::warn!(
+                    "HarvestPlugin::mcp_tools() is enabled with no HarvestPlugin::api_with_auth(..) \
+                     configured -- the generated start_/signal_/update_ tool routes are reachable \
+                     UNAUTHENTICATED at their own HTTP path, even if the app also configures \
+                     autumn-web's secure_mcp(...) (which only gates the /mcp JSON-RPC envelope, not \
+                     these routes' direct paths). Configure HarvestPlugin::api_with_auth(path, mw) \
+                     to protect the generated tool routes, or disregard this warning if \
+                     unauthenticated access is intentional (e.g. local development)."
+                );
+            }
+            let prefix =
+                crate::mcp_tools::tools_prefix(api_path.as_deref(), mcp_tools_prefix.as_deref());
+            let descriptors = crate::mcp_tools::collect_descriptors(
+                builder.workflow_infos(),
+                builder.update_handlers(),
+            );
+            crate::mcp_tools::record_schemas(&descriptors);
+            Some(crate::mcp_tools::build_mcp_tool_routes(
+                &prefix,
+                &descriptors,
+                &api_state,
+                mcp_tool_middleware.as_ref(),
+            ))
+        } else {
+            None
+        };
 
         let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
             builder: Some(builder),
             runtime: None,
         }));
-        let api_state = HarvestApiState::new();
         // issue #377: arm fail-closed so any request in the window between
         // HTTP server bind and the boot-time gate load is safely rejected.
         api_state.arm_gate_cache_fail_closed();
@@ -223,6 +367,12 @@ impl Plugin for HarvestPlugin {
                     stop_harvest_runtime(slot, api_state).await;
                 }
             });
+
+        #[cfg(feature = "mcp")]
+        let app = match mcp_routes {
+            Some(routes) => app.routes(routes),
+            None => app,
+        };
 
         if let Some(path) = api_path {
             let ui_router = harvest_ui_router(api_state.clone());
@@ -775,6 +925,7 @@ mod tests {
 
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
+            mcp: false,
             name: "echo",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -881,6 +1032,30 @@ mod tests {
 
         assert_eq!(plugin.api_path.as_deref(), Some("/api"));
         assert!(plugin.api_middleware.is_some());
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn harvest_plugin_api_with_auth_also_sets_mcp_tool_middleware() {
+        let plugin =
+            HarvestPlugin::new().api_with_auth("/api", autumn_web::auth::RequireAuth::new("test"));
+
+        assert!(
+            plugin.mcp_tool_middleware.is_some(),
+            "api_with_auth must configure the same layer for generated MCP tool routes"
+        );
+    }
+
+    /// Regression test (issue #597, PR #908 review): `mcp_tools()` combined
+    /// with no `api_with_auth(..)` must be flagged so the generated tool
+    /// routes' unauthenticated-at-their-own-path gap is never silent.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_tools_unprotected_flags_enabled_without_middleware_only() {
+        assert!(mcp_tools_unprotected(true, false));
+        assert!(!mcp_tools_unprotected(true, true));
+        assert!(!mcp_tools_unprotected(false, false));
+        assert!(!mcp_tools_unprotected(false, true));
     }
 
     #[test]
@@ -1024,5 +1199,44 @@ mod tests {
             .expect("external mode should resolve a dedicated harvest pool");
 
         assert_eq!(harvest_pool.status().max_size, 10);
+    }
+
+    #[test]
+    fn harvest_plugin_forwards_updates_and_queries_to_builder() {
+        // Issue #597 gap-fill: #[update(..., mcp)] handlers must reach the
+        // builder through the plugin's fluent surface.
+        fn fake_update() -> autumn_harvest::UpdateHandlerInfo {
+            autumn_harvest::UpdateHandlerInfo {
+                name: "approve",
+                workflow: "echo",
+                module: "tests",
+                input_type_hint: "ApproveRequest",
+                output_type_hint: "bool",
+                has_validator: false,
+                handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
+                validator: None,
+                mcp: true,
+            }
+        }
+        fn fake_query() -> autumn_harvest::QueryHandlerInfo {
+            autumn_harvest::QueryHandlerInfo {
+                name: "progress",
+                workflow: "echo",
+                module: "tests",
+                input_type_hint: "()",
+                output_type_hint: "u64",
+                handler: |_ctx, _args| Ok(serde_json::Value::Null),
+            }
+        }
+
+        let plugin = HarvestPlugin::new()
+            .workflows(vec![fake_workflow_info()])
+            .updates(vec![fake_update()])
+            .queries(vec![fake_query()]);
+        assert_eq!(plugin.builder.update_handlers().len(), 1);
+        assert_eq!(plugin.builder.update_handlers()[0].name, "approve");
+        assert!(plugin.builder.update_handlers()[0].mcp);
+        assert_eq!(plugin.builder.query_handlers().len(), 1);
+        assert_eq!(plugin.builder.query_handlers()[0].name, "progress");
     }
 }

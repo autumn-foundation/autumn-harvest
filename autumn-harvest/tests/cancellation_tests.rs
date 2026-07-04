@@ -96,7 +96,8 @@ const INIT_SQL: &str = concat!(
     // issue #534: origin column + per-schedule run-history index.
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -268,6 +269,7 @@ fn heartbeat_registry(probe: HeartbeatCancellationProbe) -> Arc<HandlerRegistry>
 
     Arc::new(HandlerRegistry::with_state(
         vec![autumn_harvest::info::WorkflowInfo {
+            mcp: false,
             name: "heartbeat_workflow",
             module: "cancellation_tests",
             handler: heartbeat_workflow,
@@ -683,6 +685,7 @@ fn uncooperative_registry(probe: UncooperativeActivityProbe) -> Arc<HandlerRegis
 
     Arc::new(HandlerRegistry::with_state(
         vec![autumn_harvest::info::WorkflowInfo {
+            mcp: false,
             name: "uncooperative_workflow",
             module: "cancellation_tests",
             handler: uncooperative_workflow,

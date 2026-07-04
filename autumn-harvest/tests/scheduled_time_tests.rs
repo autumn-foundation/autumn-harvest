@@ -131,7 +131,8 @@ const INIT_SQL: &str = concat!(
     // issue #534: origin column + per-schedule run-history index.
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 // ── Workflow handler ──────────────────────────────────────────────────────────
@@ -182,6 +183,7 @@ fn make_pool(url: &str) -> DbPool {
 fn make_registry(wf_name: &'static str) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: wf_name,
             module: "scheduled_time_tests",
             handler: scheduled_time_recorder,

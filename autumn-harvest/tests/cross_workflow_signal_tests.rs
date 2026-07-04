@@ -107,7 +107,8 @@ const INIT_SQL: &str = concat!(
     // issue #534: origin column + per-schedule run-history index.
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -247,6 +248,7 @@ async fn test_same_shard_not_found_retry() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                mcp: false,
                 name: "caller_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: caller_workflow,
@@ -268,6 +270,7 @@ async fn test_same_shard_not_found_retry() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "target_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: target_workflow,
@@ -436,6 +439,7 @@ async fn test_cross_shard_outbox_delivery() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                mcp: false,
                 name: "caller_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: caller_workflow,
@@ -457,6 +461,7 @@ async fn test_cross_shard_outbox_delivery() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "target_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: target_workflow,
@@ -615,6 +620,7 @@ async fn test_grace_window_expiration() {
 
     let built = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            mcp: false,
             name: "caller_workflow",
             module: "cross_workflow_signal_tests",
             handler: caller_workflow,
@@ -748,6 +754,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                mcp: false,
                 name: "mixed_suspension_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: mixed_suspension_workflow,
@@ -769,6 +776,7 @@ async fn test_mixed_timer_suspension_signal_wakes_timer() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "target_workflow",
                 module: "cross_workflow_signal_tests",
                 handler: target_workflow,

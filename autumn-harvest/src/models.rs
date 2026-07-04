@@ -146,6 +146,14 @@ pub struct WorkflowExecution {
     /// Dispatch origin (issue #534): `scheduled` / `backfill` / `manual_trigger` for
     /// schedule-attributed runs, `None` for all non-scheduled runs. Metadata only.
     pub origin: Option<String>,
+    /// Wall-clock of the most recent replay-non-determinism block observation
+    /// (issue #603). `None` = not blocked; state stays RUNNING while blocked.
+    pub nd_blocked_at: Option<DateTime<Utc>>,
+    /// Divergence error string from the most recent blocked cycle (issue #603).
+    pub nd_block_reason: Option<String>,
+    /// Consecutive block entries for the current divergence incident (issue
+    /// #603). Drives the re-dispatch backoff; reset to 0 on a clean cycle.
+    pub nd_block_count: i32,
 }
 
 /// Insert struct for creating a new workflow execution.

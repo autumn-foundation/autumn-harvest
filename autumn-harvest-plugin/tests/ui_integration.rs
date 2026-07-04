@@ -168,7 +168,8 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
     ),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -287,6 +288,7 @@ fn test_app_state_without_database() -> AppState {
 fn echo_registry() -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "echo_workflow",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -2918,6 +2920,7 @@ async fn detail_page_shows_custom_continue_as_new_threshold() {
     let registry = Arc::new(
         HandlerRegistry::new(
             vec![WorkflowInfo {
+                mcp: false,
                 name: "cust_wf",
                 module: "tests",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -3055,6 +3058,7 @@ async fn ui_trigger_preserves_dag_metadata() {
 
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: dag_name,
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

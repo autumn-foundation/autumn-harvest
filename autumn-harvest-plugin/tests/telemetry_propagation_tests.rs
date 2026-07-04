@@ -175,7 +175,8 @@ const INIT_SQL: &str = concat!(
     include_str!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
     ),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 // -------------------------------------------------------------------------
@@ -261,6 +262,7 @@ async fn start_workflow_stores_captured_trace_context_in_task_queue() {
 
     let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            mcp: false,
             name: "echo_workflow",
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -364,6 +366,7 @@ async fn start_workflow_leaves_trace_context_null_when_no_propagator() {
     // Default registry uses NoOpPropagator → capture() returns None.
     let registry = Arc::new(HandlerRegistry::new(
         vec![WorkflowInfo {
+            mcp: false,
             name: "echo_workflow",
             module: "telemetry_propagation_tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),

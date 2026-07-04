@@ -108,7 +108,8 @@ const INIT_SQL: &str = concat!(
     // issue #534: origin column + per-schedule run-history index.
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 async fn setup_test_db_url() -> (String, ContainerAsync<Postgres>) {
@@ -284,6 +285,7 @@ async fn wait_for_workflow_task_parked(conn: &mut AsyncPgConnection, exec_id: Ex
 
 fn wf_info(name: &'static str, handler: autumn_harvest::info::WorkflowHandlerFn) -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name,
         module: "child_policy_tests",
         handler,
@@ -311,6 +313,7 @@ fn wf_info_with_concurrency(
     concurrency: ConcurrencyPolicy,
 ) -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name,
         module: "child_policy_tests",
         handler,

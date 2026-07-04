@@ -101,6 +101,12 @@ pub struct UpdateHandlerInfo {
     pub handler: UpdateHandlerFn,
     /// Optional type-erased synchronous validator. `None` when `validator` was omitted.
     pub validator: Option<UpdateValidatorFn>,
+    /// Opt-in MCP tool exposure for this update (issue #597).
+    ///
+    /// When `true` (set via `#[update(workflow = "…", mcp)]`), the plugin's MCP
+    /// surface exposes this update as its own synchronous tool
+    /// (`{workflow}_update_{name}`) on mcp-enabled workflows.
+    pub mcp: bool,
 }
 
 /// A single violation returned by [`WorkflowInfo::validate_input`].
@@ -123,6 +129,8 @@ pub struct RegisteredWorkflowRecord {
     pub input_schema: Option<serde_json::Value>,
     pub output_schema: Option<serde_json::Value>,
     pub error_schema: Option<serde_json::Value>,
+    /// Whether this workflow opted into MCP tool exposure (issue #597).
+    pub mcp: bool,
 }
 
 impl RegisteredWorkflowRecord {
@@ -135,6 +143,7 @@ impl RegisteredWorkflowRecord {
             input_schema: info.input_schema.map(|f| f()),
             output_schema: info.output_schema.map(|f| f()),
             error_schema: info.error_schema.map(|f| f()),
+            mcp: info.mcp,
         }
     }
 }
@@ -218,6 +227,17 @@ pub struct WorkflowInfo {
     ///
     /// `None` (the default) disables auto-retry — today's behavior.
     pub retry_policy: Option<crate::policy::RetryPolicy>,
+    /// Opt-in MCP tool exposure (issue #597).
+    ///
+    /// When `true`, `autumn-harvest-plugin` (built with its `mcp` cargo feature
+    /// and configured via `HarvestPlugin::mcp_tools()`) exposes this workflow as
+    /// a correlated set of MCP tools (`start_{name}`, `{name}_status`,
+    /// `signal_{name}`, `{name}_watch`, plus one tool per mcp-flagged update).
+    /// Set via `#[workflow(mcp)]` or the [`with_mcp`](Self::with_mcp) builder.
+    ///
+    /// The core crate never consults this flag — exposure is strictly an
+    /// HTTP-edge concern with no effect on execution, history, or replay.
+    pub mcp: bool,
 }
 
 impl WorkflowInfo {
@@ -311,6 +331,19 @@ impl WorkflowInfo {
     #[must_use]
     pub fn with_retry_policy(mut self, policy: crate::policy::RetryPolicy) -> Self {
         self.retry_policy = Some(policy);
+        self
+    }
+
+    /// Opt this workflow into MCP tool exposure (issue #597).
+    ///
+    /// Equivalent to the `#[workflow(mcp)]` attribute for `WorkflowInfo` values
+    /// built or adjusted outside the macro:
+    /// ```rust,ignore
+    /// .workflows(vec![onboarding_info().with_mcp()])
+    /// ```
+    #[must_use]
+    pub const fn with_mcp(mut self) -> Self {
+        self.mcp = true;
         self
     }
 
@@ -863,6 +896,9 @@ impl DagInfo {
             output_schema: None,
             error_schema: None,
             retry_policy: None,
+            // Unified DAGs are never MCP-exposed: #[dag] has no `mcp` attribute
+            // and the DAG trigger surface is its own management-API family.
+            mcp: false,
         })
     }
 }
@@ -887,6 +923,7 @@ impl std::fmt::Debug for WorkflowInfo {
             .field("output_schema", &self.output_schema.map(|_| "<fn>"))
             .field("error_schema", &self.error_schema.map(|_| "<fn>"))
             .field("retry_policy", &self.retry_policy)
+            .field("mcp", &self.mcp)
             .finish()
     }
 }
@@ -962,6 +999,7 @@ impl std::fmt::Debug for UpdateHandlerInfo {
             .field("has_validator", &self.has_validator)
             .field("handler", &"<fn>")
             .field("validator", &self.validator.map(|_| "<fn>"))
+            .field("mcp", &self.mcp)
             .finish()
     }
 }
@@ -974,6 +1012,7 @@ mod tests {
     #[test]
     fn workflow_info_fields_accessible() {
         let info = WorkflowInfo {
+            mcp: false,
             name: "test_workflow",
             module: "my_app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1002,6 +1041,7 @@ mod tests {
     #[test]
     fn workflow_info_sla_field_is_accessible_and_defaults_none() {
         let info = WorkflowInfo {
+            mcp: false,
             name: "sla_test_wf",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1027,6 +1067,7 @@ mod tests {
     #[test]
     fn workflow_info_sla_field_can_be_set() {
         let info = WorkflowInfo {
+            mcp: false,
             name: "sla_test_wf",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1052,6 +1093,7 @@ mod tests {
     #[test]
     fn workflow_info_execution_timeout_field_is_accessible() {
         let info = WorkflowInfo {
+            mcp: false,
             name: "billing_reconciliation",
             module: "my_app::workflows",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1082,6 +1124,7 @@ mod tests {
     #[test]
     fn workflow_info_description_field_accessible() {
         let info = WorkflowInfo {
+            mcp: false,
             name: "schema_test",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1110,6 +1153,7 @@ mod tests {
     #[test]
     fn workflow_info_with_description_builder() {
         let base = WorkflowInfo {
+            mcp: false,
             name: "schema_test",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1155,6 +1199,7 @@ mod tests {
         }
 
         let info = WorkflowInfo {
+            mcp: false,
             name: "schema_test",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1192,6 +1237,7 @@ mod tests {
     #[test]
     fn registered_workflow_record_serialises_nulls_when_no_schema() {
         let info = WorkflowInfo {
+            mcp: false,
             name: "no_schema_wf",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1226,6 +1272,7 @@ mod tests {
             serde_json::json!({"type": "object"})
         }
         let info = WorkflowInfo {
+            mcp: false,
             name: "schema_wf",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1268,6 +1315,7 @@ mod tests {
             })
         }
         let info = WorkflowInfo {
+            mcp: false,
             name: "validated_wf",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1303,6 +1351,7 @@ mod tests {
             })
         }
         let info = WorkflowInfo {
+            mcp: false,
             name: "validated_wf",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1333,6 +1382,7 @@ mod tests {
     #[test]
     fn validate_input_returns_ok_when_no_schema() {
         let info = WorkflowInfo {
+            mcp: false,
             name: "no_schema_wf",
             module: "tests",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1557,6 +1607,7 @@ mod tests {
     #[test]
     fn info_debug_formats_correctly() {
         let workflow_info = WorkflowInfo {
+            mcp: false,
             name: "test_wf",
             module: "test_mod",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -1624,5 +1675,97 @@ mod tests {
         let debug_str = format!("{dag_info:?}");
         assert!(debug_str.contains("DagInfo"));
         assert!(debug_str.contains("test_dag"));
+    }
+
+    // --- issue #597: MCP tool exposure opt-in ---
+
+    fn plain_workflow_info(name: &'static str) -> WorkflowInfo {
+        WorkflowInfo {
+            name,
+            module: "tests",
+            handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            execution_timeout: None,
+            sla: None,
+            concurrency: None,
+            debounce: None,
+            batch: None,
+            max_input_bytes: None,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            description: None,
+            input_schema: None,
+            output_schema: None,
+            error_schema: None,
+            retry_policy: None,
+            mcp: false,
+        }
+    }
+
+    #[test]
+    fn workflow_info_mcp_defaults_false_and_with_mcp_sets_true() {
+        let info = plain_workflow_info("mcp_wf");
+        assert!(!info.mcp, "mcp must default to false");
+        let info = info.with_mcp();
+        assert!(info.mcp, "with_mcp() must set mcp = true");
+    }
+
+    #[test]
+    fn registered_workflow_record_surfaces_mcp_flag() {
+        let record = RegisteredWorkflowRecord::from_info(&plain_workflow_info("rec_wf"));
+        assert!(!record.mcp);
+        let record = RegisteredWorkflowRecord::from_info(&plain_workflow_info("rec_wf").with_mcp());
+        assert!(record.mcp);
+    }
+
+    #[test]
+    fn workflow_info_debug_includes_mcp() {
+        let debug_str = format!("{:?}", plain_workflow_info("dbg_wf").with_mcp());
+        assert!(debug_str.contains("mcp: true"));
+    }
+
+    #[test]
+    fn update_handler_info_mcp_field_defaults_false() {
+        let info = UpdateHandlerInfo {
+            name: "approve",
+            workflow: "order_flow",
+            module: "tests",
+            input_type_hint: "ApproveRequest",
+            output_type_hint: "bool",
+            has_validator: false,
+            handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
+            validator: None,
+            mcp: false,
+        };
+        assert!(!info.mcp);
+        let debug_str = format!("{info:?}");
+        assert!(debug_str.contains("mcp: false"));
+    }
+
+    #[test]
+    fn dag_as_workflow_info_is_never_mcp() {
+        let dag = DagInfo {
+            name: "mcp_dag",
+            module: "tests",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |_| {},
+            workflow_handler: Some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: ::std::time::Duration::ZERO,
+            overlap_policy: crate::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+        };
+        let info = dag
+            .as_workflow_info()
+            .expect("workflow_handler is Some, so as_workflow_info must be Some");
+        assert!(
+            !info.mcp,
+            "unified DAGs are never MCP-exposed (no `mcp` attr on #[dag])"
+        );
     }
 }

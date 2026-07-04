@@ -852,6 +852,7 @@ async fn child_fan_out_shares_seq_counter_with_activity_fan_out() {
 
 fn make_workflow_info(name: &'static str) -> autumn_harvest::info::WorkflowInfo {
     autumn_harvest::info::WorkflowInfo {
+        mcp: false,
         name,
         module: "test",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),

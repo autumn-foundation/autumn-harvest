@@ -118,7 +118,8 @@ const INIT_SQL: &str = concat!(
     // issue #534: origin column + per-schedule run-history index.
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 async fn setup_test_db() -> (String, ContainerAsync<Postgres>) {
@@ -191,6 +192,7 @@ fn slow_activity<'a>(
 fn build_registry(telemetry: Arc<TelemetryConfig>) -> Arc<HandlerRegistry> {
     Arc::new(HandlerRegistry::with_state_and_telemetry(
         vec![WorkflowInfo {
+            mcp: false,
             name: "slot_tuner_slow_workflow",
             module: "slot_tuner_tests",
             handler: slow_activity_workflow,

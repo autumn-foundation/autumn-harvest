@@ -1456,7 +1456,7 @@ struct BasicAck {
 /// `idempotency_key` is the lower-precedence way to supply the exactly-once
 /// delivery key — the `Idempotency-Key` HTTP header wins when both are present.
 #[derive(Debug, Default, Deserialize)]
-struct SignalQuery {
+pub(crate) struct SignalQuery {
     #[serde(default)]
     idempotency_key: Option<String>,
 }
@@ -1467,7 +1467,7 @@ struct SignalQuery {
 /// `false` when an idempotency-key collision deduplicated the delivery. Unkeyed
 /// deliveries always report `true`, matching the legacy at-least-once behavior.
 #[derive(Debug, Serialize)]
-struct SignalAck {
+pub(crate) struct SignalAck {
     ok: bool,
     signal_delivered: bool,
 }
@@ -1640,7 +1640,7 @@ struct DagRetryResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct StartWorkflowRequest {
+pub(crate) struct StartWorkflowRequest {
     workflow_id: Option<String>,
     input: Option<Value>,
     queue: Option<String>,
@@ -1662,6 +1662,34 @@ struct StartWorkflowRequest {
     batch_key: Option<String>,
     batch_max_size: Option<usize>,
     batch_max_wait: Option<String>,
+}
+
+impl StartWorkflowRequest {
+    /// Minimal request carrying only the workflow input — used by the MCP
+    /// start tool (issue #597), which exposes no other start options.
+    ///
+    /// Only called from `mcp_tools.rs`, which is entirely excluded from the
+    /// build without the `mcp` cargo feature; without this, a default
+    /// (no-`mcp`) build sees zero callers and clippy's `-D warnings` treats
+    /// that as a hard error.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) const fn from_input(input: Value) -> Self {
+        Self {
+            workflow_id: None,
+            input: Some(input),
+            queue: None,
+            memo: None,
+            search_attrs: None,
+            execution_timeout_secs: None,
+            sla_secs: None,
+            reuse_policy: None,
+            start_at: None,
+            delay: None,
+            batch_key: None,
+            batch_max_size: None,
+            batch_max_wait: None,
+        }
+    }
 }
 
 /// Response body for a 409 Conflict returned by `RejectDuplicate` policy.
@@ -2114,6 +2142,10 @@ pub struct WorkflowListPage {
     pub next_cursor: Option<String>,
 }
 
+// A parsed query-param bag: each bool is an independent opt-in filter flag
+// (`?sla_breached=true`, `?nd_blocked=true`, ...), not encodable state — a
+// state machine or enums would obscure the 1:1 query-param mapping.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WorkflowFilters {
     pub(crate) limit: i64,
@@ -2138,6 +2170,9 @@ pub(crate) struct WorkflowFilters {
     pub(crate) include_sleeping: bool,
     /// When true, return only executions whose soft SLA has been breached (#487).
     pub(crate) sla_breached: bool,
+    /// When true, return only RUNNING executions currently blocked on replay
+    /// non-determinism (issue #603).
+    pub(crate) nd_blocked: bool,
     /// Only return executions with at least this many recorded events (issue #493).
     pub(crate) min_history_events: Option<u64>,
     /// Sort direction (issue #498). Default: `Desc`.
@@ -5005,6 +5040,9 @@ pub(crate) fn parse_workflow_filters(
             "sla_breached" => {
                 filters.sla_breached = value.trim().eq_ignore_ascii_case("true");
             }
+            "nd_blocked" => {
+                filters.nd_blocked = value.trim().eq_ignore_ascii_case("true");
+            }
             "min_history_events" => {
                 let parsed = value.trim().parse::<u64>().map_err(|_| {
                     AutumnError::bad_request_msg(format!(
@@ -5579,54 +5617,68 @@ async fn get_workflow_result(
     workflow_result_pending_response()
 }
 
-/// Snapshot the result of `exec_id` using only DB reads (no LISTEN/NOTIFY),
-/// transparently following:
-/// 1. the workflow-level retry chain so a transient `FAILED` + retry successor
-///    is not surfaced as the final answer;
-/// 2. `ContinuedAsNew` → successor chains so callers get the final logical output.
+/// Resolve `exec_id` to the effective execution row by transparently
+/// following:
+/// 1. the workflow-level retry chain (issue #523) so a transient `FAILED` +
+///    retry successor is not surfaced as the final answer;
+/// 2. `ContinuedAsNew` → successor chains (issue #527) so callers get the
+///    row that actually carries the final logical output/error.
 ///
-/// Only a `NotFound` on a mid-chain successor row is swallowed (returns the last
-/// `ContinuedAsNew` sentinel rather than a confusing 404); all other errors
-/// propagate so callers see the 5xx.
-async fn workflow_result_snapshot_following_can(
+/// Only a `NotFound` on a mid-chain successor row is swallowed (returns the
+/// last-seen `CONTINUED_AS_NEW` row rather than a confusing 404); all other
+/// errors propagate so callers see the 5xx. Shared by the `/result` HTTP
+/// endpoint (issue #527) and the MCP `{wf}_status`/`{wf}_watch` tools (issue
+/// #597) so both surfaces resolve a continued-as-new chain identically.
+pub(crate) async fn resolve_terminal_workflow_execution(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
-) -> Result<WorkflowResult, AutumnError> {
-    use autumn_harvest::WorkflowResultState;
+) -> Result<WorkflowExecution, AutumnError> {
     let mut current_id = exec_id;
-    let mut last_can_snapshot: Option<WorkflowResult> = None;
+    let mut last_continued_as_new: Option<WorkflowExecution> = None;
     // Bound the chain walk so a pathological cycle can't loop forever.
     for _ in 0..128 {
         let execution = match load_execution_following_retries(api_state, current_id).await {
             Ok(e) => e,
             // Only swallow NotFound mid-chain (missing successor row).
-            Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-                return Ok(last_can_snapshot.unwrap());
+            Err(HarvestError::NotFound(_)) if last_continued_as_new.is_some() => {
+                return Ok(last_continued_as_new.unwrap());
             }
             Err(e) => return Err(map_error(e)),
         };
-        let snapshot = WorkflowResult::from_execution(&execution);
-        if snapshot.state != WorkflowResultState::ContinuedAsNew {
-            return Ok(snapshot);
+        if execution.state != "CONTINUED_AS_NEW" {
+            return Ok(execution);
         }
         // load_execution_following_retries may have advanced past current_id via
         // the retry chain; the ContinuedAsNew event lives on the effective
         // (retried) execution, so read history from its id, not current_id.
         let effective_id = ExecutionId::from_uuid(execution.id);
-        last_can_snapshot = Some(snapshot);
         match load_continue_as_new_successor(api_state, effective_id).await? {
-            Some(next_id) => current_id = next_id,
-            None => return Ok(last_can_snapshot.unwrap()),
+            Some(next_id) => {
+                current_id = next_id;
+                last_continued_as_new = Some(execution);
+            }
+            None => return Ok(execution),
         }
     }
     // Exceeded chain depth — return whatever state the current execution has.
     match load_execution_following_retries(api_state, current_id).await {
-        Ok(e) => Ok(WorkflowResult::from_execution(&e)),
-        Err(HarvestError::NotFound(_)) if last_can_snapshot.is_some() => {
-            Ok(last_can_snapshot.unwrap())
+        Ok(e) => Ok(e),
+        Err(HarvestError::NotFound(_)) if last_continued_as_new.is_some() => {
+            Ok(last_continued_as_new.unwrap())
         }
         Err(e) => Err(map_error(e)),
     }
+}
+
+/// Snapshot the result of `exec_id` using only DB reads (no LISTEN/NOTIFY),
+/// transparently following the retry and `ContinuedAsNew` chains via
+/// [`resolve_terminal_workflow_execution`].
+async fn workflow_result_snapshot_following_can(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+) -> Result<WorkflowResult, AutumnError> {
+    let execution = resolve_terminal_workflow_execution(api_state, exec_id).await?;
+    Ok(WorkflowResult::from_execution(&execution))
 }
 
 /// Load the effective execution for `exec_id` by following the workflow-level
@@ -6749,7 +6801,7 @@ fn workflow_has_resolving_debounce(
 }
 
 #[allow(clippy::too_many_lines, clippy::result_large_err)]
-async fn start_workflow(
+pub(crate) async fn start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     maybe_session: Option<Extension<Session>>,
@@ -11477,7 +11529,7 @@ async fn retry_dag_run(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn signal_workflow(
+pub(crate) async fn signal_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, signal_name)): Path<(String, String)>,
     Query(query): Query<SignalQuery>,
@@ -17791,6 +17843,14 @@ pub(crate) async fn load_workflows(
     if filters.sla_breached {
         query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
     }
+    if filters.nd_blocked {
+        // Only RUNNING rows: operator cancel/terminate escape hatches
+        // intentionally leave the marker in place, and a closed run is no
+        // longer "blocked" (issue #603).
+        query = query
+            .filter(harvest_workflow_executions::nd_blocked_at.is_not_null())
+            .filter(harvest_workflow_executions::state.eq("RUNNING"));
+    }
     if let Some(min_events) = filters.min_history_events {
         // Correlated subquery: filter to executions with at least `min_events`
         // recorded events. No schema migration is required — the count is
@@ -17952,6 +18012,13 @@ pub(crate) async fn load_stalled_workflows(
     // stalled rows because this loader bypasses `load_workflows`.
     if filters.sla_breached {
         query = query.filter(harvest_workflow_executions::sla_breached.eq(true));
+    }
+    // Honor the ND-block filter on the stalled path too (issue #603), for the
+    // same bypass reason as sla_breached above.
+    if filters.nd_blocked {
+        query = query
+            .filter(harvest_workflow_executions::nd_blocked_at.is_not_null())
+            .filter(harvest_workflow_executions::state.eq("RUNNING"));
     }
     // Honor the time-range and exec-id-prefix filters (issue #498) on the
     // stalled path too: without these, `?no_progress_minutes=N&started_after=…`
@@ -20942,13 +21009,27 @@ async fn drain_preview_handler(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-struct AdmitUpdateRequest {
+pub(crate) struct AdmitUpdateRequest {
     #[serde(default)]
     input: Value,
 }
 
-#[derive(Debug, Deserialize)]
-struct AdmitUpdateQuery {
+impl AdmitUpdateRequest {
+    /// Request carrying the update input — used by the MCP update tools
+    /// (issue #597).
+    ///
+    /// Only called from `mcp_tools.rs`, which is entirely excluded from the
+    /// build without the `mcp` cargo feature; without this, a default
+    /// (no-`mcp`) build sees zero callers and clippy's `-D warnings` treats
+    /// that as a hard error.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) const fn new(input: Value) -> Self {
+        Self { input }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct AdmitUpdateQuery {
     /// Controls how long to wait for a result.
     /// `"admitted"` — return 202 as soon as the event is durably written.
     /// `"completed"` (default) — block until the handler returns or the timeout fires.
@@ -20987,7 +21068,7 @@ struct UpdateOrphanedResponse {
 /// workflow worker, then either returns immediately (`?wait=admitted`) or polls
 /// for the terminal `UpdateCompleted`/`UpdateFailed` event (`?wait=completed`,
 /// the default) until the configurable timeout fires.
-async fn admit_update(
+pub(crate) async fn admit_update(
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, update_name)): Path<(String, String)>,
     Query(query): Query<AdmitUpdateQuery>,
@@ -21003,6 +21084,46 @@ async fn admit_update(
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
+
+    // Fail closed if the runtime isn't installed yet, rather than silently
+    // skipping the validator check below. `install_storage_pool` runs before
+    // `install(runtime)` during plugin startup (with a genuine `.await` --
+    // the boot-time admission-gate load -- in between), so a request can
+    // reach this handler with a working storage pool while `runtime()` still
+    // errors. Without this check, that narrow startup window would let a
+    // validator-bearing update slip through unvalidated into durable history
+    // instead of being rejected at the edge (code-review finding, PR #908).
+    // Mirrors `update_with_start_workflow`'s identical hard requirement.
+    let runtime = match api_state.runtime() {
+        Ok(r) => r,
+        Err(e) => return map_error(e).into_response(),
+    };
+
+    // Run the registered update handler's validator (if any) before
+    // admitting -- mirrors the validator check `update_with_start_workflow_execution`
+    // already runs, so an invalid payload is rejected at the edge instead of
+    // becoming durable history that runs/fails deep inside the workflow.
+    // Scoped by (workflow_name, update_name), not update_name alone, since two
+    // different workflows may register update handlers with the same name.
+    let execution_for_validation = load_execution(&mut conn, exec_id).await;
+    if let Ok(execution) = &execution_for_validation
+        && let Some(update_info) = runtime
+            .registry
+            .update_handlers
+            .iter()
+            .find(|h| h.workflow == execution.workflow_name && h.name == update_name)
+        && let Some(validator) = update_info.validator
+        && let Err(reason) = (validator)(&request.input)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "update rejected by validator",
+                "reason": reason,
+            })),
+        )
+            .into_response();
+    }
 
     let update_id = UpdateId::new();
 
@@ -23377,6 +23498,7 @@ mod tests {
     fn dag_registration_marker_is_separate_from_workflow_registry() {
         let registry = Arc::new(HandlerRegistry::new(
             vec![autumn_harvest::WorkflowInfo {
+                mcp: false,
                 name: "workflow_only",
                 module: "tests",
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -23822,6 +23944,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_workflow_filters_parses_nd_blocked_flag() {
+        // Absent → false (issue #603).
+        let absent = parse_workflow_filters(&pairs(&[])).expect("empty filters parse");
+        assert!(!absent.nd_blocked);
+
+        // Explicit true (case-insensitive).
+        let on = parse_workflow_filters(&pairs(&[("nd_blocked", "TRUE")]))
+            .expect("nd_blocked=true parses");
+        assert!(on.nd_blocked);
+
+        // Explicit false.
+        let off = parse_workflow_filters(&pairs(&[("nd_blocked", "false")]))
+            .expect("nd_blocked=false parses");
+        assert!(!off.nd_blocked);
+
+        // Any non-"true" value is treated as false, never an error.
+        let other = parse_workflow_filters(&pairs(&[("nd_blocked", "1")]))
+            .expect("nd_blocked=1 parses without error");
+        assert!(!other.nd_blocked);
+    }
+
+    #[test]
     fn parse_workflow_children_filters_accepts_statuses_limit_and_depth() {
         let filters = parse_workflow_children_filters(&pairs(&[
             ("status", "Failed,Running"),
@@ -24217,6 +24361,118 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Code-review regression test (issue #597, PR #908): `Plugin::build`'s
+    /// `start_harvest_runtime` calls `install_storage_pool` before an
+    /// `.await` (the boot-time admission-gate load) that yields control,
+    /// then calls `install(runtime)` only afterward -- so a request can
+    /// reach `admit_update` with a working storage pool while
+    /// `api_state.runtime()` still errors. Reproduce that exact state
+    /// directly (storage pool installed, runtime never installed) and
+    /// assert `admit_update` fails closed instead of silently skipping the
+    /// validator check and admitting the update anyway.
+    #[tokio::test]
+    async fn admit_update_fails_closed_when_storage_pool_ready_but_runtime_not_installed() {
+        let Some((database_url, _container)) = setup_workflow_result_database().await else {
+            return;
+        };
+        let exec_id = ExecutionId::new();
+        let mut conn =
+            <diesel_async::AsyncPgConnection as diesel_async::AsyncConnection>::establish(
+                &database_url,
+            )
+            .await
+            .expect("failed to connect to admit_update test database");
+        autumn_harvest::start_or_load_workflow_execution_with_metrics(
+            &mut conn,
+            autumn_harvest::StartWorkflowParams {
+                workflow_name: "admit_update_no_runtime",
+                workflow_id: "admit-update-no-runtime-1",
+                exec_id,
+                input: serde_json::json!({ "ok": true }),
+                parent_id: None,
+                queue_name: "default",
+                execution_timeout: None,
+                memo: None,
+                search_attrs: None,
+                reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+                trace_context: None,
+                max_execution_timeout_ceiling: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                priority: Priority::default(),
+                max_workflow_input_bytes: 0,
+                start_at: None,
+                delay: None,
+                max_workflow_start_delay: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                context_headers: None,
+
+                sla: None,
+                schedule_id: None,
+                scheduled_for: None,
+                workflow_attempt: 1,
+                workflow_retry_policy: None,
+                retry_of_exec_id: None,
+                max_workflow_attempts_ceiling: None,
+                origin: None,
+            },
+            None,
+        )
+        .await
+        .expect("workflow execution should be seeded");
+
+        // Deliberately install ONLY the storage pool -- never call
+        // `state.install(runtime)` -- to reproduce the plugin-startup
+        // window described above.
+        let state = HarvestApiState::new();
+        state.install_storage_pool(crate::state::HarvestDbPool::single(
+            workflow_result_test_pool(&database_url),
+        ));
+
+        let response = admit_update(
+            Extension(state),
+            Path((exec_id.to_string(), "some_update".to_string())),
+            Query(AdmitUpdateQuery {
+                wait: None,
+                timeout_secs: None,
+            }),
+            Json(AdmitUpdateRequest {
+                input: serde_json::json!({}),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "admit_update must fail closed when the runtime isn't installed yet, not silently \
+             admit"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body_text = String::from_utf8_lossy(&body);
+        assert!(
+            body_text.contains("harvest runtime is not started"),
+            "expected the runtime-not-started error, got: {body_text}"
+        );
+
+        // And the update must NOT have been durably admitted -- no
+        // UpdateAdmitted event should exist for this execution.
+        let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+            .await
+            .expect("history should load");
+        assert!(
+            !history.events.iter().any(|e| matches!(
+                e,
+                autumn_harvest::event::WorkflowEvent::UpdateAdmitted { .. }
+            )),
+            "the update must not have been durably admitted while the runtime was unavailable"
+        );
     }
 
     fn workflow_result_test_pool(database_url: &str) -> autumn_harvest::worker::DbPool {
@@ -25131,6 +25387,7 @@ mod tests {
         Arc::new(HandlerRegistry::new(
             vec![
                 autumn_harvest::WorkflowInfo {
+                    mcp: false,
                     name: "schema_wf",
                     module: "tests",
                     handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -25151,6 +25408,7 @@ mod tests {
                     retry_policy: None,
                 },
                 autumn_harvest::WorkflowInfo {
+                    mcp: false,
                     name: "no_schema_wf",
                     module: "tests",
                     handler: |_ctx, input| Box::pin(async move { Ok(input) }),

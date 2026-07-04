@@ -46,6 +46,7 @@ fn fake_activity_info(name: &'static str) -> ActivityInfo {
 
 fn fake_workflow_info(name: &'static str) -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name,
         module: "test",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -230,6 +231,7 @@ fn builder_custom_payload_caps_survive_build() {
 #[test]
 fn workflow_info_has_max_input_bytes_field() {
     let info = WorkflowInfo {
+        mcp: false,
         name: "test_wf",
         module: "test",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),
@@ -253,6 +255,7 @@ fn workflow_info_has_max_input_bytes_field() {
     assert!(info.max_input_bytes.is_none());
 
     let info_with_cap = WorkflowInfo {
+        mcp: false,
         name: "large_wf",
         module: "test",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),

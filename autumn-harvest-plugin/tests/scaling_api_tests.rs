@@ -106,6 +106,7 @@ fn build_two_shard_pool(shard0_url: &str, shard1_url: &str) -> HarvestDbPool {
 
 fn workflow_info() -> WorkflowInfo {
     WorkflowInfo {
+        mcp: false,
         name: "echo_workflow",
         module: "tests",
         handler: |_ctx, input| Box::pin(async move { Ok(input) }),

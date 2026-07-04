@@ -109,7 +109,8 @@ const INIT_SQL: &str = concat!(
     // issue #534: origin column + per-schedule run-history index.
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql")
+    include_str!("../migrations/20260704000000_harvest_build_policy_ramp/up.sql"),
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -278,6 +279,7 @@ async fn test_same_shard_live_cancel() {
     let caller_exec_id = ExecutionId::new_for_shard(ShardId::new(0));
 
     let canceller_info = WorkflowInfo {
+        mcp: false,
         name: "canceller_workflow",
         module: "cross_workflow_cancel_tests",
         handler: canceller_workflow,
@@ -298,6 +300,7 @@ async fn test_same_shard_live_cancel() {
         retry_policy: None,
     };
     let target_info = WorkflowInfo {
+        mcp: false,
         name: "long_running_target_workflow",
         module: "cross_workflow_cancel_tests",
         handler: long_running_target_workflow,
@@ -417,6 +420,7 @@ async fn test_already_terminal_target_is_no_op_success() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                mcp: false,
                 name: "canceller_workflow",
                 module: "cross_workflow_cancel_tests",
                 handler: canceller_workflow,
@@ -437,6 +441,7 @@ async fn test_already_terminal_target_is_no_op_success() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "instant_complete_workflow",
                 module: "cross_workflow_cancel_tests",
                 handler: instant_complete_workflow,
@@ -567,6 +572,7 @@ async fn test_grace_window_expiry_unknown_target() {
 
     let built = HarvestBuilder::new()
         .workflows(vec![WorkflowInfo {
+            mcp: false,
             name: "canceller_expecting_failure",
             module: "cross_workflow_cancel_tests",
             handler: canceller_expecting_failure,
@@ -678,6 +684,7 @@ async fn test_cross_shard_cancel_via_outbox() {
     let built = HarvestBuilder::new()
         .workflows(vec![
             WorkflowInfo {
+                mcp: false,
                 name: "canceller_workflow",
                 module: "cross_workflow_cancel_tests",
                 handler: canceller_workflow,
@@ -698,6 +705,7 @@ async fn test_cross_shard_cancel_via_outbox() {
                 retry_policy: None,
             },
             WorkflowInfo {
+                mcp: false,
                 name: "long_running_target_workflow",
                 module: "cross_workflow_cancel_tests",
                 handler: long_running_target_workflow,

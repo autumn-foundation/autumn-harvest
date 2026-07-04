@@ -731,6 +731,10 @@ fn emit_workflow_companion(
                 output_schema: ::std::option::Option::None,
                 error_schema: ::std::option::Option::None,
                 retry_policy: ::std::option::Option::None,
+                // Unified DAGs are never MCP-exposed (issue #597): #[dag] has
+                // no `mcp` attribute; the DAG trigger surface is its own
+                // management-API family.
+                mcp: false,
             }
         }
     }
