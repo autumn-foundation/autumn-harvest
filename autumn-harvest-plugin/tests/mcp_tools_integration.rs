@@ -616,3 +616,41 @@ async fn mcp_update_tool_rejects_invalid_payload_via_registered_validator() {
     );
     assert_eq!(accepted["output"], json!("validated priority set to high"));
 }
+
+/// Code-review regression test (issue #597, PR #908): `start_{wf}` must still
+/// reject input that violates the workflow's published issue #373 schema,
+/// with a real runtime installed. `start_tool` no longer duplicates this
+/// check itself (removed as a redundant, closure-captured-schema copy of the
+/// check `start_workflow` already performs against the live registry); the
+/// guarantee now depends entirely on `start_workflow`'s own validation, which
+/// only runs once `api_state.runtime()` resolves -- unreachable in the no-DB
+/// `tests/mcp_tools_http_tests.rs` harness. This test is that guarantee's
+/// only remaining coverage.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn mcp_start_tool_rejects_input_that_violates_the_published_schema() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(db).await;
+
+    // agent_approval_flow's published schema requires a string body; send an
+    // object instead.
+    let (is_error, rejected) = call_tool(
+        &client,
+        "start_agent_approval_flow",
+        json!({"body": {"not": "a string"}}),
+    )
+    .await;
+    assert!(
+        is_error,
+        "schema-violating start input must be rejected, got: {rejected}"
+    );
+    let detail = rejected["detail"]
+        .as_str()
+        .or_else(|| rejected["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        detail.contains("validation") || rejected.to_string().contains("violations"),
+        "rejection must reference the issue #373 schema-validation contract, got: {rejected}"
+    );
+}

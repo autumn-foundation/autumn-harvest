@@ -329,8 +329,18 @@ async fn tools_call_dispatches_through_the_real_pipeline_and_fails_closed() {
         "pre-startup calls must fail closed on harvest's storage check, got: {text}"
     );
 
-    // Start tool: input that violates the published schema is rejected before
-    // any storage access (schema validation is pure).
+    // Start tool: dispatch reaches the real (delegated) start_workflow
+    // handler and fails closed pre-startup, same as the other calls above.
+    // NOTE: start_tool no longer duplicates issue #373 schema validation
+    // itself (removed as a redundant, closure-captured-schema copy of the
+    // check start_workflow already performs against the live registry --
+    // see the code-review hardening notes in CLAUDE.md); that validation is
+    // gated behind a successful `api_state.runtime()` lookup inside
+    // start_workflow, which this no-DB harness can never reach, so a
+    // schema-violation rejection cannot be exercised here. That guarantee is
+    // instead covered end-to-end (with a real runtime) by
+    // `mcp_start_tool_rejects_input_that_violates_the_published_schema` in
+    // `tests/mcp_tools_integration.rs`.
     let out = rpc(
         &client,
         json!({
@@ -342,7 +352,7 @@ async fn tools_call_dispatches_through_the_real_pipeline_and_fails_closed() {
     assert_eq!(out["result"]["isError"], json!(true));
     let text = out["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.contains("400") || text.contains("validation"),
-        "schema-violating start input must be rejected, got: {text}"
+        text.contains("harvest runtime is not started"),
+        "pre-startup calls must fail closed on harvest's runtime check, got: {text}"
     );
 }
