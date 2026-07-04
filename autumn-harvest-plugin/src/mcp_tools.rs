@@ -184,8 +184,56 @@ pub fn collect_descriptors(
             );
         }
     }
-    let mut names: Vec<&str> = effective.keys().copied().collect();
-    names.sort_unstable();
+    // Process unique names in *first-registration* order, not alphabetical
+    // order (code review, PR #908): the operation-id collision check below
+    // is documented and tested as "first-registered wins" -- registering
+    // `start_invoice` before `invoice_status` must keep `start_invoice` even
+    // though "invoice_status" sorts first alphabetically. Sorting `names`
+    // here (an earlier revision of this fix) silently flipped that tie-break
+    // to alphabetical order for any collision pair whose registration order
+    // disagreed with lexicographic order. The final returned `Vec` is still
+    // sorted by name below, independent of processing order.
+    let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut names: Vec<&str> = Vec::new();
+    for w in workflows {
+        if seen_names.insert(w.name) {
+            names.push(w.name);
+        }
+    }
+
+    // Duplicate `(workflow, update_name)` resolution matches the runtime
+    // exactly, mirroring the workflow-name fix above: `admit_update` /
+    // `update_with_start_workflow_execution` resolve the update handler to
+    // validate/admit against via `registry.update_handlers.iter().find(|h|
+    // h.workflow == workflow_name && h.name == update_name)` -- Rust's
+    // `Iterator::find` is first-wins. An earlier version of this function
+    // filtered to `mcp`-flagged entries *before* dedup and kept the first
+    // *mcp-flagged* one -- so if the true first registration for a
+    // `(workflow, name)` pair was not `mcp`-flagged but a later duplicate
+    // was, the generated tool advertised the later registration's
+    // schema/description while the runtime validates/admits against the
+    // earlier, non-mcp one. Fixed by resolving first-wins across the whole
+    // unfiltered list *before* filtering by `mcp`.
+    let mut update_key_counts: HashMap<(&str, &str), u32> = HashMap::new();
+    let mut effective_updates: HashMap<(&str, &str), &UpdateHandlerInfo> = HashMap::new();
+    for u in updates {
+        let key = (u.workflow, u.name);
+        *update_key_counts.entry(key).or_insert(0) += 1;
+        // First-wins, mirroring `Iterator::find`'s semantics.
+        effective_updates.entry(key).or_insert(u);
+    }
+    for ((workflow, name), count) in &update_key_counts {
+        if *count > 1 {
+            tracing::warn!(
+                workflow = %workflow,
+                update = %name,
+                registrations = count,
+                "update handler registered more than once for this workflow; the runtime \
+                 validates/admits via the FIRST registration (Iterator::find) and mcp tool \
+                 exposure resolves to that same effective UpdateHandlerInfo"
+            );
+        }
+    }
 
     let mut descriptors: Vec<McpWorkflowDescriptor> = Vec::new();
     let mut seen_operation_ids: std::collections::HashSet<String> =
@@ -212,22 +260,15 @@ pub fn collect_descriptors(
             );
             continue;
         }
-        let mut wf_updates: Vec<McpUpdateDescriptor> = Vec::new();
-        for u in updates.iter().filter(|u| u.mcp && u.workflow == info.name) {
-            if wf_updates.iter().any(|existing| existing.name == u.name) {
-                tracing::warn!(
-                    workflow = info.name,
-                    update = u.name,
-                    "duplicate mcp update registration; keeping the first"
-                );
-                continue;
-            }
-            wf_updates.push(McpUpdateDescriptor {
+        let mut wf_updates: Vec<McpUpdateDescriptor> = effective_updates
+            .values()
+            .filter(|u| u.workflow == info.name && u.mcp)
+            .map(|u| McpUpdateDescriptor {
                 name: u.name.to_string(),
                 input_type_hint: u.input_type_hint.to_string(),
                 output_type_hint: u.output_type_hint.to_string(),
-            });
-        }
+            })
+            .collect();
         wf_updates.sort_by(|a, b| a.name.cmp(&b.name));
         let candidate = McpWorkflowDescriptor {
             name: info.name.to_string(),
@@ -1246,6 +1287,27 @@ mod tests {
         );
     }
 
+    /// Code-review regression test (issue #597, PR #908): the collision
+    /// tie-break must follow *registration* order, not alphabetical order.
+    /// Registering `start_invoice` (which sorts *after* `invoice_status`
+    /// alphabetically) FIRST must keep `start_invoice`, not silently flip
+    /// the winner to whichever name sorts first.
+    #[test]
+    fn collect_descriptors_collision_tie_break_follows_registration_order_not_alphabetical() {
+        let descriptors = collect_descriptors(
+            &[wf("start_invoice", true), wf("invoice_status", true)],
+            &[],
+        );
+
+        let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["start_invoice"],
+            "start_invoice was registered first and must win the collision, regardless of \
+             alphabetical order"
+        );
+    }
+
     /// A workflow whose own update-derived operation id collides with
     /// another workflow's core tool name must also be excluded, not just
     /// workflow-vs-workflow collisions.
@@ -1361,6 +1423,85 @@ mod tests {
             .map(|u| u.name.as_str())
             .collect();
         assert_eq!(updates, vec!["approve", "zz"], "sorted, deduped");
+    }
+
+    /// Code-review regression test (issue #597, PR #908): duplicate
+    /// `(workflow, update_name)` resolution must match the runtime's own
+    /// `admit_update`/`update_with_start` lookup, which is first-wins
+    /// (`Iterator::find`). A first registration that is NOT `mcp`-flagged,
+    /// followed by a duplicate `(workflow, name)` registration that IS
+    /// `mcp`-flagged, must NOT be exposed -- the runtime validates/admits
+    /// against the first (non-mcp) registration, so exposing a tool derived
+    /// from the second would advertise an update the runtime does not
+    /// actually run that way.
+    #[test]
+    fn collect_descriptors_update_resolves_duplicates_first_wins_like_the_runtime_find() {
+        let first_non_mcp = UpdateHandlerInfo {
+            name: "approve",
+            workflow: "order_flow",
+            module: "tests",
+            input_type_hint: "FirstRequest",
+            output_type_hint: "bool",
+            has_validator: false,
+            handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
+            validator: None,
+            mcp: false,
+        };
+        let second_mcp = UpdateHandlerInfo {
+            name: "approve",
+            workflow: "order_flow",
+            module: "tests",
+            input_type_hint: "SecondRequest",
+            output_type_hint: "bool",
+            has_validator: false,
+            handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
+            validator: None,
+            mcp: true,
+        };
+        let descriptors =
+            collect_descriptors(&[wf("order_flow", true)], &[first_non_mcp, second_mcp]);
+        assert_eq!(
+            descriptors[0].updates.len(),
+            0,
+            "the runtime resolves 'approve' to the first (non-mcp) registration via \
+             Iterator::find; a later mcp-flagged duplicate must not surface a tool, got: {:?}",
+            descriptors[0].updates
+        );
+    }
+
+    /// The reverse direction: the first registration IS `mcp`-flagged, so
+    /// its schema/hint must be what's advertised even if a later duplicate
+    /// for the same `(workflow, name)` differs.
+    #[test]
+    fn collect_descriptors_update_first_mcp_registration_wins_over_later_duplicate() {
+        let first_mcp = UpdateHandlerInfo {
+            name: "approve",
+            workflow: "order_flow",
+            module: "tests",
+            input_type_hint: "FirstRequest",
+            output_type_hint: "bool",
+            has_validator: false,
+            handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
+            validator: None,
+            mcp: true,
+        };
+        let second_mcp = UpdateHandlerInfo {
+            name: "approve",
+            workflow: "order_flow",
+            module: "tests",
+            input_type_hint: "SecondRequest",
+            output_type_hint: "bool",
+            has_validator: false,
+            handler: |_ctx, _args| Box::pin(async move { Ok(serde_json::Value::Null) }),
+            validator: None,
+            mcp: true,
+        };
+        let descriptors = collect_descriptors(&[wf("order_flow", true)], &[first_mcp, second_mcp]);
+        assert_eq!(descriptors[0].updates.len(), 1);
+        assert_eq!(
+            descriptors[0].updates[0].input_type_hint, "FirstRequest",
+            "must reflect the FIRST registration's hint, matching Iterator::find resolution"
+        );
     }
 
     #[test]
