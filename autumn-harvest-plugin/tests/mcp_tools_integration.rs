@@ -63,6 +63,29 @@ async fn set_priority(_ctx: &WorkflowContext, req: PriorityRequest) -> Result<St
     Ok(format!("priority set to {}", req.level))
 }
 
+fn validate_priority(input: &Value) -> Result<(), String> {
+    let level = input.get("level").and_then(Value::as_str).unwrap_or("");
+    if level.is_empty() {
+        return Err("level must not be empty".to_string());
+    }
+    Ok(())
+}
+
+/// Validator-bearing mcp update — used to prove `{wf}_update_{name}` rejects
+/// an invalid payload at admission time instead of durably admitting it and
+/// letting it run/fail inside the workflow (code-review fix, PR #908).
+#[update(
+    workflow = "agent_approval_flow",
+    validator = validate_priority,
+    mcp
+)]
+async fn set_priority_validated(
+    _ctx: &WorkflowContext,
+    req: PriorityRequest,
+) -> Result<String, String> {
+    Ok(format!("validated priority set to {}", req.level))
+}
+
 /// Continues itself exactly once, then completes — used to prove
 /// `{wf}_status`/`{wf}_watch` resolve the `ContinuedAsNew` chain to the
 /// successor's real outcome instead of surfacing the sealed predecessor's
@@ -115,7 +138,7 @@ fn harvest_plugin() -> HarvestPlugin {
             __autumn_workflow_info_agent_relay_flow(),
             __autumn_workflow_info_agent_relay_signal_flow(),
         ])
-        .updates(updates![set_priority, ping_relay])
+        .updates(updates![set_priority, set_priority_validated, ping_relay])
         .worker(WorkerConfig::default())
         .api("/api/harvest")
         .mcp_tools()
@@ -537,4 +560,59 @@ async fn signal_and_update_follow_the_continue_as_new_chain_to_the_live_successo
     .await;
     assert_eq!(status["state"], "COMPLETED");
     assert_eq!(status["output"], json!("relay signalled with hello"));
+}
+
+/// Code-review regression test (issue #597, PR #908): an mcp update declared
+/// with `validator = ...` must reject an invalid payload *before* admission
+/// -- `{wf}_update_{name}` previously delegated straight to `admit_update`,
+/// which never consulted the registered validator, so an invalid payload
+/// became durable history (`UpdateAdmitted`) instead of being rejected at
+/// the edge.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn mcp_update_tool_rejects_invalid_payload_via_registered_validator() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(db).await;
+
+    let (is_error, started) = call_tool(
+        &client,
+        "start_agent_approval_flow",
+        json!({"body": "validator-test"}),
+    )
+    .await;
+    assert!(!is_error, "start must succeed, got: {started}");
+    let handle = started["execution_id"].as_str().unwrap().to_string();
+
+    wait_for_status(&client, "agent_approval_flow_status", &handle, |s| {
+        s["state"] == "RUNNING"
+    })
+    .await;
+
+    // Invalid payload (empty level): the validator must reject it before any
+    // durable admission, not let it run/fail inside the workflow.
+    let (is_error, rejected) = call_tool(
+        &client,
+        "agent_approval_flow_update_set_priority_validated",
+        json!({"handle": handle, "body": {"level": ""}}),
+    )
+    .await;
+    assert!(
+        is_error,
+        "an empty level must be rejected by the registered validator, got: {rejected}"
+    );
+
+    // The execution must be unaffected by the rejected attempt: a
+    // subsequent valid call still succeeds normally.
+    let (is_error, accepted) = call_tool(
+        &client,
+        "agent_approval_flow_update_set_priority_validated",
+        json!({"handle": handle, "body": {"level": "high"}}),
+    )
+    .await;
+    assert!(
+        !is_error,
+        "a valid payload must still be admitted and executed, got: {accepted}"
+    );
+    assert_eq!(accepted["output"], json!("validated priority set to high"));
 }

@@ -88,6 +88,12 @@ a published schema get a permissive object schema. Update tools currently
 publish a permissive schema carrying the Rust input type hint in the tool
 description (schema publishing for updates is a follow-up).
 
+An mcp update declared with `#[update(workflow = "…", validator = …, mcp)]`
+has its validator run before admission: an invalid payload is rejected
+(`422` with `{"error": "update rejected by validator", "reason"}`) instead
+of becoming durable history that then runs or fails deep inside the
+workflow.
+
 ## Streaming progress (`foo_watch`)
 
 The watch tool returns SSE that autumn-web's MCP layer projects onto the

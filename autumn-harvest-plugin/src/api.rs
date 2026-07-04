@@ -21003,6 +21003,33 @@ pub(crate) async fn admit_update(
         Err(e) => return e.into_response(),
     };
 
+    // Run the registered update handler's validator (if any) before
+    // admitting -- mirrors the validator check `update_with_start_workflow_execution`
+    // already runs, so an invalid payload is rejected at the edge instead of
+    // becoming durable history that runs/fails deep inside the workflow.
+    // Scoped by (workflow_name, update_name), not update_name alone, since two
+    // different workflows may register update handlers with the same name.
+    let execution_for_validation = load_execution(&mut conn, exec_id).await;
+    if let Ok(execution) = &execution_for_validation
+        && let Ok(runtime) = api_state.runtime()
+        && let Some(update_info) = runtime
+            .registry
+            .update_handlers
+            .iter()
+            .find(|h| h.workflow == execution.workflow_name && h.name == update_name)
+        && let Some(validator) = update_info.validator
+        && let Err(reason) = (validator)(&request.input)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "update rejected by validator",
+                "reason": reason,
+            })),
+        )
+            .into_response();
+    }
+
     let update_id = UpdateId::new();
 
     // Durably append the UpdateAdmitted event inside a FOR UPDATE transaction
