@@ -140,7 +140,8 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #534: origin column + per-schedule run-history index.
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
-    include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql")
+    include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -208,6 +209,11 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_schedules ADD COLUMN IF NOT EXISTS retry_policy JSONB NULL;\n",
     // issue #534: the modern start path inserts origin.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS origin TEXT NULL;\n",
+    // issue #603: the modern start path's full-row insert touches the
+    // nd_block_* columns even for a fresh (never-blocked) execution.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_blocked_at TIMESTAMPTZ NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_reason TEXT NULL;\n",
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_count INTEGER NOT NULL DEFAULT 0;\n",
 );
 
 /// Start a Postgres container with the harvest schema applied and return

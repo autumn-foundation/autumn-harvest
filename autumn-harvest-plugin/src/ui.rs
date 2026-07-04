@@ -8002,6 +8002,9 @@ mod tests {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             origin: None,
+            nd_blocked_at: None,
+            nd_block_reason: None,
+            nd_block_count: 0,
         }
     }
 

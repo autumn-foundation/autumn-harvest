@@ -106,7 +106,7 @@
       "default_threshold": "Page when p99 schedule-to-start latency for any queue exceeds 30 seconds over a 5-minute window. Tune the threshold to match your per-queue SLA.",
       "severity": "page",
       "owner_persona": "workflow on-call",
-      "description": "Tasks are waiting too long between becoming eligible and being claimed by a worker — the canonical signal that worker capacity is insufficient for current load.",
+      "description": "Tasks are waiting too long between becoming eligible and being claimed by a worker \u2014 the canonical signal that worker capacity is insufficient for current load.",
       "first_action": "harvest worker health --output json",
       "dependencies": [
         {
@@ -136,7 +136,7 @@
           {
             "kind": "promql",
             "expr": "harvest_queue_oldest_pending_age{queue=\"default\"} > 30",
-            "note": "Companion oldest-pending-age gauge fires within one sampler interval (≤15 s) when a task is stuck; useful as a fast-detection complement to the p99 histogram."
+            "note": "Companion oldest-pending-age gauge fires within one sampler interval (\u226415 s) when a task is stuck; useful as a fast-detection complement to the p99 histogram."
           }
         ]
       },
@@ -152,7 +152,7 @@
     {
       "id": "harvest_queue_backlog_growth",
       "status": "enforceable",
-      "signal_source": "ADR-0001/#138 gauge harvest.queue.depth sampled per configured queue. Secondary signal — superseded as primary page by harvest_queue_schedule_to_start_high (#501).",
+      "signal_source": "ADR-0001/#138 gauge harvest.queue.depth sampled per configured queue. Secondary signal \u2014 superseded as primary page by harvest_queue_schedule_to_start_high (#501).",
       "default_threshold": "Ticket when queue depth stays above 100 pending tasks and continues growing for 10 minutes. Tune absolute depth per queue throughput. Prefer the schedule-to-start p99 alert as the primary page.",
       "severity": "ticket",
       "owner_persona": "workflow on-call",
@@ -198,10 +198,10 @@
       "id": "harvest_worker_slot_saturation",
       "status": "enforceable",
       "signal_source": "Issue #531 gauges harvest.worker.slots_in_use / harvest.worker.slots_available, sampled in-process per worker against the workflow/activity dispatch semaphores. Labelled by bounded slot_type (workflow|activity).",
-      "default_threshold": "Ticket when a worker's slot utilization (slots_in_use / (slots_in_use + slots_available)) stays above 90% for 5 minutes for either slot_type. The 90% / 5m threshold is a STARTER DEFAULT, not a universal SLO — sustained high utilization is healthy for some throughput-oriented fleets; tune per queue/latency target. Pair with harvest.queue.depth to tell a worker bottleneck (slots saturated AND backlog growing) apart from a queue/DB bottleneck (backlog growing while slots are free).",
+      "default_threshold": "Ticket when a worker's slot utilization (slots_in_use / (slots_in_use + slots_available)) stays above 90% for 5 minutes for either slot_type. The 90% / 5m threshold is a STARTER DEFAULT, not a universal SLO \u2014 sustained high utilization is healthy for some throughput-oriented fleets; tune per queue/latency target. Pair with harvest.queue.depth to tell a worker bottleneck (slots saturated AND backlog growing) apart from a queue/DB bottleneck (backlog growing while slots are free).",
       "severity": "ticket",
       "owner_persona": "workflow on-call",
-      "description": "A worker's workflow or activity dispatch slots are nearly all in use — the worker, not the queue or DB, is the bottleneck. When this fires alongside a growing harvest.queue.depth, raising max_concurrent_* or adding workers will relieve the backlog. When slots are free but the backlog grows, the bottleneck is downstream (DB/throttled dependency) and adding workers will not help.",
+      "description": "A worker's workflow or activity dispatch slots are nearly all in use \u2014 the worker, not the queue or DB, is the bottleneck. When this fires alongside a growing harvest.queue.depth, raising max_concurrent_* or adding workers will relieve the backlog. When slots are free but the backlog grows, the bottleneck is downstream (DB/throttled dependency) and adding workers will not help.",
       "first_action": "harvest worker health --output json",
       "dependencies": [
         {
@@ -537,7 +537,7 @@
       "default_threshold": "Page when the activity success ratio drops below 90% over 5 minutes for any activity type. Tune per SLO.",
       "severity": "page",
       "owner_persona": "workflow owner",
-      "description": "The fraction of activity attempts that succeeded has fallen below the threshold for a given activity type. Unlike the legacy harvest_activity_failure_surge alert (which counts failed histogram samples), this alert is computed within a single metric family — harvest.activity.attempts{outcome} — so the ratio is accurate and directly actionable. outcome is bounded to two values (completed/failed), keeping cardinality low. execution.id is never a label.",
+      "description": "The fraction of activity attempts that succeeded has fallen below the threshold for a given activity type. Unlike the legacy harvest_activity_failure_surge alert (which counts failed histogram samples), this alert is computed within a single metric family \u2014 harvest.activity.attempts{outcome} \u2014 so the ratio is accurate and directly actionable. outcome is bounded to two values (completed/failed), keeping cardinality low. execution.id is never a label.",
       "first_action": "harvest dlq list --limit 25; check harvest.activity.failed for error.type breakdown and harvest.activity.retries for retry-storm indicators",
       "dependencies": [
         {
@@ -569,7 +569,7 @@
       "default_threshold": "Ticket when the retry rate for any activity type exceeds 5 retries/second sustained over 5 minutes. Tune with harvest_activity_retry_storm_critical for a page at the 20/s threshold.",
       "severity": "ticket",
       "owner_persona": "workflow owner",
-      "description": "A high retry rate for an activity type is the earliest warning of a degrading downstream dependency before work tips into the DLQ. harvest.activity.retries fires exactly once per retry actually scheduled (after the schedule_to_close deadline check), so the counter is the authoritative retry-storm signal independent of eventual success or failure. The existing harvest_activity_failure_surge alert fires only when failures are terminal — this alert catches storms that eventually succeed but are burning retries at scale.",
+      "description": "A high retry rate for an activity type is the earliest warning of a degrading downstream dependency before work tips into the DLQ. harvest.activity.retries fires exactly once per retry actually scheduled (after the schedule_to_close deadline check), so the counter is the authoritative retry-storm signal independent of eventual success or failure. The existing harvest_activity_failure_surge alert fires only when failures are terminal \u2014 this alert catches storms that eventually succeed but are burning retries at scale.",
       "first_action": "harvest dlq list --limit 25; check harvest.activity.failed{error.type} for the failure class causing retries; inspect circuit breaker state at GET /api/harvest/admin/circuits",
       "dependencies": [
         {
@@ -599,7 +599,7 @@
       "id": "harvest_activity_retry_storm_critical",
       "status": "enforceable",
       "signal_source": "harvest.activity.retries counter (issue #528).",
-      "default_threshold": "Page when the retry rate for any activity type exceeds 20 retries/second sustained over 5 minutes — at this scale the task queue saturates and other work is blocked.",
+      "default_threshold": "Page when the retry rate for any activity type exceeds 20 retries/second sustained over 5 minutes \u2014 at this scale the task queue saturates and other work is blocked.",
       "severity": "page",
       "owner_persona": "workflow owner",
       "description": "The page-tier companion to harvest_activity_retry_storm. At 20 retries/s the worker pool is under severe pressure and latency for all work on that queue will degrade. Escalate immediately if the retry rate does not drop within 5 minutes of first response.",
@@ -631,31 +631,41 @@
     {
       "id": "harvest_workflow_non_determinism",
       "status": "enforceable",
-      "signal_source": "ADR-0001/#138 counter harvest.workflow.non_determinism plus management API failure_cause query.",
-      "default_threshold": "Page immediately on any non-zero rate of non-deterministic replay failures. This indicates a replay-breaking deploy has been shipped to production.",
+      "signal_source": "ADR-0001/#138 counters harvest.workflow.non_determinism (detection, #480) and harvest.workflow.nondeterministic_block (non-terminal block entries, #603), plus the management API nd_blocked filter.",
+      "default_threshold": "Page immediately on any non-zero rate of replay-divergence detections. This indicates a replay-breaking deploy has been shipped to production.",
       "severity": "page",
       "owner_persona": "release on-call",
-      "description": "Workflow executions are failing during replay due to non-deterministic divergence (different history generated than previously recorded). This usually happens when a new code version changes workflow logic without proper version gating or routing protection.",
-      "first_action": "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism",
+      "description": "In-flight workflow executions are diverging on replay (different commands generated than previously recorded), usually because a new code version changed workflow logic without version gating or build routing. Since issue #603 the engine BLOCKS the affected executions non-terminally (state stays RUNNING, task re-pended with capped backoff) instead of terminally failing them: rolling back or fixing the offending build resumes the whole cohort with no per-execution operator action.",
+      "first_action": "GET /api/harvest/workflows?nd_blocked=true",
       "dependencies": [
         {
           "ref": "#480",
           "status": "shipped",
           "surface": "METRIC_WORKFLOW_NON_DETERMINISM / harvest.workflow.non_determinism"
+        },
+        {
+          "ref": "#603",
+          "status": "shipped",
+          "surface": "METRIC_WORKFLOW_ND_BLOCKED / harvest.workflow.nondeterministic_block + GET /workflows?nd_blocked=true"
         }
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "Non-determinism signals a logic mismatch. Labels include workflow and build_id. Keep build_id low-cardinality.",
+        "notes": "Non-determinism signals a logic mismatch. harvest_workflow_non_determinism_total carries workflow and build_id labels (keep build_id low-cardinality); harvest_workflow_nondeterministic_block_total carries workflow and queue.",
         "expressions": [
           {
             "kind": "promql",
             "expr": "sum by (workflow, build_id) (increase(harvest_workflow_non_determinism_total[5m])) > 0"
+          },
+          {
+            "kind": "promql",
+            "expr": "sum by (workflow, queue) (increase(harvest_workflow_nondeterministic_block_total[5m])) > 0"
           }
         ]
       },
       "management_checks": [
-        "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism"
+        "GET /api/harvest/workflows?nd_blocked=true",
+        "GET /api/harvest/workflows?state=FAILED&failure_cause=non_determinism (pre-#603 terminally-failed rows only)"
       ],
       "runbook": "docs/runbooks/harvest-alerts.md#harvest_workflow_non_determinism"
     }
