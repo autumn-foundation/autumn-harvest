@@ -27,14 +27,20 @@ pub struct TypedWorkflowResult<T> {
 }
 
 /// Type-safe awaitable handle for one workflow execution.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TypedWorkflowHandle<T> {
     inner: WorkflowHandle,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<fn() -> T>,
 }
 
-unsafe impl<T> Send for TypedWorkflowHandle<T> {}
-unsafe impl<T> Sync for TypedWorkflowHandle<T> {}
+impl<T> Clone for TypedWorkflowHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
 
 impl<T> TypedWorkflowHandle<T> {
     /// Wrap an untyped [`WorkflowHandle`] with type parameter `T` representing
