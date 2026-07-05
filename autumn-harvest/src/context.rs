@@ -5130,8 +5130,11 @@ impl WorkflowContext {
         // pushing any command yet, so a branch that already has a terminal
         // recorded (the common case on any replay after the race resolves)
         // never re-emits a stray dispatch/wait command for a cancelled sibling.
-        let mut resolved: Vec<(usize, HarvestResult<Value>)> = Vec::new();
-        let mut to_dispatch: Vec<RaceDispatch> = Vec::new();
+        //
+        // ⚡ Bolt: Pre-allocate vectors using the number of branches to prevent
+        // intermediate heap allocations during branch evaluation.
+        let mut resolved: Vec<(usize, HarvestResult<Value>)> = Vec::with_capacity(branches.len());
+        let mut to_dispatch: Vec<RaceDispatch> = Vec::with_capacity(branches.len());
 
         for (index, branch) in branches.iter().enumerate() {
             match &branch.kind {
@@ -5459,8 +5462,11 @@ impl WorkflowContext {
                 details: Value::from(winner_index as u64),
             });
 
-            let mut activities = Vec::new();
-            let mut children = Vec::new();
+            // ⚡ Bolt: Pre-allocate cancellation tracking vectors based on the number
+            // of spawned branches (minus the winner) to prevent reallocations.
+            let losers_count = to_dispatch.len().saturating_sub(1);
+            let mut activities = Vec::with_capacity(losers_count);
+            let mut children = Vec::with_capacity(losers_count);
             for dispatch in to_dispatch {
                 if dispatch.index == winner_index {
                     continue;
