@@ -3,9 +3,9 @@
 //! Pure, no-DB tests for `WebhookTriggerInfo`/`WebhookCtx`/`WebhookHandlerFn`/
 //! `validate_webhook_triggers`. These exercise the shape the `#[webhook]` macro
 //! (issue #344, Layer 2) generates and the plugin route layer (Layer 3) consumes.
-//! `WebhookHandlerFn` takes its payload by value (the real dispatch shim
-//! deserializes an owned `Value`), so these hand-written fixtures do too.
-#![allow(clippy::needless_pass_by_value)]
+//! `WebhookHandlerFn` takes its payload by reference (the real dispatch shim
+//! deserializes from a borrowed `&Value` to avoid cloning the verified body),
+//! so these hand-written fixtures do too.
 
 use autumn_harvest::types::WorkflowId;
 use autumn_harvest::webhook_trigger::{
@@ -25,7 +25,7 @@ fn ctx_fixture(path: &'static str) -> WebhookCtx {
 
 fn starts_handler(
     _ctx: &WebhookCtx,
-    payload: serde_json::Value,
+    payload: &serde_json::Value,
 ) -> Result<WorkflowId, WebhookHandlerError> {
     let order_id = payload
         .get("order_id")
@@ -36,7 +36,7 @@ fn starts_handler(
 
 fn always_rejects(
     _ctx: &WebhookCtx,
-    _payload: serde_json::Value,
+    _payload: &serde_json::Value,
 ) -> Result<WorkflowId, WebhookHandlerError> {
     Err(WebhookHandlerError::Rejected("nope".to_string()))
 }
@@ -73,7 +73,7 @@ fn webhook_target_signals_with_start_reports_its_workflow() {
 fn handler_shim_returns_deterministic_workflow_id_on_success() {
     let ctx = ctx_fixture("/hooks/orders");
     let payload = serde_json::json!({"order_id": "o-1"});
-    let id = starts_handler(&ctx, payload).expect("mapping should succeed");
+    let id = starts_handler(&ctx, &payload).expect("mapping should succeed");
     assert_eq!(id.as_str(), "order-o-1");
 }
 
@@ -81,7 +81,7 @@ fn handler_shim_returns_deterministic_workflow_id_on_success() {
 fn handler_shim_classifies_deserialize_failure() {
     let ctx = ctx_fixture("/hooks/orders");
     let payload = serde_json::json!({"not_order_id": "o-1"});
-    let err = starts_handler(&ctx, payload).unwrap_err();
+    let err = starts_handler(&ctx, &payload).unwrap_err();
     assert_eq!(
         err,
         WebhookHandlerError::Deserialize("missing order_id".to_string())
@@ -91,7 +91,7 @@ fn handler_shim_classifies_deserialize_failure() {
 #[test]
 fn handler_shim_classifies_user_rejection() {
     let ctx = ctx_fixture("/hooks/orders");
-    let err = always_rejects(&ctx, serde_json::json!({})).unwrap_err();
+    let err = always_rejects(&ctx, &serde_json::json!({})).unwrap_err();
     assert_eq!(err, WebhookHandlerError::Rejected("nope".to_string()));
 }
 

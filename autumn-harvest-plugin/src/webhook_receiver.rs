@@ -22,12 +22,33 @@
 //! delegates to the same primitives the plain management API uses --
 //! [`crate::api::start_workflow`] / [`crate::api::signal_with_start_workflow`]
 //! -- so schema validation, the admission gate, debounce/batch/SLA/execution-
-//! timeout resolution, and audit all apply identically to a webhook-triggered
-//! start. This handler only reshapes the successful response into the
-//! `{"status", "workflow_exec_id", "workflow_id"}` envelope the issue
-//! specifies and classifies outcomes for `harvest.webhook.received`/`.rejected`.
+//! timeout resolution all apply identically to a webhook-triggered start.
+//! [`reshape_dispatch_response`] then reshapes the delegate's own response
+//! into the issue's `{"status", "workflow_exec_id", "workflow_id"}` envelope,
+//! classifies the outcome for `harvest.webhook.received`/`.rejected`, and
+//! writes this module's own `webhook.trigger` audit row (the delegate's
+//! `workflow.start`/`workflow.signal_with_start` audit row is a separate,
+//! additional record -- this one exists so an operator can find "which
+//! webhook path triggered this" without cross-referencing route strings).
+//!
+//! Delegating to the plain management-API handlers (rather than calling
+//! `execution.rs` primitives directly) avoids re-implementing admission-gate,
+//! debounce, batch, and schema-validation logic a second time, but couples
+//! [`reshape_dispatch_response`] to those handlers' HTTP response *shape*
+//! (status code + JSON body) rather than their typed return values --
+//! several of the outcome-classification bugs this module has had were
+//! instances of that coupling (a `202` debounce admission or an ordinary
+//! delegate-side `4xx` rejection being misread as an internal error). Status
+//! codes are classified defensively (`is_client_error()` before falling
+//! through to "anything else is internal") precisely because of that
+//! coupling; a future response-shape change on the delegate side needs the
+//! classification here re-checked by hand.
 
+use autumn_harvest::audit::{
+    self, OP_WEBHOOK_TRIGGER, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_WORKFLOW,
+};
 use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::models::NewAuditRecord;
 use autumn_harvest::telemetry::{MetricsRecorder, WebhookOutcome};
 use autumn_harvest::webhook_trigger::{
     WebhookCtx, WebhookHandlerError, WebhookTarget, WebhookTriggerInfo, validate_webhook_triggers,
@@ -84,13 +105,14 @@ fn build_webhook_route(
     let queue = trigger.queue;
 
     let handler = axum::routing::post(
-        move |hook: Result<SignedWebhook, autumn_web::AutumnError>| {
+        move |headers: axum::http::HeaderMap,
+              hook: Result<SignedWebhook, autumn_web::AutumnError>| {
             let api_state = api_state.clone();
             // Boxed: the delegated start/signal-with-start handler's future is
             // large (clippy::large_futures) and this is a cold edge path.
             async move {
                 Box::pin(handle_webhook(
-                    api_state, path, target, handler_fn, queue, hook,
+                    api_state, path, target, handler_fn, queue, headers, hook,
                 ))
                 .await
             }
@@ -169,6 +191,7 @@ async fn handle_webhook(
     target: WebhookTarget,
     handler: autumn_harvest::webhook_trigger::WebhookHandlerFn,
     queue: Option<&'static str>,
+    headers: axum::http::HeaderMap,
     hook: Result<SignedWebhook, autumn_web::AutumnError>,
 ) -> axum::response::Response {
     // Check the verification result *before* the runtime-installed check: a
@@ -236,7 +259,7 @@ async fn handle_webhook(
         );
     }
 
-    let workflow_id = match handler(&ctx, payload.clone()) {
+    let workflow_id = match handler(&ctx, &payload) {
         Ok(id) => id,
         Err(WebhookHandlerError::Deserialize(msg)) => {
             record_outcome(metrics.as_ref(), path, WebhookOutcome::ParseFailed);
@@ -258,7 +281,7 @@ async fn handle_webhook(
                 Extension(api_state.clone()),
                 axum::extract::Path(workflow.to_string()),
                 None,
-                axum::http::HeaderMap::new(),
+                headers.clone(),
                 Json(StartWorkflowRequest::from_webhook(
                     workflow_id.as_str().to_string(),
                     payload,
@@ -275,7 +298,7 @@ async fn handle_webhook(
                 Extension(api_state.clone()),
                 axum::extract::Path(workflow.to_string()),
                 None,
-                axum::http::HeaderMap::new(),
+                headers.clone(),
                 Json(SignalWithStartRequest::from_webhook(
                     workflow_id.as_str().to_string(),
                     payload,
@@ -288,32 +311,98 @@ async fn handle_webhook(
         }
     };
 
-    reshape_dispatch_response(metrics.as_ref(), path, dispatch_response).await
+    let route = format!("POST {path}");
+    let audit_ctx = DispatchAuditCtx {
+        api_state: &api_state,
+        headers: &headers,
+        route: &route,
+        workflow_id: workflow_id.as_str(),
+        delivery_id: ctx.delivery_id.as_deref(),
+    };
+    reshape_dispatch_response(metrics.as_ref(), path, dispatch_response, audit_ctx).await
+}
+
+/// Context needed to write the `webhook.trigger` audit row for one dispatch
+/// attempt, threaded through from the verified request.
+struct DispatchAuditCtx<'a> {
+    api_state: &'a HarvestApiState,
+    headers: &'a axum::http::HeaderMap,
+    route: &'a str,
+    /// The mapping function's deterministic `WorkflowId` -- used as a
+    /// `target_id` fallback when the delegate never produced an execution
+    /// (e.g. a debounce/batch admission, or a delegate-side rejection).
+    workflow_id: &'a str,
+    delivery_id: Option<&'a str>,
 }
 
 /// A minimal shape shared by [`crate::api`]'s `StartWorkflowResponse` and
 /// `SignalWithStartResponse` -- both carry `execution_id`/`workflow_id`,
 /// which is all this module needs to build its own envelope. Reading only
 /// these two fields (rather than the private response types) avoids
-/// widening either type's visibility beyond what's needed.
+/// widening either type's visibility beyond what's needed. `signal_delivered`
+/// is present only on `SignalWithStartResponse`: a `SignalsWithStart` target
+/// reports `200 OK` for both "attached to an existing execution and
+/// delivered a genuinely new signal" and "deduped redelivery" -- the boolean
+/// is the only way this module can tell them apart.
 #[derive(serde::Deserialize)]
 struct DispatchIds {
     execution_id: String,
     workflow_id: String,
+    #[serde(default)]
+    signal_delivered: Option<bool>,
 }
 
 /// Rewrite a successful `start_workflow`/`signal_with_start_workflow` response
-/// (`201`/`200`) into the issue's `{"status", "workflow_exec_id",
-/// "workflow_id"}` envelope (`202`/`200`); pass any error response through
-/// unchanged (it already carries a structured JSON body from the delegate).
+/// into the issue's `{"status", "workflow_exec_id", "workflow_id"}` envelope;
+/// pass a debounced/batched `202 Accepted` admission and any delegate error
+/// response through unchanged (both already carry a structured JSON body).
+/// Writes the `webhook.trigger` audit row for every dispatch attempt that
+/// reaches this point -- i.e. passed signature verification, JSON parsing,
+/// and the mapping function -- whether the delegate ultimately accepted or
+/// rejected it.
 async fn reshape_dispatch_response(
     metrics: &dyn MetricsRecorder,
     path: &str,
     response: axum::response::Response,
+    audit_ctx: DispatchAuditCtx<'_>,
 ) -> axum::response::Response {
     let status = response.status();
+
+    // A debounce/batch admission gate deferred the actual start -- there is
+    // no execution yet to reshape the body against, but this is a genuine,
+    // successful admission, not an internal error.
+    if status == axum::http::StatusCode::ACCEPTED {
+        record_outcome(metrics, path, WebhookOutcome::Accepted);
+        write_dispatch_audit(&audit_ctx, STATUS_SUCCEEDED, None, None).await;
+        return response;
+    }
+
+    // The delegate itself rejected the request (e.g. issue #373 schema
+    // validation, a debounce/start_at conflict, a batching-max-size limit)
+    // -- a caller/config problem, not an internal failure of this handler.
+    // Pass the delegate's own structured error body through unchanged rather
+    // than manufacturing a new one, and don't count it as an internal error.
+    if status.is_client_error() {
+        record_outcome(metrics, path, WebhookOutcome::ParseFailed);
+        write_dispatch_audit(
+            &audit_ctx,
+            STATUS_FAILED,
+            None,
+            Some(&format!("dispatch rejected by delegate: {status}")),
+        )
+        .await;
+        return response;
+    }
+
     if status != axum::http::StatusCode::CREATED && status != axum::http::StatusCode::OK {
         record_outcome(metrics, path, WebhookOutcome::InternalError);
+        write_dispatch_audit(
+            &audit_ctx,
+            STATUS_FAILED,
+            None,
+            Some(&format!("dispatch failed: {status}")),
+        )
+        .await;
         return response;
     }
 
@@ -321,6 +410,13 @@ async fn reshape_dispatch_response(
         Ok(b) => b,
         Err(e) => {
             record_outcome(metrics, path, WebhookOutcome::InternalError);
+            write_dispatch_audit(
+                &audit_ctx,
+                STATUS_FAILED,
+                None,
+                Some(&format!("failed to read dispatch response: {e}")),
+            )
+            .await;
             return error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -332,6 +428,13 @@ async fn reshape_dispatch_response(
         Ok(p) => p,
         Err(e) => {
             record_outcome(metrics, path, WebhookOutcome::InternalError);
+            write_dispatch_audit(
+                &audit_ctx,
+                STATUS_FAILED,
+                None,
+                Some(&format!("failed to parse dispatch response: {e}")),
+            )
+            .await;
             return error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -340,12 +443,26 @@ async fn reshape_dispatch_response(
         }
     };
 
-    let outcome = if status == axum::http::StatusCode::CREATED {
-        WebhookOutcome::Accepted
-    } else {
-        WebhookOutcome::IdempotentReplay
-    };
+    // `201 Created` is unambiguous (`Accepted`). A `200 OK` is ambiguous:
+    // `signal_delivered == Some(true)` means a live execution just received a
+    // genuinely new signal (still a first-time `Accepted` from the sender's
+    // point of view), vs. `Some(false)`/`None` (a `Starts` target, whose
+    // `200 OK` is always a redelivery of an already-started deterministic
+    // `WorkflowId`) meaning a deduped redelivery.
+    let outcome =
+        if status == axum::http::StatusCode::CREATED || parsed.signal_delivered == Some(true) {
+            WebhookOutcome::Accepted
+        } else {
+            WebhookOutcome::IdempotentReplay
+        };
     record_outcome(metrics, path, outcome);
+    write_dispatch_audit(
+        &audit_ctx,
+        STATUS_SUCCEEDED,
+        Some(parsed.execution_id.as_str()),
+        None,
+    )
+    .await;
     let http_status = if outcome == WebhookOutcome::Accepted {
         axum::http::StatusCode::ACCEPTED
     } else {
@@ -360,6 +477,87 @@ async fn reshape_dispatch_response(
         })),
     )
         .into_response()
+}
+
+/// Write the `webhook.trigger` audit row for one dispatch attempt (issue
+/// #344's audit AC). Best-effort: a failure to acquire a connection or
+/// insert the row is logged and swallowed rather than turned into a second
+/// error response layered on top of the dispatch outcome already decided --
+/// the sender already has its real HTTP response, and a broken audit sink
+/// must not un-deliver it.
+///
+/// When `exec_id` is known (any dispatch that produced or attached to an
+/// execution), the row is written to that execution's own shard via
+/// [`crate::api::db_conn_for_execution`], matching every other execution-
+/// scoped audit write in this codebase. When there is no execution yet (a
+/// debounced/batched admission, or a delegate-side rejection before an
+/// execution was created), the row is written to the default shard,
+/// mirroring the debounce/batch admission-audit writes in `api.rs`.
+async fn write_dispatch_audit(
+    audit_ctx: &DispatchAuditCtx<'_>,
+    status: &'static str,
+    exec_id: Option<&str>,
+    error_summary: Option<&str>,
+) {
+    let (actor, source, request_id) =
+        crate::api::audit_context(audit_ctx.headers, audit_ctx.api_state);
+
+    let acquired = if let Some(raw_exec_id) = exec_id {
+        match crate::api::parse_execution_id(raw_exec_id) {
+            Ok(id) => match crate::api::db_conn_for_execution(audit_ctx.api_state, id).await {
+                Ok(conn) => Some((conn, Some(id.shard().as_i32()))),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "audit conn acquisition failed for webhook.trigger"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::error!(error = %e, "invalid execution id for webhook.trigger audit");
+                None
+            }
+        }
+    } else {
+        match audit_ctx.api_state.storage_pool() {
+            Ok(pool) => match crate::api::acquire_conn(pool.default_pool()).await {
+                Ok(conn) => Some((conn, None)),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "audit conn acquisition failed for webhook.trigger"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::error!(error = %e, "storage pool unavailable for webhook.trigger audit");
+                None
+            }
+        }
+    };
+
+    let Some((mut conn, shard_id)) = acquired else {
+        return;
+    };
+
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_WEBHOOK_TRIGGER,
+        target_type: TARGET_WORKFLOW,
+        target_id: exec_id.or(Some(audit_ctx.workflow_id)),
+        route_or_command: audit_ctx.route,
+        request_id: request_id.as_deref(),
+        idempotency_key: audit_ctx.delivery_id,
+        status,
+        error_summary,
+        shard_id,
+        source: &source,
+    };
+    if let Err(e) = audit::insert_audit(&mut conn, &ar).await {
+        tracing::error!(error = %e, "audit insert failed for webhook.trigger");
+    }
 }
 
 #[cfg(test)]
@@ -438,5 +636,265 @@ mod tests {
         record_outcome(&m, "/hooks/x", WebhookOutcome::MissingIdempotency);
         record_outcome(&m, "/hooks/x", WebhookOutcome::InternalError);
         assert_eq!(m.rejected.lock().unwrap().len(), 4);
+    }
+
+    fn no_db_audit_ctx<'a>(
+        api_state: &'a HarvestApiState,
+        headers: &'a axum::http::HeaderMap,
+    ) -> DispatchAuditCtx<'a> {
+        DispatchAuditCtx {
+            api_state,
+            headers,
+            route: "POST /hooks/test",
+            workflow_id: "wf-1",
+            delivery_id: None,
+        }
+    }
+
+    /// `write_dispatch_audit` is exercised transitively by every case below --
+    /// with no storage pool installed (a fresh no-DB [`HarvestApiState`]),
+    /// `storage_pool()`/`db_conn_for_execution` return `Err`, so the audit
+    /// write is a logged no-op rather than a panic. This lets the pure
+    /// outcome-classification logic in [`reshape_dispatch_response`] be
+    /// tested here without Docker/testcontainers; the actual audit *row*
+    /// content is covered by `webhook_receiver_integration.rs`.
+    #[tokio::test]
+    async fn reshape_passes_a_debounced_202_through_unchanged_as_accepted() {
+        let m = RecordingMetrics::default();
+        let api_state = HarvestApiState::new();
+        let headers = axum::http::HeaderMap::new();
+        let debounce_body = serde_json::json!({
+            "debounced": true,
+            "workflow_name": "wf",
+            "workflow_id": "wf-1",
+            "debounce_key": "k",
+            "fire_at": "2026-01-01T00:00:00Z",
+            "pending_count": 3,
+        });
+        let response = (
+            axum::http::StatusCode::ACCEPTED,
+            Json(debounce_body.clone()),
+        )
+            .into_response();
+
+        let out = reshape_dispatch_response(
+            &m,
+            "/hooks/x",
+            response,
+            no_db_audit_ctx(&api_state, &headers),
+        )
+        .await;
+
+        assert_eq!(out.status(), axum::http::StatusCode::ACCEPTED);
+        assert_eq!(
+            m.received.lock().unwrap().as_slice(),
+            [("/hooks/x".to_string(), WebhookOutcome::Accepted)]
+        );
+        assert!(m.rejected.lock().unwrap().is_empty());
+        let bytes = axum::body::to_bytes(out.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed, debounce_body,
+            "debounce body must pass through byte-for-byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn reshape_classifies_delegate_client_error_as_parse_failed_not_internal() {
+        let m = RecordingMetrics::default();
+        let api_state = HarvestApiState::new();
+        let headers = axum::http::HeaderMap::new();
+        let response = (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "input validation failed"})),
+        )
+            .into_response();
+
+        let out = reshape_dispatch_response(
+            &m,
+            "/hooks/x",
+            response,
+            no_db_audit_ctx(&api_state, &headers),
+        )
+        .await;
+
+        assert_eq!(out.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            m.received.lock().unwrap().as_slice(),
+            [("/hooks/x".to_string(), WebhookOutcome::ParseFailed)]
+        );
+        assert_eq!(
+            m.rejected.lock().unwrap().as_slice(),
+            [("/hooks/x".to_string(), WebhookOutcome::ParseFailed)],
+            "an ordinary delegate-side 4xx must not be counted as internal_error"
+        );
+    }
+
+    #[tokio::test]
+    async fn reshape_classifies_ok_with_signal_delivered_true_as_accepted() {
+        let m = RecordingMetrics::default();
+        let api_state = HarvestApiState::new();
+        let headers = axum::http::HeaderMap::new();
+        let response = (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({
+                "execution_id": "e1",
+                "workflow_name": "wf",
+                "workflow_id": "wf-1",
+                "state": "RUNNING",
+                "started_fresh": false,
+                "signal_delivered": true,
+            })),
+        )
+            .into_response();
+
+        let out = reshape_dispatch_response(
+            &m,
+            "/hooks/x",
+            response,
+            no_db_audit_ctx(&api_state, &headers),
+        )
+        .await;
+
+        assert_eq!(
+            out.status(),
+            axum::http::StatusCode::ACCEPTED,
+            "a genuinely new signal delivered to an attached execution is `accepted`, not a replay"
+        );
+        assert_eq!(
+            m.received.lock().unwrap().as_slice(),
+            [("/hooks/x".to_string(), WebhookOutcome::Accepted)]
+        );
+        assert!(m.rejected.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reshape_classifies_ok_with_signal_delivered_false_as_idempotent_replay() {
+        let m = RecordingMetrics::default();
+        let api_state = HarvestApiState::new();
+        let headers = axum::http::HeaderMap::new();
+        let response = (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({
+                "execution_id": "e1",
+                "workflow_name": "wf",
+                "workflow_id": "wf-1",
+                "state": "RUNNING",
+                "started_fresh": false,
+                "signal_delivered": false,
+            })),
+        )
+            .into_response();
+
+        let out = reshape_dispatch_response(
+            &m,
+            "/hooks/x",
+            response,
+            no_db_audit_ctx(&api_state, &headers),
+        )
+        .await;
+
+        assert_eq!(out.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            m.received.lock().unwrap().as_slice(),
+            [("/hooks/x".to_string(), WebhookOutcome::IdempotentReplay)]
+        );
+        assert!(m.rejected.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reshape_classifies_ok_with_no_signal_delivered_field_as_idempotent_replay() {
+        // The `Starts` target's response shape has no `signal_delivered`
+        // field at all -- its `200 OK` is always a redelivery.
+        let m = RecordingMetrics::default();
+        let api_state = HarvestApiState::new();
+        let headers = axum::http::HeaderMap::new();
+        let response = (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({
+                "execution_id": "e1",
+                "workflow_name": "wf",
+                "workflow_id": "wf-1",
+                "state": "RUNNING",
+            })),
+        )
+            .into_response();
+
+        let out = reshape_dispatch_response(
+            &m,
+            "/hooks/x",
+            response,
+            no_db_audit_ctx(&api_state, &headers),
+        )
+        .await;
+
+        assert_eq!(out.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            m.received.lock().unwrap().as_slice(),
+            [("/hooks/x".to_string(), WebhookOutcome::IdempotentReplay)]
+        );
+    }
+
+    #[tokio::test]
+    async fn reshape_classifies_created_as_accepted() {
+        let m = RecordingMetrics::default();
+        let api_state = HarvestApiState::new();
+        let headers = axum::http::HeaderMap::new();
+        let response = (
+            axum::http::StatusCode::CREATED,
+            Json(serde_json::json!({
+                "execution_id": "e1",
+                "workflow_name": "wf",
+                "workflow_id": "wf-1",
+                "state": "RUNNING",
+            })),
+        )
+            .into_response();
+
+        let out = reshape_dispatch_response(
+            &m,
+            "/hooks/x",
+            response,
+            no_db_audit_ctx(&api_state, &headers),
+        )
+        .await;
+
+        assert_eq!(out.status(), axum::http::StatusCode::ACCEPTED);
+        assert_eq!(
+            m.received.lock().unwrap().as_slice(),
+            [("/hooks/x".to_string(), WebhookOutcome::Accepted)]
+        );
+    }
+
+    #[tokio::test]
+    async fn reshape_classifies_a_genuine_5xx_as_internal_error() {
+        let m = RecordingMetrics::default();
+        let api_state = HarvestApiState::new();
+        let headers = axum::http::HeaderMap::new();
+        let response = (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "storage pool exhausted"})),
+        )
+            .into_response();
+
+        let out = reshape_dispatch_response(
+            &m,
+            "/hooks/x",
+            response,
+            no_db_audit_ctx(&api_state, &headers),
+        )
+        .await;
+
+        assert_eq!(out.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            m.received.lock().unwrap().as_slice(),
+            [("/hooks/x".to_string(), WebhookOutcome::InternalError)]
+        );
+        assert_eq!(
+            m.rejected.lock().unwrap().as_slice(),
+            [("/hooks/x".to_string(), WebhookOutcome::InternalError)]
+        );
     }
 }

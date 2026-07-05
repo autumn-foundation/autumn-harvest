@@ -79,7 +79,7 @@ fn handler_shim_round_trips_typed_payload_to_workflow_id() {
     let info = map_order_info();
     let ctx = WebhookCtx::new("/hooks/orders", "orders", "generic", None, None, vec![]);
     let payload = serde_json::json!({"order_id": "o-42"});
-    let id = (info.handler)(&ctx, payload).expect("mapping should succeed");
+    let id = (info.handler)(&ctx, &payload).expect("mapping should succeed");
     assert_eq!(id.as_str(), "order-o-42");
 }
 
@@ -88,7 +88,7 @@ fn handler_shim_classifies_deserialize_failure_for_malformed_payload() {
     let info = map_order_info();
     let ctx = WebhookCtx::new("/hooks/orders", "orders", "generic", None, None, vec![]);
     let payload = serde_json::json!({"not_order_id": "o-42"});
-    let err = (info.handler)(&ctx, payload).unwrap_err();
+    let err = (info.handler)(&ctx, &payload).unwrap_err();
     assert!(matches!(err, WebhookHandlerError::Deserialize(_)));
 }
 
@@ -97,7 +97,7 @@ fn handler_shim_classifies_user_rejection() {
     let info = map_payment_info();
     let ctx = WebhookCtx::new("/hooks/stripe", "stripe", "stripe", None, None, vec![]);
     let payload = serde_json::json!({"amount_cents": -5});
-    let err = (info.handler)(&ctx, payload).unwrap_err();
+    let err = (info.handler)(&ctx, &payload).unwrap_err();
     assert_eq!(
         err,
         WebhookHandlerError::Rejected("amount must be positive".to_string())

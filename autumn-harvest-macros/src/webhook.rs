@@ -30,6 +30,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{ItemFn, LitStr, parse::Parser as _};
 
+use crate::attr_util::{first_param_is_ctx_type, returns_result};
+
 struct WebhookAttrs {
     path: Option<String>,
     starts: Option<String>,
@@ -164,7 +166,7 @@ pub fn webhook_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
-    if !first_param_is_webhook_ctx(&func.sig.inputs) {
+    if !first_param_is_ctx_type(&func.sig.inputs, "WebhookCtx") {
         return syn::Error::new_spanned(
             &func.sig,
             "#[webhook] mapping functions must take `ctx: &WebhookCtx` as the first argument",
@@ -208,14 +210,19 @@ pub fn webhook_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         pub fn #companion_name() -> ::autumn_harvest::WebhookTriggerInfo {
             fn __dispatch(
                 ctx: &::autumn_harvest::WebhookCtx,
-                payload: ::autumn_harvest::serde_json::Value,
+                payload: &::autumn_harvest::serde_json::Value,
             ) -> ::std::result::Result<
                 ::autumn_harvest::WorkflowId,
                 ::autumn_harvest::WebhookHandlerError,
             > {
-                let typed = ::autumn_harvest::serde_json::from_value(payload).map_err(|e| {
-                    ::autumn_harvest::WebhookHandlerError::Deserialize(e.to_string())
-                })?;
+                // Deserialize from a borrowed `&Value` (via its `Deserializer`
+                // impl) instead of `serde_json::from_value`, which requires an
+                // owned `Value` -- avoids a clone of the whole verified body on
+                // every dispatch.
+                let typed = <_ as ::autumn_harvest::serde::Deserialize>::deserialize(payload)
+                    .map_err(|e| {
+                        ::autumn_harvest::WebhookHandlerError::Deserialize(e.to_string())
+                    })?;
                 #fn_name(ctx, typed).map_err(|e| {
                     ::autumn_harvest::WebhookHandlerError::Rejected(e.to_string())
                 })
@@ -236,42 +243,4 @@ pub fn webhook_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #companion_name()
         }
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Returns `true` when the first parameter matches `ctx: &WebhookCtx`.
-fn first_param_is_webhook_ctx(
-    inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>,
-) -> bool {
-    let Some(first) = inputs.first() else {
-        return false;
-    };
-    let syn::FnArg::Typed(pt) = first else {
-        return false;
-    };
-    let syn::Type::Reference(r) = &*pt.ty else {
-        return false;
-    };
-    let syn::Type::Path(tp) = &*r.elem else {
-        return false;
-    };
-    tp.path
-        .segments
-        .last()
-        .is_some_and(|s| s.ident == "WebhookCtx")
-}
-
-fn returns_result(output: &syn::ReturnType) -> bool {
-    let syn::ReturnType::Type(_, ty) = output else {
-        return false;
-    };
-    let syn::Type::Path(type_path) = &**ty else {
-        return false;
-    };
-    type_path
-        .path
-        .segments
-        .last()
-        .is_some_and(|s| s.ident == "Result")
 }

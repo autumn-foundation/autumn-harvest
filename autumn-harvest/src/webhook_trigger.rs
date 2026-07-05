@@ -125,8 +125,14 @@ impl std::error::Error for WebhookHandlerError {}
 /// deserializes `payload` into the user's typed parameter and invokes the
 /// (synchronous, by design — see the module docs on why webhook mapping
 /// functions never do I/O) mapping function.
+///
+/// `payload` is borrowed rather than owned: the plugin's dispatch path needs
+/// the same verified body both for this shim's deserialization and, on
+/// dispatch, as the workflow input/signal payload it hands to the delegate
+/// start call -- taking `&Value` here lets the caller keep its own owned
+/// copy without an extra clone per dispatch.
 pub type WebhookHandlerFn =
-    fn(&WebhookCtx, serde_json::Value) -> Result<WorkflowId, WebhookHandlerError>;
+    fn(&WebhookCtx, &serde_json::Value) -> Result<WorkflowId, WebhookHandlerError>;
 
 /// Where a verified webhook delivery is routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
