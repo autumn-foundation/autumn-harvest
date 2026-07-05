@@ -78,10 +78,20 @@ impl AllowlistEntry {
     /// `"api.example.com:8443"`, or `"*.example.com:8443"`.
     #[must_use]
     pub fn parse(pattern: &str) -> Self {
+        // issue #921 review (Codex): an out-of-range port digit string (e.g.
+        // "api.example.com:70000", which cannot fit in a u16) must NOT
+        // silently fall back to an *unpinned* entry — that would broaden a
+        // malformed SSRF-allowlist pattern into "any port on this host" is
+        // allowed, exactly backwards for a security control. Only split the
+        // host from the port when the digits actually parse as a valid
+        // `u16`; otherwise treat the whole pattern (colon included) as the
+        // host literal, which can never match a real parsed URL host (a
+        // `url::Host::Domain` never contains a colon), so the entry simply
+        // never matches anything rather than silently widening access.
         let (host_part, port) = match pattern.rsplit_once(':') {
-            Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-                (h, p.parse::<u16>().ok())
-            }
+            Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => p
+                .parse::<u16>()
+                .map_or((pattern, None), |port| (h, Some(port))),
             _ => (pattern, None),
         };
         let lower = host_part.to_ascii_lowercase();
@@ -139,9 +149,14 @@ impl HostAllowlist {
         self.entries.is_empty()
     }
 
-    /// Returns the first matching entry for `host`, if any.
-    fn matching_entry(&self, host: &str) -> Option<&AllowlistEntry> {
-        self.entries.iter().find(|e| e.matches_host(host))
+    /// Returns every entry whose host pattern matches `host` (issue #921
+    /// review: an operator can legitimately configure multiple entries for
+    /// the same host with different pinned ports, e.g.
+    /// `api.example.com:8443` and `api.example.com:9443` — the caller must
+    /// consider all of them, not just the first, or a valid multi-port
+    /// allowlist becomes order-dependent).
+    fn matching_entries<'a>(&'a self, host: &'a str) -> impl Iterator<Item = &'a AllowlistEntry> {
+        self.entries.iter().filter(move |e| e.matches_host(host))
     }
 }
 
@@ -321,23 +336,35 @@ fn validate_domain_host(
     domain: &str,
     policy: &SsrfPolicy,
 ) -> Result<(), SsrfRejection> {
-    let entry = policy.allowlist.matching_entry(domain).ok_or_else(|| {
-        SsrfRejection::HostNotAllowlisted {
-            host: domain.to_string(),
-        }
-    })?;
-
-    if let Some(required_port) = entry.required_port() {
-        let effective_port = url.port_or_known_default().unwrap_or(required_port);
-        if effective_port != required_port {
-            return Err(SsrfRejection::PortNotAllowed {
-                host: domain.to_string(),
-                port: effective_port,
-            });
+    // issue #921 review (Codex): check every matching entry, not just the
+    // first one `matching_entries` yields — an operator can register
+    // multiple entries for the same host with different pinned ports (or a
+    // mix of pinned and unpinned entries), and the URL is allowed if *any*
+    // of them accepts it.
+    let mut host_matched = false;
+    for entry in policy.allowlist.matching_entries(domain) {
+        host_matched = true;
+        match entry.required_port() {
+            None => return Ok(()),
+            Some(required_port) => {
+                let effective_port = url.port_or_known_default().unwrap_or(required_port);
+                if effective_port == required_port {
+                    return Ok(());
+                }
+            }
         }
     }
 
-    Ok(())
+    if host_matched {
+        Err(SsrfRejection::PortNotAllowed {
+            host: domain.to_string(),
+            port: url.port_or_known_default().unwrap_or(0),
+        })
+    } else {
+        Err(SsrfRejection::HostNotAllowlisted {
+            host: domain.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +564,55 @@ mod ssrf_tests {
         assert!(validate_target_url("https://api.example.com/hook", &policy).is_ok());
         // No port pinned on the allowlist entry means any port is fine.
         assert!(validate_target_url("https://api.example.com:9443/hook", &policy).is_ok());
+    }
+
+    #[test]
+    fn an_out_of_range_port_pattern_fails_closed_instead_of_becoming_unpinned() {
+        // Issue #921 review (Codex): "api.example.com:70000" has a digit
+        // string that cannot fit in a u16. Silently dropping the port
+        // constraint would turn a malformed pattern into "any port on this
+        // host is allowed" -- backwards for an SSRF control. It must
+        // instead fail closed: the entry never matches a real host at all.
+        let policy = policy_with(&["api.example.com:70000"]);
+        let err = validate_target_url("https://api.example.com/hook", &policy).unwrap_err();
+        assert_eq!(
+            err,
+            SsrfRejection::HostNotAllowlisted {
+                host: "api.example.com".to_string()
+            }
+        );
+        let err = validate_target_url("https://api.example.com:12345/hook", &policy).unwrap_err();
+        assert_eq!(
+            err,
+            SsrfRejection::HostNotAllowlisted {
+                host: "api.example.com".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn multiple_pinned_port_entries_for_the_same_host_are_all_considered() {
+        // Issue #921 review (Codex): registering both
+        // api.example.com:8443 and api.example.com:9443 must allow either
+        // port -- not just whichever entry happens to come first.
+        let policy = policy_with(&["api.example.com:8443", "api.example.com:9443"]);
+        assert!(validate_target_url("https://api.example.com:8443/hook", &policy).is_ok());
+        assert!(validate_target_url("https://api.example.com:9443/hook", &policy).is_ok());
+        let err = validate_target_url("https://api.example.com:9999/hook", &policy).unwrap_err();
+        assert_eq!(
+            err,
+            SsrfRejection::PortNotAllowed {
+                host: "api.example.com".to_string(),
+                port: 9999
+            }
+        );
+    }
+
+    #[test]
+    fn a_later_unpinned_entry_for_the_same_host_still_allows_any_port() {
+        let policy = policy_with(&["api.example.com:8443", "api.example.com"]);
+        assert!(validate_target_url("https://api.example.com:8443/hook", &policy).is_ok());
+        assert!(validate_target_url("https://api.example.com:9999/hook", &policy).is_ok());
     }
 
     #[test]
