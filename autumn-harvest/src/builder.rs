@@ -720,6 +720,14 @@ impl BuiltHarvest {
         Vec<WorkflowSchedule>,
         WorkerConfig,
     ) {
+        // issue #921 review: `autumn-harvest-plugin`'s runner is the only
+        // installer of `GLOBAL_CALLBACK_CONFIG` this crate ships. A direct
+        // (non-plugin) core embedder using this method never routes through
+        // it, so completion-callback config would otherwise be silently
+        // inert. See `install_global_callback_config_for_direct_worker`.
+        crate::completion_callback::install_global_callback_config_for_direct_worker(
+            &self.completion_callback_config,
+        );
         (
             crate::worker::HandlerRegistry::with_state_and_telemetry(
                 self.workflows,
@@ -757,6 +765,10 @@ impl BuiltHarvest {
         Vec<WorkflowSchedule>,
         WorkerConfig,
     ) {
+        // See the identical call in `into_worker_parts` above.
+        crate::completion_callback::install_global_callback_config_for_direct_worker(
+            &self.completion_callback_config,
+        );
         self.state.extend(extra_state);
         (
             crate::worker::HandlerRegistry::with_state_and_telemetry(

@@ -670,6 +670,119 @@ async fn erase_tombstones_pii_in_a_pending_completion_delivery_without_touching_
     );
 }
 
+/// Issue #921 review (Codex P1, follow-up): a completion-callback delivery
+/// that exhausted retries writes a *second*, independent copy of the frozen
+/// envelope into `harvest_dead_letters.input`. Scrubbing
+/// `harvest_completion_deliveries.payload` alone (the prior fix, tested
+/// above) leaves that DLQ copy carrying the erased PII, so this test seeds
+/// a `task_type = "CALLBACK"` dead-letter row directly (mirroring what
+/// `apply_outcome`'s `OutcomeAction::DeadLetter` branch would insert) and
+/// asserts erasure scrubs it too.
+#[tokio::test]
+async fn erase_tombstones_pii_in_a_callback_dead_letter_row() {
+    use autumn_harvest::dlq::{NewDeadLetterEntry, dead_letter};
+    use autumn_harvest::schema::harvest_dead_letters;
+
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let pii = "carol@example.com";
+    let exec_id = seed_execution_with_pii(&mut conn, "erase-pii-wf-cb-dlq", pii).await;
+    mark_completed(&mut conn, exec_id).await;
+    let delivery_id = seed_completion_delivery_with_pii(&mut conn, exec_id, pii).await;
+
+    let dead_letter_id = dead_letter(
+        &mut conn,
+        &NewDeadLetterEntry {
+            original_task_id: delivery_id,
+            queue_name: "completion-callback".to_string(),
+            task_type: "CALLBACK".to_string(),
+            workflow_exec_id: Some(exec_id.as_uuid()),
+            activity_name: None,
+            input: json!({
+                "delivery_id": delivery_id,
+                "execution_id": exec_id.as_uuid(),
+                "workflow_name": "erasable",
+                "workflow_id": "erase-pii-wf-cb-dlq",
+                "state": "COMPLETED",
+                "result": { "email": pii },
+                "completed_at": Utc::now().to_rfc3339(),
+            }),
+            error: "delivery exhausted 10 attempts".to_string(),
+            attempts: 10,
+            owner: None,
+            severity: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // An unrelated activity dead-letter for a *different* execution/task
+    // type must never be touched -- erasure is scoped to this execution's
+    // own CALLBACK rows only.
+    let other_exec_id =
+        seed_execution_with_pii(&mut conn, "unrelated-wf", "unrelated@example.com").await;
+    mark_completed(&mut conn, other_exec_id).await;
+    let unrelated_dead_letter_id = dead_letter(
+        &mut conn,
+        &NewDeadLetterEntry {
+            original_task_id: uuid::Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: Some(other_exec_id.as_uuid()),
+            activity_name: Some("send_email".to_string()),
+            input: json!({ "email": "unrelated@example.com" }),
+            error: "boom".to_string(),
+            attempts: 3,
+            owner: None,
+            severity: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/erase-payloads"),
+        json!({ "reason": "GDPR Art. 17 DSR-003" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["dead_letters_scrubbed"].as_u64(),
+        Some(1),
+        "exactly the one CALLBACK dead-letter row for this execution must be scrubbed, body: {body}"
+    );
+
+    let scrubbed_input: serde_json::Value = harvest_dead_letters::table
+        .find(dead_letter_id)
+        .select(harvest_dead_letters::input)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        !scrubbed_input.to_string().contains(pii),
+        "PII must not survive in the CALLBACK dead-letter's input: {scrubbed_input}"
+    );
+
+    // The unrelated ACTIVITY dead-letter for a different execution is
+    // completely untouched.
+    let unrelated_input: serde_json::Value = harvest_dead_letters::table
+        .find(unrelated_dead_letter_id)
+        .select(harvest_dead_letters::input)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        unrelated_input
+            .to_string()
+            .contains("unrelated@example.com"),
+        "an unrelated dead-letter row must never be touched by erasure"
+    );
+}
+
 /// (c) 409 when target is not in a terminal state (RUNNING).
 #[tokio::test]
 async fn erase_returns_409_on_non_terminal_execution() {

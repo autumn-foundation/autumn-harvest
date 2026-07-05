@@ -1816,6 +1816,52 @@ fn read_global_callback_config() -> Option<std::sync::Arc<CallbackRuntimeConfig>
     }
 }
 
+/// Install [`GLOBAL_CALLBACK_CONFIG`] for an embedder using the core
+/// `HarvestBuilder::build()` -> `into_worker_parts()` path directly.
+///
+/// This bypasses `autumn-harvest-plugin`'s `HarvestPlugin`/`HarvestRunner`
+/// (issue #921 review, Codex P2). `autumn-harvest-plugin`'s
+/// `PreparedHarvestRuntime::build` is the *only*
+/// installer this crate ships (core has no `reqwest` dependency to fall back
+/// to when no deliverer is configured, and no obvious place to warn-and-noop
+/// otherwise), so a caller who never goes through the plugin — the
+/// documented "direct core worker" embedding path — got a builder API
+/// (`completion_callback_default`/`completion_callback_deliverer`/etc.) that
+/// silently did nothing: `enqueue_completion_deliveries` reads
+/// `GLOBAL_CALLBACK_CONFIG` and treats `None` as "feature never configured",
+/// so no delivery row was ever enqueued.
+///
+/// Only installs when a [`CompletionCallbackDeliverer`] was actually
+/// supplied via `completion_callback_deliverer(...)` — with no deliverer
+/// there is nothing to POST with, and unlike the plugin path this crate has
+/// no default implementation to substitute, so leaving the config
+/// unconfigured (byte-identical to today) is correct rather than installing
+/// a config that can never deliver anything.
+#[cfg(feature = "db")]
+pub fn install_global_callback_config_for_direct_worker(config: &CompletionCallbackBuilderConfig) {
+    let Some(deliverer) = config.deliverer.clone() else {
+        return;
+    };
+    let secret = config.secret.clone().unwrap_or_else(|| {
+        tracing::warn!(
+            "completion-callback HMAC secret was never configured via \
+             HarvestBuilder::completion_callback_secret(...) -- every delivered callback \
+             will be signed with an empty key, which defeats the X-Harvest-Signature \
+             authenticity guarantee for any receiver relying on it"
+        );
+        CallbackSecret::new(Vec::new())
+    });
+    if let Ok(mut lock) = GLOBAL_CALLBACK_CONFIG.write() {
+        *lock = Some(std::sync::Arc::new(CallbackRuntimeConfig {
+            deliverer,
+            secret,
+            ssrf_policy: config.ssrf_policy(),
+            default_targets: config.default_targets.clone(),
+            retry_policy: config.retry_policy.clone(),
+        }));
+    }
+}
+
 /// Enqueue durable completion-callback deliveries for `execution`'s terminal
 /// transition to `state`.
 ///
