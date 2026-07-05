@@ -91,13 +91,12 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut eq_idx = None;
     let mut in_idx = None;
     let mut in_quotes = None;
-    let token_chars: Vec<char> = token.chars().collect();
-    let token_lower = token.to_lowercase();
-    let token_lower_chars: Vec<char> = token_lower.chars().collect();
 
-    let mut i = 0;
-    while i < token_chars.len() {
-        let c = token_chars[i];
+    let chars: Vec<(usize, char)> = token.char_indices().collect();
+
+    for i in 0..chars.len() {
+        let (byte_idx, c) = chars[i];
+
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -107,22 +106,23 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
                 }
             }
             '=' if in_quotes.is_none() && eq_idx.is_none() => {
-                eq_idx = Some(i);
+                eq_idx = Some(byte_idx);
             }
             _ => {
                 if in_quotes.is_none()
                     && in_idx.is_none()
-                    && i + 3 < token_chars.len()
-                    && token_lower_chars[i] == ' '
-                    && token_lower_chars[i + 1] == 'i'
-                    && token_lower_chars[i + 2] == 'n'
-                    && token_lower_chars[i + 3] == ' '
+                    && i + 3 < chars.len()
                 {
-                    in_idx = Some(i);
+                    let c0 = chars[i].1.to_ascii_lowercase();
+                    let c1 = chars[i + 1].1.to_ascii_lowercase();
+                    let c2 = chars[i + 2].1.to_ascii_lowercase();
+                    let c3 = chars[i + 3].1.to_ascii_lowercase();
+                    if c0 == ' ' && c1 == 'i' && c2 == 'n' && c3 == ' ' {
+                        in_idx = Some(byte_idx);
+                    }
                 }
             }
         }
-        i += 1;
     }
     (eq_idx, in_idx)
 }

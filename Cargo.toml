@@ -55,13 +55,5 @@ testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
 
-[profile.dev.package.bollard-stubs]
-opt-level = 0
-debug = false
-
-[profile.dev.package.bollard]
-opt-level = 0
-debug = false
-
 
 
