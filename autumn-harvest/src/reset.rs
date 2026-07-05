@@ -1274,6 +1274,10 @@ async fn insert_fork_execution(
         retry_of_exec_id: None,
         // Reset fork is an operator intervention, not a schedule fire (issue #534).
         origin: None,
+        // Inherit the source's completion-callback targets (issue #605): the
+        // fork continues the same logical run, so its terminal notification
+        // targets should too.
+        completion_callbacks: source.completion_callbacks.clone(),
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -1534,6 +1538,7 @@ mod tests {
             nd_blocked_at: None,
             nd_block_reason: None,
             nd_block_count: 0,
+            completion_callbacks: None,
         }
     }
 

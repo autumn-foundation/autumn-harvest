@@ -367,6 +367,9 @@ async fn orphan_at_threshold_is_quarantined() {
         DeadLetterReason::WorkflowTaskTimeout { .. } => {
             panic!("expected PoisonPill reason, got WorkflowTaskTimeout")
         }
+        DeadLetterReason::CallbackDeliveryExhausted { .. } => {
+            panic!("expected PoisonPill reason, got CallbackDeliveryExhausted")
+        }
     }
 
     // Metric emitted with queue + reason labels (AC6).

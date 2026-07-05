@@ -186,6 +186,7 @@ async fn insert_execution(
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             origin: None,
+            completion_callbacks: None,
         })
         .execute(conn)
         .await

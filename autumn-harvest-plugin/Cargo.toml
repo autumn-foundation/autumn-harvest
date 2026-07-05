@@ -40,6 +40,7 @@ futures = { workspace = true }
 scoped-futures = "0.1"
 tower = "0.5"
 maud = { version = "0.27", features = ["axum"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 autumn-web = { version = "0.5", features = ["test-support", "mcp"] }

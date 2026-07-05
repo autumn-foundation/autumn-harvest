@@ -734,6 +734,7 @@ async fn fire_claimed_debounce_row(
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: None,
+        completion_callbacks: None,
     };
 
     // `in_outer_transaction = true`: this runs inside the scanner's fire

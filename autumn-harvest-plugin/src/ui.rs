@@ -6235,6 +6235,7 @@ async fn execute_schedule_trigger_ui(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
+            completion_callbacks: None,
         },
         Some(runtime.registry().telemetry().metrics.as_ref()),
     )
@@ -8005,6 +8006,7 @@ mod tests {
             nd_blocked_at: None,
             nd_block_reason: None,
             nd_block_count: 0,
+            completion_callbacks: None,
         }
     }
 

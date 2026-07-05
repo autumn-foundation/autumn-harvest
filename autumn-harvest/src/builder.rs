@@ -125,6 +125,10 @@ pub struct HarvestBuilder {
     /// loudly with `413` (issue #596). `None` uses
     /// `crate::usage::default_usage_max_groups()`.
     usage_max_groups: Option<usize>,
+    /// Builder-wide completion-callback configuration (issue #605): default
+    /// targets, SSRF host allowlist, HMAC secret, retry policy, and an
+    /// optional custom deliverer.
+    completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
 }
 
 impl Default for HarvestBuilder {
@@ -160,6 +164,8 @@ impl Default for HarvestBuilder {
             max_workflow_attempts: None,
             usage_window_ceiling: None,
             usage_max_groups: None,
+            completion_callback_config:
+                crate::completion_callback::CompletionCallbackBuilderConfig::default(),
         }
     }
 }
@@ -204,6 +210,10 @@ impl std::fmt::Debug for HarvestBuilder {
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
+            .field(
+                "completion_callback_default_target_count",
+                &self.completion_callback_config.default_targets.len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -263,6 +273,11 @@ pub struct BuiltHarvest {
     /// Cap on distinct groups `GET /admin/usage` will return before failing
     /// loudly with `413` (issue #596). Defaults to 10,000.
     pub usage_max_groups: usize,
+    /// Resolved builder-wide completion-callback configuration (issue #605).
+    /// `deliverer` is still `None` here when the embedder didn't supply a
+    /// custom one — the plugin substitutes its default `reqwest`-based
+    /// implementation at runtime startup.
+    completion_callback_config: crate::completion_callback::CompletionCallbackBuilderConfig,
 }
 
 impl std::fmt::Debug for BuiltHarvest {
@@ -302,6 +317,10 @@ impl std::fmt::Debug for BuiltHarvest {
             .field("max_workflow_attempts", &self.max_workflow_attempts)
             .field("usage_window_ceiling", &self.usage_window_ceiling)
             .field("usage_max_groups", &self.usage_max_groups)
+            .field(
+                "completion_callback_default_target_count",
+                &self.completion_callback_config.default_targets.len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -529,6 +548,17 @@ pub enum HarvestBuilderError {
         /// The configured soft continue-as-new threshold.
         threshold: u64,
     },
+
+    /// A builder-wide default completion-callback target (issue #605) failed
+    /// SSRF validation against the configured
+    /// [`crate::completion_callback::SsrfPolicy`] host allowlist.
+    #[error("completion-callback default target '{url}' rejected: {rejection}")]
+    CallbackTargetRejected {
+        /// The rejected target URL.
+        url: String,
+        /// The machine-readable SSRF rejection reason.
+        rejection: crate::completion_callback::SsrfRejection,
+    },
 }
 
 impl BuiltHarvest {
@@ -661,6 +691,14 @@ impl BuiltHarvest {
     #[must_use]
     pub fn history_archiver(&self) -> Option<&Arc<dyn crate::retention::HistoryArchiver>> {
         self.history_archiver.as_ref()
+    }
+
+    /// Resolved builder-wide completion-callback configuration (issue #605).
+    #[must_use]
+    pub const fn completion_callback_config(
+        &self,
+    ) -> &crate::completion_callback::CompletionCallbackBuilderConfig {
+        &self.completion_callback_config
     }
 
     /// Override the audit log retention window after the build step.
@@ -994,6 +1032,88 @@ impl HarvestBuilder {
         self
     }
 
+    /// Register a builder-wide default completion-callback target (issue
+    /// #605): a URL that receives a signed POST of the terminal result for
+    /// every workflow whose effective target set includes it (per-execution
+    /// targets set via a start option are unioned with these defaults).
+    ///
+    /// The target is validated against the configured SSRF host allowlist
+    /// at [`try_build`](Self::try_build) time — call
+    /// [`completion_callback_allowlist`](Self::completion_callback_allowlist)
+    /// first if the target's host isn't already allowlisted, or `try_build`
+    /// returns [`HarvestBuilderError::CallbackTargetRejected`].
+    #[must_use]
+    pub fn completion_callback_default(
+        mut self,
+        url: impl Into<String>,
+        filter: crate::completion_callback::EventFilter,
+    ) -> Self {
+        self.completion_callback_config
+            .default_targets
+            .push(crate::completion_callback::CallbackTarget::new(url, filter));
+        self
+    }
+
+    /// Configure the SSRF host allowlist for completion-callback targets
+    /// (issue #605). Every registered target (builder default or
+    /// per-execution) must match an entry here (exact host or `*.suffix`)
+    /// or it is rejected at registration time.
+    #[must_use]
+    pub fn completion_callback_allowlist(
+        mut self,
+        allowlist: crate::completion_callback::HostAllowlist,
+    ) -> Self {
+        self.completion_callback_config.allowlist = allowlist;
+        self
+    }
+
+    /// Permit `http://` completion-callback targets (default: `https://` only).
+    #[must_use]
+    pub const fn completion_callback_allow_http(mut self, allow: bool) -> Self {
+        self.completion_callback_config.allow_http = allow;
+        self
+    }
+
+    /// Permit IP-literal completion-callback target hosts, subject to the
+    /// private/loopback/link-local rejection rules (default: rejected).
+    #[must_use]
+    pub const fn completion_callback_allow_ip_literals(mut self, allow: bool) -> Self {
+        self.completion_callback_config.allow_ip_literals = allow;
+        self
+    }
+
+    /// Set the HMAC secret used to sign every completion-callback delivery's
+    /// `X-Harvest-Signature` header (issue #605), so receivers can verify
+    /// authenticity and reject replays. If never called, deliveries are
+    /// still signed but with an empty key — operators enabling completion
+    /// callbacks should always set a real secret.
+    #[must_use]
+    pub fn completion_callback_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+        self.completion_callback_config.secret =
+            Some(crate::completion_callback::CallbackSecret::new(secret));
+        self
+    }
+
+    /// Override the default delivery retry policy (issue #605). Defaults to
+    /// [`crate::completion_callback::default_delivery_retry_policy`] (~1 hour window).
+    #[must_use]
+    pub fn completion_callback_retry_policy(mut self, policy: crate::policy::RetryPolicy) -> Self {
+        self.completion_callback_config.retry_policy = policy;
+        self
+    }
+
+    /// Override the outbound HTTP transport for completion-callback delivery
+    /// (issue #605). When not called, the plugin substitutes its default
+    /// `reqwest`-based implementation at startup — core ships no HTTP client.
+    #[must_use]
+    pub fn completion_callback_deliverer(
+        mut self,
+        deliverer: impl crate::completion_callback::CompletionCallbackDeliverer,
+    ) -> Self {
+        self.completion_callback_config.deliverer = Some(Arc::new(deliverer));
+        self
+    }
+
     /// Override the soft history-size threshold used by
     /// [`crate::context::WorkflowContext::should_continue_as_new`].
     #[must_use]
@@ -1256,6 +1376,9 @@ impl HarvestBuilder {
         validate_dags_do_not_use_local_activities(&self.dags, &self.activities)?;
         validate_dag_schedules(&self.dags)?;
         validate_rate_limit_keys(&self.activities)?;
+        if let Err((url, rejection)) = self.completion_callback_config.validate_default_targets() {
+            return Err(HarvestBuilderError::CallbackTargetRejected { url, rejection });
+        }
 
         if let Some(ceiling) = self.max_workflow_history_events {
             let threshold = self.history_policy.continue_as_new_threshold();
@@ -1322,6 +1445,7 @@ impl HarvestBuilder {
             max_workflow_attempts: self.max_workflow_attempts,
             usage_window_ceiling,
             usage_max_groups,
+            completion_callback_config: self.completion_callback_config,
         })
     }
 }
@@ -3447,6 +3571,66 @@ mod tests {
                 })
             ),
             "expected failure when ceiling == custom threshold, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_completion_callback_default_target_is_stored() {
+        use crate::completion_callback::{EventFilter, HostAllowlist};
+        let built = HarvestBuilder::new()
+            .completion_callback_allowlist(HostAllowlist::new().with_pattern("api.example.com"))
+            .completion_callback_default("https://api.example.com/hook", EventFilter::AnyTerminal)
+            .build();
+        assert_eq!(built.completion_callback_config().default_targets.len(), 1);
+        assert_eq!(
+            built.completion_callback_config().default_targets[0].url,
+            "https://api.example.com/hook"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_a_non_allowlisted_completion_callback_default_target() {
+        use crate::completion_callback::EventFilter;
+        // No allowlist configured -> every domain host is rejected.
+        let result = HarvestBuilder::new()
+            .completion_callback_default("https://evil.com/hook", EventFilter::AnyTerminal)
+            .try_build();
+        assert!(
+            matches!(
+                result,
+                Err(HarvestBuilderError::CallbackTargetRejected { ref url, .. })
+                    if url == "https://evil.com/hook"
+            ),
+            "expected CallbackTargetRejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn builder_with_no_completion_callback_config_has_empty_defaults() {
+        // Identical-behavior guarantee: an embedder who never touches the
+        // completion-callback API gets an empty default-target list.
+        let built = HarvestBuilder::new().build();
+        assert!(
+            built
+                .completion_callback_config()
+                .default_targets
+                .is_empty()
+        );
+        assert!(built.completion_callback_config().deliverer.is_none());
+    }
+
+    #[test]
+    fn builder_completion_callback_secret_and_retry_policy_are_stored() {
+        use crate::policy::RetryPolicy;
+        use std::time::Duration;
+        let built = HarvestBuilder::new()
+            .completion_callback_secret(b"shh".to_vec())
+            .completion_callback_retry_policy(RetryPolicy::fixed(5, Duration::from_secs(2)))
+            .build();
+        assert!(built.completion_callback_config().secret.is_some());
+        assert_eq!(
+            built.completion_callback_config().retry_policy.max_attempts,
+            5
         );
     }
 }

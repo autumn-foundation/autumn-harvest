@@ -123,6 +123,9 @@ pub const OP_BATCH_RESET: &str = "batch.reset";
 pub const OP_BUILD_RAMP_SET: &str = "build_routing.ramp.set";
 /// Audit operation: Cleared a queue's percentage build ramp (issue #604).
 pub const OP_BUILD_RAMP_CLEAR: &str = "build_routing.ramp.clear";
+/// Audit operation: Manually redrove a dead-lettered completion-callback
+/// delivery (issue #605).
+pub const OP_CALLBACK_REDRIVE: &str = "completion_callback.redrive";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -143,6 +146,8 @@ pub const TARGET_ACTIVITY: &str = "activity";
 pub const TARGET_WORKER: &str = "worker";
 pub const TARGET_RATE_LIMIT: &str = "rate_limit";
 pub const TARGET_BUILD_ROUTING: &str = "build_routing";
+/// Audit target type for completion-callback delivery operations (issue #605).
+pub const TARGET_CALLBACK_DELIVERY: &str = "completion_callback_delivery";
 
 // ── Status constants ──────────────────────────────────────────────────────────
 

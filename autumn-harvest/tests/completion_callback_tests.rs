@@ -1,0 +1,806 @@
+#![cfg(feature = "db")]
+// Test-code style lints (consistent with other integration test files in this crate).
+#![allow(
+    clippy::doc_markdown,
+    clippy::items_after_statements,
+    clippy::missing_const_for_fn,
+    clippy::type_complexity,
+    clippy::significant_drop_tightening
+)]
+//! Durable completion-callback delivery integration tests — issue #605.
+//!
+//! Verifies the enqueue-on-terminal-transition + scanner + retry/backoff +
+//! dead-letter pipeline against a real Postgres container:
+//!
+//! - `enqueue_on_completion_creates_one_row_per_matching_target` — a
+//!   completed execution with two per-execution targets (`AnyTerminal` and
+//!   `CompletedOnly`) enqueues both.
+//! - `enqueue_skips_targets_whose_filter_does_not_match` — a `CompletedOnly`
+//!   target on a `Failed` execution enqueues nothing.
+//! - `enqueue_is_idempotent_on_re_evaluation` — calling
+//!   `evaluate_triggers_for_execution` twice for the same execution/state
+//!   never double-enqueues (`UNIQUE (workflow_exec_id, callback_index)` +
+//!   `ON CONFLICT DO NOTHING`).
+//! - `no_targets_configured_enqueues_nothing` — the "identical behavior for
+//!   callback-less workflows" guarantee.
+//! - `scanner_marks_delivered_on_2xx` — a 200 response transitions
+//!   `PENDING` -> `DELIVERED` and the POSTed body carries the fixed
+//!   envelope shape, HMAC-signed.
+//! - `scanner_reschedules_with_backoff_on_non_2xx` — a 500 response with
+//!   `attempt < max_attempts` reschedules with a future `next_attempt_at`.
+//! - `scanner_dead_letters_on_retry_exhaustion` — exhausting the retry
+//!   budget marks the delivery `FAILED` and writes a
+//!   `harvest_dead_letters` row with the typed `CallbackDeliveryExhausted`
+//!   reason.
+//! - `scanner_ignores_rows_not_yet_due` — a row whose `next_attempt_at` is
+//!   in the future is left untouched by the scanner.
+//! - `list_deliveries_for_execution_returns_rows_in_callback_index_order`
+//!   and the `redrive_delivery_*` tests — the management-surface read and
+//!   redrive primitives (issue #605 AC: list + manually redrive).
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use autumn_harvest::completion_callback::{
+    CallbackRuntimeConfig, CallbackSecret, CompletionCallbackDeliverer, DeliverFuture,
+    DeliveryAttempt, DeliveryRedriveOutcome, GLOBAL_CALLBACK_CONFIG, HostAllowlist, SsrfPolicy,
+    fire_due_completion_deliveries, list_deliveries_for_execution, redrive_delivery,
+};
+use autumn_harvest::completion_trigger::{TerminalState, evaluate_triggers_for_execution};
+use autumn_harvest::policy::RetryPolicy;
+use autumn_harvest::types::ExecutionId;
+use diesel_async::AsyncConnection;
+use diesel_async::AsyncPgConnection;
+use diesel_async::RunQueryDsl;
+use testcontainers::ContainerAsync;
+use testcontainers::ImageExt;
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+/// `GLOBAL_CALLBACK_CONFIG` is a process-wide static (by design — it mirrors
+/// `GLOBAL_WORKFLOW_METADATA`'s "set once at startup" contract in
+/// production). `#[tokio::test]` functions within one test binary run
+/// concurrently by default, so every test in this file must serialize
+/// through this lock for the whole time it depends on a stable config,
+/// otherwise two tests running at once would clobber each other's
+/// deliverer/secret/policy.
+static TEST_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+// All migrations through `harvest_completion_deliveries` (issue #605), the
+// same base list `tests/nd_block_tests.rs` uses (schema-relevant migrations
+// only — see that file's comment for why the full migration count is not
+// required: many later migrations don't touch a table this test reads).
+const INIT_SQL: &str = concat!(
+    include_str!("../migrations/20260409000000_harvest_initial/up.sql"),
+    "\n",
+    include_str!("../migrations/20260619000000_harvest_task_queue_created_at/up.sql"),
+    "\n",
+    include_str!("../migrations/20260424000001_harvest_trace_context/up.sql"),
+    "\n",
+    include_str!("../migrations/20260505000000_harvest_heartbeat_details/up.sql"),
+    "\n",
+    include_str!("../migrations/20260427000000_harvest_continue_as_new/up.sql"),
+    "\n",
+    include_str!("../migrations/20260429000000_harvest_concurrency_key/up.sql"),
+    "\n",
+    include_str!("../migrations/20260430000000_harvest_workflow_schedules/up.sql"),
+    "\n",
+    include_str!("../migrations/20260430000001_harvest_external_tasks/up.sql"),
+    "\n",
+    include_str!("../migrations/20260508000000_harvest_external_task_updated_at/up.sql"),
+    "\n",
+    include_str!("../migrations/20260506000000_harvest_audit_log/up.sql"),
+    "\n",
+    include_str!("../migrations/20260501000000_harvest_workers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260508010000_harvest_workers_drain_deadline/up.sql"),
+    "\n",
+    include_str!("../migrations/20260509000000_harvest_build_routing/up.sql"),
+    "\n",
+    include_str!("../migrations/20260513000000_harvest_schedule_pause_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260514020000_harvest_task_activity_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000000_harvest_signal_idempotency/up.sql"),
+    "\n",
+    include_str!("../migrations/20260517000000_harvest_schedule_jitter/up.sql"),
+    "\n",
+    include_str!("../migrations/20260517000001_harvest_schedule_overlap_policy/up.sql"),
+    "\n",
+    include_str!("../migrations/20260518000001_harvest_workflow_execution_timeout/up.sql"),
+    "\n",
+    include_str!("../migrations/20260613000000_harvest_workflow_sla/up.sql"),
+    "\n",
+    include_str!("../migrations/20260519000000_harvest_calendar_awareness/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000000_harvest_schedule_decisions/up.sql"),
+    "\n",
+    include_str!("../migrations/20260522000001_harvest_rate_limiting/up.sql"),
+    "\n",
+    include_str!("../migrations/20260526000001_harvest_parent_close_policy/up.sql"),
+    "\n",
+    include_str!("../migrations/20260530000000_harvest_schedule_ha_claim/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000000_harvest_schedule_auto_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000001_harvest_poison_pill_strikes/up.sql"),
+    "\n",
+    include_str!("../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    "\n",
+    include_str!("../migrations/20260603000000_harvest_completion_triggers/up.sql"),
+    include_str!("../migrations/20260605000000_harvest_admission_gates/up.sql"),
+    include_str!("../migrations/20260606000001_harvest_activity_schedule_to_close/up.sql"),
+    include_str!("../migrations/20260607000000_harvest_worker_capability_labels/up.sql"),
+    include_str!("../migrations/20260607000001_harvest_task_required_capabilities/up.sql"),
+    "\n",
+    include_str!("../migrations/20260607000002_harvest_workflow_pause/up.sql"),
+    "\n",
+    include_str!("../migrations/20260609000001_harvest_workflow_current_details/up.sql"),
+    "\n",
+    include_str!("../migrations/20260610000001_harvest_schedule_bounded_runs/up.sql"),
+    "\n",
+    include_str!("../migrations/20260613000001_harvest_schedule_catchup_window/up.sql"),
+    "\n",
+    include_str!("../migrations/20260616000001_harvest_workflow_schedule_id/up.sql"),
+    "\n",
+    include_str!("../migrations/20260615000001_harvest_context_headers/up.sql"),
+    "\n",
+    include_str!("../migrations/20260618000001_harvest_debounce/up.sql"),
+    "\n",
+    include_str!("../migrations/20260624000000_harvest_event_batches/up.sql"),
+    "\n",
+    include_str!("../migrations/20260626000001_harvest_workflow_retry/up.sql"),
+    "\n",
+    include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
+    include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!("../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
+);
+
+async fn setup() -> (String, ContainerAsync<Postgres>) {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let container = Postgres::default()
+        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .with_tag("16")
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    (url, container)
+}
+
+async fn connect(url: &str) -> AsyncPgConnection {
+    AsyncPgConnection::establish(url)
+        .await
+        .expect("connect failed")
+}
+
+/// A deliverer that returns a scripted sequence of outcomes (repeating the
+/// last one once exhausted) and records every call for assertions.
+#[derive(Default)]
+struct ScriptedDeliverer {
+    responses: Mutex<Vec<DeliveryAttempt>>,
+    calls: Mutex<Vec<(String, Vec<u8>, Vec<(&'static str, String)>)>>,
+}
+
+impl ScriptedDeliverer {
+    fn new(responses: Vec<DeliveryAttempt>) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+}
+
+impl CompletionCallbackDeliverer for ScriptedDeliverer {
+    fn deliver<'a>(
+        &'a self,
+        target_url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'static str, String)],
+    ) -> DeliverFuture<'a> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push((
+                target_url.to_string(),
+                body.to_vec(),
+                headers.to_vec(),
+            ));
+            let mut responses = self.responses.lock().unwrap();
+            if responses.len() > 1 {
+                responses.remove(0)
+            } else {
+                responses[0].clone()
+            }
+        })
+    }
+}
+
+fn install_config(deliverer: Arc<dyn CompletionCallbackDeliverer>, retry_policy: RetryPolicy) {
+    *GLOBAL_CALLBACK_CONFIG.write().unwrap() = Some(CallbackRuntimeConfig {
+        deliverer,
+        secret: CallbackSecret::new(b"test-secret".to_vec()),
+        ssrf_policy: SsrfPolicy::new(HostAllowlist::new().with_pattern("api.example.com")),
+        default_targets: Vec::new(),
+        retry_policy,
+    });
+}
+
+async fn insert_terminal_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    state: &str,
+    output: Option<&str>,
+    error: Option<&str>,
+    completion_callbacks: Option<&str>,
+) {
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions
+            (id, workflow_name, workflow_id, shard_id, input, state, output, error, completed_at, completion_callbacks)
+         VALUES ($1, 'process_refund', 'wf-1', 0, 'null'::jsonb, $2, $3::jsonb, $4, now(), $5::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(state)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(output)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(error)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(completion_callbacks)
+    .execute(conn)
+    .await
+    .expect("insert execution");
+}
+
+#[derive(diesel::QueryableByName, Debug)]
+struct DeliveryRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    target_url: String,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    next_attempt_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn load_deliveries(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> Vec<DeliveryRow> {
+    diesel::sql_query(
+        "SELECT state, target_url, next_attempt_at FROM harvest_completion_deliveries \
+         WHERE workflow_exec_id = $1 ORDER BY callback_index ASC",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .load(conn)
+    .await
+    .expect("load deliveries")
+}
+
+#[tokio::test]
+async fn enqueue_on_completion_creates_one_row_per_matching_target() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    install_config(
+        Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)])),
+        RetryPolicy::exponential(3, Duration::from_secs(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some(r#"{"refunded":true}"#),
+        None,
+        Some(
+            r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}},
+                {"url":"https://api.example.com/other","filter":{"type":"CompletedOnly"}}]"#,
+        ),
+    )
+    .await;
+
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert_eq!(rows.len(), 2, "both targets match TerminalState::Completed");
+    assert_eq!(rows[0].state, "PENDING");
+    assert_eq!(rows[0].target_url, "https://api.example.com/hook");
+    assert_eq!(rows[1].state, "PENDING");
+    assert_eq!(rows[1].target_url, "https://api.example.com/other");
+}
+
+#[tokio::test]
+async fn enqueue_skips_targets_whose_filter_does_not_match() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    install_config(
+        Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)])),
+        RetryPolicy::exponential(3, Duration::from_secs(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "FAILED",
+        None,
+        Some("card declined"),
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"CompletedOnly"}}]"#),
+    )
+    .await;
+
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Failed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert!(rows.is_empty(), "CompletedOnly must not fire on Failed");
+}
+
+#[tokio::test]
+async fn enqueue_is_idempotent_on_re_evaluation() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    install_config(
+        Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)])),
+        RetryPolicy::exponential(3, Duration::from_secs(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("first evaluate");
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("second evaluate (simulates a parent-close-cascade re-entry)");
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert_eq!(rows.len(), 1, "must not double-enqueue on re-evaluation");
+}
+
+#[tokio::test]
+async fn no_targets_configured_enqueues_nothing() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    install_config(
+        Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)])),
+        RetryPolicy::exponential(3, Duration::from_secs(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    // No completion_callbacks and no builder defaults configured.
+    insert_terminal_execution(&mut conn, exec_id, "COMPLETED", Some("{}"), None, None).await;
+
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert!(
+        rows.is_empty(),
+        "a callback-less workflow must behave identically to today: zero rows"
+    );
+}
+
+#[tokio::test]
+async fn scanner_marks_delivered_on_2xx() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(204)]));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(3, Duration::from_secs(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some(r#"{"refunded":true}"#),
+        None,
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let processed = fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick");
+    assert_eq!(processed, 1);
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert_eq!(rows[0].state, "DELIVERED");
+    assert_eq!(deliverer.call_count(), 1);
+
+    let calls = deliverer.calls.lock().unwrap();
+    let (posted_url, body, headers) = &calls[0];
+    assert_eq!(posted_url, "https://api.example.com/hook");
+    let body_str = String::from_utf8(body.clone()).unwrap();
+    assert!(body_str.contains("\"delivery_id\""));
+    assert!(body_str.contains("\"execution_id\""));
+    assert!(body_str.contains("\"state\":\"COMPLETED\""));
+    assert!(body_str.contains("\"refunded\":true"));
+    assert!(!body_str.contains("\"error\""), "COMPLETED must omit error");
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| *k == "X-Harvest-Signature" && v.starts_with("sha256=")),
+        "must carry the HMAC signature header"
+    );
+    assert!(
+        headers.iter().any(|(k, _)| *k == "X-Harvest-Timestamp"),
+        "must carry the timestamp header"
+    );
+}
+
+#[tokio::test]
+async fn scanner_reschedules_with_backoff_on_non_2xx() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(500)]));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(5, Duration::from_secs(60)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let before = chrono::Utc::now();
+    let processed = fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick");
+    assert_eq!(processed, 1);
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert_eq!(
+        rows[0].state, "PENDING",
+        "not yet exhausted -> reschedule, not FAILED"
+    );
+    assert!(
+        rows[0].next_attempt_at > before,
+        "backoff must push next_attempt_at into the future"
+    );
+
+    // The scanner must not re-fire it again on the very next tick since
+    // it isn't due yet.
+    let processed_again = fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("second scanner tick");
+    assert_eq!(processed_again, 0);
+    assert_eq!(deliverer.call_count(), 1);
+}
+
+#[tokio::test]
+async fn scanner_dead_letters_on_retry_exhaustion() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(503)]));
+    // max_attempts = 2, ~instant backoff so the test doesn't need to sleep.
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(2, Duration::from_millis(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "FAILED",
+        None,
+        Some("card declined"),
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Failed, None)
+        .await
+        .expect("evaluate triggers");
+
+    for _ in 0..2 {
+        // Force due immediately so the second attempt doesn't need to wait
+        // out the (tiny, but nonzero) backoff interval.
+        diesel::sql_query(
+            "UPDATE harvest_completion_deliveries SET next_attempt_at = now() WHERE workflow_exec_id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("force due");
+        fire_due_completion_deliveries(&mut conn, &None, &[])
+            .await
+            .expect("scanner tick");
+    }
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert_eq!(rows[0].state, "FAILED");
+    assert_eq!(deliverer.call_count(), 2);
+
+    #[derive(diesel::QueryableByName)]
+    struct DlqRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        task_type: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        error: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+        workflow_exec_id: Option<uuid::Uuid>,
+    }
+    let dlq: Vec<DlqRow> = diesel::sql_query(
+        "SELECT task_type, error, workflow_exec_id FROM harvest_dead_letters WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .load(&mut conn)
+    .await
+    .expect("load dlq");
+
+    assert_eq!(dlq.len(), 1, "exactly one DLQ row on exhaustion");
+    assert_eq!(
+        dlq[0].task_type, "CALLBACK",
+        "distinct from workflow/activity task types"
+    );
+    assert_eq!(dlq[0].workflow_exec_id, Some(exec_id.as_uuid()));
+    assert!(dlq[0].error.contains("CallbackDeliveryExhausted"));
+    assert!(
+        !dlq[0].error.contains("PoisonPill") && !dlq[0].error.contains("WorkflowTaskTimeout"),
+        "typed reason must be distinct from clean task-retry exhaustion reasons"
+    );
+}
+
+#[tokio::test]
+async fn scanner_ignores_rows_not_yet_due() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)]));
+    // A long initial interval means the row is nowhere near due after enqueue.
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(3, Duration::from_secs(3600)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    // Freshly enqueued rows have next_attempt_at = NOW(), so they *are* due
+    // on the very first tick — deliver it once, then push it artificially
+    // into the future to prove a not-yet-due row is skipped.
+    fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("first tick delivers immediately");
+    assert_eq!(deliverer.call_count(), 1);
+
+    diesel::sql_query(
+        "UPDATE harvest_completion_deliveries SET state = 'PENDING', next_attempt_at = now() + interval '1 hour' WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("push into the future");
+
+    let processed = fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("second tick");
+    assert_eq!(processed, 0, "a not-yet-due row must be left alone");
+    assert_eq!(deliverer.call_count(), 1, "no additional delivery attempt");
+}
+
+#[tokio::test]
+async fn list_deliveries_for_execution_returns_rows_in_callback_index_order() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    install_config(
+        Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)])),
+        RetryPolicy::exponential(3, Duration::from_secs(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(
+            r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}},
+                {"url":"https://api.example.com/other","filter":{"type":"AnyTerminal"}}]"#,
+        ),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let rows = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].target_url, "https://api.example.com/hook");
+    assert_eq!(rows[1].target_url, "https://api.example.com/other");
+    assert_eq!(rows[0].callback_index, 0);
+    assert_eq!(rows[1].callback_index, 1);
+}
+
+#[tokio::test]
+async fn redrive_delivery_resets_a_failed_row_and_clears_its_dlq_entry() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(503)]));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(1, Duration::from_millis(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "FAILED",
+        None,
+        Some("card declined"),
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Failed, None)
+        .await
+        .expect("evaluate triggers");
+
+    // max_attempts = 1 -> the very first tick exhausts the budget.
+    fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick exhausts on first attempt");
+    let rows = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries");
+    assert_eq!(rows[0].state, "FAILED");
+    let delivery_id = rows[0].id;
+
+    #[derive(diesel::QueryableByName)]
+    struct DlqCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    let before: Vec<DlqCount> = diesel::sql_query(
+        "SELECT count(*) as count FROM harvest_dead_letters WHERE original_task_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(delivery_id)
+    .load(&mut conn)
+    .await
+    .expect("count dlq rows");
+    assert_eq!(
+        before[0].count, 1,
+        "exhaustion must have written exactly one DLQ row"
+    );
+
+    let outcome = redrive_delivery(&mut conn, delivery_id)
+        .await
+        .expect("redrive");
+    assert_eq!(outcome, DeliveryRedriveOutcome::Redriven);
+
+    let rows_after = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries after redrive");
+    assert_eq!(rows_after[0].state, "PENDING");
+    assert_eq!(rows_after[0].attempt, 0, "redrive resets the retry budget");
+
+    let after: Vec<DlqCount> = diesel::sql_query(
+        "SELECT count(*) as count FROM harvest_dead_letters WHERE original_task_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(delivery_id)
+    .load(&mut conn)
+    .await
+    .expect("count dlq rows after redrive");
+    assert_eq!(
+        after[0].count, 0,
+        "redrive must clear the DLQ entry it created"
+    );
+
+    // The scanner picks the redriven row back up on its next tick.
+    let processed = fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("post-redrive tick");
+    assert_eq!(processed, 1);
+    assert_eq!(
+        deliverer.call_count(),
+        2,
+        "one call from exhaustion + one from redrive"
+    );
+}
+
+#[tokio::test]
+async fn redrive_delivery_is_a_no_op_on_an_unknown_id() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let outcome = redrive_delivery(&mut conn, uuid::Uuid::new_v4())
+        .await
+        .expect("redrive unknown id");
+    assert_eq!(outcome, DeliveryRedriveOutcome::NotFound);
+}
+
+#[tokio::test]
+async fn redrive_delivery_rejects_a_non_failed_delivery() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    install_config(
+        Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)])),
+        RetryPolicy::exponential(3, Duration::from_secs(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let rows = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries");
+    let outcome = redrive_delivery(&mut conn, rows[0].id)
+        .await
+        .expect("redrive a still-pending delivery");
+    assert_eq!(
+        outcome,
+        DeliveryRedriveOutcome::NotFailed {
+            current_state: "PENDING".to_string()
+        }
+    );
+}

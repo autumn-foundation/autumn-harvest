@@ -698,6 +698,7 @@ async fn workflow_and_activity_metrics_are_recorded() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -926,6 +927,7 @@ async fn continue_as_new_records_history_size_and_rotation_metrics() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             origin: None,
+            completion_callbacks: None,
         })
         .execute(&mut conn)
         .await
@@ -1063,6 +1065,7 @@ async fn workflow_hard_cap_moves_offender_to_dlq() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             origin: None,
+            completion_callbacks: None,
         })
         .execute(&mut conn)
         .await
@@ -1213,6 +1216,7 @@ async fn workflow_hard_cap_dlq_preserves_terminal_attempt_count() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             origin: None,
+            completion_callbacks: None,
         })
         .execute(&mut conn)
         .await
@@ -1362,6 +1366,7 @@ async fn suspended_commands_that_reach_hard_cap_move_to_dlq_immediately() {
                 workflow_retry_policy: None,
                 retry_of_exec_id: None,
                 origin: None,
+                completion_callbacks: None,
             })
             .execute(&mut conn)
             .await
@@ -1589,6 +1594,7 @@ async fn local_activity_retries_stop_when_hard_cap_is_reached() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             origin: None,
+            completion_callbacks: None,
         })
         .execute(&mut conn)
         .await
@@ -1773,6 +1779,7 @@ async fn detached_parent_close_cascade_counts_against_history_cap() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             origin: None,
+            completion_callbacks: None,
         })
         .execute(&mut conn)
         .await
@@ -1966,6 +1973,7 @@ async fn child_hard_cap_dlq_notifies_parent_and_stops_inline_growth() {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             origin: None,
+            completion_callbacks: None,
         })
         .execute(&mut conn)
         .await
@@ -2290,6 +2298,7 @@ async fn workflow_non_determinism_metric_and_search_attrs_are_recorded() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -2504,6 +2513,7 @@ async fn schedule_to_start_histogram_emitted_at_dispatch() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -2659,6 +2669,7 @@ async fn oldest_pending_age_query_positive_then_zero_after_drain() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -2772,6 +2783,7 @@ async fn oldest_pending_age_excludes_paused_executions() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -2875,6 +2887,7 @@ async fn oldest_pending_age_excludes_rate_limited_tasks() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -3012,6 +3025,7 @@ async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)
@@ -3125,6 +3139,7 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&exec_row)

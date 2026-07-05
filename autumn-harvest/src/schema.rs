@@ -90,6 +90,11 @@ diesel::table! {
         /// Consecutive block entries for the current divergence incident (issue
         /// #603). Drives the re-dispatch backoff; reset to 0 on a clean cycle.
         nd_block_count -> Int4,
+        /// Per-execution completion-callback targets (issue #605): a JSON array
+        /// of `{url, filter}` objects. NULL = no per-execution targets; the
+        /// effective set is still the union with any builder-wide defaults,
+        /// resolved at enqueue time (not stored on this row).
+        completion_callbacks -> Nullable<Jsonb>,
     }
 }
 
@@ -628,6 +633,42 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Durable completion-callback delivery rows (issue #605). One row per
+    /// `(workflow_exec_id, callback_index)`, enqueued inside the terminal
+    /// transaction and drained by `fire_due_completion_deliveries`.
+    harvest_completion_deliveries (id) {
+        id               -> Uuid,
+        workflow_exec_id -> Uuid,
+        shard_id         -> Int4,
+        callback_index   -> Int4,
+        workflow_name    -> Text,
+        workflow_id      -> Text,
+        target_url       -> Text,
+        event_filter     -> Jsonb,
+        terminal_state   -> Text,
+        /// Frozen `CompletionEnvelope` JSON, signed and `POSTed` verbatim on
+        /// every attempt (including redeliveries).
+        payload          -> Jsonb,
+        /// PENDING | INFLIGHT | DELIVERED | FAILED
+        state            -> Text,
+        attempt          -> Int4,
+        max_attempts     -> Int4,
+        /// Frozen `RetryPolicy` at enqueue time.
+        retry_policy     -> Jsonb,
+        next_attempt_at  -> Timestamptz,
+        last_status      -> Nullable<Int4>,
+        last_error       -> Nullable<Text>,
+        created_at       -> Timestamptz,
+        updated_at       -> Timestamptz,
+        delivered_at     -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::joinable!(harvest_completion_deliveries -> harvest_workflow_executions (workflow_exec_id));
+
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
@@ -653,4 +694,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_debounce,
     harvest_event_batches,
     harvest_payload_refs,
+    harvest_completion_deliveries,
 );

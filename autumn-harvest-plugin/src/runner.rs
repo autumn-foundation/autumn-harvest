@@ -116,6 +116,36 @@ impl PreparedHarvestRuntime {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
         let retention_config = built.retention().clone();
         let history_archiver = built.history_archiver().cloned();
+        // Install the process-global completion-callback runtime config
+        // (issue #605): the deliverer/secret/allowlist/defaults/retry policy
+        // the core scanner (`fire_due_completion_deliveries`) and enqueue
+        // path (`enqueue_completion_deliveries`) read via
+        // `GLOBAL_CALLBACK_CONFIG`. Every `BuiltHarvest` consumer (the
+        // `HarvestPlugin` web-app path and the standalone runner) funnels
+        // through this one construction point, so this is set exactly once
+        // regardless of which path started the runtime. Core ships no HTTP
+        // client, so an embedder-supplied deliverer is used verbatim and a
+        // `reqwest`-based default is substituted otherwise.
+        {
+            let callback_config = built.completion_callback_config();
+            let deliverer = callback_config.deliverer.clone().unwrap_or_else(|| {
+                Arc::new(crate::callback_deliverer::ReqwestCallbackDeliverer::new())
+            });
+            let secret = callback_config.secret.clone().unwrap_or_else(|| {
+                autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
+            });
+            if let Ok(mut lock) =
+                autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG.write()
+            {
+                *lock = Some(autumn_harvest::completion_callback::CallbackRuntimeConfig {
+                    deliverer,
+                    secret,
+                    ssrf_policy: callback_config.ssrf_policy(),
+                    default_targets: callback_config.default_targets.clone(),
+                    retry_policy: callback_config.retry_policy.clone(),
+                });
+            }
+        }
         let classic_dag_names = built
             .dags()
             .iter()

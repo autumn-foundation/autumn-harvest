@@ -188,6 +188,7 @@ async fn seed_run(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin,
+            completion_callbacks: None,
         },
     )
     .await

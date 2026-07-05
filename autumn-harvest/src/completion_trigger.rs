@@ -324,6 +324,10 @@ pub struct DeferredTriggerStart {
 
 #[cfg(feature = "db")]
 impl DeferredTriggerStart {
+    // Pre-existing, unrelated to issue #605: this function sits just over the
+    // 100-line clippy threshold on trunk already; allowed here rather than
+    // refactored to keep this change scoped to completion callbacks.
+    #[allow(clippy::too_many_lines)]
     pub fn spawn(self) {
         let Some(pool) = crate::shard::GLOBAL_SHARDED_POOL
             .read()
@@ -393,6 +397,7 @@ impl DeferredTriggerStart {
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: self.max_workflow_attempts_ceiling,
                     origin: None,
+                    completion_callbacks: None,
                 },
             )
             .await;
@@ -461,6 +466,15 @@ pub fn evaluate_triggers_for_execution<'a>(
         let Some(execution) = execution else {
             return Ok(deferred_starts);
         };
+
+        // Durable completion callbacks (issue #605): enqueue any matching
+        // delivery rows inside this same terminal transaction. Reuses the
+        // execution row already loaded above; a no-op when no completion-
+        // callback config has ever been registered
+        // (`completion_callback::GLOBAL_CALLBACK_CONFIG` is `None`) or when
+        // no target matches this terminal state.
+        crate::completion_callback::enqueue_completion_deliveries(conn, &execution, exec_id, state)
+            .await?;
 
         let triggers = triggers_dsl::harvest_completion_triggers
             .filter(triggers_dsl::source_workflow_name.eq(&execution.workflow_name))
@@ -628,6 +642,7 @@ pub fn evaluate_triggers_for_execution<'a>(
                         max_workflow_attempts_ceiling,
                         // Completion-trigger start is not a schedule fire (issue #534).
                         origin: None,
+                        completion_callbacks: None,
                     },
                 )
                 .await
@@ -846,6 +861,10 @@ pub async fn enforce_completion_triggers_outbox(
                 max_workflow_attempts_ceiling,
                 // Completion-trigger start is not a schedule fire (issue #534).
                 origin: None,
+                // Internal start: only builder-wide default callback targets
+                // apply (issue #605); a completion-trigger target has no
+                // per-execution callback option of its own.
+                completion_callbacks: None,
             },
         )
         .await;

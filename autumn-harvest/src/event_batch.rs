@@ -276,6 +276,7 @@ pub async fn admit_batched_start(
                             retry_of_exec_id: None,
                             max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
                             origin: None,
+                            completion_callbacks: None,
                         };
 
                         let (started, deferred_starts, deferred_checks, cancel_metrics) =
@@ -539,6 +540,7 @@ async fn fire_claimed_batch_row(
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: None,
+        completion_callbacks: None,
     };
 
     let start_res =

@@ -420,6 +420,7 @@ async fn insert_workflow_on_url(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -2186,6 +2187,7 @@ async fn insert_child_workflow_on_url(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await

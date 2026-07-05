@@ -300,6 +300,7 @@ async fn seed_workflows(database_url: &str, workflow_name: &str, count: usize) -
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
                 origin: None,
+                completion_callbacks: None,
             },
         )
         .await

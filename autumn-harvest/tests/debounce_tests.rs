@@ -639,6 +639,7 @@ async fn no_debounce_policy_uses_normal_start_path() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await

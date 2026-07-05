@@ -236,6 +236,19 @@ pub enum DeadLetterReason {
         task_timeout_strikes: i32,
         timeout_secs: u64,
     },
+    /// A completion-callback delivery (issue #605) exhausted its configured
+    /// retry budget without ever receiving a 2xx response. Distinct from
+    /// clean task-retry exhaustion: there is no `harvest_task_queue` row or
+    /// workflow execution to reactivate on redrive — an operator-triggered
+    /// redrive resets the *same* `harvest_completion_deliveries` row
+    /// (`completion_callback::redrive_delivery`) to `PENDING` so the
+    /// scanner re-attempts it with the same `delivery_id`.
+    CallbackDeliveryExhausted {
+        delivery_id: Uuid,
+        attempts: i32,
+        last_status: Option<u16>,
+        target: String,
+    },
 }
 
 impl std::fmt::Display for DeadLetterReason {
@@ -1947,6 +1960,49 @@ mod tests {
         assert!(json.contains("WorkflowTaskTimeout"));
         assert!(json.contains("task_timeout_strikes"));
         assert!(json.contains("timeout_secs"));
+    }
+
+    #[test]
+    fn dead_letter_reason_callback_delivery_exhausted_is_typed_json() {
+        let delivery_id = Uuid::new_v4();
+        let reason = DeadLetterReason::CallbackDeliveryExhausted {
+            delivery_id,
+            attempts: 5,
+            last_status: Some(503),
+            target: "https://api.example.com/hook".into(),
+        };
+
+        let json = reason.to_string();
+        let back: DeadLetterReason =
+            serde_json::from_str(&json).expect("typed reason should deserialize");
+
+        assert_eq!(back, reason);
+        assert!(json.contains("CallbackDeliveryExhausted"));
+        assert!(json.contains("api.example.com"));
+        assert!(json.contains("503"));
+    }
+
+    #[test]
+    fn callback_delivery_exhausted_is_distinct_from_poison_pill_and_timeout() {
+        // A delivery DLQ entry must never be mistaken for clean task-retry
+        // exhaustion (issue #605 AC: "typed reason distinct from clean
+        // task-retry exhaustion").
+        let callback = DeadLetterReason::CallbackDeliveryExhausted {
+            delivery_id: Uuid::new_v4(),
+            attempts: 5,
+            last_status: None,
+            target: "https://api.example.com/hook".into(),
+        };
+        let poison_pill = DeadLetterReason::PoisonPill {
+            crash_strikes: 3,
+            last_worker_id: None,
+        };
+        assert_ne!(callback.to_string(), poison_pill.to_string());
+        assert!(!matches!(callback, DeadLetterReason::PoisonPill { .. }));
+        assert!(!matches!(
+            callback,
+            DeadLetterReason::WorkflowTaskTimeout { .. }
+        ));
     }
 
     #[test]

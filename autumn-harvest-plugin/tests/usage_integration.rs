@@ -323,6 +323,7 @@ async fn seed_execution(
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)

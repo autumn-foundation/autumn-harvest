@@ -2939,6 +2939,11 @@ async fn persist_workflow_failure(
                         retry_of_exec_id: Some(exec_id.as_uuid()),
                         max_workflow_attempts_ceiling: None,
                         origin: exec_ref.origin.as_deref(),
+                        // Workflow-level retry (issue #523) is the same
+                        // logical run trying again — inherit the
+                        // predecessor's completion-callback targets (#605)
+                        // rather than silently dropping them.
+                        completion_callbacks: exec_ref.completion_callbacks.clone(),
                     };
 
                     match crate::execution::start_or_load_workflow_execution_collect(
@@ -4088,6 +4093,10 @@ async fn persist_all_started_child_workflows(
                             .and_then(|p| serde_json::to_value(&p).ok()),
                         retry_of_exec_id: None,
                         origin: None, // child workflow, not a schedule fire (issue #534)
+                        // Children get only builder-wide default callback
+                        // targets, resolved at their own terminal transition
+                        // (issue #605) — no per-execution override here.
+                        completion_callbacks: None,
                     };
                     let child_started_event = WorkflowEvent::WorkflowStarted {
                         input: child.input.clone(),
@@ -4709,6 +4718,9 @@ async fn create_detached_child_executions(
                 .and_then(|p| serde_json::to_value(&p).ok()),
             retry_of_exec_id: None,
             origin: None, // detached child workflow, not a schedule fire (issue #534)
+            // Detached children get only builder-wide default callback
+            // targets (issue #605) — no per-execution override here.
+            completion_callbacks: None,
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -6241,6 +6253,9 @@ async fn persist_workflow_continue_as_new(
         // Preserve dispatch origin through continue-as-new so a continued scheduled run
         // stays attributed to its schedule's cadence (issue #534).
         origin: execution.origin.as_deref(),
+        // Continue-as-new is the same logical run forking forward: preserve
+        // the predecessor's completion-callback targets (issue #605).
+        completion_callbacks: execution.completion_callbacks.clone(),
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
