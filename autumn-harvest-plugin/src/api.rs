@@ -34,17 +34,18 @@ use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID, HEADER_SOURCE,
     OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
-    OP_BUILD_POLICY_SET, OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY,
-    OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
-    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
-    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
-    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_TASK_REPRIORITIZE,
-    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
-    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
-    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
-    TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE,
-    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CIRCUIT_FORCE_CLOSE,
+    OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK,
+    OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE,
+    OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW,
+    OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
+    OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN,
+    OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET,
+    OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
+    OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED,
+    STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT,
+    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -2927,6 +2928,17 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             "/admin/build-routing/retire",
             post(retire_build_handler).route_layer(require_admin.clone()),
         )
+        // Percentage build ramp (issue #604): ramp a slice of new starts to a
+        // second build for a canary rollout. Mutating routes are admin-gated;
+        // the current ramp state is surfaced on the existing read route above.
+        .route(
+            "/admin/build-routing/ramp",
+            post(set_build_ramp_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/build-routing/ramp/{queue_name}",
+            delete(clear_build_ramp_handler).route_layer(require_admin.clone()),
+        )
         // Admission gates (issue #377): incident-response switch to halt new
         // workflow starts fleet-wide or for a scoped subset of work.
         // GET is read-only; POST/DELETE require admin access.
@@ -3128,6 +3140,9 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "/admin/build-routing/compat/{build_id}/{compat_with}",
         ),
         ("POST", "/admin/build-routing/retire"),
+        // ── percentage build ramp (issue #604) ─────────────────────────────────
+        ("POST", "/admin/build-routing/ramp"),
+        ("DELETE", "/admin/build-routing/ramp/{queue_name}"),
         // ── admission gates (issue #377) ──────────────────────────────────────
         ("GET", "/admin/gates"),
         ("POST", "/admin/gates"),
@@ -3402,6 +3417,17 @@ pub const fn management_api_request_fields()
             Some(&[]),
         ),
         ("POST", "/admin/build-routing/retire", Some(&["build_id"])),
+        // ── percentage build ramp (issue #604) ─────────────────────────────────
+        (
+            "POST",
+            "/admin/build-routing/ramp",
+            Some(&["queue_name", "target_build_id", "ramp_percent"]),
+        ),
+        (
+            "DELETE",
+            "/admin/build-routing/ramp/{queue_name}",
+            Some(&[]),
+        ),
         // ── schedule preview (issue #348) ─────────────────────────────────────
         (
             "POST",
@@ -4121,6 +4147,8 @@ pub const fn management_api_response_fields()
                 "deployment_name",
                 "created_at",
                 "updated_at",
+                "target_build_id",
+                "ramp_percent",
             ]),
         ),
         (
@@ -4146,6 +4174,35 @@ pub const fn management_api_response_fields()
                 "safe_to_retire",
                 "open_executions",
                 "pending_tasks",
+            ]),
+        ),
+        // ── percentage build ramp (issue #604) ─────────────────────────────────
+        (
+            "POST",
+            "/admin/build-routing/ramp",
+            Some(&[
+                "id",
+                "queue_name",
+                "build_id",
+                "deployment_name",
+                "created_at",
+                "updated_at",
+                "target_build_id",
+                "ramp_percent",
+            ]),
+        ),
+        (
+            "DELETE",
+            "/admin/build-routing/ramp/{queue_name}",
+            Some(&[
+                "id",
+                "queue_name",
+                "build_id",
+                "deployment_name",
+                "created_at",
+                "updated_at",
+                "target_build_id",
+                "ramp_percent",
             ]),
         ),
         // ── admission gates (issue #377) ──────────────────────────────────────
@@ -21638,6 +21695,295 @@ async fn set_build_policy_handler(
             axum::http::StatusCode::MULTI_STATUS,
             axum::Json(serde_json::json!({
                 "policy": policy,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetBuildRampBody {
+    queue_name: String,
+    target_build_id: String,
+    ramp_percent: i32,
+}
+
+/// `POST /admin/build-routing/ramp` — set (or update) a queue's percentage
+/// build ramp (issue #604).
+///
+/// Fans out to all shards so every shard's `get_build_policy()` call sees
+/// the new ramp when resolving `assigned_build_id` at workflow-start time.
+/// Requires a base build policy to already exist for the queue (a ramp
+/// targets a second build *in addition to* the base); returns `409 Conflict`
+/// otherwise. `ramp_percent` is validated to `0..=100` before dispatch so a
+/// bad request never reaches the database (`400`).
+#[allow(clippy::too_many_lines)]
+async fn set_build_ramp_handler(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::Json(body): axum::Json<SetBuildRampBody>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::{set_build_ramp, validate_ramp_percent};
+
+    let queue_name = body.queue_name.trim();
+    let target_build_id = body.target_build_id.trim();
+    if queue_name.is_empty() || target_build_id.is_empty() {
+        return AutumnError::bad_request_msg("queue_name and target_build_id must not be empty")
+            .into_response();
+    }
+    if let Err(e) = validate_ramp_percent(body.ramp_percent) {
+        return map_error(e).into_response();
+    }
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    let mut last_policy = None;
+    let mut last_conflict = None;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match set_build_ramp(&mut conn, queue_name, target_build_id, body.ramp_percent).await {
+            Ok(p) => last_policy = Some(p),
+            Err(e @ autumn_harvest::HarvestError::Config(_)) => {
+                last_conflict = Some(e);
+            }
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+            }
+        }
+    }
+
+    // A base-policy-missing conflict takes priority over transient shard
+    // errors: it is a genuine precondition failure, not an outage.
+    if last_policy.is_none()
+        && let Some(conflict) = last_conflict
+    {
+        return conflict_from(conflict).into_response();
+    }
+
+    // If every shard write failed, return 503 before attempting audit.
+    if !shard_errors.is_empty() && last_policy.is_none() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+    let Some(policy) = last_policy else {
+        return map_error(autumn_harvest::HarvestError::Config(
+            "no shards configured".into(),
+        ))
+        .into_response();
+    };
+
+    // Audit write is required — fail the response if it cannot be persisted.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_BUILD_RAMP_SET,
+        target_type: TARGET_BUILD_ROUTING,
+        target_id: Some(queue_name),
+        route_or_command: "POST /admin/build-routing/ramp",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match api_state.storage_pool() {
+        Ok(audit_pool) => match acquire_conn(audit_pool.default_pool()).await {
+            Ok(mut conn) => {
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %audit_err,
+                        "audit insert failed for build_routing.ramp.set"
+                    );
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "audit DB connection unavailable for build_routing.ramp.set"
+                );
+                return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "storage pool unavailable for audit in build_routing.ramp.set"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(policy)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "policy": policy,
+                "shard_errors": shard_errors,
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// `DELETE /admin/build-routing/ramp/{queue_name}` — clear a queue's
+/// percentage build ramp (issue #604).
+///
+/// Fans out to all shards. Returns `404 Not Found` when no policy row exists
+/// for `queue_name` on any shard (nothing to clear). Clearing an
+/// already-unramped policy is a no-op that still returns `200 OK`.
+#[allow(clippy::too_many_lines)]
+async fn clear_build_ramp_handler(
+    headers: axum::http::HeaderMap,
+    Extension(api_state): Extension<HarvestApiState>,
+    axum::extract::Path(queue_name): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    use autumn_harvest::build_routing::clear_build_ramp;
+
+    let pool = match api_state.storage_pool().map_err(map_error) {
+        Ok(p) => p,
+        Err(e) => return e.into_response(),
+    };
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+
+    let mut last_policy = None;
+    let mut shard_errors: Vec<String> = Vec::new();
+    for (shard_id, shard_pool) in pool.iter_shards() {
+        let mut conn = match acquire_conn(shard_pool).await {
+            Ok(c) => c,
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+                continue;
+            }
+        };
+        match clear_build_ramp(&mut conn, &queue_name)
+            .await
+            .map_err(map_error)
+        {
+            Ok(p) => {
+                if p.is_some() {
+                    last_policy = p;
+                }
+            }
+            Err(e) => {
+                shard_errors.push(format!("shard {}: {e}", shard_id.as_i32()));
+            }
+        }
+    }
+
+    // If any shard failed and no reachable shard had a policy to clear, we
+    // can't tell whether the queue truly has no ramp or the ramp lives on an
+    // unreachable shard — surface 503 rather than a misleading 404.
+    if !shard_errors.is_empty() && last_policy.is_none() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "errors": shard_errors })),
+        )
+            .into_response();
+    }
+    if last_policy.is_none() {
+        return AutumnError::not_found_msg(format!(
+            "no build policy registered for queue '{queue_name}'"
+        ))
+        .into_response();
+    }
+
+    // Audit write is required — fail the response if it cannot be persisted.
+    let status = if shard_errors.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let error_summary = if shard_errors.is_empty() {
+        None
+    } else {
+        Some(shard_errors.join("; "))
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_BUILD_RAMP_CLEAR,
+        target_type: TARGET_BUILD_ROUTING,
+        target_id: Some(queue_name.as_str()),
+        route_or_command: "DELETE /admin/build-routing/ramp/{queue_name}",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    match api_state.storage_pool() {
+        Ok(audit_pool) => match acquire_conn(audit_pool.default_pool()).await {
+            Ok(mut conn) => {
+                if let Err(audit_err) = audit::insert_audit(&mut conn, &ar).await {
+                    tracing::error!(
+                        error = %audit_err,
+                        "audit insert failed for build_routing.ramp.clear"
+                    );
+                    return AutumnError::service_unavailable_msg(format!(
+                        "audit insert failed: {audit_err}"
+                    ))
+                    .into_response();
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "audit DB connection unavailable for build_routing.ramp.clear"
+                );
+                return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                    .into_response();
+            }
+        },
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "storage pool unavailable for audit in build_routing.ramp.clear"
+            );
+            return AutumnError::service_unavailable_msg("audit DB connection unavailable")
+                .into_response();
+        }
+    }
+
+    if shard_errors.is_empty() {
+        (axum::http::StatusCode::OK, axum::Json(last_policy)).into_response()
+    } else {
+        (
+            axum::http::StatusCode::MULTI_STATUS,
+            axum::Json(serde_json::json!({
+                "policy": last_policy,
                 "shard_errors": shard_errors,
             })),
         )

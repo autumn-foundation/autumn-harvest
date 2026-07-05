@@ -8187,6 +8187,8 @@ mod tests {
             deployment_name: Some("prod-v2".to_string()),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            target_build_id: None,
+            ramp_percent: None,
         };
         let html = render_build_routing_page(&[policy], &[], &[], &[], &[], &[], false, None, None)
             .into_string();

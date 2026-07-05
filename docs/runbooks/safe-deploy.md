@@ -264,6 +264,128 @@ drain and stop the old workers using the drain runbook above.
 
 ---
 
+## Scenario A.5: Percent-ramp a new build (issue #604)
+
+Scenario A's Step 3 is a hard cutover: the instant `set_build_policy` runs,
+**100%** of new starts move to the new build. For anything customer-facing
+you usually want to validate a risky deploy against a *slice* of live
+traffic first, watch its failure/DLQ/duration metrics, and ramp up — or
+abort instantly — before it touches everyone.
+
+The ramp is a second, optional pair of columns (`target_build_id`,
+`ramp_percent`) on the same per-queue build policy row. It requires a base
+policy to already exist (Scenario A, Steps 1–2 — new workers registered,
+compat declared) but does **not** require advancing `build_id` itself: the
+base policy keeps routing the rest of traffic exactly as before.
+
+**Step 1 — Set an initial 5% ramp.**
+
+```bash
+harvest build ramp set \
+  --queue default \
+  --target-build-id sha-new123 \
+  --percent 5
+```
+
+Or over HTTP:
+
+```bash
+curl -X POST /api/harvest/admin/build-routing/ramp \
+  -H 'Content-Type: application/json' \
+  -d '{"queue_name": "default", "target_build_id": "sha-new123", "ramp_percent": 5}'
+```
+
+Or from Rust:
+
+```rust
+use autumn_harvest::build_routing::set_build_ramp;
+
+set_build_ramp(&mut conn, "default", "sha-new123", 5).await?;
+```
+
+Roughly 5% of new starts on `default` now get `assigned_build_id =
+"sha-new123"`; the rest keep the base `build_id`. The decision is a pure,
+deterministic function of the workflow's `ExecutionId` (the same rendezvous
+hash idiom used by shard routing and schedule jitter), so a start retry or
+outbox redelivery for the same execution never flips its build, and
+in-flight executions are never re-routed — only the one-time start decision
+is affected.
+
+> **Sharded deployments:** the management API route fans the write out to
+> every shard automatically. Calling `set_build_ramp` directly against a
+> single connection only affects that shard — loop over
+> `sharded_pool.iter_shards()` as in Scenario A above if you're calling the
+> core function rather than the HTTP/CLI surface.
+
+**Step 2 — Observe.**
+
+```bash
+harvest build ramp show
+# or: GET /api/harvest/admin/build-routing
+```
+
+The response's `policies` array carries `build_id`, `target_build_id`, and
+`ramp_percent` per queue, alongside the existing cross-shard `reachability`
+snapshot. Watch the canary build's failure rate, DLQ entries
+(`harvest dlq aggregate --group-by workflow_name,failure_signature`), and
+`harvest.workflow.terminal{outcome=...}` / `harvest.activity.failed` metrics
+segmented by `assigned_build_id` before deciding to ramp up.
+
+**Step 3 — Ramp up, or abort.**
+
+Ramp up in increments (5% → 25% → 100%) by re-issuing the same command with a
+higher `--percent`:
+
+```bash
+harvest build ramp set --queue default --target-build-id sha-new123 --percent 25
+```
+
+If the canary misbehaves, abort in one command — this is the whole point of
+the feature, and it's designed to be the fastest possible operator action
+(< 30s MTTR):
+
+```bash
+harvest build ramp set --queue default --target-build-id sha-new123 --percent 0
+# or, equivalently:
+harvest build ramp clear --queue default
+```
+
+Either form immediately stops new starts from reaching the target build; a
+follow-up start lands on the base build on its very next attempt. Ramping to
+`0` keeps the ramp record around (useful if you want to retry later without
+re-declaring `target_build_id`); `clear` removes it entirely.
+
+**Step 4 — Promote to full cutover.**
+
+Once you're satisfied at 100% ramp, promote the target to the queue's base
+policy so the ramp bookkeeping can be retired:
+
+```bash
+harvest workflow ...   # (verify no regressions first, per your own bar)
+harvest build ramp show   # confirm ramp_percent is 100
+```
+
+```rust
+// Promote: the target becomes the new base. Setting the base policy to the
+// same build id the ramp was already routing 100% of traffic to is a no-op
+// from the traffic's perspective — every start already resolves to
+// "sha-new123" either way.
+set_build_policy(&mut conn, "default", "sha-new123", Some("v2.3.0")).await?;
+// Then retire the now-redundant ramp record:
+clear_build_ramp(&mut conn, "default").await?;
+```
+
+Then continue with Scenario A's Step 4 (drain and retire old-build workers)
+using the same `build_reachability` check.
+
+**Compatibility gating still applies.** Ramping does not bypass
+`harvest_build_compat`: a worker on the base build declared compatible with
+the target build (or vice versa) still claims correctly, because the ramp
+only changes which build a *new start* is assigned to — the existing claim
+filter and compatibility declarations are unaffected.
+
+---
+
 ## Scenario B: Breaking deploy (new code cannot replay old history)
 
 Use this when the new binary changes execution order in a way that would corrupt

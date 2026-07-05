@@ -5048,7 +5048,9 @@
           "build_id",
           "deployment_name",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "target_build_id",
+          "ramp_percent"
         ]
       },
       "error_responses": [
@@ -5209,6 +5211,115 @@
         {
           "status": 409,
           "description": "Build has open executions or pending tasks and cannot be retired yet. Body contains the same fields showing current counts."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/admin/build-routing/ramp",
+      "category": "build_routing",
+      "read_only": false,
+      "description": "Set (or update) a queue's percentage build ramp: ramp_percent% of new workflow starts on the queue receive target_build_id, the rest receive the queue's base build_id. Requires a base build policy to already exist for the queue (issue #604).",
+      "idempotency": "Idempotent by queue_name: re-posting the same queue_name updates the ramp in place.",
+      "params": [],
+      "request_body": {
+        "required": true,
+        "free_form": false,
+        "fields": [
+          {
+            "name": "queue_name",
+            "required": true,
+            "description": "Task queue whose base build policy already exists."
+          },
+          {
+            "name": "target_build_id",
+            "required": true,
+            "description": "Ramp target build ID."
+          },
+          {
+            "name": "ramp_percent",
+            "required": true,
+            "description": "Integer percentage 0..=100 of new starts routed to target_build_id. 0 = no traffic to target, 100 = full cutover."
+          }
+        ]
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "id",
+          "queue_name",
+          "build_id",
+          "deployment_name",
+          "created_at",
+          "updated_at",
+          "target_build_id",
+          "ramp_percent"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 400,
+          "description": "queue_name/target_build_id empty, or ramp_percent outside 0..=100."
+        },
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 409,
+          "description": "No base build policy is registered for queue_name yet — call POST /admin/build-routing/policies first."
+        },
+        {
+          "status": 503,
+          "description": "Database unavailable."
+        }
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/admin/build-routing/ramp/{queue_name}",
+      "category": "build_routing",
+      "read_only": false,
+      "description": "Clear a queue's percentage build ramp, immediately stopping new starts from reaching the target build. The queue's base build policy is left untouched (issue #604).",
+      "idempotency": "Idempotent: clearing an already-unramped policy is a no-op that still returns 200.",
+      "params": [
+        {
+          "name": "queue_name",
+          "in": "path",
+          "required": true,
+          "description": "Task queue whose ramp should be cleared."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "id",
+          "queue_name",
+          "build_id",
+          "deployment_name",
+          "created_at",
+          "updated_at",
+          "target_build_id",
+          "ramp_percent"
+        ]
+      },
+      "error_responses": [
+        {
+          "status": 401,
+          "description": "Unauthenticated request."
+        },
+        {
+          "status": 404,
+          "description": "No build policy is registered for queue_name."
         },
         {
           "status": 503,

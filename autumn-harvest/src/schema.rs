@@ -376,6 +376,8 @@ diesel::table! {
         deployment_name -> Nullable<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        target_build_id -> Nullable<Text>,
+        ramp_percent -> Nullable<Integer>,
     }
 }
 
