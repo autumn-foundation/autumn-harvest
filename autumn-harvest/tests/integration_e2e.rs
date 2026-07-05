@@ -223,7 +223,10 @@ const LEGACY_INIT_SQL: &str = concat!(
     // nd_block_* columns even for a fresh (never-blocked) execution.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_blocked_at TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_reason TEXT NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_count INTEGER NOT NULL DEFAULT 0;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_count INTEGER NOT NULL DEFAULT 0;\n",
+    // issue #605: the modern start path's full-row insert touches
+    // completion_callbacks even for a workflow with no configured callback.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS completion_callbacks JSONB NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return

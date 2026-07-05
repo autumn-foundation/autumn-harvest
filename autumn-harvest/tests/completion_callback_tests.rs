@@ -806,6 +806,8 @@ async fn redrive_delivery_resets_a_failed_row_and_clears_its_dlq_entry() {
         .await
         .expect("list deliveries");
     assert_eq!(rows[0].state, "FAILED");
+    assert_eq!(rows[0].attempt, 1);
+    assert_eq!(rows[0].max_attempts, 1);
     let delivery_id = rows[0].id;
 
     #[derive(diesel::QueryableByName)]
@@ -834,7 +836,18 @@ async fn redrive_delivery_resets_a_failed_row_and_clears_its_dlq_entry() {
         .await
         .expect("list deliveries after redrive");
     assert_eq!(rows_after[0].state, "PENDING");
-    assert_eq!(rows_after[0].attempt, 0, "redrive resets the retry budget");
+    // `attempt` is deliberately *not* reset (issue #921 review, Codex P2):
+    // reusing attempt numbers across a redrive could let a stale pre-redrive
+    // response alias a fresh post-redrive claim's attempt count. Instead the
+    // retry budget is refreshed by extending `max_attempts`.
+    assert_eq!(
+        rows_after[0].attempt, 1,
+        "attempt must never be reset — only max_attempts is extended"
+    );
+    assert_eq!(
+        rows_after[0].max_attempts, 2,
+        "redrive extends max_attempts by the pre-redrive max_attempts (1 + 1 = 2)"
+    );
 
     let after: Vec<DlqCount> = diesel::sql_query(
         "SELECT count(*) as count FROM harvest_dead_letters WHERE original_task_id = $1",

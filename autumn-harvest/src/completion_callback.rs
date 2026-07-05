@@ -1345,19 +1345,41 @@ pub enum OutcomeAction {
     },
 }
 
+/// Deterministic per-delivery jitter seed, mirroring `worker.rs`'s
+/// `retry_stream_seed` (same FNV-offset-basis-XOR-halves idiom applied to a
+/// single UUID instead of two): two different deliveries never share a
+/// jitter stream, and the same delivery always jitters the same way for a
+/// given attempt number, so `JitterPolicy::Full`/`Equal`/`Decorrelated`
+/// spread retries across deliveries instead of all of them backing off in
+/// lockstep (the whole point of configuring jitter).
+#[must_use]
+fn delivery_stream_seed(delivery_id: Uuid) -> u64 {
+    let mut seed = 0xcbf2_9ce4_8422_2325_u64;
+    let raw = delivery_id.as_u128().to_le_bytes();
+    seed ^= u64::from_le_bytes(raw[..8].try_into().unwrap_or([0_u8; 8]));
+    seed = seed.wrapping_mul(0x1000_0000_01b3);
+    seed ^= u64::from_le_bytes(raw[8..].try_into().unwrap_or([0_u8; 8]));
+    seed = seed.wrapping_mul(0x1000_0000_01b3);
+    seed
+}
+
 /// Pure decision function: given the outcome of one delivery attempt and
 /// the frozen retry policy, decide what the scanner should do. The tx code
 /// (M6, DB-gated) only ever needs to *apply* this decision.
 ///
 /// `attempt` is the 1-based attempt number that was just made (i.e. after
 /// the scanner's claim-time increment). `max_attempts` is frozen onto the
-/// delivery row at enqueue time from the effective retry policy.
+/// delivery row at enqueue time from the effective retry policy. `seed`
+/// (typically [`delivery_stream_seed`] of the delivery's id) drives
+/// `retry_policy.jitter` — without it, a configured `JitterPolicy` would be
+/// silently ignored and every delivery would back off in perfect lockstep.
 #[must_use]
 pub fn classify_outcome(
     outcome: &DeliveryAttempt,
     attempt: u32,
     max_attempts: u32,
     retry_policy: &crate::policy::RetryPolicy,
+    seed: u64,
     now: DateTime<Utc>,
 ) -> OutcomeAction {
     if let Some(status) = outcome.status
@@ -1373,12 +1395,7 @@ pub fn classify_outcome(
         };
     }
 
-    let delay = crate::policy::compute_retry_delay(
-        retry_policy.initial_interval,
-        retry_policy.backoff_coefficient,
-        retry_policy.max_interval,
-        attempt,
-    );
+    let delay = crate::policy::compute_retry_delay_with_seed(retry_policy, attempt, seed);
     let next_attempt_at =
         now + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(0));
 
@@ -1408,14 +1425,14 @@ mod classify_outcome_tests {
     #[test]
     fn success_2xx_marks_delivered_regardless_of_attempt() {
         let outcome = DeliveryAttempt::success(204);
-        let action = classify_outcome(&outcome, 3, 5, &test_policy(), now());
+        let action = classify_outcome(&outcome, 3, 5, &test_policy(), 0, now());
         assert_eq!(action, OutcomeAction::Delivered { status: 204 });
     }
 
     #[test]
     fn non_2xx_below_max_attempts_schedules_backoff() {
         let outcome = DeliveryAttempt::success(500);
-        let action = classify_outcome(&outcome, 1, 5, &test_policy(), now());
+        let action = classify_outcome(&outcome, 1, 5, &test_policy(), 0, now());
         match action {
             OutcomeAction::Backoff {
                 next_attempt_at,
@@ -1433,7 +1450,7 @@ mod classify_outcome_tests {
     #[test]
     fn transport_error_below_max_attempts_schedules_backoff() {
         let outcome = DeliveryAttempt::transport_error("connection reset".to_string());
-        let action = classify_outcome(&outcome, 2, 5, &test_policy(), now());
+        let action = classify_outcome(&outcome, 2, 5, &test_policy(), 0, now());
         match action {
             OutcomeAction::Backoff {
                 last_status,
@@ -1450,7 +1467,7 @@ mod classify_outcome_tests {
     #[test]
     fn failure_at_max_attempts_dead_letters() {
         let outcome = DeliveryAttempt::success(503);
-        let action = classify_outcome(&outcome, 5, 5, &test_policy(), now());
+        let action = classify_outcome(&outcome, 5, 5, &test_policy(), 0, now());
         assert_eq!(
             action,
             OutcomeAction::DeadLetter {
@@ -1466,7 +1483,7 @@ mod classify_outcome_tests {
         // (should not happen in practice) still dead-letters rather than
         // looping forever.
         let outcome = DeliveryAttempt::transport_error("timeout".to_string());
-        let action = classify_outcome(&outcome, 9, 5, &test_policy(), now());
+        let action = classify_outcome(&outcome, 9, 5, &test_policy(), 0, now());
         assert!(matches!(action, OutcomeAction::DeadLetter { .. }));
     }
 
@@ -1476,7 +1493,7 @@ mod classify_outcome_tests {
         let mut prev_delay = StdDuration::ZERO;
         for attempt in 1..5 {
             let outcome = DeliveryAttempt::success(500);
-            let action = classify_outcome(&outcome, attempt, 10, &policy, now());
+            let action = classify_outcome(&outcome, attempt, 10, &policy, 0, now());
             let OutcomeAction::Backoff {
                 next_attempt_at, ..
             } = action
@@ -1501,14 +1518,73 @@ mod classify_outcome_tests {
         // classify_outcome must never conflate "give up" with "try again" or
         // "succeeded" — these three outcomes drive materially different DB
         // writes (FAILED+DLQ vs PENDING-with-future-scheduled_at vs DELIVERED).
-        let delivered =
-            classify_outcome(&DeliveryAttempt::success(200), 1, 5, &test_policy(), now());
-        let backoff = classify_outcome(&DeliveryAttempt::success(500), 1, 5, &test_policy(), now());
-        let dead_letter =
-            classify_outcome(&DeliveryAttempt::success(500), 5, 5, &test_policy(), now());
+        let delivered = classify_outcome(
+            &DeliveryAttempt::success(200),
+            1,
+            5,
+            &test_policy(),
+            0,
+            now(),
+        );
+        let backoff = classify_outcome(
+            &DeliveryAttempt::success(500),
+            1,
+            5,
+            &test_policy(),
+            0,
+            now(),
+        );
+        let dead_letter = classify_outcome(
+            &DeliveryAttempt::success(500),
+            5,
+            5,
+            &test_policy(),
+            0,
+            now(),
+        );
         assert!(matches!(delivered, OutcomeAction::Delivered { .. }));
         assert!(matches!(backoff, OutcomeAction::Backoff { .. }));
         assert!(matches!(dead_letter, OutcomeAction::DeadLetter { .. }));
+    }
+
+    #[test]
+    fn jitter_policy_is_honored_not_ignored() {
+        // issue #921 review (Codex P2): classify_outcome used to call the
+        // raw, non-jittered `compute_retry_delay` directly, silently
+        // dropping any configured `RetryPolicy::jitter`. Two different seeds
+        // under a `Full` jitter policy must be able to produce different
+        // delays for the same attempt — proving the seed actually reaches
+        // the jitter computation instead of being ignored.
+        let policy = test_policy().with_jitter(crate::policy::JitterPolicy::Full);
+        let outcome = DeliveryAttempt::success(500);
+        let mut delays = std::collections::HashSet::new();
+        for seed in 0..20u64 {
+            let action = classify_outcome(&outcome, 2, 10, &policy, seed, now());
+            let OutcomeAction::Backoff {
+                next_attempt_at, ..
+            } = action
+            else {
+                panic!("expected Backoff");
+            };
+            delays.insert((next_attempt_at - now()).num_nanoseconds());
+        }
+        assert!(
+            delays.len() > 1,
+            "expected varying delays across seeds under Full jitter, got a single value \
+             {delays:?} — classify_outcome is not honoring the seed"
+        );
+    }
+
+    #[test]
+    fn delivery_stream_seed_is_deterministic_and_distinguishes_deliveries() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        assert_eq!(delivery_stream_seed(a), delivery_stream_seed(a));
+        assert_ne!(
+            delivery_stream_seed(a),
+            delivery_stream_seed(b),
+            "two different delivery ids should (almost certainly) get distinct jitter streams"
+        );
     }
 }
 
@@ -2181,7 +2257,15 @@ async fn fire_due_on_conn(
 
         let max_attempts = u32::try_from(row.max_attempts).unwrap_or(u32::MAX);
         let attempt = u32::try_from(row.attempt).unwrap_or(u32::MAX);
-        let action = classify_outcome(&attempt_outcome, attempt, max_attempts, &retry_policy, now);
+        let seed = delivery_stream_seed(row.id);
+        let action = classify_outcome(
+            &attempt_outcome,
+            attempt,
+            max_attempts,
+            &retry_policy,
+            seed,
+            now,
+        );
 
         apply_outcome(conn, &row, action).await?;
         processed += 1;
@@ -2278,10 +2362,12 @@ pub async fn list_deliveries_for_execution(
 /// Outcome of a [`redrive_delivery`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryRedriveOutcome {
-    /// The delivery was reset to `PENDING` (fresh retry budget: `attempt`
-    /// reset to 0) so the scanner retries it on its next tick, and any
-    /// associated `harvest_dead_letters` row from the original exhaustion
-    /// was deleted (mirrors `dlq::redrive_dead_letter`'s cleanup).
+    /// The delivery was reset to `PENDING` (fresh retry budget granted by
+    /// extending `max_attempts` — see [`redrive_delivery`]'s doc comment for
+    /// why `attempt` itself is deliberately *not* reset) so the scanner
+    /// retries it on its next tick, and any associated
+    /// `harvest_dead_letters` row from the original exhaustion was deleted
+    /// (mirrors `dlq::redrive_dead_letter`'s cleanup).
     Redriven,
     /// No delivery row exists with this id.
     NotFound,
@@ -2301,6 +2387,25 @@ pub enum DeliveryRedriveOutcome {
 ///
 /// Redelivery reuses the same `delivery_id` (the row's own primary key),
 /// preserving the at-least-once + receiver-side-dedup contract.
+///
+/// **`attempt` is deliberately never reset** (issue #921 review, Codex P2).
+/// [`apply_outcome`] guards every outcome write with `.filter(attempt.eq(row.attempt))`
+/// so a stale attempt whose HTTP call outlives the `INFLIGHT` lease (and is
+/// therefore reclaimed by a later scanner tick, per that guard's own doc
+/// comment) can never overwrite a fresher attempt's result — that guard's
+/// soundness depends on `attempt` values never repeating over a delivery
+/// row's lifetime. Resetting `attempt` to `0` on redrive would violate that:
+/// a genuinely-still-in-flight pre-redrive call (e.g. one that raced the
+/// lease and is still awaiting a slow deliverer response) could return
+/// *after* the redrive and its captured `row.attempt` (a small number like
+/// `1`) could alias a fresh post-redrive claim that legitimately reaches the
+/// same small number, silently applying the ancient response's outcome to
+/// the wrong attempt. Instead, a "fresh retry budget" is granted by
+/// extending `max_attempts` (by the row's current `max_attempts`, so a
+/// redrive always grants at least as many additional attempts as the
+/// original policy allowed) while leaving the monotonically-increasing
+/// `attempt` counter untouched, so no attempt number is ever reused across
+/// a redrive.
 ///
 /// `exec_id` scopes the lookup to the execution named by the caller (e.g.
 /// the `{id}` path segment of `POST
@@ -2330,17 +2435,17 @@ pub async fn redrive_delivery(
 
     conn.transaction::<DeliveryRedriveOutcome, crate::error::HarvestError, _>(|conn| {
         async move {
-            let current_state: Option<String> = dsl::harvest_completion_deliveries
+            let current: Option<(String, i32)> = dsl::harvest_completion_deliveries
                 .find(delivery_id)
                 .filter(dsl::workflow_exec_id.eq(exec_uuid))
-                .select(dsl::state)
+                .select((dsl::state, dsl::max_attempts))
                 .for_update()
                 .first(conn)
                 .await
                 .optional()
                 .map_err(crate::error::database_error)?;
 
-            let Some(state) = current_state else {
+            let Some((state, max_attempts)) = current else {
                 return Ok(DeliveryRedriveOutcome::NotFound);
             };
             if state != "FAILED" {
@@ -2348,6 +2453,10 @@ pub async fn redrive_delivery(
                     current_state: state,
                 });
             }
+
+            // Extend the ceiling rather than resetting `attempt` — see the
+            // doc comment above for why reusing attempt numbers is unsafe.
+            let extended_max_attempts = max_attempts.saturating_add(max_attempts.max(1));
 
             diesel::update(
                 dsl::harvest_completion_deliveries
@@ -2357,7 +2466,7 @@ pub async fn redrive_delivery(
             .filter(dsl::state.eq("FAILED"))
             .set((
                 dsl::state.eq("PENDING"),
-                dsl::attempt.eq(0),
+                dsl::max_attempts.eq(extended_max_attempts),
                 dsl::next_attempt_at.eq(Utc::now()),
                 dsl::last_status.eq(None::<i32>),
                 dsl::last_error.eq(None::<String>),
