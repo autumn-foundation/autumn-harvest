@@ -99,6 +99,36 @@ handle is durable). A handle minted by one workflow is rejected by another
 workflow's tools with the same 404 an unknown handle gets, so tools are not
 an existence oracle across workflows.
 
+## DAGs as MCP tools
+
+A unified DAG (`unified-dag-execution`, on by default) is already a
+`WorkflowInfo` under the hood — `#[dag]` lowers it onto a shadow companion
+that `HarvestBuilder::dags()` auto-registers alongside ordinary workflows.
+Opt one into MCP the same way:
+
+```rust
+#[dag(schedule = "0 2 * * *", mcp)]
+fn daily_etl(dag: &mut DagBuilder) { … }
+```
+
+A DAG's tool set is a **subset** of an ordinary workflow's — exactly three
+tools, `start_daily_etl`, `daily_etl_status`, `daily_etl_watch`:
+
+- **No `signal_{dag}`, no update tools.** The generated level-walking DAG
+  handler never waits on a signal and DAGs have no update handlers, so both
+  are omitted rather than shipped as dead tools.
+- **`start_{dag}` preserves the DAG trigger contract.** Unlike an ordinary
+  workflow's `start_foo` (which delegates to the generic `start_workflow`
+  path), a DAG's start tool routes through the same `trigger_dag_run` handler
+  `POST /dags/{name}/trigger` uses — so admission gates and the DAG's
+  `max_active_runs`/paused enforcement apply identically to an
+  MCP-originated start. This matters: `start_workflow` has no notion of
+  either, and would silently let an agent spawn more concurrent DAG runs than
+  the operator-configured policy allows.
+
+`status`/`watch` need no DAG-specific handling — they already work by
+execution id regardless of whether it names a plain workflow or a DAG run.
+
 ## Typed input schema — no second schema
 
 `start_foo`'s `inputSchema` embeds the workflow's published JSON Schema

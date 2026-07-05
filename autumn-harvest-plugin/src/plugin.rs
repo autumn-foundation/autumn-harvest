@@ -236,7 +236,9 @@ impl HarvestPlugin {
         self
     }
 
-    /// Expose every `#[workflow(mcp)]` workflow as MCP tools (issue #597).
+    /// Expose every `#[workflow(mcp)]` workflow, and every `#[dag(mcp)]`
+    /// unified DAG, as MCP tools (issue #597; DAG support added in issue #601
+    /// follow-up).
     ///
     /// Generates typed `start_{wf}` / `{wf}_status` / `signal_{wf}` /
     /// `{wf}_watch` routes (plus one `{wf}_update_{name}` per
@@ -246,9 +248,16 @@ impl HarvestPlugin {
     /// tool catalog. The app author still mounts (and secures, via
     /// `secure_mcp`) the MCP endpoint itself.
     ///
-    /// Opt-in only: workflows without the `mcp` attribute never surface, and
-    /// the mutating tools are never part of autumn-web's read-only
-    /// `expose_all_as_mcp` hatch.
+    /// A `#[dag(mcp)]` DAG gets a reduced three-tool set instead --
+    /// `start_{dag}` / `{dag}_status` / `{dag}_watch`, no `signal_{dag}` and
+    /// no update tools (a DAG never consumes signals and has no update
+    /// handlers) -- and its `start_{dag}` tool routes through the DAG trigger
+    /// contract (admission gates, `max_active_runs`/paused enforcement)
+    /// rather than the generic workflow-start path.
+    ///
+    /// Opt-in only: workflows and DAGs without the `mcp` attribute never
+    /// surface, and the mutating tools are never part of autumn-web's
+    /// read-only `expose_all_as_mcp` hatch.
     #[cfg(feature = "mcp")]
     #[must_use]
     pub const fn mcp_tools(mut self) -> Self {
@@ -359,9 +368,16 @@ impl Plugin for HarvestPlugin {
             }
             let prefix =
                 crate::mcp_tools::tools_prefix(api_path.as_deref(), mcp_tools_prefix.as_deref());
+            // A unified DAG's shadow `WorkflowInfo` (auto-registered by
+            // `.dags(...)`) lives in `builder.workflow_infos()` alongside
+            // ordinary workflows; `collect_descriptors` cross-references
+            // `builder.dag_infos()` to tell them apart, routing a DAG's start
+            // tool through the DAG trigger contract and omitting its signal
+            // tool (issue #601 follow-up).
             let descriptors = crate::mcp_tools::collect_descriptors(
                 builder.workflow_infos(),
                 builder.update_handlers(),
+                builder.dag_infos(),
             );
             crate::mcp_tools::record_schemas(&descriptors);
             Some(crate::mcp_tools::build_mcp_tool_routes(
@@ -1043,6 +1059,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }
     }
 
