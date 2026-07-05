@@ -946,13 +946,30 @@ async fn delete_candidate_execution(
             .map_err(database_error)?;
 
             // `harvest_completion_deliveries.workflow_exec_id` has no `ON
-            // DELETE CASCADE` (issue #605 code review) — without this
-            // explicit delete, a collected execution's completion-callback
-            // delivery rows would be orphaned permanently, exactly like
-            // `harvest_dead_letters` above required the same treatment.
+            // DELETE CASCADE` (issue #605 code review). Only `DELIVERED`
+            // rows are deleted here — a fully successful delivery has
+            // nothing left to do, so it is safe cleanup exactly like
+            // `harvest_dead_letters` above. A `PENDING`/`INFLIGHT`/`FAILED`
+            // row is deliberately left alone (PR #921 review, Codex): its
+            // `payload` is frozen precisely so delivery does not depend on
+            // the execution row surviving, and this execution reaching its
+            // retention age has no bearing on whether its callback still
+            // needs to be retried or is awaiting an operator's redrive.
+            // Known limitation: once its owning execution is collected, a
+            // surviving non-`DELIVERED` row references a `workflow_exec_id`
+            // that no longer exists (there is no FK to violate, so this is
+            // safe) and this retention pass will never revisit that exact
+            // execution again — so even if the delivery later resolves to
+            // `DELIVERED`, nothing currently deletes it. A future dedicated
+            // delivery-retention policy, scoped to this table's own age/
+            // state rather than its owning execution's, would be needed to
+            // reclaim those rows; out of scope here, where the goal is only
+            // to stop retention from destroying a delivery that hasn't
+            // finished yet.
             diesel::delete(
                 harvest_completion_deliveries::table
-                    .filter(harvest_completion_deliveries::workflow_exec_id.eq(candidate_id)),
+                    .filter(harvest_completion_deliveries::workflow_exec_id.eq(candidate_id))
+                    .filter(harvest_completion_deliveries::state.eq("DELIVERED")),
             )
             .execute(conn)
             .await
