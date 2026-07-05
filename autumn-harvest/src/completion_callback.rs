@@ -955,8 +955,12 @@ impl CallbackTarget {
 /// Resolve the full, deterministic, deduplicated set of effective callback targets.
 ///
 /// Per-execution targets come first (in the order given), then builder-wide
-/// defaults, skipping any default that exactly duplicates an
-/// already-included `(url, filter)` pair.
+/// defaults, skipping any entry that exactly duplicates an already-included
+/// `(url, filter)` pair — including a duplicate *within* `per_exec` itself
+/// (issue #921 review): a caller that repeats the same target twice in one
+/// start request must still get exactly one delivery row/`delivery_id` for
+/// it, not two independently-retried deliveries to the same receiver for
+/// the same logical registration.
 ///
 /// The returned `Vec`'s index is the **stable `callback_index`** used as
 /// half of the `(workflow_exec_id, callback_index)` uniqueness key in
@@ -971,10 +975,10 @@ pub fn resolve_all_targets(
     per_exec: &[CallbackTarget],
     defaults: &[CallbackTarget],
 ) -> Vec<CallbackTarget> {
-    let mut all: Vec<CallbackTarget> = per_exec.to_vec();
-    for default in defaults {
-        if !all.contains(default) {
-            all.push(default.clone());
+    let mut all: Vec<CallbackTarget> = Vec::with_capacity(per_exec.len() + defaults.len());
+    for target in per_exec.iter().chain(defaults.iter()) {
+        if !all.contains(target) {
+            all.push(target.clone());
         }
     }
     all
@@ -1060,6 +1064,28 @@ mod config_resolution_tests {
         ];
         let all = resolve_all_targets(&per_exec, &defaults);
         assert_eq!(all.len(), 2, "the duplicate default must be dropped");
+        assert_eq!(all[0].url, "https://a.example.com");
+        assert_eq!(all[1].url, "https://b.example.com");
+    }
+
+    #[test]
+    fn resolve_all_targets_dedupes_a_repeated_target_within_per_exec_itself() {
+        // Issue #921 review (Codex): a caller repeating the same {url, filter}
+        // twice in one start request's completion_callbacks list must still
+        // resolve to exactly one target/callback_index/delivery_id, not two
+        // independently-delivered duplicates to the same receiver.
+        let dup = target("https://a.example.com", EventFilter::AnyTerminal);
+        let per_exec = vec![
+            dup.clone(),
+            target("https://b.example.com", EventFilter::AnyTerminal),
+            dup,
+        ];
+        let all = resolve_all_targets(&per_exec, &[]);
+        assert_eq!(
+            all.len(),
+            2,
+            "a target repeated within per_exec must collapse to one entry"
+        );
         assert_eq!(all[0].url, "https://a.example.com");
         assert_eq!(all[1].url, "https://b.example.com");
     }
