@@ -195,6 +195,116 @@ async fn test_event_batch_accumulation_and_size_flush() {
     assert!(o3.flushed_execution_id.is_some());
 }
 
+/// Read back the `completion_callbacks` column for a started execution.
+async fn started_execution_completion_callbacks(
+    conn: &mut AsyncPgConnection,
+    wf_id: &str,
+) -> Option<serde_json::Value> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        completion_callbacks: Option<serde_json::Value>,
+    }
+
+    diesel::sql_query(
+        "SELECT completion_callbacks FROM harvest_workflow_executions WHERE workflow_id=$1",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf_id)
+    .get_result::<Row>(conn)
+    .await
+    .expect("execution row query")
+    .completion_callbacks
+}
+
+// Regression (issue #605 code review): a per-execution completion_callbacks
+// target must survive both batch admission paths, not just the direct
+// start path -- neither a size-triggered flush nor a scanner-driven
+// time-based flush may silently drop it.
+#[tokio::test]
+async fn size_triggered_flush_threads_completion_callbacks_into_the_started_execution() {
+    let (mut conn, _container) = setup_db().await;
+    let callbacks = json!([
+        { "url": "https://api.example.com/hook", "filter": { "type": "AnyTerminal" } }
+    ]);
+
+    for i in 1..=3 {
+        let p = AdmitBatchParams {
+            workflow_name: "callback_batch_wf".to_string(),
+            batch_key: "key-cb".to_string(),
+            workflow_id: "callback-batch-001".to_string(),
+            queue_name: "default".to_string(),
+            payload: json!({"val": i}),
+            start_options: DebounceStartOptions {
+                completion_callbacks: Some(callbacks.clone()),
+                ..Default::default()
+            },
+            max_wait: Duration::from_secs(10),
+            max_size: 3,
+            shard_id: 0,
+        };
+        let (o, _deferred_starts) = admit_batched_start(&mut conn, p, None)
+            .await
+            .unwrap()
+            .unwrap();
+        if i == 3 {
+            assert!(o.is_flushed);
+            assert!(o.flushed_execution_id.is_some());
+        }
+    }
+
+    let stored = started_execution_completion_callbacks(&mut conn, "callback-batch-001").await;
+    assert_eq!(
+        stored,
+        Some(callbacks),
+        "a size-flushed batch start must carry the caller's completion_callbacks through"
+    );
+}
+
+#[tokio::test]
+async fn time_triggered_flush_threads_completion_callbacks_into_the_started_execution() {
+    let (mut conn, _container) = setup_db().await;
+    let callbacks = json!([
+        { "url": "https://api.example.com/hook", "filter": { "type": "CompletedOnly" } }
+    ]);
+
+    let p = AdmitBatchParams {
+        workflow_name: "callback_time_batch_wf".to_string(),
+        batch_key: "key-cb-time".to_string(),
+        workflow_id: "callback-time-batch-001".to_string(),
+        queue_name: "default".to_string(),
+        payload: json!({"val": 1}),
+        start_options: DebounceStartOptions {
+            completion_callbacks: Some(callbacks.clone()),
+            ..Default::default()
+        },
+        max_wait: Duration::from_secs(10),
+        max_size: 5,
+        shard_id: 0,
+    };
+    let (o, _deferred_starts) = admit_batched_start(&mut conn, p, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!o.is_flushed);
+
+    diesel::sql_query("UPDATE harvest_event_batches SET fire_at = NOW() - INTERVAL '1 minute'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let fired = fire_due_event_batches(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .unwrap();
+    assert_eq!(fired, 1);
+
+    let stored = started_execution_completion_callbacks(&mut conn, "callback-time-batch-001").await;
+    assert_eq!(
+        stored,
+        Some(callbacks),
+        "a time-flushed batch start must carry the caller's completion_callbacks through"
+    );
+}
+
 #[tokio::test]
 async fn test_event_batch_time_flush() {
     let (mut conn, _container) = setup_db().await;

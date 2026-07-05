@@ -7760,6 +7760,7 @@ pub(crate) async fn start_workflow(
                     trace_context: debounce_trace_ctx,
                     workflow_retry_policy: debounce_workflow_retry_policy,
                     max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                    completion_callbacks: completion_callbacks.clone(),
                 },
             };
 
@@ -8055,6 +8056,7 @@ pub(crate) async fn start_workflow(
                 trace_context: debounce_trace_ctx,
                 workflow_retry_policy: batch_workflow_retry_policy,
                 max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                completion_callbacks: completion_callbacks.clone(),
             },
         };
 
@@ -11307,7 +11309,8 @@ async fn redrive_completion_delivery(
     let exec_id_str = exec_id.to_string();
 
     let result =
-        autumn_harvest::completion_callback::redrive_delivery(&mut conn, delivery_uuid).await;
+        autumn_harvest::completion_callback::redrive_delivery(&mut conn, exec_id, delivery_uuid)
+            .await;
 
     let (status, error_summary) = match &result {
         Ok(_) => (STATUS_SUCCEEDED, None),

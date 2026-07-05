@@ -266,6 +266,11 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Paginated, filterable single-execution history (issue #529): read-only cursor walk.
     ("GET /workflows/{id}/history", RouteClass::ReadOnly),
     ("GET /workflows/{id}/history/export", RouteClass::ReadOnly),
+    // Completion-callback delivery listing (issue #605): read-only, no audit.
+    (
+        "GET /workflows/{id}/completion-deliveries",
+        RouteClass::ReadOnly,
+    ),
     ("GET /dags", RouteClass::ReadOnly),
     ("GET /dags/{dag_name}/runs", RouteClass::ReadOnly),
     ("GET /dead-letters", RouteClass::ReadOnly),
@@ -340,6 +345,11 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /dead-letters/discard", RouteClass::Mutating),
     ("POST /dead-letters/{id}/replay", RouteClass::Mutating),
     ("POST /dlq/redrive", RouteClass::Mutating),
+    // Completion-callback delivery redrive (issue #605).
+    (
+        "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive",
+        RouteClass::Mutating,
+    ),
     ("POST /admin/retention/run-now", RouteClass::Mutating),
     ("POST /admin/schedules/workflow", RouteClass::Mutating),
     ("POST /admin/schedules/{id}/pause", RouteClass::Mutating),
@@ -452,6 +462,8 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // Percentage build ramp (issue #604)
     OP_BUILD_RAMP_SET,
     OP_BUILD_RAMP_CLEAR,
+    // Completion-callback delivery redrive (issue #605)
+    OP_CALLBACK_REDRIVE,
 ];
 
 /// Routes explicitly excluded from audit.
@@ -474,6 +486,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "POST /workflows/{id}/update/{update_name}",
     "GET /workflows/{id}/history",
     "GET /workflows/{id}/history/export",
+    "GET /workflows/{id}/completion-deliveries",
     "GET /dags",
     "GET /dags/{dag_name}/runs",
     "GET /dead-letters",
@@ -555,6 +568,11 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}/result", None),
     ("GET /workflows/{id}/history", None),
     ("GET /workflows/{id}/history/export", None),
+    ("GET /workflows/{id}/completion-deliveries", None),
+    (
+        "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive",
+        Some(OP_CALLBACK_REDRIVE),
+    ),
     // DAG management
     ("GET /dags", None),
     ("GET /dags/{dag_name}/runs", None),
@@ -988,6 +1006,58 @@ mod tests {
             EXCLUDED_ROUTES.contains(&"GET /admin/usage"),
             "GET /admin/usage must appear in EXCLUDED_ROUTES (read-only, no audit trail \
              entry expected, issue #596)"
+        );
+    }
+
+    #[test]
+    fn completion_delivery_routes_are_classified() {
+        // Issue #605 code review: the completion-callback delivery list and
+        // redrive routes shipped registered in the router (management_api_routes
+        // in autumn-harvest-plugin/src/api.rs) but absent from
+        // CLASSIFIED_ROUTES/AUDITED_OPERATIONS/ALL_MUTATION_ROUTES entirely —
+        // exactly the gap issues #544/#601 each independently hit and had to
+        // retroactively patch, since the general exhaustiveness guards below
+        // only cross-check these lists against each other, never against the
+        // live router. This test is what actually catches that class of gap
+        // for these two specific routes.
+        assert!(
+            CLASSIFIED_ROUTES.iter().any(|(r, c)| {
+                *r == "GET /workflows/{id}/completion-deliveries" && *c == RouteClass::ReadOnly
+            }),
+            "GET /workflows/{{id}}/completion-deliveries must be classified \
+             RouteClass::ReadOnly in CLASSIFIED_ROUTES (issue #605)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES.iter().any(|(r, op)| {
+                *r == "GET /workflows/{id}/completion-deliveries" && op.is_none()
+            }),
+            "GET /workflows/{{id}}/completion-deliveries must appear in \
+             ALL_MUTATION_ROUTES with no audit operation (issue #605)"
+        );
+        assert!(
+            EXCLUDED_ROUTES.contains(&"GET /workflows/{id}/completion-deliveries"),
+            "GET /workflows/{{id}}/completion-deliveries must appear in EXCLUDED_ROUTES \
+             (read-only, no audit trail entry expected, issue #605)"
+        );
+
+        let redrive_route = "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == redrive_route && *c == RouteClass::Mutating),
+            "{redrive_route} must be classified RouteClass::Mutating in CLASSIFIED_ROUTES \
+             (issue #605)"
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == redrive_route && *op == Some(OP_CALLBACK_REDRIVE)),
+            "{redrive_route} must appear in ALL_MUTATION_ROUTES with audit operation \
+             OP_CALLBACK_REDRIVE (issue #605)"
+        );
+        assert!(
+            AUDITED_OPERATIONS.contains(&OP_CALLBACK_REDRIVE),
+            "OP_CALLBACK_REDRIVE must appear in AUDITED_OPERATIONS (issue #605)"
         );
     }
 

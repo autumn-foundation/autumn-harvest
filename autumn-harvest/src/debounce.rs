@@ -177,6 +177,11 @@ pub struct DebounceStartOptions {
     /// Server-side ceiling on workflow retry attempts, captured at admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_workflow_attempts_ceiling: Option<u32>,
+    /// Completion-callback targets validated at admission time, so a
+    /// debounced/batched start honors the caller's registered targets
+    /// instead of silently discarding them (issue #605 code review).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_callbacks: Option<serde_json::Value>,
 }
 
 /// Parameters for [`admit_debounced_start`].
@@ -734,7 +739,7 @@ async fn fire_claimed_debounce_row(
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: opts.max_workflow_attempts_ceiling,
         origin: None,
-        completion_callbacks: None,
+        completion_callbacks: opts.completion_callbacks,
     };
 
     // `in_outer_transaction = true`: this runs inside the scanner's fire

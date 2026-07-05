@@ -132,18 +132,37 @@ impl PreparedHarvestRuntime {
                 Arc::new(crate::callback_deliverer::ReqwestCallbackDeliverer::new())
             });
             let secret = callback_config.secret.clone().unwrap_or_else(|| {
+                // issue #605 code review: signing with an empty key is not a
+                // silent no-op -- HMAC-SHA256 accepts any key length and
+                // produces a valid, deterministic (and trivially
+                // reproducible by anyone) signature, so a caller who never
+                // configures `completion_callback_secret(...)` gets a
+                // `X-Harvest-Signature` header that carries no real
+                // authenticity guarantee at all. This is reachable for both
+                // builder-default AND per-execution targets (the latter
+                // bypass builder config entirely), so warn unconditionally
+                // rather than only when default targets are configured.
+                tracing::warn!(
+                    "completion-callback HMAC secret was never configured via \
+                     HarvestBuilder::completion_callback_secret(...) -- every \
+                     delivered callback will be signed with an empty key, which \
+                     defeats the X-Harvest-Signature authenticity guarantee for \
+                     any receiver relying on it"
+                );
                 autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
             });
             if let Ok(mut lock) =
                 autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG.write()
             {
-                *lock = Some(autumn_harvest::completion_callback::CallbackRuntimeConfig {
-                    deliverer,
-                    secret,
-                    ssrf_policy: callback_config.ssrf_policy(),
-                    default_targets: callback_config.default_targets.clone(),
-                    retry_policy: callback_config.retry_policy.clone(),
-                });
+                *lock = Some(Arc::new(
+                    autumn_harvest::completion_callback::CallbackRuntimeConfig {
+                        deliverer,
+                        secret,
+                        ssrf_policy: callback_config.ssrf_policy(),
+                        default_targets: callback_config.default_targets.clone(),
+                        retry_policy: callback_config.retry_policy.clone(),
+                    },
+                ));
             }
         }
         let classic_dag_names = built

@@ -27,7 +27,10 @@ use crate::error::{HarvestError, HarvestResult, database_error};
 #[cfg(feature = "db")]
 use crate::schema::harvest_workflow_executions;
 #[cfg(feature = "db")]
-use crate::schema::{harvest_dead_letters, harvest_signals, harvest_task_queue, harvest_timers};
+use crate::schema::{
+    harvest_completion_deliveries, harvest_dead_letters, harvest_signals, harvest_task_queue,
+    harvest_timers,
+};
 #[cfg(feature = "db")]
 use crate::shard::ShardedDbPool;
 #[cfg(feature = "db")]
@@ -937,6 +940,19 @@ async fn delete_candidate_execution(
             diesel::delete(
                 harvest_dead_letters::table
                     .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate_id))),
+            )
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+            // `harvest_completion_deliveries.workflow_exec_id` has no `ON
+            // DELETE CASCADE` (issue #605 code review) — without this
+            // explicit delete, a collected execution's completion-callback
+            // delivery rows would be orphaned permanently, exactly like
+            // `harvest_dead_letters` above required the same treatment.
+            diesel::delete(
+                harvest_completion_deliveries::table
+                    .filter(harvest_completion_deliveries::workflow_exec_id.eq(candidate_id)),
             )
             .execute(conn)
             .await

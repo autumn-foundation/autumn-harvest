@@ -124,6 +124,44 @@ fn usage_route_is_classified() {
     );
 }
 
+/// The completion-callback delivery list + redrive routes (issue #605) must
+/// have entries in `autumn_harvest::audit::CLASSIFIED_ROUTES`.
+///
+/// Mirrors `workflow_count_route_is_classified`/`usage_route_is_classified`:
+/// these two routes shipped registered in `management_api_routes()` but
+/// initially absent from every classification list in `audit.rs`, exactly
+/// the gap this precedent test pattern exists to catch — `audit.rs`'s own
+/// exhaustiveness tests only cross-check its lists against each other, never
+/// against the live router.
+#[test]
+fn completion_delivery_routes_are_classified() {
+    use autumn_harvest::audit::CLASSIFIED_ROUTES;
+
+    let list_route = "GET /workflows/{id}/completion-deliveries";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == list_route),
+        "{list_route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES.iter().any(|(r, _)| *r == list_route),
+        "{list_route} must have an entry in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+
+    let redrive_route = "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive";
+    assert!(
+        management_api_routes()
+            .iter()
+            .any(|(m, p)| format!("{m} {p}") == redrive_route),
+        "{redrive_route} must be registered in management_api_routes()"
+    );
+    assert!(
+        CLASSIFIED_ROUTES.iter().any(|(r, _)| *r == redrive_route),
+        "{redrive_route} must have an entry in autumn_harvest::audit::CLASSIFIED_ROUTES"
+    );
+}
+
 /// Every route in the contract must carry all required metadata fields.
 #[test]
 fn contract_routes_have_required_fields() {

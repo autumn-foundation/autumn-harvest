@@ -1591,9 +1591,18 @@ pub struct CallbackRuntimeConfig {
     pub retry_policy: crate::policy::RetryPolicy,
 }
 
+// `Arc`-wrapped (issue #605 code review): every read clones the value out of
+// the lock (see below), and `CallbackRuntimeConfig` carries owned `Vec<u8>`/
+// `Vec<String>`/`Vec<CallbackTarget>` fields alongside the already-cheap
+// `Arc<dyn CompletionCallbackDeliverer>` — without the outer `Arc`, a clone
+// deep-copies all of those on every terminal transition and every scanner
+// tick, a config value that is otherwise identical across calls and only
+// ever changes at startup. Wrapping the whole struct turns that into an O(1)
+// refcount bump.
 #[cfg(feature = "db")]
-pub static GLOBAL_CALLBACK_CONFIG: std::sync::RwLock<Option<CallbackRuntimeConfig>> =
-    std::sync::RwLock::new(None);
+pub static GLOBAL_CALLBACK_CONFIG: std::sync::RwLock<
+    Option<std::sync::Arc<CallbackRuntimeConfig>>,
+> = std::sync::RwLock::new(None);
 
 /// Enqueue durable completion-callback deliveries for `execution`'s terminal
 /// transition to `state`.
@@ -1940,13 +1949,15 @@ async fn fire_due_on_conn(
     let claimed = claim_due_deliveries(conn, now).await?;
     let mut processed = 0usize;
 
+    // Sign and send the payload bytes exactly as read back from this claim —
+    // a Postgres JSONB round-trip may reorder object keys relative to the
+    // bytes originally inserted, but that never threatens the "signature
+    // covers exactly what was posted" invariant: whatever bytes we derive
+    // here are the ones we sign *and* the ones we send, on every attempt
+    // including the first. Rows that fail to serialize are skipped (logged)
+    // rather than aborting the whole batch.
+    let mut dispatchable = Vec::with_capacity(claimed.len());
     for row in claimed {
-        // Sign and send the payload bytes exactly as read back from this
-        // claim — a Postgres JSONB round-trip may reorder object keys
-        // relative to the bytes originally inserted, but that never
-        // threatens the "signature covers exactly what was posted"
-        // invariant: whatever bytes we derive here are the ones we sign
-        // *and* the ones we send, on every attempt including the first.
         let body = match serde_json::to_vec(&row.payload) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1959,11 +1970,26 @@ async fn fire_due_on_conn(
             }
         };
         let headers = delivery_headers(&config.secret, &body, row.id, now);
-        let attempt_outcome = config
-            .deliverer
-            .deliver(&row.target_url, &body, &headers)
-            .await;
+        dispatchable.push((row, body, headers));
+    }
 
+    // Dispatch every claimed delivery's HTTP POST concurrently rather than
+    // one at a time: a sequential loop would hold this shard's single
+    // connection (checked out from a bounded pool shared with other work)
+    // for the sum of every attempt's latency — with a full batch and a few
+    // slow/unreachable targets, that's tens of minutes worst case. Dispatching
+    // concurrently bounds the wall-clock cost of one tick to the *slowest*
+    // single delivery instead of the sum of all of them. Only the network
+    // call is concurrent; outcome recording below still runs sequentially
+    // against the single connection this function was handed (mirroring
+    // every other scanner in this codebase).
+    let delivery_futures = dispatchable
+        .iter()
+        .map(|(row, body, headers)| config.deliverer.deliver(&row.target_url, body, headers));
+    let attempt_outcomes = futures::future::join_all(delivery_futures).await;
+
+    for ((row, _body, _headers), attempt_outcome) in dispatchable.into_iter().zip(attempt_outcomes)
+    {
         let retry_policy: crate::policy::RetryPolicy = match serde_json::from_value(
             row.retry_policy.clone(),
         ) {
@@ -2101,11 +2127,20 @@ pub enum DeliveryRedriveOutcome {
 /// Redelivery reuses the same `delivery_id` (the row's own primary key),
 /// preserving the at-least-once + receiver-side-dedup contract.
 ///
+/// `exec_id` scopes the lookup to the execution named by the caller (e.g.
+/// the `{id}` path segment of `POST
+/// /workflows/{id}/completion-deliveries/{delivery_id}/redrive`) — a
+/// `delivery_id` that exists but belongs to a *different* execution is
+/// reported as [`DeliveryRedriveOutcome::NotFound`], exactly like an
+/// unknown id, so the caller can never redrive (or learn the existence of)
+/// a delivery outside the execution they named.
+///
 /// # Errors
 /// Returns `HarvestError` on a database failure.
 #[cfg(feature = "db")]
 pub async fn redrive_delivery(
     conn: &mut diesel_async::AsyncPgConnection,
+    exec_id: crate::types::ExecutionId,
     delivery_id: Uuid,
 ) -> crate::error::HarvestResult<DeliveryRedriveOutcome> {
     use diesel::prelude::*;
@@ -2116,10 +2151,13 @@ pub async fn redrive_delivery(
     use crate::schema::harvest_completion_deliveries::dsl;
     use crate::schema::harvest_dead_letters::dsl as dlq_dsl;
 
+    let exec_uuid = exec_id.as_uuid();
+
     conn.transaction::<DeliveryRedriveOutcome, crate::error::HarvestError, _>(|conn| {
         async move {
             let current_state: Option<String> = dsl::harvest_completion_deliveries
                 .find(delivery_id)
+                .filter(dsl::workflow_exec_id.eq(exec_uuid))
                 .select(dsl::state)
                 .for_update()
                 .first(conn)
@@ -2136,19 +2174,23 @@ pub async fn redrive_delivery(
                 });
             }
 
-            diesel::update(dsl::harvest_completion_deliveries.find(delivery_id))
-                .filter(dsl::state.eq("FAILED"))
-                .set((
-                    dsl::state.eq("PENDING"),
-                    dsl::attempt.eq(0),
-                    dsl::next_attempt_at.eq(Utc::now()),
-                    dsl::last_status.eq(None::<i32>),
-                    dsl::last_error.eq(None::<String>),
-                    dsl::updated_at.eq(Utc::now()),
-                ))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            diesel::update(
+                dsl::harvest_completion_deliveries
+                    .find(delivery_id)
+                    .filter(dsl::workflow_exec_id.eq(exec_uuid)),
+            )
+            .filter(dsl::state.eq("FAILED"))
+            .set((
+                dsl::state.eq("PENDING"),
+                dsl::attempt.eq(0),
+                dsl::next_attempt_at.eq(Utc::now()),
+                dsl::last_status.eq(None::<i32>),
+                dsl::last_error.eq(None::<String>),
+                dsl::updated_at.eq(Utc::now()),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
 
             diesel::delete(
                 dlq_dsl::harvest_dead_letters

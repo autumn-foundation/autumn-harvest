@@ -217,6 +217,31 @@ async fn execution_count(conn: &mut AsyncPgConnection, wf: &str, wf_id: &str) ->
     .n
 }
 
+/// Read back the `completion_callbacks` column for a started execution.
+async fn started_execution_completion_callbacks(
+    conn: &mut AsyncPgConnection,
+    wf: &str,
+    wf_id: &str,
+) -> Option<serde_json::Value> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        completion_callbacks: Option<serde_json::Value>,
+    }
+
+    diesel::sql_query(
+        "SELECT completion_callbacks FROM harvest_workflow_executions WHERE workflow_name=$1 AND workflow_id=$2",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf)
+    .bind::<diesel::sql_types::Text, _>(wf_id)
+    .get_result::<Row>(conn)
+    .await
+    .expect("execution row query")
+    .completion_callbacks
+}
+
 fn no_op_metrics() -> RecordingMetrics {
     RecordingMetrics::default()
 }
@@ -295,6 +320,46 @@ async fn burst_collapse_k_upserts_produce_one_row_and_one_execution() {
 
     // Exactly 1 execution
     assert_eq!(execution_count(&mut conn, wf, wf_id).await, 1);
+}
+
+// Regression (issue #605 code review): a per-execution completion_callbacks
+// target supplied on a request that resolves to the debounce admission path
+// must not be silently discarded -- it must reach the eventually-started
+// execution's `completion_callbacks` column, exactly like every other
+// operator-facing start option DebounceStartOptions already threads through
+// (owner, sla, memo, ...).
+#[tokio::test]
+async fn fire_due_debounced_starts_threads_completion_callbacks_into_the_started_execution() {
+    let (mut conn, _c) = setup_db().await;
+
+    let wf = "callback_debounce_wf";
+    let key = "tenant:callback";
+    let wf_id = "callback-debounce-001";
+    let window = Duration::from_millis(1);
+    let max_wait = Duration::from_secs(60);
+    let callbacks = serde_json::json!([
+        { "url": "https://api.example.com/hook", "filter": { "type": "AnyTerminal" } }
+    ]);
+
+    let mut params = admit_params(wf, key, wf_id, serde_json::json!({}), window, max_wait);
+    params.start_options.completion_callbacks = Some(callbacks.clone());
+    admit_debounced_start_ungated(&mut conn, params)
+        .await
+        .expect("admit");
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("fire");
+    assert_eq!(fired, 1);
+
+    let stored = started_execution_completion_callbacks(&mut conn, wf, wf_id).await;
+    assert_eq!(
+        stored,
+        Some(callbacks),
+        "the debounced start must carry the caller's validated completion_callbacks through to the started execution"
+    );
 }
 
 // ── AC6: trailing-edge semantics ─────────────────────────────────────────────

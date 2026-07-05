@@ -227,13 +227,13 @@ impl CompletionCallbackDeliverer for ScriptedDeliverer {
 }
 
 fn install_config(deliverer: Arc<dyn CompletionCallbackDeliverer>, retry_policy: RetryPolicy) {
-    *GLOBAL_CALLBACK_CONFIG.write().unwrap() = Some(CallbackRuntimeConfig {
+    *GLOBAL_CALLBACK_CONFIG.write().unwrap() = Some(Arc::new(CallbackRuntimeConfig {
         deliverer,
         secret: CallbackSecret::new(b"test-secret".to_vec()),
         ssrf_policy: SsrfPolicy::new(HostAllowlist::new().with_pattern("api.example.com")),
         default_targets: Vec::new(),
         retry_policy,
-    });
+    }));
 }
 
 async fn insert_terminal_execution(
@@ -399,6 +399,111 @@ async fn no_targets_configured_enqueues_nothing() {
     assert!(
         rows.is_empty(),
         "a callback-less workflow must behave identically to today: zero rows"
+    );
+}
+
+/// A deliverer that sleeps a fixed duration before returning, so a test can
+/// assert on whether a batch of deliveries ran concurrently or sequentially.
+#[derive(Default)]
+struct SlowDeliverer {
+    delay: Duration,
+    call_count: std::sync::atomic::AtomicUsize,
+}
+
+impl SlowDeliverer {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl CompletionCallbackDeliverer for SlowDeliverer {
+    fn deliver<'a>(
+        &'a self,
+        _target_url: &'a str,
+        _body: &'a [u8],
+        _headers: &'a [(&'static str, String)],
+    ) -> DeliverFuture<'a> {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            DeliveryAttempt::success(200)
+        })
+    }
+}
+
+// Regression (issue #605 code review): a batch of due deliveries must be
+// dispatched concurrently, not one HTTP POST at a time -- a sequential loop
+// would hold the scanner's single pooled connection for the sum of every
+// attempt's latency, which for a full batch of slow/unreachable targets
+// could stretch a single tick to tens of minutes.
+#[tokio::test]
+async fn scanner_dispatches_a_batch_of_deliveries_concurrently_not_sequentially() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+
+    const N: usize = 5;
+    const DELAY: Duration = Duration::from_millis(300);
+    let deliverer = Arc::new(SlowDeliverer::new(DELAY));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(3, Duration::from_secs(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    let targets: Vec<serde_json::Value> = (0..N)
+        .map(|i| {
+            serde_json::json!({
+                "url": format!("https://api.example.com/hook-{i}"),
+                "filter": { "type": "AnyTerminal" }
+            })
+        })
+        .collect();
+    let callbacks_json = serde_json::to_string(&targets).unwrap();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(&callbacks_json),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert_eq!(rows.len(), N, "one row per target");
+
+    let started = std::time::Instant::now();
+    let processed = fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        processed, N,
+        "the whole batch must be processed in one tick"
+    );
+    let call_count = std::sync::atomic::AtomicUsize::load(
+        &deliverer.call_count,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    assert_eq!(call_count, N);
+    // Sequential dispatch would take at least N * DELAY (~1.5s for N=5,
+    // 300ms). Concurrent dispatch takes roughly one DELAY plus overhead.
+    // Use a generous bound well below the sequential floor to keep this
+    // robust under CI scheduling jitter while still failing if dispatch
+    // regresses to a sequential loop.
+    assert!(
+        elapsed < DELAY * 2,
+        "a batch of {N} deliveries each taking {DELAY:?} took {elapsed:?} -- \
+         this is consistent with sequential dispatch, not concurrent"
     );
 }
 
@@ -720,7 +825,7 @@ async fn redrive_delivery_resets_a_failed_row_and_clears_its_dlq_entry() {
         "exhaustion must have written exactly one DLQ row"
     );
 
-    let outcome = redrive_delivery(&mut conn, delivery_id)
+    let outcome = redrive_delivery(&mut conn, exec_id, delivery_id)
         .await
         .expect("redrive");
     assert_eq!(outcome, DeliveryRedriveOutcome::Redriven);
@@ -761,10 +866,63 @@ async fn redrive_delivery_is_a_no_op_on_an_unknown_id() {
     let (url, _container) = setup().await;
     let mut conn = connect(&url).await;
 
-    let outcome = redrive_delivery(&mut conn, uuid::Uuid::new_v4())
+    let outcome = redrive_delivery(&mut conn, ExecutionId::new(), uuid::Uuid::new_v4())
         .await
         .expect("redrive unknown id");
     assert_eq!(outcome, DeliveryRedriveOutcome::NotFound);
+}
+
+#[tokio::test]
+async fn redrive_delivery_is_a_no_op_when_delivery_belongs_to_a_different_execution() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    install_config(
+        Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(500)])),
+        RetryPolicy::exponential(1, Duration::from_millis(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "FAILED",
+        None,
+        Some("boom"),
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Failed, None)
+        .await
+        .expect("evaluate triggers");
+
+    // max_attempts = 1 -> the very first tick exhausts the budget.
+    fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick exhausts on first attempt");
+    let rows = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries");
+    assert_eq!(rows[0].state, "FAILED");
+    let delivery_id = rows[0].id;
+
+    // A delivery_id that is real, but paired with an unrelated execution id,
+    // must behave exactly like an unknown delivery_id — never redriven, and
+    // never distinguishable from NotFound (no cross-execution existence
+    // oracle).
+    let unrelated_exec_id = ExecutionId::new();
+    let outcome = redrive_delivery(&mut conn, unrelated_exec_id, delivery_id)
+        .await
+        .expect("redrive with mismatched execution id");
+    assert_eq!(outcome, DeliveryRedriveOutcome::NotFound);
+
+    let rows_after = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries after mismatched redrive attempt");
+    assert_eq!(
+        rows_after[0].state, "FAILED",
+        "the delivery must be untouched by a redrive scoped to a different execution"
+    );
 }
 
 #[tokio::test]
@@ -794,7 +952,7 @@ async fn redrive_delivery_rejects_a_non_failed_delivery() {
     let rows = list_deliveries_for_execution(&mut conn, exec_id)
         .await
         .expect("list deliveries");
-    let outcome = redrive_delivery(&mut conn, rows[0].id)
+    let outcome = redrive_delivery(&mut conn, exec_id, rows[0].id)
         .await
         .expect("redrive a still-pending delivery");
     assert_eq!(
