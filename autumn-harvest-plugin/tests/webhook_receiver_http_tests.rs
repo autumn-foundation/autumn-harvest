@@ -120,8 +120,11 @@ async fn fails_closed_when_runtime_is_not_started() {
         .await;
     // The signature verified successfully (proving the request reached this
     // crate's handler code), which then fails closed because no
-    // HarvestApiState::install(...) ever ran in this no-DB harness.
-    resp.assert_status(400);
+    // HarvestApiState::install(...) ever ran in this no-DB harness. 503, not
+    // 400: a transient boot-window condition must be a 5xx so autumn-web's
+    // replay-protection cleanup middleware releases the reserved delivery id
+    // for the provider's automatic retry (Codex review, PR #918).
+    resp.assert_status(503);
     resp.assert_body_contains("harvest runtime is not started");
 }
 
@@ -151,7 +154,18 @@ async fn missing_signature_header_returns_400() {
 }
 
 #[tokio::test]
-async fn duplicate_delivery_with_replay_protection_is_rejected_409() {
+async fn boot_window_failure_never_permanently_consumes_a_replay_protected_delivery_id() {
+    // Regression test for a Codex review finding (PR #918): the runtime-not-
+    // started path used to return 400, and autumn-web's
+    // webhook_replay_cleanup_middleware only releases a SignedWebhook
+    // extractor's reserved replay key on a 5xx response. A 400 there would
+    // have permanently consumed `dlv-replay-1`'s replay key on the very
+    // first attempt (even though nothing was ever actually dispatched), so a
+    // provider's automatic retry after the app finishes booting would 409 as
+    // a false duplicate forever. With the fix (503, not 400), both attempts
+    // below correctly release the key and neither is ever misdiagnosed as a
+    // duplicate -- proving the fix rather than the pre-fix (and, in this
+    // no-DB harness, permanently-broken) expectation of a 409 on redelivery.
     let client = build_client(vec![generic_endpoint("orders", "/hooks/orders", true)]);
     let body = serde_json::to_vec(&serde_json::json!({"order_id": "o-1"})).unwrap();
     let sig = sign(&body);
@@ -163,10 +177,7 @@ async fn duplicate_delivery_with_replay_protection_is_rejected_409() {
         .body(body.clone())
         .send()
         .await;
-    // Runtime isn't started, so even the *first* delivery 400s past
-    // verification -- but that alone proves verification (and thus the
-    // replay-protection insert) already ran and committed the delivery id.
-    first.assert_status(400);
+    first.assert_status(503);
 
     let second = client
         .post("/hooks/orders")
@@ -175,7 +186,7 @@ async fn duplicate_delivery_with_replay_protection_is_rejected_409() {
         .body(body)
         .send()
         .await;
-    second.assert_status(409);
+    second.assert_status(503);
 }
 
 fn panic_message(result: std::thread::Result<Vec<autumn_web::Route>>) -> String {
@@ -268,7 +279,7 @@ async fn webhook_routes_coexist_with_a_second_binding() {
         .body(order_body)
         .send()
         .await;
-    order_resp.assert_status(400); // fail-closed, but reached this crate's code
+    order_resp.assert_status(503); // fail-closed, but reached this crate's code
 
     let sub_resp = client
         .post("/hooks/subscriptions")
@@ -276,5 +287,5 @@ async fn webhook_routes_coexist_with_a_second_binding() {
         .body(sub_body)
         .send()
         .await;
-    sub_resp.assert_status(400); // fail-closed, but reached this crate's code
+    sub_resp.assert_status(503); // fail-closed, but reached this crate's code
 }

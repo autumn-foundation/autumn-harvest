@@ -263,9 +263,26 @@ async fn handle_webhook(
         }
     };
 
+    // Deliberately NOT `map_error(e).into_response()` (which would map this
+    // to a `400`): when `[security.webhooks].replay_protection` is enabled,
+    // the `SignedWebhook` extractor above has already reserved this
+    // delivery's replay key, and autumn-web's `webhook_replay_cleanup_middleware`
+    // (wired automatically into every app's router) only releases a reserved
+    // key when the response is a `5xx`. "The harvest runtime hasn't started
+    // yet" is a transient boot-window condition, not a bad request -- a `400`
+    // here would permanently consume the delivery id, so the provider's
+    // automatic retry (arriving after the app finishes booting) would 409 as
+    // a false duplicate forever instead of ever actually dispatching
+    // (Codex review, PR #918).
     let runtime = match api_state.runtime() {
         Ok(r) => r,
-        Err(e) => return crate::api::map_error(e).into_response(),
+        Err(e) => {
+            return error_response(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "runtime_not_started",
+                &e.to_string(),
+            );
+        }
     };
     let metrics = runtime.registry().telemetry().metrics.clone();
 

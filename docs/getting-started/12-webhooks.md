@@ -140,6 +140,7 @@ mechanism.
 | Fresh dispatch | `202 Accepted` | `{"status":"accepted","workflow_exec_id","workflow_id"}` |
 | Idempotent redelivery | `200 OK` | `{"status":"idempotent_replay","workflow_exec_id","workflow_id"}` |
 | Verification failed | `401`/`400`/`409`/`503` | autumn-web's own structured error (signature/timestamp/replay) |
+| Harvest runtime not started yet (boot window) | `503` | `{"error_code":"runtime_not_started","error"}` — a `5xx` so that, with replay protection enabled, autumn-web releases the delivery's reserved replay key instead of permanently consuming it; a provider retry after boot completes is then re-evaluated rather than 409ing as a false duplicate |
 | Body not valid JSON | `400` | `{"error_code":"parse_failed","error"}` |
 | Mapping function rejected the payload | `400` | `{"error_code":"mapping_rejected","error"}` |
 | `signals` target, no delivery ID resolved | `400` | `{"error_code":"missing_idempotency","error"}` |
