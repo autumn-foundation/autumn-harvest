@@ -2285,6 +2285,21 @@ async fn fire_due_on_conn(
         .map(|(row, body, headers)| config.deliverer.deliver(&row.target_url, body, headers));
     let attempt_outcomes = futures::future::join_all(delivery_futures).await;
 
+    // A fresh timestamp for backoff scheduling (issue #921 review, Codex
+    // P2): `now` above was captured *before* claim + dispatch, so reusing it
+    // here as the base for `next_attempt_at = now + delay` would understate
+    // the delay by however long the batch's slowest concurrent POST (or, for
+    // a large batch, the cumulative per-row serialization work before
+    // dispatch) actually took -- for a delivery whose attempt took longer
+    // than its own computed delay, `next_attempt_at` could already be in the
+    // past by the time `apply_outcome` writes it, so the scanner's very next
+    // tick would immediately retry instead of honoring the configured
+    // backoff, hammering an unhealthy receiver. `join_all` is a barrier, so
+    // every attempt in this batch has genuinely completed by this point --
+    // one fresh capture correctly anchors backoff to "after this attempt
+    // finished" for the whole batch.
+    let backoff_now = Utc::now();
+
     for ((row, _body, _headers), attempt_outcome) in dispatchable.into_iter().zip(attempt_outcomes)
     {
         let retry_policy: crate::policy::RetryPolicy = match serde_json::from_value(
@@ -2310,7 +2325,7 @@ async fn fire_due_on_conn(
             max_attempts,
             &retry_policy,
             seed,
-            now,
+            backoff_now,
         );
 
         apply_outcome(conn, &row, action).await?;

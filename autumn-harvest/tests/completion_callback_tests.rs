@@ -612,6 +612,85 @@ async fn scanner_reschedules_with_backoff_on_non_2xx() {
     assert_eq!(deliverer.call_count(), 1);
 }
 
+/// A deliverer that sleeps a fixed duration before returning a failing
+/// (non-2xx) response, so a test can assert on backoff scheduling relative
+/// to when the attempt actually completed rather than when it was claimed.
+struct SlowFailingDeliverer {
+    delay: Duration,
+    status: u16,
+}
+
+impl CompletionCallbackDeliverer for SlowFailingDeliverer {
+    fn deliver<'a>(
+        &'a self,
+        _target_url: &'a str,
+        _body: &'a [u8],
+        _headers: &'a [(&'static str, String)],
+    ) -> DeliverFuture<'a> {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            DeliveryAttempt::success(self.status)
+        })
+    }
+}
+
+// Regression (issue #921 review, Codex P2): `next_attempt_at` must be
+// scheduled from *after* the attempt actually completed, not from the
+// claim-time timestamp captured before dispatch. A deliverer whose attempt
+// takes longer than the configured backoff delay would otherwise get a
+// `next_attempt_at` that is already in the past by the time the outcome is
+// written, so the scanner's very next tick would immediately retry instead
+// of honoring the backoff -- hammering an unhealthy receiver.
+#[tokio::test]
+async fn scanner_schedules_backoff_from_attempt_completion_not_claim_time() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+
+    // The attempt takes 300ms; the configured backoff delay is only 50ms.
+    // With the bug, `next_attempt_at` = (pre-dispatch claim time) + 50ms,
+    // which is already ~250ms in the past by the time this assertion runs.
+    // With the fix, `next_attempt_at` = (post-dispatch completion time) +
+    // 50ms, which is still ~50ms in the future.
+    let deliverer = Arc::new(SlowFailingDeliverer {
+        delay: Duration::from_millis(300),
+        status: 500,
+    });
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(5, Duration::from_millis(50)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let processed = fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick");
+    assert_eq!(processed, 1);
+
+    let after_tick = chrono::Utc::now();
+    let rows = load_deliveries(&mut conn, exec_id).await;
+    assert_eq!(rows[0].state, "PENDING");
+    assert!(
+        rows[0].next_attempt_at > after_tick,
+        "next_attempt_at ({:?}) must still be in the future relative to when the tick \
+         finished ({after_tick:?}) -- backoff must anchor to attempt completion, not claim time",
+        rows[0].next_attempt_at
+    );
+}
+
 #[tokio::test]
 async fn scanner_dead_letters_on_retry_exhaustion() {
     let _guard = TEST_SERIAL.lock().await;
