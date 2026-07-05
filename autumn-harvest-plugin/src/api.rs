@@ -2766,7 +2766,7 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
         )
         .route(
             "/workflows/{id}/completion-deliveries",
-            get(list_completion_deliveries),
+            get(list_completion_deliveries).route_layer(require_admin.clone()),
         )
         .route(
             "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",

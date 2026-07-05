@@ -196,8 +196,10 @@ bytes+headers to this URL, tell me the status or transport error" seam.
 GET  /api/harvest/workflows/{id}/completion-deliveries
 ```
 Lists every delivery row for an execution (PENDING/INFLIGHT/DELIVERED/FAILED),
-ordered by `callback_index`. Read-only, no audit record (parity with
-`GET /dead-letters`).
+ordered by `callback_index`. Read-only, no audit record, admin-guarded
+(parity with `GET /dead-letters`) — a delivery's `target_url`/`last_status`/
+`last_error` fields are operational endpoint details, not something to
+expose to non-admin callers.
 
 ```
 POST /api/harvest/workflows/{id}/completion-deliveries/{delivery_id}/redrive
