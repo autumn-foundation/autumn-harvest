@@ -209,6 +209,22 @@ pub enum HarvestError {
         compensation_errors: Vec<String>,
     },
 
+    /// The workflow's published input schema (issue #373) rejected
+    /// `start_input` on a **genuine fresh start** initiated through
+    /// [`crate::execution::signal_with_start_workflow_execution`].
+    ///
+    /// Raised from inside the start transaction's `FOR UPDATE` lock, only
+    /// when the call actually creates a new execution -- a call that merely
+    /// attaches to an already-running execution never validates `start_input`
+    /// (it's never written), closing the TOCTOU window a caller-side,
+    /// pre-lock check would otherwise need to work around. Carries the same
+    /// structured violations `POST /workflows/{name}/start` returns.
+    #[error("input validation failed: {} violation(s)", violations.len())]
+    InputValidationFailed {
+        /// The schema violations reported by `WorkflowInfo::validate_input`.
+        violations: Vec<crate::info::SchemaViolation>,
+    },
+
     /// A timeout occurred for a workflow, activity, or execution component.
     #[error("timeout: {timeout_type} for {task_name}")]
     Timeout {

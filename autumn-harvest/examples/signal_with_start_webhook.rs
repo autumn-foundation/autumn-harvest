@@ -114,6 +114,10 @@ async fn handle_webhook_after(
             workflow_retry_policy: None,
             max_workflow_attempts_ceiling: None,
             reject_fresh_if_debounced: false,
+            // This example has no published input schema to validate against;
+            // see docs/getting-started/12-webhooks.md for how a webhook-facing
+            // app wires its own WorkflowInfo through this field.
+            workflow_info: None,
         },
     )
     .await?;

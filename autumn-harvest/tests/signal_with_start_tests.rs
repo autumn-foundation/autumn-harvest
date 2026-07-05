@@ -6,10 +6,12 @@
 
 #![cfg(feature = "db")]
 
+use autumn_harvest::error::HarvestError;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::execution::{
     SignalWithStartOutcome, SignalWithStartParams, signal_with_start_workflow_execution,
 };
+use autumn_harvest::info::WorkflowInfo;
 use autumn_harvest::schema::harvest_workflow_executions::dsl;
 use autumn_harvest::signal::load_pending_signals;
 use autumn_harvest::store;
@@ -148,6 +150,7 @@ fn params<'a>(
         workflow_retry_policy: None,
         max_workflow_attempts_ceiling: None,
         reject_fresh_if_debounced: false,
+        workflow_info: None,
     }
 }
 
@@ -598,4 +601,120 @@ async fn outcome_struct_distinguishes_started_vs_attached() {
         .unwrap();
     assert!(!second.started_fresh);
     assert_eq!(second.exec_id, first.exec_id);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Input schema validation (issue #373) — only on a genuine fresh start
+// (issue #918 review: it used to run unconditionally, pre-lock, in the HTTP
+// handler, and could reject a signal to an already-running execution whenever
+// the signal payload didn't match the *start*-input schema).
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn dummy_handler(
+    _ctx: &autumn_harvest::context::WorkflowContext,
+    _input: serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+> {
+    Box::pin(async { Ok(serde_json::Value::Null) })
+}
+
+fn strict_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["tier"],
+        "properties": {"tier": {"type": "string"}}
+    })
+}
+
+fn wf_info_with_schema(name: &'static str) -> WorkflowInfo {
+    WorkflowInfo {
+        name,
+        module: "signal_with_start_tests",
+        handler: dummy_handler,
+        execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: Some(strict_schema),
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+        mcp: false,
+    }
+}
+
+#[tokio::test]
+async fn signal_with_start_does_not_validate_start_input_schema_when_attaching_to_a_running_execution()
+ {
+    let (mut conn, _container) = setup_test_db().await;
+    let existing = seed_running(&mut conn, "wf-schema-attach", "id-attach").await;
+
+    let info = wf_info_with_schema("wf-schema-attach");
+    let mut p = params(
+        "wf-schema-attach",
+        "id-attach",
+        ExecutionId::new(),
+        "payment_succeeded",
+        serde_json::json!({"amount_cents": 500}),
+        WorkflowIdReusePolicy::AllowDuplicate,
+    );
+    // Deliberately violates `strict_schema` (which requires a string "tier"
+    // field) -- proves the schema is never consulted on a pure attach, where
+    // `start_input` is never written.
+    p.input = serde_json::json!({"amount_cents": 500});
+    p.workflow_info = Some(&info);
+
+    let out = signal_with_start_workflow_execution(&mut conn, p)
+        .await
+        .expect("attaching to a running execution must not validate start_input");
+    assert!(!out.started_fresh, "must attach, not start fresh");
+    assert_eq!(out.exec_id, existing);
+    assert!(out.signal_delivered);
+}
+
+#[tokio::test]
+async fn signal_with_start_validates_start_input_schema_on_a_genuine_fresh_start() {
+    let (mut conn, _container) = setup_test_db().await;
+    let info = wf_info_with_schema("wf-schema-fresh");
+    let mut p = params(
+        "wf-schema-fresh",
+        "id-fresh",
+        ExecutionId::new(),
+        "payment_succeeded",
+        serde_json::json!({"amount_cents": 500}),
+        WorkflowIdReusePolicy::AllowDuplicate,
+    );
+    // Violates `strict_schema` -- no prior execution exists, so this call
+    // must take the fresh-start branch and validate.
+    p.input = serde_json::json!({"amount_cents": 500});
+    p.workflow_info = Some(&info);
+
+    let err = signal_with_start_workflow_execution(&mut conn, p)
+        .await
+        .expect_err("fresh start with schema-invalid input must be rejected");
+    assert!(
+        matches!(err, HarvestError::InputValidationFailed { .. }),
+        "expected InputValidationFailed, got {err:?}"
+    );
+
+    // The rejected fresh start must not leave a partial execution row behind
+    // -- the whole transaction rolls back.
+    let count: i64 = dsl::harvest_workflow_executions
+        .filter(dsl::workflow_name.eq("wf-schema-fresh"))
+        .filter(dsl::workflow_id.eq("id-fresh"))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "rejected fresh start must not persist an execution row"
+    );
 }

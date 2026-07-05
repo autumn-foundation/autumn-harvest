@@ -9681,37 +9681,18 @@ pub(crate) async fn signal_with_start_workflow(
         }
     }
 
-    // issue #373: validate start_input against the workflow's published JSON Schema (if any).
-    // Always runs unconditionally: the pre-scan is unlocked, so if the observed RUNNING
-    // execution completes before the core resolver takes its FOR UPDATE lock, the core path
-    // can escalate AllowDuplicate to a fresh start and write start_input without validation.
-    // Validating unconditionally closes this TOCTOU window.
-    if let Some(info) = runtime.registry.workflows.get(&workflow_name)
-        && let Err(violations) = info.validate_input(&start_input)
-    {
-        let ar = NewAuditRecord {
-            actor: &actor,
-            operation: OP_WORKFLOW_SIGNAL_WITH_START,
-            target_type: TARGET_WORKFLOW,
-            target_id: None,
-            route_or_command: route,
-            request_id: request_id.as_deref(),
-            idempotency_key: request.idempotency_key.as_deref(),
-            status: STATUS_FAILED,
-            error_summary: Some("input validation failed"),
-            shard_id: Some(shard.as_i32()),
-            source: &source,
-        };
-        let _ = audit::insert_audit(&mut conn, &ar).await;
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({
-                "error": "input validation failed",
-                "violations": violations,
-            })),
-        )
-            .into_response();
-    }
+    // issue #373: start_input schema validation (when the workflow has one)
+    // now runs *inside* signal_with_start_workflow_execution_with_metrics,
+    // under its FOR UPDATE lock, and only on a genuine fresh start -- not
+    // here, unconditionally, before the lock. The old unconditional pre-lock
+    // check closed a TOCTOU window (an unlocked pre-scan could observe a live
+    // execution that completes before the core resolver's lock, escalating to
+    // a fresh start) at the cost of a real bug: it rejected a signal to an
+    // already-running execution whenever the signal payload didn't match the
+    // workflow's *start*-input schema, even though start_input is never
+    // written on an attach (issue #918 review). Passing `workflow_info` below
+    // lets the core primitive validate at the only point that's both race-
+    // free and semantically correct -- inside the lock, only when `created`.
 
     let trace_ctx = tracing::info_span!(
         "harvest.workflow.schedule",
@@ -9789,6 +9770,7 @@ pub(crate) async fn signal_with_start_workflow(
             reject_fresh_if_debounced,
             workflow_retry_policy: sws_workflow_retry_policy,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+            workflow_info: runtime.registry.workflows.get(&workflow_name),
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
     )
@@ -9844,6 +9826,34 @@ pub(crate) async fn signal_with_start_workflow(
                     existing_execution_id: existing_exec_id.to_string(),
                     existing_state,
                 }),
+            )
+                .into_response()
+        }
+        // issue #373 (moved inside the core primitive under its lock, per the
+        // issue #918 review above): a genuine fresh start whose start_input
+        // fails the target workflow's published schema. Never raised for an
+        // attach, since start_input is never validated there.
+        Err(HarvestError::InputValidationFailed { violations }) => {
+            let ar = NewAuditRecord {
+                actor: &actor,
+                operation: OP_WORKFLOW_SIGNAL_WITH_START,
+                target_type: TARGET_WORKFLOW,
+                target_id: None,
+                route_or_command: route,
+                request_id: request_id.as_deref(),
+                idempotency_key: request.idempotency_key.as_deref(),
+                status: STATUS_FAILED,
+                error_summary: Some("input validation failed"),
+                shard_id: Some(shard.as_i32()),
+                source: &source,
+            };
+            let _ = audit::insert_audit(&mut conn, &ar).await;
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "input validation failed",
+                    "violations": violations,
+                })),
             )
                 .into_response()
         }
