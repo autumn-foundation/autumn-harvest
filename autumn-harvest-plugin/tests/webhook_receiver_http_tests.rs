@@ -86,7 +86,12 @@ fn registered_workflows() -> Vec<autumn_harvest::WorkflowInfo> {
 /// `Plugin::build`, minus the runtime startup.
 fn build_client(endpoints: Vec<WebhookEndpointConfig>) -> TestClient {
     let triggers = vec![map_order_info(), map_subscription_info()];
-    let routes = build_webhook_routes(&triggers, &registered_workflows(), &HarvestApiState::new());
+    let routes = build_webhook_routes(
+        &triggers,
+        &registered_workflows(),
+        &[],
+        &HarvestApiState::new(),
+    );
     let config = WebhookConfig {
         endpoints,
         ..Default::default()
@@ -187,7 +192,12 @@ fn panic_message(result: std::thread::Result<Vec<autumn_web::Route>>) -> String 
 fn duplicate_binding_paths_panic_at_build_time() {
     let triggers = vec![map_order_info(), map_order_info()];
     let result = std::panic::catch_unwind(|| {
-        build_webhook_routes(&triggers, &registered_workflows(), &HarvestApiState::new())
+        build_webhook_routes(
+            &triggers,
+            &registered_workflows(),
+            &[],
+            &HarvestApiState::new(),
+        )
     });
     let message = panic_message(result);
     assert!(
@@ -199,10 +209,47 @@ fn duplicate_binding_paths_panic_at_build_time() {
 #[test]
 fn trigger_targeting_unregistered_workflow_panics_at_build_time() {
     let triggers = vec![map_order_info()];
-    let result =
-        std::panic::catch_unwind(|| build_webhook_routes(&triggers, &[], &HarvestApiState::new()));
+    let result = std::panic::catch_unwind(|| {
+        build_webhook_routes(&triggers, &[], &[], &HarvestApiState::new())
+    });
     let message = panic_message(result);
     assert!(message.contains("which is not registered"), "{message}");
+}
+
+#[test]
+fn trigger_targeting_a_registered_dag_panics_at_build_time() {
+    // A unified DAG auto-registers a shadow WorkflowInfo (issue #256), so
+    // without the DAG-aware check this would pass the plain
+    // registered-workflow assertion and only fail at the first live request
+    // (start_workflow/signal_with_start_workflow both reject registered
+    // DAGs) -- Codex review, PR #918. The DAG check runs before the plain
+    // registered-workflow check, so this fails fast even with an empty
+    // registered_workflows slice.
+    fn noop_dag_builder(_dag: &mut autumn_harvest::dag::DagBuilder) {}
+
+    let triggers = vec![map_order_info()];
+    let dag = autumn_harvest::DagInfo {
+        name: "order_flow",
+        module: "webhook_receiver_http_tests",
+        schedule: None,
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: None,
+        builder: noop_dag_builder,
+        workflow_handler: Some(__autumn_workflow_info_order_flow().handler),
+        jitter: std::time::Duration::ZERO,
+        overlap_policy: autumn_harvest::OverlapPolicy::Skip,
+        buffer_all_max: 100,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        mcp: false,
+    };
+    let result = std::panic::catch_unwind(|| {
+        build_webhook_routes(&triggers, &[], &[dag], &HarvestApiState::new())
+    });
+    let message = panic_message(result);
+    assert!(message.contains("which is a registered DAG"), "{message}");
 }
 
 #[tokio::test]

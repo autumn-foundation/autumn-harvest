@@ -286,6 +286,11 @@ impl HarvestPlugin {
     /// fast (panics) if a trigger targets an unregistered workflow, or if two
     /// triggers declare the same binding path.
     ///
+    /// Accumulates across repeated calls (mirrors `.workflows`/`.activities`/
+    /// `.queries`/`.updates`), so registering webhook bindings from separate
+    /// modules via multiple `.webhooks(...)` calls keeps every prior
+    /// registration instead of the last call silently discarding them.
+    ///
     /// See `docs/getting-started/12-webhooks.md`.
     #[cfg(feature = "webhooks")]
     #[must_use]
@@ -293,7 +298,7 @@ impl HarvestPlugin {
         mut self,
         triggers: Vec<autumn_harvest::webhook_trigger::WebhookTriggerInfo>,
     ) -> Self {
-        self.webhook_triggers = triggers;
+        self.webhook_triggers.extend(triggers);
         self
     }
 }
@@ -336,6 +341,7 @@ impl Plugin for HarvestPlugin {
             crate::webhook_receiver::build_webhook_routes(
                 &webhook_triggers,
                 builder.workflow_infos(),
+                builder.dag_infos(),
                 &api_state,
             )
         };
@@ -1061,6 +1067,55 @@ mod tests {
             severity: None,
             mcp: false,
         }
+    }
+
+    #[cfg(feature = "webhooks")]
+    fn fake_webhook_trigger(
+        name: &'static str,
+        path: &'static str,
+    ) -> autumn_harvest::webhook_trigger::WebhookTriggerInfo {
+        // Must match `WebhookHandlerFn`'s Result-returning signature.
+        #[allow(clippy::unnecessary_wraps)]
+        fn dispatch(
+            _ctx: &autumn_harvest::webhook_trigger::WebhookCtx,
+            _payload: &serde_json::Value,
+        ) -> Result<autumn_harvest::WorkflowId, autumn_harvest::webhook_trigger::WebhookHandlerError>
+        {
+            Ok(autumn_harvest::WorkflowId::new("wf"))
+        }
+
+        autumn_harvest::webhook_trigger::WebhookTriggerInfo {
+            name,
+            module: "tests",
+            path,
+            target: autumn_harvest::webhook_trigger::WebhookTarget::Starts { workflow: "echo" },
+            handler: dispatch,
+            queue: None,
+        }
+    }
+
+    #[cfg(feature = "webhooks")]
+    #[test]
+    fn webhooks_accumulates_across_repeated_calls() {
+        // Codex review (PR #918): unlike .workflows/.activities/.queries/
+        // .updates, .webhooks used to *replace* rather than extend, so a
+        // second call from a separate module silently dropped the first
+        // call's bindings.
+        let plugin = HarvestPlugin::new()
+            .webhooks(vec![fake_webhook_trigger("a", "/hooks/a")])
+            .webhooks(vec![fake_webhook_trigger("b", "/hooks/b")]);
+        assert_eq!(
+            plugin.webhook_triggers.len(),
+            2,
+            "both .webhooks() calls must be preserved"
+        );
+        let paths: Vec<_> = plugin
+            .webhook_triggers
+            .iter()
+            .map(|t| t.path)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"/hooks/a"));
+        assert!(paths.contains(&"/hooks/b"));
     }
 
     fn test_pool(database_url: &str, pool_size: usize) -> DbPool {

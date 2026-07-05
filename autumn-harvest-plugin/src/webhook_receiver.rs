@@ -62,23 +62,52 @@ use crate::api::{HarvestApiState, SignalWithStartRequest, StartWorkflowRequest};
 
 /// Build the app-level routes for a set of registered webhook triggers.
 ///
+/// `registered_dags` (e.g. from `HarvestBuilder::dag_infos()`) is scanned so
+/// a trigger targeting a registered DAG can be rejected with a specific,
+/// actionable message instead of either silently passing (a unified DAG gets
+/// an auto-registered shadow `WorkflowInfo`, so it would otherwise satisfy
+/// the plain "is this a registered workflow" check below and only fail at
+/// the first live request) or falling through to the generic "not
+/// registered" message (a classic DAG, which has no shadow `WorkflowInfo` at
+/// all). Only unified DAGs (`workflow_handler.is_some()`) are excluded here,
+/// matching exactly which DAG names `HarvestApiState::is_registered_dag`
+/// rejects at request time in `start_workflow`/`signal_with_start_workflow`
+/// -- a classic DAG has no shadow `WorkflowInfo`, so it already fails the
+/// plain registered-workflow check on its own.
+///
 /// # Panics
 ///
 /// Panics when [`validate_webhook_triggers`] rejects the set (duplicate or
-/// malformed binding paths) or when a trigger targets a workflow that is not
-/// registered on the builder -- a mount conflict or dangling target must
-/// fail at `HarvestPlugin::build` time, not on the first live request.
+/// malformed binding paths), when a trigger targets a registered DAG (start
+/// a DAG via `POST /dags/{name}/trigger` instead), or when a trigger targets
+/// a workflow that is not registered on the builder -- a mount conflict or
+/// dangling target must fail at `HarvestPlugin::build` time, not on the
+/// first live request.
 #[must_use]
 pub fn build_webhook_routes(
     triggers: &[WebhookTriggerInfo],
     registered_workflows: &[WorkflowInfo],
+    registered_dags: &[autumn_harvest::DagInfo],
     api_state: &HarvestApiState,
 ) -> Vec<autumn_web::Route> {
     if let Err(e) = validate_webhook_triggers(triggers) {
         panic!("HarvestPlugin::webhooks(...) failed validation: {e}");
     }
+    let dag_names: std::collections::HashSet<&str> = registered_dags
+        .iter()
+        .filter(|d| d.workflow_handler.is_some())
+        .map(|d| d.name)
+        .collect();
     for trigger in triggers {
         let workflow = trigger.target.workflow();
+        assert!(
+            !dag_names.contains(workflow),
+            "webhook trigger '{}' (path '{}') targets '{workflow}', which is a registered DAG \
+             -- webhooks can only target plain #[workflow] handlers; DAGs are triggered via \
+             POST /dags/{workflow}/trigger, not a #[webhook] binding",
+            trigger.name,
+            trigger.path
+        );
         assert!(
             registered_workflows.iter().any(|w| w.name == workflow),
             "webhook trigger '{}' (path '{}') targets workflow '{workflow}', which is not \
