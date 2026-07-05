@@ -3053,6 +3053,7 @@ async fn ui_trigger_preserves_dag_metadata() {
         owner: Some("ui-team"),
         runbook_url: Some("http://ui-runbook"),
         severity: Some("sev3"),
+        mcp: false,
     };
 
     let dag_catalog =

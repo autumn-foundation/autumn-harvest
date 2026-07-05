@@ -116,6 +116,7 @@ fn harvest_builder_collects_dags() {
         owner: None,
         runbook_url: None,
         severity: None,
+        mcp: false,
     }]);
 
     assert_eq!(builder.dag_count(), 1);

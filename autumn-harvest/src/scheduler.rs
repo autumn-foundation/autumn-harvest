@@ -4145,6 +4145,10 @@ mod tests {
             jitter: ::std::time::Duration::ZERO,
             overlap_policy: crate::policy::OverlapPolicy::Skip,
             buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
         }
     }
 
