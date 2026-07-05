@@ -821,6 +821,11 @@ pub struct DagInfo {
     pub runbook_url: Option<&'static str>,
     /// Severity level metadata (issue #372).
     pub severity: Option<&'static str>,
+    /// Whether this DAG is exposed as MCP tools (`#[dag(mcp)]`), mirroring
+    /// `WorkflowInfo::mcp` (issue #597 follow-up). Only meaningful when the
+    /// `unified-dag-execution` feature is on, since MCP exposure lowers the
+    /// DAG onto its shadow `WorkflowInfo`.
+    pub mcp: bool,
 }
 
 impl DagInfo {
@@ -835,6 +840,14 @@ impl DagInfo {
             .map_or_else(DagBuilder::new, DagBuilder::with_default_queue);
         (self.builder)(&mut dag);
         dag.build()
+    }
+
+    /// Opt this DAG into MCP tool exposure, mirroring
+    /// [`WorkflowInfo::with_mcp`]. Equivalent to `#[dag(mcp)]`.
+    #[must_use]
+    pub const fn with_mcp(mut self) -> Self {
+        self.mcp = true;
+        self
     }
 
     /// Return a [`WorkflowSchedule`] that fires this DAG on its declared cron
@@ -896,9 +909,13 @@ impl DagInfo {
             output_schema: None,
             error_schema: None,
             retry_policy: None,
-            // Unified DAGs are never MCP-exposed: #[dag] has no `mcp` attribute
-            // and the DAG trigger surface is its own management-API family.
-            mcp: false,
+            // `#[dag(mcp)]` / `DagInfo::with_mcp()` opt-in (issue #601
+            // follow-up): mirrors this DAG's own `mcp` flag onto the shadow
+            // `WorkflowInfo`. The MCP generator (`mcp_tools::collect_descriptors`)
+            // detects this is a DAG separately and routes its `start` tool
+            // through the DAG trigger contract rather than generic workflow
+            // start.
+            mcp: self.mcp,
         })
     }
 }
@@ -971,6 +988,7 @@ impl std::fmt::Debug for DagInfo {
             .field("owner", &self.owner)
             .field("runbook_url", &self.runbook_url)
             .field("severity", &self.severity)
+            .field("mcp", &self.mcp)
             .finish()
     }
 }
@@ -1591,6 +1609,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         };
 
         let definition = info.build_definition().expect("dag should compile");
@@ -1671,6 +1690,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         };
         let debug_str = format!("{dag_info:?}");
         assert!(debug_str.contains("DagInfo"));
@@ -1742,9 +1762,8 @@ mod tests {
         assert!(debug_str.contains("mcp: false"));
     }
 
-    #[test]
-    fn dag_as_workflow_info_is_never_mcp() {
-        let dag = DagInfo {
+    fn mcp_dag(mcp: bool) -> DagInfo {
+        DagInfo {
             name: "mcp_dag",
             module: "tests",
             schedule: None,
@@ -1759,13 +1778,34 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
-        };
-        let info = dag
+            mcp,
+        }
+    }
+
+    #[test]
+    fn dag_as_workflow_info_defaults_to_not_mcp() {
+        let info = mcp_dag(false)
             .as_workflow_info()
             .expect("workflow_handler is Some, so as_workflow_info must be Some");
         assert!(
             !info.mcp,
-            "unified DAGs are never MCP-exposed (no `mcp` attr on #[dag])"
+            "a DAG without `#[dag(mcp)]` must not be MCP-exposed"
         );
+    }
+
+    #[test]
+    fn dag_as_workflow_info_propagates_mcp_opt_in() {
+        let info = mcp_dag(true)
+            .as_workflow_info()
+            .expect("workflow_handler is Some, so as_workflow_info must be Some");
+        assert!(
+            info.mcp,
+            "`#[dag(mcp)]` / `DagInfo::with_mcp()` must propagate onto the shadow WorkflowInfo"
+        );
+    }
+
+    #[test]
+    fn dag_with_mcp_sets_the_flag() {
+        assert!(mcp_dag(false).with_mcp().mcp);
     }
 }
