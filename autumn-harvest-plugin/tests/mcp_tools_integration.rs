@@ -127,10 +127,30 @@ async fn ping_relay(_ctx: &WorkflowContext, _req: Value) -> Result<String, Strin
     Ok("pong".to_string())
 }
 
+/// Sleeps briefly so a concurrent second DAG trigger reliably observes the
+/// first run still `RUNNING` -- needed to exercise `max_active_runs`
+/// deterministically without a flaky race against instant completion.
+#[activity]
+async fn dag_mcp_slow_task(_ctx: &ActivityContext) -> Result<(), String> {
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Ok(())
+}
+
+/// A unified DAG opted into MCP exposure (issue #601 follow-up). No
+/// `schedule` attribute, so nothing fires it automatically -- only the
+/// generated `start_agent_mcp_dag` MCP tool (routed through the real DAG
+/// trigger contract) fires it. `max_active_runs` defaults to 1, which is
+/// exactly what the test below exercises.
+#[cfg(feature = "unified-dag-execution")]
+#[dag(mcp)]
+fn agent_mcp_dag(dag: &mut DagBuilder) {
+    let _ = dag.activity(dag_mcp_slow_task);
+}
+
 // ── Harness ───────────────────────────────────────────────────────────────────
 
 fn harvest_plugin() -> HarvestPlugin {
-    HarvestPlugin::new()
+    let plugin = HarvestPlugin::new()
         .workflows(vec![
             __autumn_workflow_info_agent_approval_flow()
                 .with_input_schema_fn(approval_input_schema),
@@ -141,7 +161,12 @@ fn harvest_plugin() -> HarvestPlugin {
         .updates(updates![set_priority, set_priority_validated, ping_relay])
         .worker(WorkerConfig::default())
         .api("/api/harvest")
-        .mcp_tools()
+        .mcp_tools();
+    #[cfg(feature = "unified-dag-execution")]
+    let plugin = plugin
+        .activities(activities![dag_mcp_slow_task])
+        .dags(dags![agent_mcp_dag]);
+    plugin
 }
 
 async fn build_app(db: &TestDb) -> TestClient {
@@ -652,5 +677,87 @@ async fn mcp_start_tool_rejects_input_that_violates_the_published_schema() {
     assert!(
         detail.contains("validation") || rejected.to_string().contains("violations"),
         "rejection must reference the issue #373 schema-validation contract, got: {rejected}"
+    );
+}
+
+/// A unified DAG's `start_{dag}` MCP tool must route through the real DAG
+/// trigger contract (`trigger_dag_run` -> `trigger_unified_dag`), not the
+/// generic `start_workflow` path -- proven end to end by: (1) the first start
+/// actually creates and runs a DAG execution that reaches `COMPLETED`, and
+/// (2) a second start fired while the first is still `RUNNING` is rejected by
+/// the DAG's `max_active_runs` admission gate (default 1), which
+/// `start_workflow` has no notion of and would have silently admitted.
+#[cfg(feature = "unified-dag-execution")]
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn dag_start_tool_triggers_a_real_dag_run_and_enforces_max_active_runs() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(db).await;
+
+    let (is_error, first) = call_tool(&client, "start_agent_mcp_dag", json!({})).await;
+    assert!(!is_error, "first DAG start must succeed, got: {first}");
+    let handle = first["execution_id"]
+        .as_str()
+        .expect("execution_id")
+        .to_string();
+
+    wait_for_status(&client, "agent_mcp_dag_status", &handle, |s| {
+        s["state"] == "RUNNING"
+    })
+    .await;
+
+    // The first run's activity sleeps 500ms, so this concurrent second
+    // trigger reliably observes it still RUNNING and must be rejected by
+    // max_active_runs (default 1) rather than admitted as a second run.
+    let (is_error, second) = call_tool(&client, "start_agent_mcp_dag", json!({})).await;
+    assert!(
+        is_error,
+        "a concurrent DAG start must be rejected by max_active_runs, got: {second}"
+    );
+    let detail = second["detail"]
+        .as_str()
+        .or_else(|| second["error"].as_str())
+        .unwrap_or_default();
+    assert!(
+        detail.contains("max_active_runs") || second.to_string().contains("max_active_runs"),
+        "rejection must cite max_active_runs, got: {second}"
+    );
+
+    let status = wait_for_status(&client, "agent_mcp_dag_status", &handle, |s| {
+        s["state"] == "COMPLETED"
+    })
+    .await;
+    assert_eq!(status["state"], "COMPLETED");
+}
+
+/// A unified DAG never consumes signals (issue #601 follow-up): its tool set
+/// must not include `signal_{dag}` at all, so calling it is an unknown-tool
+/// error from autumn-web's own MCP dispatch, not a delegated handler call.
+#[cfg(feature = "unified-dag-execution")]
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn dag_tool_set_has_no_signal_tool() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let db = setup_db().await;
+    let client = build_app(db).await;
+
+    let out = rpc(
+        &client,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    )
+    .await;
+    let names: Vec<&str> = out["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"start_agent_mcp_dag"));
+    assert!(names.contains(&"agent_mcp_dag_status"));
+    assert!(names.contains(&"agent_mcp_dag_watch"));
+    assert!(
+        !names.contains(&"signal_agent_mcp_dag"),
+        "a DAG must never surface a signal tool, got: {names:?}"
     );
 }

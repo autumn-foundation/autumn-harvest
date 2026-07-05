@@ -15,6 +15,8 @@
 #![cfg(feature = "mcp")]
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]
 
+use std::collections::HashSet;
+
 use autumn_harvest::prelude::*;
 use autumn_harvest_plugin::HarvestApiState;
 use autumn_harvest_plugin::mcp_tools::{
@@ -48,6 +50,20 @@ async fn internal_only(_ctx: &WorkflowContext, req: ApproveRequest) -> Result<bo
     Ok(req.approved)
 }
 
+#[activity]
+async fn noop_task(_ctx: &ActivityContext) -> Result<(), String> {
+    Ok(())
+}
+
+/// A unified DAG opted into MCP exposure (issue #601 follow-up). Requires
+/// `unified-dag-execution` (a default feature) to lower onto a shadow
+/// `WorkflowInfo`.
+#[cfg(feature = "unified-dag-execution")]
+#[dag(schedule = "0 3 * * *", mcp)]
+fn daily_etl_dag(dag: &mut DagBuilder) {
+    let _ = dag.activity(noop_task);
+}
+
 fn order_input_schema() -> Value {
     json!({
         "type": "object",
@@ -71,7 +87,7 @@ fn build_client() -> TestClient {
         __autumn_update_handler_info_approve(),
         __autumn_update_handler_info_internal_only(),
     ];
-    let descriptors = collect_descriptors(&workflows, &updates);
+    let descriptors = collect_descriptors(&workflows, &updates, &HashSet::new());
     record_schemas(&descriptors);
     let routes = build_mcp_tool_routes(
         "/api/harvest/mcp",
@@ -264,7 +280,7 @@ async fn tool_routes_coexist_with_the_nested_management_router() {
     // the nested catch-all side by side without a collision panic.
     let workflows =
         vec![__autumn_workflow_info_order_flow().with_input_schema_fn(order_input_schema)];
-    let descriptors = collect_descriptors(&workflows, &[]);
+    let descriptors = collect_descriptors(&workflows, &[], &HashSet::new());
     record_schemas(&descriptors);
     let api_state = HarvestApiState::new();
     let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &api_state, None);
@@ -354,5 +370,68 @@ async fn tools_call_dispatches_through_the_real_pipeline_and_fails_closed() {
     assert!(
         text.contains("harvest runtime is not started"),
         "pre-startup calls must fail closed on harvest's runtime check, got: {text}"
+    );
+}
+
+/// A unified DAG's shadow `WorkflowInfo` (`daily_etl_dag`), assembled the
+/// same way `HarvestPlugin::build` would: workflows + `dag_names` set ->
+/// `collect_descriptors` -> schemas -> routes -> `mount_mcp`.
+#[cfg(feature = "unified-dag-execution")]
+fn build_dag_client() -> TestClient {
+    let dag_info = __autumn_dag_info_daily_etl_dag();
+    let dag_names: HashSet<&str> = std::iter::once(dag_info.name).collect();
+    let workflows = vec![__autumn_workflow_info_daily_etl_dag()];
+    let descriptors = collect_descriptors(&workflows, &[], &dag_names);
+    record_schemas(&descriptors);
+    let routes = build_mcp_tool_routes(
+        "/api/harvest/mcp",
+        &descriptors,
+        &HarvestApiState::new(),
+        None,
+    );
+    TestApp::new().routes(routes).mount_mcp("/mcp").build()
+}
+
+#[cfg(feature = "unified-dag-execution")]
+#[tokio::test]
+async fn tools_list_exposes_start_status_watch_but_not_signal_for_a_dag() {
+    let client = build_dag_client();
+    let tools = tools(&client).await;
+    let mut names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    names.sort_unstable();
+
+    assert_eq!(
+        names,
+        vec![
+            "daily_etl_dag_status",
+            "daily_etl_dag_watch",
+            "start_daily_etl_dag",
+        ],
+        "a DAG must surface exactly start/status/watch -- no signal, no updates"
+    );
+}
+
+#[cfg(feature = "unified-dag-execution")]
+#[tokio::test]
+async fn dag_start_tool_call_dispatches_through_the_dag_trigger_pipeline() {
+    let client = build_dag_client();
+
+    // No storage/runtime installed -> the delegated trigger_dag_run handler
+    // fails closed on harvest's own runtime check, proving the call reaches
+    // the real DAG trigger pipeline (not the generic start_workflow path,
+    // which would fail closed with a different, workflow-shaped error).
+    let out = rpc(
+        &client,
+        json!({
+            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+            "params": {"name": "start_daily_etl_dag", "arguments": {"body": null}}
+        }),
+    )
+    .await;
+    assert_eq!(out["result"]["isError"], json!(true));
+    let text = out["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("harvest runtime is not started"),
+        "pre-startup DAG start calls must fail closed on harvest's runtime check, got: {text}"
     );
 }

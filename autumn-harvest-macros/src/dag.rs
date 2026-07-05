@@ -14,6 +14,7 @@ struct DagAttrs {
     owner: Option<String>,
     runbook: Option<String>,
     severity: Option<String>,
+    mcp: bool,
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
@@ -61,9 +62,12 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<DagAttrs> {
             }
             result.severity = Some(s);
             Ok(())
+        } else if meta.path.is_ident("mcp") {
+            result.mcp = crate::attr_util::parse_bool_flag(&meta)?;
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected schedule, catchup, max_active_runs, default_queue, jitter, owner, runbook, or severity",
+                "unsupported attribute: expected schedule, catchup, max_active_runs, default_queue, jitter, owner, runbook, severity, or mcp",
             ))
         }
     })
@@ -128,6 +132,7 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         attrs.owner.as_deref(),
         attrs.runbook.as_deref(),
         attrs.severity.as_deref(),
+        attrs.mcp,
     );
 
     #[cfg(not(feature = "unified-dag-execution"))]
@@ -398,6 +403,7 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .severity
         .as_deref()
         .map_or_else(|| quote! { None }, |s| quote! { Some(#s) });
+    let mcp = attrs.mcp;
 
     quote! {
         #input_fn
@@ -421,6 +427,7 @@ pub fn dag_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 owner: #owner_expr,
                 runbook_url: #runbook_url_expr,
                 severity: #severity_expr,
+                mcp: #mcp,
             }
         }
 
@@ -439,6 +446,7 @@ fn emit_workflow_companion(
     owner: Option<&str>,
     runbook: Option<&str>,
     severity: Option<&str>,
+    mcp: bool,
 ) -> TokenStream {
     let companion_name = format_ident!("__autumn_workflow_info_{fn_name}");
 
@@ -731,10 +739,16 @@ fn emit_workflow_companion(
                 output_schema: ::std::option::Option::None,
                 error_schema: ::std::option::Option::None,
                 retry_policy: ::std::option::Option::None,
-                // Unified DAGs are never MCP-exposed (issue #597): #[dag] has
-                // no `mcp` attribute; the DAG trigger surface is its own
-                // management-API family.
-                mcp: false,
+                // `#[dag(mcp)]` opt-in (issue #601 follow-up): the DAG's
+                // `start`/`status`/`watch` MCP tools are generated from this
+                // exact `WorkflowInfo.mcp` flag by
+                // `mcp_tools::collect_descriptors`, mirroring `#[workflow(mcp)]`.
+                // The DAG-specific trigger contract (admission gates,
+                // `max_active_runs`) is preserved separately: the MCP
+                // generator detects this is a DAG via `DagInfo` and routes
+                // its `start` tool through `trigger_dag_run` rather than the
+                // generic `start_workflow` path.
+                mcp: #mcp,
             }
         }
     }

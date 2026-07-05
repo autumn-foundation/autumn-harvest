@@ -1439,7 +1439,7 @@ pub(crate) fn is_terminal_state(state: &str) -> bool {
 }
 
 #[derive(Debug, Serialize)]
-struct StartWorkflowResponse {
+pub(crate) struct StartWorkflowResponse {
     execution_id: String,
     workflow_name: String,
     workflow_id: String,
@@ -1813,8 +1813,24 @@ impl UpdateWithStartResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct DagTriggerRequest {
+pub(crate) struct DagTriggerRequest {
     conf: Option<Value>,
+}
+
+impl DagTriggerRequest {
+    /// Build a request carrying the given `conf` payload directly, bypassing
+    /// JSON deserialization. Used by the MCP `start_{dag}` tool handler
+    /// (`mcp_tools::start_dag_tool`), which receives the conf as an
+    /// already-parsed `serde_json::Value`.
+    ///
+    /// Only called from `mcp_tools.rs`, which is entirely excluded from the
+    /// build without the `mcp` cargo feature; without this, a default
+    /// (no-`mcp`) build sees zero callers and clippy's `-D warnings` treats
+    /// that as a hard error.
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) const fn from_conf(conf: Option<Value>) -> Self {
+        Self { conf }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -12008,7 +12024,7 @@ async fn list_dag_runs(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn trigger_dag_run(
+pub(crate) async fn trigger_dag_run(
     Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
     headers: axum::http::HeaderMap,

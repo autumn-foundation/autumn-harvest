@@ -312,9 +312,17 @@ impl Plugin for HarvestPlugin {
             }
             let prefix =
                 crate::mcp_tools::tools_prefix(api_path.as_deref(), mcp_tools_prefix.as_deref());
+            // A unified DAG's shadow `WorkflowInfo` (auto-registered by
+            // `.dags(...)`) lives in `builder.workflow_infos()` alongside
+            // ordinary workflows; this name set is how `collect_descriptors`
+            // tells them apart to route a DAG's start tool through the DAG
+            // trigger contract and omit its signal tool (issue #601 follow-up).
+            let dag_names: std::collections::HashSet<&str> =
+                builder.dag_infos().iter().map(|d| d.name).collect();
             let descriptors = crate::mcp_tools::collect_descriptors(
                 builder.workflow_infos(),
                 builder.update_handlers(),
+                &dag_names,
             );
             crate::mcp_tools::record_schemas(&descriptors);
             Some(crate::mcp_tools::build_mcp_tool_routes(
@@ -989,6 +997,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }
     }
 

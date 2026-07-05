@@ -154,3 +154,58 @@ fn dag_macro_condition_compiles_and_is_stored_on_task() {
         "conditioned task should have condition set (AC2: macro parity with builder)"
     );
 }
+
+// ── DAGs as MCP tools (issue #601 follow-up) ─────────────────────────────────
+
+#[dag(schedule = "0 3 * * *", mcp)]
+fn mcp_daily_etl(dag: &mut DagBuilder) {
+    let _ = dag.activity(extract_users);
+}
+
+#[test]
+fn dag_macro_mcp_bare_flag_sets_mcp_true() {
+    let info = __autumn_dag_info_mcp_daily_etl();
+    assert!(info.mcp, "bare `#[dag(mcp)]` must set DagInfo.mcp = true");
+}
+
+#[cfg(feature = "unified-dag-execution")]
+#[test]
+fn dag_macro_mcp_propagates_to_shadow_workflow_info() {
+    let workflow_info = __autumn_workflow_info_mcp_daily_etl();
+    assert!(
+        workflow_info.mcp,
+        "the shadow WorkflowInfo companion must carry the same mcp flag as the DagInfo"
+    );
+}
+
+#[dag(schedule = "0 4 * * *")]
+fn non_mcp_daily_etl(dag: &mut DagBuilder) {
+    let _ = dag.activity(extract_users);
+}
+
+#[test]
+fn dag_macro_default_mcp_is_false() {
+    let info = __autumn_dag_info_non_mcp_daily_etl();
+    assert!(
+        !info.mcp,
+        "a `#[dag]` without the `mcp` attribute must default to mcp = false"
+    );
+}
+
+#[cfg(feature = "unified-dag-execution")]
+#[test]
+fn dag_macro_default_mcp_is_false_on_shadow_workflow_info() {
+    let workflow_info = __autumn_workflow_info_non_mcp_daily_etl();
+    assert!(!workflow_info.mcp);
+}
+
+#[dag(mcp = false)]
+fn explicit_non_mcp_dag(dag: &mut DagBuilder) {
+    let _ = dag.activity(extract_users);
+}
+
+#[test]
+fn dag_macro_mcp_explicit_false() {
+    let info = __autumn_dag_info_explicit_non_mcp_dag();
+    assert!(!info.mcp);
+}

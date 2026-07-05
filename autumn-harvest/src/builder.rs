@@ -788,10 +788,24 @@ impl HarvestBuilder {
     /// Registered workflow metadata, in registration order.
     ///
     /// Used by the plugin's MCP tool generator (issue #597) to select
-    /// `mcp`-flagged workflows before the runtime starts.
+    /// `mcp`-flagged workflows before the runtime starts. Includes the
+    /// auto-registered shadow `WorkflowInfo` for each unified DAG (see
+    /// [`Self::dag_infos`]).
     #[must_use]
     pub fn workflow_infos(&self) -> &[WorkflowInfo] {
         &self.workflows
+    }
+
+    /// Registered DAG metadata, in registration order.
+    ///
+    /// Pre-build counterpart of [`BuiltHarvest::dags`]. Used by the plugin's
+    /// MCP tool generator to distinguish a unified DAG's auto-registered
+    /// `WorkflowInfo` (see [`Self::workflow_infos`]) from an ordinary
+    /// workflow, so the DAG's `start` tool can route through the DAG trigger
+    /// contract rather than generic workflow start.
+    #[must_use]
+    pub fn dag_infos(&self) -> &[DagInfo] {
+        &self.dags
     }
 
     /// Registered declarative update handlers, in registration order.
@@ -2303,6 +2317,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }
     }
 
@@ -2325,6 +2340,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         }
     }
 
@@ -3127,6 +3143,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         };
         let result = HarvestBuilder::new().dags(vec![dag]).try_build();
         assert!(
@@ -3159,6 +3176,7 @@ mod tests {
             owner: None,
             runbook_url: None,
             severity: None,
+            mcp: false,
         };
         let result = HarvestBuilder::new().dags(vec![dag]).try_build();
         assert!(
