@@ -1690,6 +1690,41 @@ impl StartWorkflowRequest {
             batch_max_wait: None,
         }
     }
+
+    /// Request carrying the deterministic `workflow_id` a `#[webhook]`
+    /// mapping function returned (issue #344) -- unlike [`Self::from_input`]
+    /// (which lets `start_workflow` mint a random UUID, fine for the MCP
+    /// `start_{wf}` tool's always-fresh semantics), a webhook `Starts` target
+    /// needs the caller-chosen id so that redelivering the same logical event
+    /// resolves to the same execution under the default `AllowDuplicate`
+    /// reuse policy.
+    ///
+    /// Only called from `webhook_receiver.rs`, which is entirely excluded
+    /// from the build without the `webhooks` cargo feature; without this,
+    /// a default (no-`webhooks`) build sees zero callers and clippy's
+    /// `-D warnings` treats that as a hard error.
+    #[cfg_attr(not(feature = "webhooks"), allow(dead_code))]
+    pub(crate) const fn from_webhook(
+        workflow_id: String,
+        input: Value,
+        queue: Option<String>,
+    ) -> Self {
+        Self {
+            workflow_id: Some(workflow_id),
+            input: Some(input),
+            queue,
+            memo: None,
+            search_attrs: None,
+            execution_timeout_secs: None,
+            sla_secs: None,
+            reuse_policy: None,
+            start_at: None,
+            delay: None,
+            batch_key: None,
+            batch_max_size: None,
+            batch_max_wait: None,
+        }
+    }
 }
 
 /// Response body for a 409 Conflict returned by `RejectDuplicate` policy.
@@ -1701,7 +1736,7 @@ struct AlreadyExistsResponse {
 
 /// Request body for `POST /workflows/{workflow_name}/signal-with-start` (issue #244).
 #[derive(Debug, Deserialize)]
-struct SignalWithStartRequest {
+pub(crate) struct SignalWithStartRequest {
     workflow_id: String,
     #[serde(default)]
     start_input: Option<Value>,
@@ -1726,6 +1761,39 @@ struct SignalWithStartRequest {
     /// GitHub `X-GitHub-Delivery`, etc.).
     #[serde(default)]
     idempotency_key: Option<String>,
+}
+
+impl SignalWithStartRequest {
+    /// Request carrying the deterministic `workflow_id`, signal name/payload,
+    /// idempotency key (the verified webhook delivery ID), and optional queue
+    /// override -- used by the inbound webhook receiver (issue #344) for its
+    /// `SignalsWithStart` target.
+    ///
+    /// Only called from `webhook_receiver.rs`, which is entirely excluded
+    /// from the build without the `webhooks` cargo feature; without this,
+    /// a default (no-`webhooks`) build sees zero callers and clippy's
+    /// `-D warnings` treats that as a hard error.
+    #[cfg_attr(not(feature = "webhooks"), allow(dead_code))]
+    pub(crate) fn from_webhook(
+        workflow_id: String,
+        signal_input: Value,
+        signal_name: String,
+        idempotency_key: Option<String>,
+        queue: Option<String>,
+    ) -> Self {
+        Self {
+            workflow_id,
+            start_input: Some(signal_input.clone()),
+            signal_name,
+            signal_payload: Some(signal_input),
+            queue,
+            memo: None,
+            search_attrs: None,
+            execution_timeout_secs: None,
+            id_reuse_policy: None,
+            idempotency_key,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -9303,7 +9371,7 @@ async fn audit_batch_start_failure(
 // ── SignalWithStart (issue #244) ──────────────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-async fn signal_with_start_workflow(
+pub(crate) async fn signal_with_start_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     maybe_session: Option<Extension<Session>>,

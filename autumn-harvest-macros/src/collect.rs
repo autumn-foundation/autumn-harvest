@@ -102,3 +102,22 @@ pub fn updates_macro(input: TokenStream) -> TokenStream {
         vec![ #(#calls),* ]
     }
 }
+
+pub fn webhooks_macro(input: TokenStream) -> TokenStream {
+    let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {
+        Ok(n) => n,
+        Err(e) => return e.to_compile_error(),
+    };
+
+    let calls: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let companion = quote::format_ident!("__autumn_webhook_info_{name}");
+            quote! { #companion() }
+        })
+        .collect();
+
+    quote! {
+        vec![ #(#calls),* ]
+    }
+}

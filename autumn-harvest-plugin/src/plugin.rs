@@ -113,6 +113,10 @@ pub struct HarvestPlugin {
     mcp_tools_enabled: bool,
     /// Optional prefix override for the generated MCP tool routes.
     mcp_tools_prefix: Option<String>,
+    /// Inbound webhook trigger bindings produced by `autumn_harvest::webhooks!`
+    /// (issue #344). Set via [`Self::webhooks`] (feature `webhooks`).
+    #[cfg(feature = "webhooks")]
+    webhook_triggers: Vec<autumn_harvest::webhook_trigger::WebhookTriggerInfo>,
 }
 
 impl Default for HarvestPlugin {
@@ -132,6 +136,8 @@ impl HarvestPlugin {
             mcp_tool_middleware: None,
             mcp_tools_enabled: false,
             mcp_tools_prefix: None,
+            #[cfg(feature = "webhooks")]
+            webhook_triggers: Vec::new(),
         }
     }
 
@@ -259,6 +265,28 @@ impl HarvestPlugin {
         self.mcp_tools_prefix = Some(prefix.into());
         self
     }
+
+    /// Register inbound webhook triggers produced by `autumn_harvest::webhooks!`
+    /// (issue #344).
+    ///
+    /// Each `#[webhook]`-annotated function is mounted as an app-level route
+    /// at its declared `path`, verified by autumn-web's `[security.webhooks]`
+    /// signed-webhook layer (`SignedWebhook`) before this crate's dispatch
+    /// code ever runs. Call `.workflows(...)` with every trigger's target
+    /// workflow *before* calling this method -- `HarvestPlugin::build` fails
+    /// fast (panics) if a trigger targets an unregistered workflow, or if two
+    /// triggers declare the same binding path.
+    ///
+    /// See `docs/getting-started/12-webhooks.md`.
+    #[cfg(feature = "webhooks")]
+    #[must_use]
+    pub fn webhooks(
+        mut self,
+        triggers: Vec<autumn_harvest::webhook_trigger::WebhookTriggerInfo>,
+    ) -> Self {
+        self.webhook_triggers = triggers;
+        self
+    }
 }
 
 /// Whether the generated MCP tool routes are about to be registered with no
@@ -270,6 +298,7 @@ const fn mcp_tools_unprotected(mcp_tools_enabled: bool, has_tool_middleware: boo
 }
 
 impl Plugin for HarvestPlugin {
+    #[allow(clippy::too_many_lines)]
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
             builder,
@@ -278,11 +307,29 @@ impl Plugin for HarvestPlugin {
             mcp_tool_middleware,
             mcp_tools_enabled,
             mcp_tools_prefix,
+            #[cfg(feature = "webhooks")]
+            webhook_triggers,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
 
         let api_state = HarvestApiState::new();
+
+        // Issue #344: generate the inbound webhook receiver routes before the
+        // builder is stashed in the runtime slot (same ordering constraint as
+        // the MCP tool routes below -- `builder.workflow_infos()` is only
+        // available pre-build). Fails fast (panics) on a duplicate/malformed
+        // binding path or a trigger targeting an unregistered workflow.
+        #[cfg(feature = "webhooks")]
+        let webhook_routes = if webhook_triggers.is_empty() {
+            Vec::new()
+        } else {
+            crate::webhook_receiver::build_webhook_routes(
+                &webhook_triggers,
+                builder.workflow_infos(),
+                &api_state,
+            )
+        };
 
         // Issue #597: generate the MCP tool routes before the builder is
         // stashed in the runtime slot. These are app-level typed routes
@@ -372,6 +419,13 @@ impl Plugin for HarvestPlugin {
         let app = match mcp_routes {
             Some(routes) => app.routes(routes),
             None => app,
+        };
+
+        #[cfg(feature = "webhooks")]
+        let app = if webhook_routes.is_empty() {
+            app
+        } else {
+            app.routes(webhook_routes)
         };
 
         if let Some(path) = api_path {
