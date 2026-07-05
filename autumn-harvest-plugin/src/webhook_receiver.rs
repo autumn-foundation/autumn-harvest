@@ -184,6 +184,22 @@ fn outcome_for_verify_status(status: axum::http::StatusCode) -> WebhookOutcome {
     }
 }
 
+/// Normalizes a resolved webhook delivery id: blank/whitespace-only is
+/// treated as "no delivery id resolved", not a genuine (if empty) id.
+///
+/// autumn-web's own JSON-body `"id"` fallback (`resolve_delivery_id` /
+/// `json_string_field`) has no non-empty guard the way its header-based
+/// lookup does, so a naive/generic sender's `{"id": ""}` payload resolves
+/// `Some("")` rather than `None`. Left unnormalized, every such delivery
+/// would collide on the same namespaced idempotency key
+/// (`{path}:{signal_name}:`), silently dropping all but the first unrelated
+/// event for a `SignalsWithStart` target (Codex review, PR #918). A genuine,
+/// non-blank id is returned untouched (not trimmed) -- only the
+/// all-whitespace case is treated as missing.
+fn normalize_delivery_id(raw: Option<&str>) -> Option<String> {
+    raw.map(str::to_string).filter(|d| !d.trim().is_empty())
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_webhook(
     api_state: HarvestApiState,
@@ -236,11 +252,13 @@ async fn handle_webhook(
         }
     };
 
+    let delivery_id = normalize_delivery_id(hook.delivery_id());
+
     let ctx = WebhookCtx::new(
         path,
         hook.endpoint().to_string(),
         hook.provider().to_string(),
-        hook.delivery_id().map(str::to_string),
+        delivery_id,
         hook.event_type().map(str::to_string),
         hook.raw_body().to_vec(),
     );
@@ -605,6 +623,32 @@ mod tests {
                 .unwrap()
                 .push((path.to_string(), outcome));
         }
+    }
+
+    #[test]
+    fn normalize_delivery_id_treats_none_as_none() {
+        assert_eq!(normalize_delivery_id(None), None);
+    }
+
+    #[test]
+    fn normalize_delivery_id_treats_blank_and_whitespace_as_none() {
+        assert_eq!(normalize_delivery_id(Some("")), None);
+        assert_eq!(normalize_delivery_id(Some("   ")), None);
+        assert_eq!(normalize_delivery_id(Some("\t\n")), None);
+    }
+
+    #[test]
+    fn normalize_delivery_id_preserves_a_genuine_id_untrimmed() {
+        assert_eq!(
+            normalize_delivery_id(Some("evt_123")),
+            Some("evt_123".to_string())
+        );
+        // A real (non-blank) id with incidental surrounding whitespace is
+        // passed through as-is -- only the all-whitespace case is missing.
+        assert_eq!(
+            normalize_delivery_id(Some(" evt_123 ")),
+            Some(" evt_123 ".to_string())
+        );
     }
 
     #[test]

@@ -268,3 +268,51 @@ async fn duplicate_webhook_delivery_to_signals_target_delivers_signal_exactly_on
     .count;
     assert_eq!(signal_count, 1, "the signal must be admitted exactly once");
 }
+
+/// A blank top-level `"id"` field (`autumn_web::webhook`'s JSON-body
+/// delivery-id fallback has no non-empty guard) must be treated as "no
+/// delivery id resolved" -- not a genuine, if empty, id that would let two
+/// unrelated `SignalsWithStart` deliveries collide on the same namespaced
+/// idempotency key (Codex review, PR #918).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn blank_delivery_id_is_rejected_as_missing_for_signals_target() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let db = TestDb::shared().await;
+    unsafe {
+        std::env::set_var("AUTUMN_DATABASE__URL", db.url());
+    }
+    autumn_web::migrate::run_pending(db.url(), autumn_web::migrate::FRAMEWORK_MIGRATIONS)
+        .expect("failed to run framework migrations");
+    autumn_web::migrate::run_pending(db.url(), autumn_harvest::MIGRATIONS)
+        .expect("failed to run Harvest migrations");
+
+    let client = TestApp::new()
+        .config(webhook_config())
+        .plugin(
+            HarvestPlugin::new()
+                .workflows(workflows![order_flow, subscription_flow])
+                .webhooks(webhooks![map_order, map_subscription])
+                .worker(WorkerConfig::default())
+                .api("/api/harvest"),
+        )
+        .with_db(db.pool())
+        .build();
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "id": "",
+        "amount_cents": 500
+    }))
+    .unwrap();
+    let sig = sign(&body);
+
+    let resp = client
+        .post("/hooks/subscriptions")
+        .header("X-Webhook-Signature", &sig)
+        .body(body)
+        .send()
+        .await;
+    resp.assert_status(400);
+    resp.assert_body_contains("missing_idempotency");
+}
