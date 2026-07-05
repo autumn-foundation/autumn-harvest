@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use autumn_harvest::{UpdateHandlerInfo, WorkflowInfo};
+use autumn_harvest::{DagInfo, UpdateHandlerInfo, WorkflowInfo};
 use autumn_web::reexports::axum;
 use axum::extract::{Path, Query};
 use axum::{Extension, Json};
@@ -158,14 +158,27 @@ pub fn update_input_schema_component(workflow: &str, update: &str) -> String {
 /// whose `workflow` does not match any mcp-enabled workflow are ignored
 /// (they may belong to a non-exposed workflow, which is not an error).
 ///
-/// `dag_names` is the set of registered unified-DAG names (`DagInfo::name`,
-/// e.g. from `HarvestBuilder::dag_infos()`), used only to set
-/// [`McpWorkflowDescriptor::is_dag`] on the matching `WorkflowInfo` entry --
-/// a unified DAG's `builder.dags()` call auto-registers its shadow
-/// `WorkflowInfo` into the same `workflows` slice this function scans, so
-/// `is_dag` is the only signal distinguishing it from an ordinary workflow.
+/// `dags` (e.g. from `HarvestBuilder::dag_infos()`) is scanned to determine
+/// which `WorkflowInfo` entries in `workflows` are actually a unified DAG's
+/// auto-registered shadow companion, setting [`McpWorkflowDescriptor::is_dag`]
+/// accordingly -- a unified DAG's `builder.dags()` call auto-registers that
+/// shadow `WorkflowInfo` into the same `workflows` slice this function scans,
+/// so `is_dag` is the only signal distinguishing it from an ordinary workflow.
 /// A DAG descriptor never gets updates attached (unified DAGs have no update
 /// handlers).
+///
+/// **Only DAGs with `workflow_handler.is_some()` count as a DAG name**
+/// (code-review fix): a classic (pre-unified) `DagInfo` has `workflow_handler:
+/// None`, so `DagInfo::as_workflow_info()` returns `None` for it and it is
+/// never added to `workflows` at all -- treating its name as a DAG name
+/// anyway would wrongly mark an unrelated, independently-registered
+/// `#[workflow(mcp)]` workflow that happens to share that name as `is_dag`,
+/// routing its start tool through the DAG trigger contract for a DAG it has
+/// nothing to do with and silently dropping its legitimate signal tool. This
+/// collision is *not* caught by `HarvestBuilder`'s own
+/// `validate_dag_workflow_name_collisions`, which only cross-checks
+/// `auto_registered_dag_workflows` (itself populated only for DAGs with a
+/// shadow `WorkflowInfo`) -- so filtering here is the only guard.
 ///
 /// **Duplicate workflow-name resolution matches the runtime exactly.**
 /// `HandlerRegistry::with_state_and_telemetry` collapses the builder's
@@ -184,12 +197,17 @@ pub fn update_input_schema_component(workflow: &str, update: &str) -> String {
 /// schema derivation always read the exact `WorkflowInfo` the runtime will
 /// execute.
 #[must_use]
-#[allow(clippy::implicit_hasher)]
+#[allow(clippy::too_many_lines)]
 pub fn collect_descriptors(
     workflows: &[WorkflowInfo],
     updates: &[UpdateHandlerInfo],
-    dag_names: &HashSet<&str>,
+    dags: &[DagInfo],
 ) -> Vec<McpWorkflowDescriptor> {
+    let dag_names: HashSet<&str> = dags
+        .iter()
+        .filter(|d| d.workflow_handler.is_some())
+        .map(|d| d.name)
+        .collect();
     let mut name_counts: HashMap<&str, u32> = HashMap::new();
     let mut effective: HashMap<&str, &WorkflowInfo> = HashMap::new();
     // Index of the registration `effective` currently points to for this
@@ -392,29 +410,61 @@ pub fn tool_route_specs(prefix: &str, descriptor: &McpWorkflowDescriptor) -> Vec
         .as_deref()
         .map_or_else(String::new, |d| format!(" {d}"));
 
-    let start_summary_suffix = if descriptor.is_dag {
-        String::new()
+    // The full DAG-vs-workflow behavioral difference lives right here: which
+    // handler the start tool routes to (and how it's described), and whether
+    // a signal tool exists at all. A DAG never consumes signals, so
+    // signal_{wf} is entirely absent for it rather than a no-op tool.
+    let (start_kind, start_description, signal_spec) = if descriptor.is_dag {
+        (
+            ToolKind::DagStart,
+            format!(
+                "Start a durable '{wf}' DAG run.{about} Returns a workflow handle \
+                 immediately without blocking to completion; the work survives \
+                 daemon restarts and does not require the caller to stay connected. \
+                 Correlate follow-up calls ({wf}_status, {wf}_watch) with the \
+                 returned execution_id handle."
+            ),
+            None,
+        )
     } else {
-        format!(", signal_{wf}")
+        (
+            ToolKind::Start,
+            format!(
+                "Start a durable '{wf}' workflow execution.{about} Returns a workflow \
+                 handle immediately without blocking to completion; the work survives \
+                 daemon restarts and does not require the caller to stay connected. \
+                 Correlate follow-up calls ({wf}_status, signal_{wf}, {wf}_watch) \
+                 with the returned execution_id handle."
+            ),
+            Some(ToolRouteSpec {
+                kind: ToolKind::Signal,
+                method: "POST",
+                path: format!("{prefix}/workflows/{wf}/{{handle}}/signal/{{signal_name}}"),
+                operation_id: format!("signal_{wf}"),
+                summary: format!("Send a signal to a '{wf}' workflow execution"),
+                description: format!(
+                    "Deliver an asynchronous signal to a running '{wf}' execution by \
+                     handle, unblocking any wait_for_signal/receive_signal in the \
+                     workflow body. The JSON body is the signal payload."
+                ),
+                path_params: vec!["handle", "signal_name"],
+                body_component: Some(SIGNAL_PAYLOAD_SCHEMA.to_string()),
+                response_component: Some(SIGNAL_ACK_SCHEMA),
+                stream: false,
+                workflow: wf.clone(),
+                update: None,
+            }),
+        )
     };
+
     let mut specs = vec![
         ToolRouteSpec {
-            kind: if descriptor.is_dag {
-                ToolKind::DagStart
-            } else {
-                ToolKind::Start
-            },
+            kind: start_kind,
             method: "POST",
             path: format!("{prefix}/workflows/{wf}/start"),
             operation_id: format!("start_{wf}"),
             summary: format!("Start the '{wf}' workflow"),
-            description: format!(
-                "Start a durable '{wf}' workflow execution.{about} Returns a workflow \
-                 handle immediately without blocking to completion; the work survives \
-                 daemon restarts and does not require the caller to stay connected. \
-                 Correlate follow-up calls ({wf}_status{start_summary_suffix}, {wf}_watch) \
-                 with the returned execution_id handle."
-            ),
+            description: start_description,
             path_params: vec![],
             body_component: Some(input_schema_component(wf)),
             response_component: Some(START_RESULT_SCHEMA),
@@ -441,29 +491,7 @@ pub fn tool_route_specs(prefix: &str, descriptor: &McpWorkflowDescriptor) -> Vec
             update: None,
         },
     ];
-
-    // A unified DAG run never waits on or handles a signal, so signal_{wf}
-    // would be a no-op tool for it -- omit it entirely (issue #601 follow-up).
-    if !descriptor.is_dag {
-        specs.push(ToolRouteSpec {
-            kind: ToolKind::Signal,
-            method: "POST",
-            path: format!("{prefix}/workflows/{wf}/{{handle}}/signal/{{signal_name}}"),
-            operation_id: format!("signal_{wf}"),
-            summary: format!("Send a signal to a '{wf}' workflow execution"),
-            description: format!(
-                "Deliver an asynchronous signal to a running '{wf}' execution by \
-                 handle, unblocking any wait_for_signal/receive_signal in the \
-                 workflow body. The JSON body is the signal payload."
-            ),
-            path_params: vec!["handle", "signal_name"],
-            body_component: Some(SIGNAL_PAYLOAD_SCHEMA.to_string()),
-            response_component: Some(SIGNAL_ACK_SCHEMA),
-            stream: false,
-            workflow: wf.clone(),
-            update: None,
-        });
-    }
+    specs.extend(signal_spec);
 
     for u in &descriptor.updates {
         specs.push(ToolRouteSpec {
@@ -919,17 +947,24 @@ async fn start_tool(
     .await
 }
 
-/// `start_{dag}` — delegate to the real DAG trigger handler
-/// (`POST /dags/{name}/trigger`), *not* the generic `start_workflow` path.
+/// `start_{dag}` — delegate to the real DAG trigger pipeline
+/// (`trigger_dag_run_inner`, shared with `POST /dags/{name}/trigger`), *not*
+/// the generic `start_workflow` path.
 ///
 /// A unified DAG's shadow `WorkflowInfo` would let `start_workflow` admit a
 /// run directly, but doing so would bypass DAG-specific admission gates
 /// (issue #377) and `max_active_runs`/paused enforcement that
-/// `trigger_dag_run` -> `trigger_unified_dag` applies before starting a new
-/// execution -- silently letting an MCP-originated call spawn more
+/// `trigger_dag_run_inner` -> `trigger_unified_dag` applies before starting a
+/// new execution -- silently letting an MCP-originated call spawn more
 /// concurrent DAG runs than the DAG's own operator-configured policy allows.
-/// Routing through `trigger_dag_run` keeps the MCP tool's admission
-/// semantics identical to the HTTP trigger route.
+/// Routing through the same inner implementation keeps the MCP tool's
+/// admission semantics identical to the HTTP trigger route.
+///
+/// Passes its own `route` label (rather than reusing `trigger_dag_run`'s
+/// `"POST /dags/{dag_name}/trigger"` string, code-review fix) so the audit
+/// trail attributes the trigger to the MCP tool it actually came through,
+/// instead of misreporting every MCP-originated DAG start as the classic
+/// HTTP route.
 ///
 /// The request body, if any, is forwarded as the DAG's `conf` (matching
 /// `DagTriggerRequest`'s `{"conf": ...}` shape); a `null`/absent body means
@@ -943,11 +978,12 @@ async fn start_dag_tool(
     use axum::response::IntoResponse as _;
 
     let conf = if body.is_null() { None } else { Some(body) };
-    Box::pin(crate::api::trigger_dag_run(
-        Extension(api_state),
-        Path(dag_name.to_string()),
-        headers,
-        Json(crate::api::DagTriggerRequest::from_conf(conf)),
+    Box::pin(crate::api::trigger_dag_run_inner(
+        &api_state,
+        dag_name.to_string(),
+        &headers,
+        crate::api::DagTriggerRequest::from_conf(conf),
+        "MCP tool: start_{dag}",
     ))
     .await
     .into_response()
@@ -1321,6 +1357,30 @@ mod tests {
         }
     }
 
+    /// `has_shadow_workflow = true` mirrors a unified DAG (macro emits
+    /// `workflow_handler: Some(...)`); `false` mirrors a classic
+    /// (pre-unified) DAG, which never produces a shadow `WorkflowInfo`.
+    fn dag_info(name: &'static str, has_shadow_workflow: bool) -> DagInfo {
+        DagInfo {
+            name,
+            module: "tests",
+            schedule: None,
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: None,
+            builder: |_| {},
+            workflow_handler: has_shadow_workflow
+                .then_some(|_ctx, input| Box::pin(async move { Ok(input) })),
+            jitter: std::time::Duration::ZERO,
+            overlap_policy: autumn_harvest::policy::OverlapPolicy::Skip,
+            buffer_all_max: 100,
+            owner: None,
+            runbook_url: None,
+            severity: None,
+            mcp: false,
+        }
+    }
+
     fn order_input_schema() -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -1331,11 +1391,7 @@ mod tests {
 
     #[test]
     fn collect_descriptors_filters_non_mcp_workflows() {
-        let descriptors = collect_descriptors(
-            &[wf("plain", false), wf("exposed", true)],
-            &[],
-            &HashSet::new(),
-        );
+        let descriptors = collect_descriptors(&[wf("plain", false), wf("exposed", true)], &[], &[]);
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0].name, "exposed");
         assert!(descriptors[0].updates.is_empty());
@@ -1361,7 +1417,7 @@ mod tests {
             });
         let plain = wf("plain_flow", true);
 
-        let descriptors = collect_descriptors(&[debounced, batched, plain], &[], &HashSet::new());
+        let descriptors = collect_descriptors(&[debounced, batched, plain], &[], &[]);
 
         let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
@@ -1385,7 +1441,7 @@ mod tests {
         let descriptors = collect_descriptors(
             &[wf("invoice_status", true), wf("start_invoice", true)],
             &[],
-            &HashSet::new(),
+            &[],
         );
 
         let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
@@ -1406,7 +1462,7 @@ mod tests {
         let descriptors = collect_descriptors(
             &[wf("start_invoice", true), wf("invoice_status", true)],
             &[],
-            &HashSet::new(),
+            &[],
         );
 
         let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
@@ -1437,7 +1493,7 @@ mod tests {
                 wf("invoice_status", true), // effective registration
             ],
             &[],
-            &HashSet::new(),
+            &[],
         );
 
         let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
@@ -1461,7 +1517,7 @@ mod tests {
         let descriptors = collect_descriptors(
             &[wf("a", true), wf("a_update", true)],
             &[upd("watch", "a", true)],
-            &HashSet::new(),
+            &[],
         );
 
         let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
@@ -1482,8 +1538,7 @@ mod tests {
     /// advertise a workflow the runtime does not actually run that way.
     #[test]
     fn collect_descriptors_resolves_duplicate_names_last_wins_like_the_runtime_hashmap() {
-        let descriptors =
-            collect_descriptors(&[wf("foo", true), wf("foo", false)], &[], &HashSet::new());
+        let descriptors = collect_descriptors(&[wf("foo", true), wf("foo", false)], &[], &[]);
         assert!(
             descriptors.is_empty(),
             "the runtime's last-wins HashMap resolves 'foo' to the non-mcp registration; \
@@ -1504,7 +1559,7 @@ mod tests {
                     .with_input_schema_fn(order_input_schema),
             ],
             &[],
-            &HashSet::new(),
+            &[],
         );
         assert_eq!(descriptors.len(), 1);
         assert_eq!(descriptors[0].name, "foo");
@@ -1521,7 +1576,7 @@ mod tests {
         let info = wf("order_flow", true)
             .with_description("Processes an order")
             .with_input_schema_fn(order_input_schema);
-        let descriptors = collect_descriptors(&[info], &[], &HashSet::new());
+        let descriptors = collect_descriptors(&[info], &[], &[]);
         assert_eq!(
             descriptors[0].description.as_deref(),
             Some("Processes an order")
@@ -1539,7 +1594,7 @@ mod tests {
                 upd("orphan", "hidden_flow", true), // workflow not exposed
                 upd("other", "missing_flow", true), // workflow not registered
             ],
-            &HashSet::new(),
+            &[],
         );
         assert_eq!(descriptors.len(), 1);
         let updates: Vec<&str> = descriptors[0]
@@ -1560,7 +1615,7 @@ mod tests {
                 upd("approve", "a_flow", true),
                 upd("zz", "a_flow", true),
             ],
-            &HashSet::new(),
+            &[],
         );
         let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["a_flow", "b_flow"], "sorted, deduped");
@@ -1605,11 +1660,8 @@ mod tests {
             validator: None,
             mcp: true,
         };
-        let descriptors = collect_descriptors(
-            &[wf("order_flow", true)],
-            &[first_non_mcp, second_mcp],
-            &HashSet::new(),
-        );
+        let descriptors =
+            collect_descriptors(&[wf("order_flow", true)], &[first_non_mcp, second_mcp], &[]);
         assert_eq!(
             descriptors[0].updates.len(),
             0,
@@ -1646,11 +1698,8 @@ mod tests {
             validator: None,
             mcp: true,
         };
-        let descriptors = collect_descriptors(
-            &[wf("order_flow", true)],
-            &[first_mcp, second_mcp],
-            &HashSet::new(),
-        );
+        let descriptors =
+            collect_descriptors(&[wf("order_flow", true)], &[first_mcp, second_mcp], &[]);
         assert_eq!(descriptors[0].updates.len(), 1);
         assert_eq!(
             descriptors[0].updates[0].input_type_hint, "FirstRequest",
@@ -1816,12 +1865,10 @@ mod tests {
 
     #[test]
     fn collect_descriptors_marks_registered_dag_names_as_is_dag() {
-        let mut dag_names = HashSet::new();
-        dag_names.insert("daily_etl");
         let descriptors = collect_descriptors(
             &[wf("daily_etl", true), wf("order_flow", true)],
             &[],
-            &dag_names,
+            &[dag_info("daily_etl", true)],
         );
 
         let dag = descriptors
@@ -1843,18 +1890,46 @@ mod tests {
 
     #[test]
     fn collect_descriptors_dag_ignores_updates_registered_under_its_name() {
-        let mut dag_names = HashSet::new();
-        dag_names.insert("daily_etl");
         let descriptors = collect_descriptors(
             &[wf("daily_etl", true)],
             &[upd("some_update", "daily_etl", true)],
-            &dag_names,
+            &[dag_info("daily_etl", true)],
         );
         assert_eq!(descriptors.len(), 1);
         assert!(
             descriptors[0].updates.is_empty(),
             "unified DAGs have no update handlers; a stray UpdateHandlerInfo \
              registered under the DAG's name must not be attached"
+        );
+    }
+
+    /// Code-review regression test: a classic (pre-unified) DAG --
+    /// `workflow_handler: None`, never lowered onto a shadow `WorkflowInfo` --
+    /// must NOT cause an unrelated, independently-registered
+    /// `#[workflow(mcp)]` workflow of the same name to be mistagged `is_dag`.
+    /// An earlier version of `collect_descriptors` accepted a pre-derived
+    /// `dag_names: &HashSet<&str>` built from *every* registered `DagInfo`
+    /// (including classic ones with no shadow `WorkflowInfo`), which this
+    /// scenario would wrongly mark as a DAG -- routing its start tool
+    /// through `trigger_dag_run` for a DAG that has nothing to do with it,
+    /// and silently dropping its legitimate signal tool.
+    #[test]
+    fn collect_descriptors_classic_dag_does_not_mistag_a_same_named_workflow() {
+        let descriptors = collect_descriptors(
+            &[wf("reconcile_inventory", true)],
+            &[],
+            &[dag_info("reconcile_inventory", false)],
+        );
+
+        let workflow = descriptors
+            .iter()
+            .find(|d| d.name == "reconcile_inventory")
+            .expect("reconcile_inventory must be exposed");
+        assert!(
+            !workflow.is_dag,
+            "a classic DAG (workflow_handler: None) has no shadow WorkflowInfo, \
+             so it must never cause a same-named ordinary workflow to be \
+             mistaken for a DAG"
         );
     }
 
@@ -1908,15 +1983,14 @@ mod tests {
     /// tests here) would be a genuine cross-test race.
     #[test]
     fn record_schemas_is_idempotent_and_last_write_wins_on_divergence() {
-        let first =
-            collect_descriptors(&[wf("review_fix_schema_probe", true)], &[], &HashSet::new());
+        let first = collect_descriptors(&[wf("review_fix_schema_probe", true)], &[], &[]);
         record_schemas(&first);
         record_schemas(&first); // identical re-registration: must not panic
 
         let diverged = collect_descriptors(
             &[wf("review_fix_schema_probe", true).with_input_schema_fn(order_input_schema)],
             &[],
-            &HashSet::new(),
+            &[],
         );
         record_schemas(&diverged); // divergent re-registration: must not panic
 
@@ -1953,7 +2027,7 @@ mod tests {
         let tool_middleware: crate::plugin::McpToolMiddlewareFn =
             std::sync::Arc::new(move |mr| mr.layer(deny_layer.clone()));
 
-        let descriptors = collect_descriptors(&[wf("order_flow", true)], &[], &HashSet::new());
+        let descriptors = collect_descriptors(&[wf("order_flow", true)], &[], &[]);
         record_schemas(&descriptors);
         let routes = build_mcp_tool_routes(
             "/api/harvest/mcp",
@@ -1984,7 +2058,7 @@ mod tests {
     /// the embedder never opted into `api_with_auth`.
     #[tokio::test]
     async fn mcp_tool_routes_are_unwrapped_when_no_middleware_is_configured() {
-        let descriptors = collect_descriptors(&[wf("order_flow", true)], &[], &HashSet::new());
+        let descriptors = collect_descriptors(&[wf("order_flow", true)], &[], &[]);
         record_schemas(&descriptors);
         let routes = build_mcp_tool_routes(
             "/api/harvest/mcp",

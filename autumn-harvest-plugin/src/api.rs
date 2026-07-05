@@ -12030,6 +12030,29 @@ pub(crate) async fn trigger_dag_run(
     headers: axum::http::HeaderMap,
     Json(request): Json<DagTriggerRequest>,
 ) -> Result<(axum::http::StatusCode, Json<StartWorkflowResponse>), AutumnError> {
+    trigger_dag_run_inner(
+        &api_state,
+        dag_name,
+        &headers,
+        request,
+        "POST /dags/{dag_name}/trigger",
+    )
+    .await
+}
+
+/// Shared implementation behind both the classic HTTP trigger route
+/// (`trigger_dag_run`, always passing its own route string) and the MCP
+/// `start_{dag}` tool (`mcp_tools::start_dag_tool`), which passes a distinct
+/// `route` label so the audit trail records the call's true origin instead
+/// of always attributing it to the classic HTTP route.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn trigger_dag_run_inner(
+    api_state: &HarvestApiState,
+    dag_name: String,
+    headers: &axum::http::HeaderMap,
+    request: DagTriggerRequest,
+    route: &'static str,
+) -> Result<(axum::http::StatusCode, Json<StartWorkflowResponse>), AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
 
@@ -12050,8 +12073,7 @@ pub(crate) async fn trigger_dag_run(
         .unwrap_or("default")
         .to_string();
 
-    let (actor, source, request_id) = audit_context(&headers, &api_state);
-    let route = "POST /dags/{dag_name}/trigger";
+    let (actor, source, request_id) = audit_context(headers, api_state);
 
     // issue #377: check admission gates before creating a new DAG run.
     {

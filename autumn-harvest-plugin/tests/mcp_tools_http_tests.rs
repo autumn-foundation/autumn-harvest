@@ -15,8 +15,6 @@
 #![cfg(feature = "mcp")]
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]
 
-use std::collections::HashSet;
-
 use autumn_harvest::prelude::*;
 use autumn_harvest_plugin::HarvestApiState;
 use autumn_harvest_plugin::mcp_tools::{
@@ -87,7 +85,7 @@ fn build_client() -> TestClient {
         __autumn_update_handler_info_approve(),
         __autumn_update_handler_info_internal_only(),
     ];
-    let descriptors = collect_descriptors(&workflows, &updates, &HashSet::new());
+    let descriptors = collect_descriptors(&workflows, &updates, &[]);
     record_schemas(&descriptors);
     let routes = build_mcp_tool_routes(
         "/api/harvest/mcp",
@@ -280,7 +278,7 @@ async fn tool_routes_coexist_with_the_nested_management_router() {
     // the nested catch-all side by side without a collision panic.
     let workflows =
         vec![__autumn_workflow_info_order_flow().with_input_schema_fn(order_input_schema)];
-    let descriptors = collect_descriptors(&workflows, &[], &HashSet::new());
+    let descriptors = collect_descriptors(&workflows, &[], &[]);
     record_schemas(&descriptors);
     let api_state = HarvestApiState::new();
     let routes = build_mcp_tool_routes("/api/harvest/mcp", &descriptors, &api_state, None);
@@ -374,14 +372,13 @@ async fn tools_call_dispatches_through_the_real_pipeline_and_fails_closed() {
 }
 
 /// A unified DAG's shadow `WorkflowInfo` (`daily_etl_dag`), assembled the
-/// same way `HarvestPlugin::build` would: workflows + `dag_names` set ->
+/// same way `HarvestPlugin::build` would: workflows + dags ->
 /// `collect_descriptors` -> schemas -> routes -> `mount_mcp`.
 #[cfg(feature = "unified-dag-execution")]
 fn build_dag_client() -> TestClient {
-    let dag_info = __autumn_dag_info_daily_etl_dag();
-    let dag_names: HashSet<&str> = std::iter::once(dag_info.name).collect();
+    let dags = vec![__autumn_dag_info_daily_etl_dag()];
     let workflows = vec![__autumn_workflow_info_daily_etl_dag()];
-    let descriptors = collect_descriptors(&workflows, &[], &dag_names);
+    let descriptors = collect_descriptors(&workflows, &[], &dags);
     record_schemas(&descriptors);
     let routes = build_mcp_tool_routes(
         "/api/harvest/mcp",
