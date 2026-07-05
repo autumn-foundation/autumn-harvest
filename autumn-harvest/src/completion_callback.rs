@@ -1604,6 +1604,40 @@ pub static GLOBAL_CALLBACK_CONFIG: std::sync::RwLock<
     Option<std::sync::Arc<CallbackRuntimeConfig>>,
 > = std::sync::RwLock::new(None);
 
+/// Read the current [`GLOBAL_CALLBACK_CONFIG`], tolerating a poisoned lock
+/// (issue #921 review) rather than either panicking or silently treating a
+/// poisoned lock the same as "never configured".
+///
+/// A poisoned `RwLock` means some other thread panicked while holding the
+/// write guard — but the single `*lock = Some(..)` assignment that write
+/// path performs is not itself a multi-step invariant that a panic could
+/// leave half-updated, so the data behind a poisoned read guard is still
+/// perfectly valid to read. Recovering it (via `into_inner()`) rather than
+/// discarding it avoids the failure mode a bare `.read().ok()` has: if
+/// *anything* elsewhere in the process ever panics while holding this
+/// lock's write guard, every subsequent terminal transition would
+/// otherwise silently stop enqueuing/delivering completion callbacks for
+/// the rest of the process's life, with no diagnostic at all. Panicking
+/// instead (the alternative some reviewers suggest) was rejected: it would
+/// propagate into `enqueue_completion_deliveries`, called inside the
+/// worker's terminal-transition transaction for *every* workflow
+/// completion in the system — crashing delivery of a completion callback
+/// must never crash the workflow's own terminal transition.
+#[cfg(feature = "db")]
+fn read_global_callback_config() -> Option<std::sync::Arc<CallbackRuntimeConfig>> {
+    match GLOBAL_CALLBACK_CONFIG.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => {
+            tracing::error!(
+                "GLOBAL_CALLBACK_CONFIG lock was poisoned by a panic elsewhere in the \
+                 process; recovering the last-written config rather than treating it as \
+                 unconfigured"
+            );
+            poisoned.into_inner().clone()
+        }
+    }
+}
+
 /// Enqueue durable completion-callback deliveries for `execution`'s terminal
 /// transition to `state`.
 ///
@@ -1635,7 +1669,7 @@ pub async fn enqueue_completion_deliveries(
 ) -> crate::error::HarvestResult<()> {
     use diesel_async::RunQueryDsl;
 
-    let Some(config) = GLOBAL_CALLBACK_CONFIG.read().ok().and_then(|g| g.clone()) else {
+    let Some(config) = read_global_callback_config() else {
         return Ok(());
     };
 
@@ -1827,36 +1861,56 @@ async fn apply_outcome(
 
     use crate::schema::harvest_completion_deliveries::dsl;
 
+    // Guard every outcome write by the exact `attempt` number this row had
+    // *when it was claimed* (issue #921 review, Codex P2): if a delivery
+    // attempt runs longer than the INFLIGHT lease (a slow custom deliverer,
+    // a stalled executor, or just an unlucky scheduling gap), a later
+    // scanner tick can reclaim the same row and bump `attempt` again while
+    // the earlier, stale attempt is still in flight. Without this guard,
+    // the stale attempt's outcome — arriving after the newer attempt's —
+    // would win the update-by-`id`-only race and could silently revive an
+    // already-`DELIVERED`/`FAILED` row back to `PENDING`, or overwrite a
+    // fresher dead-letter with stale status/error text. Filtering on
+    // `attempt.eq(row.attempt)` makes a superseded attempt's write a
+    // no-op (0 rows matched) instead of corrupting the newer state.
     match action {
         OutcomeAction::Delivered { status } => {
-            diesel::update(dsl::harvest_completion_deliveries.find(row.id))
-                .set((
-                    dsl::state.eq("DELIVERED"),
-                    dsl::last_status.eq(Some(i32::from(status))),
-                    dsl::last_error.eq(None::<String>),
-                    dsl::delivered_at.eq(Some(Utc::now())),
-                    dsl::updated_at.eq(Utc::now()),
-                ))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            diesel::update(
+                dsl::harvest_completion_deliveries
+                    .find(row.id)
+                    .filter(dsl::attempt.eq(row.attempt)),
+            )
+            .set((
+                dsl::state.eq("DELIVERED"),
+                dsl::last_status.eq(Some(i32::from(status))),
+                dsl::last_error.eq(None::<String>),
+                dsl::delivered_at.eq(Some(Utc::now())),
+                dsl::updated_at.eq(Utc::now()),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
         }
         OutcomeAction::Backoff {
             next_attempt_at,
             last_status,
             last_error,
         } => {
-            diesel::update(dsl::harvest_completion_deliveries.find(row.id))
-                .set((
-                    dsl::state.eq("PENDING"),
-                    dsl::next_attempt_at.eq(next_attempt_at),
-                    dsl::last_status.eq(last_status.map(i32::from)),
-                    dsl::last_error.eq(last_error),
-                    dsl::updated_at.eq(Utc::now()),
-                ))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            diesel::update(
+                dsl::harvest_completion_deliveries
+                    .find(row.id)
+                    .filter(dsl::attempt.eq(row.attempt)),
+            )
+            .set((
+                dsl::state.eq("PENDING"),
+                dsl::next_attempt_at.eq(next_attempt_at),
+                dsl::last_status.eq(last_status.map(i32::from)),
+                dsl::last_error.eq(last_error),
+                dsl::updated_at.eq(Utc::now()),
+            ))
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
         }
         OutcomeAction::DeadLetter {
             last_status,
@@ -1883,18 +1937,26 @@ async fn apply_outcome(
 
             conn.transaction::<_, crate::error::HarvestError, _>(|conn| {
                 async move {
-                    diesel::update(dsl::harvest_completion_deliveries.find(row.id))
-                        .set((
-                            dsl::state.eq("FAILED"),
-                            dsl::last_status.eq(last_status.map(i32::from)),
-                            dsl::last_error.eq(last_error),
-                            dsl::updated_at.eq(Utc::now()),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
+                    let updated = diesel::update(
+                        dsl::harvest_completion_deliveries
+                            .find(row.id)
+                            .filter(dsl::attempt.eq(row.attempt)),
+                    )
+                    .set((
+                        dsl::state.eq("FAILED"),
+                        dsl::last_status.eq(last_status.map(i32::from)),
+                        dsl::last_error.eq(last_error),
+                        dsl::updated_at.eq(Utc::now()),
+                    ))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
 
-                    crate::dlq::dead_letter(conn, &entry).await?;
+                    // A stale/superseded attempt must not dead-letter a row a
+                    // newer attempt already resolved differently.
+                    if updated > 0 {
+                        crate::dlq::dead_letter(conn, &entry).await?;
+                    }
                     Ok(())
                 }
                 .scope_boxed()
@@ -1954,8 +2016,13 @@ async fn fire_due_on_conn(
     // bytes originally inserted, but that never threatens the "signature
     // covers exactly what was posted" invariant: whatever bytes we derive
     // here are the ones we sign *and* the ones we send, on every attempt
-    // including the first. Rows that fail to serialize are skipped (logged)
-    // rather than aborting the whole batch.
+    // including the first. A row that fails to serialize is dead-lettered
+    // immediately rather than merely skipped (issue #921 review): a `continue`
+    // here would leave the row's just-claimed `INFLIGHT` state and
+    // `next_attempt_at = lease_until` untouched, so — since serialization
+    // failure is deterministic for a given payload — the very next scanner
+    // tick (30s later) would reclaim and fail to serialize it again,
+    // forever, spamming logs and never actually resolving the delivery.
     let mut dispatchable = Vec::with_capacity(claimed.len());
     for row in claimed {
         let body = match serde_json::to_vec(&row.payload) {
@@ -1964,8 +2031,14 @@ async fn fire_due_on_conn(
                 tracing::error!(
                     delivery_id = %row.id,
                     error = %e,
-                    "failed to serialize completion-callback payload for delivery; skipping this tick"
+                    "failed to serialize completion-callback payload for delivery; dead-lettering"
                 );
+                let action = OutcomeAction::DeadLetter {
+                    last_status: None,
+                    last_error: Some(format!("payload serialization failed: {e}")),
+                };
+                apply_outcome(conn, &row, action).await?;
+                processed += 1;
                 continue;
             }
         };
@@ -2037,7 +2110,7 @@ pub async fn fire_due_completion_deliveries(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 ) -> crate::error::HarvestResult<usize> {
-    let Some(config) = GLOBAL_CALLBACK_CONFIG.read().ok().and_then(|g| g.clone()) else {
+    let Some(config) = read_global_callback_config() else {
         return Ok(0);
     };
 
