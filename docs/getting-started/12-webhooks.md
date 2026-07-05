@@ -120,7 +120,16 @@ fn map_payment(_ctx: &WebhookCtx, evt: StripeEvent) -> Result<WorkflowId, String
 
 A `signals` target **requires** the endpoint to resolve a delivery ID
 (configured `delivery_id_header`, or a top-level `"id"` JSON field — Stripe's
-default) — that ID becomes the signal's idempotency key. A `starts` target
+default). That ID feeds the signal's idempotency key, but the raw ID is not
+used verbatim: it's namespaced with the webhook's `path` and `signal_name`
+(`{path}:{signal_name}:{delivery_id}`) before being handed to
+`signal_with_start`. `signal_with_start`'s own dedupe is scoped to
+`(workflow_name, workflow_id, idempotency_key)` only — it has no notion of
+webhook endpoints — so without namespacing, two different `#[webhook(signals
+= ...)]` bindings that both target the same `(workflow_name, workflow_id)`
+pair (an entity workflow fed by more than one provider) could collide
+whenever their raw delivery IDs happened to match, silently dropping the
+second signal as an "idempotent replay" of the first. A `starts` target
 needs no delivery ID; its own returned `WorkflowId` is the idempotency
 mechanism.
 

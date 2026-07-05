@@ -255,9 +255,12 @@ async fn duplicate_webhook_delivery_to_signals_target_delivers_signal_exactly_on
         "exactly one execution must exist after redelivery"
     );
 
+    // The idempotency key is namespaced by binding (path + signal_name), not
+    // the raw provider delivery id -- see webhook_receiver.rs::handle_webhook.
     let mut conn = db.pool().get().await.expect("pool conn");
     let signal_count: i64 = diesel::sql_query(
-        "SELECT COUNT(*) as count FROM harvest_signals WHERE idempotency_key = 'dlv-payment-1'",
+        "SELECT COUNT(*) as count FROM harvest_signals WHERE idempotency_key = \
+         '/hooks/subscriptions:payment_succeeded:dlv-payment-1'",
     )
     .get_result::<CountRow>(&mut conn)
     .await

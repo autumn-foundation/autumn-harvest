@@ -294,6 +294,28 @@ async fn handle_webhook(
             workflow,
             signal_name,
         } => {
+            // Namespace the idempotency key by this binding (path +
+            // signal_name) rather than passing the raw provider delivery id
+            // straight through: `signal_with_start`'s dedupe is scoped to
+            // `(workflow_name, workflow_id, idempotency_key)` only -- it does
+            // not know about webhook endpoints or signal names. Two
+            // different `#[webhook(signals = ...)]` bindings that target the
+            // same (workflow_name, workflow_id) pair (e.g. two providers
+            // signalling one shared entity workflow) would otherwise collide
+            // whenever their raw delivery ids happen to match (a real risk
+            // for naive/generic senders using small sequential ids, or the
+            // same event redelivered to two configured paths) -- the second
+            // delivery would be misread as an idempotent replay of the
+            // first and its signal silently dropped. `path` alone already
+            // disambiguates every binding (`validate_webhook_triggers`
+            // forbids duplicate paths); `signal_name` is included for
+            // defense-in-depth. A same-binding redelivery of the same event
+            // still maps to the same key, so exactly-once dedup for the
+            // common case is unchanged.
+            let namespaced_idempotency_key = ctx
+                .delivery_id
+                .as_deref()
+                .map(|delivery_id| format!("{path}:{signal_name}:{delivery_id}"));
             Box::pin(crate::api::signal_with_start_workflow(
                 Extension(api_state.clone()),
                 axum::extract::Path(workflow.to_string()),
@@ -303,7 +325,7 @@ async fn handle_webhook(
                     workflow_id.as_str().to_string(),
                     payload,
                     signal_name.to_string(),
-                    ctx.delivery_id.clone(),
+                    namespaced_idempotency_key,
                     queue.map(str::to_string),
                 )),
             ))
