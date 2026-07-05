@@ -74,7 +74,7 @@
 //! ## Known limitation: `search_attr` value collision with the sentinel
 //!
 //! An execution whose `search_attrs` value for the requested key literally
-//! equals [`UNATTRIBUTED_GROUP`] (`"(unattributed)"`) is indistinguishable
+//! equals [`crate::usage::UNATTRIBUTED_GROUP`] (`"(unattributed)"`) is indistinguishable
 //! from an execution that lacks the key entirely — both merge into the same
 //! `"(unattributed)"` group. This is an accepted, documented limitation, not
 //! a defect: issue #596's AC mandates this exact literal for missing-key
@@ -110,7 +110,7 @@ pub const fn default_usage_window_ceiling() -> std::time::Duration {
 /// Unlike `GET /workflows/count`'s top-N + `other` rollup, a chargeback
 /// report must never silently drop a low-volume tenant's data — so
 /// exceeding this cap is a hard error naming the ceiling rather than a
-/// silent rollup. The cap is enforced at two layers: [`usage_sql`] binds it
+/// silent rollup. The cap is enforced at two layers: `usage_sql` binds it
 /// (plus one) as a `LIMIT` so a single high-cardinality shard can't
 /// materialize an unbounded result set, and the plugin's
 /// `build_usage_response` checks the merged cross-shard count before
@@ -360,7 +360,7 @@ LIMIT $5
 /// Load grouped usage rows from a single shard without mutating state.
 ///
 /// `row_limit` bounds the number of grouped rows this single shard's query
-/// can return (a `LIMIT` clause in [`usage_sql`]) — callers should pass the
+/// can return (a `LIMIT` clause in `usage_sql`) — callers should pass the
 /// configured group cap plus one, so the plugin can still detect and report
 /// an over-cap condition without ever materializing an unbounded result set
 /// for a single high-cardinality shard.

@@ -6,7 +6,7 @@
 //! or hand-querying every shard database. `GET /workflows/count` groups
 //! `harvest_workflow_executions` rows by `state` and/or `workflow_name` with a
 //! real per-shard SQL `GROUP BY … COUNT(*)`
-//! ([`count_workflow_executions_grouped`](autumn_harvest::execution::count_workflow_executions_grouped))
+//! ([`count_workflow_executions_grouped`])
 //! and sums the per-group counts across shards here.
 //!
 //! ## Response shape
@@ -21,7 +21,7 @@
 //! (default [`DEFAULT_LIMIT_GROUPS`], max [`MAX_LIMIT_GROUPS`]); the long tail
 //! is rolled into a single `{"other": true}` group so a pathological number of
 //! workflow types can never produce an unbounded payload, via the same
-//! [`rollup_top_n`](autumn_harvest::dlq::rollup_top_n) helper the DLQ
+//! [`rollup_top_n`] helper the DLQ
 //! aggregation endpoint's `_other` rollup (issue #385) uses.
 //!
 //! ## Partial answers

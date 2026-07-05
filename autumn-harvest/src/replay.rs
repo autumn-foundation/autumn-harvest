@@ -3608,7 +3608,7 @@ impl HistoryMatcher {
     /// `race_winner:1` marker. Those tolerated event kinds are scanned past
     /// (tracked, not consumed) rather than treated as an immediate miss; on
     /// a match, the cursor rewinds to the first such tolerated event (like
-    /// [`Self::settle_terminal`]) so a sibling's own later scan still finds
+    /// `Self::settle_terminal`) so a sibling's own later scan still finds
     /// it. On a genuine miss (scan exhausted, or an event outside the
     /// tolerated set is encountered) the cursor is left unchanged if nothing
     /// was skipped, or parked at the first tolerated event otherwise — in

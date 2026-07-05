@@ -521,7 +521,7 @@ fn permissive_object_schema(description: &str) -> serde_json::Value {
 /// Record the descriptors' schemas into the process-global schema map.
 ///
 /// Covers each workflow's input schema plus the fixed response/payload
-/// schemas, consumed by [`register_harvest_mcp_schemas`]. Idempotent,
+/// schemas, consumed by `register_harvest_mcp_schemas`. Idempotent,
 /// name-keyed: re-recording the same workflow overwrites with identical
 /// content.
 pub fn record_schemas(descriptors: &[McpWorkflowDescriptor]) {
@@ -673,7 +673,7 @@ fn leak(s: String) -> &'static str {
 /// Each route carries an `ApiDoc` with `mcp_tool: true` (and `mcp_stream` for
 /// watch) so autumn-web's `mount_mcp` projects it into the tool catalog; the
 /// handlers delegate to the same primitives the management API uses, reading
-/// runtime state from the given [`HarvestApiState`] (fail-closed 503 before
+/// runtime state from the given [`crate::api::HarvestApiState`] (fail-closed 503 before
 /// `on_startup` installs the runtime).
 #[must_use]
 pub fn build_mcp_tool_routes(
