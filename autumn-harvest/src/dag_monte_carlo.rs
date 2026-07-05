@@ -148,11 +148,23 @@ impl DagMonteCarloSimulator {
         let sum: u128 = total_durations.iter().map(Duration::as_nanos).sum();
         let mean_nanos = sum / (iterations as u128);
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
         let p50_idx = (iterations as f64 * 0.50) as usize;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
         let p90_idx = (iterations as f64 * 0.90) as usize;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
         let p99_idx = (iterations as f64 * 0.99) as usize;
 
         let mean_secs = u64::try_from(mean_nanos / 1_000_000_000).unwrap_or(u64::MAX);
