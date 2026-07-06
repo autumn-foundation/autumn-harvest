@@ -62,6 +62,7 @@ mod query_deadlock;
 mod query_tests;
 mod queue_fairness_tests;
 mod redrive_tests;
+#[cfg(all(feature = "testing", feature = "db"))]
 mod replay_canary_tests;
 mod replay_tests;
 #[cfg(feature = "testing")]
@@ -75,6 +76,7 @@ mod saga_tests;
 mod schedule_decisions;
 mod schedule_runs_tests;
 mod schedule_to_close_tests;
+#[cfg(all(feature = "testing", feature = "db"))]
 mod scheduled_time_tests;
 mod scheduler_auto_pause_tests;
 mod scheduler_bounded_runs_tests;
