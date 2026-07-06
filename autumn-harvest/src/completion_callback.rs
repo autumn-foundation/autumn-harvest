@@ -2338,6 +2338,36 @@ async fn fire_due_on_conn(
     // forever, spamming logs and never actually resolving the delivery.
     let mut dispatchable = Vec::with_capacity(claimed.len());
     for row in claimed {
+        // Re-validate the target URL against the *live* SSRF policy before
+        // dispatching (issue #921 review, Codex P2): `target_url` was only
+        // ever checked at enqueue time (`enqueue_completion_deliveries`'s
+        // own defense-in-depth re-check). A row can sit `PENDING`/`INFLIGHT`/
+        // `FAILED` for a long time -- or be manually redriven long after
+        // enqueue -- so an operator who tightens the allowlist (removing a
+        // compromised or decommissioned host) after enqueue must have that
+        // change actually enforced on the next dispatch attempt, not just
+        // for brand-new deliveries. A rejection here dead-letters the row
+        // immediately rather than silently dropping it forever: the
+        // operator gets a visible, actionable DLQ entry instead of a task
+        // that appears to make no progress.
+        if let Err(rejection) = validate_target_url(&row.target_url, &config.ssrf_policy) {
+            tracing::warn!(
+                delivery_id = %row.id,
+                target_url = %row.target_url,
+                rejection = ?rejection,
+                "completion-callback target URL no longer allowed by the live SSRF policy; dead-lettering"
+            );
+            let action = OutcomeAction::DeadLetter {
+                last_status: None,
+                last_error: Some(format!(
+                    "target URL rejected by current SSRF policy: {rejection}"
+                )),
+            };
+            apply_outcome(conn, &row, action).await?;
+            processed += 1;
+            continue;
+        }
+
         let payload = fresh_payloads.get(&row.id).unwrap_or(&row.payload);
         let body = match serde_json::to_vec(payload) {
             Ok(bytes) => bytes,

@@ -863,6 +863,83 @@ async fn scanner_dead_letters_on_retry_exhaustion() {
     );
 }
 
+// Regression (issue #921 review, Codex P2): `target_url` is only ever
+// checked against the SSRF allowlist at enqueue time. A delivery can sit
+// PENDING/INFLIGHT/FAILED for a long time -- or be manually redriven long
+// after enqueue -- so an operator who tightens the allowlist (removing a
+// compromised or decommissioned host) after enqueue must have that change
+// actually enforced on the next dispatch attempt, not just for brand-new
+// deliveries.
+#[tokio::test]
+async fn scanner_rejects_dispatch_when_target_is_no_longer_allowlisted() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)]));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(3, Duration::from_secs(60)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some(r#"{"refunded":true}"#),
+        None,
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let rows = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries");
+    assert_eq!(rows[0].state, "PENDING", "sanity: enqueue succeeded");
+
+    // Simulate an operator tightening the allowlist after this delivery was
+    // already enqueued: reinstall the runtime config with an allowlist that
+    // no longer covers "api.example.com".
+    *GLOBAL_CALLBACK_CONFIG.write().unwrap() = Some(Arc::new(CallbackRuntimeConfig {
+        deliverer: deliverer.clone(),
+        secret: CallbackSecret::new(b"test-secret".to_vec()),
+        ssrf_policy: SsrfPolicy::new(HostAllowlist::new()),
+        default_targets: Vec::new(),
+        retry_policy: RetryPolicy::exponential(3, Duration::from_secs(60)),
+    }));
+
+    let processed = fire_due_completion_deliveries(&mut conn, &None, &[])
+        .await
+        .expect("scanner tick");
+    assert_eq!(processed, 1);
+
+    assert_eq!(
+        deliverer.call_count(),
+        0,
+        "the deliverer must never be invoked for a target the live policy no longer allows"
+    );
+
+    let rows_after = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries after tick");
+    assert_eq!(
+        rows_after[0].state, "FAILED",
+        "a rejected target must be dead-lettered, not silently retried forever"
+    );
+    assert!(
+        rows_after[0]
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("SSRF policy"),
+        "last_error must explain the rejection: {:?}",
+        rows_after[0].last_error
+    );
+}
+
 async fn exhaust_one_callback_delivery(
     conn: &mut AsyncPgConnection,
     workflow_id: &str,
