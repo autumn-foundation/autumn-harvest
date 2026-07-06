@@ -34,7 +34,7 @@ pub const SESSION_MEMBER_STICKY_TIMEOUT: Duration = Duration::from_secs(24 * 360
 /// Lower/upper bounds for [`acquire_retry_backoff`]'s randomized reschedule
 /// delay after a session-acquire task loses the in-process semaphore race.
 pub const ACQUIRE_RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
-pub const ACQUIRE_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(1000);
+pub const ACQUIRE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Session-slot acquire eligibility
