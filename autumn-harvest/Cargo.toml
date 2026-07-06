@@ -60,7 +60,6 @@ schemars = { version = "0.8", optional = true }
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
-required-features = ["testing", "db"]
 
 [[bench]]
 name = "metrics_noop"
