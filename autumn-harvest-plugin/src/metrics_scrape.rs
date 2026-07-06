@@ -14,10 +14,20 @@
 //! shared instance into both the core `HarvestBuilder::telemetry(..)` slot
 //! and `AppBuilder::metrics_source("harvest", ..)`.
 //!
-//! Only the nine ADR-0001 §7 catalogue metrics are aggregated here. Every
-//! other `MetricsRecorder` method keeps the trait's no-op default — an
-//! embedder who needs the full metric surface (or OTLP) still reaches for
-//! the `metrics-rs` adapter escape hatch.
+//! This aggregates the nine ADR-0001 §7 catalogue metrics named in issue
+//! #355, plus `harvest.queue.oldest_pending_age`, `harvest.worker.slots_*`,
+//! and `harvest.shard.stranded_pending` — the engine's own background
+//! samplers already compute these under the same `MetricsRecorder::is_enabled()`
+//! gate (see `HarvestMetricsRecorder::is_enabled`, which reports `true`
+//! unconditionally so the nine required metrics are actually sampled), so
+//! leaving them unimplemented would mean the sampler's DB queries still ran
+//! on every tick with their results silently discarded. Every other
+//! `MetricsRecorder` method keeps the trait's no-op default — an embedder
+//! who needs the full metric surface (e.g. `harvest.workflow.terminal`,
+//! `harvest.activity.attempts`/`.retries`, `harvest.schedule.fire_attempts`,
+//! and the rest of the starter alert pack in `docs/alerts/`) or OTLP export
+//! still reaches for the `metrics-rs` adapter escape hatch — this endpoint
+//! does **not** back the full starter alert pack.
 //!
 //! A `MetricFamily` is only emitted once at least one sample has been
 //! recorded for it — there is no way to synthesize a meaningful zero-value
@@ -28,8 +38,8 @@ use std::sync::{Arc, RwLock};
 
 use autumn_harvest::telemetry::{
     ActivityStatus, METRIC_LABEL_ACTIVITY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
-    METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_STATUS,
-    METRIC_LABEL_WORKFLOW, MetricsRecorder, WorkflowStatus,
+    METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE,
+    METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, MetricsRecorder, SlotType, WorkflowStatus,
 };
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
 
@@ -128,9 +138,23 @@ struct Inner {
     schedule_runs: Counter,
     schedule_skipped: Counter,
     retention_deleted: Counter,
+    // These four back-fill metrics that the engine's own is_enabled()-gated
+    // background samplers already compute (queue-depth sampler's oldest-age
+    // query, the stranded-work scanner, the worker-slot sampler): once
+    // `.with_metrics_scrape()` flips `is_enabled()` to true, those samplers
+    // run regardless of whether this recorder was going to use the result.
+    // Implementing them turns already-paid-for sampler work into real
+    // series instead of a discarded read.
+    queue_oldest_pending_age: Gauge,
+    worker_slots_in_use: Gauge,
+    worker_slots_available: Gauge,
+    worker_slot_target: Gauge,
+    shard_stranded_pending: Gauge,
 }
 
-/// In-process aggregator for the nine ADR-0001 §7 catalogue metrics.
+/// In-process aggregator for the built-in Prometheus scrape endpoint
+/// (issue #355) — see the module docs above for exactly which metrics are
+/// covered.
 ///
 /// Implements both `MetricsRecorder` (recording side, installed via
 /// `HarvestBuilder::telemetry`) and `MetricsSource` (rendering side,
@@ -149,6 +173,11 @@ impl HarvestMetricsRecorder {
 }
 
 impl MetricsRecorder for HarvestMetricsRecorder {
+    // Must be `true` for the engine's own is_enabled()-gated background
+    // samplers (queue depth, DLQ depth, worker slots, stranded-work) to run
+    // at all -- the required nine catalogue metrics live behind those same
+    // samplers. Every metric those samplers compute is implemented below so
+    // none of that gated work goes to waste.
     fn is_enabled(&self) -> bool {
         true
     }
@@ -240,6 +269,36 @@ impl MetricsRecorder for HarvestMetricsRecorder {
         self.0
             .retention_deleted
             .incr(vec![shard.to_string()], deleted_count);
+    }
+
+    fn record_queue_oldest_pending_age(&self, queue_name: &str, age_secs: f64) {
+        self.0
+            .queue_oldest_pending_age
+            .set(vec![queue_name.to_owned()], age_secs);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_worker_slots(&self, slot_type: SlotType, in_use: u64, available: u64) {
+        self.0
+            .worker_slots_in_use
+            .set(vec![slot_type.as_str().to_owned()], in_use as f64);
+        self.0
+            .worker_slots_available
+            .set(vec![slot_type.as_str().to_owned()], available as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_worker_slot_target(&self, slot_type: SlotType, target: u64) {
+        self.0
+            .worker_slot_target
+            .set(vec![slot_type.as_str().to_owned()], target as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_shard_stranded_pending(&self, shard: u16, count: u64) {
+        self.0
+            .shard_stranded_pending
+            .set(vec![shard.to_string()], count as f64);
     }
 }
 
@@ -337,80 +396,127 @@ fn push_histogram(
     });
 }
 
+/// The nine ADR-0001 §7 catalogue metrics named in issue #355.
+fn push_catalogue_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
+    push_counter(
+        families,
+        "harvest_workflow_started_total",
+        "Total number of workflow executions started",
+        &[METRIC_LABEL_WORKFLOW, METRIC_LABEL_QUEUE],
+        inner.workflow_started.snapshot(),
+    );
+    push_histogram(
+        families,
+        "harvest_workflow_duration",
+        "Workflow execution duration in seconds",
+        &[
+            METRIC_LABEL_WORKFLOW,
+            METRIC_LABEL_QUEUE,
+            METRIC_LABEL_STATUS,
+        ],
+        inner.workflow_duration.snapshot(),
+    );
+    push_histogram(
+        families,
+        "harvest_activity_duration",
+        "Activity execution duration in seconds",
+        &[
+            METRIC_LABEL_ACTIVITY,
+            METRIC_LABEL_QUEUE,
+            METRIC_LABEL_STATUS,
+        ],
+        inner.activity_duration.snapshot(),
+    );
+    push_counter(
+        families,
+        "harvest_timer_started_total",
+        "Total number of durable timers started",
+        &[],
+        inner.timer_started.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_queue_depth",
+        "Current pending task count per queue",
+        &[METRIC_LABEL_QUEUE],
+        inner.queue_depth.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_dlq_entries",
+        "Current dead-letter queue entry count per shard",
+        &[METRIC_LABEL_SHARD],
+        inner.dlq_entries.snapshot(),
+    );
+    push_counter(
+        families,
+        "harvest_schedule_runs_total",
+        "Total number of schedule firings",
+        &[METRIC_LABEL_KIND, METRIC_LABEL_NAME],
+        inner.schedule_runs.snapshot(),
+    );
+    push_counter(
+        families,
+        "harvest_schedule_skipped_total",
+        "Total number of skipped schedule firings",
+        &[METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_REASON],
+        inner.schedule_skipped.snapshot(),
+    );
+    push_counter(
+        families,
+        "harvest_retention_deleted_total",
+        "Total number of records deleted by the retention sweep",
+        &[METRIC_LABEL_SHARD],
+        inner.retention_deleted.snapshot(),
+    );
+}
+
+/// Metrics the engine's own `is_enabled()`-gated background samplers already
+/// compute alongside the nine catalogue metrics above -- implemented so that
+/// sampler work isn't silently discarded (see the module docs).
+fn push_sampler_adjacent_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
+    push_gauge(
+        families,
+        "harvest_queue_oldest_pending_age",
+        "Age in seconds of the oldest claimable pending task per queue",
+        &[METRIC_LABEL_QUEUE],
+        inner.queue_oldest_pending_age.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_worker_slots_in_use",
+        "Currently occupied dispatch slots per slot type",
+        &[METRIC_LABEL_SLOT_TYPE],
+        inner.worker_slots_in_use.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_worker_slots_available",
+        "Currently free dispatch slots per slot type",
+        &[METRIC_LABEL_SLOT_TYPE],
+        inner.worker_slots_available.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_worker_slot_target",
+        "Adaptive slot tuner's current resize target per slot type",
+        &[METRIC_LABEL_SLOT_TYPE],
+        inner.worker_slot_target.snapshot(),
+    );
+    push_gauge(
+        families,
+        "harvest_shard_stranded_pending",
+        "Claimable pending task demand per shard with no compatible worker",
+        &[METRIC_LABEL_SHARD],
+        inner.shard_stranded_pending.snapshot(),
+    );
+}
+
 impl MetricsSource for HarvestMetricsRecorder {
     fn collect(&self) -> Vec<MetricFamily> {
         let mut families = Vec::new();
-        push_counter(
-            &mut families,
-            "harvest_workflow_started_total",
-            "Total number of workflow executions started",
-            &[METRIC_LABEL_WORKFLOW, METRIC_LABEL_QUEUE],
-            self.0.workflow_started.snapshot(),
-        );
-        push_histogram(
-            &mut families,
-            "harvest_workflow_duration",
-            "Workflow execution duration in seconds",
-            &[
-                METRIC_LABEL_WORKFLOW,
-                METRIC_LABEL_QUEUE,
-                METRIC_LABEL_STATUS,
-            ],
-            self.0.workflow_duration.snapshot(),
-        );
-        push_histogram(
-            &mut families,
-            "harvest_activity_duration",
-            "Activity execution duration in seconds",
-            &[
-                METRIC_LABEL_ACTIVITY,
-                METRIC_LABEL_QUEUE,
-                METRIC_LABEL_STATUS,
-            ],
-            self.0.activity_duration.snapshot(),
-        );
-        push_counter(
-            &mut families,
-            "harvest_timer_started_total",
-            "Total number of durable timers started",
-            &[],
-            self.0.timer_started.snapshot(),
-        );
-        push_gauge(
-            &mut families,
-            "harvest_queue_depth",
-            "Current pending task count per queue",
-            &[METRIC_LABEL_QUEUE],
-            self.0.queue_depth.snapshot(),
-        );
-        push_gauge(
-            &mut families,
-            "harvest_dlq_entries",
-            "Current dead-letter queue entry count per shard",
-            &[METRIC_LABEL_SHARD],
-            self.0.dlq_entries.snapshot(),
-        );
-        push_counter(
-            &mut families,
-            "harvest_schedule_runs_total",
-            "Total number of schedule firings",
-            &[METRIC_LABEL_KIND, METRIC_LABEL_NAME],
-            self.0.schedule_runs.snapshot(),
-        );
-        push_counter(
-            &mut families,
-            "harvest_schedule_skipped_total",
-            "Total number of skipped schedule firings",
-            &[METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_REASON],
-            self.0.schedule_skipped.snapshot(),
-        );
-        push_counter(
-            &mut families,
-            "harvest_retention_deleted_total",
-            "Total number of records deleted by the retention sweep",
-            &[METRIC_LABEL_SHARD],
-            self.0.retention_deleted.snapshot(),
-        );
+        push_catalogue_metrics(&mut families, &self.0);
+        push_sampler_adjacent_metrics(&mut families, &self.0);
         families
     }
 }
@@ -592,6 +698,51 @@ mod tests {
         let families = recorder.collect();
         let f = family(&families, "harvest_retention_deleted_total");
         assert_eq!(sample_value(f, &[("shard", "0")]), 42.0);
+    }
+
+    #[test]
+    fn queue_oldest_pending_age_is_a_gauge_labeled_by_queue() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_queue_oldest_pending_age("default", 12.5);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_queue_oldest_pending_age");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(f, &[("queue", "default")]), 12.5);
+    }
+
+    #[test]
+    fn worker_slots_are_gauges_labeled_by_slot_type() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_worker_slots(SlotType::Workflow, 3, 7);
+
+        let families = recorder.collect();
+        let in_use = family(&families, "harvest_worker_slots_in_use");
+        let available = family(&families, "harvest_worker_slots_available");
+        assert_eq!(in_use.kind, MetricKind::Gauge);
+        assert_eq!(available.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(in_use, &[("slot_type", "workflow")]), 3.0);
+        assert_eq!(sample_value(available, &[("slot_type", "workflow")]), 7.0);
+    }
+
+    #[test]
+    fn worker_slot_target_is_a_gauge_labeled_by_slot_type() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_worker_slot_target(SlotType::Activity, 10);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_worker_slot_target");
+        assert_eq!(sample_value(f, &[("slot_type", "activity")]), 10.0);
+    }
+
+    #[test]
+    fn shard_stranded_pending_is_a_gauge_labeled_by_shard() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_shard_stranded_pending(2, 9);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_shard_stranded_pending");
+        assert_eq!(sample_value(f, &[("shard", "2")]), 9.0);
     }
 
     #[test]

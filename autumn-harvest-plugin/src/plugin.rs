@@ -315,7 +315,7 @@ impl HarvestPlugin {
         self
     }
 
-    /// Expose the nine ADR-0001 §7 catalogue metrics on the app's shared
+    /// Expose the ADR-0001 §7 catalogue metrics on the app's shared
     /// `/actuator/prometheus` scrape endpoint (issue #355).
     ///
     /// Installs a `HarvestMetricsRecorder` as both the engine's
@@ -335,12 +335,19 @@ impl HarvestPlugin {
     /// duplicate `"harvest"` registration with a `tracing::warn!` and keeps
     /// the first).
     ///
-    /// For OTLP export, a custom `MetricsRecorder`, or a full bucketed
-    /// histogram (this endpoint renders `harvest.workflow.duration` /
-    /// `harvest.activity.duration` as `_count`/`_sum` counter pairs, since
-    /// `MetricsSource`'s `MetricKind` has no histogram variant), use the
-    /// `metrics-rs` adapter escape hatch documented in `docs/telemetry.md`
-    /// instead.
+    /// This does **not** back the full starter alert pack
+    /// (`docs/alerts/starter-pack-v0.1.0.json`) — it covers the metrics
+    /// named in issue #355 plus a few more that the engine's own
+    /// background samplers already compute for free once enabled (queue
+    /// backlog age, worker slot occupancy, stranded-work demand), but not
+    /// the wider catalogue (e.g. `harvest.workflow.terminal`,
+    /// `harvest.activity.attempts`/`.retries`, `harvest.schedule.fire_attempts`).
+    /// For OTLP export, a custom `MetricsRecorder`, the full metric surface,
+    /// or a full bucketed histogram (this endpoint renders
+    /// `harvest.workflow.duration` / `harvest.activity.duration` as
+    /// `_count`/`_sum` counter pairs, since `MetricsSource`'s `MetricKind`
+    /// has no histogram variant), use the `metrics-rs` adapter escape hatch
+    /// documented in `docs/telemetry.md` instead.
     #[cfg(feature = "metrics")]
     #[must_use]
     pub const fn with_metrics_scrape(mut self) -> Self {
@@ -1449,5 +1456,25 @@ mod tests {
         assert!(plugin.builder.update_handlers()[0].mcp);
         assert_eq!(plugin.builder.query_handlers().len(), 1);
         assert_eq!(plugin.builder.query_handlers()[0].name, "progress");
+    }
+
+    #[test]
+    fn harvest_plugin_forwards_retention_to_builder() {
+        // Issue #355 review follow-up: `.retention(...)` had no dedicated
+        // coverage of its own -- only the metrics_scrape_quickstart example
+        // (Docker-requiring) exercised it. `try_build()` only validates
+        // config in-memory (no DB connection), so this stays a fast unit test.
+        let custom = autumn_harvest::retention::RetentionConfig {
+            max_age_secs: Some(42),
+            tick_interval_secs: 7,
+            ..autumn_harvest::retention::RetentionConfig::default()
+        };
+        let plugin = HarvestPlugin::new().retention(custom);
+        let built = plugin
+            .builder
+            .try_build()
+            .expect("valid retention config should build");
+        assert_eq!(built.retention().max_age_secs, Some(42));
+        assert_eq!(built.retention().tick_interval_secs, 7);
     }
 }

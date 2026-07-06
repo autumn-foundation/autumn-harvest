@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use autumn_harvest::telemetry::{ActivityStatus, MetricsRecorder, WorkflowStatus};
+use autumn_harvest::telemetry::{ActivityStatus, MetricsRecorder, SlotType, WorkflowStatus};
 use autumn_harvest_plugin::metrics_scrape::HarvestMetricsRecorder;
 use autumn_web::app::AppBuilder;
 use autumn_web::plugin::Plugin;
@@ -45,7 +45,7 @@ async fn scrape(client: &TestClient) -> String {
 }
 
 #[tokio::test]
-async fn scrape_endpoint_renders_all_nine_catalogue_metrics_after_recording() {
+async fn scrape_endpoint_renders_all_catalogue_metrics_after_recording() {
     let recorder = HarvestMetricsRecorder::new();
     recorder.record_workflow_started("onboarding", "default");
     recorder.record_workflow_completed("onboarding", "default", 1.5, WorkflowStatus::Completed);
@@ -61,15 +61,25 @@ async fn scrape_endpoint_renders_all_nine_catalogue_metrics_after_recording() {
     recorder.record_schedule_run("cron", "nightly_report");
     recorder.record_schedule_skipped("cron", "nightly_report", "overlap");
     recorder.record_retention_tick(0, 100, 42, 0.5);
+    // These four back the engine's own is_enabled()-gated background
+    // samplers (queue depth/DLQ depth samplers' oldest-age query, the
+    // stranded-work scanner, the worker-slot sampler) -- implemented so
+    // that already-paid-for sampler work isn't silently discarded once
+    // .with_metrics_scrape() flips is_enabled() to true.
+    recorder.record_queue_oldest_pending_age("default", 12.5);
+    recorder.record_worker_slots(SlotType::Workflow, 3, 7);
+    recorder.record_worker_slot_target(SlotType::Activity, 10);
+    recorder.record_shard_stranded_pending(2, 9);
 
     let client = TestApp::new()
         .plugin(MetricsScrapeTestPlugin(recorder))
         .build();
     let body = scrape(&client).await;
 
-    // The nine ADR-0001 §7 catalogue metrics (issue #355 AC2). Duration
-    // histograms render as `_count`/`_sum` counter pairs since
-    // `autumn_web::actuator::MetricKind` has no histogram variant.
+    // The nine ADR-0001 §7 catalogue metrics (issue #355 AC2), plus the four
+    // sampler-adjacent metrics above. Duration histograms render as
+    // `_count`/`_sum` counter pairs since `autumn_web::actuator::MetricKind`
+    // has no histogram variant.
     for expected in [
         "# TYPE harvest_workflow_started_total counter",
         "harvest_workflow_started_total{queue=\"default\",workflow=\"onboarding\"} 1",
@@ -93,6 +103,16 @@ async fn scrape_endpoint_renders_all_nine_catalogue_metrics_after_recording() {
         "harvest_schedule_skipped_total{kind=\"cron\",name=\"nightly_report\",reason=\"overlap\"} 1",
         "# TYPE harvest_retention_deleted_total counter",
         "harvest_retention_deleted_total{shard=\"0\"} 42",
+        "# TYPE harvest_queue_oldest_pending_age gauge",
+        "harvest_queue_oldest_pending_age{queue=\"default\"} 12.5",
+        "# TYPE harvest_worker_slots_in_use gauge",
+        "harvest_worker_slots_in_use{slot_type=\"workflow\"} 3",
+        "# TYPE harvest_worker_slots_available gauge",
+        "harvest_worker_slots_available{slot_type=\"workflow\"} 7",
+        "# TYPE harvest_worker_slot_target gauge",
+        "harvest_worker_slot_target{slot_type=\"activity\"} 10",
+        "# TYPE harvest_shard_stranded_pending gauge",
+        "harvest_shard_stranded_pending{shard=\"2\"} 9",
     ] {
         assert!(body.contains(expected), "missing `{expected}` in:\n{body}");
     }

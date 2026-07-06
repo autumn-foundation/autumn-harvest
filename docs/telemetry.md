@@ -30,13 +30,13 @@ let app = autumn_web::app().plugin(
 
 `with_metrics_scrape()` registers a `HarvestMetricsRecorder` as both the
 engine's `MetricsRecorder` (via `HarvestBuilder::telemetry`) and an
-autumn-web `MetricsSource` (via `AppBuilder::metrics_source`). Harvest's nine
-ADR-0001 §7 catalogue metrics then appear on the app's **one, already-shared**
-`/actuator/prometheus` endpoint, alongside the app's own `autumn_http_*`
-families and any other plugin's metrics — there is deliberately no separate,
-Harvest-owned scrape route. This is the "one endpoint for autumn-web apps and
-their plugins" model: every plugin registers its metrics into the same
-scrape, instead of each mounting its own.
+autumn-web `MetricsSource` (via `AppBuilder::metrics_source`). The metrics it
+covers then appear on the app's **one, already-shared** `/actuator/prometheus`
+endpoint, alongside the app's own `autumn_http_*` families and any other
+plugin's metrics — there is deliberately no separate, Harvest-owned scrape
+route. This is the "one endpoint for autumn-web apps and their plugins"
+model: every plugin registers its metrics into the same scrape, instead of
+each mounting its own.
 
 ```bash
 curl http://localhost:8080/actuator/prometheus
@@ -46,6 +46,24 @@ Auth posture is governed entirely by the app's own `[actuator]` config
 (`actuator.prometheus`, profile-aware sensitive-endpoint gating) — the same
 policy that already protects the app's other actuator endpoints, rather than
 a second, Harvest-specific toggle.
+
+**Coverage:** this endpoint aggregates the nine ADR-0001 §7 catalogue
+metrics named in issue #355 (`harvest.workflow.started`,
+`harvest.workflow.duration`, `harvest.activity.duration`,
+`harvest.timer.started`, `harvest.queue.depth`, `harvest.dlq.entries`,
+`harvest.schedule.runs`, `harvest.schedule.skipped`,
+`harvest.retention.deleted`), plus `harvest.queue.oldest_pending_age`,
+`harvest.worker.slots_in_use`/`slots_available`/`slot_target`, and
+`harvest.shard.stranded_pending` — the engine's own background samplers
+already compute these under the same `is_enabled()` gate the nine required
+metrics live behind, so they're implemented too rather than sampled and
+discarded. **It does not back the full starter alert pack**
+(`docs/alerts/starter-pack-v0.1.0.json`), which also references metrics this
+endpoint never emits (e.g. `harvest_workflow_terminal_total`,
+`harvest_activity_attempts_total`/`retries_total`,
+`harvest_schedule_fire_attempts_total`, `harvest_no_active_workers`). If you
+want the full starter alert pack to work, use the `metrics-rs` adapter
+escape hatch below, which bridges every `MetricsRecorder` method.
 
 **Trade-off:** `autumn_web::actuator::MetricsSource`'s `MetricKind` only
 supports `Counter`/`Gauge` (no histogram variant), so `harvest.workflow.duration`

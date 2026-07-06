@@ -32,6 +32,8 @@ jobs:
         run: cargo clippy -p autumn-harvest-plugin --all-targets -- -D warnings
       - name: Clippy autumn-harvest-plugin (mcp feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features mcp,unified-dag-execution -- -D warnings
+      - name: Clippy autumn-harvest-plugin (metrics feature)
+        run: cargo clippy -p autumn-harvest-plugin --all-targets --features metrics -- -D warnings
       - name: Clippy autumn-harvest-macros
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
 
@@ -63,6 +65,10 @@ jobs:
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --lib --test mcp_tools_http_tests
       - name: Compile plugin MCP integration tests
         run: cargo test -p autumn-harvest-plugin --features mcp,unified-dag-execution --test mcp_tools_integration --no-run
+      - name: Run plugin metrics scrape tests (issue #355)
+        run: cargo test -p autumn-harvest-plugin --features metrics --lib --test metrics_scrape_http_tests
+      - name: Compile plugin metrics scrape example
+        run: cargo build -p autumn-harvest-plugin --example metrics_scrape_quickstart --features metrics
       - name: Run macros tests
         run: cargo test -p autumn-harvest-macros
       - name: Compile plugin integration tests
