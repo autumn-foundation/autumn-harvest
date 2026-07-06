@@ -1,0 +1,610 @@
+//! Built-in Prometheus scrape endpoint for `HarvestPlugin` (issue #355).
+//!
+//! [`HarvestMetricsRecorder`] is an in-process aggregator that implements
+//! both `autumn_harvest::telemetry::MetricsRecorder` (so the core engine can
+//! record samples into it) and `autumn_web::actuator::MetricsSource` (so
+//! autumn-web's already-shared `/actuator/prometheus` endpoint can render
+//! those samples alongside the app's own `autumn_http_*` families and any
+//! other plugin's metrics).
+//!
+//! This deliberately does **not** touch the global `metrics`-crate registry
+//! (unlike the `metrics-rs` adapter/escape hatch documented in
+//! `docs/telemetry.md`) — there is nothing to double-register, and no new
+//! dependency is pulled in. `HarvestPlugin::with_metrics_scrape()` wires one
+//! shared instance into both the core `HarvestBuilder::telemetry(..)` slot
+//! and `AppBuilder::metrics_source("harvest", ..)`.
+//!
+//! Only the nine ADR-0001 §7 catalogue metrics are aggregated here. Every
+//! other `MetricsRecorder` method keeps the trait's no-op default — an
+//! embedder who needs the full metric surface (or OTLP) still reaches for
+//! the `metrics-rs` adapter escape hatch.
+//!
+//! A `MetricFamily` is only emitted once at least one sample has been
+//! recorded for it — there is no way to synthesize a meaningful zero-value
+//! default for a labeled series before its label values are known.
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use autumn_harvest::telemetry::{
+    ActivityStatus, METRIC_LABEL_ACTIVITY, METRIC_LABEL_KIND, METRIC_LABEL_NAME,
+    METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_SHARD, METRIC_LABEL_STATUS,
+    METRIC_LABEL_WORKFLOW, MetricsRecorder, WorkflowStatus,
+};
+use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
+
+/// Label values keyed to a stable position; label *names* are supplied by
+/// the caller at render time (see [`push_counter`]/[`push_gauge`]/[`push_histogram`]),
+/// since every call site always records labels in the same declared order.
+type LabelValues = Vec<String>;
+
+#[derive(Default)]
+struct Counter(RwLock<HashMap<LabelValues, u64>>);
+
+impl Counter {
+    fn incr(&self, labels: LabelValues, delta: u64) {
+        let mut map = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *map.entry(labels).or_insert(0) += delta;
+    }
+
+    fn snapshot(&self) -> Vec<(LabelValues, u64)> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct Gauge(RwLock<HashMap<LabelValues, f64>>);
+
+impl Gauge {
+    fn set(&self, labels: LabelValues, value: f64) {
+        let mut map = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(labels, value);
+    }
+
+    fn snapshot(&self) -> Vec<(LabelValues, f64)> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+}
+
+/// `(count, sum)` per label combination — the Prometheus histogram/summary
+/// decomposition without bucket boundaries. `autumn_web::actuator::MetricKind`
+/// only supports `Counter`/`Gauge` (no `Histogram` variant), so a duration
+/// metric is rendered as a `_count` and a `_sum` counter pair; a caller can
+/// still chart an average via `rate(x_sum[5m]) / rate(x_count[5m])`. Full
+/// bucketed histograms remain available via the `metrics-rs` adapter escape
+/// hatch documented in `docs/telemetry.md`.
+#[derive(Default)]
+struct Histogram(RwLock<HashMap<LabelValues, (u64, f64)>>);
+
+impl Histogram {
+    // The write guard is held only for the two-statement bump below (bounded,
+    // uncontended in-process work); the lint's general "hold locks briefly"
+    // advice doesn't apply cleanly to `HashMap::entry`'s borrow shape here.
+    #[allow(clippy::significant_drop_tightening)]
+    fn observe(&self, labels: LabelValues, value: f64) {
+        let mut map = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = map.entry(labels).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += value;
+    }
+
+    fn snapshot(&self) -> Vec<(LabelValues, (u64, f64))> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct Inner {
+    workflow_started: Counter,
+    workflow_duration: Histogram,
+    activity_duration: Histogram,
+    timer_started: Counter,
+    queue_depth: Gauge,
+    dlq_entries: Gauge,
+    schedule_runs: Counter,
+    schedule_skipped: Counter,
+    retention_deleted: Counter,
+}
+
+/// In-process aggregator for the nine ADR-0001 §7 catalogue metrics.
+///
+/// Implements both `MetricsRecorder` (recording side, installed via
+/// `HarvestBuilder::telemetry`) and `MetricsSource` (rendering side,
+/// registered via `AppBuilder::metrics_source`) over one shared
+/// `Arc<Inner>`, so `.clone()` is cheap and every clone observes the same
+/// underlying counters/gauges/histograms.
+#[derive(Clone, Default)]
+pub struct HarvestMetricsRecorder(Arc<Inner>);
+
+impl HarvestMetricsRecorder {
+    /// Create a fresh, empty aggregator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl MetricsRecorder for HarvestMetricsRecorder {
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
+    fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
+        self.0
+            .workflow_started
+            .incr(vec![workflow_name.to_owned(), queue.to_owned()], 1);
+    }
+
+    fn record_workflow_completed(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        duration_secs: f64,
+        status: WorkflowStatus,
+    ) {
+        self.0.workflow_duration.observe(
+            vec![
+                workflow_name.to_owned(),
+                queue.to_owned(),
+                status.as_str().to_owned(),
+            ],
+            duration_secs,
+        );
+    }
+
+    fn record_activity_completed(
+        &self,
+        activity_name: &str,
+        queue: &str,
+        duration_secs: f64,
+        status: ActivityStatus,
+    ) {
+        self.0.activity_duration.observe(
+            vec![
+                activity_name.to_owned(),
+                queue.to_owned(),
+                status.as_str().to_owned(),
+            ],
+            duration_secs,
+        );
+    }
+
+    fn record_timer_started(&self, _duration_secs: f64) {
+        self.0.timer_started.incr(Vec::new(), 1);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_queue_depth(&self, queue_name: &str, depth: u64) {
+        self.0
+            .queue_depth
+            .set(vec![queue_name.to_owned()], depth as f64);
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn record_dlq_entries(&self, shard: u16, depth: u64) {
+        self.0
+            .dlq_entries
+            .set(vec![shard.to_string()], depth as f64);
+    }
+
+    fn record_schedule_run(&self, kind: &str, name: &str) {
+        self.0
+            .schedule_runs
+            .incr(vec![kind.to_owned(), name.to_owned()], 1);
+    }
+
+    fn record_schedule_skipped(&self, kind: &str, name: &str, reason: &str) {
+        self.0
+            .schedule_skipped
+            .incr(vec![kind.to_owned(), name.to_owned(), reason.to_owned()], 1);
+    }
+
+    fn record_schedule_skipped_n(&self, kind: &str, name: &str, reason: &str, count: u64) {
+        self.0.schedule_skipped.incr(
+            vec![kind.to_owned(), name.to_owned(), reason.to_owned()],
+            count,
+        );
+    }
+
+    fn record_retention_tick(
+        &self,
+        shard: u16,
+        _candidate_count: u64,
+        deleted_count: u64,
+        _duration_secs: f64,
+    ) {
+        self.0
+            .retention_deleted
+            .incr(vec![shard.to_string()], deleted_count);
+    }
+}
+
+fn zip_labels(label_names: &[&str], values: LabelValues) -> Vec<(String, String)> {
+    label_names
+        .iter()
+        .map(|s| (*s).to_string())
+        .zip(values)
+        .collect()
+}
+
+fn push_counter(
+    out: &mut Vec<MetricFamily>,
+    name: &str,
+    help: &str,
+    label_names: &[&str],
+    data: Vec<(LabelValues, u64)>,
+) {
+    if data.is_empty() {
+        return;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let samples = data
+        .into_iter()
+        .map(|(vals, v)| MetricSample {
+            labels: zip_labels(label_names, vals),
+            value: v as f64,
+        })
+        .collect();
+    out.push(MetricFamily {
+        name: name.to_string(),
+        help: help.to_string(),
+        kind: MetricKind::Counter,
+        samples,
+    });
+}
+
+fn push_gauge(
+    out: &mut Vec<MetricFamily>,
+    name: &str,
+    help: &str,
+    label_names: &[&str],
+    data: Vec<(LabelValues, f64)>,
+) {
+    if data.is_empty() {
+        return;
+    }
+    let samples = data
+        .into_iter()
+        .map(|(vals, value)| MetricSample {
+            labels: zip_labels(label_names, vals),
+            value,
+        })
+        .collect();
+    out.push(MetricFamily {
+        name: name.to_string(),
+        help: help.to_string(),
+        kind: MetricKind::Gauge,
+        samples,
+    });
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn push_histogram(
+    out: &mut Vec<MetricFamily>,
+    name: &str,
+    help: &str,
+    label_names: &[&str],
+    data: Vec<(LabelValues, (u64, f64))>,
+) {
+    if data.is_empty() {
+        return;
+    }
+    let mut count_samples = Vec::with_capacity(data.len());
+    let mut sum_samples = Vec::with_capacity(data.len());
+    for (vals, (count, sum)) in data {
+        let labels = zip_labels(label_names, vals);
+        count_samples.push(MetricSample {
+            labels: labels.clone(),
+            value: count as f64,
+        });
+        sum_samples.push(MetricSample { labels, value: sum });
+    }
+    out.push(MetricFamily {
+        name: format!("{name}_count"),
+        help: format!("{help} (sample count)"),
+        kind: MetricKind::Counter,
+        samples: count_samples,
+    });
+    out.push(MetricFamily {
+        name: format!("{name}_sum"),
+        help: format!("{help} (sum)"),
+        kind: MetricKind::Counter,
+        samples: sum_samples,
+    });
+}
+
+impl MetricsSource for HarvestMetricsRecorder {
+    fn collect(&self) -> Vec<MetricFamily> {
+        let mut families = Vec::new();
+        push_counter(
+            &mut families,
+            "harvest_workflow_started_total",
+            "Total number of workflow executions started",
+            &[METRIC_LABEL_WORKFLOW, METRIC_LABEL_QUEUE],
+            self.0.workflow_started.snapshot(),
+        );
+        push_histogram(
+            &mut families,
+            "harvest_workflow_duration",
+            "Workflow execution duration in seconds",
+            &[
+                METRIC_LABEL_WORKFLOW,
+                METRIC_LABEL_QUEUE,
+                METRIC_LABEL_STATUS,
+            ],
+            self.0.workflow_duration.snapshot(),
+        );
+        push_histogram(
+            &mut families,
+            "harvest_activity_duration",
+            "Activity execution duration in seconds",
+            &[
+                METRIC_LABEL_ACTIVITY,
+                METRIC_LABEL_QUEUE,
+                METRIC_LABEL_STATUS,
+            ],
+            self.0.activity_duration.snapshot(),
+        );
+        push_counter(
+            &mut families,
+            "harvest_timer_started_total",
+            "Total number of durable timers started",
+            &[],
+            self.0.timer_started.snapshot(),
+        );
+        push_gauge(
+            &mut families,
+            "harvest_queue_depth",
+            "Current pending task count per queue",
+            &[METRIC_LABEL_QUEUE],
+            self.0.queue_depth.snapshot(),
+        );
+        push_gauge(
+            &mut families,
+            "harvest_dlq_entries",
+            "Current dead-letter queue entry count per shard",
+            &[METRIC_LABEL_SHARD],
+            self.0.dlq_entries.snapshot(),
+        );
+        push_counter(
+            &mut families,
+            "harvest_schedule_runs_total",
+            "Total number of schedule firings",
+            &[METRIC_LABEL_KIND, METRIC_LABEL_NAME],
+            self.0.schedule_runs.snapshot(),
+        );
+        push_counter(
+            &mut families,
+            "harvest_schedule_skipped_total",
+            "Total number of skipped schedule firings",
+            &[METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_REASON],
+            self.0.schedule_skipped.snapshot(),
+        );
+        push_counter(
+            &mut families,
+            "harvest_retention_deleted_total",
+            "Total number of records deleted by the retention sweep",
+            &[METRIC_LABEL_SHARD],
+            self.0.retention_deleted.snapshot(),
+        );
+        families
+    }
+}
+
+#[cfg(test)]
+// Every assertion compares an exactly-representable whole-number count/sum
+// (small integers, safe well below f64's 2^53 exact-integer bound) against a
+// literal -- intentional exact equality, not a precision-sensitive float
+// comparison.
+#[allow(clippy::float_cmp)]
+mod tests {
+    use super::*;
+
+    fn family<'a>(families: &'a [MetricFamily], name: &str) -> &'a MetricFamily {
+        families
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("missing family {name} in {families:?}"))
+    }
+
+    fn sample_value(family: &MetricFamily, labels: &[(&str, &str)]) -> f64 {
+        family
+            .samples
+            .iter()
+            .find(|s| {
+                s.labels.len() == labels.len()
+                    && labels
+                        .iter()
+                        .all(|(k, v)| s.labels.iter().any(|(sk, sv)| sk == k && sv == v))
+            })
+            .unwrap_or_else(|| panic!("missing sample {labels:?} in family {family:?}"))
+            .value
+    }
+
+    #[test]
+    fn no_families_emitted_before_any_recording() {
+        let recorder = HarvestMetricsRecorder::new();
+        assert!(recorder.collect().is_empty());
+    }
+
+    #[test]
+    fn workflow_started_is_a_counter_with_workflow_and_queue_labels() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_started("onboarding", "default");
+        recorder.record_workflow_started("onboarding", "default");
+        recorder.record_workflow_started("billing", "priority");
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_workflow_started_total");
+        assert_eq!(f.kind, MetricKind::Counter);
+        assert_eq!(
+            sample_value(f, &[("workflow", "onboarding"), ("queue", "default")]),
+            2.0
+        );
+        assert_eq!(
+            sample_value(f, &[("workflow", "billing"), ("queue", "priority")]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn workflow_duration_decomposes_into_count_and_sum_counters() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_workflow_completed("onboarding", "default", 1.5, WorkflowStatus::Completed);
+        recorder.record_workflow_completed("onboarding", "default", 2.5, WorkflowStatus::Completed);
+
+        let families = recorder.collect();
+        let count_f = family(&families, "harvest_workflow_duration_count");
+        let sum_f = family(&families, "harvest_workflow_duration_sum");
+        assert_eq!(count_f.kind, MetricKind::Counter);
+        assert_eq!(sum_f.kind, MetricKind::Counter);
+        let labels = [
+            ("workflow", "onboarding"),
+            ("queue", "default"),
+            ("status", "completed"),
+        ];
+        assert_eq!(sample_value(count_f, &labels), 2.0);
+        assert_eq!(sample_value(sum_f, &labels), 4.0);
+    }
+
+    #[test]
+    fn activity_duration_decomposes_into_count_and_sum_counters() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_activity_completed(
+            "send_email",
+            "email-workers",
+            0.25,
+            ActivityStatus::Completed,
+        );
+
+        let families = recorder.collect();
+        let count_f = family(&families, "harvest_activity_duration_count");
+        let sum_f = family(&families, "harvest_activity_duration_sum");
+        let labels = [
+            ("activity", "send_email"),
+            ("queue", "email-workers"),
+            ("status", "completed"),
+        ];
+        assert_eq!(sample_value(count_f, &labels), 1.0);
+        assert_eq!(sample_value(sum_f, &labels), 0.25);
+    }
+
+    #[test]
+    fn timer_started_is_an_unlabeled_counter() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_timer_started(30.0);
+        recorder.record_timer_started(60.0);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_timer_started_total");
+        assert_eq!(f.kind, MetricKind::Counter);
+        assert_eq!(f.samples.len(), 1);
+        assert_eq!(f.samples[0].labels.len(), 0);
+        assert_eq!(f.samples[0].value, 2.0);
+    }
+
+    #[test]
+    fn queue_depth_is_a_last_write_wins_gauge() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_queue_depth("default", 5);
+        recorder.record_queue_depth("default", 3);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_queue_depth");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(f, &[("queue", "default")]), 3.0);
+    }
+
+    #[test]
+    fn dlq_entries_is_a_gauge_labeled_by_shard() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_dlq_entries(0, 7);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_dlq_entries");
+        assert_eq!(f.kind, MetricKind::Gauge);
+        assert_eq!(sample_value(f, &[("shard", "0")]), 7.0);
+    }
+
+    #[test]
+    fn schedule_runs_is_a_counter_labeled_by_kind_and_name() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_schedule_run("cron", "nightly_report");
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_schedule_runs_total");
+        assert_eq!(
+            sample_value(f, &[("kind", "cron"), ("name", "nightly_report")]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn schedule_skipped_batches_via_record_schedule_skipped_n() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_schedule_skipped("cron", "nightly_report", "overlap");
+        recorder.record_schedule_skipped_n("cron", "nightly_report", "overlap", 4);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_schedule_skipped_total");
+        assert_eq!(
+            sample_value(
+                f,
+                &[
+                    ("kind", "cron"),
+                    ("name", "nightly_report"),
+                    ("reason", "overlap")
+                ]
+            ),
+            5.0
+        );
+    }
+
+    #[test]
+    fn retention_deleted_is_a_counter_labeled_by_shard() {
+        let recorder = HarvestMetricsRecorder::new();
+        recorder.record_retention_tick(0, 100, 42, 0.5);
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_retention_deleted_total");
+        assert_eq!(sample_value(f, &[("shard", "0")]), 42.0);
+    }
+
+    #[test]
+    fn clones_share_the_same_underlying_state() {
+        let recorder = HarvestMetricsRecorder::new();
+        let clone = recorder.clone();
+        clone.record_workflow_started("onboarding", "default");
+
+        let families = recorder.collect();
+        let f = family(&families, "harvest_workflow_started_total");
+        assert_eq!(
+            sample_value(f, &[("workflow", "onboarding"), ("queue", "default")]),
+            1.0
+        );
+    }
+}

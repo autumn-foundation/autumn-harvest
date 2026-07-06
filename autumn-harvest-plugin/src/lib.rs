@@ -34,6 +34,13 @@ pub mod webhook_receiver;
 #[cfg(feature = "mcp")]
 pub mod mcp_tools;
 
+/// Built-in Prometheus scrape endpoint (issue #355).
+///
+/// Registers the nine ADR-0001 §7 catalogue metrics as an autumn-web
+/// `MetricsSource` feeding the app's shared `/actuator/prometheus` endpoint.
+#[cfg(feature = "metrics")]
+pub mod metrics_scrape;
+
 pub use api::{
     HarvestApiRuntime, HarvestApiState, HarvestRetentionRuntime, harvest_api_router,
     management_api_request_fields, management_api_response_fields, management_api_routes,
