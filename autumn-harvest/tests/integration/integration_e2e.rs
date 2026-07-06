@@ -194,6 +194,7 @@ const LEGACY_INIT_SQL: &str = concat!(
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS rate_limit_key TEXT NULL;\n",
     "\n",
     include_str!("../../migrations/20260601000002_harvest_ownership_metadata/up.sql"),
+    include_str!("../../migrations/20260706000000_harvest_worker_sessions/up.sql"),
     "\n",
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS schedule_to_close_at TIMESTAMPTZ NULL;\n",
     "\n",
