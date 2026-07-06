@@ -341,7 +341,23 @@ pub async fn admit_debounced_start(
             -- id is the one the run is created with, and every 202 echoes it.
             queue_name        = EXCLUDED.queue_name,
             last_input        = EXCLUDED.last_input,
-            start_options     = EXCLUDED.start_options,
+            -- issue #921 review (Codex P2): start_options is last-input-wins
+            -- for every field (matching this function's documented semantics)
+            -- EXCEPT completion_callbacks, which is merged (array-concatenated)
+            -- across every admission in the burst instead of overwritten. A
+            -- caller whose request registered a callback must still be
+            -- notified when the collapsed execution eventually completes,
+            -- even if a later burst member carried no callbacks (or a
+            -- different one) and would otherwise clobber the earlier
+            -- registration. Duplicate `{url, filter}` entries are harmless:
+            -- `resolve_all_targets` already dedups by (url, filter) at
+            -- workflow-start time, so this union does not need to dedup here.
+            start_options = jsonb_set(
+                EXCLUDED.start_options,
+                '{completion_callbacks}',
+                COALESCE(harvest_debounce.start_options->'completion_callbacks', '[]'::jsonb)
+                    || COALESCE(EXCLUDED.start_options->'completion_callbacks', '[]'::jsonb)
+            ),
             effective_fire_at = LEAST($8, harvest_debounce.max_fire_at),
             pending_count     = harvest_debounce.pending_count + 1,
             updated_at        = NOW()

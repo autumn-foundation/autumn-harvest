@@ -364,6 +364,105 @@ async fn fire_due_debounced_starts_threads_completion_callbacks_into_the_started
     );
 }
 
+// Regression (issue #921 review): `admit_debounced_start`'s conflict path is
+// otherwise last-input-wins (matching the documented semantics), but that must
+// not apply to completion_callbacks -- an earlier admission's registered
+// callback would silently vanish if a later burst member (which wins on every
+// other field) carried no callback, or a different one. Two admissions for the
+// same key with distinct callback targets must both survive into the single
+// started execution's completion_callbacks column, mirroring the identical
+// array-merge fix already shipped for the batched-start path
+// (admit_batched_start).
+#[tokio::test]
+async fn debounce_conflict_merges_completion_callbacks_instead_of_overwriting() {
+    let (mut conn, _c) = setup_db().await;
+
+    let wf = "callback_merge_debounce_wf";
+    let key = "tenant:callback-merge";
+    let wf_id = "callback-debounce-merge-001";
+    let window = Duration::from_millis(50);
+    let max_wait = Duration::from_secs(60);
+
+    let callback_a = serde_json::json!(
+        { "url": "https://api.example.com/hook-a", "filter": { "type": "AnyTerminal" } }
+    );
+    let callback_b = serde_json::json!(
+        { "url": "https://api.example.com/hook-b", "filter": { "type": "CompletedOnly" } }
+    );
+
+    // First admission in the burst registers callback A.
+    let mut first = admit_params(wf, key, wf_id, serde_json::json!({}), window, max_wait);
+    first.start_options.completion_callbacks = Some(serde_json::json!([callback_a.clone()]));
+    admit_debounced_start_ungated(&mut conn, first)
+        .await
+        .expect("admit first");
+
+    // A later burst member for the same key registers a *different* callback
+    // (B) and no memory of A -- last-input-wins would otherwise clobber A here.
+    let mut second = admit_params(
+        wf,
+        key,
+        wf_id,
+        serde_json::json!({"later": true}),
+        window,
+        max_wait,
+    );
+    second.start_options.completion_callbacks = Some(serde_json::json!([callback_b.clone()]));
+    admit_debounced_start_ungated(&mut conn, second)
+        .await
+        .expect("admit second");
+
+    // Still exactly 1 row -- the burst collapsed as usual.
+    assert_eq!(debounce_row_count(&mut conn, wf, key).await, 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("fire");
+    assert_eq!(fired, 1);
+
+    let stored = started_execution_completion_callbacks(&mut conn, wf, wf_id)
+        .await
+        .expect("completion_callbacks must be present");
+    let stored_targets = stored.as_array().expect("array").clone();
+    assert_eq!(
+        stored_targets.len(),
+        2,
+        "both burst members' callback registrations must survive the merge, got {stored_targets:?}"
+    );
+    assert!(
+        stored_targets.contains(&callback_a),
+        "the first admission's callback A must not be dropped by the second admission's conflict update"
+    );
+    assert!(
+        stored_targets.contains(&callback_b),
+        "the second admission's callback B must be present alongside A"
+    );
+
+    // Last-input-wins semantics for every *other* field are unaffected: the
+    // started run's input is the second (most recent) admission's input.
+    let started_input = {
+        use diesel_async::RunQueryDsl;
+
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Jsonb)]
+            input: serde_json::Value,
+        }
+        diesel::sql_query(
+            "SELECT input FROM harvest_workflow_executions WHERE workflow_name=$1 AND workflow_id=$2",
+        )
+        .bind::<diesel::sql_types::Text, _>(wf)
+        .bind::<diesel::sql_types::Text, _>(wf_id)
+        .get_result::<Row>(&mut conn)
+        .await
+        .expect("query started input")
+        .input
+    };
+    assert_eq!(started_input, serde_json::json!({"later": true}));
+}
+
 // ── AC6: trailing-edge semantics ─────────────────────────────────────────────
 
 #[tokio::test]
