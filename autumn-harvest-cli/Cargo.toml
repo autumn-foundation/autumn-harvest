@@ -33,5 +33,9 @@ path = "src/bin/harvest_replay.rs"
 [dev-dependencies]
 tempfile = "3"
 
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
 [lints]
 workspace = true

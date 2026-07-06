@@ -58,72 +58,13 @@ metrics = { version = "0.24", optional = true }
 schemars = { version = "0.8", optional = true }
 
 [[test]]
-name = "macros_query_handlers"
-required-features = ["testing"]
-
-[[test]]
-name = "macros_compile_fail"
-required-features = ["testing"]
-
-[[test]]
-name = "external_completion_tests"
-required-features = ["testing"]
+name = "integration"
+path = "tests/integration/mod.rs"
+required-features = ["testing", "db"]
 
 [[bench]]
 name = "metrics_noop"
 harness = false
-
-[[test]]
-name = "idempotency_tests"
-required-features = ["testing"]
-
-[[test]]
-name = "replayer_tests"
-required-features = ["testing"]
-
-[[test]]
-name = "payload_offload_replay_tests"
-required-features = ["testing"]
-
-[[test]]
-name = "payload_offload_db_tests"
-required-features = ["db"]
-
-[[test]]
-name = "workflow_test_env_tests"
-required-features = ["testing"]
-
-[[test]]
-name = "dag_unified_tests"
-required-features = ["testing", "unified-dag-execution"]
-
-[[test]]
-name = "replayer_integration_tests"
-required-features = ["testing", "db"]
-
-[[test]]
-name = "scheduler_ha_tests"
-required-features = ["db"]
-
-[[test]]
-name = "scheduler_carryover_tests"
-required-features = ["db", "testing"]
-
-[[test]]
-name = "build_routing_tests"
-required-features = ["db"]
-
-[[test]]
-name = "workflow_handle_tests"
-required-features = ["db"]
-
-[[test]]
-name = "signal_with_start_tests"
-required-features = ["db"]
-
-[[test]]
-name = "typed_stubs_tests"
-required-features = ["db"]
 
 [[example]]
 name = "signal_with_start_webhook"
@@ -131,14 +72,6 @@ required-features = ["db"]
 
 [[example]]
 name = "update_with_start_cart"
-required-features = ["db"]
-
-[[test]]
-name = "cross_workflow_signal_tests"
-required-features = ["db"]
-
-[[test]]
-name = "transactional_activity_tests"
 required-features = ["db"]
 
 [[example]]
@@ -168,14 +101,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
 schemars = { version = "0.8" }
-
-[[test]]
-name = "replay_verifier_tests"
-required-features = ["testing"]
-
-[[test]]
-name = "payload_cap_tests"
-required-features = ["testing"]
 
 [[bench]]
 name = "replay_bench"
