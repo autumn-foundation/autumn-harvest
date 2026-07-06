@@ -21,5 +21,11 @@ fn compile_fail_cases() {
     t.compile_fail("tests/compile_fail/hvg007_process_global.rs");
     t.compile_fail("tests/compile_fail/hvg008_nondeterministic_predicate.rs");
     t.compile_fail("tests/compile_fail/hvg010_select_macro.rs");
+    t.compile_fail("tests/compile_fail/webhook_missing_path.rs");
+    t.compile_fail("tests/compile_fail/webhook_neither_target.rs");
+    t.compile_fail("tests/compile_fail/webhook_both_targets.rs");
+    t.compile_fail("tests/compile_fail/webhook_signals_missing_signal_name.rs");
+    t.compile_fail("tests/compile_fail/webhook_verifier_attr_unsupported.rs");
+    t.compile_fail("tests/compile_fail/webhook_async_fn.rs");
     t.pass("tests/compile_fail/suppressed_guardrails.rs");
 }

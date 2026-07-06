@@ -36,6 +36,7 @@ Stop at any chapter — each one ends in a runnable state.
 9. [Worker routing and capabilities](09-worker-routing.md) — Queue name partitioning, Build-ID compatibility, and capability labels.
 10. [Operating the service](10-operations.md) — preflight, dashboard, CLI, DLQ, worker drain, reuse policies.
 11. [Testing your workflow code](11-testing.md) — unit tests and `WorkflowReplayer` regression coverage.
+12. [Inbound webhooks](12-webhooks.md) — `#[webhook]`, `[security.webhooks]` verification, idempotent dispatch.
 
 Start with [Chapter 1 →](01-project-skeleton.md)
 

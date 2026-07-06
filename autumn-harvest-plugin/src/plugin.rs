@@ -113,6 +113,10 @@ pub struct HarvestPlugin {
     mcp_tools_enabled: bool,
     /// Optional prefix override for the generated MCP tool routes.
     mcp_tools_prefix: Option<String>,
+    /// Inbound webhook trigger bindings produced by `autumn_harvest::webhooks!`
+    /// (issue #344). Set via [`Self::webhooks`] (feature `webhooks`).
+    #[cfg(feature = "webhooks")]
+    webhook_triggers: Vec<autumn_harvest::webhook_trigger::WebhookTriggerInfo>,
 }
 
 impl Default for HarvestPlugin {
@@ -132,6 +136,8 @@ impl HarvestPlugin {
             mcp_tool_middleware: None,
             mcp_tools_enabled: false,
             mcp_tools_prefix: None,
+            #[cfg(feature = "webhooks")]
+            webhook_triggers: Vec::new(),
         }
     }
 
@@ -268,6 +274,33 @@ impl HarvestPlugin {
         self.mcp_tools_prefix = Some(prefix.into());
         self
     }
+
+    /// Register inbound webhook triggers produced by `autumn_harvest::webhooks!`
+    /// (issue #344).
+    ///
+    /// Each `#[webhook]`-annotated function is mounted as an app-level route
+    /// at its declared `path`, verified by autumn-web's `[security.webhooks]`
+    /// signed-webhook layer (`SignedWebhook`) before this crate's dispatch
+    /// code ever runs. Call `.workflows(...)` with every trigger's target
+    /// workflow *before* calling this method -- `HarvestPlugin::build` fails
+    /// fast (panics) if a trigger targets an unregistered workflow, or if two
+    /// triggers declare the same binding path.
+    ///
+    /// Accumulates across repeated calls (mirrors `.workflows`/`.activities`/
+    /// `.queries`/`.updates`), so registering webhook bindings from separate
+    /// modules via multiple `.webhooks(...)` calls keeps every prior
+    /// registration instead of the last call silently discarding them.
+    ///
+    /// See `docs/getting-started/12-webhooks.md`.
+    #[cfg(feature = "webhooks")]
+    #[must_use]
+    pub fn webhooks(
+        mut self,
+        triggers: Vec<autumn_harvest::webhook_trigger::WebhookTriggerInfo>,
+    ) -> Self {
+        self.webhook_triggers.extend(triggers);
+        self
+    }
 }
 
 /// Whether the generated MCP tool routes are about to be registered with no
@@ -279,6 +312,7 @@ const fn mcp_tools_unprotected(mcp_tools_enabled: bool, has_tool_middleware: boo
 }
 
 impl Plugin for HarvestPlugin {
+    #[allow(clippy::too_many_lines)]
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
             builder,
@@ -287,11 +321,30 @@ impl Plugin for HarvestPlugin {
             mcp_tool_middleware,
             mcp_tools_enabled,
             mcp_tools_prefix,
+            #[cfg(feature = "webhooks")]
+            webhook_triggers,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
 
         let api_state = HarvestApiState::new();
+
+        // Issue #344: generate the inbound webhook receiver routes before the
+        // builder is stashed in the runtime slot (same ordering constraint as
+        // the MCP tool routes below -- `builder.workflow_infos()` is only
+        // available pre-build). Fails fast (panics) on a duplicate/malformed
+        // binding path or a trigger targeting an unregistered workflow.
+        #[cfg(feature = "webhooks")]
+        let webhook_routes = if webhook_triggers.is_empty() {
+            Vec::new()
+        } else {
+            crate::webhook_receiver::build_webhook_routes(
+                &webhook_triggers,
+                builder.workflow_infos(),
+                builder.dag_infos(),
+                &api_state,
+            )
+        };
 
         // Issue #597: generate the MCP tool routes before the builder is
         // stashed in the runtime slot. These are app-level typed routes
@@ -388,6 +441,13 @@ impl Plugin for HarvestPlugin {
         let app = match mcp_routes {
             Some(routes) => app.routes(routes),
             None => app,
+        };
+
+        #[cfg(feature = "webhooks")]
+        let app = if webhook_routes.is_empty() {
+            app
+        } else {
+            app.routes(webhook_routes)
         };
 
         if let Some(path) = api_path {
@@ -1007,6 +1067,55 @@ mod tests {
             severity: None,
             mcp: false,
         }
+    }
+
+    #[cfg(feature = "webhooks")]
+    fn fake_webhook_trigger(
+        name: &'static str,
+        path: &'static str,
+    ) -> autumn_harvest::webhook_trigger::WebhookTriggerInfo {
+        // Must match `WebhookHandlerFn`'s Result-returning signature.
+        #[allow(clippy::unnecessary_wraps)]
+        fn dispatch(
+            _ctx: &autumn_harvest::webhook_trigger::WebhookCtx,
+            _payload: &serde_json::Value,
+        ) -> Result<autumn_harvest::WorkflowId, autumn_harvest::webhook_trigger::WebhookHandlerError>
+        {
+            Ok(autumn_harvest::WorkflowId::new("wf"))
+        }
+
+        autumn_harvest::webhook_trigger::WebhookTriggerInfo {
+            name,
+            module: "tests",
+            path,
+            target: autumn_harvest::webhook_trigger::WebhookTarget::Starts { workflow: "echo" },
+            handler: dispatch,
+            queue: None,
+        }
+    }
+
+    #[cfg(feature = "webhooks")]
+    #[test]
+    fn webhooks_accumulates_across_repeated_calls() {
+        // Codex review (PR #918): unlike .workflows/.activities/.queries/
+        // .updates, .webhooks used to *replace* rather than extend, so a
+        // second call from a separate module silently dropped the first
+        // call's bindings.
+        let plugin = HarvestPlugin::new()
+            .webhooks(vec![fake_webhook_trigger("a", "/hooks/a")])
+            .webhooks(vec![fake_webhook_trigger("b", "/hooks/b")]);
+        assert_eq!(
+            plugin.webhook_triggers.len(),
+            2,
+            "both .webhooks() calls must be preserved"
+        );
+        let paths: Vec<_> = plugin
+            .webhook_triggers
+            .iter()
+            .map(|t| t.path)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"/hooks/a"));
+        assert!(paths.contains(&"/hooks/b"));
     }
 
     fn test_pool(database_url: &str, pool_size: usize) -> DbPool {

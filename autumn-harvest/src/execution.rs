@@ -18,6 +18,7 @@ use crate::build_routing;
 use crate::completion_trigger::DeferredTriggerStart;
 use crate::error::{HarvestError, HarvestResult, database_error};
 use crate::event::WorkflowEvent;
+use crate::info::WorkflowInfo;
 use crate::models::{NewHarvestSignal, NewWorkflowExecution, WorkflowExecution};
 use crate::queue::{self, EnqueueParams, TaskType};
 use crate::schema::{harvest_signals, harvest_workflow_executions};
@@ -2310,6 +2311,14 @@ pub struct SignalWithStartParams<'a> {
     /// Server-side ceiling on retry attempts. Forwarded to
     /// [`StartWorkflowParams::max_workflow_attempts_ceiling`].
     pub max_workflow_attempts_ceiling: Option<u32>,
+    /// The target workflow's registered [`WorkflowInfo`], consulted only to
+    /// validate `input` against its published JSON Schema (issue #373) —
+    /// and only on a genuine fresh start, never on attach (see
+    /// [`HarvestError::InputValidationFailed`]). `None` skips validation
+    /// entirely (schema-less workflow, or a caller — e.g. the typed client
+    /// stub — that intentionally never validates, matching every other
+    /// schema-validation call site being HTTP-JSON-boundary-only).
+    pub workflow_info: Option<&'a WorkflowInfo>,
 }
 
 /// Result of a [`signal_with_start_workflow_execution`] call.
@@ -2408,6 +2417,23 @@ fn check_sws_payload_cap(
         });
     }
     Ok(())
+}
+
+/// Validate `input` against `workflow_info`'s published JSON Schema
+/// (issue #373), when one is registered. Called only on a genuine fresh
+/// start (see the two call sites in
+/// [`signal_with_start_workflow_execution_with_metrics`]) — an attach never
+/// writes `start_input`, so validating it there would reject a call that
+/// will never actually use the value it's rejecting (issue #918 review).
+fn check_sws_input_schema(
+    input: &serde_json::Value,
+    workflow_info: Option<&WorkflowInfo>,
+) -> HarvestResult<()> {
+    let Some(info) = workflow_info else {
+        return Ok(());
+    };
+    info.validate_input(input)
+        .map_err(|violations| HarvestError::InputValidationFailed { violations })
 }
 /// # Errors
 ///
@@ -2600,7 +2626,12 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                     s
                 };
 
-                // On fresh start only: enforce workflow input cap (tx rollback on error).
+                // On fresh start only: enforce workflow input cap and schema (tx
+                // rollback on error). An attach never writes start_input, so neither
+                // check runs for it (issue #918 review — schema validation used to
+                // run unconditionally, pre-lock, in the HTTP handler, rejecting
+                // legitimate signal deliveries to an already-running execution
+                // whenever the signal payload didn't match the start-input schema).
                 if started.created {
                     check_sws_payload_cap(
                         &request.input,
@@ -2608,6 +2639,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         request.max_workflow_input_bytes,
                         request.workflow_name,
                     )?;
+                    check_sws_input_schema(&request.input, request.workflow_info)?;
                 }
 
                 // TOCTOU guard: if a concurrent transaction completed the run between
@@ -2650,6 +2682,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                             request.max_workflow_input_bytes,
                             request.workflow_name,
                         )?;
+                        check_sws_input_schema(&request.input, request.workflow_info)?;
                     }
                     fresh
                 } else {

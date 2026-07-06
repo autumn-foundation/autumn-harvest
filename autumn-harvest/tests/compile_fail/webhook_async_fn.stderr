@@ -1,0 +1,5 @@
+error: #[webhook] mapping functions are synchronous -- do I/O inside the target workflow, not in the mapping function
+ --> tests/compile_fail/webhook_async_fn.rs:6:7
+  |
+6 | async fn map_order(_ctx: &WebhookCtx, evt: serde_json::Value) -> Result<WorkflowId, String> {
+  |       ^^

@@ -22,6 +22,10 @@ pub mod workflow_reachability;
 #[cfg(feature = "webhooks")]
 pub mod webhook;
 
+/// Inbound HTTP webhook receiver route generation and dispatch (issue #344).
+#[cfg(feature = "webhooks")]
+pub mod webhook_receiver;
+
 #[cfg(feature = "mcp")]
 pub mod mcp_tools;
 
