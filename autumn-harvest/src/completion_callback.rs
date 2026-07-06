@@ -1834,12 +1834,27 @@ fn read_global_callback_config() -> Option<std::sync::Arc<CallbackRuntimeConfig>
 /// Only installs when a [`CompletionCallbackDeliverer`] was actually
 /// supplied via `completion_callback_deliverer(...)` — with no deliverer
 /// there is nothing to POST with, and unlike the plugin path this crate has
-/// no default implementation to substitute, so leaving the config
-/// unconfigured (byte-identical to today) is correct rather than installing
-/// a config that can never deliver anything.
+/// no default implementation to substitute, so this runtime must be
+/// callback-inert.
+///
+/// **Clears any prior [`GLOBAL_CALLBACK_CONFIG`] on this path** (issue #921
+/// review, Codex P2): the config is a single process-wide static, not
+/// per-worker-instance, so a process that builds a direct core worker with
+/// `completion_callback_deliverer(...)` and later builds a *second* direct
+/// worker without one must not leave the first worker's deliverer/default
+/// targets/secret installed — otherwise the second (supposedly
+/// callback-inert) runtime's terminal workflows would still enqueue
+/// deliveries and POST results to the first runtime's callback URL using a
+/// deliverer/secret that has nothing to do with this runtime. Clearing to
+/// `None` here matches the documented "no deliverer configured -> no
+/// deliveries enqueued" contract for whichever runtime was built most
+/// recently in this process.
 #[cfg(feature = "db")]
 pub fn install_global_callback_config_for_direct_worker(config: &CompletionCallbackBuilderConfig) {
     let Some(deliverer) = config.deliverer.clone() else {
+        if let Ok(mut lock) = GLOBAL_CALLBACK_CONFIG.write() {
+            *lock = None;
+        }
         return;
     };
     let secret = config.secret.clone().unwrap_or_else(|| {
@@ -1859,6 +1874,84 @@ pub fn install_global_callback_config_for_direct_worker(config: &CompletionCallb
             default_targets: config.default_targets.clone(),
             retry_policy: config.retry_policy.clone(),
         }));
+    }
+}
+
+// `GLOBAL_CALLBACK_CONFIG` is a process-wide static (by design -- it mirrors
+// `GLOBAL_WORKFLOW_METADATA`'s "set once at startup" contract in production),
+// so tests that mutate it must serialize against each other the same way
+// `tests/completion_callback_tests.rs`'s `TEST_SERIAL` does -- this is a
+// separate test binary (`--lib`) from that integration-test file, so it
+// needs its own guard rather than sharing that one.
+#[cfg(all(test, feature = "db"))]
+static DIRECT_WORKER_INSTALL_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, feature = "db"))]
+mod direct_worker_install_tests {
+    use super::*;
+
+    struct NoopDeliverer;
+
+    impl CompletionCallbackDeliverer for NoopDeliverer {
+        fn deliver<'a>(
+            &'a self,
+            _target_url: &'a str,
+            _body: &'a [u8],
+            _headers: &'a [(&'static str, String)],
+        ) -> DeliverFuture<'a> {
+            Box::pin(async { DeliveryAttempt::transport_error("unused in this test".to_string()) })
+        }
+    }
+
+    // Regression (issue #921 review, Codex P2): a process that builds a
+    // direct core worker with a deliverer, then later builds a *second*
+    // direct worker with none, must not leave the first runtime's
+    // deliverer/secret/targets installed -- the second (supposedly
+    // callback-inert) runtime would otherwise still enqueue deliveries using
+    // stale config that has nothing to do with it.
+    #[test]
+    fn installing_without_a_deliverer_clears_a_previously_installed_config() {
+        let _guard = DIRECT_WORKER_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let with_deliverer = CompletionCallbackBuilderConfig {
+            deliverer: Some(std::sync::Arc::new(NoopDeliverer)),
+            ..CompletionCallbackBuilderConfig::default()
+        };
+        install_global_callback_config_for_direct_worker(&with_deliverer);
+        assert!(
+            read_global_callback_config().is_some(),
+            "a config with a deliverer must install"
+        );
+
+        let without_deliverer = CompletionCallbackBuilderConfig::default();
+        install_global_callback_config_for_direct_worker(&without_deliverer);
+        assert!(
+            read_global_callback_config().is_none(),
+            "a later runtime built with no deliverer must clear the prior runtime's stale config, \
+             not leave it installed"
+        );
+    }
+
+    // The existing behavior this fix must not regress: installing with no
+    // deliverer when nothing was ever configured stays a no-op (`None`
+    // stays `None`), not an error.
+    #[test]
+    fn installing_without_a_deliverer_when_never_configured_stays_none() {
+        let _guard = DIRECT_WORKER_INSTALL_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Establish a known baseline (clears any state a prior test in this
+        // process may have left behind, since the static is shared process-wide).
+        if let Ok(mut lock) = GLOBAL_CALLBACK_CONFIG.write() {
+            *lock = None;
+        }
+
+        let without_deliverer = CompletionCallbackBuilderConfig::default();
+        install_global_callback_config_for_direct_worker(&without_deliverer);
+        assert!(read_global_callback_config().is_none());
     }
 }
 
