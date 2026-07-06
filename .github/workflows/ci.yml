@@ -69,7 +69,7 @@ jobs:
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --no-run
       - name: Run Docker-backed integration tests
         if: runner.os == 'Linux'
-        run: cargo test -p autumn-harvest --test integration_e2e -- --test-threads=1
+        run: cargo test -p autumn-harvest --test integration -- integration_e2e -- --test-threads=1
       - name: Run plugin API and scheduler integration tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
