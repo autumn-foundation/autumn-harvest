@@ -446,7 +446,11 @@ async fn replay_session_pipeline_workflow_succeeds_regardless_of_recorded_host_w
     // replay time.
     let replayer = build_replayer();
 
-    for host in ["worker-host-A", "worker-host-B", "a-totally-different-worker"] {
+    for host in [
+        "worker-host-A",
+        "worker-host-B",
+        "a-totally-different-worker",
+    ] {
         let (exec_id, events) = session_pipeline_history(host);
         let report = replayer
             .replay_from_snapshot(make_snapshot("session_pipeline_workflow", exec_id, events))

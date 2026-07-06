@@ -1296,6 +1296,8 @@ mod tests {
                 build_id: String::new(),
                 deployment_name: None,
                 labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
             },
             health,
             active_task_ids: Vec::new(),

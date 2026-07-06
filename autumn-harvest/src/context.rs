@@ -1320,7 +1320,7 @@ impl Session<'_> {
         self.ctx
             .execute_activity_raw_full(
                 SESSION_RELEASE_ACTIVITY_NAME,
-                Value::Null,
+                Value::from(self.id.to_string()),
                 &self.queue,
                 None,
                 None,
@@ -5754,10 +5754,7 @@ impl WorkflowContext {
     /// Generate the next worker-session sequence number for marker naming
     /// (mirrors `next_fan_out_seq`/`next_race_seq`).
     fn next_session_seq(&self) -> u32 {
-        let mut seq = self
-            .session_seq
-            .lock()
-            .expect("session_seq lock poisoned");
+        let mut seq = self.session_seq.lock().expect("session_seq lock poisoned");
         *seq += 1;
         *seq
     }
@@ -12938,9 +12935,9 @@ mod tests {
         // already recorded.
         let commands = ctx.drain_commands();
         assert!(
-            !commands
-                .iter()
-                .any(|c| matches!(c, WorkflowCommand::RecordMarker { name, .. } if name == "session:1")),
+            !commands.iter().any(
+                |c| matches!(c, WorkflowCommand::RecordMarker { name, .. } if name == "session:1")
+            ),
             "replay must not re-record an already-recorded session marker"
         );
     }
@@ -13035,7 +13032,11 @@ mod tests {
         }
 
         let commands = ctx.drain_commands();
-        assert_eq!(commands.len(), 2, "expected exactly [RecordMarker, ScheduleActivity]");
+        assert_eq!(
+            commands.len(),
+            2,
+            "expected exactly [RecordMarker, ScheduleActivity]"
+        );
         match &commands[0] {
             WorkflowCommand::RecordMarker { name, .. } => assert_eq!(name, "session:1"),
             other => panic!("expected RecordMarker first, got {other:?}"),
@@ -13133,7 +13134,9 @@ mod tests {
             panic!("expected create_session to fail with SessionAcquireTimeout");
         };
         match err {
-            HarvestError::SessionAcquireTimeout { session_id, queue, .. } => {
+            HarvestError::SessionAcquireTimeout {
+                session_id, queue, ..
+            } => {
                 assert_eq!(session_id, SessionId::from_uuid(session_uuid));
                 assert_eq!(queue, "gpu-workers");
             }

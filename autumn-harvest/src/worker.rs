@@ -274,6 +274,53 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
 // HandlerRegistry
 // ---------------------------------------------------------------------------
 
+/// Stub dispatch fn for the internal worker-session acquire/release
+/// activities (issue #606). `process_activity_task` always intercepts these
+/// reserved names before consulting `registry.activities`, so this body
+/// should be unreachable in practice; it fails loudly (rather than silently
+/// no-opping) if that invariant is ever violated by a future change.
+fn session_internal_stub_handler(
+    _ctx: &ActivityContext,
+    _input: serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+> {
+    Box::pin(async move {
+        Err(
+            "internal session activity dispatched through the normal handler path; \
+             this indicates an engine bug (process_activity_task should have \
+             intercepted this reserved name first)"
+                .to_string(),
+        )
+    })
+}
+
+/// Build the `ActivityInfo` registered for a reserved worker-session
+/// activity name (issue #606) -- see [`session_internal_stub_handler`].
+fn session_internal_activity_info(name: &'static str) -> ActivityInfo {
+    ActivityInfo {
+        name,
+        module: "autumn_harvest::sessions",
+        default_retry_policy: None,
+        default_start_to_close: None,
+        default_heartbeat_timeout: None,
+        default_schedule_to_start: None,
+        default_queue: None,
+        max_concurrent: None,
+        concurrency_key: None,
+        default_schedule_to_close: None,
+        is_local: false,
+        max_input_bytes: None,
+        max_result_bytes: None,
+        rate_limit_rps: None,
+        rate_limit_burst: None,
+        rate_limit_key: None,
+        circuit_breaker: None,
+        requires: None,
+        handler: session_internal_stub_handler,
+    }
+}
+
 /// Fast name-to-handler lookup for workflows and activities.
 ///
 /// Built once at startup from the vectors produced by the `workflows![]` and
@@ -406,10 +453,25 @@ impl HandlerRegistry {
                 .collect();
             *lock = Some(metadata);
         }
-        let activities: HashMap<String, ActivityInfo> = activities
+        let mut activities: HashMap<String, ActivityInfo> = activities
             .into_iter()
             .map(|a| (a.name.to_string(), a))
             .collect();
+        // Worker sessions (issue #606): the internal acquire/release
+        // activities have no author-registered handler -- `process_activity_task`
+        // intercepts them by reserved name before this map is ever consulted
+        // for dispatch. They still need an `ActivityInfo` entry so
+        // `persist_scheduled_activities`'s `registry.activities.get(name)`
+        // lookup succeeds at enqueue time; the stub handler below is never
+        // actually invoked. Inserted unconditionally (after user activities
+        // are collected) so a reserved name always resolves to the engine's
+        // own entry.
+        for name in [
+            crate::context::SESSION_ACQUIRE_ACTIVITY_NAME,
+            crate::context::SESSION_RELEASE_ACTIVITY_NAME,
+        ] {
+            activities.insert(name.to_string(), session_internal_activity_info(name));
+        }
         // Circuit breakers are enforced on the task-dispatch path
         // (`process_activity_task`), which local activities bypass by running
         // inline. The `#[activity]` macro rejects `circuit_breaker` on local
@@ -5044,7 +5106,142 @@ const RATE_LIMIT_DEFER_MIN: Duration = Duration::from_millis(50);
 /// still re-evaluates `on_dispatch` (the breaker may have changed) reasonably soon.
 const RATE_LIMIT_DEFER_MAX: Duration = Duration::from_secs(5);
 
-#[allow(clippy::too_many_lines)]
+/// Handle the internal session-acquire activity (issue #606) -- see the
+/// interception in [`process_activity_task`].
+///
+/// On winning the in-process slot race: writes a `harvest_sessions`
+/// `ACTIVE` row and completes the task with the host worker id as output --
+/// the value `WorkflowContext::dispatch_session_acquire` decodes into the
+/// session's physical binding. On losing the race (this worker is at
+/// capacity, or sessions are disabled): reschedules the task with a
+/// randomized backoff so it can be claimed by a different worker with a
+/// free slot, without consuming a retry attempt.
+async fn handle_session_acquire(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    exec_id: ExecutionId,
+    max_concurrent_sessions: i32,
+    session_slots_in_use: &crate::sessions::SessionSlotCounter,
+) -> HarvestResult<()> {
+    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+
+    let Some(activity_uuid) = task.activity_id else {
+        return fail_task_only(
+            &mut conn,
+            task.id,
+            "session-acquire task missing activity_id",
+        )
+        .await;
+    };
+    let activity_id = ActivityExecId::from_uuid(activity_uuid);
+
+    let Some(session_id) = task
+        .input
+        .as_str()
+        .and_then(|s| s.parse::<crate::types::SessionId>().ok())
+    else {
+        let error = "session-acquire task input is not a valid SessionId".to_string();
+        fail_task_and_execution(&mut conn, task, worker_id, &error).await?;
+        return Err(HarvestError::Config(error));
+    };
+
+    if !crate::sessions::try_acquire_session_slot(session_slots_in_use, max_concurrent_sessions) {
+        // Lost the race: this worker is at its advertised session
+        // capacity (or sessions are disabled: max_concurrent_sessions <= 0,
+        // so every acquire loses). Reschedule with a randomized backoff so
+        // the task can be claimed by a different, less-loaded worker --
+        // this is not a failed attempt, so it must not consume the retry
+        // budget (mirrors the rate-limit defer path, which has the
+        // identical "not a real attempt" contract).
+        let backoff = crate::sessions::acquire_retry_backoff(
+            rand::random::<f64>(),
+            crate::sessions::ACQUIRE_RETRY_BACKOFF_MIN,
+            crate::sessions::ACQUIRE_RETRY_BACKOFF_MAX,
+        );
+        let scheduled_at = chrono::Utc::now()
+            + chrono::Duration::from_std(backoff)
+                .unwrap_or_else(|_| chrono::Duration::milliseconds(200));
+        return queue::defer_rate_limited_task(&mut conn, task.id, scheduled_at).await;
+    }
+
+    let expires_at = chrono::Utc::now()
+        + chrono::Duration::from_std(crate::sessions::SESSION_MEMBER_STICKY_TIMEOUT)
+            .unwrap_or_else(|_| chrono::Duration::hours(24));
+    if let Err(error) = crate::sessions::record_session_acquired(
+        &mut conn,
+        session_id,
+        exec_id,
+        worker_id,
+        &task.queue_name,
+        expires_at,
+    )
+    .await
+    {
+        // Failed to durably record the session -- release the slot just
+        // claimed (never leak it) and fail the task so the workflow
+        // observes an ordinary activity failure instead of silently
+        // wedging.
+        crate::sessions::release_session_slot(session_slots_in_use);
+        let msg = error.to_string();
+        fail_task_and_execution(&mut conn, task, worker_id, &msg).await?;
+        return Err(error);
+    }
+    let output = serde_json::json!(worker_id);
+    finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None).await
+}
+
+/// Handle the internal session-release activity (issue #606), dispatched by
+/// [`crate::context::Session::complete`] and hard-pinned to the session's
+/// host worker.
+///
+/// Marks the `harvest_sessions` row `COMPLETED` and frees the in-process
+/// slot before completing the task normally.
+async fn handle_session_release(
+    pool: &DbPool,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    exec_id: ExecutionId,
+    session_slots_in_use: &crate::sessions::SessionSlotCounter,
+) -> HarvestResult<()> {
+    let mut conn = pool.get().await.map_err(crate::error::database_error)?;
+
+    let Some(activity_uuid) = task.activity_id else {
+        return fail_task_only(
+            &mut conn,
+            task.id,
+            "session-release task missing activity_id",
+        )
+        .await;
+    };
+    let activity_id = ActivityExecId::from_uuid(activity_uuid);
+
+    let Some(session_id) = task
+        .input
+        .as_str()
+        .and_then(|s| s.parse::<crate::types::SessionId>().ok())
+    else {
+        let error = "session-release task input is not a valid SessionId".to_string();
+        fail_task_and_execution(&mut conn, task, worker_id, &error).await?;
+        return Err(HarvestError::Config(error));
+    };
+
+    if let Err(error) = crate::sessions::record_session_completed(&mut conn, session_id).await {
+        let msg = error.to_string();
+        fail_task_and_execution(&mut conn, task, worker_id, &msg).await?;
+        return Err(error);
+    }
+
+    // Frees the in-process slot for a future acquire. Idempotent/saturating
+    // (never goes below zero), so a defensive double-release (e.g. a
+    // manually-crafted or corrupted history) cannot underflow the counter.
+    crate::sessions::release_session_slot(session_slots_in_use);
+
+    let output = serde_json::Value::Null;
+    finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None).await
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn process_activity_task(
     pool: &DbPool,
     registry: &HandlerRegistry,
@@ -5052,6 +5249,8 @@ async fn process_activity_task(
     worker_id: &str,
     cancellation_grace_period: Duration,
     dispatched_at: std::time::Instant,
+    max_concurrent_sessions: i32,
+    session_slots_in_use: &crate::sessions::SessionSlotCounter,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
@@ -5062,6 +5261,28 @@ async fn process_activity_task(
         return fail_task_only(&mut conn, task.id, "activity task missing activity_name").await;
     };
     let exec_id = execution_id_from_uuid(exec_uuid);
+
+    // Worker sessions (issue #606): intercept the two reserved internal
+    // activity names before any of the normal handler-dispatch machinery
+    // (circuit breaker, rate limiting, ActivityStarted append) runs. Both
+    // names are always registered in `registry.activities` (see
+    // `session_internal_activity_info`) so the enqueue-time lookup in
+    // `persist_scheduled_activities` succeeds, but their `handler` fn is a
+    // stub that must never actually run.
+    if activity_name == crate::context::SESSION_ACQUIRE_ACTIVITY_NAME {
+        return handle_session_acquire(
+            pool,
+            task,
+            worker_id,
+            exec_id,
+            max_concurrent_sessions,
+            session_slots_in_use,
+        )
+        .await;
+    }
+    if activity_name == crate::context::SESSION_RELEASE_ACTIVITY_NAME {
+        return handle_session_release(pool, task, worker_id, exec_id, session_slots_in_use).await;
+    }
 
     let Some(activity) = registry.activities.get(activity_name) else {
         let error = format!("no activity handler registered for '{activity_name}'");
@@ -8164,6 +8385,8 @@ async fn process_task(
     max_local_activity_start_to_close: Duration,
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
     dispatched_at: std::time::Instant,
+    max_concurrent_sessions: i32,
+    session_slots_in_use: &crate::sessions::SessionSlotCounter,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -8195,6 +8418,8 @@ async fn process_task(
                 worker_id,
                 cancellation_grace_period,
                 dispatched_at,
+                max_concurrent_sessions,
+                session_slots_in_use,
             )
             .await
         }
@@ -8909,6 +9134,17 @@ pub struct Worker {
     /// the same execution accumulate toward the same threshold.
     workflow_task_timeout_strikes:
         Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, i32>>>,
+    /// In-process count of worker sessions currently hosted by this worker
+    /// (issue #606), bounded against `config.max_concurrent_sessions` via
+    /// [`crate::sessions::try_acquire_session_slot`]. `0` (the default) means
+    /// sessions are disabled, so the session-acquire interception in
+    /// `process_activity_task` always loses the race and reschedules --
+    /// zero behavior change beyond that reschedule loop, which only ever
+    /// fires for a workflow that calls `create_session` against a worker
+    /// that never opted in. A plain `Arc<AtomicI64>` rather than a
+    /// `tokio::sync::Semaphore`/`OwnedSemaphorePermit` map -- see
+    /// [`crate::sessions::SessionSlotCounter`]'s doc comment for why.
+    session_slots_in_use: crate::sessions::SessionSlotCounter,
 }
 
 struct WorkerMonitoringHandles {
@@ -9205,7 +9441,6 @@ impl Worker {
         let workflow_cache = Arc::new(tokio::sync::Mutex::new(crate::cache::WorkflowCache::new(
             config.workflow_cache_size,
         )));
-
         Ok(Self {
             config,
             registry,
@@ -9224,6 +9459,7 @@ impl Worker {
             workflow_task_timeout_strikes: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            session_slots_in_use: crate::sessions::new_session_slot_counter(),
         })
     }
 
@@ -10645,6 +10881,8 @@ impl Worker {
             ClaimedTaskKind::Workflow => self.workflow_permit_wait_micros.clone(),
             ClaimedTaskKind::Activity => self.activity_permit_wait_micros.clone(),
         };
+        let session_slots_in_use = Arc::clone(&self.session_slots_in_use);
+        let max_concurrent_sessions = self.config.max_concurrent_sessions;
 
         // Per-queue dispatch counter for live split observability (issue #515).
         self.registry
@@ -10742,6 +10980,8 @@ impl Worker {
                         max_local_activity_start_to_close,
                         workflow_cache,
                         dispatched_at,
+                        max_concurrent_sessions,
+                        &session_slots_in_use,
                     ),
                 )
                 .await
@@ -10877,6 +11117,8 @@ impl Worker {
                     max_local_activity_start_to_close,
                     workflow_cache,
                     dispatched_at,
+                    max_concurrent_sessions,
+                    &session_slots_in_use,
                 )
                 .await
                 {
@@ -12070,6 +12312,68 @@ mod tests {
         assert!(!registry.workflows.contains_key("nonexistent"));
     }
 
+    // ── Worker sessions (issue #606) ────────────────────────────────────────
+
+    #[test]
+    fn handler_registry_always_registers_reserved_session_activities() {
+        // No user activities registered at all -- the reserved acquire/
+        // release entries must still be present, since
+        // persist_scheduled_activities's registry.activities.get(name)
+        // lookup must succeed for them at enqueue time (Hole #1).
+        let registry = HandlerRegistry::new(vec![], vec![]);
+        assert!(
+            registry
+                .activities
+                .contains_key(crate::context::SESSION_ACQUIRE_ACTIVITY_NAME)
+        );
+        assert!(
+            registry
+                .activities
+                .contains_key(crate::context::SESSION_RELEASE_ACTIVITY_NAME)
+        );
+    }
+
+    #[test]
+    fn handler_registry_reserved_session_activities_have_no_special_policies() {
+        let registry = HandlerRegistry::new(vec![], vec![]);
+        for name in [
+            crate::context::SESSION_ACQUIRE_ACTIVITY_NAME,
+            crate::context::SESSION_RELEASE_ACTIVITY_NAME,
+        ] {
+            let info = registry
+                .activities
+                .get(name)
+                .expect("reserved session activity must be registered");
+            assert!(
+                !info.is_local,
+                "session activities must be enqueued, never run inline"
+            );
+            assert!(info.circuit_breaker.is_none());
+            assert!(info.requires.is_none());
+            assert!(info.rate_limit_key.is_none());
+            assert!(info.default_schedule_to_start.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn session_internal_stub_handler_never_succeeds() {
+        // Defense-in-depth: if the process_activity_task interception is
+        // ever accidentally bypassed, the stub must fail loudly rather than
+        // silently no-op.
+        let ctx = ActivityContext::new_test();
+        let result = session_internal_stub_handler(&ctx, serde_json::Value::Null).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_session_slot_counter_starts_at_zero() {
+        let counter = crate::sessions::new_session_slot_counter();
+        assert_eq!(
+            std::sync::atomic::AtomicI64::load(&counter, std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
     #[test]
     fn worker_rejects_invalid_config() {
         let cfg = WorkerRuntimeConfig {
@@ -12319,10 +12623,7 @@ mod tests {
             .expect("a single ScheduleActivity command must extract");
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].session_id, Some(session_id));
-        assert_eq!(
-            scheduled[0].session_worker_id.as_deref(),
-            Some("worker-7")
-        );
+        assert_eq!(scheduled[0].session_worker_id.as_deref(), Some("worker-7"));
         assert_eq!(
             scheduled[0].schedule_to_start_override,
             Some(std::time::Duration::from_secs(30))

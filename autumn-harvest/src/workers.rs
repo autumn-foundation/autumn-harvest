@@ -1720,7 +1720,10 @@ mod tests {
         // Flattened directly onto the top-level object, not nested under "worker".
         assert_eq!(json["max_concurrent_sessions"], serde_json::json!(5));
         assert_eq!(json["in_use_sessions"], serde_json::json!(2));
-        assert!(json.get("worker").is_none(), "HarvestWorker fields must be flattened, not nested");
+        assert!(
+            json.get("worker").is_none(),
+            "HarvestWorker fields must be flattened, not nested"
+        );
     }
 
     #[test]

@@ -31,6 +31,11 @@ use std::time::Duration;
 /// expire" for a legitimately still-open session.
 pub const SESSION_MEMBER_STICKY_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 
+/// Lower/upper bounds for [`acquire_retry_backoff`]'s randomized reschedule
+/// delay after a session-acquire task loses the in-process semaphore race.
+pub const ACQUIRE_RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
+pub const ACQUIRE_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(1000);
+
 // ---------------------------------------------------------------------------
 // Session-slot acquire eligibility
 // ---------------------------------------------------------------------------
@@ -62,7 +67,12 @@ pub const fn session_acquire_eligible(
 ) -> AcquireEligibility {
     if max_concurrent_sessions <= 0 {
         AcquireEligibility::SessionsDisabled
-    } else if (if in_use_sessions < 0 { 0 } else { in_use_sessions }) < max_concurrent_sessions {
+    } else if (if in_use_sessions < 0 {
+        0
+    } else {
+        in_use_sessions
+    }) < max_concurrent_sessions
+    {
         AcquireEligibility::Eligible
     } else {
         AcquireEligibility::AtCapacity
@@ -129,7 +139,10 @@ pub const fn broken_session_reason(
 
 /// Pure lease-expiry check: has `now` reached or passed `expires_at`?
 #[must_use]
-pub fn lease_expired(now: chrono::DateTime<chrono::Utc>, expires_at: chrono::DateTime<chrono::Utc>) -> bool {
+pub fn lease_expired(
+    now: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
     now >= expires_at
 }
 
@@ -154,7 +167,9 @@ pub fn lease_expired(now: chrono::DateTime<chrono::Utc>, expires_at: chrono::Dat
 #[must_use]
 pub fn acquire_retry_backoff(rng_fraction: f64, min: Duration, max: Duration) -> Duration {
     let min_ms = u64::try_from(min.as_millis()).unwrap_or(u64::MAX);
-    let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX).max(min_ms);
+    let max_ms = u64::try_from(max.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(min_ms);
     let span = max_ms.saturating_sub(min_ms);
     // `span as f64` and `rng_fraction.clamp(0.0, 1.0)` are both non-negative,
     // so the product is always >= 0 -- sign loss cannot actually occur.
@@ -165,6 +180,155 @@ pub fn acquire_retry_backoff(rng_fraction: f64, min: Duration, max: Duration) ->
     )]
     let jitter = (span as f64 * rng_fraction.clamp(0.0, 1.0)) as u64;
     Duration::from_millis(min_ms + jitter)
+}
+
+// ---------------------------------------------------------------------------
+// In-process session-slot counter
+// ---------------------------------------------------------------------------
+
+/// Per-worker in-process count of sessions currently hosted by this worker
+/// (issue #606).
+///
+/// A plain atomic counter rather than a `tokio::sync::Semaphore` +
+/// `OwnedSemaphorePermit` map: a session's acquire and release happen in
+/// *different* task-dispatch invocations (potentially different tokio
+/// tasks, arbitrarily far apart in time), so there is no async-fn scope to
+/// hold an owned permit against. Storing a `HashMap<SessionId,
+/// OwnedSemaphorePermit>` directly as a `Worker` field hits the exact
+/// `clippy::significant_drop_tightening` trap already documented for
+/// `crate::slot_tuner::TunedSlotRuntime` (issue #548) -- but worse, since
+/// unlike that type (constructed and consumed within one function), a
+/// session registry must live for the worker's entire lifetime as a real
+/// struct field, so the lint fires on every single test in the crate that
+/// merely constructs a `Worker`. A bare `Arc<AtomicI64>` has no significant
+/// drop and sidesteps the trap entirely.
+pub type SessionSlotCounter = std::sync::Arc<std::sync::atomic::AtomicI64>;
+
+/// Build a new, zeroed session-slot counter.
+#[must_use]
+pub fn new_session_slot_counter() -> SessionSlotCounter {
+    std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0))
+}
+
+/// Attempt to claim one session slot, bounded by `max_concurrent_sessions`.
+///
+/// Returns `true` on success (the counter has been incremented; the caller
+/// now holds the slot and must eventually call [`release_session_slot`]).
+/// Returns `false` without side effects when `max <= 0` (sessions disabled)
+/// or the counter is already at `max`.
+#[must_use]
+pub fn try_acquire_session_slot(in_use: &std::sync::atomic::AtomicI64, max: i32) -> bool {
+    use std::sync::atomic::Ordering;
+
+    if max <= 0 {
+        return false;
+    }
+    let max = i64::from(max);
+    let mut current = in_use.load(Ordering::SeqCst);
+    loop {
+        if current >= max {
+            return false;
+        }
+        match in_use.compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Release one previously claimed session slot.
+///
+/// Saturating: never decrements below zero, so a defensive double-release
+/// (e.g. a manually crafted or corrupted history triggering `complete()`
+/// twice) cannot underflow the counter into a state where it never again
+/// reports "at capacity".
+pub fn release_session_slot(in_use: &std::sync::atomic::AtomicI64) {
+    use std::sync::atomic::Ordering;
+
+    let mut current = in_use.load(Ordering::SeqCst);
+    loop {
+        if current <= 0 {
+            return;
+        }
+        match in_use.compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DB-gated session persistence
+// ---------------------------------------------------------------------------
+
+/// Record a newly acquired session (issue #606).
+///
+/// Called by the worker's session-acquire interception after it wins the
+/// in-process semaphore race.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on failure.
+#[cfg(feature = "db")]
+pub async fn record_session_acquired(
+    conn: &mut diesel_async::AsyncPgConnection,
+    session_id: crate::types::SessionId,
+    workflow_exec_id: crate::types::ExecutionId,
+    host_worker_id: &str,
+    queue_name: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> crate::error::HarvestResult<()> {
+    use diesel_async::RunQueryDsl;
+
+    let row = crate::models::NewHarvestSession {
+        id: session_id.as_uuid(),
+        workflow_exec_id: workflow_exec_id.as_uuid(),
+        host_worker_id,
+        queue_name,
+        expires_at,
+    };
+    diesel::insert_into(crate::schema::harvest_sessions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Mark a session `COMPLETED` (issue #606).
+///
+/// Called by the worker's session-release interception. Idempotent-shaped:
+/// only an `ACTIVE` row transitions; a session already `BROKEN` (reclaimed
+/// by the scanner concurrently with a late release) is left alone.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on failure.
+#[cfg(feature = "db")]
+pub async fn record_session_completed(
+    conn: &mut diesel_async::AsyncPgConnection,
+    session_id: crate::types::SessionId,
+) -> crate::error::HarvestResult<()> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_sessions::dsl;
+
+    diesel::update(
+        dsl::harvest_sessions
+            .find(session_id.as_uuid())
+            .filter(dsl::state.eq("ACTIVE")),
+    )
+    .set(crate::models::SessionCompletedUpdate {
+        state: "COMPLETED".to_string(),
+        completed_at: chrono::Utc::now(),
+    })
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -196,18 +360,27 @@ mod tests {
 
     #[test]
     fn session_acquire_at_capacity_when_equal() {
-        assert_eq!(session_acquire_eligible(5, 5), AcquireEligibility::AtCapacity);
+        assert_eq!(
+            session_acquire_eligible(5, 5),
+            AcquireEligibility::AtCapacity
+        );
     }
 
     #[test]
     fn session_acquire_at_capacity_when_over() {
         // Should never happen in practice, but must not wrap or panic.
-        assert_eq!(session_acquire_eligible(5, 6), AcquireEligibility::AtCapacity);
+        assert_eq!(
+            session_acquire_eligible(5, 6),
+            AcquireEligibility::AtCapacity
+        );
     }
 
     #[test]
     fn session_acquire_eligible_negative_in_use_treated_as_zero() {
-        assert_eq!(session_acquire_eligible(1, -3), AcquireEligibility::Eligible);
+        assert_eq!(
+            session_acquire_eligible(1, -3),
+            AcquireEligibility::Eligible
+        );
     }
 
     #[test]
@@ -320,8 +493,10 @@ mod tests {
 
     #[test]
     fn acquire_retry_backoff_clamps_out_of_range_fraction() {
-        let below = acquire_retry_backoff(-1.0, Duration::from_millis(10), Duration::from_millis(20));
-        let above = acquire_retry_backoff(2.0, Duration::from_millis(10), Duration::from_millis(20));
+        let below =
+            acquire_retry_backoff(-1.0, Duration::from_millis(10), Duration::from_millis(20));
+        let above =
+            acquire_retry_backoff(2.0, Duration::from_millis(10), Duration::from_millis(20));
         assert_eq!(below, Duration::from_millis(10));
         assert_eq!(above, Duration::from_millis(20));
     }
@@ -332,5 +507,69 @@ mod tests {
         // or underflow -- it degrades to always returning min.
         let d = acquire_retry_backoff(0.5, Duration::from_millis(500), Duration::from_millis(100));
         assert_eq!(d, Duration::from_millis(500));
+    }
+
+    // ── session slot counter ─────────────────────────────────────────────
+
+    #[test]
+    fn new_session_slot_counter_starts_at_zero() {
+        let counter = new_session_slot_counter();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn try_acquire_session_slot_fails_when_max_is_zero() {
+        let counter = new_session_slot_counter();
+        assert!(!try_acquire_session_slot(&counter, 0));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn try_acquire_session_slot_fails_when_max_is_negative() {
+        let counter = new_session_slot_counter();
+        assert!(!try_acquire_session_slot(&counter, -1));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn try_acquire_session_slot_succeeds_under_capacity_and_increments() {
+        let counter = new_session_slot_counter();
+        assert!(try_acquire_session_slot(&counter, 2));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(try_acquire_session_slot(&counter, 2));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn try_acquire_session_slot_fails_at_capacity_without_incrementing() {
+        let counter = new_session_slot_counter();
+        assert!(try_acquire_session_slot(&counter, 1));
+        assert!(!try_acquire_session_slot(&counter, 1));
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn release_session_slot_decrements() {
+        let counter = new_session_slot_counter();
+        assert!(try_acquire_session_slot(&counter, 1));
+        release_session_slot(&counter);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn release_session_slot_never_goes_negative() {
+        let counter = new_session_slot_counter();
+        release_session_slot(&counter);
+        release_session_slot(&counter);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn acquire_then_release_frees_a_slot_for_reacquire() {
+        let counter = new_session_slot_counter();
+        assert!(try_acquire_session_slot(&counter, 1));
+        assert!(!try_acquire_session_slot(&counter, 1));
+        release_session_slot(&counter);
+        assert!(try_acquire_session_slot(&counter, 1));
     }
 }

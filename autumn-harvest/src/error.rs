@@ -452,9 +452,7 @@ pub enum HarvestError {
     /// (`max_concurrent_sessions`) before the deadline. Author-catchable —
     /// the workflow may retry `create_session` or fall back to plain
     /// activities.
-    #[error(
-        "session {session_id} acquisition timed out after {timeout_ms}ms on queue '{queue}'"
-    )]
+    #[error("session {session_id} acquisition timed out after {timeout_ms}ms on queue '{queue}'")]
     SessionAcquireTimeout {
         /// The session identity that failed to acquire a host.
         session_id: crate::types::SessionId,
@@ -1008,7 +1006,10 @@ mod tests {
             reason: "reason".into(),
         };
         assert_ne!(timeout.to_string(), broken.to_string());
-        assert!(!matches!(broken, HarvestError::SessionAcquireTimeout { .. }));
+        assert!(!matches!(
+            broken,
+            HarvestError::SessionAcquireTimeout { .. }
+        ));
         assert!(!matches!(timeout, HarvestError::SessionBroken { .. }));
     }
 }

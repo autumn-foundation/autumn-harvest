@@ -240,8 +240,7 @@ mod db_tests {
         let (mut conn, _c) = setup().await;
         let exec_id = insert_execution(&mut conn).await;
 
-        let mut params =
-            EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
+        let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!(null));
         params.workflow_exec_id = Some(exec_id.as_uuid());
 
         let task_id = queue::enqueue(&mut conn, &params).await.expect("enqueue");
