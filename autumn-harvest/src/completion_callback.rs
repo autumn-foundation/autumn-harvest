@@ -2036,36 +2036,73 @@ struct ClaimedDeliveryRow {
 /// — and, critically, does **not** hold any lock across the network POST
 /// that follows: the statement (and its row locks) completes before this
 /// function returns.
+///
+/// `shard_id` scopes the claim to one logical shard (issue #921 review,
+/// Codex P2): when two or more logical shards share the same physical
+/// Postgres database (the connection handed to a per-shard scanner tick can
+/// be the same pool as a sibling shard's), an unscoped claim would let one
+/// shard's tick claim and deliver rows that belong to a different shard,
+/// violating shard assignment and starving the owning shard's scan. `None`
+/// (the single-pool fallback path with no sharded configuration at all)
+/// claims across the whole table, matching every pre-sharding deployment's
+/// existing behavior — mirrors `event_batch::fire_due_on_conn`'s identical
+/// `Option<i32>` shard parameter and conditional-SQL shape.
 #[cfg(feature = "db")]
 async fn claim_due_deliveries(
     conn: &mut diesel_async::AsyncPgConnection,
     now: DateTime<Utc>,
+    shard_id: Option<i32>,
 ) -> crate::error::HarvestResult<Vec<ClaimedDeliveryRow>> {
     use diesel_async::RunQueryDsl;
 
     let lease_until = now + chrono::Duration::seconds(INFLIGHT_LEASE_SECS);
-    let sql = "
-        WITH candidate AS (
-            SELECT id FROM harvest_completion_deliveries
-            WHERE state IN ('PENDING', 'INFLIGHT') AND next_attempt_at <= $1
-            ORDER BY next_attempt_at ASC
-            LIMIT $2
-            FOR UPDATE SKIP LOCKED
-        )
-        UPDATE harvest_completion_deliveries d
-        SET state = 'INFLIGHT', attempt = d.attempt + 1, next_attempt_at = $3, updated_at = $1
-        FROM candidate c
-        WHERE d.id = c.id
-        RETURNING d.id, d.workflow_exec_id, d.target_url, d.payload, d.attempt, d.max_attempts, d.retry_policy
-    ";
 
-    diesel::sql_query(sql)
-        .bind::<diesel::sql_types::Timestamptz, _>(now)
-        .bind::<diesel::sql_types::BigInt, _>(COMPLETION_DELIVERY_FIRE_BATCH_SIZE)
-        .bind::<diesel::sql_types::Timestamptz, _>(lease_until)
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)
+    if let Some(sid) = shard_id {
+        let sql = "
+            WITH candidate AS (
+                SELECT id FROM harvest_completion_deliveries
+                WHERE state IN ('PENDING', 'INFLIGHT') AND next_attempt_at <= $1 AND shard_id = $4
+                ORDER BY next_attempt_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE harvest_completion_deliveries d
+            SET state = 'INFLIGHT', attempt = d.attempt + 1, next_attempt_at = $3, updated_at = $1
+            FROM candidate c
+            WHERE d.id = c.id
+            RETURNING d.id, d.workflow_exec_id, d.target_url, d.payload, d.attempt, d.max_attempts, d.retry_policy
+        ";
+        diesel::sql_query(sql)
+            .bind::<diesel::sql_types::Timestamptz, _>(now)
+            .bind::<diesel::sql_types::BigInt, _>(COMPLETION_DELIVERY_FIRE_BATCH_SIZE)
+            .bind::<diesel::sql_types::Timestamptz, _>(lease_until)
+            .bind::<diesel::sql_types::Integer, _>(sid)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)
+    } else {
+        let sql = "
+            WITH candidate AS (
+                SELECT id FROM harvest_completion_deliveries
+                WHERE state IN ('PENDING', 'INFLIGHT') AND next_attempt_at <= $1
+                ORDER BY next_attempt_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE harvest_completion_deliveries d
+            SET state = 'INFLIGHT', attempt = d.attempt + 1, next_attempt_at = $3, updated_at = $1
+            FROM candidate c
+            WHERE d.id = c.id
+            RETURNING d.id, d.workflow_exec_id, d.target_url, d.payload, d.attempt, d.max_attempts, d.retry_policy
+        ";
+        diesel::sql_query(sql)
+            .bind::<diesel::sql_types::Timestamptz, _>(now)
+            .bind::<diesel::sql_types::BigInt, _>(COMPLETION_DELIVERY_FIRE_BATCH_SIZE)
+            .bind::<diesel::sql_types::Timestamptz, _>(lease_until)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)
+    }
 }
 
 /// Re-read the current `payload` for a batch of just-claimed delivery ids,
@@ -2296,13 +2333,14 @@ async fn completion_deliveries_table_exists(
 async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     config: &CallbackRuntimeConfig,
+    shard_id: Option<i32>,
 ) -> crate::error::HarvestResult<usize> {
     if !completion_deliveries_table_exists(conn).await? {
         return Ok(0);
     }
 
     let now = Utc::now();
-    let claimed = claim_due_deliveries(conn, now).await?;
+    let claimed = claim_due_deliveries(conn, now, shard_id).await?;
     let mut processed = 0usize;
 
     // Re-read each row's payload immediately before serializing it for
@@ -2498,11 +2536,11 @@ pub async fn fire_due_completion_deliveries(
                         continue;
                     }
                 };
-                total += fire_due_on_conn(&mut shard_conn, &config).await?;
+                total += fire_due_on_conn(&mut shard_conn, &config, Some(shard.as_i32())).await?;
             }
         }
         _ => {
-            total += fire_due_on_conn(conn, &config).await?;
+            total += fire_due_on_conn(conn, &config, None).await?;
         }
     }
 

@@ -38,6 +38,7 @@
 //!   and the `redrive_delivery_*` tests — the management-surface read and
 //!   redrive primitives (issue #605 AC: list + manually redrive).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -48,10 +49,13 @@ use autumn_harvest::completion_callback::{
 };
 use autumn_harvest::completion_trigger::{TerminalState, evaluate_triggers_for_execution};
 use autumn_harvest::policy::RetryPolicy;
-use autumn_harvest::types::ExecutionId;
+use autumn_harvest::shard::ShardedDbPool;
+use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::worker::DbPool;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -180,6 +184,18 @@ async fn connect(url: &str) -> AsyncPgConnection {
     AsyncPgConnection::establish(url)
         .await
         .expect("connect failed")
+}
+
+/// Build a raw connection pool for a database URL — used to construct a
+/// [`ShardedDbPool`] test fixture (mirrors
+/// `autumn-harvest-plugin/tests/shard_health_integration.rs`'s identically
+/// named helper).
+fn build_test_pool(database_url: &str) -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("failed to build test pool")
 }
 
 /// A deliverer that returns a scripted sequence of outcomes (repeating the
@@ -1123,6 +1139,102 @@ async fn scanner_ignores_rows_not_yet_due() {
         .expect("second tick");
     assert_eq!(processed, 0, "a not-yet-due row must be left alone");
     assert_eq!(deliverer.call_count(), 1, "no additional delivery attempt");
+}
+
+/// Guards against issue #921 review (Codex P2): `claim_due_deliveries`
+/// previously claimed *any* due row in the connected database, with no
+/// `shard_id` predicate. When two logical shards are backed by the same
+/// physical Postgres database (a supported deployment shape — see
+/// `docs/sharding.md` and the identical scoping precedent in
+/// `execution::non_terminal_counts_by_workflow_name`/
+/// `event_batch::fire_due_on_conn`), a shard-0 scanner tick could claim and
+/// POST a shard-1 delivery, violating shard assignment and starving the
+/// shard-1 scan.
+///
+/// This test simulates exactly that: two enqueued deliveries, one left on
+/// shard 0 and one moved to shard 1, both served by pools that point at the
+/// *same* underlying database — then runs the scanner assigned to shard 0
+/// only and asserts the shard-1 row is left completely untouched.
+#[tokio::test]
+async fn scanner_scopes_claims_to_the_assigned_shard_when_shards_share_a_pool() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(200)]));
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(3, Duration::from_secs(1)),
+    );
+
+    let exec_shard0 = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_shard0,
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(r#"[{"url":"https://api.example.com/shard0","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_shard0, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers shard0");
+
+    let exec_shard1 = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_shard1,
+        "COMPLETED",
+        Some("{}"),
+        None,
+        Some(r#"[{"url":"https://api.example.com/shard1","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_shard1, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers shard1");
+
+    // `insert_terminal_execution` always seeds `shard_id = 0`; move the
+    // second delivery's row onto logical shard 1 to simulate the
+    // shared-physical-database scenario the fix guards against.
+    diesel::sql_query(
+        "UPDATE harvest_completion_deliveries SET shard_id = 1 WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_shard1.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("move delivery to shard 1");
+
+    // Both ShardId(0) and ShardId(1) point at the SAME physical database --
+    // the shared-pool deployment shape this test guards.
+    let mut pools = BTreeMap::new();
+    pools.insert(ShardId::new(0), build_test_pool(&url));
+    pools.insert(ShardId::new(1), build_test_pool(&url));
+    let sharded_pool = ShardedDbPool::from_map(pools, ShardId::new(0));
+
+    // Run the scanner assigned to shard 0 only.
+    let processed =
+        fire_due_completion_deliveries(&mut conn, &Some(sharded_pool), &[ShardId::new(0)])
+            .await
+            .expect("scanner tick for shard 0");
+
+    assert_eq!(
+        processed, 1,
+        "only the shard-0 row should be claimed and delivered"
+    );
+    assert_eq!(deliverer.call_count(), 1);
+    assert_eq!(
+        deliverer.calls.lock().unwrap()[0].0,
+        "https://api.example.com/shard0",
+        "the shard-0-only scanner tick must not have delivered the shard-1 row"
+    );
+
+    let shard1_rows = load_deliveries(&mut conn, exec_shard1).await;
+    assert_eq!(shard1_rows.len(), 1);
+    assert_eq!(
+        shard1_rows[0].state, "PENDING",
+        "the shard-1 row must be left untouched by a shard-0-only scanner tick"
+    );
 }
 
 #[tokio::test]
