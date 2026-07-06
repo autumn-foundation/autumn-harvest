@@ -91,13 +91,8 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
     let mut eq_idx = None;
     let mut in_idx = None;
     let mut in_quotes = None;
-    let token_chars: Vec<char> = token.chars().collect();
-    let token_lower = token.to_lowercase();
-    let token_lower_chars: Vec<char> = token_lower.chars().collect();
 
-    let mut i = 0;
-    while i < token_chars.len() {
-        let c = token_chars[i];
+    for (i, c) in token.char_indices() {
         match c {
             '\'' | '"' => {
                 if in_quotes == Some(c) {
@@ -109,29 +104,29 @@ fn find_operator_indices(token: &str) -> (Option<usize>, Option<usize>) {
             '=' if in_quotes.is_none() && eq_idx.is_none() => {
                 eq_idx = Some(i);
             }
-            _ => {
+            ' ' => {
                 if in_quotes.is_none()
                     && in_idx.is_none()
-                    && i + 3 < token_chars.len()
-                    && token_lower_chars[i] == ' '
-                    && token_lower_chars[i + 1] == 'i'
-                    && token_lower_chars[i + 2] == 'n'
-                    && token_lower_chars[i + 3] == ' '
+                    && token.get(i..i + 4).is_some_and(|slice| slice.eq_ignore_ascii_case(" in "))
                 {
                     in_idx = Some(i);
                 }
             }
+            _ => {}
         }
-        i += 1;
     }
     (eq_idx, in_idx)
 }
 
 fn parse_exact(token: &str, idx: usize) -> Result<Requirement, String> {
-    let key_raw = &token[..idx];
-    let mut val_raw = &token[idx + 1..];
+    let key_raw = token
+        .get(..idx)
+        .ok_or_else(|| format!("invalid index in requirement '{token}'"))?;
+    let mut val_raw = token
+        .get(idx + 1..)
+        .ok_or_else(|| format!("invalid index in requirement '{token}'"))?;
     if val_raw.starts_with('=') {
-        val_raw = &val_raw[1..];
+        val_raw = val_raw.get(1..).unwrap_or("");
     }
 
     let key = strip_quotes(key_raw).to_string();
@@ -144,8 +139,12 @@ fn parse_exact(token: &str, idx: usize) -> Result<Requirement, String> {
 }
 
 fn parse_in(token: &str, idx: usize) -> Result<Requirement, String> {
-    let key_raw = &token[..idx];
-    let val_raw = &token[idx + 4..];
+    let key_raw = token
+        .get(..idx)
+        .ok_or_else(|| format!("invalid index in requirement '{token}'"))?;
+    let val_raw = token
+        .get(idx + 4..)
+        .ok_or_else(|| format!("invalid index in requirement '{token}'"))?;
 
     let key = strip_quotes(key_raw).to_string();
     if key.is_empty() {
@@ -381,5 +380,24 @@ mod tests {
 
         // Empty requirements always match
         assert!(matches_requirements(&[], &labels));
+    }
+}
+
+#[cfg(test)]
+mod havoc_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_requirements_emoji_edge_case() {
+        // Trigger: Input string with multibyte unicode characters ("𐄷=") caused panics due to byte-indexing slicing error.
+        let trigger = "𐄷=";
+        let result = parse_requirements(trigger);
+        assert_eq!(
+            result.unwrap(),
+            vec![Requirement::Exact {
+                key: "𐄷".to_string(),
+                value: "".to_string()
+            }]
+        );
     }
 }
