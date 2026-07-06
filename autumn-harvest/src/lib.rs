@@ -130,6 +130,8 @@ pub mod replay;
 pub mod reset;
 pub mod retention;
 pub mod saga;
+/// Worker session fleet-side registry and pure decision functions (issue #606).
+pub mod sessions;
 pub mod shard;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
