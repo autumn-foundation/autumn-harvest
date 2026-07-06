@@ -1290,11 +1290,25 @@ impl Session<'_> {
     /// [`HarvestError::SessionBroken`], mirroring
     /// [`WorkflowContext::create_session`]'s identical mapping for the
     /// acquire step. Any other error passes through unchanged.
+    ///
+    /// This is the actually-reachable place a `SessionBroken` outcome is
+    /// first observed (member-activity or `complete()` failure, unlike
+    /// `create_session`'s own defensive mapping, which can never fire since
+    /// the acquire task never carries `session_id`), so the
+    /// `harvest.session.acquisition{outcome="broken"}` metric is emitted
+    /// here -- guarded on `!is_replaying()` so a replay of the same recorded
+    /// failure doesn't re-increment it.
     fn broken_session_error(&self, err: HarvestError) -> HarvestError {
         match err {
             HarvestError::ActivityFailed {
                 error_type, source, ..
             } if error_type == crate::failure::ERROR_TYPE_SESSION_BROKEN => {
+                if !self.ctx.is_replaying() {
+                    self.ctx.metrics.record_session_acquisition(
+                        &self.queue,
+                        crate::telemetry::SessionAcquisitionOutcome::Broken,
+                    );
+                }
                 HarvestError::SessionBroken {
                     session_id: self.id,
                     reason: source.to_string(),
@@ -5860,14 +5874,31 @@ impl WorkflowContext {
                 HarvestError::Timeout {
                     timeout_type: crate::error::TimeoutType::ScheduleToStart,
                     ..
-                } => HarvestError::SessionAcquireTimeout {
-                    session_id,
-                    queue: options.queue.clone(),
-                    timeout_ms: duration_to_millis_saturating(options.acquisition_timeout),
-                },
+                } => {
+                    // Only the live discovery of the timeout should count --
+                    // a replay of the same recorded terminal outcome must not
+                    // re-increment the metric on every subsequent cycle.
+                    if !self.is_replaying() {
+                        self.metrics.record_session_acquisition(
+                            &options.queue,
+                            crate::telemetry::SessionAcquisitionOutcome::TimedOut,
+                        );
+                    }
+                    HarvestError::SessionAcquireTimeout {
+                        session_id,
+                        queue: options.queue.clone(),
+                        timeout_ms: duration_to_millis_saturating(options.acquisition_timeout),
+                    }
+                }
                 HarvestError::ActivityFailed {
                     error_type, source, ..
                 } if error_type == crate::failure::ERROR_TYPE_SESSION_BROKEN => {
+                    // Defensive only -- the acquire task itself never carries
+                    // `session_id`, so the broken-session scanner can never
+                    // target it; this arm cannot actually be reached today.
+                    // The `Broken` metric is emitted from the genuinely
+                    // reachable path instead: `Session::broken_session_error`
+                    // (member-activity/`complete()` failures).
                     HarvestError::SessionBroken {
                         session_id,
                         reason: source.to_string(),
@@ -13142,6 +13173,130 @@ mod tests {
             }
             other => panic!("expected SessionAcquireTimeout, got {other}"),
         }
+    }
+
+    /// Test double counting `record_session_acquisition` calls by outcome.
+    #[derive(Default)]
+    struct SessionAcquisitionCounter {
+        acquired: std::sync::atomic::AtomicUsize,
+        timed_out: std::sync::atomic::AtomicUsize,
+        broken: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::telemetry::MetricsRecorder for SessionAcquisitionCounter {
+        fn record_session_acquisition(
+            &self,
+            _queue: &str,
+            outcome: crate::telemetry::SessionAcquisitionOutcome,
+        ) {
+            use crate::telemetry::SessionAcquisitionOutcome as O;
+            let counter = match outcome {
+                O::Acquired => &self.acquired,
+                O::TimedOut => &self.timed_out,
+                O::Broken => &self.broken,
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The `TimedOut` metric fires when the `ActivityTimedOut` event is the
+    /// tail of recorded history (the cycle that first discovers it, where
+    /// `is_replaying()` becomes `false` right after the match) -- mirroring
+    /// the exactly-once-on-the-live-frontier contract `ctx.metrics()`
+    /// (issue #532) already documents.
+    #[tokio::test]
+    async fn create_session_emits_timed_out_metric_on_first_discovery() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: crate::error::TimeoutType::ScheduleToStart,
+            },
+        ];
+        let recorder = std::sync::Arc::new(SessionAcquisitionCounter::default());
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), events).with_metrics(recorder.clone());
+        let result = ctx.create_session(SessionOptions::new("gpu-workers")).await;
+        assert!(matches!(
+            result,
+            Err(HarvestError::SessionAcquireTimeout { .. })
+        ));
+        assert_eq!(
+            recorder.timed_out.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            recorder.acquired.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(recorder.broken.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A later replay of a history that already carries a further event past
+    /// the timeout (i.e. the cursor still has more to consume at the match
+    /// point) must not re-increment the metric -- `is_replaying()` is `true`
+    /// at that point, so the guard suppresses it.
+    #[tokio::test]
+    async fn create_session_does_not_reemit_timed_out_metric_on_later_replay() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: crate::error::TimeoutType::ScheduleToStart,
+            },
+            // A further recorded event past the timeout -- proves this
+            // history has already progressed beyond the point where the
+            // timeout was first discovered.
+            WorkflowEvent::WorkflowFailed {
+                error: "session acquisition timed out".to_string(),
+            },
+        ];
+        let recorder = std::sync::Arc::new(SessionAcquisitionCounter::default());
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), events).with_metrics(recorder.clone());
+        let _ = ctx.create_session(SessionOptions::new("gpu-workers")).await;
+        assert_eq!(
+            recorder.timed_out.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a replay that still has further recorded history ahead must not \
+             re-increment the metric"
+        );
     }
 
     #[tokio::test]

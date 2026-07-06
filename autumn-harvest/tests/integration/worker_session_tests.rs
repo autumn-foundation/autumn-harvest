@@ -666,4 +666,266 @@ mod db_tests {
         // since this test never actually completed the underlying activity.
         assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
     }
+
+    // -----------------------------------------------------------------------
+    // Co-location (AC4, issue #606) -- full worker-loop integration
+    // -----------------------------------------------------------------------
+
+    use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
+    use autumn_harvest::models::WorkflowExecution;
+    use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
+    use autumn_harvest::{ActivityContext, WorkflowContext};
+    use diesel::{ExpressionMethods, QueryDsl};
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+    use std::pin::Pin;
+
+    async fn setup_with_url() -> (String, ContainerAsync<Postgres>) {
+        let container = Postgres::default()
+            .with_init_sql(INIT_SQL.to_string().into_bytes())
+            .with_tag("16")
+            .start()
+            .await
+            .expect("failed to start Postgres container");
+        let host = container.get_host().await.expect("host");
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        (url, container)
+    }
+
+    fn build_pool(database_url: &str) -> DbPool {
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+        deadpool::managed::Pool::builder(manager)
+            .max_size(10)
+            .build()
+            .expect("failed to build test pool")
+    }
+
+    /// A three-step pipeline: opens a worker session, dispatches three
+    /// activities through it, releases the session, and returns their
+    /// outputs.
+    fn session_pipeline_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: serde_json::Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let session = ctx
+                .create_session(sessions_options())
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut outputs = Vec::new();
+            for step in 0..3i64 {
+                let out = session
+                    .execute_activity_raw("pipeline_step", serde_json::json!(step), "default")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                outputs.push(out);
+            }
+            session.complete().await.map_err(|e| e.to_string())?;
+            Ok(serde_json::json!(outputs))
+        })
+    }
+
+    fn sessions_options() -> autumn_harvest::context::SessionOptions {
+        autumn_harvest::context::SessionOptions::new("default")
+    }
+
+    fn pipeline_step_activity<'a>(
+        _ctx: &'a ActivityContext,
+        input: serde_json::Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(input) })
+    }
+
+    async fn load_execution(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> WorkflowExecution {
+        use diesel::SelectableHelper;
+        harvest_workflow_executions::table
+            .find(exec_id.as_uuid())
+            .select(WorkflowExecution::as_select())
+            .first(conn)
+            .await
+            .expect("load execution")
+    }
+
+    async fn pipeline_task_worker_ids(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> Vec<Option<String>> {
+        use autumn_harvest::schema::harvest_task_queue::dsl as q;
+        q::harvest_task_queue
+            .filter(q::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(q::activity_name.eq(Some("pipeline_step")))
+            .select(q::worker_id)
+            .load::<Option<String>>(conn)
+            .await
+            .expect("load pipeline task worker_ids")
+    }
+
+    /// AC4: across one successful session, every member activity's recorded
+    /// task row attributes the SAME `worker_id` -- even with two workers in
+    /// the fleet racing to claim the session-acquire task, only one wins and
+    /// hosts the entire pipeline; the hard-pin claim gate (issue #606, step
+    /// 9) prevents the other worker from ever picking up a member activity.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn co_location_all_member_activities_share_one_worker_id() {
+        let (database_url, _container) = setup_with_url().await;
+        let mut conn = AsyncPgConnection::establish(&database_url)
+            .await
+            .expect("connect");
+
+        let exec_id = insert_execution(&mut conn).await;
+        store::append_events(
+            &mut conn,
+            exec_id,
+            &[WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            0,
+        )
+        .await
+        .expect("append WorkflowStarted");
+
+        let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::Value::Null);
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        params.scheduled_at = chrono::Utc::now() - chrono::Duration::seconds(5);
+        queue::enqueue(&mut conn, &params)
+            .await
+            .expect("enqueue workflow task");
+
+        let registry = std::sync::Arc::new(HandlerRegistry::new(
+            vec![WorkflowInfo {
+                mcp: false,
+                name: "session_test_wf",
+                module: "worker_session_tests",
+                handler: session_pipeline_workflow,
+                execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            }],
+            vec![ActivityInfo {
+                name: "pipeline_step",
+                module: "worker_session_tests",
+                default_retry_policy: None,
+                default_start_to_close: None,
+                default_heartbeat_timeout: None,
+                default_schedule_to_start: None,
+                default_schedule_to_close: None,
+                default_queue: Some("default"),
+                max_concurrent: None,
+                concurrency_key: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+                rate_limit_key: None,
+                circuit_breaker: None,
+                is_local: false,
+                max_input_bytes: None,
+                max_result_bytes: None,
+                requires: None,
+                handler: pipeline_step_activity,
+            }],
+        ));
+
+        let pool = build_pool(&database_url);
+        let make_worker = |worker_id: &str| {
+            std::sync::Arc::new(
+                Worker::new(
+                    autumn_harvest::worker::WorkerRuntimeConfig {
+                        worker_id: worker_id.to_string(),
+                        queues: vec!["default".to_string()],
+                        notification_database_url: None,
+                        max_concurrent_workflows: 2,
+                        max_concurrent_activities: 2,
+                        poll_interval: Duration::from_millis(25),
+                        shutdown_timeout: Duration::from_secs(1),
+                        cancellation_grace_period: Duration::from_secs(1),
+                        sticky_timeout: Duration::from_secs(5),
+                        max_local_activity_start_to_close: Duration::from_secs(60),
+                        shard_assignments: vec![autumn_harvest::types::ShardId::new(0)],
+                        worker_heartbeat_interval: Duration::from_secs(5),
+                        build_id: String::new(),
+                        deployment_name: None,
+                        workflow_cache_size: 1000,
+                        priority_aging_secs: None,
+                        unknown_target_grace_window: Duration::from_secs(5),
+                        poison_pill_threshold: 3,
+                        workflow_task_timeout: Duration::from_secs(20),
+                        labels: std::collections::HashMap::new(),
+                        queue_weights: std::collections::HashMap::new(),
+                        max_workflow_pause_duration: Duration::from_secs(24 * 3600),
+                        max_workflow_history_events: None,
+                        shard_notification_database_urls: Vec::new(),
+                        sharded_pool: None,
+                        slot_tuner: None,
+                        // Both workers advertise session capacity so either
+                        // one could win the acquire race -- the point of
+                        // this test is that whichever wins hosts *all* of
+                        // the pipeline's member activities.
+                        max_concurrent_sessions: 1,
+                    },
+                    registry.clone(),
+                )
+                .expect("worker should build"),
+            )
+        };
+
+        let worker_a = make_worker("worker-a");
+        let worker_b = make_worker("worker-b");
+        let pool_a = pool.clone();
+        let pool_b = pool.clone();
+        let runner_a = worker_a.clone();
+        let runner_b = worker_b.clone();
+        let handle_a = tokio::spawn(async move { runner_a.run(&pool_a).await });
+        let handle_b = tokio::spawn(async move { runner_b.run(&pool_b).await });
+
+        let completed = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let execution = load_execution(&mut conn, exec_id).await;
+                if execution.state == "COMPLETED" || execution.state == "FAILED" {
+                    break execution;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("pipeline should complete within timeout");
+
+        worker_a.shutdown();
+        worker_b.shutdown();
+        handle_a.await.expect("worker a should join");
+        handle_b.await.expect("worker b should join");
+
+        assert_eq!(
+            completed.state, "COMPLETED",
+            "session pipeline workflow should complete successfully"
+        );
+
+        let worker_ids = pipeline_task_worker_ids(&mut conn, exec_id).await;
+        assert_eq!(worker_ids.len(), 3, "expected all 3 pipeline steps to run");
+        let first = worker_ids[0].clone();
+        assert!(first.is_some(), "every member task must record a worker_id");
+        assert!(
+            worker_ids.iter().all(|w| *w == first),
+            "every session member activity must share the same worker_id, got {worker_ids:?}"
+        );
+    }
 }

@@ -5123,6 +5123,7 @@ async fn handle_session_acquire(
     exec_id: ExecutionId,
     max_concurrent_sessions: i32,
     session_slots_in_use: &crate::sessions::SessionSlotCounter,
+    metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -5187,6 +5188,10 @@ async fn handle_session_acquire(
         fail_task_and_execution(&mut conn, task, worker_id, &msg).await?;
         return Err(error);
     }
+    metrics.record_session_acquisition(
+        &task.queue_name,
+        crate::telemetry::SessionAcquisitionOutcome::Acquired,
+    );
     let output = serde_json::json!(worker_id);
     finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None).await
 }
@@ -5277,6 +5282,7 @@ async fn process_activity_task(
             exec_id,
             max_concurrent_sessions,
             session_slots_in_use,
+            registry.telemetry().metrics.as_ref(),
         )
         .await;
     }
