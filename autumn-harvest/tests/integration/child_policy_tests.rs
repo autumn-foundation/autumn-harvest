@@ -1318,6 +1318,7 @@ async fn workflow_task_timeout_cascades_detached_children() {
         &[ShardId::new(0)],
         None,
         None,
+        60,
     )
     .await
     .expect("timeout enforcement should succeed");

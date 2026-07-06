@@ -419,4 +419,251 @@ mod db_tests {
              worker once its lease expires"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Broken-session scanner (issue #606, TDD step 11)
+    // -----------------------------------------------------------------------
+
+    use autumn_harvest::event::WorkflowEvent;
+    use autumn_harvest::sessions;
+    use autumn_harvest::store;
+    use autumn_harvest::types::ActivityExecId;
+
+    async fn insert_worker(
+        conn: &mut AsyncPgConnection,
+        worker_id: &str,
+        last_heartbeat_at: chrono::DateTime<chrono::Utc>,
+        status: &str,
+    ) {
+        diesel::sql_query(
+            "INSERT INTO harvest_workers \
+             (worker_id, started_at, last_heartbeat_at, queues, shard_assignments, \
+              max_concurrency, host, status, build_id, labels, max_concurrent_sessions) \
+             VALUES ($1, NOW(), $2, '[]'::jsonb, '[]'::jsonb, 10, 'localhost', $3, '', \
+                     '{}'::jsonb, 1)",
+        )
+        .bind::<Text, _>(worker_id)
+        .bind::<Timestamptz, _>(last_heartbeat_at)
+        .bind::<Text, _>(status)
+        .execute(conn)
+        .await
+        .expect("insert worker");
+    }
+
+    /// Sets up one execution with a `WorkflowStarted` + `ActivityScheduled`
+    /// history, a `PENDING` session-pinned task queue row, and an `ACTIVE`
+    /// `harvest_sessions` row hosted by `host_worker_id`. Returns
+    /// `(exec_id, session_id, activity_id, task_id)`.
+    async fn setup_active_session(
+        conn: &mut AsyncPgConnection,
+        host_worker_id: &str,
+        session_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> (ExecutionId, Uuid, ActivityExecId, Uuid) {
+        let exec_id = insert_execution(conn).await;
+        let activity_id = ActivityExecId::new();
+        let session_id = Uuid::new_v4();
+
+        store::append_events(
+            conn,
+            exec_id,
+            &[WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            }],
+            0,
+        )
+        .await
+        .expect("append WorkflowStarted");
+        store::append_events(
+            conn,
+            exec_id,
+            &[WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "transcode_chunk".to_string(),
+                input: serde_json::Value::Null,
+                queue: "gpu-workers".to_string(),
+            }],
+            1,
+        )
+        .await
+        .expect("append ActivityScheduled");
+
+        let mut params =
+            EnqueueParams::new("gpu-workers", TaskType::Activity, serde_json::json!(null));
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        params.activity_name = Some("transcode_chunk".to_string());
+        params.activity_id = Some(activity_id.as_uuid());
+        let params = params
+            .with_session_id(session_id)
+            .with_sticky(host_worker_id, Duration::from_secs(24 * 3600));
+        let task_id = queue::enqueue(conn, &params).await.expect("enqueue");
+
+        sessions::record_session_acquired(
+            conn,
+            autumn_harvest::types::SessionId::from_uuid(session_id),
+            exec_id,
+            host_worker_id,
+            "gpu-workers",
+            session_expires_at,
+        )
+        .await
+        .expect("record_session_acquired");
+
+        (exec_id, session_id, activity_id, task_id)
+    }
+
+    async fn session_state(conn: &mut AsyncPgConnection, session_id: Uuid) -> String {
+        #[derive(diesel::QueryableByName)]
+        struct StateRow {
+            #[diesel(sql_type = Text)]
+            state: String,
+        }
+        diesel::sql_query("SELECT state FROM harvest_sessions WHERE id = $1")
+            .bind::<SqlUuid, _>(session_id)
+            .get_result::<StateRow>(conn)
+            .await
+            .expect("read session state")
+            .state
+    }
+
+    async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
+        #[derive(diesel::QueryableByName)]
+        struct StateRow {
+            #[diesel(sql_type = Text)]
+            state: String,
+        }
+        diesel::sql_query("SELECT state FROM harvest_task_queue WHERE id = $1")
+            .bind::<SqlUuid, _>(task_id)
+            .get_result::<StateRow>(conn)
+            .await
+            .expect("read task state")
+            .state
+    }
+
+    /// AC5: a session whose host has no `harvest_workers` row at all (never
+    /// registered, or GC'd) is reclaimed as broken -- the member task fails
+    /// with a distinct, non-retryable `SessionBroken` error, never silently
+    /// retried onto a different worker.
+    #[tokio::test]
+    async fn broken_session_scanner_reclaims_session_with_no_worker_row() {
+        let (mut conn, _c) = setup().await;
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let (exec_id, session_id, activity_id, task_id) =
+            setup_active_session(&mut conn, "worker-ghost", far_future).await;
+
+        let failed = sessions::enforce_broken_sessions(&mut conn, 60)
+            .await
+            .expect("enforce_broken_sessions");
+        assert_eq!(failed, 1, "exactly one member task should be failed");
+
+        assert_eq!(session_state(&mut conn, session_id).await, "BROKEN");
+        assert_eq!(task_state(&mut conn, task_id).await, "FAILED");
+
+        let history = store::load_history(&mut conn, exec_id)
+            .await
+            .expect("load history");
+        let found = history.events.iter().any(|e| {
+            matches!(
+                e,
+                WorkflowEvent::ActivityFailed {
+                    activity_id: id,
+                    error_type,
+                    non_retryable: true,
+                    ..
+                } if *id == activity_id && error_type == "SessionBroken"
+            )
+        });
+        assert!(
+            found,
+            "expected a non-retryable ActivityFailed{{error_type=SessionBroken}} event"
+        );
+    }
+
+    /// A session hosted by a live, healthy worker with an unexpired lease is
+    /// left entirely alone -- the scanner is a no-op.
+    #[tokio::test]
+    async fn broken_session_scanner_leaves_healthy_session_untouched() {
+        let (mut conn, _c) = setup().await;
+        insert_worker(&mut conn, "worker-alive", chrono::Utc::now(), "Active").await;
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let (_exec_id, session_id, _activity_id, task_id) =
+            setup_active_session(&mut conn, "worker-alive", far_future).await;
+
+        let failed = sessions::enforce_broken_sessions(&mut conn, 60)
+            .await
+            .expect("enforce_broken_sessions");
+        assert_eq!(failed, 0, "a healthy session must not be touched");
+
+        assert_eq!(session_state(&mut conn, session_id).await, "ACTIVE");
+        assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
+    }
+
+    /// AC5 (lease path): a session hosted by a live, healthy worker but whose
+    /// lease has elapsed is still reclaimed as broken -- guards against a
+    /// wedged workflow that never called `Session::complete()`.
+    #[tokio::test]
+    async fn broken_session_scanner_reclaims_session_with_expired_lease_even_if_host_alive() {
+        let (mut conn, _c) = setup().await;
+        insert_worker(&mut conn, "worker-alive", chrono::Utc::now(), "Active").await;
+        let already_expired = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let (_exec_id, session_id, _activity_id, task_id) =
+            setup_active_session(&mut conn, "worker-alive", already_expired).await;
+
+        let failed = sessions::enforce_broken_sessions(&mut conn, 60)
+            .await
+            .expect("enforce_broken_sessions");
+        assert_eq!(failed, 1);
+
+        assert_eq!(session_state(&mut conn, session_id).await, "BROKEN");
+        assert_eq!(task_state(&mut conn, task_id).await, "FAILED");
+    }
+
+    /// A worker whose status is `Draining` (still heartbeating) is treated as
+    /// broken -- a graceful drain must not leave a session hard-pinned to a
+    /// worker that will soon stop processing tasks.
+    #[tokio::test]
+    async fn broken_session_scanner_reclaims_session_hosted_by_draining_worker() {
+        let (mut conn, _c) = setup().await;
+        insert_worker(&mut conn, "worker-draining", chrono::Utc::now(), "Draining").await;
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let (_exec_id, session_id, _activity_id, task_id) =
+            setup_active_session(&mut conn, "worker-draining", far_future).await;
+
+        let failed = sessions::enforce_broken_sessions(&mut conn, 60)
+            .await
+            .expect("enforce_broken_sessions");
+        assert_eq!(failed, 1);
+
+        assert_eq!(session_state(&mut conn, session_id).await, "BROKEN");
+        assert_eq!(task_state(&mut conn, task_id).await, "FAILED");
+    }
+
+    /// Already-`BROKEN`/`COMPLETED` sessions are ignored -- the scanner only
+    /// ever transitions `ACTIVE` rows, so a concurrent scan (or a late
+    /// `Session::complete()` racing a prior sweep) is idempotent.
+    #[tokio::test]
+    async fn broken_session_scanner_ignores_already_completed_session() {
+        let (mut conn, _c) = setup().await;
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let (_exec_id, session_id, _activity_id, task_id) =
+            setup_active_session(&mut conn, "worker-ghost", far_future).await;
+        sessions::record_session_completed(
+            &mut conn,
+            autumn_harvest::types::SessionId::from_uuid(session_id),
+        )
+        .await
+        .expect("record_session_completed");
+
+        let failed = sessions::enforce_broken_sessions(&mut conn, 60)
+            .await
+            .expect("enforce_broken_sessions");
+        assert_eq!(failed, 0);
+        assert_eq!(session_state(&mut conn, session_id).await, "COMPLETED");
+        // The task row is untouched by the scanner; it may still be PENDING
+        // since this test never actually completed the underlying activity.
+        assert_eq!(task_state(&mut conn, task_id).await, "PENDING");
+    }
 }

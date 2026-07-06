@@ -2188,6 +2188,7 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         &[],
         None,
         None,
+        60,
     )
     .await
     .expect("timeout enforcement should succeed");

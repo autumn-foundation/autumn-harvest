@@ -1159,8 +1159,20 @@ pub struct CompletionDeliveryOutcomeUpdate {
 // ── Worker sessions (issue #606) ───────────────────────────────────────────
 
 /// A worker session row from `harvest_sessions`.
+///
+/// Derives `QueryableByName` (alongside the ORM-path `Queryable`) so the
+/// broken-session scanner's raw `LEFT JOIN` candidate scan
+/// ([`crate::sessions::broken_session_candidates_query`]) can load rows
+/// directly, mirroring `TaskQueueItem`'s identical dual-path precedent.
 #[derive(
-    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Queryable,
+    QueryableByName,
+    Selectable,
+    Identifiable,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 #[diesel(table_name = harvest_sessions)]
 #[diesel(check_for_backend(diesel::pg::Pg))]

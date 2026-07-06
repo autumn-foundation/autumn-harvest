@@ -10122,13 +10122,29 @@ impl Worker {
         #[cfg(not(feature = "db"))]
         let shard_pools_for_monitors: Vec<DbPool> = vec![pool.clone()];
 
+        // Worker-stale threshold mirrors the fleet-health classifier:
+        // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
+        // Double *before* rounding to whole seconds so a fractional interval
+        // (e.g. 1500ms → 3s, not 2s) keeps the documented liveness window, and
+        // cap at one year so an absurd interval can never overflow the
+        // chrono::Duration arithmetic in the reclaim path. Shared by the
+        // poison-pill reclaimer and the worker-session broken-session scanner
+        // (issue #606, folded into `enforce_timeouts_once`) -- both use the
+        // exact same "is this worker's heartbeat too old" liveness signal.
+        let doubled = self.config.worker_heartbeat_interval.saturating_mul(2);
+        let worker_stale_secs = i64::try_from(doubled.as_secs())
+            .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
+            .saturating_add(i64::from(doubled.subsec_nanos() > 0))
+            .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS);
+
         // One timeout checker per assigned shard. `enforce_timeouts_once` scans
         // the connection's *own* database (find_timed_out_tasks, external-task
         // timeouts, workflow-execution deadlines, SLA breaches, history
-        // ceiling), so a single checker on the default pool would leave expired
-        // tasks/executions on the other shards stuck RUNNING/PENDING forever.
-        // The cross-shard outbox helpers inside each pass still receive the full
-        // sharded_pool + shard_assignments so peer-shard delivery is unchanged.
+        // ceiling, broken worker sessions), so a single checker on the default
+        // pool would leave expired tasks/executions on the other shards stuck
+        // RUNNING/PENDING forever. The cross-shard outbox helpers inside each
+        // pass still receive the full sharded_pool + shard_assignments so
+        // peer-shard delivery is unchanged.
         let timeout_checkers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|shard_pool| {
@@ -10142,21 +10158,10 @@ impl Worker {
                     self.config.shard_assignments.clone(),
                     self.registry.circuit_breakers(),
                     self.config.max_workflow_history_events,
+                    worker_stale_secs,
                 )
             })
             .collect();
-
-        // Worker-stale threshold mirrors the fleet-health classifier:
-        // 2 × heartbeat interval, with a 1 s floor for sub-second intervals.
-        // Double *before* rounding to whole seconds so a fractional interval
-        // (e.g. 1500ms → 3s, not 2s) keeps the documented liveness window, and
-        // cap at one year so an absurd interval can never overflow the
-        // chrono::Duration arithmetic in the reclaim path.
-        let doubled = self.config.worker_heartbeat_interval.saturating_mul(2);
-        let worker_stale_secs = i64::try_from(doubled.as_secs())
-            .unwrap_or(crate::poison_pill::MAX_WORKER_STALE_SECS)
-            .saturating_add(i64::from(doubled.subsec_nanos() > 0))
-            .clamp(1, crate::poison_pill::MAX_WORKER_STALE_SECS);
 
         let poison_pill_reclaimers: Vec<_> = shard_pools_for_monitors
             .iter()

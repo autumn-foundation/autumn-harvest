@@ -331,6 +331,242 @@ pub async fn record_session_completed(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Broken-session scanner
+// ---------------------------------------------------------------------------
+
+/// Raw SQL selecting `ACTIVE` sessions whose host may no longer be viable.
+///
+/// A host is a candidate when it has no `harvest_workers` row at all, a
+/// stale heartbeat, a `Draining`/`Stopped` status, or an elapsed lease
+/// (`expires_at < NOW()`).
+///
+/// A broad, best-effort scan -- [`enforce_broken_sessions`] re-verifies each
+/// candidate (without a row lock, since `harvest_sessions` carries no
+/// meaningful concurrent-writer other than this scanner and
+/// `record_session_completed`, both idempotent-shaped via the `state =
+/// 'ACTIVE'` guard) before acting, mirroring the poison-pill reclaimer's
+/// broad-scan-then-reverify shape (issue #367).
+///
+/// `$1` is the worker-stale threshold in seconds (BIGINT), matching
+/// [`crate::poison_pill::orphaned_running_tasks_query`]'s convention.
+#[cfg(feature = "db")]
+#[must_use]
+pub const fn broken_session_candidates_query() -> &'static str {
+    "SELECT s.* FROM harvest_sessions s \
+     LEFT JOIN harvest_workers w ON w.worker_id = s.host_worker_id \
+     WHERE s.state = 'ACTIVE' \
+       AND ( \
+         w.worker_id IS NULL \
+         OR w.last_heartbeat_at <= NOW() - ($1::bigint * INTERVAL '1 second') \
+         OR w.status IN ('Draining', 'Stopped') \
+         OR s.expires_at < NOW() \
+       )"
+}
+
+/// Re-resolve why a candidate session's host is broken, re-reading
+/// `harvest_workers` fresh (guards against acting on a stale broad-scan
+/// snapshot, e.g. the host resurrected its heartbeat between the scan and
+/// this check). Returns `None` when the session is no longer actually
+/// broken.
+#[cfg(feature = "db")]
+async fn resolve_broken_reason(
+    conn: &mut diesel_async::AsyncPgConnection,
+    session: &crate::models::HarvestSession,
+    worker_stale_secs: i64,
+) -> crate::error::HarvestResult<Option<BrokenSessionReason>> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_workers::dsl as w;
+
+    let worker: Option<(chrono::DateTime<chrono::Utc>, String)> = w::harvest_workers
+        .filter(w::worker_id.eq(&session.host_worker_id))
+        .select((w::last_heartbeat_at, w::status))
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    let (host_heartbeat_stale, host_status_draining_or_stopped) = match worker {
+        // No worker row at all -- treat exactly like a dead host (a worker
+        // can be de-registered/GC'd without ever transitioning to Stopped).
+        None => (true, false),
+        Some((last_heartbeat_at, status)) => {
+            let cutoff = chrono::Utc::now() - chrono::Duration::seconds(worker_stale_secs);
+            (
+                last_heartbeat_at <= cutoff,
+                status == "Draining" || status == "Stopped",
+            )
+        }
+    };
+    let expired = lease_expired(chrono::Utc::now(), session.expires_at);
+
+    Ok(broken_session_reason(
+        host_heartbeat_stale,
+        host_status_draining_or_stopped,
+        expired,
+    ))
+}
+
+/// Mark one session `BROKEN` and fail every `PENDING`/`RUNNING` member
+/// activity task pinned to it (issue #606).
+///
+/// Runs in a single transaction (session row + member task rows always
+/// share one shard by construction): re-checks the session is still
+/// `ACTIVE` before acting (idempotent against a concurrent
+/// `record_session_completed` late-release racing this scan), transitions
+/// it to `BROKEN`, then for each affected member task appends an
+/// `ActivityFailed { error_type: "SessionBroken", non_retryable: true }`
+/// event (reusing the existing event variant -- no new `WorkflowEvent`),
+/// fails the task row, and wakes the workflow so it observes the failure on
+/// its very next decision cycle. `non_retryable` is required: a
+/// hard-pinned member task can never fail over to a different host, so a
+/// retryable failure would simply re-pend forever against the same dead
+/// host.
+///
+/// Returns the number of member tasks failed.
+#[cfg(feature = "db")]
+async fn break_session_and_fail_members(
+    conn: &mut diesel_async::AsyncPgConnection,
+    session_id: crate::types::SessionId,
+    reason: BrokenSessionReason,
+) -> crate::error::HarvestResult<usize> {
+    use diesel::prelude::*;
+    use diesel_async::{AsyncConnection, RunQueryDsl};
+    use scoped_futures::ScopedFutureExt;
+
+    use crate::error::HarvestError;
+    use crate::event::WorkflowEvent;
+    use crate::models::TaskQueueItem;
+
+    conn.transaction::<usize, HarvestError, _>(|conn| {
+        async move {
+            use crate::schema::harvest_sessions::dsl as s;
+            use crate::schema::harvest_task_queue::dsl as q;
+
+            let still_active: Option<String> = s::harvest_sessions
+                .find(session_id.as_uuid())
+                .for_update()
+                .select(s::state)
+                .first(conn)
+                .await
+                .optional()
+                .map_err(crate::error::database_error)?;
+            if still_active.as_deref() != Some("ACTIVE") {
+                return Ok(0);
+            }
+
+            diesel::update(s::harvest_sessions.find(session_id.as_uuid()))
+                .set(crate::models::SessionBrokenUpdate {
+                    state: "BROKEN".to_string(),
+                    broken_at: chrono::Utc::now(),
+                    broken_reason: reason.to_string(),
+                })
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
+            let member_tasks: Vec<TaskQueueItem> = q::harvest_task_queue
+                .filter(q::session_id.eq(Some(session_id.as_uuid())))
+                .filter(q::state.eq_any(["PENDING", "RUNNING"]))
+                .select(TaskQueueItem::as_select())
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+
+            let mut failed = 0usize;
+            for task in member_tasks {
+                let Some(exec_uuid) = task.workflow_exec_id else {
+                    continue;
+                };
+                let Some(activity_name) = task.activity_name.as_deref() else {
+                    continue;
+                };
+                let exec_id: crate::types::ExecutionId = exec_uuid
+                    .to_string()
+                    .parse()
+                    .expect("database UUIDs must round-trip into ExecutionId");
+
+                let history =
+                    crate::timeout::lock_workflow_execution_and_load_history(conn, exec_id).await?;
+                let Some(activity_id) = crate::timeout::pending_activity_id_for_task(
+                    &history.events,
+                    &task,
+                    activity_name,
+                )?
+                else {
+                    continue;
+                };
+                let Some(state) = crate::timeout::task_state_for_update(conn, task.id).await?
+                else {
+                    continue;
+                };
+                if state != "PENDING" && state != "RUNNING" {
+                    continue;
+                }
+
+                let attempt = u32::try_from(task.attempt.max(1)).unwrap_or(1);
+                let failed_event = WorkflowEvent::ActivityFailed {
+                    activity_id,
+                    error: reason.to_string(),
+                    attempt,
+                    error_type: crate::failure::ERROR_TYPE_SESSION_BROKEN.to_string(),
+                    non_retryable: true,
+                    details: None,
+                };
+                crate::store::append_events(conn, exec_id, &[failed_event], history.next_event_id)
+                    .await?;
+                crate::queue::fail_task(conn, task.id, &reason.to_string()).await?;
+                crate::queue::wake_workflow_task(conn, exec_id).await?;
+                failed += 1;
+            }
+
+            Ok(failed)
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Scan for and reclaim `ACTIVE` sessions whose host is no longer viable
+/// (issue #606) -- folded into [`crate::timeout::enforce_timeouts_once`], no
+/// separate poll loop.
+///
+/// `worker_stale_secs` mirrors the poison-pill reclaimer's convention: `2 ×
+/// worker_heartbeat_interval`, computed once by the caller.
+///
+/// Returns the number of member activity tasks failed across all sessions
+/// reclaimed this sweep (0 when no session was broken).
+///
+/// # Errors
+///
+/// Returns the first database error encountered.
+#[cfg(feature = "db")]
+pub async fn enforce_broken_sessions(
+    conn: &mut diesel_async::AsyncPgConnection,
+    worker_stale_secs: i64,
+) -> crate::error::HarvestResult<usize> {
+    use diesel_async::RunQueryDsl;
+
+    let candidates: Vec<crate::models::HarvestSession> =
+        diesel::sql_query(broken_session_candidates_query())
+            .bind::<diesel::sql_types::BigInt, _>(worker_stale_secs)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+    let mut total = 0usize;
+    for candidate in candidates {
+        let Some(reason) = resolve_broken_reason(conn, &candidate, worker_stale_secs).await? else {
+            continue;
+        };
+        let session_id = crate::types::SessionId::from_uuid(candidate.id);
+        total += break_session_and_fail_members(conn, session_id, reason).await?;
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +807,20 @@ mod tests {
         assert!(!try_acquire_session_slot(&counter, 1));
         release_session_slot(&counter);
         assert!(try_acquire_session_slot(&counter, 1));
+    }
+
+    // ── broken_session_candidates_query ──────────────────────────────────
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn broken_session_candidates_query_matches_active_sessions_with_dead_or_expired_hosts() {
+        let sql = broken_session_candidates_query();
+        assert!(sql.contains("s.state = 'ACTIVE'"));
+        assert!(sql.contains("w.worker_id IS NULL"));
+        assert!(sql.contains("w.last_heartbeat_at"));
+        assert!(sql.contains("Draining"));
+        assert!(sql.contains("Stopped"));
+        assert!(sql.contains("s.expires_at < NOW()"));
+        assert!(sql.contains("LEFT JOIN harvest_workers"));
     }
 }
