@@ -800,6 +800,7 @@ pub async fn trigger_unified_dag(
             origin: schedule
                 .as_ref()
                 .map(|_| crate::execution::ORIGIN_MANUAL_TRIGGER),
+            completion_callbacks: None,
         },
     )
     .await
@@ -2832,6 +2833,7 @@ async fn tick_one_workflow_schedule(
                 max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
                 // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
                 origin: Some(crate::execution::ORIGIN_SCHEDULED),
+                completion_callbacks: None,
             },
         )
         .await;
@@ -3750,6 +3752,7 @@ async fn drain_buffered_schedule_runs(
                     max_workflow_attempts_ceiling: registry.max_workflow_attempts_ceiling,
                     // Normal scheduler-tick fire — attributed as the schedule's cadence (issue #534).
                     origin: Some(crate::execution::ORIGIN_SCHEDULED),
+                    completion_callbacks: None,
                 },
             )
             .await;

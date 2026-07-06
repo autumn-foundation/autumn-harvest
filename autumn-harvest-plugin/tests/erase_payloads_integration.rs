@@ -170,7 +170,11 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
+    )
 );
 
 type HarvestApiApp = axum::Router;
@@ -319,6 +323,7 @@ async fn seed_execution_with_pii(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -442,6 +447,79 @@ async fn seed_signal_with_pii(conn: &mut AsyncPgConnection, exec_id: ExecutionId
         .unwrap();
 }
 
+/// Check if PII appears in a completion-callback delivery's frozen payload
+/// for an execution (issue #605 / PR #921 review).
+async fn pii_survives_in_completion_deliveries(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    pii: &str,
+) -> bool {
+    use autumn_harvest::schema::harvest_completion_deliveries;
+
+    let payloads: Vec<serde_json::Value> = harvest_completion_deliveries::table
+        .filter(harvest_completion_deliveries::workflow_exec_id.eq(exec_id.as_uuid()))
+        .select(harvest_completion_deliveries::payload)
+        .load(conn)
+        .await
+        .unwrap();
+
+    for p in &payloads {
+        if p.to_string().contains(pii) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Seed a still-`PENDING` completion-callback delivery whose frozen payload
+/// carries PII, mirroring what `evaluate_triggers_for_execution` would have
+/// enqueued for a real terminal transition.
+async fn seed_completion_delivery_with_pii(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    pii: &str,
+) -> uuid::Uuid {
+    use autumn_harvest::models::NewCompletionDelivery;
+    use autumn_harvest::schema::harvest_completion_deliveries;
+
+    let delivery_id = uuid::Uuid::new_v4();
+    diesel::insert_into(harvest_completion_deliveries::table)
+        .values(NewCompletionDelivery {
+            id: delivery_id,
+            workflow_exec_id: exec_id.as_uuid(),
+            shard_id: 0,
+            callback_index: 0,
+            workflow_name: "erasable",
+            workflow_id: "erase-pii-wf",
+            target_url: "https://receiver.example.com/hook",
+            event_filter: json!({ "type": "AnyTerminal" }),
+            terminal_state: "COMPLETED",
+            payload: json!({
+                "delivery_id": delivery_id,
+                "execution_id": exec_id.as_uuid(),
+                "workflow_name": "erasable",
+                "workflow_id": "erase-pii-wf",
+                "state": "COMPLETED",
+                "result": { "email": pii },
+                "completed_at": Utc::now().to_rfc3339(),
+            }),
+            max_attempts: 10,
+            retry_policy: json!({
+                "max_attempts": 10,
+                "initial_interval": { "secs": 30, "nanos": 0 },
+                "backoff_coefficient": 2.0,
+                "max_interval": { "secs": 600, "nanos": 0 },
+                "non_retryable_errors": [],
+                "jitter": "None"
+            }),
+            next_attempt_at: Utc::now(),
+        })
+        .execute(conn)
+        .await
+        .unwrap();
+    delivery_id
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 /// (a) + (b): Erase a completed execution with PII. After erase, no PII
@@ -513,6 +591,195 @@ async fn erase_tombstones_pii_in_events_row_and_signals() {
     assert!(
         event_count >= 2,
         "event rows must be retained, found {event_count}"
+    );
+}
+
+/// Issue #605 / PR #921 review (Codex P1): a completion-callback delivery's
+/// frozen `payload` carries the workflow's own result/error, so it must be
+/// scrubbed by erasure exactly like events/execution row/signals -- and the
+/// delivery row itself (`state`/`attempt`/`next_attempt_at`) must be left alone
+/// so a still-pending delivery keeps its retry schedule (it will now just
+/// post the tombstone marker instead of the real data).
+#[tokio::test]
+async fn erase_tombstones_pii_in_a_pending_completion_delivery_without_touching_its_schedule() {
+    use autumn_harvest::schema::harvest_completion_deliveries;
+
+    #[derive(Queryable)]
+    struct DeliverySchedule {
+        state: String,
+        attempt: i32,
+    }
+
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let pii = "bob@example.com";
+    let exec_id = seed_execution_with_pii(&mut conn, "erase-pii-wf-cb", pii).await;
+    mark_completed(&mut conn, exec_id).await;
+    let delivery_id = seed_completion_delivery_with_pii(&mut conn, exec_id, pii).await;
+
+    let before: DeliverySchedule = harvest_completion_deliveries::table
+        .find(delivery_id)
+        .select((
+            harvest_completion_deliveries::state,
+            harvest_completion_deliveries::attempt,
+        ))
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(before.state, "PENDING", "sanity: delivery starts PENDING");
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/erase-payloads"),
+        json!({ "reason": "GDPR Art. 17 DSR-002" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["completion_deliveries_scrubbed"].as_u64().unwrap_or(0) > 0,
+        "at least one completion-delivery row must have been scrubbed, body: {body}"
+    );
+
+    assert!(
+        !pii_survives_in_completion_deliveries(&mut conn, exec_id, pii).await,
+        "PII must not survive in harvest_completion_deliveries.payload"
+    );
+
+    // The delivery's own schedule (state/attempt) is untouched -- erasure
+    // must never interfere with delivery/retry mechanics, only scrub the
+    // data that would be sent.
+    let after: DeliverySchedule = harvest_completion_deliveries::table
+        .find(delivery_id)
+        .select((
+            harvest_completion_deliveries::state,
+            harvest_completion_deliveries::attempt,
+        ))
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.state, before.state,
+        "erasure must not change the delivery's state"
+    );
+    assert_eq!(
+        after.attempt, before.attempt,
+        "erasure must not change the delivery's attempt count"
+    );
+}
+
+/// Issue #921 review (Codex P1, follow-up): a completion-callback delivery
+/// that exhausted retries writes a *second*, independent copy of the frozen
+/// envelope into `harvest_dead_letters.input`. Scrubbing
+/// `harvest_completion_deliveries.payload` alone (the prior fix, tested
+/// above) leaves that DLQ copy carrying the erased PII, so this test seeds
+/// a `task_type = "CALLBACK"` dead-letter row directly (mirroring what
+/// `apply_outcome`'s `OutcomeAction::DeadLetter` branch would insert) and
+/// asserts erasure scrubs it too.
+#[tokio::test]
+async fn erase_tombstones_pii_in_a_callback_dead_letter_row() {
+    use autumn_harvest::dlq::{NewDeadLetterEntry, dead_letter};
+    use autumn_harvest::schema::harvest_dead_letters;
+
+    let (url, _container) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool);
+    let mut conn = AsyncPgConnection::establish(&url).await.unwrap();
+
+    let pii = "carol@example.com";
+    let exec_id = seed_execution_with_pii(&mut conn, "erase-pii-wf-cb-dlq", pii).await;
+    mark_completed(&mut conn, exec_id).await;
+    let delivery_id = seed_completion_delivery_with_pii(&mut conn, exec_id, pii).await;
+
+    let dead_letter_id = dead_letter(
+        &mut conn,
+        &NewDeadLetterEntry {
+            original_task_id: delivery_id,
+            queue_name: "completion-callback".to_string(),
+            task_type: "CALLBACK".to_string(),
+            workflow_exec_id: Some(exec_id.as_uuid()),
+            activity_name: None,
+            input: json!({
+                "delivery_id": delivery_id,
+                "execution_id": exec_id.as_uuid(),
+                "workflow_name": "erasable",
+                "workflow_id": "erase-pii-wf-cb-dlq",
+                "state": "COMPLETED",
+                "result": { "email": pii },
+                "completed_at": Utc::now().to_rfc3339(),
+            }),
+            error: "delivery exhausted 10 attempts".to_string(),
+            attempts: 10,
+            owner: None,
+            severity: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // An unrelated activity dead-letter for a *different* execution/task
+    // type must never be touched -- erasure is scoped to this execution's
+    // own CALLBACK rows only.
+    let other_exec_id =
+        seed_execution_with_pii(&mut conn, "unrelated-wf", "unrelated@example.com").await;
+    mark_completed(&mut conn, other_exec_id).await;
+    let unrelated_dead_letter_id = dead_letter(
+        &mut conn,
+        &NewDeadLetterEntry {
+            original_task_id: uuid::Uuid::new_v4(),
+            queue_name: "default".to_string(),
+            task_type: "ACTIVITY".to_string(),
+            workflow_exec_id: Some(other_exec_id.as_uuid()),
+            activity_name: Some("send_email".to_string()),
+            input: json!({ "email": "unrelated@example.com" }),
+            error: "boom".to_string(),
+            attempts: 3,
+            owner: None,
+            severity: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/workflows/{exec_id}/erase-payloads"),
+        json!({ "reason": "GDPR Art. 17 DSR-003" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["dead_letters_scrubbed"].as_u64(),
+        Some(1),
+        "exactly the one CALLBACK dead-letter row for this execution must be scrubbed, body: {body}"
+    );
+
+    let scrubbed_input: serde_json::Value = harvest_dead_letters::table
+        .find(dead_letter_id)
+        .select(harvest_dead_letters::input)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        !scrubbed_input.to_string().contains(pii),
+        "PII must not survive in the CALLBACK dead-letter's input: {scrubbed_input}"
+    );
+
+    // The unrelated ACTIVITY dead-letter for a different execution is
+    // completely untouched.
+    let unrelated_input: serde_json::Value = harvest_dead_letters::table
+        .find(unrelated_dead_letter_id)
+        .select(harvest_dead_letters::input)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        unrelated_input
+            .to_string()
+            .contains("unrelated@example.com"),
+        "an unrelated dead-letter row must never be touched by erasure"
     );
 }
 

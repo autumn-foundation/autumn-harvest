@@ -144,7 +144,11 @@ const INIT_SQL: &str = concat!(
     "\n",
     // issue #604: target_build_id/ramp_percent columns on harvest_build_policies.
     include_str!("../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    // issue #605: harvest_completion_deliveries table + completion_callbacks
+    // column on harvest_workflow_executions.
+    include_str!("../migrations/20260705000000_harvest_completion_deliveries/up.sql")
 );
 
 /// The minimal "legacy" migration set used by the upgrade-path regression
@@ -219,7 +223,10 @@ const LEGACY_INIT_SQL: &str = concat!(
     // nd_block_* columns even for a fresh (never-blocked) execution.
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_blocked_at TIMESTAMPTZ NULL;\n",
     "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_reason TEXT NULL;\n",
-    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_count INTEGER NOT NULL DEFAULT 0;\n"
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS nd_block_count INTEGER NOT NULL DEFAULT 0;\n",
+    // issue #605: the modern start path's full-row insert touches
+    // completion_callbacks even for a workflow with no configured callback.
+    "ALTER TABLE harvest_workflow_executions ADD COLUMN IF NOT EXISTS completion_callbacks JSONB NULL;\n"
 );
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -597,6 +604,7 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -662,6 +670,7 @@ async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts
         retry_of_exec_id: None,
         max_workflow_attempts_ceiling: None,
         origin: None,
+        completion_callbacks: None,
     };
 
     // On the legacy schema there is no `(workflow_name, workflow_id)`
@@ -4216,6 +4225,7 @@ async fn insert_named_workflow_execution(
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)
@@ -4873,6 +4883,7 @@ mod reuse_policy_helpers {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         }
     }
 
@@ -6171,6 +6182,7 @@ async fn search_attrs_upsert_visible_after_update_and_filterable() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -6340,6 +6352,7 @@ async fn search_attrs_survive_worker_crash_and_resume() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -7854,6 +7867,7 @@ async fn signal_blocked_workflow_times_out_at_deadline() {
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin: None,
+        completion_callbacks: None,
     };
     diesel::insert_into(harvest_workflow_executions::table)
         .values(&row)

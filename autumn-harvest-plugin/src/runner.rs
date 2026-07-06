@@ -116,6 +116,55 @@ impl PreparedHarvestRuntime {
         let shard_router = resources.shard_router.clone().unwrap_or_default();
         let retention_config = built.retention().clone();
         let history_archiver = built.history_archiver().cloned();
+        // Install the process-global completion-callback runtime config
+        // (issue #605): the deliverer/secret/allowlist/defaults/retry policy
+        // the core scanner (`fire_due_completion_deliveries`) and enqueue
+        // path (`enqueue_completion_deliveries`) read via
+        // `GLOBAL_CALLBACK_CONFIG`. Every `BuiltHarvest` consumer (the
+        // `HarvestPlugin` web-app path and the standalone runner) funnels
+        // through this one construction point, so this is set exactly once
+        // regardless of which path started the runtime. Core ships no HTTP
+        // client, so an embedder-supplied deliverer is used verbatim and a
+        // `reqwest`-based default is substituted otherwise.
+        {
+            let callback_config = built.completion_callback_config();
+            let deliverer = callback_config.deliverer.clone().unwrap_or_else(|| {
+                Arc::new(crate::callback_deliverer::ReqwestCallbackDeliverer::new())
+            });
+            let secret = callback_config.secret.clone().unwrap_or_else(|| {
+                // issue #605 code review: signing with an empty key is not a
+                // silent no-op -- HMAC-SHA256 accepts any key length and
+                // produces a valid, deterministic (and trivially
+                // reproducible by anyone) signature, so a caller who never
+                // configures `completion_callback_secret(...)` gets a
+                // `X-Harvest-Signature` header that carries no real
+                // authenticity guarantee at all. This is reachable for both
+                // builder-default AND per-execution targets (the latter
+                // bypass builder config entirely), so warn unconditionally
+                // rather than only when default targets are configured.
+                tracing::warn!(
+                    "completion-callback HMAC secret was never configured via \
+                     HarvestBuilder::completion_callback_secret(...) -- every \
+                     delivered callback will be signed with an empty key, which \
+                     defeats the X-Harvest-Signature authenticity guarantee for \
+                     any receiver relying on it"
+                );
+                autumn_harvest::completion_callback::CallbackSecret::new(Vec::new())
+            });
+            if let Ok(mut lock) =
+                autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG.write()
+            {
+                *lock = Some(Arc::new(
+                    autumn_harvest::completion_callback::CallbackRuntimeConfig {
+                        deliverer,
+                        secret,
+                        ssrf_policy: callback_config.ssrf_policy(),
+                        default_targets: callback_config.default_targets.clone(),
+                        retry_policy: callback_config.retry_policy.clone(),
+                    },
+                ));
+            }
+        }
         let classic_dag_names = built
             .dags()
             .iter()

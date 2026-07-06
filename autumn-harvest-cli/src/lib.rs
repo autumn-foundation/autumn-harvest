@@ -371,6 +371,12 @@ enum Commands {
         #[command(subcommand)]
         command: DeadLetterCommand,
     },
+    /// Inspect and redrive durable completion-callback deliveries (issue #605).
+    #[command(alias = "completion-deliveries", alias = "callbacks")]
+    CompletionDelivery {
+        #[command(subcommand)]
+        command: CompletionDeliveryCommand,
+    },
     /// Retention janitor operations.
     Retention {
         #[command(subcommand)]
@@ -1440,6 +1446,32 @@ enum DeadLetterCommand {
     },
 }
 
+/// Subcommands for `harvest completion-delivery` (issue #605).
+#[derive(Debug, Subcommand)]
+enum CompletionDeliveryCommand {
+    /// List completion-callback deliveries registered for a workflow execution.
+    ///
+    /// Includes PENDING, INFLIGHT, DELIVERED, and FAILED rows, ordered by
+    /// `callback_index`. Filtering by `--state` is applied client-side.
+    List {
+        /// Workflow execution ID.
+        execution_id: String,
+        /// Filter to a single delivery state: pending | inflight | delivered | failed.
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// Manually redrive a FAILED completion-callback delivery after fixing the receiver.
+    ///
+    /// Idempotent-shaped: redriving a delivery that is not currently FAILED
+    /// returns `ok=false` with `outcome="not_failed"` instead of erroring.
+    Redrive {
+        /// Workflow execution ID that owns the delivery.
+        execution_id: String,
+        /// Completion-delivery row ID, as returned by `list`.
+        delivery_id: String,
+    },
+}
+
 /// Subcommands for `harvest worker` (issue #170).
 #[derive(Debug, Subcommand)]
 enum WorkerCommand {
@@ -1543,6 +1575,7 @@ impl Cli {
             Commands::Dag { command } => dag_request(command, self.actor.as_deref()),
             Commands::Schedule { command } => schedule_request(command),
             Commands::Dlq { command } => Ok(dead_letter_request(command)),
+            Commands::CompletionDelivery { command } => Ok(completion_delivery_request(command)),
             Commands::Retention { command } => Ok(retention_request(command)),
             Commands::Concurrency { command } => Ok(concurrency_request(command)),
             Commands::RateLimit { command } => Ok(rate_limit_request(command)),
@@ -2007,6 +2040,10 @@ pub fn format_output(value: &Value, output: OutputFormat) -> Result<String, CliE
 }
 
 fn render_response(cli: &Cli, value: &Value) -> Result<String, CliError> {
+    let state_filtered = completion_delivery_list_state_filter(cli)
+        .map(|state| filter_completion_deliveries_by_state(value, state));
+    let value = state_filtered.as_ref().unwrap_or(value);
+
     if preflight_wants_table(cli) {
         return Ok(format_preflight_table(value));
     }
@@ -4359,6 +4396,72 @@ fn start_batch_request(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Builds the request for `harvest completion-delivery` subcommands (issue
+/// #605). `List`'s `--state` filter is applied client-side in
+/// `render_response` (the server has no query-param filter for this
+/// endpoint), so it never reaches the request path/body here.
+fn completion_delivery_request(command: &CompletionDeliveryCommand) -> ApiRequest {
+    match command {
+        CompletionDeliveryCommand::List {
+            execution_id,
+            state: _,
+        } => ApiRequest::get(format!(
+            "/workflows/{}/completion-deliveries",
+            path_segment(execution_id)
+        )),
+        CompletionDeliveryCommand::Redrive {
+            execution_id,
+            delivery_id,
+        } => ApiRequest::post(
+            format!(
+                "/workflows/{}/completion-deliveries/{}/redrive",
+                path_segment(execution_id),
+                path_segment(delivery_id)
+            ),
+            None,
+        ),
+    }
+}
+
+/// The `--state` filter for `harvest completion-delivery list`, if the
+/// current command is that one and the flag was supplied.
+const fn completion_delivery_list_state_filter(cli: &Cli) -> Option<&str> {
+    match &cli.command {
+        Commands::CompletionDelivery {
+            command:
+                CompletionDeliveryCommand::List {
+                    state: Some(state), ..
+                },
+        } => Some(state.as_str()),
+        _ => None,
+    }
+}
+
+/// Filter a `GET .../completion-deliveries` JSON array response down to rows
+/// whose `state` field matches `state` case-insensitively. Passes non-array
+/// values through unchanged (defensive; the endpoint always returns an
+/// array on success).
+fn filter_completion_deliveries_by_state(value: &Value, state: &str) -> Value {
+    let Some(rows) = value.as_array() else {
+        return value.clone();
+    };
+    Value::Array(
+        rows.iter()
+            .filter(|row| {
+                row.get("state")
+                    .and_then(Value::as_str)
+                    .is_some_and(|row_state| row_state.eq_ignore_ascii_case(state))
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+// Pre-existing clippy::too_many_lines debt (121 lines before issue #605
+// touched this file at all; unrelated to completion-callback deliveries).
+// Allowed here rather than left broken, matching the precedent already
+// established for `DeferredTriggerStart::spawn` in the core crate.
+#[allow(clippy::too_many_lines)]
 fn dead_letter_request(command: &DeadLetterCommand) -> ApiRequest {
     match command {
         DeadLetterCommand::List { limit } => ApiRequest::get(path_with_limit(
@@ -6298,6 +6401,135 @@ mod retry_activity_cli_tests {
             req.body.is_none(),
             "retry-activity must send no request body"
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_delivery_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("harvest").chain(args.iter().copied()))
+            .expect("CLI should parse successfully")
+    }
+
+    fn request(args: &[&str]) -> ApiRequest {
+        parse(args)
+            .api_request()
+            .expect("request mapping should succeed")
+    }
+
+    #[test]
+    fn list_builds_get_request_with_correct_path() {
+        let req = request(&["completion-delivery", "list", "exec-123"]);
+        assert_eq!(req.method, ApiMethod::Get);
+        assert_eq!(req.path, "/workflows/exec-123/completion-deliveries");
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn list_alias_completion_deliveries_parses() {
+        let req = request(&["completion-deliveries", "list", "exec-123"]);
+        assert_eq!(req.path, "/workflows/exec-123/completion-deliveries");
+    }
+
+    #[test]
+    fn list_alias_callbacks_parses() {
+        let req = request(&["callbacks", "list", "exec-123"]);
+        assert_eq!(req.path, "/workflows/exec-123/completion-deliveries");
+    }
+
+    #[test]
+    fn list_with_state_does_not_send_state_as_a_query_param() {
+        // --state is applied client-side in render_response, not sent to the
+        // server (the endpoint has no query-param filter).
+        let req = request(&[
+            "completion-delivery",
+            "list",
+            "exec-123",
+            "--state",
+            "failed",
+        ]);
+        assert_eq!(req.path, "/workflows/exec-123/completion-deliveries");
+    }
+
+    #[test]
+    fn redrive_builds_post_request_with_correct_path_and_no_body() {
+        let req = request(&["completion-delivery", "redrive", "exec-123", "delivery-456"]);
+        assert_eq!(req.method, ApiMethod::Post);
+        assert_eq!(
+            req.path,
+            "/workflows/exec-123/completion-deliveries/delivery-456/redrive"
+        );
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn execution_id_and_delivery_id_are_path_segment_encoded() {
+        let req = request(&["completion-delivery", "redrive", "exec/123", "del/456"]);
+        assert!(!req.path.contains("exec/123"));
+        assert!(!req.path.contains("del/456"));
+        assert!(req.path.contains("exec%2F123"));
+        assert!(req.path.contains("del%2F456"));
+    }
+
+    #[test]
+    fn filter_completion_deliveries_by_state_is_case_insensitive_and_keeps_matches() {
+        let value = json!([
+            { "delivery_id": "a", "state": "PENDING" },
+            { "delivery_id": "b", "state": "FAILED" },
+            { "delivery_id": "c", "state": "DELIVERED" },
+        ]);
+        let filtered = filter_completion_deliveries_by_state(&value, "failed");
+        assert_eq!(filtered, json!([{ "delivery_id": "b", "state": "FAILED" }]));
+    }
+
+    #[test]
+    fn filter_completion_deliveries_by_state_passes_non_array_through_unchanged() {
+        let value = json!({ "ok": true });
+        let filtered = filter_completion_deliveries_by_state(&value, "failed");
+        assert_eq!(filtered, value);
+    }
+
+    #[test]
+    fn render_response_applies_state_filter_only_for_completion_delivery_list() {
+        let cli = parse(&[
+            "completion-delivery",
+            "list",
+            "exec-123",
+            "--state",
+            "delivered",
+        ]);
+        let value = json!([
+            { "delivery_id": "a", "state": "PENDING" },
+            { "delivery_id": "b", "state": "DELIVERED" },
+        ]);
+        let rendered = render_response(&cli, &value).expect("should render");
+        let parsed: Value = serde_json::from_str(&rendered).expect("valid json");
+        assert_eq!(
+            parsed,
+            json!([{ "delivery_id": "b", "state": "DELIVERED" }])
+        );
+    }
+
+    #[test]
+    fn render_response_without_state_flag_returns_full_list() {
+        let cli = parse(&["completion-delivery", "list", "exec-123"]);
+        let value = json!([
+            { "delivery_id": "a", "state": "PENDING" },
+            { "delivery_id": "b", "state": "DELIVERED" },
+        ]);
+        let rendered = render_response(&cli, &value).expect("should render");
+        let parsed: Value = serde_json::from_str(&rendered).expect("valid json");
+        assert_eq!(parsed, value);
+    }
+
+    #[test]
+    fn redrive_command_never_applies_the_list_state_filter() {
+        // Sanity check that completion_delivery_list_state_filter is scoped
+        // to List and does not accidentally intercept Redrive's response.
+        let cli = parse(&["completion-delivery", "redrive", "exec-123", "delivery-456"]);
+        assert!(completion_delivery_list_state_filter(&cli).is_none());
     }
 }
 

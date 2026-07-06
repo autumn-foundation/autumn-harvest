@@ -34,18 +34,19 @@ use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
     self, AuditFilters, HEADER_ACTOR, HEADER_IDEMPOTENCY_KEY, HEADER_REQUEST_ID, HEADER_SOURCE,
     OP_ACTIVITY_RETRY_NOW, OP_BATCH_SUBMIT, OP_BUILD_COMPAT_DECLARE, OP_BUILD_COMPAT_REVOKE,
-    OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CIRCUIT_FORCE_CLOSE,
-    OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER, OP_DLQ_DISCARD_BULK,
-    OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK, OP_EXTERNAL_ACTIVITY_COMPLETE,
-    OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT, OP_RETENTION_RUN_NOW,
-    OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE,
-    OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_TASK_REPRIORITIZE, OP_WORKER_DRAIN,
-    OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RESET,
-    OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START,
-    OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API, STATUS_FAILED,
-    STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CIRCUIT,
-    TARGET_DAG, TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION,
-    TARGET_SCHEDULE, TARGET_TASK, TARGET_WORKER, TARGET_WORKFLOW,
+    OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE,
+    OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
+    OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
+    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
+    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
+    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_TASK_REPRIORITIZE,
+    OP_WORKER_DRAIN, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE,
+    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
+    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, SOURCE_API,
+    STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_BATCH, TARGET_BUILD_ROUTING,
+    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK,
+    TARGET_WORKER, TARGET_WORKFLOW,
 };
 use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
 use autumn_harvest::batch::{
@@ -331,6 +332,11 @@ pub struct HarvestApiState {
     /// Cap on distinct groups `GET /admin/usage` will return before failing
     /// loudly with `413` (issue #596). Defaults to 10,000.
     usage_max_groups: Arc<Mutex<usize>>,
+    /// SSRF policy for completion-callback targets (issue #605), mirrored
+    /// from `BuiltHarvest::completion_callback_config()` at startup so the
+    /// HTTP start route can validate a per-execution target the same way
+    /// `enqueue_completion_deliveries` re-validates at delivery time.
+    completion_callback_ssrf_policy: Arc<Mutex<autumn_harvest::completion_callback::SsrfPolicy>>,
 }
 
 impl Default for HarvestApiState {
@@ -366,6 +372,9 @@ impl Default for HarvestApiState {
             )),
             usage_max_groups: Arc::new(Mutex::new(
                 autumn_harvest::usage::default_usage_max_groups(),
+            )),
+            completion_callback_ssrf_policy: Arc::new(Mutex::new(
+                autumn_harvest::completion_callback::SsrfPolicy::default(),
             )),
         }
     }
@@ -472,6 +481,36 @@ impl HarvestApiState {
             .max_workflow_attempts
             .lock()
             .expect("harvest api state lock poisoned")
+    }
+
+    /// Set the SSRF policy used to validate completion-callback targets at
+    /// registration time (issue #605). Call this during startup from the
+    /// plugin to mirror `BuiltHarvest::completion_callback_config()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn set_completion_callback_ssrf_policy(
+        &self,
+        policy: autumn_harvest::completion_callback::SsrfPolicy,
+    ) {
+        *self
+            .completion_callback_ssrf_policy
+            .lock()
+            .expect("harvest api state lock poisoned") = policy;
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn completion_callback_ssrf_policy(
+        &self,
+    ) -> autumn_harvest::completion_callback::SsrfPolicy {
+        self.completion_callback_ssrf_policy
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone()
     }
 
     /// Set the hard ceiling on per-execution event count (issue #493).
@@ -1560,6 +1599,57 @@ struct RetryActivityNowResponse {
     already_eligible: bool,
 }
 
+/// Response row for `GET /workflows/{id}/completion-deliveries` (issue #605).
+#[derive(Debug, Serialize)]
+struct CompletionDeliveryResponse {
+    delivery_id: uuid::Uuid,
+    callback_index: i32,
+    target_url: String,
+    terminal_state: String,
+    /// `PENDING` | `INFLIGHT` | `DELIVERED` | `FAILED`.
+    state: String,
+    attempt: i32,
+    max_attempts: i32,
+    next_attempt_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_status: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivered_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<autumn_harvest::models::CompletionDelivery> for CompletionDeliveryResponse {
+    fn from(d: autumn_harvest::models::CompletionDelivery) -> Self {
+        Self {
+            delivery_id: d.id,
+            callback_index: d.callback_index,
+            target_url: d.target_url,
+            terminal_state: d.terminal_state,
+            state: d.state,
+            attempt: d.attempt,
+            max_attempts: d.max_attempts,
+            next_attempt_at: d.next_attempt_at,
+            last_status: d.last_status,
+            last_error: d.last_error,
+            created_at: d.created_at,
+            delivered_at: d.delivered_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct RedriveCompletionDeliveryResponse {
+    ok: bool,
+    execution_id: String,
+    delivery_id: String,
+    /// `redriven` | `not_found` | `not_failed`.
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_state: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ResetWorkflowResponse {
     new_exec_id: String,
@@ -1662,6 +1752,13 @@ pub(crate) struct StartWorkflowRequest {
     batch_key: Option<String>,
     batch_max_size: Option<usize>,
     batch_max_wait: Option<String>,
+    /// Per-execution completion-callback targets (issue #605): a JSON array
+    /// of `{url, filter}` objects (see
+    /// `autumn_harvest::completion_callback::CallbackTarget`). Each target's
+    /// URL is validated against the operator-configured SSRF host allowlist
+    /// before the workflow is admitted; a non-allowlisted target rejects the
+    /// start with `422` and a machine-readable reason.
+    completion_callbacks: Option<Value>,
 }
 
 impl StartWorkflowRequest {
@@ -1688,6 +1785,7 @@ impl StartWorkflowRequest {
             batch_key: None,
             batch_max_size: None,
             batch_max_wait: None,
+            completion_callbacks: None,
         }
     }
 
@@ -1723,6 +1821,7 @@ impl StartWorkflowRequest {
             batch_key: None,
             batch_max_size: None,
             batch_max_wait: None,
+            completion_callbacks: None,
         }
     }
 }
@@ -2735,6 +2834,14 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
             post(retry_activity_now).route_layer(require_admin.clone()),
         )
         .route(
+            "/workflows/{id}/completion-deliveries",
+            get(list_completion_deliveries).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",
+            post(redrive_completion_delivery).route_layer(require_admin.clone()),
+        )
+        .route(
             "/workflows/{id}/pause",
             post(pause_workflow).route_layer(require_admin.clone()),
         )
@@ -3123,6 +3230,11 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "POST",
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
         ),
+        ("GET", "/workflows/{id}/completion-deliveries"),
+        (
+            "POST",
+            "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",
+        ),
         ("POST", "/workflows/{id}/reset"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
         ("GET", "/workflows/{id}/queries"),
@@ -3266,6 +3378,7 @@ pub const fn management_api_request_fields()
                 "batch_key",
                 "batch_max_size",
                 "batch_max_wait",
+                "completion_callbacks",
             ]),
         ),
         (
@@ -3325,6 +3438,11 @@ pub const fn management_api_request_fields()
         (
             "POST",
             "/workflows/{id}/activities/{activity_exec_id}/retry-now",
+            Some(&[]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",
             Some(&[]),
         ),
         (
@@ -3747,6 +3865,35 @@ pub const fn management_api_response_fields()
                 "next_retry_at",
                 "advanced",
                 "already_eligible",
+            ]),
+        ),
+        (
+            "GET",
+            "/workflows/{id}/completion-deliveries",
+            Some(&[
+                "delivery_id",
+                "callback_index",
+                "target_url",
+                "terminal_state",
+                "state",
+                "attempt",
+                "max_attempts",
+                "next_attempt_at",
+                "last_status",
+                "last_error",
+                "created_at",
+                "delivered_at",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",
+            Some(&[
+                "ok",
+                "execution_id",
+                "delivery_id",
+                "outcome",
+                "current_state",
             ]),
         ),
         (
@@ -7204,6 +7351,84 @@ pub(crate) async fn start_workflow(
         return (axum::http::StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
 
+    // issue #605: validate each completion-callback target against the
+    // operator-configured SSRF host allowlist before the workflow is
+    // admitted. Runs before delayed-start checks for the same "fail fast,
+    // never reach the DB" reasoning as the schema check above.
+    let completion_callbacks = match request.completion_callbacks.clone() {
+        None => None,
+        Some(raw) => {
+            let targets: Vec<autumn_harvest::completion_callback::CallbackTarget> =
+                match serde_json::from_value(raw.clone()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        if let Ok(pool) = api_state.storage_pool()
+                            && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+                        {
+                            let ar = NewAuditRecord {
+                                actor: &actor,
+                                operation: OP_WORKFLOW_START,
+                                target_type: TARGET_WORKFLOW,
+                                target_id: Some(workflow_name.as_str()),
+                                route_or_command: route,
+                                request_id: request_id.as_deref(),
+                                idempotency_key: None,
+                                status: STATUS_FAILED,
+                                error_summary: Some("malformed completion_callbacks"),
+                                shard_id: None,
+                                source: &source,
+                            };
+                            let _ = audit::insert_audit(&mut conn, &ar).await;
+                        }
+                        return (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "malformed completion_callbacks",
+                                "message": e.to_string(),
+                            })),
+                        )
+                            .into_response();
+                    }
+                };
+
+            let policy = api_state.completion_callback_ssrf_policy();
+            for target in &targets {
+                if let Err(rejection) =
+                    autumn_harvest::completion_callback::validate_target_url(&target.url, &policy)
+                {
+                    if let Ok(pool) = api_state.storage_pool()
+                        && let Ok(mut conn) = acquire_conn(pool.default_pool()).await
+                    {
+                        let ar = NewAuditRecord {
+                            actor: &actor,
+                            operation: OP_WORKFLOW_START,
+                            target_type: TARGET_WORKFLOW,
+                            target_id: Some(workflow_name.as_str()),
+                            route_or_command: route,
+                            request_id: request_id.as_deref(),
+                            idempotency_key: None,
+                            status: STATUS_FAILED,
+                            error_summary: Some("completion callback target rejected"),
+                            shard_id: None,
+                            source: &source,
+                        };
+                        let _ = audit::insert_audit(&mut conn, &ar).await;
+                    }
+                    return (
+                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(serde_json::json!({
+                            "error": "completion callback target rejected",
+                            "url": target.url,
+                            "rejection": rejection,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+            Some(raw)
+        }
+    };
+
     // Validate delayed start parameters (issue #322)
     if request.start_at.is_some() && request.delay.is_some() {
         if let Ok(pool) = api_state.storage_pool()
@@ -7620,6 +7845,7 @@ pub(crate) async fn start_workflow(
                     trace_context: debounce_trace_ctx,
                     workflow_retry_policy: debounce_workflow_retry_policy,
                     max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                    completion_callbacks: completion_callbacks.clone(),
                 },
             };
 
@@ -7915,6 +8141,7 @@ pub(crate) async fn start_workflow(
                 trace_context: debounce_trace_ctx,
                 workflow_retry_policy: batch_workflow_retry_policy,
                 max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
+                completion_callbacks: completion_callbacks.clone(),
             },
         };
 
@@ -8098,6 +8325,7 @@ pub(crate) async fn start_workflow(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             origin: None,
+            completion_callbacks,
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
     )
@@ -8789,6 +9017,7 @@ async fn batch_start_workflows(
                     retry_of_exec_id: None,
                     max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
                     origin: None,
+                    completion_callbacks: None,
                 },
                 false,
                 item_reject_fresh,
@@ -11119,6 +11348,110 @@ async fn retry_activity_now(
             ))
         }
         Err(e) => Err(conflict_from(e)),
+    }
+}
+
+/// `GET /workflows/{id}/completion-deliveries` — list pending/failed
+/// (and delivered) completion-callback deliveries for an execution (issue
+/// #605). Read-only; no audit record, matching `GET /dead-letters`.
+async fn list_completion_deliveries(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<CompletionDeliveryResponse>>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+
+    let rows =
+        autumn_harvest::completion_callback::list_deliveries_for_execution(&mut conn, exec_id)
+            .await
+            .map_err(map_error)?;
+
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
+}
+
+/// `POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive` —
+/// manually redrive a dead-lettered completion-callback delivery after the
+/// receiver is fixed (issue #605). Admin-guarded. Self-contained: resets
+/// only the `harvest_completion_deliveries` row (same `delivery_id`, fresh
+/// retry budget) and clears its `harvest_dead_letters` entry; never touches
+/// `harvest_workflow_executions`. Idempotent-shaped: redriving a delivery
+/// that is not currently `FAILED` returns `200` with `outcome: "not_failed"`
+/// rather than erroring.
+async fn redrive_completion_delivery(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((id, delivery_id)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<
+    (
+        axum::http::StatusCode,
+        Json<RedriveCompletionDeliveryResponse>,
+    ),
+    AutumnError,
+> {
+    use autumn_harvest::models::NewAuditRecord;
+
+    let (actor, source, request_id) = audit_context(&headers, &api_state);
+    let route = "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive";
+
+    let exec_id = parse_execution_id(&id)?;
+    let Ok(delivery_uuid) = uuid::Uuid::parse_str(&delivery_id) else {
+        return Err(AutumnError::not_found_msg(format!(
+            "unknown delivery_id: {delivery_id}"
+        )));
+    };
+
+    let mut conn = db_conn_for_execution(&api_state, exec_id).await?;
+    let exec_id_str = exec_id.to_string();
+
+    let result =
+        autumn_harvest::completion_callback::redrive_delivery(&mut conn, exec_id, delivery_uuid)
+            .await;
+
+    let (status, error_summary) = match &result {
+        Ok(_) => (STATUS_SUCCEEDED, None),
+        Err(e) => (STATUS_FAILED, Some(e.to_string())),
+    };
+    let ar = NewAuditRecord {
+        actor: &actor,
+        operation: OP_CALLBACK_REDRIVE,
+        target_type: TARGET_CALLBACK_DELIVERY,
+        target_id: Some(delivery_id.as_str()),
+        route_or_command: route,
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status,
+        error_summary: error_summary.as_deref(),
+        shard_id: None,
+        source: &source,
+    };
+    let _ = audit::insert_audit(&mut conn, &ar).await;
+
+    match result.map_err(map_error)? {
+        autumn_harvest::completion_callback::DeliveryRedriveOutcome::Redriven => Ok((
+            axum::http::StatusCode::ACCEPTED,
+            Json(RedriveCompletionDeliveryResponse {
+                ok: true,
+                execution_id: exec_id_str,
+                delivery_id,
+                outcome: "redriven",
+                current_state: None,
+            }),
+        )),
+        autumn_harvest::completion_callback::DeliveryRedriveOutcome::NotFound => Err(
+            AutumnError::not_found_msg(format!("unknown delivery_id: {delivery_id}")),
+        ),
+        autumn_harvest::completion_callback::DeliveryRedriveOutcome::NotFailed {
+            current_state,
+        } => Ok((
+            axum::http::StatusCode::OK,
+            Json(RedriveCompletionDeliveryResponse {
+                ok: false,
+                execution_id: exec_id_str,
+                delivery_id,
+                outcome: "not_failed",
+                current_state: Some(current_state),
+            }),
+        )),
     }
 }
 
@@ -14277,6 +14610,7 @@ async fn trigger_schedule_now(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: api_state.max_workflow_attempts(),
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
+            completion_callbacks: None,
         },
         Some(runtime.registry.telemetry().metrics.as_ref()),
     )
@@ -15008,6 +15342,7 @@ async fn schedule_backfill(
                             .max_workflow_attempts_ceiling,
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
+                        completion_callbacks: None,
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                 )
@@ -15202,6 +15537,7 @@ async fn schedule_backfill(
                             .max_workflow_attempts_ceiling,
                         // Distinguish a backfill storm from normal cadence (issue #534).
                         origin: Some(autumn_harvest::execution::ORIGIN_BACKFILL),
+                        completion_callbacks: None,
                     },
                     Some(runtime.registry.telemetry().metrics.as_ref()),
                 )
@@ -24458,6 +24794,7 @@ mod tests {
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
                 origin: None,
+                completion_callbacks: None,
             },
             None,
         )
@@ -24535,6 +24872,7 @@ mod tests {
                 retry_of_exec_id: None,
                 max_workflow_attempts_ceiling: None,
                 origin: None,
+                completion_callbacks: None,
             },
             None,
         )

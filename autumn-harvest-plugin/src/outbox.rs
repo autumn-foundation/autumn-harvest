@@ -340,6 +340,7 @@ pub(crate) async fn dispatch_workflow_start_request(
             max_workflow_attempts_ceiling,
             // Outbox delivery is not a schedule fire (issue #534).
             origin: None,
+            completion_callbacks: None,
         },
         registry_ext.as_ref().map(|r| {
             r.telemetry().metrics.as_ref()

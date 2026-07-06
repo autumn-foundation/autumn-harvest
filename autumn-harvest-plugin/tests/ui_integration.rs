@@ -169,7 +169,11 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
+    ),
 );
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
@@ -420,6 +424,7 @@ async fn insert_workflow_on_url(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -2186,6 +2191,7 @@ async fn insert_child_workflow_on_url(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await

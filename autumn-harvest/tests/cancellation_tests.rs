@@ -97,7 +97,9 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
     include_str!("../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!("../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -191,6 +193,7 @@ async fn start_test_workflow(conn: &mut AsyncPgConnection) -> autumn_harvest::Ex
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -604,6 +607,7 @@ async fn running_activity_heartbeat_observes_workflow_cancellation() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -824,6 +828,7 @@ async fn uncooperative_activity_is_hard_aborted_after_grace_period() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -981,6 +986,7 @@ async fn activity_exits_early_on_workflow_cancellation() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -1135,6 +1141,7 @@ async fn activity_without_cancellation_check_completes_normally() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await

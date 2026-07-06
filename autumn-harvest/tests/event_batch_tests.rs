@@ -111,7 +111,9 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
     include_str!("../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!("../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
 );
 
 async fn setup_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -193,6 +195,200 @@ async fn test_event_batch_accumulation_and_size_flush() {
     assert_eq!(o3.pending_count, 3);
     assert!(o3.is_flushed);
     assert!(o3.flushed_execution_id.is_some());
+}
+
+/// Read back the `completion_callbacks` column for a started execution.
+async fn started_execution_completion_callbacks(
+    conn: &mut AsyncPgConnection,
+    wf_id: &str,
+) -> Option<serde_json::Value> {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        completion_callbacks: Option<serde_json::Value>,
+    }
+
+    diesel::sql_query(
+        "SELECT completion_callbacks FROM harvest_workflow_executions WHERE workflow_id=$1",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf_id)
+    .get_result::<Row>(conn)
+    .await
+    .expect("execution row query")
+    .completion_callbacks
+}
+
+// Regression (issue #605 code review): a per-execution completion_callbacks
+// target must survive both batch admission paths, not just the direct
+// start path -- neither a size-triggered flush nor a scanner-driven
+// time-based flush may silently drop it.
+#[tokio::test]
+async fn size_triggered_flush_threads_completion_callbacks_into_the_started_execution() {
+    let (mut conn, _container) = setup_db().await;
+    let callbacks = json!([
+        { "url": "https://api.example.com/hook", "filter": { "type": "AnyTerminal" } }
+    ]);
+
+    for i in 1..=3 {
+        let p = AdmitBatchParams {
+            workflow_name: "callback_batch_wf".to_string(),
+            batch_key: "key-cb".to_string(),
+            workflow_id: "callback-batch-001".to_string(),
+            queue_name: "default".to_string(),
+            payload: json!({"val": i}),
+            start_options: DebounceStartOptions {
+                completion_callbacks: Some(callbacks.clone()),
+                ..Default::default()
+            },
+            max_wait: Duration::from_secs(10),
+            max_size: 3,
+            shard_id: 0,
+        };
+        let (o, _deferred_starts) = admit_batched_start(&mut conn, p, None)
+            .await
+            .unwrap()
+            .unwrap();
+        if i == 3 {
+            assert!(o.is_flushed);
+            assert!(o.flushed_execution_id.is_some());
+        }
+    }
+
+    let stored = started_execution_completion_callbacks(&mut conn, "callback-batch-001").await;
+    assert_eq!(
+        stored,
+        Some(callbacks),
+        "a size-flushed batch start must carry the caller's completion_callbacks through"
+    );
+}
+
+// Regression (issue #921 review, Codex P2): the ON CONFLICT upsert only
+// ever updated buffered_payloads/fire_at, leaving the *first* admission's
+// start_options (including completion_callbacks) untouched. A later
+// admission into the same batch group that specified a *different*
+// completion_callbacks target would therefore be silently dropped -- that
+// caller's callback would never fire when the collapsed execution
+// completes. The two admissions' target arrays must instead be merged.
+#[tokio::test]
+async fn a_later_admissions_completion_callbacks_are_merged_not_dropped() {
+    let (mut conn, _container) = setup_db().await;
+    let first_target = json!([
+        { "url": "https://a.example.com/hook", "filter": { "type": "AnyTerminal" } }
+    ]);
+    let second_target = json!([
+        { "url": "https://b.example.com/hook", "filter": { "type": "CompletedOnly" } }
+    ]);
+
+    let p1 = AdmitBatchParams {
+        workflow_name: "callback_merge_batch_wf".to_string(),
+        batch_key: "key-cb-merge".to_string(),
+        workflow_id: "callback-merge-batch-001".to_string(),
+        queue_name: "default".to_string(),
+        payload: json!({"val": 1}),
+        start_options: DebounceStartOptions {
+            completion_callbacks: Some(first_target.clone()),
+            ..Default::default()
+        },
+        max_wait: Duration::from_secs(10),
+        max_size: 2,
+        shard_id: 0,
+    };
+    let (o1, _deferred_starts1) = admit_batched_start(&mut conn, p1, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!o1.is_flushed);
+
+    let p2 = AdmitBatchParams {
+        workflow_name: "callback_merge_batch_wf".to_string(),
+        batch_key: "key-cb-merge".to_string(),
+        workflow_id: "callback-merge-batch-001".to_string(),
+        queue_name: "default".to_string(),
+        payload: json!({"val": 2}),
+        start_options: DebounceStartOptions {
+            completion_callbacks: Some(second_target.clone()),
+            ..Default::default()
+        },
+        max_wait: Duration::from_secs(10),
+        max_size: 2,
+        shard_id: 0,
+    };
+    let (o2, _deferred_starts2) = admit_batched_start(&mut conn, p2, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        o2.is_flushed,
+        "second admission reaches max_size and flushes"
+    );
+
+    let stored = started_execution_completion_callbacks(&mut conn, "callback-merge-batch-001")
+        .await
+        .expect("flushed execution must carry completion_callbacks");
+    let stored_targets = stored.as_array().expect("completion_callbacks is an array");
+    assert_eq!(
+        stored_targets.len(),
+        2,
+        "both admissions' callback targets must survive, merged: {stored_targets:?}"
+    );
+    assert!(
+        stored_targets
+            .iter()
+            .any(|t| t["url"] == "https://a.example.com/hook"),
+        "the first admission's target must survive: {stored_targets:?}"
+    );
+    assert!(
+        stored_targets
+            .iter()
+            .any(|t| t["url"] == "https://b.example.com/hook"),
+        "the second (later) admission's target must survive, not be silently dropped: \
+         {stored_targets:?}"
+    );
+}
+
+#[tokio::test]
+async fn time_triggered_flush_threads_completion_callbacks_into_the_started_execution() {
+    let (mut conn, _container) = setup_db().await;
+    let callbacks = json!([
+        { "url": "https://api.example.com/hook", "filter": { "type": "CompletedOnly" } }
+    ]);
+
+    let p = AdmitBatchParams {
+        workflow_name: "callback_time_batch_wf".to_string(),
+        batch_key: "key-cb-time".to_string(),
+        workflow_id: "callback-time-batch-001".to_string(),
+        queue_name: "default".to_string(),
+        payload: json!({"val": 1}),
+        start_options: DebounceStartOptions {
+            completion_callbacks: Some(callbacks.clone()),
+            ..Default::default()
+        },
+        max_wait: Duration::from_secs(10),
+        max_size: 5,
+        shard_id: 0,
+    };
+    let (o, _deferred_starts) = admit_batched_start(&mut conn, p, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!o.is_flushed);
+
+    diesel::sql_query("UPDATE harvest_event_batches SET fire_at = NOW() - INTERVAL '1 minute'")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+    let fired = fire_due_event_batches(&mut conn, &None, &[], &NoOpMetrics)
+        .await
+        .unwrap();
+    assert_eq!(fired, 1);
+
+    let stored = started_execution_completion_callbacks(&mut conn, "callback-time-batch-001").await;
+    assert_eq!(
+        stored,
+        Some(callbacks),
+        "a time-flushed batch start must carry the caller's completion_callbacks through"
+    );
 }
 
 #[tokio::test]

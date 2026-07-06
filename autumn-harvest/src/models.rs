@@ -12,11 +12,11 @@ use uuid::Uuid;
 use crate::schema::{
     harvest_admission_gates, harvest_audit_log, harvest_backfill_log, harvest_batch_jobs,
     harvest_build_compat, harvest_build_policies, harvest_calendar_exclusions, harvest_calendars,
-    harvest_completion_trigger_fires, harvest_completion_trigger_outbox,
-    harvest_completion_triggers, harvest_dead_letters, harvest_events, harvest_external_tasks,
-    harvest_payload_refs, harvest_rate_limit_buckets, harvest_schedule_decisions,
-    harvest_schedules, harvest_signals, harvest_task_queue, harvest_timers, harvest_workers,
-    harvest_workflow_executions,
+    harvest_completion_deliveries, harvest_completion_trigger_fires,
+    harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_dead_letters,
+    harvest_events, harvest_external_tasks, harvest_payload_refs, harvest_rate_limit_buckets,
+    harvest_schedule_decisions, harvest_schedules, harvest_signals, harvest_task_queue,
+    harvest_timers, harvest_workers, harvest_workflow_executions,
 };
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
@@ -154,6 +154,10 @@ pub struct WorkflowExecution {
     /// Consecutive block entries for the current divergence incident (issue
     /// #603). Drives the re-dispatch backoff; reset to 0 on a clean cycle.
     pub nd_block_count: i32,
+    /// Per-execution completion-callback targets (issue #605): a JSON array
+    /// of `{url, filter}` objects. `None` = no per-execution targets; the
+    /// effective set is still the union with any builder-wide defaults.
+    pub completion_callbacks: Option<serde_json::Value>,
 }
 
 /// Insert struct for creating a new workflow execution.
@@ -201,6 +205,8 @@ pub struct NewWorkflowExecution<'a> {
     /// Dispatch origin (issue #534): `scheduled` / `backfill` / `manual_trigger` for
     /// schedule-attributed runs, `None` for all non-scheduled runs. Metadata only.
     pub origin: Option<&'a str>,
+    /// Per-execution completion-callback targets (issue #605). `None` = none configured.
+    pub completion_callbacks: Option<serde_json::Value>,
 }
 
 // ── HarvestEvent ──────────────────────────────────────────────────────────────
@@ -1050,4 +1056,87 @@ pub struct NewAdmissionGateRow<'a> {
     pub message: Option<&'a str>,
     pub created_by: &'a str,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+// ── CompletionDelivery ───────────────────────────────────────────────────────
+
+/// A durable completion-callback delivery row (issue #605).
+///
+/// One row per `(workflow_exec_id, callback_index)`, enqueued inside the
+/// terminal transaction and drained by the `fire_due_completion_deliveries`
+/// scanner.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_completion_deliveries)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CompletionDelivery {
+    pub id: Uuid,
+    pub workflow_exec_id: Uuid,
+    pub shard_id: i32,
+    pub callback_index: i32,
+    pub workflow_name: String,
+    pub workflow_id: String,
+    pub target_url: String,
+    pub event_filter: serde_json::Value,
+    pub terminal_state: String,
+    /// Frozen `CompletionEnvelope` JSON, signed and `POSTed` verbatim on every
+    /// attempt, including redeliveries.
+    pub payload: serde_json::Value,
+    /// `PENDING` | `INFLIGHT` | `DELIVERED` | `FAILED`.
+    pub state: String,
+    pub attempt: i32,
+    pub max_attempts: i32,
+    /// Frozen `RetryPolicy` JSON at enqueue time.
+    pub retry_policy: serde_json::Value,
+    pub next_attempt_at: DateTime<Utc>,
+    pub last_status: Option<i32>,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+/// Insert struct for enqueuing a new completion-callback delivery.
+#[derive(Debug, Insertable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_completion_deliveries)]
+pub struct NewCompletionDelivery<'a> {
+    pub id: Uuid,
+    pub workflow_exec_id: Uuid,
+    pub shard_id: i32,
+    pub callback_index: i32,
+    pub workflow_name: &'a str,
+    pub workflow_id: &'a str,
+    pub target_url: &'a str,
+    pub event_filter: serde_json::Value,
+    pub terminal_state: &'a str,
+    pub payload: serde_json::Value,
+    pub max_attempts: i32,
+    pub retry_policy: serde_json::Value,
+    pub next_attempt_at: DateTime<Utc>,
+}
+
+/// Changeset applied by the scanner after claiming a batch of due rows
+/// (transitions `PENDING`/`INFLIGHT` -> `INFLIGHT`, bumps `attempt`, and
+/// sets a short in-flight lease on `next_attempt_at`).
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = harvest_completion_deliveries)]
+pub struct CompletionDeliveryClaim {
+    pub state: String,
+    pub attempt: i32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Changeset applied after a delivery attempt completes, recording the
+/// outcome ([`crate::completion_callback::OutcomeAction`]).
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = harvest_completion_deliveries)]
+pub struct CompletionDeliveryOutcomeUpdate {
+    pub state: String,
+    pub next_attempt_at: DateTime<Utc>,
+    pub last_status: Option<i32>,
+    pub last_error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
 }

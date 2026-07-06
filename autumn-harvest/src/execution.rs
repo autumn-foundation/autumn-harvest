@@ -136,6 +136,12 @@ pub struct StartWorkflowParams<'a> {
     /// carryover, or shard routing, and is surfaced solely by the per-schedule
     /// run-history endpoint to distinguish normal cadence from backfill/manual fires.
     pub origin: Option<&'a str>,
+    /// Per-execution completion-callback targets (issue #605): a JSON array
+    /// of `{url, filter}` objects (see
+    /// [`crate::completion_callback::CallbackTarget`]). `None` = no
+    /// per-execution targets; the effective target set at the terminal
+    /// transition is still the union with any builder-wide defaults.
+    pub completion_callbacks: Option<serde_json::Value>,
 }
 
 /// Origin marker for a normal scheduler-tick fire (issue #534).
@@ -468,6 +474,7 @@ pub async fn start_or_load_workflow_execution_collect(
         }),
         retry_of_exec_id: request.retry_of_exec_id,
         origin: request.origin,
+        completion_callbacks: request.completion_callbacks.clone(),
     };
     let mut enqueue = EnqueueParams::new(
         request.queue_name.to_owned(),
@@ -2588,6 +2595,7 @@ pub async fn signal_with_start_workflow_execution_with_metrics(
                         retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
                         origin: None,
+                        completion_callbacks: None,
                     };
 
                 // For a debounced workflow, route the start through the no-spawn collect
@@ -3144,6 +3152,7 @@ pub async fn update_with_start_workflow_execution_with_metrics(
                         retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: request.max_workflow_attempts_ceiling,
                         origin: None,
+                        completion_callbacks: None,
                     };
 
                 // Debounced workflow: route through the no-spawn collect path with

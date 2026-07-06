@@ -581,6 +581,11 @@
             "name": "batch_max_wait",
             "required": false,
             "description": "Maximum wait duration from first trigger before flushing the batch (e.g. \"30s\", \"5m\")."
+          },
+          {
+            "name": "completion_callbacks",
+            "required": false,
+            "description": "Per-execution completion-callback targets (issue #605): a JSON array of {url, filter} objects. Each target's URL is validated against the operator-configured SSRF host allowlist before admission; a non-allowlisted target rejects the start with 422."
           }
         ]
       },
@@ -1164,6 +1169,108 @@
         {
           "status": 409,
           "description": "Task is not in PENDING state (e.g. currently RUNNING or already terminal)."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/workflows/{id}/completion-deliveries",
+      "category": "workflow",
+      "read_only": true,
+      "description": "List completion-callback deliveries (issue #605) for an execution, ordered by callback_index, including PENDING/INFLIGHT/DELIVERED/FAILED rows. Read-only; no audit record, matching GET /dead-letters.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Workflow execution UUID."
+        }
+      ],
+      "request_body": null,
+      "success_response": {
+        "status": 200,
+        "fields": [
+          "delivery_id",
+          "callback_index",
+          "target_url",
+          "terminal_state",
+          "state",
+          "attempt",
+          "max_attempts",
+          "next_attempt_at",
+          "last_status",
+          "last_error",
+          "created_at",
+          "delivered_at"
+        ],
+        "field_notes": {
+          "state": "PENDING | INFLIGHT | DELIVERED | FAILED.",
+          "last_status": "The HTTP status code of the most recent delivery attempt, if any.",
+          "last_error": "The transport error or non-2xx summary of the most recent delivery attempt, if any.",
+          "delivered_at": "Set only once the delivery reaches DELIVERED."
+        },
+        "note": "Response is a JSON array of these row objects, not a single object."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found."
+        },
+        {
+          "status": 500,
+          "description": "Database error."
+        }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",
+      "category": "workflow",
+      "read_only": false,
+      "description": "Manually redrive a dead-lettered completion-callback delivery (issue #605) after the receiver endpoint is fixed. Admin-guarded. Self-contained: resets only the harvest_completion_deliveries row (same delivery_id, fresh retry budget starting at attempt 0) and clears its harvest_dead_letters entry; never touches harvest_workflow_executions or the DLQ task-reactivation path.",
+      "idempotency": "Idempotent-shaped: redriving a delivery that is not currently FAILED returns 200 with outcome=\"not_failed\" instead of erroring. A delivery already reset to PENDING will not be re-redriven by a repeat call.",
+      "params": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Workflow execution UUID."
+        },
+        {
+          "name": "delivery_id",
+          "in": "path",
+          "required": true,
+          "description": "Completion-delivery row UUID, as returned by GET /workflows/{id}/completion-deliveries."
+        }
+      ],
+      "request_body": {
+        "required": false,
+        "free_form": false,
+        "fields": []
+      },
+      "success_response": {
+        "status": 202,
+        "fields": [
+          "ok",
+          "execution_id",
+          "delivery_id",
+          "outcome",
+          "current_state"
+        ],
+        "field_notes": {
+          "outcome": "\"redriven\" (202) or \"not_failed\" (200) — the not_failed case reuses this same field list on a 200 response.",
+          "current_state": "Only present when outcome=\"not_failed\"; the delivery's actual current state."
+        },
+        "note": "Status is 202 when outcome=\"redriven\" and 200 when outcome=\"not_failed\"; the field set is identical either way."
+      },
+      "error_responses": [
+        {
+          "status": 404,
+          "description": "Execution not found, or delivery_id is unknown / not a valid UUID."
         },
         {
           "status": 500,

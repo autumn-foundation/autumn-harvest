@@ -236,6 +236,19 @@ pub enum DeadLetterReason {
         task_timeout_strikes: i32,
         timeout_secs: u64,
     },
+    /// A completion-callback delivery (issue #605) exhausted its configured
+    /// retry budget without ever receiving a 2xx response. Distinct from
+    /// clean task-retry exhaustion: there is no `harvest_task_queue` row or
+    /// workflow execution to reactivate on redrive — an operator-triggered
+    /// redrive resets the *same* `harvest_completion_deliveries` row
+    /// (`completion_callback::redrive_delivery`) to `PENDING` so the
+    /// scanner re-attempts it with the same `delivery_id`.
+    CallbackDeliveryExhausted {
+        delivery_id: Uuid,
+        attempts: i32,
+        last_status: Option<u16>,
+        target: String,
+    },
 }
 
 impl std::fmt::Display for DeadLetterReason {
@@ -243,6 +256,47 @@ impl std::fmt::Display for DeadLetterReason {
         match serde_json::to_string(self) {
             Ok(json) => f.write_str(&json),
             Err(_) => f.write_str("DeadLetterReasonSerializationFailed"),
+        }
+    }
+}
+
+/// Delegate a `task_type = "CALLBACK"` dead-letter's replay to the
+/// completion-delivery redrive primitive (issue #605), so the generic DLQ
+/// replay surface (single-row API, bulk replay, UI) actually redrives the
+/// delivery instead of failing on `dead_letter_task_type`'s "invalid
+/// `task_type`" error (issue #921 review, Codex P2). Called from inside the
+/// caller's already-open transaction; `completion_callback::redrive_delivery`
+/// opens its own nested transaction (a savepoint) on the same connection,
+/// which is safe.
+///
+/// Returns the delivery's own id (`original_task_id`, stable across
+/// redrives) in place of a newly-created task-queue row id — there is no
+/// task-queue row for a completion delivery, so this is the closest
+/// equivalent "id of the unit of work that now represents this retry."
+async fn redrive_callback_dead_letter(
+    conn: &mut AsyncPgConnection,
+    dead_letter_id: Uuid,
+    workflow_exec_id: Option<Uuid>,
+    original_task_id: Uuid,
+) -> HarvestResult<Uuid> {
+    let exec_id = workflow_exec_id
+        .map(crate::types::ExecutionId::from_uuid)
+        .ok_or_else(|| {
+            HarvestError::Config(format!(
+                "dead-letter {dead_letter_id} is a CALLBACK entry with no workflow_exec_id"
+            ))
+        })?;
+
+    match crate::completion_callback::redrive_delivery(conn, exec_id, original_task_id).await? {
+        crate::completion_callback::DeliveryRedriveOutcome::Redriven => Ok(original_task_id),
+        crate::completion_callback::DeliveryRedriveOutcome::NotFound => Err(
+            HarvestError::NotFound(format!("dead-letter {dead_letter_id}")),
+        ),
+        crate::completion_callback::DeliveryRedriveOutcome::NotFailed { current_state } => {
+            Err(HarvestError::Config(format!(
+                "cannot replay dead-letter {dead_letter_id}: completion delivery \
+                 {original_task_id} is {current_state}, not FAILED"
+            )))
         }
     }
 }
@@ -409,6 +463,23 @@ pub async fn replay_dead_letter(
                 .optional()
                 .map_err(crate::error::database_error)?
                 .ok_or_else(|| HarvestError::NotFound(format!("dead-letter {dead_letter_id}")))?;
+
+            // A completion-callback dead letter (issue #605) is not a
+            // WORKFLOW/ACTIVITY task-queue row -- it represents an exhausted
+            // completion-delivery attempt, and "replay by re-enqueue" below
+            // has no meaning for it. Delegate to the delivery's own redrive
+            // primitive instead of erroring with "invalid task_type" (issue
+            // #921 review, Codex P2): the generic DLQ "replay" surface (API,
+            // bulk replay, UI) must actually redrive the delivery, not fail.
+            if entry.task_type.eq_ignore_ascii_case("callback") {
+                return redrive_callback_dead_letter(
+                    conn,
+                    dead_letter_id,
+                    entry.workflow_exec_id,
+                    entry.original_task_id,
+                )
+                .await;
+            }
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
@@ -833,6 +904,25 @@ pub async fn redrive_dead_letter(
                 // Already redriven (or discarded): idempotent no-op.
                 return Ok(RedriveOutcome::Skipped);
             };
+
+            // Delegate a completion-callback dead letter (issue #605) to its
+            // own redrive primitive instead of erroring with "invalid
+            // task_type" (issue #921 review, Codex P2) -- see
+            // `redrive_callback_dead_letter`'s doc comment.
+            if entry.task_type.eq_ignore_ascii_case("callback") {
+                return match redrive_callback_dead_letter(
+                    conn,
+                    dead_letter_id,
+                    entry.workflow_exec_id,
+                    entry.original_task_id,
+                )
+                .await
+                {
+                    Ok(delivery_id) => Ok(RedriveOutcome::Redriven(delivery_id)),
+                    Err(HarvestError::NotFound(_)) => Ok(RedriveOutcome::Skipped),
+                    Err(e) => Err(e),
+                };
+            }
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
@@ -1947,6 +2037,49 @@ mod tests {
         assert!(json.contains("WorkflowTaskTimeout"));
         assert!(json.contains("task_timeout_strikes"));
         assert!(json.contains("timeout_secs"));
+    }
+
+    #[test]
+    fn dead_letter_reason_callback_delivery_exhausted_is_typed_json() {
+        let delivery_id = Uuid::new_v4();
+        let reason = DeadLetterReason::CallbackDeliveryExhausted {
+            delivery_id,
+            attempts: 5,
+            last_status: Some(503),
+            target: "https://api.example.com/hook".into(),
+        };
+
+        let json = reason.to_string();
+        let back: DeadLetterReason =
+            serde_json::from_str(&json).expect("typed reason should deserialize");
+
+        assert_eq!(back, reason);
+        assert!(json.contains("CallbackDeliveryExhausted"));
+        assert!(json.contains("api.example.com"));
+        assert!(json.contains("503"));
+    }
+
+    #[test]
+    fn callback_delivery_exhausted_is_distinct_from_poison_pill_and_timeout() {
+        // A delivery DLQ entry must never be mistaken for clean task-retry
+        // exhaustion (issue #605 AC: "typed reason distinct from clean
+        // task-retry exhaustion").
+        let callback = DeadLetterReason::CallbackDeliveryExhausted {
+            delivery_id: Uuid::new_v4(),
+            attempts: 5,
+            last_status: None,
+            target: "https://api.example.com/hook".into(),
+        };
+        let poison_pill = DeadLetterReason::PoisonPill {
+            crash_strikes: 3,
+            last_worker_id: None,
+        };
+        assert_ne!(callback.to_string(), poison_pill.to_string());
+        assert!(!matches!(callback, DeadLetterReason::PoisonPill { .. }));
+        assert!(!matches!(
+            callback,
+            DeadLetterReason::WorkflowTaskTimeout { .. }
+        ));
     }
 
     #[test]

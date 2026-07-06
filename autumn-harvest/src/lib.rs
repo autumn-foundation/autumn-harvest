@@ -57,6 +57,11 @@ pub mod calendar;
 /// Per-activity circuit breaker that fast-fails dispatch during downstream
 /// outages (issue #369).
 pub mod circuit_breaker;
+/// Durable completion callbacks (issue #605).
+///
+/// Pushes a workflow's terminal result to an operator-registered URL,
+/// HMAC-signed and SSRF-guarded.
+pub mod completion_callback;
 pub mod completion_trigger;
 /// Per-key concurrency limits for tenant fair-share scheduling (issue #247).
 pub mod concurrency;

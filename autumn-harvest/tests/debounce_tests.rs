@@ -128,7 +128,9 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
     include_str!("../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!("../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
 );
 
 // ── Metrics recorder ─────────────────────────────────────────────────────────
@@ -217,6 +219,31 @@ async fn execution_count(conn: &mut AsyncPgConnection, wf: &str, wf_id: &str) ->
     .n
 }
 
+/// Read back the `completion_callbacks` column for a started execution.
+async fn started_execution_completion_callbacks(
+    conn: &mut AsyncPgConnection,
+    wf: &str,
+    wf_id: &str,
+) -> Option<serde_json::Value> {
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Jsonb>)]
+        completion_callbacks: Option<serde_json::Value>,
+    }
+
+    diesel::sql_query(
+        "SELECT completion_callbacks FROM harvest_workflow_executions WHERE workflow_name=$1 AND workflow_id=$2",
+    )
+    .bind::<diesel::sql_types::Text, _>(wf)
+    .bind::<diesel::sql_types::Text, _>(wf_id)
+    .get_result::<Row>(conn)
+    .await
+    .expect("execution row query")
+    .completion_callbacks
+}
+
 fn no_op_metrics() -> RecordingMetrics {
     RecordingMetrics::default()
 }
@@ -295,6 +322,145 @@ async fn burst_collapse_k_upserts_produce_one_row_and_one_execution() {
 
     // Exactly 1 execution
     assert_eq!(execution_count(&mut conn, wf, wf_id).await, 1);
+}
+
+// Regression (issue #605 code review): a per-execution completion_callbacks
+// target supplied on a request that resolves to the debounce admission path
+// must not be silently discarded -- it must reach the eventually-started
+// execution's `completion_callbacks` column, exactly like every other
+// operator-facing start option DebounceStartOptions already threads through
+// (owner, sla, memo, ...).
+#[tokio::test]
+async fn fire_due_debounced_starts_threads_completion_callbacks_into_the_started_execution() {
+    let (mut conn, _c) = setup_db().await;
+
+    let wf = "callback_debounce_wf";
+    let key = "tenant:callback";
+    let wf_id = "callback-debounce-001";
+    let window = Duration::from_millis(1);
+    let max_wait = Duration::from_secs(60);
+    let callbacks = serde_json::json!([
+        { "url": "https://api.example.com/hook", "filter": { "type": "AnyTerminal" } }
+    ]);
+
+    let mut params = admit_params(wf, key, wf_id, serde_json::json!({}), window, max_wait);
+    params.start_options.completion_callbacks = Some(callbacks.clone());
+    admit_debounced_start_ungated(&mut conn, params)
+        .await
+        .expect("admit");
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("fire");
+    assert_eq!(fired, 1);
+
+    let stored = started_execution_completion_callbacks(&mut conn, wf, wf_id).await;
+    assert_eq!(
+        stored,
+        Some(callbacks),
+        "the debounced start must carry the caller's validated completion_callbacks through to the started execution"
+    );
+}
+
+// Regression (issue #921 review): `admit_debounced_start`'s conflict path is
+// otherwise last-input-wins (matching the documented semantics), but that must
+// not apply to completion_callbacks -- an earlier admission's registered
+// callback would silently vanish if a later burst member (which wins on every
+// other field) carried no callback, or a different one. Two admissions for the
+// same key with distinct callback targets must both survive into the single
+// started execution's completion_callbacks column, mirroring the identical
+// array-merge fix already shipped for the batched-start path
+// (admit_batched_start).
+#[tokio::test]
+async fn debounce_conflict_merges_completion_callbacks_instead_of_overwriting() {
+    let (mut conn, _c) = setup_db().await;
+
+    let wf = "callback_merge_debounce_wf";
+    let key = "tenant:callback-merge";
+    let wf_id = "callback-debounce-merge-001";
+    let window = Duration::from_millis(50);
+    let max_wait = Duration::from_secs(60);
+
+    let callback_a = serde_json::json!(
+        { "url": "https://api.example.com/hook-a", "filter": { "type": "AnyTerminal" } }
+    );
+    let callback_b = serde_json::json!(
+        { "url": "https://api.example.com/hook-b", "filter": { "type": "CompletedOnly" } }
+    );
+
+    // First admission in the burst registers callback A.
+    let mut first = admit_params(wf, key, wf_id, serde_json::json!({}), window, max_wait);
+    first.start_options.completion_callbacks = Some(serde_json::json!([callback_a.clone()]));
+    admit_debounced_start_ungated(&mut conn, first)
+        .await
+        .expect("admit first");
+
+    // A later burst member for the same key registers a *different* callback
+    // (B) and no memory of A -- last-input-wins would otherwise clobber A here.
+    let mut second = admit_params(
+        wf,
+        key,
+        wf_id,
+        serde_json::json!({"later": true}),
+        window,
+        max_wait,
+    );
+    second.start_options.completion_callbacks = Some(serde_json::json!([callback_b.clone()]));
+    admit_debounced_start_ungated(&mut conn, second)
+        .await
+        .expect("admit second");
+
+    // Still exactly 1 row -- the burst collapsed as usual.
+    assert_eq!(debounce_row_count(&mut conn, wf, key).await, 1);
+
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let metrics = no_op_metrics();
+    let fired = fire_due_debounced_starts(&mut conn, &None, &[], &metrics)
+        .await
+        .expect("fire");
+    assert_eq!(fired, 1);
+
+    let stored = started_execution_completion_callbacks(&mut conn, wf, wf_id)
+        .await
+        .expect("completion_callbacks must be present");
+    let stored_targets = stored.as_array().expect("array").clone();
+    assert_eq!(
+        stored_targets.len(),
+        2,
+        "both burst members' callback registrations must survive the merge, got {stored_targets:?}"
+    );
+    assert!(
+        stored_targets.contains(&callback_a),
+        "the first admission's callback A must not be dropped by the second admission's conflict update"
+    );
+    assert!(
+        stored_targets.contains(&callback_b),
+        "the second admission's callback B must be present alongside A"
+    );
+
+    // Last-input-wins semantics for every *other* field are unaffected: the
+    // started run's input is the second (most recent) admission's input.
+    let started_input = {
+        use diesel_async::RunQueryDsl;
+
+        #[derive(diesel::QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = diesel::sql_types::Jsonb)]
+            input: serde_json::Value,
+        }
+        diesel::sql_query(
+            "SELECT input FROM harvest_workflow_executions WHERE workflow_name=$1 AND workflow_id=$2",
+        )
+        .bind::<diesel::sql_types::Text, _>(wf)
+        .bind::<diesel::sql_types::Text, _>(wf_id)
+        .get_result::<Row>(&mut conn)
+        .await
+        .expect("query started input")
+        .input
+    };
+    assert_eq!(started_input, serde_json::json!({"later": true}));
 }
 
 // ── AC6: trailing-edge semantics ─────────────────────────────────────────────
@@ -639,6 +805,7 @@ async fn no_debounce_policy_uses_normal_start_path() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await

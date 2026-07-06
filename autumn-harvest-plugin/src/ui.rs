@@ -2883,6 +2883,13 @@ fn dead_letter_task_kind_label(task_type: &str) -> &'static str {
         "Activity"
     } else if task_type.eq_ignore_ascii_case("workflow") {
         "Workflow"
+    } else if task_type.eq_ignore_ascii_case("callback") {
+        // Issue #605 completion-callback exhaustion. The generic "Replay"
+        // action still works for this row -- `dlq::replay_dead_letter`
+        // delegates it to the completion-delivery redrive primitive (issue
+        // #921 review) -- so no separate UI treatment is needed beyond a
+        // clear label.
+        "Callback"
     } else {
         "Unknown"
     }
@@ -6235,6 +6242,7 @@ async fn execute_schedule_trigger_ui(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: runtime.registry().max_workflow_attempts_ceiling,
             origin: Some(autumn_harvest::execution::ORIGIN_MANUAL_TRIGGER),
+            completion_callbacks: None,
         },
         Some(runtime.registry().telemetry().metrics.as_ref()),
     )
@@ -7154,6 +7162,17 @@ mod tests {
     }
 
     #[test]
+    fn dead_letter_task_kind_label_recognizes_callback_rows() {
+        // Issue #921 review: a completion-callback dead letter (issue #605)
+        // used to render as "Unknown" instead of a recognized kind.
+        assert_eq!(dead_letter_task_kind_label("CALLBACK"), "Callback");
+        assert_eq!(dead_letter_task_kind_label("callback"), "Callback");
+        assert_eq!(dead_letter_task_kind_label("ACTIVITY"), "Activity");
+        assert_eq!(dead_letter_task_kind_label("WORKFLOW"), "Workflow");
+        assert_eq!(dead_letter_task_kind_label("TIMER"), "Unknown");
+    }
+
+    #[test]
     fn event_label_disambiguates_terminate_from_cancel() {
         // The WorkflowCancelled event is reused for force-terminate (#504): the
         // timeline label must follow the authoritative execution state so a
@@ -8005,6 +8024,7 @@ mod tests {
             nd_blocked_at: None,
             nd_block_reason: None,
             nd_block_count: 0,
+            completion_callbacks: None,
         }
     }
 

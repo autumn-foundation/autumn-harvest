@@ -91,7 +91,9 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
     include_str!("../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!("../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
 );
 
 async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
@@ -228,6 +230,7 @@ async fn test_delayed_start_validation() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -281,6 +284,7 @@ async fn test_delayed_start_validation() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -395,6 +399,7 @@ async fn test_delayed_start_no_premature_dispatch() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -479,6 +484,7 @@ async fn test_delayed_start_cancel_before_firing() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -570,6 +576,7 @@ async fn test_delayed_start_workflow_started_event_timestamp() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -629,6 +636,7 @@ async fn test_immediate_start_skew_tolerance() {
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await

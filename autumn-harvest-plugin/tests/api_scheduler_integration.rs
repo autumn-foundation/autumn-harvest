@@ -191,7 +191,11 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
+    )
 );
 type HarvestApiApp = axum::Router;
 
@@ -610,6 +614,7 @@ async fn insert_workflow_on_url(
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -697,6 +702,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             retry_of_exec_id: None,
             max_workflow_attempts_ceiling: None,
             origin: None,
+            completion_callbacks: None,
         },
     )
     .await
@@ -865,6 +871,7 @@ async fn seed_dag_run_on_url(database_url: &str, dag_name: &str) -> uuid::Uuid {
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             origin: None,
+            completion_callbacks: None,
         })
         .execute(&mut conn)
         .await
@@ -1199,6 +1206,7 @@ async fn seed_scheduled_activity_task_from_url(
             workflow_retry_policy: None,
             retry_of_exec_id: None,
             origin: None,
+            completion_callbacks: None,
         })
         .execute(&mut conn)
         .await

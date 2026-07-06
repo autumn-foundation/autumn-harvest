@@ -129,7 +129,9 @@ const INIT_SQL: &str = concat!(
     include_str!("../migrations/20260628000001_harvest_execution_origin/up.sql"),
     include_str!("../migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"),
     include_str!("../migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql")
+    include_str!("../migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!("../migrations/20260705000000_harvest_completion_deliveries/up.sql"),
 );
 
 // ---------------------------------------------------------------------------
@@ -491,4 +493,97 @@ async fn quarantine_with_no_exec_id_only_fails_task() {
     assert_eq!(task_state(&mut conn, task_id).await, "FAILED");
     let dlq_count = dead_letter_count(&mut conn).await.expect("dlq count");
     assert_eq!(dlq_count, 1);
+}
+
+/// Count `harvest_events` rows for an execution.
+async fn event_count(conn: &mut AsyncPgConnection, exec_id: Uuid) -> i64 {
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    diesel::sql_query("SELECT COUNT(*) AS n FROM harvest_events WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id)
+        .load::<Count>(conn)
+        .await
+        .expect("event count query")
+        .into_iter()
+        .next()
+        .expect("row")
+        .n
+}
+
+/// Regression (issue #605 code review): a workflow-task timeout can race a
+/// legitimate completion that commits between the timeout firing and this
+/// quarantine's own transaction acquiring its lock. Quarantining must never
+/// clobber (or misreport, via a spurious `WorkflowFailed` event and a
+/// re-triggered completion-callback delivery) an execution that already
+/// reached a different terminal state.
+#[tokio::test]
+async fn quarantine_does_not_overwrite_an_execution_that_already_completed() {
+    let (mut conn, pool, _container) = setup().await;
+
+    let exec_id = insert_running_workflow(&mut conn).await;
+    let task_id = insert_running_workflow_task(&mut conn, exec_id, "worker-1").await;
+
+    // Simulate the race: a legitimate completion commits before the
+    // quarantine transaction acquires its row lock.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+         SET state = 'COMPLETED', output = '{}'::jsonb, completed_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .execute(&mut conn)
+    .await
+    .expect("simulate concurrent completion");
+
+    let events_before = event_count(&mut conn, exec_id).await;
+
+    let metrics = std::sync::Arc::new(RecordingMetrics::default());
+    quarantine_workflow_task_timeout(
+        &pool,
+        task_id,
+        Some(exec_id),
+        "worker-1",
+        3,
+        10,
+        "timeout_wf",
+        "default",
+        &*metrics,
+    )
+    .await;
+
+    // The timed-out task row is still failed/DLQ'd — that part is about the
+    // task, not the execution's own terminal outcome.
+    assert_eq!(task_state(&mut conn, task_id).await, "FAILED");
+    let dlq_count = dead_letter_count(&mut conn).await.expect("dlq count");
+    assert_eq!(dlq_count, 1);
+
+    // But the execution itself must be untouched: still COMPLETED, and no
+    // spurious WorkflowFailed event appended.
+    assert_eq!(
+        execution_state(&mut conn, exec_id).await,
+        "COMPLETED",
+        "a legitimately completed execution must not be overwritten to FAILED \
+         by a racing quarantine"
+    );
+    assert_eq!(
+        event_count(&mut conn, exec_id).await,
+        events_before,
+        "quarantine must not append a WorkflowFailed event once the execution \
+         has already left RUNNING/PAUSED"
+    );
+
+    // No terminal("failed") metric should have been recorded for this race.
+    let has_failed_terminal = {
+        let terminal = metrics.terminal.lock().unwrap();
+        terminal
+            .iter()
+            .any(|(wf, _, status)| wf == "timeout_wf" && status == "Failed")
+    };
+    assert!(
+        !has_failed_terminal,
+        "no failed-terminal metric should be recorded when quarantine loses the race"
+    );
 }

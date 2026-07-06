@@ -27,7 +27,10 @@ use crate::error::{HarvestError, HarvestResult, database_error};
 #[cfg(feature = "db")]
 use crate::schema::harvest_workflow_executions;
 #[cfg(feature = "db")]
-use crate::schema::{harvest_dead_letters, harvest_signals, harvest_task_queue, harvest_timers};
+use crate::schema::{
+    harvest_completion_deliveries, harvest_dead_letters, harvest_signals, harvest_task_queue,
+    harvest_timers,
+};
 #[cfg(feature = "db")]
 use crate::shard::ShardedDbPool;
 #[cfg(feature = "db")]
@@ -587,6 +590,38 @@ async fn run_shard_tick(
         active: true,
     };
 
+    // Reclaim `harvest_completion_deliveries` rows that resolved to
+    // `DELIVERED` *after* their owning execution was already collected
+    // (issue #921 review, Codex P2, follow-up). A PENDING/INFLIGHT/FAILED
+    // row is deliberately kept when its owner is collected below (the
+    // delivery may still need to retry or await redrive), but if that same
+    // row *later* succeeds, nothing else ever revisits it -- the candidate
+    // loop only ever iterates over still-live executions, so an orphaned
+    // row (whose `workflow_exec_id` no longer names an existing execution)
+    // would otherwise carry its frozen result/error PII with no retention
+    // bound at all. Scoped to `DELIVERED` only, matching the per-candidate
+    // delete's existing "not finished yet" rule for PENDING/INFLIGHT/FAILED
+    // rows. Runs once per shard tick (not per candidate) since it is a
+    // table-wide reclaim, not scoped to this tick's candidate batch.
+    {
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let reclaimed = diesel::sql_query(
+            "DELETE FROM harvest_completion_deliveries
+             WHERE state = 'DELIVERED'
+               AND NOT EXISTS (
+                   SELECT 1 FROM harvest_workflow_executions
+                   WHERE harvest_workflow_executions.id = harvest_completion_deliveries.workflow_exec_id
+               )",
+        )
+        .execute(&mut conn)
+        .await
+        .map_err(database_error)?;
+        outcome.deleted_count += reclaimed;
+    }
+
     while remaining > 0 {
         // Check out a short-lived connection just to load and claim this batch of candidates in a single transaction
         let mut conn = pool
@@ -934,9 +969,53 @@ async fn delete_candidate_execution(
             .await
             .map_err(database_error)?;
 
+            // `task_type = 'CALLBACK'` dead letters (issue #605) are
+            // excluded here (issue #921 review, Codex P2): a CALLBACK
+            // dead-letter row only ever exists for a delivery that reached
+            // `FAILED`, and the completion-deliveries delete just below
+            // deliberately keeps every non-`DELIVERED` (i.e. `FAILED`)
+            // delivery row around for redrive -- deleting its DLQ entry
+            // here would drop it from the `GET /dead-letters` / aggregate
+            // discovery surface while the delivery row itself (and its
+            // redrive path) still exists, breaking the advertised "find
+            // failures via DLQ" operator workflow for any callback failure
+            // that outlives the owning workflow's retention window. A
+            // redrive already deletes its own DLQ row on success, so this
+            // exclusion cannot leak an entry whose delivery was resolved.
             diesel::delete(
                 harvest_dead_letters::table
-                    .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate_id))),
+                    .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate_id)))
+                    .filter(harvest_dead_letters::task_type.ne("CALLBACK")),
+            )
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+
+            // `harvest_completion_deliveries.workflow_exec_id` has no `ON
+            // DELETE CASCADE` (issue #605 code review). Only `DELIVERED`
+            // rows are deleted here — a fully successful delivery has
+            // nothing left to do, so it is safe cleanup exactly like
+            // `harvest_dead_letters` above. A `PENDING`/`INFLIGHT`/`FAILED`
+            // row is deliberately left alone (PR #921 review, Codex): its
+            // `payload` is frozen precisely so delivery does not depend on
+            // the execution row surviving, and this execution reaching its
+            // retention age has no bearing on whether its callback still
+            // needs to be retried or is awaiting an operator's redrive.
+            // Known limitation: once its owning execution is collected, a
+            // surviving non-`DELIVERED` row references a `workflow_exec_id`
+            // that no longer exists (there is no FK to violate, so this is
+            // safe) and this retention pass will never revisit that exact
+            // execution again — so even if the delivery later resolves to
+            // `DELIVERED`, nothing currently deletes it. A future dedicated
+            // delivery-retention policy, scoped to this table's own age/
+            // state rather than its owning execution's, would be needed to
+            // reclaim those rows; out of scope here, where the goal is only
+            // to stop retention from destroying a delivery that hasn't
+            // finished yet.
+            diesel::delete(
+                harvest_completion_deliveries::table
+                    .filter(harvest_completion_deliveries::workflow_exec_id.eq(candidate_id))
+                    .filter(harvest_completion_deliveries::state.eq("DELIVERED")),
             )
             .execute(conn)
             .await

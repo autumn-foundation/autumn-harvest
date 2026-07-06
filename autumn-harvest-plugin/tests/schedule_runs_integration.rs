@@ -163,7 +163,11 @@ const INIT_SQL: &str = concat!(
         "../../autumn-harvest/migrations/20260703000000_harvest_task_queue_wake_requested/up.sql"
     ),
     include_str!("../../autumn-harvest/migrations/20260704000001_harvest_build_policy_ramp/up.sql"),
-    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql")
+    include_str!("../../autumn-harvest/migrations/20260704000000_harvest_workflow_nd_block/up.sql"),
+    "\n",
+    include_str!(
+        "../../autumn-harvest/migrations/20260705000000_harvest_completion_deliveries/up.sql"
+    ),
 );
 
 type HarvestApiApp = axum::Router;
@@ -309,6 +313,7 @@ async fn seed_run(
         workflow_retry_policy: None,
         retry_of_exec_id: None,
         origin,
+        completion_callbacks: None,
     };
     diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
         .values(&row)

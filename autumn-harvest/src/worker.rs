@@ -2939,6 +2939,11 @@ async fn persist_workflow_failure(
                         retry_of_exec_id: Some(exec_id.as_uuid()),
                         max_workflow_attempts_ceiling: None,
                         origin: exec_ref.origin.as_deref(),
+                        // Workflow-level retry (issue #523) is the same
+                        // logical run trying again — inherit the
+                        // predecessor's completion-callback targets (#605)
+                        // rather than silently dropping them.
+                        completion_callbacks: exec_ref.completion_callbacks.clone(),
                     };
 
                     match crate::execution::start_or_load_workflow_execution_collect(
@@ -4088,6 +4093,10 @@ async fn persist_all_started_child_workflows(
                             .and_then(|p| serde_json::to_value(&p).ok()),
                         retry_of_exec_id: None,
                         origin: None, // child workflow, not a schedule fire (issue #534)
+                        // Children get only builder-wide default callback
+                        // targets, resolved at their own terminal transition
+                        // (issue #605) — no per-execution override here.
+                        completion_callbacks: None,
                     };
                     let child_started_event = WorkflowEvent::WorkflowStarted {
                         input: child.input.clone(),
@@ -4709,6 +4718,9 @@ async fn create_detached_child_executions(
                 .and_then(|p| serde_json::to_value(&p).ok()),
             retry_of_exec_id: None,
             origin: None, // detached child workflow, not a schedule fire (issue #534)
+            // Detached children get only builder-wide default callback
+            // targets (issue #605) — no per-execution override here.
+            completion_callbacks: None,
         };
 
         diesel::insert_into(harvest_workflow_executions::table)
@@ -6241,6 +6253,9 @@ async fn persist_workflow_continue_as_new(
         // Preserve dispatch origin through continue-as-new so a continued scheduled run
         // stays attributed to its schedule's cadence (issue #534).
         origin: execution.origin.as_deref(),
+        // Continue-as-new is the same logical run forking forward: preserve
+        // the predecessor's completion-callback targets (issue #605).
+        completion_callbacks: execution.completion_callbacks.clone(),
     };
     let mut enqueue =
         queue::EnqueueParams::new(execution.queue_name.clone(), TaskType::Workflow, input);
@@ -11073,87 +11088,131 @@ pub async fn quarantine_workflow_task_timeout(
 
                 let (deferred, queue_used, closed_children) = if let Some(exec_uuid) = exec_id_opt {
                     if exec_exists {
-                        // Drain sibling tasks (PENDING/RUNNING) so they are not
-                        // claimed and run after the workflow has been terminally
-                        // failed. Mirrors the poison-pill quarantine path.
-                        diesel::update(
-                            task_dsl::harvest_task_queue
-                                .filter(task_dsl::workflow_exec_id.eq(exec_uuid))
-                                .filter(
-                                    task_dsl::state
-                                        .eq("PENDING")
-                                        .or(task_dsl::state.eq("RUNNING")),
-                                ),
-                        )
-                        .set((
-                            task_dsl::state.eq("FAILED"),
-                            task_dsl::error.eq(Some(error_msg.clone())),
-                            task_dsl::completed_at.eq(Some(chrono::Utc::now())),
-                        ))
-                        .execute(conn)
-                        .await
-                        .map_err(crate::error::database_error)?;
+                        // Lock the execution row and re-check its *current* state
+                        // before appending any event or mutating it further.
+                        //
+                        // A legitimate completion (or cancel/terminate/timeout) can
+                        // commit in the window between this workflow task's own
+                        // timeout firing and this transaction acquiring the lock —
+                        // `tokio::time::timeout` racing an already-durable side
+                        // effect is a well-known hazard. Proceeding unconditionally
+                        // used to append a spurious `WorkflowFailed` event onto a
+                        // run that actually finished some other way, and (per issue
+                        // #605's completion-callback delivery, which re-reads the
+                        // execution row inside `evaluate_triggers_for_execution`)
+                        // could deliver a signed callback claiming `state: failed`
+                        // while sourcing `output`/`completed_at` from the real,
+                        // concurrently-committed terminal row.
+                        let current_state: Option<String> = exec_dsl::harvest_workflow_executions
+                            .find(exec_uuid)
+                            .select(exec_dsl::state)
+                            .for_update()
+                            .first(conn)
+                            .await
+                            .optional()
+                            .map_err(crate::error::database_error)?;
 
-                        let exec_id = execution_id_from_uuid(exec_uuid);
-                        let history = crate::store::load_history(conn, exec_id).await?;
-                        crate::store::append_events(
-                            conn,
-                            exec_id,
-                            &[WorkflowEvent::WorkflowFailed {
-                                error: error_msg.clone(),
-                            }],
-                            history.next_event_id,
-                        )
-                        .await?;
-                        // update_workflow_execution_failed only transitions RUNNING
-                        // rows; ignore errors — the DLQ entry and event append are
-                        // the durable record.
-                        let _ = update_workflow_execution_failed(
-                            conn, exec_id, &worker_id, &error_msg, None,
-                        )
-                        .await;
-                        // Also handle the PAUSED → FAILED transition: an operator
-                        // may have paused the execution between dispatch and quarantine.
-                        let _ = diesel::update(
-                            exec_dsl::harvest_workflow_executions
-                                .find(exec_uuid)
-                                .filter(exec_dsl::state.eq("PAUSED")),
-                        )
-                        .set((
-                            exec_dsl::state.eq("FAILED"),
-                            exec_dsl::output.eq(None::<serde_json::Value>),
-                            exec_dsl::error.eq(Some(error_msg.clone())),
-                            exec_dsl::completed_at.eq(Some(chrono::Utc::now())),
-                        ))
-                        .execute(conn)
-                        .await;
-                        let (mut deferred, closed_children) =
-                            apply_parent_close_cascade(conn, exec_id).await?;
-                        let triggers = crate::completion_trigger::evaluate_triggers_for_execution(
-                            conn,
-                            exec_id,
-                            crate::completion_trigger::TerminalState::Failed,
-                            None,
-                        )
-                        .await?;
-                        deferred.extend(triggers);
-                        // Notify the parent only for awaited children (those without
-                        // a parent_close_policy). Detached children are managed by
-                        // apply_parent_close_cascade above, mirroring the poison-pill
-                        // and timeout paths.
-                        if parent_close_policy_opt.is_none()
-                            && let Some(parent_uuid) = parent_id_opt
-                        {
-                            let parent_exec_id = execution_id_from_uuid(parent_uuid);
-                            let _ = wake_parent_for_child_failure(
+                        if matches!(current_state.as_deref(), Some("RUNNING" | "PAUSED")) {
+                            // Drain sibling tasks (PENDING/RUNNING) so they are not
+                            // claimed and run after the workflow has been terminally
+                            // failed. Mirrors the poison-pill quarantine path.
+                            diesel::update(
+                                task_dsl::harvest_task_queue
+                                    .filter(task_dsl::workflow_exec_id.eq(exec_uuid))
+                                    .filter(
+                                        task_dsl::state
+                                            .eq("PENDING")
+                                            .or(task_dsl::state.eq("RUNNING")),
+                                    ),
+                            )
+                            .set((
+                                task_dsl::state.eq("FAILED"),
+                                task_dsl::error.eq(Some(error_msg.clone())),
+                                task_dsl::completed_at.eq(Some(chrono::Utc::now())),
+                            ))
+                            .execute(conn)
+                            .await
+                            .map_err(crate::error::database_error)?;
+
+                            let exec_id = execution_id_from_uuid(exec_uuid);
+                            let history = crate::store::load_history(conn, exec_id).await?;
+                            crate::store::append_events(
                                 conn,
-                                parent_exec_id,
                                 exec_id,
-                                &error_msg,
+                                &[WorkflowEvent::WorkflowFailed {
+                                    error: error_msg.clone(),
+                                }],
+                                history.next_event_id,
+                            )
+                            .await?;
+                            // update_workflow_execution_failed only transitions RUNNING
+                            // rows; ignore errors — the DLQ entry and event append are
+                            // the durable record.
+                            let _ = update_workflow_execution_failed(
+                                conn, exec_id, &worker_id, &error_msg, None,
                             )
                             .await;
+                            // Also handle the PAUSED → FAILED transition: an operator
+                            // may have paused the execution between dispatch and quarantine.
+                            let _ = diesel::update(
+                                exec_dsl::harvest_workflow_executions
+                                    .find(exec_uuid)
+                                    .filter(exec_dsl::state.eq("PAUSED")),
+                            )
+                            .set((
+                                exec_dsl::state.eq("FAILED"),
+                                exec_dsl::output.eq(None::<serde_json::Value>),
+                                exec_dsl::error.eq(Some(error_msg.clone())),
+                                exec_dsl::completed_at.eq(Some(chrono::Utc::now())),
+                            ))
+                            .execute(conn)
+                            .await;
+                            let (mut deferred, closed_children) =
+                                apply_parent_close_cascade(conn, exec_id).await?;
+                            let triggers =
+                                crate::completion_trigger::evaluate_triggers_for_execution(
+                                    conn,
+                                    exec_id,
+                                    crate::completion_trigger::TerminalState::Failed,
+                                    None,
+                                )
+                                .await?;
+                            deferred.extend(triggers);
+                            // Notify the parent only for awaited children (those without
+                            // a parent_close_policy). Detached children are managed by
+                            // apply_parent_close_cascade above, mirroring the poison-pill
+                            // and timeout paths.
+                            if parent_close_policy_opt.is_none()
+                                && let Some(parent_uuid) = parent_id_opt
+                            {
+                                let parent_exec_id = execution_id_from_uuid(parent_uuid);
+                                let _ = wake_parent_for_child_failure(
+                                    conn,
+                                    parent_exec_id,
+                                    exec_id,
+                                    &error_msg,
+                                )
+                                .await;
+                            }
+                            (deferred, Some(entry.queue_name.clone()), closed_children)
+                        } else {
+                            // The execution already reached a different terminal
+                            // state (or was deleted/archived) before this
+                            // quarantine's lock was acquired: this attempt lost the
+                            // race. The timed-out task row itself is still
+                            // failed/DLQ'd above (that part is about the task, not
+                            // the workflow's own terminal outcome), but the
+                            // execution — and any completion-callback delivery for
+                            // it — must not be touched.
+                            tracing::warn!(
+                                exec_id = %exec_uuid,
+                                current_state = ?current_state,
+                                "workflow task timeout quarantine: execution already \
+                                 left RUNNING/PAUSED before the quarantine lock was \
+                                 acquired; skipping the WorkflowFailed transition"
+                            );
+                            (Vec::new(), None, Vec::new())
                         }
-                        (deferred, Some(entry.queue_name.clone()), closed_children)
                     } else {
                         (Vec::new(), None, Vec::new())
                     }

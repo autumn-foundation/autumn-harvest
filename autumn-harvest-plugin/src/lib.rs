@@ -1,6 +1,11 @@
 //! Autumn plugin crate for autumn-harvest.
 
 pub mod api;
+/// Default `reqwest`-based completion-callback deliverer (issue #605).
+///
+/// Implements [`autumn_harvest::completion_callback::CompletionCallbackDeliverer`],
+/// auto-wired by [`crate::plugin::HarvestPlugin`].
+pub mod callback_deliverer;
 pub mod config;
 pub mod dag_retry;
 pub mod outbox;

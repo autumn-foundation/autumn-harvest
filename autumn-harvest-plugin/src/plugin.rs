@@ -564,6 +564,14 @@ async fn start_harvest_runtime(
     api_state.set_usage_max_groups(built.usage_max_groups);
     // Propagate batch start caps from builder config (issue #357).
     api_state.set_batch_start_config(&built.batch_start_config);
+    // Propagate the completion-callback SSRF policy (issue #605) so the
+    // HTTP start route validates a per-execution target against the same
+    // allowlist the scanner re-validates at delivery time. The full runtime
+    // config (deliverer/secret/defaults/retry policy) is installed by
+    // `PreparedHarvestRuntime::build` inside `HarvestRunner::start` below,
+    // which every `BuiltHarvest` consumer (this plugin and the standalone
+    // runner) funnels through.
+    api_state.set_completion_callback_ssrf_policy(built.completion_callback_config().ssrf_policy());
 
     // Apply the api_state audit retention override only when explicitly set,
     // so that builder-level retention config is not silently clobbered.
@@ -719,6 +727,7 @@ async fn start_harvest_runtime(
                         retry_of_exec_id: None,
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
                         origin: None,
+                        completion_callbacks: None,
                     };
 
                     let Some(harvest_db) = harvest_db else {
