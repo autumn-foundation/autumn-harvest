@@ -5,7 +5,87 @@ instruments that cover every production-observable aspect of the engine. The
 default implementation (`NoOpMetrics`) is zero-cost; no samples are emitted
 until you register a recorder.
 
-## Quick start with `metrics-exporter-prometheus`
+## Recommended: the built-in scrape endpoint (issue #355)
+
+If you're embedding Harvest via `autumn-harvest-plugin`'s `HarvestPlugin` in
+an autumn-web app, this is the fastest path to a working Prometheus scrape —
+one builder call, no exporter to install, no route to wire, and no new
+dependency (rendering is done entirely through autumn-web's existing
+`MetricsSource` contract):
+
+```toml
+[dependencies]
+autumn-harvest-plugin = { version = "0.4", features = ["metrics"] }
+```
+
+```rust
+let app = autumn_web::app().plugin(
+    HarvestPlugin::new()
+        .workflows(workflows![onboarding])
+        .activities(activities![send_email])
+        .api("/api/harvest")
+        .with_metrics_scrape(),
+);
+```
+
+`with_metrics_scrape()` registers a `HarvestMetricsRecorder` as both the
+engine's `MetricsRecorder` (via `HarvestBuilder::telemetry`) and an
+autumn-web `MetricsSource` (via `AppBuilder::metrics_source`). The metrics it
+covers then appear on the app's **one, already-shared** `/actuator/prometheus`
+endpoint, alongside the app's own `autumn_http_*` families and any other
+plugin's metrics — there is deliberately no separate, Harvest-owned scrape
+route. This is the "one endpoint for autumn-web apps and their plugins"
+model: every plugin registers its metrics into the same scrape, instead of
+each mounting its own.
+
+```bash
+curl http://localhost:8080/actuator/prometheus
+```
+
+Auth posture is governed entirely by the app's own `[actuator]` config
+(`actuator.prometheus`, profile-aware sensitive-endpoint gating) — the same
+policy that already protects the app's other actuator endpoints, rather than
+a second, Harvest-specific toggle.
+
+**Coverage:** this endpoint aggregates the nine ADR-0001 §7 catalogue
+metrics named in issue #355 (`harvest.workflow.started`,
+`harvest.workflow.duration`, `harvest.activity.duration`,
+`harvest.timer.started`, `harvest.queue.depth`, `harvest.dlq.entries`,
+`harvest.schedule.runs`, `harvest.schedule.skipped`,
+`harvest.retention.deleted`), plus `harvest.queue.oldest_pending_age`,
+`harvest.worker.slots_in_use`/`slots_available`/`slot_target`, and
+`harvest.shard.stranded_pending` — the engine's own background samplers
+already compute these under the same `is_enabled()` gate the nine required
+metrics live behind, so they're implemented too rather than sampled and
+discarded. **It does not back the full starter alert pack**
+(`docs/alerts/starter-pack-v0.1.0.json`), which also references metrics this
+endpoint never emits (e.g. `harvest_workflow_terminal_total`,
+`harvest_activity_attempts_total`/`retries_total`,
+`harvest_schedule_fire_attempts_total`, `harvest_no_active_workers`). If you
+want the full starter alert pack to work, use the `metrics-rs` adapter
+escape hatch below, which bridges every `MetricsRecorder` method.
+
+**Trade-off:** `autumn_web::actuator::MetricsSource`'s `MetricKind` only
+supports `Counter`/`Gauge` (no histogram variant), so `harvest.workflow.duration`
+and `harvest.activity.duration` are rendered as `_count`/`_sum` counter pairs
+rather than a bucketed histogram. That's enough for an average-latency query
+(`rate(harvest_workflow_duration_sum[5m]) / rate(harvest_workflow_duration_count[5m])`)
+but not for `histogram_quantile(...)`. If you need full bucketed histograms
+(e.g. for the starter alert pack's `harvest_queue_schedule_to_start_high` p99
+alert), OTLP export, or a custom recorder, use the `metrics-rs` adapter
+escape hatch below instead — a fresh `HarvestBuilder::telemetry(...)` call
+(or a second `HarvestPlugin` that never calls `.with_metrics_scrape()`)
+overrides nothing else in your app.
+
+See `autumn-harvest-plugin/examples/metrics_scrape_quickstart.rs` for a
+complete runnable example: `cargo run`, `curl .../actuator/prometheus`, see
+all nine metrics after a single workflow run.
+
+## Escape hatch: `metrics-exporter-prometheus` for full histograms, OTLP, or a custom recorder
+
+Reach for this path if you need bucketed histogram `_bucket` series, OTLP
+push, or you already have a global `metrics`-crate recorder installed for
+app-level metrics.
 
 Enable the in-tree `metrics-rs` adapter in your application's `Cargo.toml`:
 

@@ -18,6 +18,11 @@ webhooks = ["autumn-harvest/db"]
 # autumn-web's MCP layer so HarvestPlugin::mcp_tools() can project workflows
 # as start/status/signal/update/watch tools via AppBuilder::mount_mcp.
 mcp = ["autumn-web/mcp"]
+# Built-in Prometheus scrape endpoint (issue #355). Registers Harvest's nine
+# ADR-0001 catalogue metrics as an autumn-web MetricsSource feeding the
+# app's shared /actuator/prometheus endpoint. No new dependency: rendering
+# is done entirely through autumn-web's existing MetricsSource contract.
+metrics = []
 
 
 [dependencies]
@@ -60,3 +65,7 @@ required-features = ["mcp"]
 [[example]]
 name = "webhook_receiver_quickstart"
 required-features = ["webhooks"]
+
+[[example]]
+name = "metrics_scrape_quickstart"
+required-features = ["metrics"]

@@ -117,6 +117,10 @@ pub struct HarvestPlugin {
     /// (issue #344). Set via [`Self::webhooks`] (feature `webhooks`).
     #[cfg(feature = "webhooks")]
     webhook_triggers: Vec<autumn_harvest::webhook_trigger::WebhookTriggerInfo>,
+    /// Built-in Prometheus scrape endpoint (issue #355). Set via
+    /// [`Self::with_metrics_scrape`] (feature `metrics`).
+    #[cfg(feature = "metrics")]
+    metrics_scrape_enabled: bool,
 }
 
 impl Default for HarvestPlugin {
@@ -138,6 +142,8 @@ impl HarvestPlugin {
             mcp_tools_prefix: None,
             #[cfg(feature = "webhooks")]
             webhook_triggers: Vec::new(),
+            #[cfg(feature = "metrics")]
+            metrics_scrape_enabled: false,
         }
     }
 
@@ -187,6 +193,13 @@ impl HarvestPlugin {
     #[must_use]
     pub fn worker(mut self, config: WorkerConfig) -> Self {
         self.builder = self.builder.worker(config);
+        self
+    }
+
+    /// Configure the background retention job (history/audit pruning).
+    #[must_use]
+    pub fn retention(mut self, config: autumn_harvest::retention::RetentionConfig) -> Self {
+        self.builder = self.builder.retention(config);
         self
     }
 
@@ -301,6 +314,46 @@ impl HarvestPlugin {
         self.webhook_triggers.extend(triggers);
         self
     }
+
+    /// Expose the ADR-0001 §7 catalogue metrics on the app's shared
+    /// `/actuator/prometheus` scrape endpoint (issue #355).
+    ///
+    /// Installs a `HarvestMetricsRecorder` as both the engine's
+    /// `MetricsRecorder` (via `HarvestBuilder::telemetry`) and an
+    /// `autumn_web::actuator::MetricsSource` registered under the name
+    /// `"harvest"`. There is exactly **one** metrics scrape endpoint for the
+    /// whole app — Harvest's samples appear alongside the app's own
+    /// `autumn_http_*` families and any other plugin's `MetricsSource`, not on
+    /// a second, Harvest-owned route. Auth posture is therefore governed
+    /// entirely by the app's own `[actuator]` config (`actuator.prometheus`,
+    /// profile-aware sensitive-endpoint gating) rather than a
+    /// Harvest-specific toggle.
+    ///
+    /// Opt-in and additive: without this call, telemetry stays wired to the
+    /// zero-cost `NoOpMetrics` default exactly as before. Calling it a second
+    /// time is idempotent (autumn-web's `MetricsSourceRegistry` rejects the
+    /// duplicate `"harvest"` registration with a `tracing::warn!` and keeps
+    /// the first).
+    ///
+    /// This does **not** back the full starter alert pack
+    /// (`docs/alerts/starter-pack-v0.1.0.json`) — it covers the metrics
+    /// named in issue #355 plus a few more that the engine's own
+    /// background samplers already compute for free once enabled (queue
+    /// backlog age, worker slot occupancy, stranded-work demand), but not
+    /// the wider catalogue (e.g. `harvest.workflow.terminal`,
+    /// `harvest.activity.attempts`/`.retries`, `harvest.schedule.fire_attempts`).
+    /// For OTLP export, a custom `MetricsRecorder`, the full metric surface,
+    /// or a full bucketed histogram (this endpoint renders
+    /// `harvest.workflow.duration` / `harvest.activity.duration` as
+    /// `_count`/`_sum` counter pairs, since `MetricsSource`'s `MetricKind`
+    /// has no histogram variant), use the `metrics-rs` adapter escape hatch
+    /// documented in `docs/telemetry.md` instead.
+    #[cfg(feature = "metrics")]
+    #[must_use]
+    pub const fn with_metrics_scrape(mut self) -> Self {
+        self.metrics_scrape_enabled = true;
+        self
+    }
 }
 
 /// Whether the generated MCP tool routes are about to be registered with no
@@ -323,11 +376,41 @@ impl Plugin for HarvestPlugin {
             mcp_tools_prefix,
             #[cfg(feature = "webhooks")]
             webhook_triggers,
+            #[cfg(feature = "metrics")]
+            metrics_scrape_enabled,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
 
         let api_state = HarvestApiState::new();
+
+        // Issue #355: one shared `HarvestMetricsRecorder` instance backs both
+        // the engine-side `MetricsRecorder` (installed on `builder` before it
+        // is stashed in the runtime slot -- `HarvestBuilder::telemetry(..)`
+        // must be applied before `try_build()` runs inside
+        // `start_harvest_runtime`) and the app-level `MetricsSource`
+        // registration, so the shared `/actuator/prometheus` endpoint always
+        // renders the exact samples the engine recorded. There is
+        // deliberately no separate Harvest-owned scrape route.
+        #[cfg(feature = "metrics")]
+        let metrics_recorder =
+            metrics_scrape_enabled.then(crate::metrics_scrape::HarvestMetricsRecorder::new);
+        #[cfg(feature = "metrics")]
+        let app = if let Some(recorder) = &metrics_recorder {
+            app.metrics_source("harvest", Arc::new(recorder.clone()))
+        } else {
+            app
+        };
+        #[cfg(feature = "metrics")]
+        let builder = if let Some(recorder) = metrics_recorder {
+            builder.telemetry(
+                autumn_harvest::telemetry::TelemetryConfig::builder()
+                    .metrics(Arc::new(recorder))
+                    .build(),
+            )
+        } else {
+            builder
+        };
 
         // Issue #344: generate the inbound webhook receiver routes before the
         // builder is stashed in the runtime slot (same ordering constraint as
@@ -1373,5 +1456,25 @@ mod tests {
         assert!(plugin.builder.update_handlers()[0].mcp);
         assert_eq!(plugin.builder.query_handlers().len(), 1);
         assert_eq!(plugin.builder.query_handlers()[0].name, "progress");
+    }
+
+    #[test]
+    fn harvest_plugin_forwards_retention_to_builder() {
+        // Issue #355 review follow-up: `.retention(...)` had no dedicated
+        // coverage of its own -- only the metrics_scrape_quickstart example
+        // (Docker-requiring) exercised it. `try_build()` only validates
+        // config in-memory (no DB connection), so this stays a fast unit test.
+        let custom = autumn_harvest::retention::RetentionConfig {
+            max_age_secs: Some(42),
+            tick_interval_secs: 7,
+            ..autumn_harvest::retention::RetentionConfig::default()
+        };
+        let plugin = HarvestPlugin::new().retention(custom);
+        let built = plugin
+            .builder
+            .try_build()
+            .expect("valid retention config should build");
+        assert_eq!(built.retention().max_age_secs, Some(42));
+        assert_eq!(built.retention().tick_interval_secs, 7);
     }
 }
