@@ -688,4 +688,201 @@ async fn retention_preserves_a_failed_callback_delivery_and_its_dead_letter() {
     runner.stop().await;
 }
 
+/// Issue #921 review (Codex P2, follow-up): a `harvest_completion_deliveries`
+/// row that resolves to `DELIVERED` *after* its owning execution has already
+/// been collected by an earlier retention pass would otherwise never be
+/// revisited -- retention only ever iterates over still-live executions, so
+/// an orphaned `DELIVERED` row (its `workflow_exec_id` naming no execution
+/// at all) would carry its frozen result/error PII with no retention bound.
+/// A dedicated per-tick reclaim step deletes exactly these orphaned
+/// `DELIVERED` rows; a still-open orphaned `FAILED` row (awaiting redrive)
+/// and a `DELIVERED` row whose owner is a live, non-candidate execution must
+/// both survive untouched.
+fn orphan_reclaim_delivery_fixture(
+    id: uuid::Uuid,
+    workflow_exec_id: uuid::Uuid,
+) -> autumn_harvest::models::NewCompletionDelivery<'static> {
+    autumn_harvest::models::NewCompletionDelivery {
+        id,
+        workflow_exec_id,
+        shard_id: 0,
+        callback_index: 0,
+        workflow_name: "orphan-reclaim-test",
+        workflow_id: "orphan-reclaim-test",
+        target_url: "https://receiver.example.com/hook",
+        event_filter: json!({ "type": "AnyTerminal" }),
+        terminal_state: "COMPLETED",
+        payload: json!({ "state": "COMPLETED" }),
+        max_attempts: 5,
+        retry_policy: json!({
+            "max_attempts": 5,
+            "initial_interval": { "secs": 30, "nanos": 0 },
+            "backoff_coefficient": 2.0,
+            "max_interval": { "secs": 600, "nanos": 0 },
+            "non_retryable_errors": [],
+            "jitter": "None"
+        }),
+        next_attempt_at: chrono::Utc::now(),
+    }
+}
+
+async fn orphan_reclaim_delivery_row_exists(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> bool {
+    diesel::sql_query("SELECT COUNT(*) AS count FROM harvest_completion_deliveries WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(id)
+        .get_result::<CountByName>(conn)
+        .await
+        .expect("count query should succeed")
+        .count
+        > 0
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn retention_reclaims_an_orphaned_delivered_completion_delivery() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+
+    let runner = HarvestRunner::start(
+        autumn_harvest::HarvestBuilder::new()
+            .retention(RetentionConfig {
+                max_age_secs: Some(7 * 24 * 60 * 60),
+                tick_interval_secs: 60 * 60,
+                batch_size: 1000,
+                dry_run: false,
+                audit_retention_days: 90,
+                schedule_decision_retention_days: 7,
+                archival_timeout_secs: 30,
+            })
+            .build(),
+        &HarvestRuntimeConfig {
+            mode: HarvestMode::External,
+            worker_enabled: false,
+            scheduler_enabled: false,
+            database: autumn_harvest_plugin::HarvestDatabaseConfig {
+                url: Some(database_url.clone()),
+            },
+            outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
+            batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
+            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+        },
+        HarvestRunnerResources::new(pool.clone()),
+    )
+    .await
+    .expect("runner with retention should start");
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for retention fixture");
+
+    // Orphan #1: DELIVERED, owner does not exist at all (simulates the
+    // owner having been collected by an earlier retention pass). Must be
+    // reclaimed.
+    let orphan_delivered_id = uuid::Uuid::new_v4();
+    let orphan_exec_id = uuid::Uuid::new_v4();
+    diesel::insert_into(autumn_harvest::schema::harvest_completion_deliveries::table)
+        .values(orphan_reclaim_delivery_fixture(
+            orphan_delivered_id,
+            orphan_exec_id,
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("failed to seed orphaned DELIVERED fixture row");
+    diesel::update(
+        autumn_harvest::schema::harvest_completion_deliveries::table.find(orphan_delivered_id),
+    )
+    .set(autumn_harvest::schema::harvest_completion_deliveries::state.eq("DELIVERED"))
+    .execute(&mut conn)
+    .await
+    .expect("failed to mark orphaned fixture DELIVERED");
+
+    // Orphan #2: FAILED, owner also does not exist. Must survive -- only
+    // DELIVERED orphans are reclaimed; a FAILED row may still be awaiting
+    // an operator's redrive.
+    let orphan_failed_id = uuid::Uuid::new_v4();
+    diesel::insert_into(autumn_harvest::schema::harvest_completion_deliveries::table)
+        .values(orphan_reclaim_delivery_fixture(
+            orphan_failed_id,
+            uuid::Uuid::new_v4(),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("failed to seed orphaned FAILED fixture row");
+    diesel::update(
+        autumn_harvest::schema::harvest_completion_deliveries::table.find(orphan_failed_id),
+    )
+    .set(autumn_harvest::schema::harvest_completion_deliveries::state.eq("FAILED"))
+    .execute(&mut conn)
+    .await
+    .expect("failed to mark orphaned fixture FAILED");
+
+    // Non-orphan: DELIVERED, but the owner is a live RUNNING execution (so
+    // it will never become a retention candidate). Must survive -- this
+    // reclaim step is scoped to *orphaned* rows only, not every DELIVERED
+    // row in the table.
+    let live_exec_id = uuid::Uuid::new_v4();
+    insert_retention_fixture_execution(
+        &mut conn,
+        live_exec_id,
+        "orphan-reclaim-live-owner",
+        "RUNNING",
+        "NULL",
+    )
+    .await;
+    let live_owned_delivered_id = uuid::Uuid::new_v4();
+    diesel::insert_into(autumn_harvest::schema::harvest_completion_deliveries::table)
+        .values(orphan_reclaim_delivery_fixture(
+            live_owned_delivered_id,
+            live_exec_id,
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("failed to seed live-owned DELIVERED fixture row");
+    diesel::update(
+        autumn_harvest::schema::harvest_completion_deliveries::table.find(live_owned_delivered_id),
+    )
+    .set(autumn_harvest::schema::harvest_completion_deliveries::state.eq("DELIVERED"))
+    .execute(&mut conn)
+    .await
+    .expect("failed to mark live-owned fixture DELIVERED");
+
+    api_state.install_storage_pool(runner.storage_pool());
+    api_state.install(runner.api_runtime());
+    api_state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
+
+    let (run_now_status, run_now_json) =
+        post_json(&app, "/admin/retention/run-now", json!({})).await;
+    assert_eq!(run_now_status, StatusCode::OK);
+    assert_eq!(run_now_json["ok"], true);
+
+    // Poll until the orphaned DELIVERED row is reclaimed (or time out).
+    let mut reclaimed = false;
+    for _ in 0..40 {
+        if !orphan_reclaim_delivery_row_exists(&mut conn, orphan_delivered_id).await {
+            reclaimed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        reclaimed,
+        "an orphaned DELIVERED completion-delivery row must be reclaimed by retention"
+    );
+
+    assert!(
+        orphan_reclaim_delivery_row_exists(&mut conn, orphan_failed_id).await,
+        "an orphaned FAILED completion-delivery row must survive -- only DELIVERED orphans \
+         are reclaimed"
+    );
+    assert!(
+        orphan_reclaim_delivery_row_exists(&mut conn, live_owned_delivered_id).await,
+        "a DELIVERED completion-delivery row owned by a live, non-candidate execution must \
+         survive -- the reclaim is scoped to orphaned rows only"
+    );
+
+    runner.stop().await;
+}
+
 use autumn_harvest_plugin::HarvestMode;

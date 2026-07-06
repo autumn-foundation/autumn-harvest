@@ -590,6 +590,38 @@ async fn run_shard_tick(
         active: true,
     };
 
+    // Reclaim `harvest_completion_deliveries` rows that resolved to
+    // `DELIVERED` *after* their owning execution was already collected
+    // (issue #921 review, Codex P2, follow-up). A PENDING/INFLIGHT/FAILED
+    // row is deliberately kept when its owner is collected below (the
+    // delivery may still need to retry or await redrive), but if that same
+    // row *later* succeeds, nothing else ever revisits it -- the candidate
+    // loop only ever iterates over still-live executions, so an orphaned
+    // row (whose `workflow_exec_id` no longer names an existing execution)
+    // would otherwise carry its frozen result/error PII with no retention
+    // bound at all. Scoped to `DELIVERED` only, matching the per-candidate
+    // delete's existing "not finished yet" rule for PENDING/INFLIGHT/FAILED
+    // rows. Runs once per shard tick (not per candidate) since it is a
+    // table-wide reclaim, not scoped to this tick's candidate batch.
+    {
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|error| HarvestError::Database(error.to_string()))?;
+        let reclaimed = diesel::sql_query(
+            "DELETE FROM harvest_completion_deliveries
+             WHERE state = 'DELIVERED'
+               AND NOT EXISTS (
+                   SELECT 1 FROM harvest_workflow_executions
+                   WHERE harvest_workflow_executions.id = harvest_completion_deliveries.workflow_exec_id
+               )",
+        )
+        .execute(&mut conn)
+        .await
+        .map_err(database_error)?;
+        outcome.deleted_count += reclaimed;
+    }
+
     while remaining > 0 {
         // Check out a short-lived connection just to load and claim this batch of candidates in a single transaction
         let mut conn = pool

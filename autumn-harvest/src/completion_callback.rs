@@ -2068,6 +2068,36 @@ async fn claim_due_deliveries(
         .map_err(crate::error::database_error)
 }
 
+/// Re-read the current `payload` for a batch of just-claimed delivery ids,
+/// keyed by id. A non-locking bulk `SELECT` — used only to narrow the
+/// window between claim and dispatch during which a concurrent
+/// `erase_workflow_payloads` call could tombstone a row's payload (issue
+/// #921 review, Codex P1, follow-up); see the call site in
+/// [`fire_due_on_conn`] for the full rationale.
+#[cfg(feature = "db")]
+async fn reread_claimed_payloads(
+    conn: &mut diesel_async::AsyncPgConnection,
+    ids: &[Uuid],
+) -> crate::error::HarvestResult<std::collections::HashMap<Uuid, serde_json::Value>> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_completion_deliveries::dsl;
+
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let rows: Vec<(Uuid, serde_json::Value)> = dsl::harvest_completion_deliveries
+        .filter(dsl::id.eq_any(ids))
+        .select((dsl::id, dsl::payload))
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    Ok(rows.into_iter().collect())
+}
+
 /// Build the [`crate::dlq::NewDeadLetterEntry`] for an exhausted delivery,
 /// sourcing `input` from a *fresh* read of the row's `payload` column rather
 /// than the in-memory [`ClaimedDeliveryRow`] snapshot captured at claim time
@@ -2275,8 +2305,27 @@ async fn fire_due_on_conn(
     let claimed = claim_due_deliveries(conn, now).await?;
     let mut processed = 0usize;
 
-    // Sign and send the payload bytes exactly as read back from this claim —
-    // a Postgres JSONB round-trip may reorder object keys relative to the
+    // Re-read each row's payload immediately before serializing it for
+    // dispatch (issue #921 review, Codex P1, follow-up): `claimed` carries
+    // the payload as of the claim, but `erase_workflow_payloads` can
+    // tombstone this row's payload column at any point afterward --
+    // including while this tick is still building its dispatch batch.
+    // Bytes already POSTed to an external receiver cannot be recalled, so
+    // the freshness check for the network body has to happen as close to
+    // send time as realistically achievable without holding a lock across
+    // the network call. This does not close the race entirely (an erase
+    // landing in the gap between this read and the actual `deliver()` call
+    // moments later is still possible), but it eliminates the dominant
+    // source of staleness: the full claim-to-dispatch batch-build time,
+    // plus (for every row after the first in a large batch) the cumulative
+    // serialization work for earlier rows. `dead_letter_entry_with_current_
+    // payload` performs its own separate re-read *after* the network round
+    // trip, closing the remaining window for what gets written to the DLQ.
+    let claimed_ids: Vec<Uuid> = claimed.iter().map(|row| row.id).collect();
+    let fresh_payloads = reread_claimed_payloads(conn, &claimed_ids).await?;
+
+    // Sign and send the payload bytes exactly as read back above — a
+    // Postgres JSONB round-trip may reorder object keys relative to the
     // bytes originally inserted, but that never threatens the "signature
     // covers exactly what was posted" invariant: whatever bytes we derive
     // here are the ones we sign *and* the ones we send, on every attempt
@@ -2289,7 +2338,8 @@ async fn fire_due_on_conn(
     // forever, spamming logs and never actually resolving the delivery.
     let mut dispatchable = Vec::with_capacity(claimed.len());
     for row in claimed {
-        let body = match serde_json::to_vec(&row.payload) {
+        let payload = fresh_payloads.get(&row.id).unwrap_or(&row.payload);
+        let body = match serde_json::to_vec(payload) {
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::error!(
