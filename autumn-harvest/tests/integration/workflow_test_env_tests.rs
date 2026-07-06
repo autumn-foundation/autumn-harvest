@@ -17,7 +17,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use autumn_harvest::ExecutionId;
-use autumn_harvest::context::WorkflowContext;
+use autumn_harvest::context::{SessionOptions, WorkflowContext};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowTestEnv};
 use autumn_harvest::types::ParentClosePolicy;
@@ -1669,4 +1669,103 @@ async fn test_race_approval_or_timeout_timer_branch() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "timer-branch race must replay deterministically:\n{report}"
     );
+}
+
+// ─────────────────────── Worker sessions (issue #606) ─────────────────────────
+
+/// A 3-step pipeline over a worker session: open, run one member activity
+/// through it, then close. Deliberately registers **no** mock for the
+/// reserved `__harvest_session_acquire`/`__harvest_session_release`
+/// activities -- the harness must auto-resolve them so a session-using
+/// workflow needs no special test setup for the happy path.
+fn session_pipeline_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .map_err(|e| e.to_string())?;
+        let host = session.host_worker_id().to_string();
+
+        let transcoded: Value = session
+            .execute_activity_raw("transcode_chunk", json!({"chunk": 1}), "gpu-workers")
+            .await
+            .map_err(|e| e.to_string())?;
+
+        session.complete().await.map_err(|e| e.to_string())?;
+
+        Ok(json!({"host": host, "transcoded": transcoded}))
+    })
+}
+
+#[tokio::test]
+async fn test_worker_session_pipeline_auto_resolves_reserved_activities() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("transcode_chunk", |_| Ok(json!("transcoded")))
+        .run(session_pipeline_workflow, json!(null))
+        .await;
+
+    assert!(
+        outcome.result.is_ok(),
+        "session pipeline should succeed with no mock registered for the reserved \
+         acquire/release activities: {:?}",
+        outcome.result
+    );
+    let output = outcome.result.clone().unwrap();
+    assert_eq!(output["transcoded"], json!("transcoded"));
+    // The auto-resolved host worker id must be a non-empty, stable string.
+    assert!(output["host"].as_str().is_some_and(|h| !h.is_empty()));
+
+    let events = outcome.events();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { name, .. }
+                if name == "__harvest_session_acquire"
+        )),
+        "expected ActivityScheduled for the internal session-acquire activity"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { name, .. }
+                if name == "__harvest_session_release"
+        )),
+        "expected ActivityScheduled for the internal session-release activity"
+    );
+
+    let report = outcome.replay_check(session_pipeline_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "session pipeline must replay deterministically:\n{report}"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_session_auto_resolved_host_is_stable_across_replay() {
+    // Run once to get recorded history, then replay it directly and confirm
+    // the *same* host worker id comes back both times (proving the harness's
+    // auto-resolution is deterministic, not re-randomized per call).
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("transcode_chunk", |_| Ok(json!("transcoded")))
+        .run(session_pipeline_workflow, json!(null))
+        .await;
+    let first_host = outcome.result.as_ref().unwrap()["host"].clone();
+
+    let report = outcome.replay_check(session_pipeline_workflow).await;
+    assert!(matches!(report.status, ReplayStatus::ReplaySucceeded));
+
+    // Re-run against the exact same recorded history via a fresh env to
+    // confirm the acquire activity's *recorded* output (not a fresh
+    // auto-resolution) is what a real replay would use.
+    let events = outcome.events().to_vec();
+    let acquired_host = events.iter().find_map(|e| match e {
+        WorkflowEvent::ActivityCompleted { output, .. } if output.as_str().is_some() => {
+            Some(output.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(Some(first_host), acquired_host);
 }

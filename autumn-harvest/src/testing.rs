@@ -2108,6 +2108,12 @@ async fn replay_fixture_file(
 /// Maximum number of executor iterations before declaring an infinite loop.
 const MAX_TEST_ITERATIONS: usize = 1_000;
 
+/// Synthetic host worker id auto-resolved for the internal worker-session
+/// acquire activity (issue #606) when no explicit mock/`attempt_result` is
+/// registered for it. Stable across a run and its replay -- see
+/// `resolve_activity`.
+const TEST_SESSION_HOST_WORKER_ID: &str = "test-worker";
+
 /// Type alias for the mock closure stored in `WorkflowTestEnv`.
 type MockFn = Arc<dyn Fn(Value) -> Result<Value, String> + Send + Sync>;
 
@@ -3050,6 +3056,20 @@ impl WorkflowTestEnv {
         }
         if let Some(mock) = self.activity_mocks.get(name) {
             return Ok(mock(input));
+        }
+        // Worker sessions (issue #606): the internal acquire/release
+        // activities have no registered handler in production either -- the
+        // real worker intercepts them by reserved name before regular
+        // dispatch. Auto-resolve them here to a stable synthetic worker id
+        // so a session-using workflow needs no special mock for the happy
+        // path. Register an explicit mock/attempt_result above (this check
+        // runs first) to exercise acquisition-timeout or broken-session
+        // behavior instead.
+        if name == crate::context::SESSION_ACQUIRE_ACTIVITY_NAME {
+            return Ok(Ok(serde_json::json!(TEST_SESSION_HOST_WORKER_ID)));
+        }
+        if name == crate::context::SESSION_RELEASE_ACTIVITY_NAME {
+            return Ok(Ok(Value::Null));
         }
         Err(format!(
             "WorkflowTestEnv: no mock registered for activity '{name}' \
