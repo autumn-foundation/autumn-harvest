@@ -1821,6 +1821,7 @@ impl StartWorkflowRequest {
             batch_key: None,
             batch_max_size: None,
             batch_max_wait: None,
+            completion_callbacks: None,
         }
     }
 }
