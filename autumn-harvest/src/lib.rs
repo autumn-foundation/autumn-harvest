@@ -343,7 +343,7 @@ pub use testing::{
 };
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalCancelId,
-    ExternalSignalId, ParentClosePolicy, Priority, ShardId, TimerId, UpdateId, WorkerId,
+    ExternalSignalId, ParentClosePolicy, Priority, SessionId, ShardId, TimerId, UpdateId, WorkerId,
     WorkflowId, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;

@@ -740,6 +740,17 @@ struct ScheduledActivityCommand {
     queue: String,
     retry_policy_override: Option<crate::policy::RetryPolicy>,
     start_to_close_override: Option<std::time::Duration>,
+    /// Worker session this activity belongs to (issue #606). `None` for an
+    /// ordinary activity dispatch.
+    session_id: Option<crate::types::SessionId>,
+    /// The session's host worker id (issue #606); when `Some`, the enqueued
+    /// task row is hard-pinned to this worker. `None` for a non-session
+    /// activity.
+    session_worker_id: Option<String>,
+    /// Per-call `schedule_to_start` override (issue #606), used only by the
+    /// internal session-acquire dispatch. `None` for every ordinary
+    /// activity.
+    schedule_to_start_override: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -964,6 +975,9 @@ fn extract_all_scheduled_activities(
                 queue,
                 retry_policy_override,
                 start_to_close_override,
+                session_id,
+                session_worker_id,
+                schedule_to_start_override,
                 ..
             } => {
                 scheduled.push(ScheduledActivityCommand {
@@ -973,6 +987,9 @@ fn extract_all_scheduled_activities(
                     queue: queue.clone(),
                     retry_policy_override: retry_policy_override.clone(),
                     start_to_close_override: *start_to_close_override,
+                    session_id: *session_id,
+                    session_worker_id: session_worker_id.clone(),
+                    schedule_to_start_override: *schedule_to_start_override,
                 });
             }
             _ => return None,
@@ -12232,12 +12249,45 @@ mod tests {
                 queue: "default".to_string(),
                 retry_policy_override: None,
                 start_to_close_override: None,
+                session_id: None,
+                session_worker_id: None,
+                schedule_to_start_override: None,
                 result_tx: tx,
             },
         ];
         let scheduled = extract_all_scheduled_activities(&commands);
         assert!(scheduled.is_some());
         assert_eq!(scheduled.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn extract_all_scheduled_activities_preserves_session_fields() {
+        let (tx, _rx) = oneshot::channel::<Result<serde_json::Value, String>>();
+        let session_id = crate::types::SessionId::new();
+        let commands = vec![WorkflowCommand::ScheduleActivity {
+            activity_id: crate::types::ActivityExecId::new(),
+            name: "transcode_chunk".to_string(),
+            input: serde_json::Value::Null,
+            queue: "gpu-workers".to_string(),
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: Some(session_id),
+            session_worker_id: Some("worker-7".to_string()),
+            schedule_to_start_override: Some(std::time::Duration::from_secs(30)),
+            result_tx: tx,
+        }];
+        let scheduled = extract_all_scheduled_activities(&commands)
+            .expect("a single ScheduleActivity command must extract");
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].session_id, Some(session_id));
+        assert_eq!(
+            scheduled[0].session_worker_id.as_deref(),
+            Some("worker-7")
+        );
+        assert_eq!(
+            scheduled[0].schedule_to_start_override,
+            Some(std::time::Duration::from_secs(30))
+        );
     }
 
     #[test]

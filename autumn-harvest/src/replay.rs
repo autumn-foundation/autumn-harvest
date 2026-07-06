@@ -3589,6 +3589,64 @@ impl HistoryMatcher {
         }
     }
 
+    // ── Worker sessions (issue #606) ─────────────────────────────────────────
+
+    /// Match (or discover) a worker-session identity marker at the current
+    /// cursor position.
+    ///
+    /// A worker session's identity ([`crate::types::SessionId`]) is a
+    /// randomly generated UUID, recorded once via `MarkerRecorded { name:
+    /// "session:{seq}", details: <uuid string> }` on the session's first live
+    /// dispatch. Unlike [`Self::match_fan_out_marker`] (which *verifies* a
+    /// caller-supplied value against the recording) there is no independently
+    /// derivable "expected" value here — the UUID exists only because it was
+    /// recorded — so this method *discovers* the previously recorded id
+    /// rather than comparing it to one, mirroring [`Self::peek_u64_marker`]'s
+    /// discovery role but at a fixed cursor position (sessions are opened
+    /// sequentially, not raced concurrently, so no interleave tolerance is
+    /// needed).
+    ///
+    /// Returns:
+    /// - [`HistoryMatch::Matched`] — marker found; `output` carries the
+    ///   recorded `SessionId` as a JSON string.
+    /// - [`HistoryMatch::Diverged`] — a different event, a marker with the
+    ///   wrong name, or a non-UUID payload is at this cursor position.
+    /// - [`HistoryMatch::NoMatch`] — past end of history (live execution):
+    ///   the caller should generate a fresh `SessionId` and record it.
+    pub fn match_session_marker(&mut self, seq: u32) -> HistoryMatch {
+        let marker_name = format!("session:{seq}");
+        if !self.prepare_match() {
+            return HistoryMatch::NoMatch;
+        }
+
+        match &self.events[self.cursor] {
+            WorkflowEvent::MarkerRecorded { name, details } if *name == marker_name => {
+                let recorded = details.as_str().and_then(|s| s.parse::<uuid::Uuid>().ok());
+                match recorded {
+                    Some(uuid) => {
+                        self.cursor += 1;
+                        self.advance_to_next_unconsumed_event();
+                        HistoryMatch::Matched {
+                            output: serde_json::json!(uuid.to_string()),
+                        }
+                    }
+                    None => HistoryMatch::Diverged {
+                        expected: format!("MarkerRecorded({marker_name}, <uuid>)"),
+                        actual: format!("MarkerRecorded({marker_name}, {details:?})"),
+
+                        event_index: i32::try_from(self.cursor).ok(),
+                    },
+                }
+            }
+            other => HistoryMatch::Diverged {
+                expected: format!("MarkerRecorded({marker_name})"),
+                actual: Self::actual_event_name(other),
+
+                event_index: i32::try_from(self.cursor).ok(),
+            },
+        }
+    }
+
     /// Non-destructively check whether a `u64`-valued `MarkerRecorded` event
     /// named `marker_name` exists ahead in history, returning its value and
     /// consuming it if so.
@@ -6833,5 +6891,114 @@ mod tests {
         );
         // Cursor should now sit at the TimerFired event, ready for the next matcher.
         assert_eq!(matcher.cursor, 1);
+    }
+
+    // ── Worker session identity marker (issue #606) ─────────────────────────
+
+    #[test]
+    fn match_session_marker_no_match_on_empty_history() {
+        let mut matcher = HistoryMatcher::new(vec![]);
+        assert_eq!(matcher.match_session_marker(1), HistoryMatch::NoMatch);
+    }
+
+    #[test]
+    fn match_session_marker_matches_recorded_uuid() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "session:1".into(),
+            details: serde_json::json!(session_uuid.to_string()),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_session_marker(1),
+            HistoryMatch::Matched {
+                output: serde_json::json!(session_uuid.to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn match_session_marker_diverges_on_name_mismatch() {
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "session:2".into(),
+            details: serde_json::json!(uuid::Uuid::new_v4().to_string()),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_session_marker(1);
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn match_session_marker_diverges_on_unexpected_event() {
+        let events = vec![WorkflowEvent::TimerFired {
+            timer_id: TimerId::new("t1"),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_session_marker(1);
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn match_session_marker_diverges_on_non_uuid_payload() {
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "session:1".into(),
+            details: serde_json::json!("not-a-uuid"),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_session_marker(1);
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+    }
+
+    #[test]
+    fn match_session_marker_advances_cursor_past_marker() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let events = vec![
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: serde_json::json!(session_uuid.to_string()),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("t1"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_session_marker(1),
+            HistoryMatch::Matched {
+                output: serde_json::json!(session_uuid.to_string())
+            }
+        );
+        assert_eq!(matcher.cursor, 1);
+    }
+
+    #[test]
+    fn match_session_marker_distinguishes_by_seq() {
+        // Two distinct sessions opened in one workflow must never collide on
+        // marker name, mirroring fan_out:{seq}/race:{seq} numbering.
+        let uuid1 = uuid::Uuid::new_v4();
+        let uuid2 = uuid::Uuid::new_v4();
+        let events = vec![
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: serde_json::json!(uuid1.to_string()),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:2".into(),
+                details: serde_json::json!(uuid2.to_string()),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_session_marker(1),
+            HistoryMatch::Matched {
+                output: serde_json::json!(uuid1.to_string())
+            }
+        );
+        assert_eq!(
+            matcher.match_session_marker(2),
+            HistoryMatch::Matched {
+                output: serde_json::json!(uuid2.to_string())
+            }
+        );
     }
 }

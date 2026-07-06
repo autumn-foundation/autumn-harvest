@@ -27,7 +27,7 @@ use crate::replay::{HistoryMatch, HistoryMatcher};
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalCancelId, ExternalSignalId,
-    IdempotencyKey, TimerId, UpdateId,
+    IdempotencyKey, SessionId, TimerId, UpdateId,
 };
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
@@ -179,6 +179,26 @@ pub enum WorkflowCommand {
         retry_policy_override: Option<crate::policy::RetryPolicy>,
         /// Optional start-to-close timeout override from a DAG task definition.
         start_to_close_override: Option<std::time::Duration>,
+        /// Worker session this activity belongs to (issue #606). `Some` when
+        /// dispatched through `Session::execute_activity` or as the internal
+        /// session-acquire/release activities; `None` for an ordinary
+        /// activity. Never affects behavior when `None` — zero change for
+        /// existing dispatch.
+        session_id: Option<SessionId>,
+        /// The session's host worker id, resolved from the session-acquire
+        /// activity's recorded output (issue #606). When `Some`, the worker
+        /// hard-pins this task's `sticky_worker_id` so it can never fail over
+        /// to a different worker, even after the ordinary sticky lease
+        /// expires. `None` for a non-session activity.
+        session_worker_id: Option<String>,
+        /// Per-call `schedule_to_start` override (issue #606). Used
+        /// exclusively by the internal `__harvest_session_acquire` dispatch
+        /// to bound session acquisition by `SessionOptions::acquisition_timeout`
+        /// without adding a schedule-to-start override to the public
+        /// `execute_activity` surface. `None` for every ordinary activity
+        /// dispatch, which continues to use the activity's registered
+        /// `default_schedule_to_start`.
+        schedule_to_start_override: Option<std::time::Duration>,
         /// The worker sends the result back through this channel.
         result_tx: oneshot::Sender<Result<Value, String>>,
     },
@@ -1120,6 +1140,11 @@ pub struct WorkflowContext {
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
     /// replays, mirroring `fan_out_seq`.
     race_seq: Mutex<u32>,
+    /// Monotonically increasing counter for naming worker-session identity
+    /// markers (issue #606). Each `create_session()` call increments this once
+    /// so each session has a stable, unique `session:{seq}` marker name across
+    /// replays, mirroring `fan_out_seq`/`race_seq`.
+    session_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
     state: SharedState,
     /// In-memory query handlers (not persisted to history).
@@ -1446,6 +1471,7 @@ impl WorkflowContext {
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
+            session_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -1557,6 +1583,7 @@ impl WorkflowContext {
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
+            session_seq: Mutex::new(0),
             state,
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -1605,6 +1632,7 @@ impl WorkflowContext {
             fan_out_seq: Mutex::new(0),
             signal_timeout_seq: Mutex::new(0),
             race_seq: Mutex::new(0),
+            session_seq: Mutex::new(0),
             state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
             declarative_queries: Mutex::new(std::collections::HashMap::new()),
@@ -2866,6 +2894,9 @@ impl WorkflowContext {
                     queue: queue.to_string(),
                     retry_policy_override: None,
                     start_to_close_override: None,
+                    session_id: None,
+                    session_worker_id: None,
+                    schedule_to_start_override: None,
                     result_tx: tx,
                 });
 
@@ -2990,6 +3021,9 @@ impl WorkflowContext {
                     queue: queue.to_string(),
                     retry_policy_override,
                     start_to_close_override,
+                    session_id: None,
+                    session_worker_id: None,
+                    schedule_to_start_override: None,
                     result_tx: tx,
                 });
                 match rx.await {
@@ -5355,6 +5389,9 @@ impl WorkflowContext {
                             queue: queue.clone(),
                             retry_policy_override: retry.clone(),
                             start_to_close_override: *start_to_close,
+                            session_id: None,
+                            session_worker_id: None,
+                            schedule_to_start_override: None,
                             result_tx: tx,
                         });
                     } else {
@@ -5564,6 +5601,81 @@ impl WorkflowContext {
                 value: payload,
             },
         ))
+    }
+
+    // ── Worker sessions (issue #606) ────────────────────────────────────────
+
+    /// Generate the next worker-session sequence number for marker naming
+    /// (mirrors `next_fan_out_seq`/`next_race_seq`).
+    fn next_session_seq(&self) -> u32 {
+        let mut seq = self
+            .session_seq
+            .lock()
+            .expect("session_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Resolve a worker session's deterministic identity.
+    ///
+    /// On the **first live dispatch** (past end of history): generates a
+    /// fresh [`SessionId`] and pushes a `RecordMarker { name: "session:{seq}"
+    /// }` command so every future replay recovers the identical id. On
+    /// **replay**: returns the id previously recorded at this cursor
+    /// position.
+    ///
+    /// This is the entire determinism contract for worker sessions — **no
+    /// new `WorkflowEvent` variant is introduced**. The session's *physical
+    /// worker binding* is resolved separately (via the session-acquire
+    /// activity's recorded output) and is non-replayed runtime routing
+    /// state, exactly like activity placement today.
+    fn resolve_session_id(&self, seq: u32) -> HarvestResult<SessionId> {
+        let marker_result = self.match_history(|m| m.match_session_marker(seq));
+        match marker_result {
+            HistoryMatch::NoMatch => {
+                self.check_strict_replay_no_match(&format!("MarkerRecorded(session:{seq})"))?;
+                let session_id = SessionId::new();
+                self.push_command(WorkflowCommand::RecordMarker {
+                    name: format!("session:{seq}"),
+                    details: Value::from(session_id.to_string()),
+                });
+                Ok(session_id)
+            }
+            HistoryMatch::Matched { output } => {
+                let uuid_str = output.as_str().ok_or_else(|| {
+                    self.nd_error(
+                        format!("session #{seq}: recorded marker value is not a string"),
+                        None,
+                        None,
+                        None,
+                    )
+                })?;
+                uuid_str.parse::<SessionId>().map_err(|e| {
+                    self.nd_error(
+                        format!(
+                            "session #{seq}: recorded marker value '{uuid_str}' is not a \
+                             valid UUID: {e}"
+                        ),
+                        None,
+                        None,
+                        None,
+                    )
+                })
+            }
+            HistoryMatch::Diverged {
+                expected,
+                actual,
+                event_index,
+            } => Err(self.nd_error(
+                format!(
+                    "session #{seq}: history has {expected} but current code supplies {actual}"
+                ),
+                event_index,
+                Some(expected),
+                Some(actual),
+            )),
+            _ => unreachable!("match_session_marker only returns Matched, NoMatch, or Diverged"),
+        }
     }
 
     // ── External activity completion ───────────────────────────────────
@@ -12522,5 +12634,121 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    // ── Worker session marker resolution tests (issue #606) ──────────────────
+
+    #[test]
+    fn next_session_seq_increments_monotonically() {
+        let ctx = WorkflowContext::new_test();
+        assert_eq!(ctx.next_session_seq(), 1);
+        assert_eq!(ctx.next_session_seq(), 2);
+        assert_eq!(ctx.next_session_seq(), 3);
+    }
+
+    #[test]
+    fn resolve_session_id_on_live_execution_generates_and_records_marker() {
+        let ctx = WorkflowContext::new_test();
+        let session_id = ctx.resolve_session_id(1).expect("live resolve succeeds");
+
+        let commands = ctx.drain_commands();
+        let recorded = commands.iter().find_map(|c| match c {
+            WorkflowCommand::RecordMarker { name, details } if name == "session:1" => {
+                Some(details.clone())
+            }
+            _ => None,
+        });
+        let recorded = recorded.expect("a session:1 marker must be recorded on live dispatch");
+        assert_eq!(recorded, Value::from(session_id.to_string()));
+    }
+
+    #[test]
+    fn resolve_session_id_generates_distinct_ids_per_seq() {
+        let ctx = WorkflowContext::new_test();
+        let a = ctx.resolve_session_id(1).unwrap();
+        let b = ctx.resolve_session_id(2).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn resolve_session_id_on_replay_recovers_recorded_id() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let resolved = ctx.resolve_session_id(1).expect("replay resolve succeeds");
+        assert_eq!(resolved, SessionId::from_uuid(session_uuid));
+
+        // Replay must not re-push a RecordMarker command — the marker was
+        // already recorded.
+        let commands = ctx.drain_commands();
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::RecordMarker { name, .. } if name == "session:1")),
+            "replay must not re-record an already-recorded session marker"
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_diverges_when_history_disagrees() {
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("unrelated"),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx.resolve_session_id(1);
+        assert!(matches!(result, Err(HarvestError::NonDeterministic { .. })));
+    }
+
+    #[test]
+    fn resolve_session_id_two_sessions_get_distinct_markers_on_replay() {
+        let uuid1 = uuid::Uuid::new_v4();
+        let uuid2 = uuid::Uuid::new_v4();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(uuid1.to_string()),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:2".into(),
+                details: Value::from(uuid2.to_string()),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        assert_eq!(
+            ctx.resolve_session_id(1).unwrap(),
+            SessionId::from_uuid(uuid1)
+        );
+        assert_eq!(
+            ctx.resolve_session_id(2).unwrap(),
+            SessionId::from_uuid(uuid2)
+        );
     }
 }
