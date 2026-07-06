@@ -19,6 +19,18 @@
 
 use std::time::Duration;
 
+/// Sticky-lease duration applied to a session member activity's task row
+/// (`harvest_task_queue.sticky_timeout`).
+///
+/// Purely a bookkeeping value to satisfy the `sticky_worker_id IS NULL <=>
+/// sticky_until IS NULL` check constraint: the hard-pin claim gate (`AND
+/// (session_id IS NULL OR sticky_worker_id = $1)`) never consults
+/// `sticky_until` for a session-tagged row, so this never causes a
+/// mid-session failover the way an ordinary sticky lease would. Generously
+/// long so operator-facing views of `sticky_until` never read as "about to
+/// expire" for a legitimately still-open session.
+pub const SESSION_MEMBER_STICKY_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+
 // ---------------------------------------------------------------------------
 // Session-slot acquire eligibility
 // ---------------------------------------------------------------------------

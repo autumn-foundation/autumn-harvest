@@ -3561,7 +3561,15 @@ async fn persist_scheduled_activities(
             params.start_to_close =
                 Some(chrono_duration_from_std(timeout, "start_to_close timeout")?);
         }
-        if let Some(timeout) = activity.default_schedule_to_start {
+        // Issue #606: a per-call schedule_to_start override (used exclusively
+        // by the internal session-acquire dispatch to bound acquisition by
+        // SessionOptions::acquisition_timeout) takes priority over the
+        // activity's registered default -- mirroring retry_policy_override /
+        // start_to_close_override above. `None` for every ordinary activity.
+        let effective_schedule_to_start = scheduled
+            .schedule_to_start_override
+            .or(activity.default_schedule_to_start);
+        if let Some(timeout) = effective_schedule_to_start {
             params.schedule_to_start = Some(chrono_duration_from_std(
                 timeout,
                 "schedule_to_start timeout",
@@ -3595,6 +3603,21 @@ async fn persist_scheduled_activities(
                 });
         if let Some(key) = effective_rate_limit_key {
             params.rate_limit_key = Some(key);
+        }
+
+        // Worker sessions (issue #606): a member activity carrying a
+        // resolved host worker is hard-pinned via session_id + the ordinary
+        // sticky_worker_id/sticky_timeout columns -- claim_task's session_id
+        // gate makes this pin unconditional (it does not fail over on lease
+        // expiry the way ordinary sticky routing does). The session-acquire
+        // dispatch itself never sets session_worker_id (it has no resolved
+        // host yet), so it is never hard-pinned here.
+        if let (Some(session_id), Some(host_worker_id)) =
+            (scheduled.session_id, &scheduled.session_worker_id)
+        {
+            params.session_id = Some(session_id.as_uuid());
+            params.sticky_worker_id = Some(host_worker_id.clone());
+            params.sticky_timeout = Some(crate::sessions::SESSION_MEMBER_STICKY_TIMEOUT);
         }
 
         activity_events.push(WorkflowEvent::ActivityScheduled {
