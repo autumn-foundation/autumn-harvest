@@ -863,6 +863,142 @@ async fn scanner_dead_letters_on_retry_exhaustion() {
     );
 }
 
+async fn exhaust_one_callback_delivery(
+    conn: &mut AsyncPgConnection,
+    workflow_id: &str,
+) -> (ExecutionId, uuid::Uuid, uuid::Uuid) {
+    let deliverer = Arc::new(ScriptedDeliverer::new(vec![DeliveryAttempt::success(503)]));
+    install_config(
+        deliverer,
+        RetryPolicy::exponential(1, Duration::from_millis(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions
+            (id, workflow_name, workflow_id, shard_id, input, state, output, error, completed_at, completion_callbacks)
+         VALUES ($1, 'process_refund', $2, 0, 'null'::jsonb, 'FAILED', NULL, 'card declined', now(), $3::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(workflow_id)
+    .bind::<diesel::sql_types::Text, _>(
+        r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#,
+    )
+    .execute(conn)
+    .await
+    .expect("insert execution");
+    evaluate_triggers_for_execution(conn, exec_id, TerminalState::Failed, None)
+        .await
+        .expect("evaluate triggers");
+
+    fire_due_completion_deliveries(conn, &None, &[])
+        .await
+        .expect("scanner tick exhausts on first attempt");
+
+    let rows = list_deliveries_for_execution(conn, exec_id)
+        .await
+        .expect("list deliveries");
+    assert_eq!(rows[0].state, "FAILED");
+    let delivery_id = rows[0].id;
+
+    #[derive(diesel::QueryableByName)]
+    struct DlqId {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+    }
+    let dlq: Vec<DlqId> = diesel::sql_query(
+        "SELECT id FROM harvest_dead_letters WHERE original_task_id = $1 AND task_type = 'CALLBACK'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(delivery_id)
+    .load(conn)
+    .await
+    .expect("load dlq row");
+    assert_eq!(dlq.len(), 1, "exactly one CALLBACK dead-letter row");
+
+    (exec_id, delivery_id, dlq[0].id)
+}
+
+// Regression (issue #921 review, Codex P2): the generic DLQ "replay" action
+// (API/bulk-replay/UI) used to error with "invalid task_type 'CALLBACK'"
+// for a completion-callback dead letter instead of actually redriving the
+// delivery. `dlq::replay_dead_letter` now delegates to the completion-
+// delivery redrive primitive for a CALLBACK row.
+#[tokio::test]
+async fn replay_dead_letter_delegates_a_callback_row_to_completion_delivery_redrive() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let (exec_id, delivery_id, dead_letter_id) =
+        exhaust_one_callback_delivery(&mut conn, "replay-cb-wf").await;
+
+    let replayed_id = autumn_harvest::dlq::replay_dead_letter(&mut conn, dead_letter_id, None)
+        .await
+        .expect("replay_dead_letter must delegate instead of erroring");
+    assert_eq!(
+        replayed_id, delivery_id,
+        "replay_dead_letter returns the delivery's own id for a CALLBACK row"
+    );
+
+    let rows = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries after replay");
+    assert_eq!(rows[0].state, "PENDING", "delivery must be redriven");
+
+    #[derive(diesel::QueryableByName)]
+    struct DlqCount {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    let after: DlqCount = diesel::sql_query(
+        "SELECT count(*) as count FROM harvest_dead_letters WHERE original_task_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(delivery_id)
+    .get_result(&mut conn)
+    .await
+    .expect("count dlq rows");
+    assert_eq!(
+        after.count, 0,
+        "the DLQ row must be cleared by the delegated redrive"
+    );
+}
+
+// Regression (issue #921 review, Codex P2): same delegation, exercised via
+// `redrive_dead_letter` (issue #510's execution-reactivating primitive) --
+// the other generic entry point the DLQ UI/API can reach a CALLBACK row
+// through.
+#[tokio::test]
+async fn redrive_dead_letter_delegates_a_callback_row_to_completion_delivery_redrive() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+
+    let (exec_id, delivery_id, dead_letter_id) =
+        exhaust_one_callback_delivery(&mut conn, "redrive-cb-wf").await;
+
+    let outcome = autumn_harvest::dlq::redrive_dead_letter(&mut conn, dead_letter_id, None, None)
+        .await
+        .expect("redrive_dead_letter must delegate instead of erroring");
+    assert_eq!(
+        outcome,
+        autumn_harvest::dlq::RedriveOutcome::Redriven(delivery_id)
+    );
+
+    let rows = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries after redrive");
+    assert_eq!(rows[0].state, "PENDING", "delivery must be redriven");
+
+    // A second call is idempotent: the DLQ row is already gone, so this
+    // mirrors the "already redriven" Skipped semantics for workflow/activity
+    // dead letters.
+    let outcome_again =
+        autumn_harvest::dlq::redrive_dead_letter(&mut conn, dead_letter_id, None, None)
+            .await
+            .expect("second redrive must not error");
+    assert_eq!(outcome_again, autumn_harvest::dlq::RedriveOutcome::Skipped);
+}
+
 #[tokio::test]
 async fn scanner_ignores_rows_not_yet_due() {
     let _guard = TEST_SERIAL.lock().await;

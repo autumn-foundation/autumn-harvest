@@ -2883,6 +2883,13 @@ fn dead_letter_task_kind_label(task_type: &str) -> &'static str {
         "Activity"
     } else if task_type.eq_ignore_ascii_case("workflow") {
         "Workflow"
+    } else if task_type.eq_ignore_ascii_case("callback") {
+        // Issue #605 completion-callback exhaustion. The generic "Replay"
+        // action still works for this row -- `dlq::replay_dead_letter`
+        // delegates it to the completion-delivery redrive primitive (issue
+        // #921 review) -- so no separate UI treatment is needed beyond a
+        // clear label.
+        "Callback"
     } else {
         "Unknown"
     }
@@ -7152,6 +7159,17 @@ mod tests {
         assert_eq!(badge_class("CANCELLED"), "CANCELLED");
         assert_eq!(badge_class("TERMINATED"), "TERMINATED");
         assert_eq!(badge_class("MYSTERY"), "UNKNOWN");
+    }
+
+    #[test]
+    fn dead_letter_task_kind_label_recognizes_callback_rows() {
+        // Issue #921 review: a completion-callback dead letter (issue #605)
+        // used to render as "Unknown" instead of a recognized kind.
+        assert_eq!(dead_letter_task_kind_label("CALLBACK"), "Callback");
+        assert_eq!(dead_letter_task_kind_label("callback"), "Callback");
+        assert_eq!(dead_letter_task_kind_label("ACTIVITY"), "Activity");
+        assert_eq!(dead_letter_task_kind_label("WORKFLOW"), "Workflow");
+        assert_eq!(dead_letter_task_kind_label("TIMER"), "Unknown");
     }
 
     #[test]

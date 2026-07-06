@@ -260,6 +260,47 @@ impl std::fmt::Display for DeadLetterReason {
     }
 }
 
+/// Delegate a `task_type = "CALLBACK"` dead-letter's replay to the
+/// completion-delivery redrive primitive (issue #605), so the generic DLQ
+/// replay surface (single-row API, bulk replay, UI) actually redrives the
+/// delivery instead of failing on `dead_letter_task_type`'s "invalid
+/// `task_type`" error (issue #921 review, Codex P2). Called from inside the
+/// caller's already-open transaction; `completion_callback::redrive_delivery`
+/// opens its own nested transaction (a savepoint) on the same connection,
+/// which is safe.
+///
+/// Returns the delivery's own id (`original_task_id`, stable across
+/// redrives) in place of a newly-created task-queue row id — there is no
+/// task-queue row for a completion delivery, so this is the closest
+/// equivalent "id of the unit of work that now represents this retry."
+async fn redrive_callback_dead_letter(
+    conn: &mut AsyncPgConnection,
+    dead_letter_id: Uuid,
+    workflow_exec_id: Option<Uuid>,
+    original_task_id: Uuid,
+) -> HarvestResult<Uuid> {
+    let exec_id = workflow_exec_id
+        .map(crate::types::ExecutionId::from_uuid)
+        .ok_or_else(|| {
+            HarvestError::Config(format!(
+                "dead-letter {dead_letter_id} is a CALLBACK entry with no workflow_exec_id"
+            ))
+        })?;
+
+    match crate::completion_callback::redrive_delivery(conn, exec_id, original_task_id).await? {
+        crate::completion_callback::DeliveryRedriveOutcome::Redriven => Ok(original_task_id),
+        crate::completion_callback::DeliveryRedriveOutcome::NotFound => Err(
+            HarvestError::NotFound(format!("dead-letter {dead_letter_id}")),
+        ),
+        crate::completion_callback::DeliveryRedriveOutcome::NotFailed { current_state } => {
+            Err(HarvestError::Config(format!(
+                "cannot replay dead-letter {dead_letter_id}: completion delivery \
+                 {original_task_id} is {current_state}, not FAILED"
+            )))
+        }
+    }
+}
+
 fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult<TaskType> {
     if task_type.eq_ignore_ascii_case("workflow") {
         Ok(TaskType::Workflow)
@@ -422,6 +463,23 @@ pub async fn replay_dead_letter(
                 .optional()
                 .map_err(crate::error::database_error)?
                 .ok_or_else(|| HarvestError::NotFound(format!("dead-letter {dead_letter_id}")))?;
+
+            // A completion-callback dead letter (issue #605) is not a
+            // WORKFLOW/ACTIVITY task-queue row -- it represents an exhausted
+            // completion-delivery attempt, and "replay by re-enqueue" below
+            // has no meaning for it. Delegate to the delivery's own redrive
+            // primitive instead of erroring with "invalid task_type" (issue
+            // #921 review, Codex P2): the generic DLQ "replay" surface (API,
+            // bulk replay, UI) must actually redrive the delivery, not fail.
+            if entry.task_type.eq_ignore_ascii_case("callback") {
+                return redrive_callback_dead_letter(
+                    conn,
+                    dead_letter_id,
+                    entry.workflow_exec_id,
+                    entry.original_task_id,
+                )
+                .await;
+            }
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
@@ -846,6 +904,25 @@ pub async fn redrive_dead_letter(
                 // Already redriven (or discarded): idempotent no-op.
                 return Ok(RedriveOutcome::Skipped);
             };
+
+            // Delegate a completion-callback dead letter (issue #605) to its
+            // own redrive primitive instead of erroring with "invalid
+            // task_type" (issue #921 review, Codex P2) -- see
+            // `redrive_callback_dead_letter`'s doc comment.
+            if entry.task_type.eq_ignore_ascii_case("callback") {
+                return match redrive_callback_dead_letter(
+                    conn,
+                    dead_letter_id,
+                    entry.workflow_exec_id,
+                    entry.original_task_id,
+                )
+                .await
+                {
+                    Ok(delivery_id) => Ok(RedriveOutcome::Redriven(delivery_id)),
+                    Err(HarvestError::NotFound(_)) => Ok(RedriveOutcome::Skipped),
+                    Err(e) => Err(e),
+                };
+            }
 
             let task_type = dead_letter_task_type(dead_letter_id, &entry.task_type)?;
 
