@@ -262,6 +262,90 @@ async fn size_triggered_flush_threads_completion_callbacks_into_the_started_exec
     );
 }
 
+// Regression (issue #921 review, Codex P2): the ON CONFLICT upsert only
+// ever updated buffered_payloads/fire_at, leaving the *first* admission's
+// start_options (including completion_callbacks) untouched. A later
+// admission into the same batch group that specified a *different*
+// completion_callbacks target would therefore be silently dropped -- that
+// caller's callback would never fire when the collapsed execution
+// completes. The two admissions' target arrays must instead be merged.
+#[tokio::test]
+async fn a_later_admissions_completion_callbacks_are_merged_not_dropped() {
+    let (mut conn, _container) = setup_db().await;
+    let first_target = json!([
+        { "url": "https://a.example.com/hook", "filter": { "type": "AnyTerminal" } }
+    ]);
+    let second_target = json!([
+        { "url": "https://b.example.com/hook", "filter": { "type": "CompletedOnly" } }
+    ]);
+
+    let p1 = AdmitBatchParams {
+        workflow_name: "callback_merge_batch_wf".to_string(),
+        batch_key: "key-cb-merge".to_string(),
+        workflow_id: "callback-merge-batch-001".to_string(),
+        queue_name: "default".to_string(),
+        payload: json!({"val": 1}),
+        start_options: DebounceStartOptions {
+            completion_callbacks: Some(first_target.clone()),
+            ..Default::default()
+        },
+        max_wait: Duration::from_secs(10),
+        max_size: 2,
+        shard_id: 0,
+    };
+    let (o1, _deferred_starts1) = admit_batched_start(&mut conn, p1, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!o1.is_flushed);
+
+    let p2 = AdmitBatchParams {
+        workflow_name: "callback_merge_batch_wf".to_string(),
+        batch_key: "key-cb-merge".to_string(),
+        workflow_id: "callback-merge-batch-001".to_string(),
+        queue_name: "default".to_string(),
+        payload: json!({"val": 2}),
+        start_options: DebounceStartOptions {
+            completion_callbacks: Some(second_target.clone()),
+            ..Default::default()
+        },
+        max_wait: Duration::from_secs(10),
+        max_size: 2,
+        shard_id: 0,
+    };
+    let (o2, _deferred_starts2) = admit_batched_start(&mut conn, p2, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        o2.is_flushed,
+        "second admission reaches max_size and flushes"
+    );
+
+    let stored = started_execution_completion_callbacks(&mut conn, "callback-merge-batch-001")
+        .await
+        .expect("flushed execution must carry completion_callbacks");
+    let stored_targets = stored.as_array().expect("completion_callbacks is an array");
+    assert_eq!(
+        stored_targets.len(),
+        2,
+        "both admissions' callback targets must survive, merged: {stored_targets:?}"
+    );
+    assert!(
+        stored_targets
+            .iter()
+            .any(|t| t["url"] == "https://a.example.com/hook"),
+        "the first admission's target must survive: {stored_targets:?}"
+    );
+    assert!(
+        stored_targets
+            .iter()
+            .any(|t| t["url"] == "https://b.example.com/hook"),
+        "the second (later) admission's target must survive, not be silently dropped: \
+         {stored_targets:?}"
+    );
+}
+
 #[tokio::test]
 async fn time_triggered_flush_threads_completion_callbacks_into_the_started_execution() {
     let (mut conn, _container) = setup_db().await;

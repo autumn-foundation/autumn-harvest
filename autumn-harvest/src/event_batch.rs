@@ -154,7 +154,26 @@ pub async fn admit_batched_start(
         ON CONFLICT (workflow_name, batch_key) DO UPDATE SET
             buffered_payloads = harvest_event_batches.buffered_payloads || EXCLUDED.buffered_payloads,
             fire_at           = LEAST(harvest_event_batches.fire_at, EXCLUDED.fire_at),
-            updated_at        = NOW()
+            updated_at        = NOW(),
+            -- issue #921 review (Codex P2): every field of `start_options`
+            -- other than this one is deliberately first-request-wins (the
+            -- row created by the first admission in a batch group is what
+            -- actually fires), but silently dropping a *later* caller's
+            -- completion_callbacks entirely would mean that caller never
+            -- gets notified when the collapsed execution finishes even
+            -- though its own request explicitly asked for a callback.
+            -- Merge (array-concatenate) the two callback-target arrays
+            -- instead of leaving the first admission's array untouched.
+            -- Duplicate `{url, filter}` entries are harmless: the same
+            -- dedup-by-(url,filter) logic that already runs at workflow
+            -- start time (`resolve_all_targets`) collapses them, so this
+            -- union does not need to dedup here.
+            start_options = jsonb_set(
+                harvest_event_batches.start_options,
+                '{completion_callbacks}',
+                COALESCE(harvest_event_batches.start_options->'completion_callbacks', '[]'::jsonb)
+                    || COALESCE(EXCLUDED.start_options->'completion_callbacks', '[]'::jsonb)
+            )
         RETURNING
             id,
             workflow_name,
