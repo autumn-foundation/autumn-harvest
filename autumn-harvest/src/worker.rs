@@ -5122,6 +5122,50 @@ const RATE_LIMIT_DEFER_MIN: Duration = Duration::from_millis(50);
 /// still re-evaluates `on_dispatch` (the breaker may have changed) reasonably soon.
 const RATE_LIMIT_DEFER_MAX: Duration = Duration::from_secs(5);
 
+/// Append `ActivityTimedOut { ScheduleToStart }` and fail a session-acquire
+/// task whose `SessionOptions::acquisition_timeout` has elapsed (issue
+/// #606). Mirrors [`record_schedule_to_close_activity_timeout`]'s shape.
+/// Reaches `WorkflowContext::create_session`'s existing
+/// `HarvestError::Timeout { timeout_type: ScheduleToStart, .. }` mapping
+/// arm, surfacing `HarvestError::SessionAcquireTimeout` to the workflow.
+async fn record_session_acquire_schedule_to_start_timeout(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    exec_id: ExecutionId,
+    activity_id: ActivityExecId,
+) -> HarvestResult<()> {
+    let error = HarvestError::Timeout {
+        timeout_type: crate::error::TimeoutType::ScheduleToStart,
+        task_name: task
+            .activity_name
+            .clone()
+            .unwrap_or_else(|| task.task_type.clone()),
+    }
+    .to_string();
+
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        let error = error.clone();
+        async move {
+            let history = lock_workflow_execution_and_load_history(conn, exec_id).await?;
+            let Some(state) = task_state_for_update(conn, task.id).await? else {
+                return Ok(());
+            };
+            if state != "RUNNING" {
+                return Ok(());
+            }
+            let timeout_event = WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: crate::error::TimeoutType::ScheduleToStart,
+            };
+            store::append_events(conn, exec_id, &[timeout_event], history.next_event_id).await?;
+            queue::fail_task(conn, task.id, &error).await?;
+            queue::wake_workflow_task(conn, exec_id).await
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 /// Handle the internal session-acquire activity (issue #606) -- see the
 /// interception in [`process_activity_task`].
 ///
@@ -5168,6 +5212,34 @@ async fn handle_session_acquire(
         max_concurrent_sessions,
         session_id,
     ) {
+        // Bound total elapsed time against `options.acquisition_timeout`
+        // (carried as this task's `schedule_to_start`) *before* deferring
+        // again. `defer_rate_limited_task` rewrites `scheduled_at` to
+        // `now + backoff` on every call, and the generic schedule-to-start
+        // timeout scanner computes its deadline as `scheduled_at +
+        // schedule_to_start` -- so relying on that scanner here would let
+        // every defer push the effective deadline forward, making
+        // `acquisition_timeout` unbounded whenever every worker on the
+        // queue is at session capacity (or has the default
+        // `max_concurrent_sessions = 0`) for longer than one backoff
+        // interval (issue #929 review). Comparing directly against the
+        // task's original eligibility anchor (`created_at`, falling back to
+        // `scheduled_at` for pre-#501 rows) keeps the deadline fixed
+        // regardless of how many times this task defers.
+        let eligible_since = task.created_at.unwrap_or(task.scheduled_at);
+        let acquisition_timeout_exceeded = task
+            .schedule_to_start
+            .is_some_and(|budget| chrono::Utc::now() >= eligible_since + budget);
+        if acquisition_timeout_exceeded {
+            return record_session_acquire_schedule_to_start_timeout(
+                &mut conn,
+                task,
+                exec_id,
+                activity_id,
+            )
+            .await;
+        }
+
         // Lost the race: this worker is at its advertised session
         // capacity (or sessions are disabled: max_concurrent_sessions <= 0,
         // so every acquire loses). Reschedule with a randomized backoff so
@@ -5199,7 +5271,37 @@ async fn handle_session_acquire(
     )
     .await
     {
-        Ok(host) => host,
+        Ok(crate::sessions::SessionAcquireRecordOutcome::Active { host_worker_id }) => {
+            host_worker_id
+        }
+        Ok(crate::sessions::SessionAcquireRecordOutcome::NotActive { reason }) => {
+            // The session already left ACTIVE (e.g. the broken-session
+            // scanner reclaimed it) before this retried acquire resolved --
+            // release the slot just claimed (it was never actually granted)
+            // and fail the *activity*, not the whole workflow, with a
+            // typed, non-retryable SessionBroken failure. This reaches the
+            // `create_session` error-mapping arm that maps
+            // `ActivityFailed{error_type == ERROR_TYPE_SESSION_BROKEN}` to
+            // `HarvestError::SessionBroken`, letting the workflow author
+            // re-establish a fresh session instead of hard-pinning member
+            // activities to a host already known to be dead/broken forever.
+            crate::sessions::release_session_slot(session_slots_in_use, session_id);
+            metrics.record_session_acquisition(
+                &task.queue_name,
+                crate::telemetry::SessionAcquisitionOutcome::Broken,
+            );
+            let payload = crate::failure::IntoActivityErrorString::into_error_payload(
+                crate::failure::ActivityFailure::non_retryable(
+                    crate::failure::ERROR_TYPE_SESSION_BROKEN,
+                    format!(
+                        "session {session_id} was already broken before acquisition resolved: \
+                         {reason}"
+                    ),
+                ),
+            );
+            return finalize_activity_failure(&mut conn, task, exec_id, activity_id, &payload)
+                .await;
+        }
         Err(error) => {
             // Failed to durably record the session -- release the slot just
             // claimed (never leak it) and fail the task so the workflow

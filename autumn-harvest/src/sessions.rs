@@ -391,6 +391,27 @@ pub fn spawn_session_slot_reconciler(
 // DB-gated session persistence
 // ---------------------------------------------------------------------------
 
+/// Outcome of [`record_session_acquired`]'s idempotent read-back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionAcquireRecordOutcome {
+    /// The session is (still) `ACTIVE`. `host_worker_id` is the durably
+    /// recorded host -- `host_worker_id` on a fresh insert, or a *different*
+    /// worker's id if this call lost the race to an earlier attempt.
+    Active {
+        /// The durably-recorded host worker id.
+        host_worker_id: String,
+    },
+    /// The session already left `ACTIVE` (e.g. the broken-session scanner
+    /// reclaimed it) before this call resolved -- the crash-then-retry race
+    /// described on [`record_session_acquired`]. The caller must not treat
+    /// this as a successful acquisition.
+    NotActive {
+        /// Why the session is no longer usable (its `broken_reason` when
+        /// available, else a description of the unexpected state).
+        reason: String,
+    },
+}
+
 /// Record a newly acquired session (issue #606), idempotently.
 ///
 /// Called by the worker's session-acquire interception after it wins the
@@ -401,13 +422,24 @@ pub fn spawn_session_slot_reconciler(
 /// after its original worker crashes between committing this insert and
 /// completing the task -- and a second, honest attempt on a *different*
 /// worker must not error out on a duplicate-key violation or silently
-/// overwrite the first winner's `host_worker_id`. Returns the session's
-/// actual, durably-recorded host -- which is `host_worker_id` on a fresh
-/// insert, or a *different* worker's id if this call lost the race to an
-/// earlier attempt. Callers must compare the returned host against their
-/// own worker id and release any local slot reservation they are not
-/// actually entitled to when they differ (see `handle_session_acquire` in
-/// `worker.rs`).
+/// overwrite the first winner's `host_worker_id`.
+///
+/// **The read-back also re-checks `state`.** In the crash window above, the
+/// broken-session scanner can mark the row `BROKEN` (the original host lost
+/// its heartbeat) *before* the poison-pill reclaimer requeues the stuck
+/// acquire task -- a retried acquire on a different worker must not resolve
+/// the session as successfully acquired against a host it already knows is
+/// dead; that would hard-pin every later member activity to an
+/// unreachable worker with no further scanner coverage (the scanner's
+/// candidate query only ever selects `state = 'ACTIVE'` rows, so a session
+/// already `BROKEN` is never revisited). Returns
+/// [`SessionAcquireRecordOutcome::NotActive`] in that case so the caller can
+/// fail the acquire activity with a typed `SessionBroken` failure instead.
+///
+/// Callers must compare an [`SessionAcquireRecordOutcome::Active`] host
+/// against their own worker id and release any local slot reservation they
+/// are not actually entitled to when they differ (see
+/// `handle_session_acquire` in `worker.rs`).
 ///
 /// # Errors
 ///
@@ -420,7 +452,7 @@ pub async fn record_session_acquired(
     host_worker_id: &str,
     queue_name: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
-) -> crate::error::HarvestResult<String> {
+) -> crate::error::HarvestResult<SessionAcquireRecordOutcome> {
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
@@ -441,12 +473,23 @@ pub async fn record_session_acquired(
         .await
         .map_err(crate::error::database_error)?;
 
-    dsl::harvest_sessions
-        .find(session_id.as_uuid())
-        .select(dsl::host_worker_id)
-        .first(conn)
-        .await
-        .map_err(crate::error::database_error)
+    let (recorded_host, state, broken_reason): (String, String, Option<String>) =
+        dsl::harvest_sessions
+            .find(session_id.as_uuid())
+            .select((dsl::host_worker_id, dsl::state, dsl::broken_reason))
+            .first(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+
+    if state == "ACTIVE" {
+        Ok(SessionAcquireRecordOutcome::Active {
+            host_worker_id: recorded_host,
+        })
+    } else {
+        let reason =
+            broken_reason.unwrap_or_else(|| format!("session state is {state}, not ACTIVE"));
+        Ok(SessionAcquireRecordOutcome::NotActive { reason })
+    }
 }
 
 /// Mark a session `COMPLETED` (issue #606).
