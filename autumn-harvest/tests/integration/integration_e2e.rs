@@ -835,6 +835,7 @@ fn build_runtime_worker_with_task_timeout(
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )
@@ -1501,6 +1502,7 @@ async fn worker_completes_workflow_task_and_persists_result() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )
@@ -1631,6 +1633,7 @@ async fn worker_marks_workflow_failed_when_handler_errors() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )
@@ -1794,6 +1797,7 @@ async fn worker_completes_workflow_with_activity_round_trip() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )
@@ -2022,6 +2026,7 @@ async fn worker_fails_orphaned_activity_task_without_scheduled_event() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::new(HandlerRegistry::new(
                 vec![],
@@ -2277,6 +2282,7 @@ async fn worker_fails_workflow_when_activity_start_to_close_timeout_elapses() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -2441,6 +2447,7 @@ async fn worker_completes_workflow_with_timer_round_trip() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::new(HandlerRegistry::new(
                 vec![WorkflowInfo {
@@ -5726,6 +5733,7 @@ async fn workflow_schedule_baseline_dispatches_multiple_runs() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::clone(&registry),
         )
@@ -5851,6 +5859,7 @@ async fn workflow_schedule_max_active_runs_enforced() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::clone(&registry),
         )
@@ -5965,6 +5974,7 @@ async fn workflow_schedule_pause_and_resume() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             Arc::clone(&registry),
         )
@@ -6523,6 +6533,7 @@ async fn drain_accepted_sets_status_to_draining() {
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -6572,6 +6583,7 @@ async fn drain_already_draining_on_second_call() {
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -6631,6 +6643,7 @@ async fn drain_already_stopped_after_transition() {
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -6685,6 +6698,7 @@ async fn drain_with_explicit_deadline_is_stored() {
         "",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -6725,6 +6739,7 @@ async fn drain_preview_returns_active_workers() {
             "",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -8431,6 +8446,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         "v1",
         None,
         &std::collections::HashMap::new(),
+        0,
     )
     .await
     .unwrap();
@@ -8467,6 +8483,7 @@ async fn test_rolling_deploy_capability_routing_with_database_enforcement() {
         "v1",
         None,
         &new_labels,
+        0,
     )
     .await
     .unwrap();

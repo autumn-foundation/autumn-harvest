@@ -56,6 +56,10 @@ pub struct WorkerRegistration {
     pub deployment_name: Option<String>,
     /// Capability labels for hardware-aware and regional routing (issue #382).
     pub labels: std::collections::HashMap<String, String>,
+    /// Advertised worker-session capacity (issue #606). `0` (the default)
+    /// means sessions are disabled on this worker -- zero behavior change
+    /// for existing deployments.
+    pub max_concurrent_sessions: i32,
 }
 use crate::models::{HarvestWorker, NewHarvestWorker};
 use crate::schema::{harvest_task_queue, harvest_workers, harvest_workflow_executions};
@@ -299,6 +303,7 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
     build_id: &str,
     deployment_name: Option<&str>,
     labels: &std::collections::HashMap<String, String, S>,
+    max_concurrent_sessions: i32,
 ) -> HarvestResult<()> {
     use diesel::pg::upsert::excluded;
 
@@ -317,6 +322,7 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
         build_id,
         deployment_name,
         labels: labels_json,
+        max_concurrent_sessions,
     };
 
     diesel::insert_into(harvest_workers::table)
@@ -339,6 +345,12 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
             // Clear any stale drain deadline so a re-registering worker does not
             // inherit the deadline left behind by a prior Draining/Stopped cycle.
             harvest_workers::drain_deadline_at.eq(Option::<DateTime<Utc>>::None),
+            harvest_workers::max_concurrent_sessions
+                .eq(excluded(harvest_workers::max_concurrent_sessions)),
+            // A re-registering worker starts with zero in-use sessions -- any
+            // sessions it previously hosted are reconciled by the
+            // broken-session scanner against its new (post-restart) identity.
+            harvest_workers::in_use_sessions.eq(0_i32),
         ))
         .execute(conn)
         .await
@@ -1118,6 +1130,7 @@ async fn do_heartbeat_tick(
                     &registration.build_id,
                     registration.deployment_name.as_deref(),
                     &registration.labels,
+                    registration.max_concurrent_sessions,
                 )
                 .await
                 {
@@ -1565,6 +1578,7 @@ mod tests {
             build_id: String::new(),
             deployment_name: None,
             labels: std::collections::HashMap::new(),
+            max_concurrent_sessions: 0,
         };
         assert_eq!(reg.worker_id, "w1");
         assert_eq!(reg.queues, vec!["default"]);
@@ -1591,6 +1605,8 @@ mod tests {
                 build_id: String::new(),
                 deployment_name: None,
                 labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],
@@ -1660,6 +1676,8 @@ mod tests {
                 build_id: String::new(),
                 deployment_name: None,
                 labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
             },
             health: WorkerHealth::Healthy,
             active_task_ids,
@@ -1686,6 +1704,33 @@ mod tests {
             .expect("active_task_ids should be array");
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].as_str().unwrap(), tid.to_string());
+    }
+
+    // -- Worker session capacity surfaces via WorkerRow's #[serde(flatten)]
+    //    HarvestWorker (issue #606) -- no handler change needed for
+    //    GET /workers / GET /workers/{id} to expose these fields.
+
+    #[test]
+    fn worker_row_flattens_session_capacity_fields() {
+        let mut row = make_test_worker_row(vec![]);
+        row.worker.max_concurrent_sessions = 5;
+        row.worker.in_use_sessions = 2;
+
+        let json = serde_json::to_value(&row).unwrap();
+        // Flattened directly onto the top-level object, not nested under "worker".
+        assert_eq!(json["max_concurrent_sessions"], serde_json::json!(5));
+        assert_eq!(json["in_use_sessions"], serde_json::json!(2));
+        assert!(json.get("worker").is_none(), "HarvestWorker fields must be flattened, not nested");
+    }
+
+    #[test]
+    fn worker_row_default_session_capacity_is_zero() {
+        // The default-off contract (AC2): a worker that never calls
+        // with_max_concurrent_sessions surfaces 0/0.
+        let row = make_test_worker_row(vec![]);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["max_concurrent_sessions"], serde_json::json!(0));
+        assert_eq!(json["in_use_sessions"], serde_json::json!(0));
     }
 
     // -- DrainOutcome --
@@ -1844,6 +1889,8 @@ mod tests {
                 build_id: String::new(),
                 deployment_name: None,
                 labels: serde_json::json!({}),
+                max_concurrent_sessions: 0,
+                in_use_sessions: 0,
             },
             health: WorkerHealth::Healthy,
             active_task_ids: vec![],

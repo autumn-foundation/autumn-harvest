@@ -2023,6 +2023,15 @@ pub struct WorkerConfig {
     #[cfg(feature = "db")]
     /// Optional sharded database pool for exact shard routing.
     pub sharded_pool: Option<crate::shard::ShardedDbPool>,
+    /// Advertised worker-session capacity (issue #606): the maximum number
+    /// of `ctx.create_session(...)` sessions this worker will host
+    /// concurrently. Opening a session consumes one slot; ending it
+    /// (`Session::complete()`) or the broken-session scanner reclaiming a
+    /// dead/expired session releases it.
+    ///
+    /// **Defaults to `0`: sessions disabled, zero behavior change** for
+    /// existing deployments. Set via `with_max_concurrent_sessions`.
+    pub max_concurrent_sessions: i32,
 }
 
 impl Default for WorkerConfig {
@@ -2056,6 +2065,7 @@ impl Default for WorkerConfig {
             slot_tuner: None,
             #[cfg(feature = "db")]
             sharded_pool: None,
+            max_concurrent_sessions: 0,
         }
     }
 }
@@ -2400,6 +2410,18 @@ impl WorkerConfig {
     #[must_use]
     pub fn with_sharded_pool(mut self, pool: crate::shard::ShardedDbPool) -> Self {
         self.sharded_pool = Some(pool);
+        self
+    }
+
+    /// Advertise worker-session capacity (issue #606).
+    ///
+    /// Enables `ctx.create_session(...)` to acquire this worker: up to `n`
+    /// sessions may be `ACTIVE` on it at once. Defaults to `0` (sessions
+    /// disabled) — the single builder call adopting this feature costs the
+    /// author, per the issue's success metric.
+    #[must_use]
+    pub const fn with_max_concurrent_sessions(mut self, n: i32) -> Self {
+        self.max_concurrent_sessions = n;
         self
     }
 }

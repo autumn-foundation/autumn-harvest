@@ -272,6 +272,7 @@ fn runtime_config(worker_id: &str, slot_tuner: Option<SlotTunerConfig>) -> Worke
         shard_notification_database_urls: Vec::new(),
         sharded_pool: None,
         slot_tuner,
+        max_concurrent_sessions: 0,
     }
 }
 

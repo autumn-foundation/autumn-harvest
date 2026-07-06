@@ -452,6 +452,7 @@ fn all_adr_0001_span_kinds_are_emitted() {
                         shard_notification_database_urls: Vec::new(),
                         sharded_pool: None,
                         slot_tuner: None,
+                        max_concurrent_sessions: 0,
                     },
                     registry,
                 )

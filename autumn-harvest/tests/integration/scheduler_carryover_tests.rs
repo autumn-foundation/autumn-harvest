@@ -284,6 +284,7 @@ fn make_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )

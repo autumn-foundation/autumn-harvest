@@ -15,8 +15,8 @@ use crate::schema::{
     harvest_completion_deliveries, harvest_completion_trigger_fires,
     harvest_completion_trigger_outbox, harvest_completion_triggers, harvest_dead_letters,
     harvest_events, harvest_external_tasks, harvest_payload_refs, harvest_rate_limit_buckets,
-    harvest_schedule_decisions, harvest_schedules, harvest_signals, harvest_task_queue,
-    harvest_timers, harvest_workers, harvest_workflow_executions,
+    harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
+    harvest_task_queue, harvest_timers, harvest_workers, harvest_workflow_executions,
 };
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
@@ -344,6 +344,10 @@ pub struct TaskQueueItem {
     /// hardening). See `wake_workflow_task`/`park_workflow_task` in `queue.rs`.
     #[serde(default)]
     pub wake_requested: bool,
+    /// Worker session this activity belongs to (issue #606). `None` for an
+    /// ordinary activity dispatch.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -382,6 +386,9 @@ pub struct NewTaskQueueItem<'a> {
     pub required_capabilities: Option<serde_json::Value>,
     /// Ambient context headers propagated from the parent workflow (issue #481).
     pub context_headers: Option<serde_json::Value>,
+    /// Worker session this activity belongs to (issue #606). `None` for an
+    /// ordinary activity dispatch.
+    pub session_id: Option<Uuid>,
 }
 
 /// Database representation of a rate limit bucket.
@@ -691,6 +698,11 @@ pub struct HarvestWorker {
     pub deployment_name: Option<String>,
     /// Capability labels for hardware-aware and regional routing (issue #382).
     pub labels: serde_json::Value,
+    /// Advertised worker-session capacity (issue #606). `0` = sessions
+    /// disabled on this worker (the default).
+    pub max_concurrent_sessions: i32,
+    /// Sessions currently `ACTIVE` on this worker (issue #606).
+    pub in_use_sessions: i32,
 }
 
 /// Insert struct for registering a new worker process.
@@ -709,6 +721,9 @@ pub struct NewHarvestWorker<'a> {
     pub deployment_name: Option<&'a str>,
     /// Capability labels for hardware-aware and regional routing (issue #382).
     pub labels: serde_json::Value,
+    /// Advertised worker-session capacity (issue #606). `0` = sessions
+    /// disabled on this worker (the default).
+    pub max_concurrent_sessions: i32,
 }
 
 // ── BatchJob ──────────────────────────────────────────────────────────────────
@@ -1139,4 +1154,65 @@ pub struct CompletionDeliveryOutcomeUpdate {
     pub last_error: Option<String>,
     pub updated_at: DateTime<Utc>,
     pub delivered_at: Option<DateTime<Utc>>,
+}
+
+// ── Worker sessions (issue #606) ───────────────────────────────────────────
+
+/// A worker session row from `harvest_sessions`.
+#[derive(
+    Debug, Clone, Queryable, Selectable, Identifiable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = harvest_sessions)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestSession {
+    pub id: Uuid,
+    pub workflow_exec_id: Uuid,
+    pub host_worker_id: String,
+    pub queue_name: String,
+    /// `ACTIVE`, `BROKEN`, or `COMPLETED`.
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub broken_at: Option<DateTime<Utc>>,
+    pub broken_reason: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+/// Insert struct for a newly acquired worker session.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_sessions)]
+pub struct NewHarvestSession<'a> {
+    pub id: Uuid,
+    pub workflow_exec_id: Uuid,
+    pub host_worker_id: &'a str,
+    pub queue_name: &'a str,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Changeset for refreshing a session's lease (issue #606).
+///
+/// Applied after each member-activity completion so a long-running,
+/// legitimate session isn't reaped by the broken-session scanner's
+/// lease-expiry check.
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = harvest_sessions)]
+pub struct SessionLeaseRefresh {
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Changeset applied by the broken-session scanner (issue #606).
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = harvest_sessions)]
+pub struct SessionBrokenUpdate {
+    pub state: String,
+    pub broken_at: DateTime<Utc>,
+    pub broken_reason: String,
+}
+
+/// Changeset applied by `Session::complete()`'s release activity.
+#[derive(Debug, AsChangeset)]
+#[diesel(table_name = harvest_sessions)]
+pub struct SessionCompletedUpdate {
+    pub state: String,
+    pub completed_at: DateTime<Utc>,
 }

@@ -319,6 +319,7 @@ fn make_worker(
             sharded_pool: None,
             max_workflow_history_events: None,
             slot_tuner: None,
+            max_concurrent_sessions: 0,
         },
         registry,
     )

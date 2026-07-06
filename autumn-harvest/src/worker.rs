@@ -145,6 +145,9 @@ pub struct WorkerRuntimeConfig {
     /// Opt-in adaptive dispatch-slot tuner (issue #548). `None` = today's
     /// fixed-concurrency semaphore behaviour, byte-for-byte unchanged.
     pub slot_tuner: Option<crate::slot_tuner::SlotTunerConfig>,
+    /// Advertised worker-session capacity (issue #606). `0` (the default)
+    /// means sessions are disabled on this worker.
+    pub max_concurrent_sessions: i32,
 }
 
 impl WorkerRuntimeConfig {
@@ -262,6 +265,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             sharded_pool: cfg.sharded_pool,
             max_workflow_history_events: cfg.max_workflow_history_events,
             slot_tuner: cfg.slot_tuner,
+            max_concurrent_sessions: cfg.max_concurrent_sessions,
         }
     }
 }
@@ -10149,6 +10153,7 @@ impl Worker {
                 build_id: self.config.build_id.clone(),
                 deployment_name: self.config.deployment_name.clone(),
                 labels: self.config.labels.clone(),
+                max_concurrent_sessions: self.config.max_concurrent_sessions,
             },
             Arc::clone(&self.workflow_semaphore),
             workflow_slot_target,
@@ -10335,6 +10340,7 @@ impl Worker {
                     &self.config.build_id,
                     self.config.deployment_name.as_deref(),
                     &self.config.labels,
+                    self.config.max_concurrent_sessions,
                 )
                 .await
                 {
@@ -11449,6 +11455,7 @@ mod tests {
             #[cfg(feature = "db")]
             sharded_pool: None,
             slot_tuner: None,
+            max_concurrent_sessions: 0,
         }
     }
 
@@ -11959,6 +11966,7 @@ mod tests {
             max_workflow_history_events: None,
             queue_weights: std::collections::HashMap::new(),
             slot_tuner: None,
+            max_concurrent_sessions: 0,
             #[cfg(feature = "db")]
             sharded_pool: None,
         };

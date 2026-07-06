@@ -288,6 +288,9 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         schedule_to_close_at: params.schedule_to_close_at,
         required_capabilities: params.required_capabilities.clone(),
         context_headers: params.context_headers.clone(),
+        // TODO(#606 step 9): threaded from EnqueueParams.session_id once the
+        // hard-pin claim gate lands.
+        session_id: None,
     };
 
     diesel::insert_into(harvest_task_queue::table)

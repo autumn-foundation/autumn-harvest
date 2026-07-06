@@ -611,6 +611,7 @@ mod db_tests {
             "v1.0",
             Some("prod-blue"),
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .expect("register_worker");
@@ -641,6 +642,7 @@ mod db_tests {
             "v1.0",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -655,6 +657,7 @@ mod db_tests {
             "v2.0",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -914,6 +917,7 @@ mod db_tests {
             "v1.0",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();
@@ -928,6 +932,7 @@ mod db_tests {
             "v2.0",
             None,
             &std::collections::HashMap::new(),
+            0,
         )
         .await
         .unwrap();

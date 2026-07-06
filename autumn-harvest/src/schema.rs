@@ -169,6 +169,13 @@ diesel::table! {
         /// be silently dropped. Read-and-cleared by `park_workflow_task` so a park
         /// racing a same-cycle wake immediately re-pends instead of parking.
         wake_requested -> Bool,
+        /// Worker session this activity belongs to (issue #606). NULL for an
+        /// ordinary activity. When set, the claim query hard-pins this row to
+        /// `sticky_worker_id` -- unlike ordinary sticky routing, it never
+        /// fails over to another worker even after the lease (`sticky_until`)
+        /// expires, since the session's local state only exists on that one
+        /// worker.
+        session_id -> Nullable<Uuid>,
     }
 }
 
@@ -368,6 +375,13 @@ diesel::table! {
         /// Optional human-readable deployment name (issue #171).
         deployment_name -> Nullable<Text>,
         labels -> Jsonb,
+        /// Advertised worker-session capacity (issue #606). `0` (the
+        /// default) means sessions are disabled on this worker -- zero
+        /// behavior change for existing deployments.
+        max_concurrent_sessions -> Int4,
+        /// Sessions currently ACTIVE on this worker (issue #606), updated on
+        /// each heartbeat tick alongside `in_flight_count`.
+        in_use_sessions -> Int4,
     }
 }
 
@@ -669,6 +683,38 @@ diesel::table! {
 
 diesel::joinable!(harvest_completion_deliveries -> harvest_workflow_executions (workflow_exec_id));
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// Worker sessions (issue #606): one row per open/closed session, tracking
+    /// which worker hosts it and its lifecycle state.
+    harvest_sessions (id) {
+        /// The session's identity -- matches the `SessionId` recorded in the
+        /// workflow's `session:{seq}` marker.
+        id -> Uuid,
+        /// The workflow execution that opened this session.
+        workflow_exec_id -> Uuid,
+        /// The worker id that acquired this session and hosts its member
+        /// activities.
+        host_worker_id -> Text,
+        /// The task queue the session was opened on.
+        queue_name -> Text,
+        /// `ACTIVE`, `BROKEN`, or `COMPLETED`.
+        state -> Text,
+        created_at -> Timestamptz,
+        /// Lease deadline -- refreshed on each member-activity completion.
+        /// A session past this deadline with no activity is treated as
+        /// abandoned (e.g. a wedged workflow that never called
+        /// `Session::complete()`) and is marked `BROKEN`.
+        expires_at -> Timestamptz,
+        broken_at -> Nullable<Timestamptz>,
+        broken_reason -> Nullable<Text>,
+        completed_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::joinable!(harvest_sessions -> harvest_workflow_executions (workflow_exec_id));
+
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
     harvest_events,
@@ -695,4 +741,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_event_batches,
     harvest_payload_refs,
     harvest_completion_deliveries,
+    harvest_sessions,
 );

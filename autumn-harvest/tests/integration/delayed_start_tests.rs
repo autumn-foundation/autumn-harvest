@@ -346,6 +346,7 @@ async fn test_delayed_start_no_premature_dispatch() {
                 shard_notification_database_urls: Vec::new(),
                 sharded_pool: None,
                 slot_tuner: None,
+                max_concurrent_sessions: 0,
             },
             registry,
         )
