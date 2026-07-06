@@ -1,18 +1,22 @@
 //! Tests for worker-session enqueue pinning and the hard-pin claim gate
 //! (issue #606, TDD step 9).
 //!
-//! **Pure-logic tests (no DB required):** `EnqueueParams::with_session_id`
-//! builder behavior.
+//! **Pure-logic tests (no live database connection required):**
+//! `EnqueueParams::with_session_id` builder behavior. These still require
+//! the `db` Cargo feature to compile, since `queue::EnqueueParams` itself
+//! lives entirely behind `#[cfg(feature = "db")]` -- hence `#![cfg(feature =
+//! "db")]` gating the whole file below, not just the `db_tests` submodule.
 //!
-//! **DB integration tests (`db` feature, bottom of file):** the `session_id`
-//! column round-trips through `enqueue`, and `claim_task`'s hard-pin gate --
-//! unlike ordinary sticky routing, a session-tagged row is claimable *only*
-//! by its pinned worker even after the (bookkeeping) sticky lease has
-//! elapsed. Written RED-first; pass GREEN against the implementation in
-//! `queue.rs`.
+//! **DB integration tests (bottom of file, testcontainers):** the
+//! `session_id` column round-trips through `enqueue`, and `claim_task`'s
+//! hard-pin gate -- unlike ordinary sticky routing, a session-tagged row is
+//! claimable *only* by its pinned worker even after the (bookkeeping) sticky
+//! lease has elapsed. Written RED-first; pass GREEN against the
+//! implementation in `queue.rs`.
 //!
 //! Compile-checked only in this sandbox (no Docker/testcontainers available),
 //! matching the #543/#544/#601 precedent documented in CLAUDE.md.
+#![cfg(feature = "db")]
 
 use autumn_harvest::queue::{EnqueueParams, TaskType};
 

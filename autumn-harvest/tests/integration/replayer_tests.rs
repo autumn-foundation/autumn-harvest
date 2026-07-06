@@ -340,7 +340,11 @@ fn session_pipeline_history(host_worker_id: &str) -> (ExecutionId, Vec<WorkflowE
         WorkflowEvent::ActivityScheduled {
             activity_id: release_id,
             name: "__harvest_session_release".into(),
-            input: Value::Null,
+            // `Session::complete()` dispatches the release activity with the
+            // session id (as a string) for input -- the worker-side handler
+            // parses it back out to know which `harvest_sessions` row to
+            // mark COMPLETED.
+            input: serde_json::json!(session_uuid.to_string()),
             queue: "gpu-workers".into(),
         },
         WorkflowEvent::ActivityCompleted {
