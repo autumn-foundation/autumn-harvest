@@ -937,9 +937,23 @@ async fn delete_candidate_execution(
             .await
             .map_err(database_error)?;
 
+            // `task_type = 'CALLBACK'` dead letters (issue #605) are
+            // excluded here (issue #921 review, Codex P2): a CALLBACK
+            // dead-letter row only ever exists for a delivery that reached
+            // `FAILED`, and the completion-deliveries delete just below
+            // deliberately keeps every non-`DELIVERED` (i.e. `FAILED`)
+            // delivery row around for redrive -- deleting its DLQ entry
+            // here would drop it from the `GET /dead-letters` / aggregate
+            // discovery surface while the delivery row itself (and its
+            // redrive path) still exists, breaking the advertised "find
+            // failures via DLQ" operator workflow for any callback failure
+            // that outlives the owning workflow's retention window. A
+            // redrive already deletes its own DLQ row on success, so this
+            // exclusion cannot leak an entry whose delivery was resolved.
             diesel::delete(
                 harvest_dead_letters::table
-                    .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate_id))),
+                    .filter(harvest_dead_letters::workflow_exec_id.eq(Some(candidate_id)))
+                    .filter(harvest_dead_letters::task_type.ne("CALLBACK")),
             )
             .execute(conn)
             .await

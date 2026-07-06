@@ -9,6 +9,7 @@ use autumn_harvest_plugin::{HarvestRunner, HarvestRunnerResources, HarvestRuntim
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use serde_json::{Value, json};
 use testcontainers::ContainerAsync;
@@ -519,6 +520,169 @@ async fn archival_hook_times_out_and_preserves_execution() {
     assert_eq!(
         count, 1,
         "Workflow execution must NOT be deleted if the archival hook times out"
+    );
+
+    runner.stop().await;
+}
+
+/// Issue #921 review (Codex P2, follow-up): a `task_type = "CALLBACK"`
+/// dead-letter row (issue #605) must survive retention alongside its
+/// `FAILED` `harvest_completion_deliveries` row -- an earlier review round
+/// already scoped the completion-deliveries delete to `state = 'DELIVERED'`
+/// so a `FAILED` delivery survives for redrive, but the *separate*
+/// `harvest_dead_letters` delete was still unconditional, silently dropping
+/// the same delivery's DLQ entry from `GET /dead-letters` discovery even
+/// though the delivery row (and its redrive path) still exists.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn retention_preserves_a_failed_callback_delivery_and_its_dead_letter() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+
+    let runner = HarvestRunner::start(
+        autumn_harvest::HarvestBuilder::new()
+            .retention(RetentionConfig {
+                max_age_secs: Some(7 * 24 * 60 * 60),
+                tick_interval_secs: 60 * 60,
+                batch_size: 1000,
+                dry_run: false,
+                audit_retention_days: 90,
+                schedule_decision_retention_days: 7,
+                archival_timeout_secs: 30,
+            })
+            .build(),
+        &HarvestRuntimeConfig {
+            mode: HarvestMode::External,
+            worker_enabled: false,
+            scheduler_enabled: false,
+            database: autumn_harvest_plugin::HarvestDatabaseConfig {
+                url: Some(database_url.clone()),
+            },
+            outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
+            batch: autumn_harvest_plugin::HarvestBatchConfig::default(),
+            readiness: autumn_harvest_plugin::HarvestReadinessConfig::default(),
+        },
+        HarvestRunnerResources::new(pool.clone()),
+    )
+    .await
+    .expect("runner with retention should start");
+
+    let exec_id = uuid::Uuid::new_v4();
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for retention fixture");
+
+    insert_retention_fixture_execution(
+        &mut conn,
+        exec_id,
+        "callback-dlq-retention",
+        "COMPLETED",
+        "NOW() - INTERVAL '10 days'",
+    )
+    .await;
+
+    // A FAILED completion-delivery row (already-exhausted callback).
+    let delivery_id = uuid::Uuid::new_v4();
+    diesel::insert_into(autumn_harvest::schema::harvest_completion_deliveries::table)
+        .values(autumn_harvest::models::NewCompletionDelivery {
+            id: delivery_id,
+            workflow_exec_id: exec_id,
+            shard_id: 0,
+            callback_index: 0,
+            workflow_name: "callback-dlq-retention",
+            workflow_id: "callback-dlq-retention",
+            target_url: "https://receiver.example.com/hook",
+            event_filter: json!({ "type": "AnyTerminal" }),
+            terminal_state: "COMPLETED",
+            payload: json!({ "delivery_id": delivery_id, "state": "COMPLETED" }),
+            max_attempts: 5,
+            retry_policy: json!({
+                "max_attempts": 5,
+                "initial_interval": { "secs": 30, "nanos": 0 },
+                "backoff_coefficient": 2.0,
+                "max_interval": { "secs": 600, "nanos": 0 },
+                "non_retryable_errors": [],
+                "jitter": "None"
+            }),
+            next_attempt_at: chrono::Utc::now(),
+        })
+        .execute(&mut conn)
+        .await
+        .expect("failed to seed FAILED completion-delivery fixture row");
+    diesel::update(autumn_harvest::schema::harvest_completion_deliveries::table.find(delivery_id))
+        .set(autumn_harvest::schema::harvest_completion_deliveries::state.eq("FAILED"))
+        .execute(&mut conn)
+        .await
+        .expect("failed to mark fixture delivery FAILED");
+
+    // The matching CALLBACK dead-letter written on exhaustion.
+    let dead_letter_id = autumn_harvest::dlq::dead_letter(
+        &mut conn,
+        &autumn_harvest::dlq::NewDeadLetterEntry {
+            original_task_id: delivery_id,
+            queue_name: "completion-callback".to_string(),
+            task_type: "CALLBACK".to_string(),
+            workflow_exec_id: Some(exec_id),
+            activity_name: None,
+            input: json!({ "delivery_id": delivery_id, "state": "COMPLETED" }),
+            error: "delivery exhausted 5 attempts".to_string(),
+            attempts: 5,
+            owner: None,
+            severity: None,
+        },
+    )
+    .await
+    .expect("failed to seed CALLBACK dead-letter fixture row");
+
+    api_state.install_storage_pool(runner.storage_pool());
+    api_state.install(runner.api_runtime());
+    api_state.set_admin_auth_boundary(true);
+    let app = harvest_api_router(api_state).with_state(autumn_web::AppState::for_test());
+
+    let (run_now_status, run_now_json) =
+        post_json(&app, "/admin/retention/run-now", json!({})).await;
+    assert_eq!(run_now_status, StatusCode::OK);
+    assert_eq!(run_now_json["ok"], true);
+
+    // Wait for the execution row to be collected.
+    let mut deleted = false;
+    for _ in 0..40 {
+        if count_execution_rows(&mut conn, exec_id).await == 0 {
+            deleted = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(deleted, "execution row should be collected by retention");
+
+    // The FAILED completion-delivery row survives (pre-existing fix).
+    let delivery_count: i64 = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM harvest_completion_deliveries WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(delivery_id)
+    .get_result::<CountByName>(&mut conn)
+    .await
+    .expect("count query should succeed")
+    .count;
+    assert_eq!(
+        delivery_count, 1,
+        "a FAILED completion-delivery row must survive its owning execution's retention"
+    );
+
+    // The matching CALLBACK dead-letter row also survives (this fix).
+    let dead_letter_count: i64 =
+        diesel::sql_query("SELECT COUNT(*) AS count FROM harvest_dead_letters WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(dead_letter_id)
+            .get_result::<CountByName>(&mut conn)
+            .await
+            .expect("count query should succeed")
+            .count;
+    assert_eq!(
+        dead_letter_count, 1,
+        "a CALLBACK dead-letter row must survive retention alongside its FAILED delivery row, \
+         so it stays visible via GET /dead-letters"
     );
 
     runner.stop().await;

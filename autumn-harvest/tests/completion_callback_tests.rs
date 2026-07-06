@@ -691,6 +691,103 @@ async fn scanner_schedules_backoff_from_attempt_completion_not_claim_time() {
     );
 }
 
+// Regression (issue #921 review, Codex P1): a completion delivery that is
+// concurrently claimed for its final (exhausting) attempt must not
+// re-introduce PII into `harvest_dead_letters.input` if
+// `erase_workflow_payloads` tombstones the delivery's payload *after* the
+// claim but *before* the outcome is recorded. `apply_outcome`'s DeadLetter
+// branch used to build the DLQ entry from the in-memory `row.payload`
+// snapshot captured at claim time; if erase committed in the meantime, that
+// snapshot is now stale and dead-lettering with it would resurrect the
+// erased PII in a brand new DLQ row. Fixed by re-reading the payload from
+// the DB (under `FOR UPDATE`, serializing against a concurrent erase) inside
+// the same transaction that records the DeadLetter outcome.
+#[tokio::test]
+async fn erase_racing_a_dead_letter_write_does_not_reintroduce_pii() {
+    let _guard = TEST_SERIAL.lock().await;
+    let (url, _container) = setup().await;
+    let mut conn = connect(&url).await;
+    let mut erase_conn = connect(&url).await;
+
+    let pii = "dave@example.com";
+    // The attempt takes 300ms; the erase races in after only 50ms, so by the
+    // time the deliverer's failure resolves and `apply_outcome` runs, the
+    // erase transaction has already committed.
+    let deliverer = Arc::new(SlowFailingDeliverer {
+        delay: Duration::from_millis(300),
+        status: 500,
+    });
+    // max_attempts = 1 -> the very first (and only) attempt exhausts.
+    install_config(
+        deliverer.clone(),
+        RetryPolicy::exponential(1, Duration::from_millis(1)),
+    );
+
+    let exec_id = ExecutionId::new();
+    insert_terminal_execution(
+        &mut conn,
+        exec_id,
+        "COMPLETED",
+        Some(&format!(r#"{{"email":"{pii}"}}"#)),
+        None,
+        Some(r#"[{"url":"https://api.example.com/hook","filter":{"type":"AnyTerminal"}}]"#),
+    )
+    .await;
+    evaluate_triggers_for_execution(&mut conn, exec_id, TerminalState::Completed, None)
+        .await
+        .expect("evaluate triggers");
+
+    let rows = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries");
+    let delivery_id = rows[0].id;
+    assert!(
+        rows[0].payload.to_string().contains(pii),
+        "sanity: the frozen payload must carry the PII before erasure"
+    );
+
+    let scanner_fut = fire_due_completion_deliveries(&mut conn, &None, &[]);
+    let erase_fut = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        autumn_harvest::erase::erase_workflow_payloads(&mut erase_conn, exec_id, "test race")
+            .await
+            .expect("erase should succeed")
+    };
+    let (processed, _erase_outcome) = tokio::join!(scanner_fut, erase_fut);
+    assert_eq!(processed.expect("scanner tick"), 1);
+
+    let rows_after = list_deliveries_for_execution(&mut conn, exec_id)
+        .await
+        .expect("list deliveries after race");
+    assert_eq!(rows_after[0].state, "FAILED");
+    assert!(
+        !rows_after[0].payload.to_string().contains(pii),
+        "the delivery's own payload must stay erased"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct DeadLetterInput {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        input: serde_json::Value,
+    }
+    let dlq_rows: Vec<DeadLetterInput> =
+        diesel::sql_query("SELECT input FROM harvest_dead_letters WHERE original_task_id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(delivery_id)
+            .load(&mut conn)
+            .await
+            .expect("load dead-letter rows");
+    assert_eq!(
+        dlq_rows.len(),
+        1,
+        "exactly one dead-letter row must be written"
+    );
+    assert!(
+        !dlq_rows[0].input.to_string().contains(pii),
+        "the dead-letter's input must not resurrect the erased PII: {}",
+        dlq_rows[0].input
+    );
+}
+
 #[tokio::test]
 async fn scanner_dead_letters_on_retry_exhaustion() {
     let _guard = TEST_SERIAL.lock().await;

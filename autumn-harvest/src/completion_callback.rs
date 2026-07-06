@@ -2068,6 +2068,62 @@ async fn claim_due_deliveries(
         .map_err(crate::error::database_error)
 }
 
+/// Build the [`crate::dlq::NewDeadLetterEntry`] for an exhausted delivery,
+/// sourcing `input` from a *fresh* read of the row's `payload` column rather
+/// than the in-memory [`ClaimedDeliveryRow`] snapshot captured at claim time
+/// (issue #921 review, Codex P1).
+///
+/// A concurrent `erase_workflow_payloads` call can tombstone this row's
+/// `payload` column *after* the claim but *before* this outcome is
+/// recorded, and that erase transaction may have already committed by the
+/// time this runs. Dead-lettering with the stale, pre-erase `row.payload`
+/// would re-insert the erased result/error PII into
+/// `harvest_dead_letters.input`, silently undoing an erasure the operator
+/// believed was durable. Must be called from inside the same transaction
+/// that subsequently writes the `FAILED` state, under `FOR UPDATE`, which
+/// also serializes this read against a concurrent erase's own `UPDATE` on
+/// this row: whichever transaction's lock-acquiring statement runs first is
+/// authoritative, and the other blocks until it commits.
+#[cfg(feature = "db")]
+async fn dead_letter_entry_with_current_payload(
+    conn: &mut diesel_async::AsyncPgConnection,
+    row: &ClaimedDeliveryRow,
+    last_status: Option<u16>,
+) -> crate::error::HarvestResult<crate::dlq::NewDeadLetterEntry> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_completion_deliveries::dsl;
+
+    let current_payload: Option<serde_json::Value> = dsl::harvest_completion_deliveries
+        .find(row.id)
+        .select(dsl::payload)
+        .for_update()
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+
+    let reason = crate::dlq::DeadLetterReason::CallbackDeliveryExhausted {
+        delivery_id: row.id,
+        attempts: row.attempt,
+        last_status,
+        target: row.target_url.clone(),
+    };
+    Ok(crate::dlq::NewDeadLetterEntry {
+        original_task_id: row.id,
+        queue_name: "completion-callback".to_string(),
+        task_type: "CALLBACK".to_string(),
+        workflow_exec_id: Some(row.workflow_exec_id),
+        activity_name: None,
+        input: current_payload.unwrap_or_else(|| row.payload.clone()),
+        error: reason.to_string(),
+        attempts: row.attempt,
+        owner: None,
+        severity: None,
+    })
+}
+
 /// Record the outcome of one delivery attempt: `DELIVERED` (single
 /// `UPDATE`), rescheduled with backoff (single `UPDATE`), or dead-lettered
 /// (`UPDATE` + `harvest_dead_letters` insert, in one transaction so the two
@@ -2140,27 +2196,11 @@ async fn apply_outcome(
             last_status,
             last_error,
         } => {
-            let reason = crate::dlq::DeadLetterReason::CallbackDeliveryExhausted {
-                delivery_id: row.id,
-                attempts: row.attempt,
-                last_status,
-                target: row.target_url.clone(),
-            };
-            let entry = crate::dlq::NewDeadLetterEntry {
-                original_task_id: row.id,
-                queue_name: "completion-callback".to_string(),
-                task_type: "CALLBACK".to_string(),
-                workflow_exec_id: Some(row.workflow_exec_id),
-                activity_name: None,
-                input: row.payload.clone(),
-                error: reason.to_string(),
-                attempts: row.attempt,
-                owner: None,
-                severity: None,
-            };
-
             conn.transaction::<_, crate::error::HarvestError, _>(|conn| {
                 async move {
+                    let entry =
+                        dead_letter_entry_with_current_payload(conn, row, last_status).await?;
+
                     let updated = diesel::update(
                         dsl::harvest_completion_deliveries
                             .find(row.id)
