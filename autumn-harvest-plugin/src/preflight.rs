@@ -1020,7 +1020,15 @@ fn required_queues(runtime: &crate::api::HarvestApiRuntime) -> BTreeSet<String> 
         queues.insert("default".to_string());
     }
     for activity in runtime.registry().activities.values() {
-        if !activity.is_local {
+        // Worker sessions (issue #606): the two reserved internal
+        // activities (`__harvest_session_acquire`/`__harvest_session_release`)
+        // are always registered so the enqueue-time handler lookup never
+        // hard-fails on them, but they're dispatched on the *caller-supplied*
+        // session queue at the point `create_session`/`Session::complete` is
+        // called, never on `default_queue`. Counting them here would
+        // spuriously report a deployment with no session-based workflow at
+        // all as requiring a worker on `"default"`.
+        if !activity.is_local && !autumn_harvest::is_reserved_session_activity_name(activity.name) {
             queues.insert(activity.default_queue.unwrap_or("default").to_string());
         }
     }

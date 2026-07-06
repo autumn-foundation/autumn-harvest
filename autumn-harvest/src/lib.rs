@@ -226,7 +226,7 @@ pub use completion_trigger::{CompletionTrigger, InputMapping, TerminalState};
 pub use context::{
     ActivityContext, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
     DEFAULT_SESSION_ACQUISITION_TIMEOUT, RaceBuilder, RaceWinner, Session, SessionOptions,
-    WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy,
+    WorkflowCommand, WorkflowContext, WorkflowHistoryPolicy, is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
 pub use dag::{

@@ -183,90 +183,231 @@ pub fn acquire_retry_backoff(rng_fraction: f64, min: Duration, max: Duration) ->
 }
 
 // ---------------------------------------------------------------------------
-// In-process session-slot counter
+// In-process session-slot registry
 // ---------------------------------------------------------------------------
 
-/// Per-worker in-process count of sessions currently hosted by this worker
-/// (issue #606).
+/// Per-worker in-process registry of sessions currently hosted by this
+/// worker (issue #606).
 ///
-/// A plain atomic counter rather than a `tokio::sync::Semaphore` +
-/// `OwnedSemaphorePermit` map: a session's acquire and release happen in
-/// *different* task-dispatch invocations (potentially different tokio
-/// tasks, arbitrarily far apart in time), so there is no async-fn scope to
-/// hold an owned permit against. Storing a `HashMap<SessionId,
-/// OwnedSemaphorePermit>` directly as a `Worker` field hits the exact
-/// `clippy::significant_drop_tightening` trap already documented for
-/// `crate::slot_tuner::TunedSlotRuntime` (issue #548) -- but worse, since
-/// unlike that type (constructed and consumed within one function), a
-/// session registry must live for the worker's entire lifetime as a real
-/// struct field, so the lint fires on every single test in the crate that
-/// merely constructs a `Worker`. A bare `Arc<AtomicI64>` has no significant
-/// drop and sidesteps the trap entirely.
-pub type SessionSlotCounter = std::sync::Arc<std::sync::atomic::AtomicI64>;
+/// A plain `HashSet<SessionId>` guarded by a `Mutex`, not a
+/// `tokio::sync::Semaphore` + `OwnedSemaphorePermit` map: a session's
+/// acquire and release happen in *different* task-dispatch invocations
+/// (potentially different tokio tasks, arbitrarily far apart in time), so
+/// there is no async-fn scope to hold an owned permit against. Storing a
+/// `HashMap<SessionId, OwnedSemaphorePermit>` directly as a `Worker` field
+/// hits the exact `clippy::significant_drop_tightening` trap already
+/// documented for `crate::slot_tuner::TunedSlotRuntime` (issue #548) -- but
+/// worse, since unlike that type (constructed and consumed within one
+/// function), a session registry must live for the worker's entire
+/// lifetime as a real struct field, so the lint fires on every single test
+/// in the crate that merely constructs a `Worker`. `SessionId` is a plain
+/// `Copy` newtype with no custom `Drop`, so a `HashSet<SessionId>` has no
+/// significant drop and sidesteps the trap entirely -- while, unlike a bare
+/// counter, still tracking *which* sessions are held. That identity is
+/// required for [`reconcile_local_sessions`] to correct the leak a bare
+/// counter cannot: the broken-session scanner (`enforce_broken_sessions`)
+/// runs from a plain DB connection with no reference to any specific
+/// worker's registry, so it can never release a slot itself when it
+/// reclaims a session hosted by a *different* (possibly still-healthy)
+/// worker process. Each worker instead periodically reconciles its own
+/// registry against `harvest_sessions` and drops any entry that left
+/// `ACTIVE` through any path -- scanner reclaim, or a release whose
+/// `record_session_completed` call failed after committing.
+pub type SessionSlotRegistry =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<crate::types::SessionId>>>;
 
-/// Build a new, zeroed session-slot counter.
+/// Build a new, empty session-slot registry.
 #[must_use]
-pub fn new_session_slot_counter() -> SessionSlotCounter {
-    std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0))
+pub fn new_session_slot_registry() -> SessionSlotRegistry {
+    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
-/// Attempt to claim one session slot, bounded by `max_concurrent_sessions`.
+/// Attempt to claim `session_id`'s slot, bounded by `max_concurrent_sessions`.
 ///
-/// Returns `true` on success (the counter has been incremented; the caller
-/// now holds the slot and must eventually call [`release_session_slot`]).
-/// Returns `false` without side effects when `max <= 0` (sessions disabled)
-/// or the counter is already at `max`.
+/// Returns `true` on success (either newly inserted, or already held by
+/// this worker -- idempotent, so a retried acquire dispatch that already
+/// won locally on an earlier attempt this process doesn't need to re-claim
+/// a slot) -- the caller now holds the slot and must eventually call
+/// [`release_session_slot`]. Returns `false` without side effects when
+/// `max <= 0` (sessions disabled) or the registry is already at `max` and
+/// does not already contain `session_id`.
 #[must_use]
-pub fn try_acquire_session_slot(in_use: &std::sync::atomic::AtomicI64, max: i32) -> bool {
-    use std::sync::atomic::Ordering;
-
+pub fn try_acquire_session_slot(
+    registry: &SessionSlotRegistry,
+    max: i32,
+    session_id: crate::types::SessionId,
+) -> bool {
     if max <= 0 {
         return false;
     }
-    let max = i64::from(max);
-    let mut current = in_use.load(Ordering::SeqCst);
-    loop {
-        if current >= max {
-            return false;
-        }
-        match in_use.compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
-        {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
-        }
+    let Ok(max) = usize::try_from(max) else {
+        return false;
+    };
+    let mut held = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.contains(&session_id) {
+        return true;
     }
+    if held.len() >= max {
+        return false;
+    }
+    held.insert(session_id);
+    true
 }
 
-/// Release one previously claimed session slot.
+/// Release a previously claimed session slot.
 ///
-/// Saturating: never decrements below zero, so a defensive double-release
-/// (e.g. a manually crafted or corrupted history triggering `complete()`
-/// twice) cannot underflow the counter into a state where it never again
-/// reports "at capacity".
-pub fn release_session_slot(in_use: &std::sync::atomic::AtomicI64) {
-    use std::sync::atomic::Ordering;
+/// Idempotent: releasing a `session_id` this registry doesn't (or no
+/// longer) hold is a no-op, so a defensive double-release (e.g. a
+/// reconcile sweep racing an in-flight `Session::complete()`) is safe.
+pub fn release_session_slot(registry: &SessionSlotRegistry, session_id: crate::types::SessionId) {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&session_id);
+}
 
-    let mut current = in_use.load(Ordering::SeqCst);
-    loop {
-        if current <= 0 {
-            return;
-        }
-        match in_use.compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
-        {
-            Ok(_) => return,
-            Err(observed) => current = observed,
+/// Current number of sessions this worker's registry believes it is
+/// hosting -- the live value reported as `harvest_workers.in_use_sessions`
+/// on each heartbeat (issue #606 AC8).
+#[must_use]
+pub fn session_slot_count(registry: &SessionSlotRegistry) -> i32 {
+    let held = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    i32::try_from(held.len()).unwrap_or(i32::MAX)
+}
+
+/// Reconcile this worker's local session-slot registry against durable state
+/// (issue #606).
+///
+/// Drops any locally-held `session_id` whose `harvest_sessions` row has left
+/// `ACTIVE` through a path this worker's own release call never observed --
+/// the broken-session scanner reclaiming it (host died/drained/lease-expired,
+/// possibly detected by a *different* worker's timeout-checker loop), or a
+/// `Session::complete()` dispatch whose `record_session_completed` call
+/// errored after the row had already committed COMPLETED on a retry.
+///
+/// Returns the number of slots actually released.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on failure.
+#[cfg(feature = "db")]
+pub async fn reconcile_local_sessions(
+    conn: &mut diesel_async::AsyncPgConnection,
+    registry: &SessionSlotRegistry,
+) -> crate::error::HarvestResult<usize> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_sessions::dsl as s;
+
+    let candidate_ids: Vec<uuid::Uuid> = {
+        let held = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.iter().map(crate::types::SessionId::as_uuid).collect()
+    };
+    if candidate_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let non_active: Vec<uuid::Uuid> = s::harvest_sessions
+        .filter(s::id.eq_any(&candidate_ids))
+        .filter(s::state.ne("ACTIVE"))
+        .select(s::id)
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    if non_active.is_empty() {
+        return Ok(0);
+    }
+
+    let mut held = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut released = 0usize;
+    for id in non_active {
+        if held.remove(&crate::types::SessionId::from_uuid(id)) {
+            released += 1;
         }
     }
+    Ok(released)
+}
+
+/// Spawn a background task that periodically reconciles this worker's local
+/// session-slot registry against `harvest_sessions` (issue #606).
+///
+/// Releases any slot the registry believes is still held but whose row has
+/// left `ACTIVE` -- see [`reconcile_local_sessions`] for why a worker cannot
+/// rely solely on its own release paths. Mirrors
+/// [`crate::poison_pill::spawn_poison_pill_reclaimer`]'s loop shape. Stops
+/// when `cancel` is triggered.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn spawn_session_slot_reconciler(
+    pool: crate::worker::DbPool,
+    registry: SessionSlotRegistry,
+    cancel: tokio_util::sync::CancellationToken,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break,
+                () = tokio::time::sleep(interval) => {}
+            }
+            match pool.get().await {
+                Ok(mut conn) => match reconcile_local_sessions(&mut conn, &registry).await {
+                    Ok(released) if released > 0 => {
+                        tracing::warn!(
+                            released,
+                            "reconciled local worker-session registry against harvest_sessions"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(error = %e, "worker-session slot reconcile sweep failed");
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to acquire DB connection for worker-session slot reconcile"
+                    );
+                }
+            }
+            if cancel.is_cancelled() {
+                break;
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // DB-gated session persistence
 // ---------------------------------------------------------------------------
 
-/// Record a newly acquired session (issue #606).
+/// Record a newly acquired session (issue #606), idempotently.
 ///
 /// Called by the worker's session-acquire interception after it wins the
-/// in-process semaphore race.
+/// in-process semaphore race. Uses `ON CONFLICT (id) DO NOTHING` and reads
+/// the row back rather than a plain insert: a session-acquire task can be
+/// claimed and (partially) processed more than once for the same
+/// `session_id` -- e.g. the poison-pill reclaimer requeues the task row
+/// after its original worker crashes between committing this insert and
+/// completing the task -- and a second, honest attempt on a *different*
+/// worker must not error out on a duplicate-key violation or silently
+/// overwrite the first winner's `host_worker_id`. Returns the session's
+/// actual, durably-recorded host -- which is `host_worker_id` on a fresh
+/// insert, or a *different* worker's id if this call lost the race to an
+/// earlier attempt. Callers must compare the returned host against their
+/// own worker id and release any local slot reservation they are not
+/// actually entitled to when they differ (see `handle_session_acquire` in
+/// `worker.rs`).
 ///
 /// # Errors
 ///
@@ -279,8 +420,11 @@ pub async fn record_session_acquired(
     host_worker_id: &str,
     queue_name: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
-) -> crate::error::HarvestResult<()> {
+) -> crate::error::HarvestResult<String> {
+    use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_sessions::dsl;
 
     let row = crate::models::NewHarvestSession {
         id: session_id.as_uuid(),
@@ -291,10 +435,18 @@ pub async fn record_session_acquired(
     };
     diesel::insert_into(crate::schema::harvest_sessions::table)
         .values(&row)
+        .on_conflict(dsl::id)
+        .do_nothing()
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
-    Ok(())
+
+    dsl::harvest_sessions
+        .find(session_id.as_uuid())
+        .select(dsl::host_worker_id)
+        .first(conn)
+        .await
+        .map_err(crate::error::database_error)
 }
 
 /// Mark a session `COMPLETED` (issue #606).
@@ -325,6 +477,45 @@ pub async fn record_session_completed(
         state: "COMPLETED".to_string(),
         completed_at: chrono::Utc::now(),
     })
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Push a session's lease (`expires_at`) forward from now (issue #606).
+///
+/// Called after each member-activity completion so a long-running, still
+/// legitimately active pipeline isn't reclaimed by the broken-session
+/// scanner's `expires_at < NOW()` check purely because its member activities
+/// individually take longer than one [`SESSION_MEMBER_STICKY_TIMEOUT`]
+/// window to finish. Idempotent-shaped: only an `ACTIVE` row is refreshed —
+/// a session already `BROKEN`/`COMPLETED` is left alone (there is nothing to
+/// extend, and refreshing a `BROKEN` row's lease could otherwise race the
+/// scanner into believing a just-reclaimed session is still alive).
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on failure.
+#[cfg(feature = "db")]
+pub async fn refresh_session_lease(
+    conn: &mut diesel_async::AsyncPgConnection,
+    session_id: crate::types::SessionId,
+) -> crate::error::HarvestResult<()> {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    use crate::schema::harvest_sessions::dsl;
+
+    let expires_at = chrono::Utc::now()
+        + chrono::Duration::from_std(SESSION_MEMBER_STICKY_TIMEOUT)
+            .unwrap_or_else(|_| chrono::Duration::hours(24));
+    diesel::update(
+        dsl::harvest_sessions
+            .find(session_id.as_uuid())
+            .filter(dsl::state.eq("ACTIVE")),
+    )
+    .set(crate::models::SessionLeaseRefresh { expires_at })
     .execute(conn)
     .await
     .map_err(crate::error::database_error)?;
@@ -745,68 +936,106 @@ mod tests {
         assert_eq!(d, Duration::from_millis(500));
     }
 
-    // ── session slot counter ─────────────────────────────────────────────
+    // ── session slot registry ────────────────────────────────────────────
 
     #[test]
-    fn new_session_slot_counter_starts_at_zero() {
-        let counter = new_session_slot_counter();
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    fn new_session_slot_registry_starts_empty() {
+        let registry = new_session_slot_registry();
+        assert_eq!(session_slot_count(&registry), 0);
     }
 
     #[test]
     fn try_acquire_session_slot_fails_when_max_is_zero() {
-        let counter = new_session_slot_counter();
-        assert!(!try_acquire_session_slot(&counter, 0));
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let registry = new_session_slot_registry();
+        assert!(!try_acquire_session_slot(
+            &registry,
+            0,
+            crate::types::SessionId::new()
+        ));
+        assert_eq!(session_slot_count(&registry), 0);
     }
 
     #[test]
     fn try_acquire_session_slot_fails_when_max_is_negative() {
-        let counter = new_session_slot_counter();
-        assert!(!try_acquire_session_slot(&counter, -1));
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let registry = new_session_slot_registry();
+        assert!(!try_acquire_session_slot(
+            &registry,
+            -1,
+            crate::types::SessionId::new()
+        ));
+        assert_eq!(session_slot_count(&registry), 0);
     }
 
     #[test]
     fn try_acquire_session_slot_succeeds_under_capacity_and_increments() {
-        let counter = new_session_slot_counter();
-        assert!(try_acquire_session_slot(&counter, 2));
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(try_acquire_session_slot(&counter, 2));
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let registry = new_session_slot_registry();
+        assert!(try_acquire_session_slot(
+            &registry,
+            2,
+            crate::types::SessionId::new()
+        ));
+        assert_eq!(session_slot_count(&registry), 1);
+        assert!(try_acquire_session_slot(
+            &registry,
+            2,
+            crate::types::SessionId::new()
+        ));
+        assert_eq!(session_slot_count(&registry), 2);
     }
 
     #[test]
     fn try_acquire_session_slot_fails_at_capacity_without_incrementing() {
-        let counter = new_session_slot_counter();
-        assert!(try_acquire_session_slot(&counter, 1));
-        assert!(!try_acquire_session_slot(&counter, 1));
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let registry = new_session_slot_registry();
+        assert!(try_acquire_session_slot(
+            &registry,
+            1,
+            crate::types::SessionId::new()
+        ));
+        assert!(!try_acquire_session_slot(
+            &registry,
+            1,
+            crate::types::SessionId::new()
+        ));
+        assert_eq!(session_slot_count(&registry), 1);
+    }
+
+    #[test]
+    fn try_acquire_session_slot_is_idempotent_for_the_same_session_id() {
+        // Re-acquiring the same id (e.g. a retried dispatch on the same
+        // worker) must not double-count against capacity.
+        let registry = new_session_slot_registry();
+        let id = crate::types::SessionId::new();
+        assert!(try_acquire_session_slot(&registry, 1, id));
+        assert!(try_acquire_session_slot(&registry, 1, id));
+        assert_eq!(session_slot_count(&registry), 1);
     }
 
     #[test]
     fn release_session_slot_decrements() {
-        let counter = new_session_slot_counter();
-        assert!(try_acquire_session_slot(&counter, 1));
-        release_session_slot(&counter);
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let registry = new_session_slot_registry();
+        let id = crate::types::SessionId::new();
+        assert!(try_acquire_session_slot(&registry, 1, id));
+        release_session_slot(&registry, id);
+        assert_eq!(session_slot_count(&registry), 0);
     }
 
     #[test]
-    fn release_session_slot_never_goes_negative() {
-        let counter = new_session_slot_counter();
-        release_session_slot(&counter);
-        release_session_slot(&counter);
-        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+    fn release_session_slot_of_unknown_id_is_a_no_op() {
+        let registry = new_session_slot_registry();
+        release_session_slot(&registry, crate::types::SessionId::new());
+        release_session_slot(&registry, crate::types::SessionId::new());
+        assert_eq!(session_slot_count(&registry), 0);
     }
 
     #[test]
     fn acquire_then_release_frees_a_slot_for_reacquire() {
-        let counter = new_session_slot_counter();
-        assert!(try_acquire_session_slot(&counter, 1));
-        assert!(!try_acquire_session_slot(&counter, 1));
-        release_session_slot(&counter);
-        assert!(try_acquire_session_slot(&counter, 1));
+        let registry = new_session_slot_registry();
+        let first = crate::types::SessionId::new();
+        let second = crate::types::SessionId::new();
+        assert!(try_acquire_session_slot(&registry, 1, first));
+        assert!(!try_acquire_session_slot(&registry, 1, second));
+        release_session_slot(&registry, first);
+        assert!(try_acquire_session_slot(&registry, 1, second));
     }
 
     // ── broken_session_candidates_query ──────────────────────────────────

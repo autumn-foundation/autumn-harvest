@@ -1384,7 +1384,7 @@ async fn test_worker_heartbeat_updates_labels() {
 
     {
         let mut conn = pool.get().await.unwrap();
-        let affected = heartbeat_worker(&mut conn, "worker-hb-labels-test", 0, &labels_json)
+        let affected = heartbeat_worker(&mut conn, "worker-hb-labels-test", 0, &labels_json, 0)
             .await
             .unwrap();
         assert_eq!(affected, 1);

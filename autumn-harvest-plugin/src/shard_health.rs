@@ -1085,7 +1085,12 @@ fn required_queues(
             queues.insert("default".to_string());
         }
         for activity in runtime.registry().activities.values() {
-            if !activity.is_local {
+            // See the matching comment in `preflight::required_queues`: the
+            // two reserved worker-session internal activities dispatch on
+            // the caller-supplied session queue, never `default_queue`.
+            if !activity.is_local
+                && !autumn_harvest::is_reserved_session_activity_name(activity.name)
+            {
                 queues.insert(activity.default_queue.unwrap_or("default").to_string());
             }
         }

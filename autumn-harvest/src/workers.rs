@@ -373,12 +373,14 @@ pub async fn heartbeat_worker(
     worker_id: &str,
     in_flight_count: i32,
     labels: &serde_json::Value,
+    in_use_sessions: i32,
 ) -> HarvestResult<usize> {
     let affected = diesel::update(harvest_workers::table.find(worker_id))
         .set((
             harvest_workers::last_heartbeat_at.eq(Utc::now()),
             harvest_workers::in_flight_count.eq(in_flight_count),
             harvest_workers::labels.eq(labels),
+            harvest_workers::in_use_sessions.eq(in_use_sessions),
         ))
         .execute(conn)
         .await
@@ -1105,8 +1107,17 @@ async fn do_heartbeat_tick(
     worker_shutdown: &CancellationToken,
     drain_deadline_max: &Mutex<Option<DateTime<Utc>>>,
     remote_drain_deadline: &Mutex<Option<std::time::Instant>>,
+    in_use_sessions: i32,
 ) {
-    match heartbeat_worker(conn, &registration.worker_id, in_flight, labels_json).await {
+    match heartbeat_worker(
+        conn,
+        &registration.worker_id,
+        in_flight,
+        labels_json,
+        in_use_sessions,
+    )
+    .await
+    {
         Ok(0) => {
             if worker_shutdown.is_cancelled() {
                 // Worker is already draining — do not create a new Active row on
@@ -1220,6 +1231,11 @@ pub fn spawn_worker_heartbeat(
     // the prior deadline from reverting the cell: stale shorter values are rejected
     // while genuine extensions (newer, later values) always advance the cell.
     drain_deadline_max: Arc<Mutex<Option<DateTime<Utc>>>>,
+    // In-process worker-session registry (issue #606): sampled fresh each
+    // tick (mirroring `in_flight` above) so `harvest_workers.in_use_sessions`
+    // — previously always written as a literal `0` — reflects this worker's
+    // actual live session count.
+    session_slots_in_use: crate::sessions::SessionSlotRegistry,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let labels_json = serde_json::to_value(&registration.labels).unwrap_or_default();
@@ -1241,6 +1257,7 @@ pub fn spawn_worker_heartbeat(
                 &act_semaphore,
                 AtomicUsize::load(&act_max, Ordering::Relaxed),
             );
+            let in_use_sessions = crate::sessions::session_slot_count(&session_slots_in_use);
             match pool.get().await {
                 Ok(mut conn) => {
                     let () = do_heartbeat_tick(
@@ -1251,6 +1268,7 @@ pub fn spawn_worker_heartbeat(
                         &worker_shutdown,
                         &drain_deadline_max,
                         &remote_drain_deadline,
+                        in_use_sessions,
                     )
                     .await;
                 }

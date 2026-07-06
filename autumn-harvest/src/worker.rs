@@ -4523,6 +4523,22 @@ async fn finalize_activity_completion(
             )
             .await?;
             queue::complete_task(conn, task.id, output).await?;
+            // Worker sessions (issue #606): a session member activity's
+            // completion pushes the session's lease forward, so a
+            // long-running but still-legitimate pipeline isn't reclaimed by
+            // the broken-session scanner's `expires_at < NOW()` check just
+            // because its steps individually outlast one sticky-timeout
+            // window. `task.session_id` is `None` for both ordinary
+            // activities and the reserved acquire/release activities
+            // themselves (neither is dispatched through `Session::
+            // execute_activity`), so this is scoped to genuine members only.
+            if let Some(session_uuid) = task.session_id {
+                crate::sessions::refresh_session_lease(
+                    conn,
+                    crate::types::SessionId::from_uuid(session_uuid),
+                )
+                .await?;
+            }
             queue::wake_workflow_task(conn, exec_id).await
         }
         .scope_boxed()
@@ -5122,7 +5138,7 @@ async fn handle_session_acquire(
     worker_id: &str,
     exec_id: ExecutionId,
     max_concurrent_sessions: i32,
-    session_slots_in_use: &crate::sessions::SessionSlotCounter,
+    session_slots_in_use: &crate::sessions::SessionSlotRegistry,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
@@ -5147,7 +5163,11 @@ async fn handle_session_acquire(
         return Err(HarvestError::Config(error));
     };
 
-    if !crate::sessions::try_acquire_session_slot(session_slots_in_use, max_concurrent_sessions) {
+    if !crate::sessions::try_acquire_session_slot(
+        session_slots_in_use,
+        max_concurrent_sessions,
+        session_id,
+    ) {
         // Lost the race: this worker is at its advertised session
         // capacity (or sessions are disabled: max_concurrent_sessions <= 0,
         // so every acquire loses). Reschedule with a randomized backoff so
@@ -5169,7 +5189,7 @@ async fn handle_session_acquire(
     let expires_at = chrono::Utc::now()
         + chrono::Duration::from_std(crate::sessions::SESSION_MEMBER_STICKY_TIMEOUT)
             .unwrap_or_else(|_| chrono::Duration::hours(24));
-    if let Err(error) = crate::sessions::record_session_acquired(
+    let actual_host = match crate::sessions::record_session_acquired(
         &mut conn,
         session_id,
         exec_id,
@@ -5179,20 +5199,37 @@ async fn handle_session_acquire(
     )
     .await
     {
-        // Failed to durably record the session -- release the slot just
-        // claimed (never leak it) and fail the task so the workflow
-        // observes an ordinary activity failure instead of silently
-        // wedging.
-        crate::sessions::release_session_slot(session_slots_in_use);
-        let msg = error.to_string();
-        fail_task_and_execution(&mut conn, task, worker_id, &msg).await?;
-        return Err(error);
+        Ok(host) => host,
+        Err(error) => {
+            // Failed to durably record the session -- release the slot just
+            // claimed (never leak it) and fail the task so the workflow
+            // observes an ordinary activity failure instead of silently
+            // wedging. The periodic reconciler (`reconcile_local_sessions`) is
+            // a backstop for this same release should it ever be missed (e.g.
+            // a crash between the DB error and this line).
+            crate::sessions::release_session_slot(session_slots_in_use, session_id);
+            let msg = error.to_string();
+            fail_task_and_execution(&mut conn, task, worker_id, &msg).await?;
+            return Err(error);
+        }
+    };
+    if actual_host != worker_id {
+        // Split-brain guard: `record_session_acquired` is idempotent
+        // (`ON CONFLICT (id) DO NOTHING`), so a session-acquire task can be
+        // (re)claimed and processed more than once for the same
+        // `session_id` -- e.g. the poison-pill reclaimer requeues this task
+        // after its earlier host crashed between committing the
+        // `harvest_sessions` row and completing the task. When the
+        // durably-recorded host is not *this* worker, this attempt never
+        // actually won the session -- release the local slot just claimed
+        // (it was speculative, not a real grant) rather than leaking it.
+        crate::sessions::release_session_slot(session_slots_in_use, session_id);
     }
     metrics.record_session_acquisition(
         &task.queue_name,
         crate::telemetry::SessionAcquisitionOutcome::Acquired,
     );
-    let output = serde_json::json!(worker_id);
+    let output = serde_json::json!(actual_host);
     finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None).await
 }
 
@@ -5207,7 +5244,7 @@ async fn handle_session_release(
     task: &TaskQueueItem,
     worker_id: &str,
     exec_id: ExecutionId,
-    session_slots_in_use: &crate::sessions::SessionSlotCounter,
+    session_slots_in_use: &crate::sessions::SessionSlotRegistry,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -5237,10 +5274,10 @@ async fn handle_session_release(
         return Err(error);
     }
 
-    // Frees the in-process slot for a future acquire. Idempotent/saturating
-    // (never goes below zero), so a defensive double-release (e.g. a
-    // manually-crafted or corrupted history) cannot underflow the counter.
-    crate::sessions::release_session_slot(session_slots_in_use);
+    // Frees the in-process slot for a future acquire. Idempotent -- removing
+    // an id that isn't present (e.g. a defensive double-release from a
+    // manually-crafted or corrupted history) is a no-op.
+    crate::sessions::release_session_slot(session_slots_in_use, session_id);
 
     let output = serde_json::Value::Null;
     finalize_activity_completion(&mut conn, task, exec_id, activity_id, output, None).await
@@ -5255,7 +5292,7 @@ async fn process_activity_task(
     cancellation_grace_period: Duration,
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
-    session_slots_in_use: &crate::sessions::SessionSlotCounter,
+    session_slots_in_use: &crate::sessions::SessionSlotRegistry,
 ) -> HarvestResult<()> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let mut conn = pool.get().await.map_err(crate::error::database_error)?;
@@ -8392,7 +8429,7 @@ async fn process_task(
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
     dispatched_at: std::time::Instant,
     max_concurrent_sessions: i32,
-    session_slots_in_use: &crate::sessions::SessionSlotCounter,
+    session_slots_in_use: &crate::sessions::SessionSlotRegistry,
 ) -> HarvestResult<()> {
     let mut conn = pool.get().await.map_err(crate::error::database_error)?;
 
@@ -9140,17 +9177,24 @@ pub struct Worker {
     /// the same execution accumulate toward the same threshold.
     workflow_task_timeout_strikes:
         Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, i32>>>,
-    /// In-process count of worker sessions currently hosted by this worker
-    /// (issue #606), bounded against `config.max_concurrent_sessions` via
-    /// [`crate::sessions::try_acquire_session_slot`]. `0` (the default) means
-    /// sessions are disabled, so the session-acquire interception in
-    /// `process_activity_task` always loses the race and reschedules --
-    /// zero behavior change beyond that reschedule loop, which only ever
-    /// fires for a workflow that calls `create_session` against a worker
-    /// that never opted in. A plain `Arc<AtomicI64>` rather than a
+    /// In-process registry of worker sessions currently hosted by this
+    /// worker (issue #606), bounded against `config.max_concurrent_sessions`
+    /// via [`crate::sessions::try_acquire_session_slot`]. `0` (the default
+    /// `max_concurrent_sessions`) means sessions are disabled, so the
+    /// session-acquire interception in `process_activity_task` always loses
+    /// the race and reschedules -- zero behavior change beyond that
+    /// reschedule loop, which only ever fires for a workflow that calls
+    /// `create_session` against a worker that never opted in. Tracks
+    /// identity (`SessionId`), not just a count, so a periodic reconciler
+    /// (see [`crate::sessions::reconcile_local_sessions`]) can detect and
+    /// release a specific slot this worker's local view believes is still
+    /// held but whose `harvest_sessions` row has since left `ACTIVE` --
+    /// e.g. because the broken-session scanner reclaimed it, or because a
+    /// prior release attempt failed after already freeing the slot
+    /// in-memory. A `HashSet<SessionId>` rather than a
     /// `tokio::sync::Semaphore`/`OwnedSemaphorePermit` map -- see
-    /// [`crate::sessions::SessionSlotCounter`]'s doc comment for why.
-    session_slots_in_use: crate::sessions::SessionSlotCounter,
+    /// [`crate::sessions::SessionSlotRegistry`]'s doc comment for why.
+    session_slots_in_use: crate::sessions::SessionSlotRegistry,
 }
 
 struct WorkerMonitoringHandles {
@@ -9161,6 +9205,9 @@ struct WorkerMonitoringHandles {
     timeout_checkers: Vec<tokio::task::JoinHandle<()>>,
     poison_pill_reclaimers: Vec<tokio::task::JoinHandle<()>>,
     pause_auto_resumers: Vec<tokio::task::JoinHandle<()>>,
+    /// Worker-session local-registry reconcilers (issue #606). Empty when
+    /// `db` is disabled.
+    session_slot_reconcilers: Vec<tokio::task::JoinHandle<()>>,
     history_oversized_sampler: tokio::task::JoinHandle<()>,
     worker_slot_sampler: Option<tokio::task::JoinHandle<()>>,
     stranded_work_sampler: Option<tokio::task::JoinHandle<()>>,
@@ -9465,7 +9512,7 @@ impl Worker {
             workflow_task_timeout_strikes: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            session_slots_in_use: crate::sessions::new_session_slot_counter(),
+            session_slots_in_use: crate::sessions::new_session_slot_registry(),
         })
     }
 
@@ -9912,6 +9959,11 @@ impl Worker {
                 tracing::warn!(error = %error, "poison-pill reclaimer failed during shutdown");
             }
         }
+        for handle in monitors.session_slot_reconcilers {
+            if let Err(error) = handle.await {
+                tracing::warn!(error = %error, "session slot reconciler failed during shutdown");
+            }
+        }
         for handle in monitors.pause_auto_resumers {
             if let Err(error) = handle.await {
                 tracing::warn!(error = %error, "pause auto-resumer failed during shutdown");
@@ -10182,6 +10234,27 @@ impl Worker {
                 )
             })
             .collect();
+        // Worker-session local-registry reconciler (issue #606): a session's
+        // `harvest_sessions` row may live on any shard this worker touches
+        // (session identity doesn't self-encode a shard the way ExecutionId
+        // does), so — mirroring the poison-pill reclaimer above — one
+        // reconciler per assigned shard pool checks this worker's *entire*
+        // local registry against that shard's rows; a session hosted on a
+        // different shard simply matches zero rows there and is a no-op for
+        // that pool. Reuses the heartbeat cadence, matching the other
+        // session-adjacent scanners (the broken-session scanner shares this
+        // same interval via `enforce_timeouts_once`).
+        let session_slot_reconcilers: Vec<_> = shard_pools_for_monitors
+            .iter()
+            .map(|shard_pool| {
+                crate::sessions::spawn_session_slot_reconciler(
+                    shard_pool.clone(),
+                    Arc::clone(&self.session_slots_in_use),
+                    self.shutdown.clone(),
+                    self.config.worker_heartbeat_interval,
+                )
+            })
+            .collect();
         let pause_auto_resumers: Vec<_> = shard_pools_for_monitors
             .iter()
             .map(|shard_pool| {
@@ -10372,6 +10445,7 @@ impl Worker {
             timeout_checkers,
             poison_pill_reclaimers,
             pause_auto_resumers,
+            session_slot_reconcilers,
             history_oversized_sampler,
             worker_slot_sampler,
             stranded_work_sampler,
@@ -10434,6 +10508,7 @@ impl Worker {
             self.shutdown.clone(),
             Arc::clone(&self.remote_drain_deadline),
             Arc::clone(&self.drain_deadline_max),
+            Arc::clone(&self.session_slots_in_use),
         )
     }
 
@@ -10473,6 +10548,11 @@ impl Worker {
         }
     }
 
+    // A long, flat sequence of "drain this monitor handle and warn on
+    // failure" blocks, one per `WorkerMonitoringHandles` field -- inherently
+    // repetitive rather than complex; splitting it up would just move the
+    // line count into a helper with an equally uninteresting signature.
+    #[allow(clippy::too_many_lines)]
     async fn shutdown_and_cleanup(
         &self,
         heartbeat_handle: tokio::task::JoinHandle<()>,
@@ -10500,6 +10580,15 @@ impl Worker {
                     worker_id = %self.config.worker_id,
                     error = %error,
                     "poison-pill reclaimer task failed during shutdown"
+                );
+            }
+        }
+        for handle in monitors.session_slot_reconcilers {
+            if let Err(error) = handle.await {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    error = %error,
+                    "session slot reconciler task failed during shutdown"
                 );
             }
         }
@@ -12377,12 +12466,9 @@ mod tests {
     }
 
     #[test]
-    fn new_session_slot_counter_starts_at_zero() {
-        let counter = crate::sessions::new_session_slot_counter();
-        assert_eq!(
-            std::sync::atomic::AtomicI64::load(&counter, std::sync::atomic::Ordering::SeqCst),
-            0
-        );
+    fn new_session_slot_registry_starts_empty() {
+        let registry = crate::sessions::new_session_slot_registry();
+        assert_eq!(crate::sessions::session_slot_count(&registry), 0);
     }
 
     #[test]

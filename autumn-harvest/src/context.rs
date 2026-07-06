@@ -1118,6 +1118,25 @@ pub(crate) const SESSION_ACQUIRE_ACTIVITY_NAME: &str = "__harvest_session_acquir
 /// like a member activity, so only the host frees its own in-process slot.
 pub(crate) const SESSION_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_release";
 
+/// Returns `true` when `name` is one of the two reserved worker-session
+/// internal activity names (issue #606): `__harvest_session_acquire` or
+/// `__harvest_session_release`.
+///
+/// Both are always registered in `HandlerRegistry::activities` (so the
+/// enqueue-time handler lookup never hard-fails on them) with
+/// `default_queue: None`, but they are dispatched on the *caller-supplied*
+/// session queue (`SessionOptions::queue`) at the point `create_session`/
+/// `Session::complete` is called, never on a fixed queue of their own. A
+/// preflight/readiness check deriving "queues this deployment needs a
+/// worker listening on" from every registered activity's
+/// `default_queue.unwrap_or("default")` must exclude these two names —
+/// otherwise a deployment with no session-based workflow at all is
+/// spuriously reported as requiring a worker on `"default"`.
+#[must_use]
+pub fn is_reserved_session_activity_name(name: &str) -> bool {
+    name == SESSION_ACQUIRE_ACTIVITY_NAME || name == SESSION_RELEASE_ACTIVITY_NAME
+}
+
 /// Default session acquisition timeout.
 ///
 /// Bounds how long [`WorkflowContext::create_session`] waits for a worker
