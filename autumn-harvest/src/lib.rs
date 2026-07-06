@@ -154,6 +154,12 @@ pub mod usage;
 pub mod version_gate_retirement;
 #[cfg(feature = "db")]
 pub mod version_usage;
+/// Inbound HTTP webhook trigger descriptors (issue #344).
+///
+/// Pure, unconditional (not `db`-gated) — the `#[webhook]` macro's
+/// companion function must always compile. See the module docs for the
+/// autumn-web-owns-verification design.
+pub mod webhook_trigger;
 
 #[cfg(feature = "db")]
 #[doc(hidden)]
@@ -318,7 +324,7 @@ pub use store::AwaitMode;
 pub use telemetry::{
     ActivityStatus, MetricsRecorder, NoOpMetrics, NoOpPropagator, TelemetryConfig,
     TelemetryConfigBuilder, TraceContextCarrier, TraceContextPropagator, USER_METRIC_PREFIX,
-    UserMetricError, UserMetrics, WorkflowStatus, validate_user_metric,
+    UserMetricError, UserMetrics, WebhookOutcome, WorkflowStatus, validate_user_metric,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use test_generator::TestHarnessGenerator;
@@ -344,6 +350,10 @@ pub use update::UpdateRegistry;
 #[cfg(feature = "db")]
 pub use version_usage::{
     VersionExecutionStateGroup, VersionUsageFilters, VersionUsageShardRow, load_version_usage,
+};
+pub use webhook_trigger::{
+    WebhookCtx, WebhookHandlerError, WebhookHandlerFn, WebhookTarget, WebhookTriggerInfo,
+    validate_webhook_triggers,
 };
 
 #[cfg(feature = "db")]

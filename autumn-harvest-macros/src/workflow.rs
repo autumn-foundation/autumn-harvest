@@ -933,6 +933,12 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         workflow_retry_policy: info.retry_policy
                             .and_then(|p| ::autumn_harvest::serde_json::to_value(&p).ok()),
                         max_workflow_attempts_ceiling: client.max_workflow_attempts(),
+                        // Schema validation (issue #373) is an HTTP-JSON-boundary
+                        // concern only: a typed stub caller's `input: I` is already
+                        // checked by Rust's type system, so it never needs runtime
+                        // schema validation -- consistent with every other
+                        // `validate_input` call site being in the HTTP handlers.
+                        workflow_info: None,
                     };
 
                     let outcome = ::autumn_harvest::execution::signal_with_start_workflow_execution(conn, params).await?;

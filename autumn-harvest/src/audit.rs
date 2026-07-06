@@ -126,6 +126,17 @@ pub const OP_BUILD_RAMP_CLEAR: &str = "build_routing.ramp.clear";
 /// Audit operation: Manually redrove a dead-lettered completion-callback
 /// delivery (issue #605).
 pub const OP_CALLBACK_REDRIVE: &str = "completion_callback.redrive";
+/// Audit operation: an inbound webhook trigger dispatched a workflow start or signal (issue #344).
+///
+/// Written only for dispatch *attempts* that pass autumn-web's signature
+/// verification -- an unauthenticated sender cannot generate audit rows by
+/// sending unsigned/badly-signed requests. No
+/// `ALL_MUTATION_ROUTES`/`CLASSIFIED_ROUTES` entry exists for this operation:
+/// webhook binding paths are user-defined and registered as app-level routes
+/// outside `harvest_api_router`, so they are invisible to (and correctly
+/// excluded from) those management-router manifests. See
+/// `docs/getting-started/12-webhooks.md`.
+pub const OP_WEBHOOK_TRIGGER: &str = "webhook.trigger";
 
 // ── Target type constants ─────────────────────────────────────────────────────
 
@@ -464,6 +475,10 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_BUILD_RAMP_CLEAR,
     // Completion-callback delivery redrive (issue #605)
     OP_CALLBACK_REDRIVE,
+    // Inbound webhook receiver (issue #344). No ALL_MUTATION_ROUTES entry --
+    // webhook paths are user-defined, app-level routes; see the doc comment
+    // on OP_WEBHOOK_TRIGGER.
+    OP_WEBHOOK_TRIGGER,
 ];
 
 /// Routes explicitly excluded from audit.

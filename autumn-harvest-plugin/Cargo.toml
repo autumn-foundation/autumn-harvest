@@ -56,3 +56,7 @@ workspace = true
 [[example]]
 name = "mcp_tools_quickstart"
 required-features = ["mcp"]
+
+[[example]]
+name = "webhook_receiver_quickstart"
+required-features = ["webhooks"]

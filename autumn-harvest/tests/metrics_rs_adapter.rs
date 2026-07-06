@@ -6,7 +6,9 @@
 #![cfg(feature = "metrics-rs")]
 
 use autumn_harvest::metrics_rs_adapter::MetricsRsRecorder;
-use autumn_harvest::telemetry::{ActivityStatus, MetricsRecorder, TelemetryConfig, WorkflowStatus};
+use autumn_harvest::telemetry::{
+    ActivityStatus, MetricsRecorder, TelemetryConfig, WebhookOutcome, WorkflowStatus,
+};
 use std::sync::Arc;
 
 #[test]
@@ -32,6 +34,9 @@ fn metrics_rs_recorder_implements_metrics_recorder_trait() {
     recorder.record_activity_attempt("charge_card", "billing", ActivityStatus::Completed);
     recorder.record_activity_attempt("charge_card", "billing", ActivityStatus::Failed);
     recorder.record_activity_retried("charge_card", "billing");
+    // Inbound webhook receiver counters (issue #344) must be bridged.
+    recorder.record_webhook_received("/hooks/orders", WebhookOutcome::Accepted);
+    recorder.record_webhook_rejected("/hooks/orders", WebhookOutcome::VerifyFailed);
 }
 
 #[test]

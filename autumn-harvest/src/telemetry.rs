@@ -524,6 +524,81 @@ pub const METRIC_SCHEDULE_AUTO_PAUSED: &str = "harvest.schedule.auto_paused";
 /// can nudge the author or enable `max_workflow_history_events`.
 pub const METRIC_WORKFLOW_HISTORY_OVERSIZED: &str = "harvest.workflow.history_oversized";
 
+/// Counter: incremented on every request that reaches an inbound webhook
+/// receiver route, regardless of outcome (issue #344).
+///
+/// Labels: `path` (the registered `#[webhook(path = ...)]` binding — a
+/// closed set fixed at `HarvestPlugin::build` time, so cardinality is bounded
+/// by construction per ADR-0001 §7) and `outcome` (= [`METRIC_LABEL_OUTCOME`],
+/// one of [`WebhookOutcome`]'s bounded values). `execution.id` is never a
+/// label here — it stays span-only.
+pub const METRIC_WEBHOOK_RECEIVED: &str = "harvest.webhook.received";
+
+/// Counter: incremented every time an inbound webhook request is rejected (issue #344).
+///
+/// Rejection reasons: signature/timestamp/replay verification failure,
+/// payload parse failure, a mapping function rejection, or a missing
+/// idempotency key.
+///
+/// Labels: `path` and `outcome`, same bounded contract as
+/// [`METRIC_WEBHOOK_RECEIVED`]. `outcome` is never `"accepted"` on this
+/// counter.
+pub const METRIC_WEBHOOK_REJECTED: &str = "harvest.webhook.rejected";
+
+/// Metric label: the registered `#[webhook(path = ...)]` binding path
+/// (issue #344). Bounded cardinality: only registered webhook bindings ever
+/// appear, fixed at `HarvestPlugin::build` time.
+pub const METRIC_LABEL_PATH: &str = "path";
+
+/// Bounded outcome classification for an inbound webhook request (issue #344).
+///
+/// Every value maps 1:1 to an HTTP status class the receiver route returns,
+/// so the set is closed by construction — no user input ever becomes an
+/// outcome string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookOutcome {
+    /// A fresh workflow execution (or signal) was dispatched (`202`).
+    Accepted,
+    /// A redelivery of an already-dispatched event was recognized and
+    /// short-circuited without a duplicate dispatch (`200`, or a `409` from
+    /// autumn-web's own replay-protection layer).
+    IdempotentReplay,
+    /// autumn-web's `SignedWebhook` extractor rejected the request
+    /// (signature mismatch, stale timestamp, missing/malformed header).
+    VerifyFailed,
+    /// The verified body was not valid JSON, or the mapping function
+    /// deserialize/reject step failed.
+    ParseFailed,
+    /// A `SignalsWithStart` target resolved no delivery ID to use as the
+    /// signal's idempotency key.
+    MissingIdempotency,
+    /// Any other internal failure (e.g. the harvest runtime is not yet
+    /// started, or the dispatch call itself failed).
+    InternalError,
+}
+
+impl WebhookOutcome {
+    /// Stable lower-case outcome string used as the `outcome` metric label
+    /// and the JSON `error_code` field.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::IdempotentReplay => "idempotent_replay",
+            Self::VerifyFailed => "verify_failed",
+            Self::ParseFailed => "parse_failed",
+            Self::MissingIdempotency => "missing_idempotency",
+            Self::InternalError => "internal_error",
+        }
+    }
+}
+
+impl std::fmt::Display for WebhookOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Metric label key constants
 // Used by MetricsRecorder implementations to avoid string literals at call
@@ -1610,6 +1685,22 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue);
     }
 
+    /// A request reached an inbound webhook receiver route (issue #344).
+    ///
+    /// Maps to the counter [`METRIC_WEBHOOK_RECEIVED`] with labels `path`
+    /// and `outcome`.
+    fn record_webhook_received(&self, path: &str, outcome: WebhookOutcome) {
+        let _ = (path, outcome);
+    }
+
+    /// An inbound webhook request was rejected (issue #344).
+    ///
+    /// Maps to the counter [`METRIC_WEBHOOK_REJECTED`] with labels `path`
+    /// and `outcome`. `outcome` is never [`WebhookOutcome::Accepted`] here.
+    fn record_webhook_rejected(&self, path: &str, outcome: WebhookOutcome) {
+        let _ = (path, outcome);
+    }
+
     /// Whether this recorder actually forwards samples anywhere.
     ///
     /// Defaults to `true` for every real recorder. [`NoOpMetrics`] overrides it to
@@ -2465,6 +2556,30 @@ mod tests {
         assert_eq!(WorkflowStatus::ContinuedAsNew.as_str(), "continued_as_new");
         assert_eq!(ActivityStatus::Completed.as_str(), "completed");
         assert_eq!(ActivityStatus::Failed.as_str(), "failed");
+    }
+
+    #[test]
+    fn webhook_outcome_stringifies_to_bounded_values() {
+        assert_eq!(WebhookOutcome::Accepted.as_str(), "accepted");
+        assert_eq!(
+            WebhookOutcome::IdempotentReplay.as_str(),
+            "idempotent_replay"
+        );
+        assert_eq!(WebhookOutcome::VerifyFailed.as_str(), "verify_failed");
+        assert_eq!(WebhookOutcome::ParseFailed.as_str(), "parse_failed");
+        assert_eq!(
+            WebhookOutcome::MissingIdempotency.as_str(),
+            "missing_idempotency"
+        );
+        assert_eq!(WebhookOutcome::InternalError.as_str(), "internal_error");
+        assert_eq!(WebhookOutcome::Accepted.to_string(), "accepted");
+    }
+
+    #[test]
+    fn noop_metrics_implements_webhook_methods_without_panicking() {
+        let rec = NoOpMetrics;
+        rec.record_webhook_received("/hooks/orders", WebhookOutcome::Accepted);
+        rec.record_webhook_rejected("/hooks/orders", WebhookOutcome::VerifyFailed);
     }
 
     #[test]
