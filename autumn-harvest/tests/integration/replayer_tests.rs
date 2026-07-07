@@ -192,6 +192,33 @@ fn patched_workflow_deprecated_residual<'a>(
     })
 }
 
+/// Sandwich-flip regression handler (issue #687 review finding F1):
+/// `patched(id)` → `deprecate_patch(id)` → residual `patched(id)` in one
+/// body. On the live cycle the first call's marker exists only as a pending
+/// command; the this-cycle latch makes `deprecate_patch` (and the residual
+/// call's memo) see it, so live and replay passes agree: (true, true).
+fn patched_workflow_sandwich<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let first = ctx.patched("gate");
+        ctx.deprecate_patch("gate");
+        let second = ctx.patched("gate");
+        if first && second {
+            ctx.execute_activity_raw("new_activity", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"branch": "new"}))
+        } else {
+            ctx.execute_activity_raw("old_activity", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"branch": "old"}))
+        }
+    })
+}
+
 /// Workflow that calls `set_current_details` before, between, and after
 /// activities, including a trailing clear via an empty string (issue #593).
 /// It must replay against a history containing **only** the activity events
@@ -376,6 +403,7 @@ fn build_replayer() -> WorkflowReplayer {
             "patched_workflow_deprecated_residual",
             patched_workflow_deprecated_residual,
         )
+        .register_fn("patched_workflow_sandwich", patched_workflow_sandwich)
         .register_fn("timer_first_workflow", timer_first_workflow)
         .register_fn("jitter_timer_workflow", jitter_timer_workflow)
         .register_fn("current_details_workflow", current_details_workflow)
@@ -903,6 +931,31 @@ async fn replay_deprecate_patch_with_residual_patched_keeps_phase1_branch() {
     assert!(
         matches!(phase0.status, ReplayStatus::ReplaySucceeded),
         "residual patched() must keep a phase-0 history on the old branch, got: {phase0}"
+    );
+}
+
+/// Sandwich-flip money test (issue #687 review finding F1): the history a
+/// fixed live pass of the sandwich handler produces — `patched("gate")`
+/// records exactly one marker, `deprecate_patch` + residual `patched` add
+/// nothing, both booleans are true → new branch. That history must replay
+/// cleanly against the same handler: without the this-cycle latch the live
+/// pass would have taken the OLD branch (residual `patched` false) while
+/// every replay pass takes the new one — a permanent nd-block.
+#[tokio::test]
+async fn replay_patched_deprecate_patched_sandwich_is_replay_consistent() {
+    let replayer = build_replayer();
+
+    let report = replayer
+        .replay_from_snapshot(make_snapshot(
+            "patched_workflow_sandwich",
+            ExecutionId::new(),
+            post_patch_history(),
+        ))
+        .await;
+
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the patched→deprecate→patched sandwich must be live/replay consistent, got: {report}"
     );
 }
 

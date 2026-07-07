@@ -3096,7 +3096,12 @@ impl WorkflowContext {
     /// for phase-0 histories) — but it also returns `false` for **new
     /// executions** started post-deprecation, and records nothing. If you
     /// still branch on it, new runs take the *old* branch. The fix is to
-    /// delete the residual call when you deprecate.
+    /// delete the residual call when you deprecate. One exception keeps the
+    /// live cycle consistent with replay: a marker recorded **earlier in the
+    /// same cycle** (by a `patched(id)` or `version(id, ..)` call before the
+    /// `deprecate_patch(id)`) counts as present, so a
+    /// `patched(id)` → `deprecate_patch(id)` → `patched(id)` sandwich yields
+    /// `(true, true)` on both the live pass and every replay pass.
     ///
     /// # Panics
     ///
@@ -9406,6 +9411,32 @@ mod tests {
 
         assert!(ctx.patched("x"));
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn context_patched_then_deprecate_then_patched_is_consistent_live() {
+        // The sandwich flip (review finding F1): on the live cycle the first
+        // patched() call's marker exists only as a pending command, so a
+        // naive deprecate_patch history scan would latch `false` and the
+        // residual patched() would return false live / true on replay — a
+        // permanent nd-block. The this-cycle latch makes the memo agree
+        // with every replay cycle.
+        let ctx = WorkflowContext::new_test();
+
+        assert!(ctx.patched("x"));
+        ctx.deprecate_patch("x");
+        assert!(
+            ctx.patched("x"),
+            "residual patched() must agree with the marker recorded this cycle"
+        );
+
+        // Exactly ONE marker command: the residual call hits the memo and
+        // must not record a second marker.
+        let cmds = ctx.drain_commands();
+        assert_eq!(cmds.len(), 1);
+        assert!(
+            matches!(&cmds[0], WorkflowCommand::RecordMarker { name, .. } if name == "patch:x")
+        );
     }
 
     #[test]

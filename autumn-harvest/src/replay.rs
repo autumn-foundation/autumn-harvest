@@ -355,6 +355,19 @@ pub struct HistoryMatcher {
     /// histories, `false` for phase-0 histories AND for new executions
     /// started post-deprecation, on both live and replay passes.
     deprecated_patches: HashMap<String, bool>,
+    /// Patch/version ids whose marker was recorded on the **live frontier of
+    /// this very cycle** (issue #687, review hardening): a
+    /// [`Self::match_patch_marker`] `NewlyPatched` result or a
+    /// [`Self::match_version`] live-frontier `max_version` result means the
+    /// context is about to push a `RecordMarker` command that exists only as
+    /// a pending command — invisible to [`Self::deprecate_patch`]'s
+    /// full-history scan. Without this latch, a same-cycle
+    /// `patched(id)` → `deprecate_patch(id)` → `patched(id)` sandwich would
+    /// memoize `false` on the live pass and `true` on every replay pass — a
+    /// live/replay branch flip and a permanent nd-block (issue #603).
+    /// `deprecate_patch` ORs this set into its presence computation so the
+    /// live cycle agrees with every replay cycle.
+    patch_ids_recorded_this_cycle: HashSet<String>,
 }
 
 impl HistoryMatcher {
@@ -413,6 +426,7 @@ impl HistoryMatcher {
             late_race_signal_events: HashSet::new(),
             race_reserved_signal_events,
             deprecated_patches: HashMap::new(),
+            patch_ids_recorded_this_cycle: HashSet::new(),
         }
     }
 
@@ -3507,8 +3521,13 @@ impl HistoryMatcher {
         let marker_name = format!("version:{change_id}");
 
         // Check BEFORE draining: if already past cursor-based history, this is
-        // a genuinely new code path → record max_version.
+        // a genuinely new code path → record max_version. This is exactly the
+        // case where the context will push a `version:{change_id}` marker
+        // command, so latch the id for a same-cycle `deprecate_patch`
+        // (issue #687 interop — see `patch_ids_recorded_this_cycle`).
         if !self.is_replaying() {
+            self.patch_ids_recorded_this_cycle
+                .insert(change_id.to_string());
             return max_version;
         }
 
@@ -3581,7 +3600,11 @@ impl HistoryMatcher {
 
         // Check BEFORE draining: if already past cursor-based history, this is
         // a genuinely new code path → the caller records a fresh marker.
+        // Latch the id so a same-cycle `deprecate_patch` sees the marker even
+        // though it exists only as a pending command, not in history yet.
         if !self.is_replaying() {
+            self.patch_ids_recorded_this_cycle
+                .insert(patch_id.to_string());
             return PatchMarkerMatch::NewlyPatched;
         }
 
@@ -3637,7 +3660,12 @@ impl HistoryMatcher {
 
         let patch_name = patch_marker_name(patch_id);
         let version_name = version_marker_name(patch_id);
-        let mut present = false;
+        // A marker recorded earlier in this SAME cycle (by `patched()` or
+        // `version()` on the live frontier) is not in history yet — it is a
+        // pending `RecordMarker` command — but it counts as present, or the
+        // live cycle's memo would disagree with every replay cycle's
+        // (the sandwich flip, review finding on issue #687).
+        let mut present = self.patch_ids_recorded_this_cycle.contains(patch_id);
         for (idx, event) in self.events.iter().enumerate() {
             if let WorkflowEvent::MarkerRecorded { name, .. } = event
                 && (*name == patch_name || *name == version_name)
@@ -4487,6 +4515,45 @@ mod tests {
         let mut matcher = HistoryMatcher::new(vec![]);
         assert!(!matcher.deprecate_patch("x"));
         assert_eq!(matcher.match_patch_marker("x"), PatchMarkerMatch::Absent);
+    }
+
+    #[test]
+    fn matcher_deprecate_patch_sees_marker_recorded_this_cycle() {
+        // The sandwich flip (review finding F1): on the LIVE cycle a
+        // `patched(id)` call records its marker only as a pending
+        // WorkflowCommand — a subsequent `deprecate_patch(id)`'s full-history
+        // scan cannot see it. Without the this-cycle latch the memo latches
+        // `false`, a residual `patched(id)` returns false on the live pass
+        // and true on every replay pass → permanent nd-block.
+        let mut matcher = HistoryMatcher::new(vec![]);
+        assert_eq!(
+            matcher.match_patch_marker("x"),
+            PatchMarkerMatch::NewlyPatched
+        );
+        assert!(
+            matcher.deprecate_patch("x"),
+            "deprecate_patch must see a marker recorded earlier in the SAME cycle"
+        );
+        assert_eq!(
+            matcher.match_patch_marker("x"),
+            PatchMarkerMatch::Recorded,
+            "the residual patched() call must agree with every replay cycle"
+        );
+    }
+
+    #[test]
+    fn matcher_deprecate_patch_sees_version_marker_recorded_this_cycle() {
+        // Version-interop variant of the sandwich flip: a live
+        // `ctx.version(id, ..)` call returning max is exactly the case where
+        // the context pushes a `version:{id}` marker command — a same-cycle
+        // `deprecate_patch(id)` must observe it as present.
+        let mut matcher = HistoryMatcher::new(vec![]);
+        assert_eq!(matcher.match_version("x", 1, 2), 2);
+        assert!(
+            matcher.deprecate_patch("x"),
+            "deprecate_patch must see a version marker recorded this cycle"
+        );
+        assert_eq!(matcher.match_patch_marker("x"), PatchMarkerMatch::Recorded);
     }
 
     #[test]
