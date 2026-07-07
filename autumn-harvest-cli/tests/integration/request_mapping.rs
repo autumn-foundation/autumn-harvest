@@ -1284,6 +1284,70 @@ fn workflow_retry_activity_maps_to_post_retry_now_route() {
     assert_eq!(request.body, None, "retry-activity sends no body");
 }
 
+// ── pause / resume subcommands (issue #609) ───────────────────────────────────
+
+#[test]
+fn workflow_pause_maps_to_post_pause_route_with_reason_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "pause",
+        "00000000-0000-0000-0000-000000000001",
+        "--reason",
+        "investigating incident INC-42",
+    ])
+    .expect("workflow pause args should parse");
+    let request = cli.api_request().expect("pause request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/pause"
+    );
+    assert_eq!(
+        request.body,
+        Some(json!({ "reason": "investigating incident INC-42" }))
+    );
+}
+
+#[test]
+fn workflow_pause_without_reason_sends_empty_object_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "pause",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow pause args should parse");
+    let request = cli.api_request().expect("pause request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/pause"
+    );
+    assert_eq!(request.body, Some(json!({})));
+}
+
+#[test]
+fn workflow_resume_maps_to_post_resume_route_with_no_body() {
+    let cli = Cli::try_parse_from([
+        "harvest",
+        "workflow",
+        "resume",
+        "00000000-0000-0000-0000-000000000001",
+    ])
+    .expect("workflow resume args should parse");
+    let request = cli.api_request().expect("resume request should build");
+
+    assert_eq!(request.method, ApiMethod::Post);
+    assert_eq!(
+        request.path,
+        "/workflows/00000000-0000-0000-0000-000000000001/resume"
+    );
+    assert_eq!(request.body, None, "resume sends no body");
+}
+
 // ── batch-reset subcommand (issue #538) ───────────────────────────────────────
 
 #[test]
