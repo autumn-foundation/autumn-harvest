@@ -64,6 +64,33 @@ Runbook step: `harvest_schedule_missed_runs` -> `### Triage steps`, especially
 Resolution target: resume the schedule or clear the synthetic active run, then
 verify `harvest_schedule_runs_total` increases on the next interval.
 
+## runaway-execution-containment
+
+Start a long-running synthetic workflow in staging (a loop of short activities
+with a durable timer between iterations works well — it exercises both the
+activity and timer wake paths). Start a second, identical control run and let
+it complete un-paused; record its output. Pause the first run mid-flight with
+`harvest workflow pause <execution_id> --reason "drill"` (or
+`POST /workflows/{id}/pause`), wait at least two poll intervals, and confirm
+zero further dispatch progress: `state` is `PAUSED` on
+`GET /workflows/{id}` with `paused_at`/`pause_reason`/`pause_actor` set, the
+parked workflow task row stays `PENDING`, and the event history gains no new
+`ActivityScheduled`/`TimerStarted` events (an activity that was already
+in-flight at pause time may still record its completion — that is expected).
+Then resume with `harvest workflow resume <execution_id>` and let the run
+finish.
+
+Expected signal: `harvest.workflow.paused` increments once on pause;
+`harvest.workflow.pause_duration` records the span on resume; the run appears
+in `GET /workflows?state=PAUSED` only between the two calls.
+
+Runbook step: `contain-runaway-execution.md` -> `## Verify containment`.
+
+Resolution target: the paused-then-resumed run reaches `COMPLETED` with output
+**identical** to the un-paused control run (deterministic-resume correctness —
+the issue #609 success metric), and repeating the resume call afterwards
+returns `200` with `newly_resumed: false` rather than an error.
+
 ## shard-unready
 
 In a multi-shard staging environment, remove worker coverage for a writable
