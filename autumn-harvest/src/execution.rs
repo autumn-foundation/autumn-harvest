@@ -1574,6 +1574,31 @@ fn resume_deadline_shifts(
     }
 }
 
+/// Upper bound for the resume-time pause-span shift, in microseconds:
+/// 100 years (~3.15e15 µs).
+///
+/// `chrono::Duration::num_microseconds` returns `None` for a span too long to
+/// represent in `i64` microseconds (> ~292,471 years); binding an `i64::MAX`
+/// fallback into the `... * INTERVAL '1 microsecond'` shift SQL would raise a
+/// Postgres "timestamp/interval out of range" error and roll back the whole
+/// resume transaction. An unrepresentable (or merely astronomically long)
+/// span instead clamps to this finite bound — far below Postgres's
+/// interval/timestamp range (timestamps top out at year 294276) — so the
+/// shift SQL can never raise "out of range" and the resume always commits.
+const MAX_PAUSE_SHIFT_MICROS: i64 = 100 * 365 * 24 * 3600 * 1_000_000;
+
+/// Pure clamp for the pause-span → microseconds conversion used by
+/// [`shift_schedule_to_close_for_resume`]: non-positive spans pass through
+/// (the caller skips the shift entirely for them); the upper end is bounded
+/// by [`MAX_PAUSE_SHIFT_MICROS`] so the bound value is always safe to add to
+/// a real timestamp in SQL.
+fn clamped_pause_shift_micros(pause_span: chrono::Duration) -> i64 {
+    pause_span
+        .num_microseconds()
+        .unwrap_or(i64::MAX)
+        .min(MAX_PAUSE_SHIFT_MICROS)
+}
+
 /// AC5 (issue #609) × #378: pause also suspends the per-activity cross-retry
 /// wall-clock deadline. Shifts every still-open task row's
 /// `schedule_to_close_at` forward by the clamped pause span — and, for
@@ -1596,9 +1621,7 @@ async fn shift_schedule_to_close_for_resume(
     exec_id: ExecutionId,
     pause_span: chrono::Duration,
 ) -> HarvestResult<()> {
-    // An unrepresentable (astronomically long) span saturates rather than
-    // silently skipping the shift, preserving "paused time is never charged".
-    let pause_span_micros = pause_span.num_microseconds().unwrap_or(i64::MAX);
+    let pause_span_micros = clamped_pause_shift_micros(pause_span);
     if pause_span_micros > 0 {
         diesel::sql_query(shift_schedule_to_close_on_resume_query())
             .bind::<diesel::sql_types::BigInt, _>(pause_span_micros)
@@ -4360,11 +4383,43 @@ mod non_terminal_sql_tests {
 #[cfg(test)]
 mod pause_helper_tests {
     use super::{
-        pause_timeout_exceeded, shift_external_schedule_to_close_on_resume_query,
-        shift_schedule_to_close_on_resume_query,
+        MAX_PAUSE_SHIFT_MICROS, clamped_pause_shift_micros, pause_timeout_exceeded,
+        shift_external_schedule_to_close_on_resume_query, shift_schedule_to_close_on_resume_query,
     };
     use chrono::{Duration as ChronoDuration, Utc};
     use std::time::Duration;
+
+    #[test]
+    fn pause_shift_micros_clamps_unrepresentable_span_to_finite_bound() {
+        // Binding an i64::MAX fallback into the `* INTERVAL '1 microsecond'`
+        // shift SQL would raise a PostgreSQL "timestamp/interval out of
+        // range" error and roll back the resume transaction: a span too long
+        // for `num_microseconds` must clamp to the finite cap instead.
+        assert_eq!(
+            clamped_pause_shift_micros(ChronoDuration::MAX),
+            MAX_PAUSE_SHIFT_MICROS
+        );
+        // A representable-but-absurd span beyond the cap clamps too.
+        assert_eq!(
+            clamped_pause_shift_micros(ChronoDuration::days(200 * 365)),
+            MAX_PAUSE_SHIFT_MICROS
+        );
+    }
+
+    #[test]
+    fn pause_shift_micros_passes_normal_spans_through_untouched() {
+        assert_eq!(
+            clamped_pause_shift_micros(ChronoDuration::minutes(30)),
+            30 * 60 * 1_000_000
+        );
+        assert_eq!(clamped_pause_shift_micros(ChronoDuration::zero()), 0);
+        // Non-positive spans pass through; the caller skips the shift for
+        // them (`pause_span_micros > 0` guard).
+        assert_eq!(
+            clamped_pause_shift_micros(ChronoDuration::seconds(-5)),
+            -5_000_000
+        );
+    }
 
     #[test]
     fn resume_shift_query_targets_open_deadline_bearing_tasks_only() {
